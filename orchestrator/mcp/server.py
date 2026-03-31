@@ -44,6 +44,9 @@ if _transport == "http":
         except ImportError:
             from oauth_bridge import SRWOAuthProxy  # type: ignore[no-redef]
 
+        _base_url = os.environ.get(
+            "MCP_BASE_URL", "https://mcp.superhuman-remote-worker.com"
+        )
         _auth = SRWOAuthProxy(
             config_url=os.environ.get(
                 "MCP_OIDC_CONFIG_URL",
@@ -51,13 +54,10 @@ if _transport == "http":
             ),
             client_id=os.environ["MCP_OIDC_CLIENT_ID"],
             client_secret=os.environ["MCP_OIDC_CLIENT_SECRET"],
-            base_url=os.environ.get(
-                "MCP_BASE_URL", "https://mcp.superhuman-remote-worker.com"
-            ),
-            issuer_url=os.environ.get(
-                "MCP_OIDC_ISSUER",
-                "https://auth.superhuman-remote-worker.com/realms/srw",
-            ),
+            base_url=_base_url,
+            # issuer_url = base_url (the proxy IS the authorization server
+            # from the client's perspective; Keycloak is only used internally
+            # via config_url for OIDC discovery)
             mcp_verifier=_token_verifier,
             verify_id_token=True,  # Keycloak access tokens may be opaque
         )

@@ -179,9 +179,9 @@ docs/_build/
 !.vscode/extensions.json
 .history/*
 
-# Eclipse
-.classpath
-.settings/
+# AI Stuff
+CLAUDE.md
+.claude
 
 # Miscellaneous
 /.angular

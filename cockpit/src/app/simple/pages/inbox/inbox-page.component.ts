@@ -10,7 +10,8 @@ import {
     signal,
     ViewChild,
 } from '@angular/core';
-import {ActivatedRoute} from '@angular/router';
+import {ActivatedRoute, Router} from '@angular/router';
+import {JsonPipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
 import {ActionCenterService} from '../../../core/services/action-center.service';
@@ -59,7 +60,7 @@ function relativeTime(iso: string): string {
 @Component({
   selector: 'app-inbox-page',
   standalone: true,
-  imports: [FormsModule, MarkdownComponent],
+  imports: [FormsModule, JsonPipe, MarkdownComponent],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
       <!-- Header -->
@@ -117,6 +118,17 @@ function relativeTime(iso: string): string {
               <span class="chip-count">{{ actionCenter.counts().reviews }}</span>
             }
           </button>
+          <button
+            class="chip"
+            [class.active]="activeFilter() === 'session'"
+            (click)="setFilter('session')"
+          >
+            <span class="chip-icon">smart_toy</span>
+            Sessions
+            @if (actionCenter.counts().sessions > 0) {
+              <span class="chip-count">{{ actionCenter.counts().sessions }}</span>
+            }
+          </button>
         </div>
 
         <div class="header-right">
@@ -164,6 +176,7 @@ function relativeTime(iso: string): string {
                     @case ('message') { mail }
                     @case ('sudo') { admin_panel_settings }
                     @case ('review') { rate_review }
+                    @case ('session') { smart_toy }
                   }
                 </span>
                 <div class="item-content">
@@ -525,6 +538,51 @@ function relativeTime(iso: string): string {
                 }
               </div>
             </div>
+          } @else if (selectedItem()!.type === 'session' && selectedItem()!.session) {
+            <!-- ========== SESSION DETAIL ========== -->
+            <div class="detail-content session-detail">
+              <div class="detail-header">
+                <span class="detail-type-badge session">
+                  <span class="icon">smart_toy</span>
+                  Agent Session
+                </span>
+                <span class="status-badge status-pending">needs attention</span>
+              </div>
+
+              <h3 class="session-title">{{ selectedItem()!.title }}</h3>
+              <div class="session-subtitle">{{ selectedItem()!.subtitle }}</div>
+
+              @if (selectedItem()!.session!.event.tool) {
+                <div class="session-section">
+                  <span class="meta-label">Tool</span>
+                  <code class="command-block">{{ selectedItem()!.session!.event.tool }}</code>
+                </div>
+                @if (selectedItem()!.session!.event.args) {
+                  <div class="session-section">
+                    <span class="meta-label">Arguments</span>
+                    <pre class="args-block">{{ selectedItem()!.session!.event.args | json }}</pre>
+                  </div>
+                }
+              }
+              @if (selectedItem()!.session!.event.command) {
+                <div class="session-section">
+                  <span class="meta-label">Command</span>
+                  <code class="command-block">{{ selectedItem()!.session!.event.command }}</code>
+                </div>
+              }
+              @if (selectedItem()!.session!.event.reason) {
+                <div class="session-section">
+                  <span class="meta-label">Reason</span>
+                  <span>{{ selectedItem()!.session!.event.reason }}</span>
+                </div>
+              }
+
+              <div class="session-actions">
+                <button class="btn btn-primary" (click)="goToSession(selectedItem()!.session!.threadId)">
+                  <span class="icon">open_in_new</span> Go to Session
+                </button>
+              </div>
+            </div>
           }
         </div>
       </div>
@@ -794,6 +852,7 @@ function relativeTime(iso: string): string {
     .type-message { color: #89b4fa; }
     .type-sudo { color: #fab387; }
     .type-review { color: #a6e3a1; }
+    .type-session { color: #cba6f7; }
 
     .item-content { flex: 1; min-width: 0; }
 
@@ -961,6 +1020,51 @@ function relativeTime(iso: string): string {
     .detail-type-badge.sudo .icon { color: #fab387; }
     .detail-type-badge.message .icon { color: #89b4fa; }
     .detail-type-badge.review .icon { color: #a6e3a1; }
+    .detail-type-badge.session .icon { color: #cba6f7; }
+
+    .session-detail .session-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin: 16px 0 4px;
+    }
+    .session-detail .session-subtitle {
+      font-size: 12px;
+      color: var(--text-muted, #6c7086);
+      margin-bottom: 16px;
+    }
+    .session-detail .session-section {
+      margin-bottom: 12px;
+    }
+    .session-detail .args-block {
+      background: var(--surface-0, #313244);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 12px;
+      overflow-x: auto;
+      max-height: 200px;
+      margin-top: 4px;
+    }
+    .session-detail .session-actions {
+      margin-top: 20px;
+      display: flex;
+      gap: 8px;
+    }
+    .session-detail .btn-primary {
+      background: var(--accent-color, #cba6f7);
+      color: var(--panel-bg, #1e1e2e);
+      border: none;
+      padding: 8px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .session-detail .btn-primary:hover {
+      opacity: 0.9;
+    }
 
     .detail-countdown {
       font-size: 12px;
@@ -1587,6 +1691,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   readonly sudo = inject(SudoService);
   private readonly api = inject(ApiService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly zone = inject(NgZone);
 
   @ViewChild('threadBody') threadBodyRef?: ElementRef<HTMLElement>;
@@ -1823,6 +1928,11 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     });
   }
 
+  // --- Session actions ---
+  goToSession(threadId: string): void {
+    this.router.navigate(['/sessions', threadId]);
+  }
+
   // --- Sudo actions ---
   approveSudo(): void {
     const item = this.selectedItem();
@@ -1961,6 +2071,9 @@ export class InboxPageComponent implements OnInit, OnDestroy {
       case '1': this.setFilter('message'); break;
       case '2': this.setFilter('sudo'); break;
       case '3': this.setFilter('review'); break;
+      case '4':
+        this.setFilter('session');
+        break;
     }
   }
 }

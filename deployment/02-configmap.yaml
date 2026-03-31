@@ -28,6 +28,7 @@ data:
   # Agent
   AGENT_CONFIG: "defaults"
   AGENT_PORT: "8001"
+  PERSISTENT_AGENT_CONFIG: "interactive"
 
   # Keycloak SSO (public OIDC config)
   KEYCLOAK_URL: "http://srw-keycloak:8080"

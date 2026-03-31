@@ -194,6 +194,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.delegation = []
+        config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "stateless"}}
 
         names = get_all_tool_names(config)
@@ -218,6 +219,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.delegation = []
+        config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "persistent"}}
 
         names = get_all_tool_names(config)
@@ -242,6 +244,7 @@ class TestToolNameAliasing:
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.delegation = []
+        config.tools.orchestrator = []
         config.extra = {}  # No shell config at all
 
         names = get_all_tool_names(config)

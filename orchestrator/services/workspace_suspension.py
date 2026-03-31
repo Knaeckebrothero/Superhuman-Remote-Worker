@@ -198,19 +198,26 @@ class WorkspaceSuspensionService:
             )
             return False
 
-    async def _extract_snapshot(self, job_id: str, ssh_host: str) -> None:
+    async def _extract_snapshot(
+            self, entity_id: str, ssh_host: str, entity_type: str = "jobs"
+    ) -> None:
         """Download snapshot from S3 and extract into the pod via SSH.
 
         Mirrors ide_session.py:_extract_snapshot_to_vm (lines 782-836).
         """
         with tempfile.NamedTemporaryFile(
-            suffix=".tar.zst", delete=True, prefix=f"restore_{job_id[:8]}_"
+                suffix=".tar.zst", delete=True, prefix=f"restore_{entity_id[:8]}_"
         ) as tmp:
             tar_path = tmp.name
 
-            ok = await self._snapshot_service.download_snapshot(job_id, tar_path)
+            ok = await self._snapshot_service.download_snapshot(
+                entity_id, tar_path, entity_type=entity_type
+            )
             if not ok:
-                logger.warning("Failed to download snapshot for job %s", job_id)
+                logger.warning(
+                    "Failed to download snapshot for %s %s",
+                    entity_type.rstrip("s"), entity_id,
+                )
                 return
 
             ssh_cmd = [
@@ -241,14 +248,199 @@ class WorkspaceSuspensionService:
 
             if proc.returncode != 0:
                 logger.warning(
-                    "Snapshot extraction had errors for job %s (rc=%d): %s",
-                    job_id,
+                    "Snapshot extraction had errors for %s %s (rc=%d): %s",
+                    entity_type.rstrip("s"),
+                    entity_id,
                     proc.returncode,
                     stderr.decode(errors="replace")[:500],
                 )
 
     # =========================================================================
-    # Idle sweep
+    # Thread suspension (mirrors job suspension for persistent agent threads)
+    # =========================================================================
+
+    async def suspend_thread_workspace(self, thread_id: str) -> bool:
+        """Capture thread workspace snapshot to S3, then delete the pod.
+
+        Returns True if snapshot + deletion succeeded.
+        On failure, reverts status to 'ready' and keeps the pod alive.
+        """
+        if not self.is_enabled or not self._db:
+            return False
+
+        thread = await self._db.get_thread(thread_id)
+        if not thread:
+            return False
+
+        metadata = thread.get("metadata") or {}
+        ws_ctx = metadata.get("workspace_container", {})
+        pod_ip = ws_ctx.get("pod_ip")
+
+        if not pod_ip or ws_ctx.get("status") != "ready":
+            return False
+
+        await self._db.merge_thread_workspace_context(
+            thread_id, {"status": "suspending"}
+        )
+
+        try:
+            ok = await self._snapshot_service.capture_vm_snapshot(
+                job_id=thread_id,
+                ssh_host=pod_ip,
+                ssh_port=22,
+                source_type="pod",
+                entity_type="threads",
+            )
+            if not ok:
+                logger.warning(
+                    "Snapshot capture failed for thread %s — keeping pod alive",
+                    thread_id,
+                )
+                await self._db.merge_thread_workspace_context(
+                    thread_id, {"status": "ready"}
+                )
+                return False
+
+            await self._container_provisioner.delete_thread_workspace(thread_id)
+
+            await self._db.merge_thread_workspace_context(
+                thread_id,
+                {
+                    "status": "suspended",
+                    "suspended_at": datetime.now(timezone.utc).isoformat(),
+                    "pod_ip": None,
+                    "pod_name": None,
+                },
+            )
+            logger.info("Workspace suspended to S3 for thread %s", thread_id)
+            return True
+
+        except Exception:
+            logger.exception("Failed to suspend workspace for thread %s", thread_id)
+            try:
+                await self._db.merge_thread_workspace_context(
+                    thread_id, {"status": "ready"}
+                )
+            except Exception:
+                pass
+            return False
+
+    async def restore_thread_workspace(self, thread_id: str) -> bool:
+        """Create a new pod and extract the S3 snapshot into it.
+
+        Returns True if pod creation + snapshot extraction succeeded.
+        """
+        if not self.is_enabled or not self._db:
+            return False
+
+        await self._db.merge_thread_workspace_context(
+            thread_id, {"status": "restoring"}
+        )
+
+        try:
+            ok = await self._container_provisioner.create_thread_workspace(thread_id)
+            if not ok:
+                logger.error(
+                    "Failed to create pod for restore of thread %s", thread_id
+                )
+                await self._db.merge_thread_workspace_context(
+                    thread_id,
+                    {"status": "failed", "error": "pod creation failed on restore"},
+                )
+                return False
+
+            # Re-read to get new pod IP
+            thread = await self._db.get_thread(thread_id)
+            ws_ctx = (thread.get("metadata") or {}).get("workspace_container", {})
+            pod_ip = ws_ctx.get("pod_ip")
+
+            if not pod_ip:
+                logger.error(
+                    "No pod IP after restore creation for thread %s", thread_id
+                )
+                await self._db.merge_thread_workspace_context(
+                    thread_id, {"status": "failed", "error": "no pod IP after creation"}
+                )
+                return False
+
+            # Extract snapshot into the new pod
+            await self._extract_snapshot(thread_id, pod_ip, entity_type="threads")
+
+            await self._db.merge_thread_workspace_context(
+                thread_id,
+                {
+                    "status": "ready",
+                    "restored_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            logger.info(
+                "Workspace restored from S3 for thread %s (pod_ip=%s)",
+                thread_id, pod_ip,
+            )
+            return True
+
+        except Exception:
+            logger.exception("Failed to restore workspace for thread %s", thread_id)
+            await self._db.merge_thread_workspace_context(
+                thread_id, {"status": "failed", "error": "restore exception"}
+            )
+            return False
+
+    async def check_idle_threads(self) -> int:
+        """Sweep idle thread workspace containers and suspend them.
+
+        A thread container is idle if:
+        - Thread status is 'idle' (no active WebSocket)
+        - Workspace container status is 'ready'
+        - last_activity is older than idle_timeout_minutes
+
+        Returns the count of containers suspended.
+        """
+        if not self.is_enabled or not self._db:
+            return 0
+
+        suspended_count = 0
+        timeout = self.idle_timeout_minutes
+        now = datetime.now(timezone.utc)
+
+        try:
+            async with self._db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, metadata, last_activity
+                    FROM threads
+                    WHERE metadata - > 'workspace_container' ->>'status' = 'ready'
+                      AND status = 'idle'
+                    """,
+                )
+        except Exception:
+            logger.exception("Failed to query idle thread workspace containers")
+            return 0
+
+        for row in rows:
+            thread_id = str(row["id"])
+            last_activity = row.get("last_activity", now)
+
+            if last_activity and last_activity.tzinfo is None:
+                last_activity = last_activity.replace(tzinfo=timezone.utc)
+
+            idle_minutes = (now - last_activity).total_seconds() / 60
+
+            if idle_minutes >= timeout:
+                logger.info(
+                    "Suspending idle workspace for thread %s (idle %.0fm, timeout %dm)",
+                    thread_id,
+                    idle_minutes,
+                    timeout,
+                )
+                ok = await self.suspend_thread_workspace(thread_id)
+                if ok:
+                    suspended_count += 1
+
+        return suspended_count
+
+    # =========================================================================
+    # Idle sweep (jobs)
     # =========================================================================
 
     async def check_idle_all(self) -> int:

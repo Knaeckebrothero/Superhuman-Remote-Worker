@@ -1,0 +1,453 @@
+import {Injectable, signal, computed, inject} from '@angular/core';
+import {HttpClient} from '@angular/common/http';
+import {firstValueFrom} from 'rxjs';
+import {environment} from '../environment';
+
+/** A chat message in the persistent session. */
+export interface ChatMessage {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    toolCalls?: ToolCallInfo[];
+    timestamp: Date;
+    /** True for messages loaded from DB history (not live). */
+    historical?: boolean;
+}
+
+/** Info about a tool call within an assistant message. */
+export interface ToolCallInfo {
+    id: string;
+    tool: string;
+    args: Record<string, unknown>;
+    result?: string;
+    status: 'pending' | 'running' | 'completed' | 'denied';
+}
+
+/** Permission request from the agent. */
+export interface PermissionRequest {
+    tool: string;
+    args: Record<string, unknown>;
+}
+
+type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
+type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
+
+/**
+ * WebSocket client for persistent agent sessions.
+ *
+ * Manages the connection to /ws/persistent/{threadId} (via orchestrator proxy)
+ * or directly to the agent pod's /ws/chat endpoint for local development.
+ *
+ * All state is exposed as Angular signals for reactive UI updates.
+ */
+@Injectable({providedIn: 'root'})
+export class PersistentChatService {
+    private readonly http = inject(HttpClient);
+
+    // --- Connection state ---
+    readonly connectionState = signal<ConnectionState>('disconnected');
+    readonly isConnected = computed(() => this.connectionState() === 'connected');
+    readonly threadId = signal<string | null>(null);
+
+    // --- Chat state ---
+    readonly messages = signal<ChatMessage[]>([]);
+    readonly streamingText = signal('');
+    readonly isStreaming = signal(false);
+    readonly currentToolCalls = signal<ToolCallInfo[]>([]);
+    readonly historyLoaded = signal(false);
+
+    // --- Permission state ---
+    readonly permissionMode = signal<PermissionMode>('supervised');
+    readonly pendingPermission = signal<PermissionRequest | null>(null);
+
+    // --- Turn tracking ---
+    readonly currentTurnId = signal<number | null>(null);
+    readonly isWaitingForInput = signal(false);
+
+    // --- Error ---
+    readonly error = signal<string | null>(null);
+
+    private ws: WebSocket | null = null;
+    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    /**
+     * Connect to a persistent agent session.
+     *
+     * For orchestrator-proxied sessions: loads history via REST first, then opens WS.
+     * For direct local dev: opens WS directly (no history).
+     */
+    async connect(target: { threadId: string } | { directUrl: string }): Promise<void> {
+        this.disconnect();
+        this.messages.set([]);
+        this.connectionState.set('connecting');
+        this.error.set(null);
+        this.historyLoaded.set(false);
+
+        let url: string;
+        if ('directUrl' in target) {
+            url = target.directUrl;
+            this.threadId.set('local');
+        } else {
+            // Load history via REST before opening WS
+            this.threadId.set(target.threadId);
+            await this.loadHistory(target.threadId);
+
+            // Derive WS URL from API URL
+            const apiUrl = environment.apiUrl;
+            const wsBase = apiUrl
+                .replace(/\/api\/?$/, '')
+                .replace(/^http/, 'ws');
+            url = `${wsBase}/ws/persistent/${target.threadId}`;
+        }
+
+        this._connectWs(url);
+    }
+
+    /** Load message history from REST endpoint. */
+    private async loadHistory(threadId: string): Promise<void> {
+        try {
+            const resp = await firstValueFrom(
+                this.http.get<{ messages: HistoryMessage[]; total: number }>(
+                    `${environment.apiUrl}/persistent/threads/${threadId}/messages`
+                )
+            );
+
+            if (resp.messages?.length) {
+                const historical: ChatMessage[] = resp.messages
+                    .filter(m => m.role === 'user' || m.role === 'ai' || m.role === 'assistant' || m.role === 'human')
+                    .map(m => ({
+                        role: (m.role === 'human' || m.role === 'user') ? 'user' as const : 'assistant' as const,
+                        content: m.content || '',
+                        toolCalls: m.tool_calls?.map(tc => ({
+                            id: tc.id || '',
+                            tool: tc.name || '',
+                            args: tc.args || {},
+                            status: 'completed' as const,
+                        })),
+                        timestamp: new Date(m.created_at || Date.now()),
+                        historical: true,
+                    }));
+                this.messages.set(historical);
+            }
+            this.historyLoaded.set(true);
+        } catch (e) {
+            // History load failure is non-fatal — proceed with empty history
+            this.historyLoaded.set(true);
+        }
+    }
+
+    /** Open the WebSocket connection. */
+    private _connectWs(url: string): void {
+        this.ws = new WebSocket(url);
+
+        this.ws.onopen = () => {
+            this.connectionState.set('connected');
+            this.error.set(null);
+        };
+
+        this.ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                this.handleMessage(data);
+            } catch {
+                // Ignore malformed messages
+            }
+        };
+
+        this.ws.onclose = (event) => {
+            this.connectionState.set('disconnected');
+            this.isStreaming.set(false);
+            this.isWaitingForInput.set(false);
+            if (event.code !== 1000 && event.code !== 4408) {
+                this.error.set(`Connection closed: ${event.reason || `code ${event.code}`}`);
+            }
+        };
+
+        this.ws.onerror = () => {
+            this.connectionState.set('error');
+            this.error.set('WebSocket connection failed');
+        };
+    }
+
+    /** Disconnect from the session. */
+    disconnect(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.ws) {
+            this.ws.onclose = null; // Prevent error handling on intentional close
+            this.ws.close(1000);
+            this.ws = null;
+        }
+        this.connectionState.set('disconnected');
+        this.isStreaming.set(false);
+        this.isWaitingForInput.set(false);
+        this.pendingPermission.set(null);
+    }
+
+    /** Send a user message (with slash command parsing). */
+    sendMessage(content: string): void {
+        if (!content.trim() || !this.ws) return;
+
+        // Slash command parsing
+        const trimmed = content.trim();
+        if (trimmed.startsWith('/')) {
+            const handled = this.handleSlashCommand(trimmed);
+            if (handled) return;
+        }
+
+        // Add to local messages immediately
+        this.messages.update((msgs) => [
+            ...msgs,
+            {role: 'user', content, timestamp: new Date()},
+        ]);
+
+        this.isWaitingForInput.set(false);
+        this.send({method: 'message', content});
+    }
+
+    /** Parse and dispatch slash commands. Returns true if handled. */
+    private handleSlashCommand(input: string): boolean {
+        const parts = input.split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+        const arg = parts.slice(1).join(' ');
+
+        switch (cmd) {
+            case '/compact':
+                this.send({method: 'compact', focus: arg});
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system', content: `Compacting context${arg ? ` (focus: ${arg})` : ''}...`,
+                    timestamp: new Date(),
+                }]);
+                return true;
+            case '/done':
+                this.send({method: 'archive'});
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system', content: 'Ending session...', timestamp: new Date(),
+                }]);
+                return true;
+            case '/auto':
+                this.setMode('auto_accept');
+                return true;
+            case '/supervised':
+                this.setMode('supervised');
+                return true;
+            case '/autonomous':
+                this.setMode('autonomous');
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Approve a pending permission request. */
+    approve(): void {
+        this.pendingPermission.set(null);
+        this.send({method: 'approve'});
+    }
+
+    /** Deny a pending permission request. */
+    deny(): void {
+        this.pendingPermission.set(null);
+        this.send({method: 'deny'});
+    }
+
+    /** Interrupt the current turn. */
+    interrupt(): void {
+        this.send({method: 'interrupt'});
+    }
+
+    /** Change permission mode. */
+    setMode(mode: PermissionMode): void {
+        this.permissionMode.set(mode);
+        this.send({method: 'mode.set', mode});
+    }
+
+    /** Clear message history (local only). */
+    clearMessages(): void {
+        this.messages.set([]);
+    }
+
+    // --- Private ---
+
+    private send(data: Record<string, unknown>): void {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify(data));
+        }
+    }
+
+    private handleMessage(data: { method: string; params?: Record<string, unknown> }): void {
+        const params = data.params ?? {};
+
+        switch (data.method) {
+            case 'session.state':
+                // Sync client state with agent's current state on connect
+                if (params['permission_mode']) {
+                    this.permissionMode.set(params['permission_mode'] as PermissionMode);
+                }
+                break;
+
+            case 'greeting':
+                this.messages.update((msgs) => [
+                    ...msgs,
+                    {
+                        role: 'assistant',
+                        content: (params['content'] as string) || '',
+                        timestamp: new Date(),
+                    },
+                ]);
+                this.isWaitingForInput.set(true);
+                break;
+
+            case 'ready':
+                this.isWaitingForInput.set(true);
+                this.isStreaming.set(false);
+                // Finalize any streaming text into a message
+                this.finalizeStreaming();
+                break;
+
+            case 'turn.started':
+                this.currentTurnId.set((params['turn_id'] as number) ?? null);
+                this.isStreaming.set(true);
+                this.streamingText.set('');
+                this.currentToolCalls.set([]);
+                break;
+
+            case 'token':
+                this.streamingText.update((t) => t + ((params['content'] as string) || ''));
+                break;
+
+            case 'tool.started': {
+                const tc: ToolCallInfo = {
+                    id: (params['id'] as string) || '',
+                    tool: (params['tool'] as string) || '',
+                    args: (params['args'] as Record<string, unknown>) || {},
+                    status: 'running',
+                };
+                this.currentToolCalls.update((calls) => [...calls, tc]);
+                break;
+            }
+
+            case 'tool.completed': {
+                const id = params['id'] as string;
+                this.currentToolCalls.update((calls) =>
+                    calls.map((tc) =>
+                        tc.id === id
+                            ? {...tc, status: 'completed' as const, result: (params['result'] as string) || ''}
+                            : tc,
+                    ),
+                );
+                break;
+            }
+
+            case 'permission.request':
+                this.pendingPermission.set({
+                    tool: (params['tool'] as string) || '',
+                    args: (params['args'] as Record<string, unknown>) || {},
+                });
+                break;
+
+            case 'turn.completed':
+                this.finalizeStreaming();
+                this.isStreaming.set(false);
+                this.currentTurnId.set(null);
+                break;
+
+            case 'mode.changed':
+                this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+                break;
+
+            case 'context.compacted':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: `Context compacted: ${params['before']} → ${params['after']} messages`,
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'session.ended':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system', content: 'Session ended.', timestamp: new Date(),
+                }]);
+                this.isWaitingForInput.set(false);
+                break;
+
+            case 'session.idle_timeout':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved \u2014 click Resume to continue.`,
+                    timestamp: new Date(),
+                }]);
+                this.isWaitingForInput.set(false);
+                break;
+
+            case 'vm_upgrade.needed':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}. `
+                        + `Use the upgrade button or send /upgrade to switch to a VM workspace.`,
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'vm_upgrade.started':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: 'Upgrading workspace to VM, please wait...',
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'vm_upgrade.complete':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: 'VM upgrade complete. Workspace is now running on a VM with sudo access.',
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'vm_upgrade.failed':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: `VM upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'error':
+                this.error.set((params['message'] as string) || 'Unknown error');
+                break;
+        }
+    }
+
+    /** Move accumulated streaming text + tool calls into the messages array. */
+    private finalizeStreaming(): void {
+        const text = this.streamingText();
+        const tools = this.currentToolCalls();
+
+        if (text || tools.length > 0) {
+            this.messages.update((msgs) => [
+                ...msgs,
+                {
+                    role: 'assistant',
+                    content: text,
+                    toolCalls: tools.length > 0 ? [...tools] : undefined,
+                    timestamp: new Date(),
+                },
+            ]);
+        }
+
+        this.streamingText.set('');
+        this.currentToolCalls.set([]);
+    }
+}
+
+/** Shape of a message from the REST history endpoint. */
+interface HistoryMessage {
+    id: string;
+    role: string;
+    content: string | null;
+    tool_calls: { name: string; args: Record<string, unknown>; id: string }[] | null;
+    turn_number: number | null;
+    created_at: string | null;
+}

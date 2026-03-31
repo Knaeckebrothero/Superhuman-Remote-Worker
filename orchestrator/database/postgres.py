@@ -1140,6 +1140,123 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_thread_workspace_context(
+            self, thread_id: str, container_updates: Dict[str, Any]
+    ) -> bool:
+        """Atomically merge updates into threads.metadata.workspace_container.
+
+        Same pattern as merge_workspace_container_context() but targets the
+        threads table metadata JSONB instead of jobs.context.
+
+        Args:
+            thread_id: Thread UUID as string
+            container_updates: Dictionary to merge into metadata.workspace_container
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{workspace_container}', "
+            "    COALESCE(metadata->'workspace_container', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(container_updates), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
+    async def merge_thread_vm_context(
+            self, thread_id: str, vm_updates: Dict[str, Any]
+    ) -> bool:
+        """Atomically merge updates into threads.metadata.vm.
+
+        Same pattern as merge_vm_context() but targets the threads table
+        metadata JSONB instead of jobs.context.
+
+        Args:
+            thread_id: Thread UUID as string
+            vm_updates: Dictionary to merge into metadata.vm
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{vm}', "
+            "    COALESCE(metadata->'vm', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(vm_updates), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
+    async def merge_thread_snapshot_context(
+            self, thread_id: str, snapshot_updates: Dict[str, Any]
+    ) -> bool:
+        """Atomically merge updates into threads.metadata.snapshot.
+
+        Same pattern as merge_thread_workspace_context() but targets the
+        snapshot key instead of workspace_container.
+
+        Args:
+            thread_id: Thread UUID as string
+            snapshot_updates: Dictionary to merge into metadata.snapshot
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE threads "
+            "SET metadata = jsonb_set("
+            "    COALESCE(metadata, '{}'::jsonb), "
+            "    '{snapshot}', "
+            "    COALESCE(metadata->'snapshot', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    last_activity = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(snapshot_updates), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
 
@@ -1286,6 +1403,8 @@ class PostgresDB:
         hostname: str | None = None,
         pod_port: int = 8001,
         pid: int | None = None,
+            agent_mode: str = "worker",
+            thread_id: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -1338,7 +1457,9 @@ class PostgresDB:
                             status = 'booting',
                             current_job_id = NULL,
                             last_heartbeat = CURRENT_TIMESTAMP,
-                            registered_at = CURRENT_TIMESTAMP
+                            registered_at = CURRENT_TIMESTAMP,
+                            agent_mode    = $6,
+                            thread_id     = $7
                         WHERE id = $5
                         """,
                         pod_ip,
@@ -1346,6 +1467,8 @@ class PostgresDB:
                         pid,
                         config_name,
                         agent_id,
+                        agent_mode,
+                        thread_id,
                     )
                     return {
                         "agent_id": str(agent_id),
@@ -1355,8 +1478,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
                 """,
                 config_name,
@@ -1364,6 +1487,8 @@ class PostgresDB:
                 pod_ip,
                 pod_port,
                 pid,
+                agent_mode,
+                thread_id,
             )
 
             return {
@@ -1699,6 +1824,7 @@ class PostgresDB:
                        last_completed_at, metadata
                 FROM agents
                 WHERE status = 'ready'
+                  AND COALESCE(agent_mode, 'worker') = 'worker'
                   AND (last_completed_at IS NULL
                        OR NOW() - last_completed_at >= make_interval(secs => $1))
                 ORDER BY last_heartbeat DESC
@@ -1708,6 +1834,260 @@ class PostgresDB:
                 limit,
             )
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Thread CRUD (persistent agent sessions)
+    # ------------------------------------------------------------------
+
+    async def create_thread(
+            self,
+            user_id: str | None = None,
+            project_id: str | None = None,
+            config_name: str = "defaults",
+            permission_mode: str = "supervised",
+            title: str = "Untitled Session",
+    ) -> str:
+        """Create a new persistent thread."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO threads (user_id, project_id, config_name, permission_mode, title)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
+                """,
+                user_id,
+                project_id,
+                config_name,
+                permission_mode,
+                title,
+            )
+        return str(row["id"])
+
+    async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
+        """Get thread by ID."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id = $1",
+                thread_id,
+            )
+        return dict(row) if row else None
+
+    async def list_threads(
+            self,
+            user_id: str | None = None,
+            project_id: str | None = None,
+            status: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List threads with optional filters."""
+        conditions = []
+        params = []
+        idx = 1
+
+        if user_id:
+            conditions.append(f"(user_id = ${idx} OR user_id IS NULL)")
+            params.append(user_id)
+            idx += 1
+        if project_id:
+            conditions.append(f"project_id = ${idx}")
+            params.append(project_id)
+            idx += 1
+        if status:
+            conditions.append(f"status = ${idx}")
+            params.append(status)
+            idx += 1
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM threads {where} ORDER BY created_at DESC LIMIT 50",
+                *params,
+            )
+        return [dict(row) for row in rows]
+
+    async def end_thread(self, thread_id: str) -> None:
+        """End a persistent thread."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET status   = 'ended',
+                    ended_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                thread_id,
+            )
+
+    async def resume_thread(self, thread_id: str) -> None:
+        """Resume an ended/idle thread — reset to 'created', clear stale agent."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET status        = 'created',
+                    agent_id      = NULL,
+                    ended_at      = NULL,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                thread_id,
+            )
+
+    async def delete_thread(self, thread_id: str) -> None:
+        """Permanently delete a thread and its messages."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM thread_messages WHERE thread_id = $1",
+                thread_id,
+            )
+            await conn.execute(
+                "DELETE FROM threads WHERE id = $1",
+                thread_id,
+            )
+
+    async def update_thread_status(self, thread_id: str, status: str) -> None:
+        """Update thread status."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET status        = $2,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                thread_id,
+                status,
+            )
+
+    async def mark_orphaned_threads_idle(self) -> int:
+        """Mark threads as idle if their bound agent is offline or deleted.
+
+        Threads in 'created' or 'active' status whose agent_id is NULL
+        (deleted) or bound to an offline agent are set to 'idle'.
+
+        Returns:
+            Number of threads marked idle.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE threads
+                SET status        = 'idle',
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE status IN ('created', 'active')
+                  AND (
+                    agent_id IS NULL
+                        OR agent_id IN (SELECT id
+                                        FROM agents
+                                        WHERE status = 'offline')
+                    )
+                """
+            )
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
+    async def update_thread_agent(self, thread_id: str, agent_id: str) -> None:
+        """Bind an agent to a thread."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET agent_id = $2 WHERE id = $1",
+                thread_id,
+                agent_id,
+            )
+
+    # --- Thread message persistence ---
+
+    async def save_thread_message(
+            self,
+            thread_id: str,
+            role: str,
+            content: Optional[str],
+            tool_calls: Optional[Any] = None,
+            turn_number: Optional[int] = None,
+            metrics: Optional[dict] = None,
+    ) -> str:
+        """Save a message to thread_messages. Fire-and-forget safe."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO thread_messages (thread_id, role, content, tool_calls, turn_number, metrics)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+                """,
+                thread_id,
+                role,
+                content,
+                json.dumps(tool_calls) if tool_calls else None,
+                turn_number,
+                json.dumps(metrics) if metrics else None,
+            )
+            # Update thread activity + turn count
+            await conn.execute(
+                """
+                UPDATE threads
+                SET last_activity = CURRENT_TIMESTAMP,
+                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                WHERE id = $1
+                """,
+                thread_id,
+                turn_number,
+            )
+        return str(row["id"])
+
+    async def get_thread_messages_history(
+            self,
+            thread_id: str,
+            limit: int = 200,
+            offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Load thread message history for session resume. Ordered by created_at ASC."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, role, content, tool_calls, turn_number, metrics, created_at
+                FROM thread_messages
+                WHERE thread_id = $1
+                ORDER BY created_at ASC
+                    LIMIT $2
+                OFFSET $3
+                """,
+                thread_id,
+                limit,
+                offset,
+            )
+        result = []
+        for row in rows:
+            msg = {
+                "id": str(row["id"]),
+                "role": row["role"],
+                "content": row["content"],
+                "tool_calls": json.loads(row["tool_calls"]) if row["tool_calls"] else None,
+                "turn_number": row["turn_number"],
+                "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            result.append(msg)
+        return result
+
+    async def get_thread_message_count(self, thread_id: str) -> int:
+        """Get total message count for a thread."""
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM thread_messages WHERE thread_id = $1",
+                thread_id,
+            )
+
+    async def update_thread_tokens(self, thread_id: str, tokens: int) -> None:
+        """Increment total token usage for a thread."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET total_tokens = total_tokens + $2
+                WHERE id = $1
+                """,
+                thread_id,
+                tokens,
+            )
 
     async def get_preemption_candidates(self) -> List[Dict[str, Any]]:
         """Get running jobs ordered by priority ASC (lowest priority first).

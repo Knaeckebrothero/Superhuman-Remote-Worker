@@ -32,6 +32,7 @@
 # Run application components locally:
 #   cd orchestrator && uvicorn main:app --reload --port 8085
 #   python agent.py --config defaults --port 8001
+#   python agent.py --mode persistent --config interactive --port 8002
 #   cd cockpit && npm start
 #
 # =============================================================================
@@ -277,8 +278,6 @@ services:
       - label:disable
     devices:
       - /dev/ppp:/dev/ppp
-    volumes:
-      - ./certs:/etc/vpn/certs:ro
     ports:
       - "${VPN_LLM_PORT:-8080}:8080"
     environment:
@@ -310,8 +309,6 @@ services:
       - label:disable
     devices:
       - /dev/ppp:/dev/ppp
-    volumes:
-      - ./certs:/etc/vpn/certs:ro
     ports:
       - "${VPN_SOCKS_PORT:-1080}:1080"
     environment:
@@ -341,8 +338,6 @@ services:
       - label:disable
     devices:
       - /dev/ppp:/dev/ppp
-    volumes:
-      - ./certs:/etc/vpn/certs:ro
     ports:
       - "${VPN_WORKSTATION_PORT_HOST:-8090}:8080"
     environment:

@@ -22,9 +22,13 @@ related:
 
 # Agent Lifecycle — Persistent and Worker Modes
 
-Design document for the two-mode agent architecture: Persistent (permanent, interactive, session-based) and Worker (autonomous, pooled, job-based). Same container image, same shared infrastructure, different execution loops and lifecycle management.
+Design and implementation document for the two-mode agent architecture: Persistent (permanent, interactive,
+session-based) and Worker (autonomous, pooled, job-based). Same container image, same shared infrastructure, different
+execution loops and lifecycle management. The persistent mode is additive — the existing worker codebase is unchanged.
 
-**Status:** Design phase.
+**Status:** All phases implemented (2026-03-29). Interactive loop, WebSocket transport, orchestrator integration,
+thread schema, job delegation tools, and cockpit chat UI are functional. Deferred items remain across phases (see
+checkboxes).
 
 ## Overview
 
@@ -959,105 +963,166 @@ For local development, persistent agents run as local processes (`python agent.p
 
 ## Implementation Phases
 
+> **Implementation note (2026-03-29):** All 6 phases were implemented in a single pass with the following deviations
+> from the original plan:
+> - **No graph rename.** `src/graph.py` stays as-is. The worker mode is unchanged — persistent mode is purely additive.
+> - **No K8s deployment rename.** The existing `srw-agent` Deployment is not renamed to `srw-worker`. The
+    `--mode worker` default preserves current behavior.
+> - **No worker pool scaling.** The `worker_pool_manager` background task is deferred. Dynamic replica management
+    requires RBAC changes and production testing.
+> - **Phases 1–4 were collapsed** because the additive approach (no renames, no worker-side changes) made them
+    naturally parallel.
+
 ### Phase 1: Worker Rename and Pool Foundation
 
 Foundation work — no persistent agent code, no interactive loop. Existing tests must pass.
 
-- [ ] Rename `src/graph.py` → `src/worker_graph.py`, update all imports
-- [ ] Add `--mode` flag to `agent.py` CLI (default: `worker`, only `worker` supported initially)
-- [ ] Add `agent_mode` column to agents table (migration in `schema.sql`)
-- [ ] Add `draining` to agent status constraint
-- [ ] Worker registration includes `agent_mode: 'worker'` in metadata
-- [ ] `get_available_agents()` filters by `agent_mode = 'worker'`
-- [ ] Rename K8s Deployment from `srw-agent` to `srw-worker`, add labels
-- [ ] Worker pool manager background task (orchestrator): monitor queue depth, patch replicas
-- [ ] K8s RBAC: grant orchestrator ServiceAccount permission to patch Deployments
-- [ ] Scaling configuration env vars (`WORKER_POOL_MIN`, `WORKER_POOL_MAX`, etc.)
-- [ ] Graceful drain: `draining` status, dispatcher skips draining agents
-- [ ] Update docker-compose.dev.yaml agent service with `--mode worker`
-
-**Risk:** Low — additive changes, existing behavior preserved behind default `--mode worker`.
+- [x] ~~Rename `src/graph.py` → `src/worker_graph.py`, update all imports~~ **Skipped** — graph stays as
+  `src/graph.py`, no renames needed for additive approach
+- [x] Add `--mode` flag to `agent.py` CLI (default: `worker`, only `worker` supported initially) — `agent.py:188-196`
+- [x] Add `agent_mode` column to agents table (migration in `schema.sql`) — `orchestrator/database/schema.sql`
+- [x] ~~Add `draining` to agent status constraint~~ **Already existed** in schema.sql
+- [x] Worker registration includes `agent_mode: 'worker'` in metadata — `src/api/orchestrator_client.py:register()`
+  defaults to `agent_mode="worker"`
+- [x] `get_available_agents()` filters by `agent_mode = 'worker'` — `orchestrator/database/postgres.py:1701` adds
+  `AND COALESCE(agent_mode, 'worker') = 'worker'`
+- [ ] ~~Rename K8s Deployment from `srw-agent` to `srw-worker`, add labels~~ **Deferred** — not needed for additive
+  approach
+- [ ] Worker pool manager background task (orchestrator): monitor queue depth, patch replicas — **Deferred**
+- [ ] K8s RBAC: grant orchestrator ServiceAccount permission to patch Deployments — **Deferred**
+- [ ] Scaling configuration env vars (`WORKER_POOL_MIN`, `WORKER_POOL_MAX`, etc.) — **Deferred**
+- [ ] Graceful drain: `draining` status, dispatcher skips draining agents — **Deferred** (status already in constraint)
+- [ ] Update docker-compose.dev.yaml agent service with `--mode worker` — **Deferred** (default is already worker)
 
 ### Phase 2: Persistent Agent Provisioner and Thread Schema
 
 Infrastructure for persistent agent sessions — no interactive loop yet, just the provisioning and lifecycle.
 
-- [ ] Create `threads` table (migration in `schema.sql`)
-- [ ] `orchestrator/services/persistent_provisioner.py` — create/delete/status agent pods
-- [ ] Persistent agent pod K8s template (Pod spec, env vars, probes)
-- [ ] Persistent agent REST endpoints on orchestrator (`/api/persistent` CRUD)
-- [ ] Registration endpoint (agent boots → registers with `agent_mode: 'persistent'`, `thread_id`)
-- [ ] Thread status tracking (creating → active → archived lifecycle)
-- [ ] Stale agent detection (reuse `stale_agent_detector`, mark thread as `failed`)
-- [ ] Basic `src/api/persistent_app.py` skeleton: health endpoint, registration, no interactive loop yet
-- [ ] Cleanup on thread archival/deletion: delete pod, delete VM
-
-**Risk:** Medium — new K8s API integration, but follows established VMProvisioner pattern.
+- [x] Create `threads` table (migration in `schema.sql`) — columns: id, title, user_id, project_id, agent_id, status,
+  permission_mode, config_name, timestamps, metadata
+- [x] `orchestrator/services/persistent_provisioner.py` — skeletal provisioner following VMProvisioner pattern,
+  graceful no-op when K8s unavailable
+- [ ] Persistent agent pod K8s template (Pod spec, env vars, probes) — **Deferred** to production deployment
+- [x] Persistent agent REST endpoints on orchestrator (`/api/persistent/threads` CRUD) — `orchestrator/main.py`
+- [x] Registration endpoint (agent boots → registers with `agent_mode: 'persistent'`, `thread_id`) — extended
+  `AgentRegistration` model + `register_agent()` DB method
+- [x] Thread status tracking (created → active → idle → ended lifecycle) — thread CRUD in
+  `orchestrator/database/postgres.py`
+- [ ] Stale agent detection (reuse `stale_agent_detector`, mark thread as `failed`) — **Deferred**
+- [x] Basic `src/api/persistent_app.py` skeleton: health endpoint, registration, no interactive loop yet — **Exceeded
+  **: full app with WebSocket + interactive loop implemented
+- [ ] Cleanup on thread archival/deletion: delete pod, delete VM — **Deferred** (provisioner is skeletal)
 
 ### Phase 3: Persistent Agent Interactive Loop and WebSocket
 
 The core interactive agent implementation.
 
-- [ ] `src/persistent_graph.py` — the `while(tool_call)` loop (see Interactive Loop section above)
-- [ ] `PersistentSession` dataclass for session-scoped state
-- [ ] WebSocket endpoint on agent pod (`ws://agent:8001/ws`)
-- [ ] Item/Turn/Thread protocol (JSON over WebSocket, see Protocol section above)
-- [ ] LLM streaming (token-by-token via `astream()`)
-- [ ] Tool execution with permission mode enforcement
-- [ ] Transient injection: workspace.md, memories, knowledge (reuse existing helpers)
-- [ ] Context compaction (reuse `ContextManager`)
-- [ ] Steering: user injects message mid-turn
-- [ ] Interrupt: user cancels active turn
-- [ ] Session checkpoint/restore (for reconnection)
+- [x] `src/persistent_graph.py` — the `while(tool_call)` loop with `run_persistent_loop()` + `_execute_turn()` inner
+  loop
+- [x] `PersistentSession` dataclass for session-scoped state — `src/api/persistent_session.py` with workspace, tools,
+  LLM, context manager, shell manager, memory
+- [x] WebSocket endpoint on agent pod (`ws://agent:8001/ws/chat`) — `src/api/persistent_app.py`
+- [x] ~~Item/Turn/Thread protocol (JSON over WebSocket)~~ **Simplified**: JSON protocol with `method` field —
+  `turn.started`, `token`, `tool.started`, `tool.completed`, `permission.request`, `turn.completed`, `ready`, `error`,
+  `greeting`, `mode.changed`
+- [x] LLM streaming (token-by-token via `astream()`) — `src/persistent_graph.py:_execute_turn()`
+- [x] Tool execution with permission mode enforcement — three modes: supervised (ask for all writes/shell),
+  auto_accept (ask for shell only), autonomous (no approval)
+- [x] Transient injection: workspace.md — injected as `<workspace_memory>` SystemMessage before each LLM call
+- [x] Context compaction (reuse `ContextManager.ensure_within_limits()`)
+- [ ] Steering: user injects message mid-turn — **Partial**: interrupt flag exists but mid-turn message injection not
+  yet implemented
+- [x] Interrupt: user cancels active turn — `check_interrupt()` callback checked before each LLM call
+- [ ] Session checkpoint/restore (for reconnection) — **Deferred**: messages are in-memory only, no persistence across
+  restarts
 
-**Risk:** High — this is the most complex new code.
+**Implementation notes:**
+
+- The loop uses direct `tool.ainvoke()` instead of LangGraph's `ToolNode` — simpler for the non-graph architecture
+- Phase-specific tools (`next_phase_todos`, `todo_complete`, `todo_list`, `todo_rewind`, `mark_complete`,
+  `job_complete`) are excluded from the tool set
+- `PersistentSession.setup()` composes around `UniversalAgent` without modifying it — pulls initialized LLMs, DB
+  connections, and config
+- Config extended with `InteractiveConfig` dataclass (`src/core/loader.py`) parsed from `interactive:` section in YAML
 
 ### Phase 4: Orchestrator WebSocket Proxy
 
 Connect the cockpit to persistent agent pods through the orchestrator.
 
-- [ ] WebSocket proxy endpoint: `GET /ws/persistent/{thread_id}` → upgrade → forward to agent pod
-- [ ] Proxy implementation: bidirectional frame forwarding (transparent)
-- [ ] Reconnection handling: agent pod alive check, state recovery
-- [ ] Thread status updates from WebSocket events (active ↔ idle ↔ disconnected)
-- [ ] Idle timeout detection: no activity → mark thread `idle` → configurable cleanup
-- [ ] CORS/auth for WebSocket upgrade (reuse existing auth middleware)
-- [ ] Cloudflare Tunnel: verify WebSocket frames pass through (SSE buffering already disabled)
-
-**Risk:** Medium — WebSocket proxying is well-understood, but reconnection edge cases need careful handling.
+- [x] WebSocket proxy endpoint: `GET /ws/persistent/{thread_id}` → upgrade → forward to agent pod —
+  `orchestrator/main.py`
+- [x] Proxy implementation: bidirectional frame forwarding (transparent) — follows existing IDE proxy pattern (
+  `/api/ide/{job_id}/proxy/`)
+- [ ] Reconnection handling: agent pod alive check, state recovery — **Deferred**
+- [ ] Thread status updates from WebSocket events (active ↔ idle ↔ disconnected) — **Deferred**
+- [ ] Idle timeout detection: no activity → mark thread `idle` → configurable cleanup — **Deferred** (config key
+  exists: `interactive.idle_timeout_minutes`)
+- [ ] CORS/auth for WebSocket upgrade (reuse existing auth middleware) — **Deferred**
+- [ ] Cloudflare Tunnel: verify WebSocket frames pass through (SSE buffering already disabled) — **Deferred** to
+  deployment
 
 ### Phase 5: MCP Integration and Session Lifecycle
 
 Give persistent agents the ability to create and manage worker jobs.
 
-- [ ] MCP tool access: load orchestrator MCP tools into agent's tool set via MCP client (→ srw-mcp:8055)
-- [ ] Agent can call `create_job`, `get_job`, `pause_job`, `resume_job_with_feedback`, etc.
-- [ ] Job progress monitoring: agent periodically checks job status, streams updates to user
-- [ ] Session forking: `POST /api/persistent/{thread_id}/fork` → new thread, checkpoint copy
-- [ ] Session archival: git push, memory extraction, thread status update, pod teardown
-- [ ] Disconnect behavior: configurable `pause` vs `continue` per session
-- [ ] Token usage tracking per thread (`total_tokens_used`, `total_requests`)
-- [ ] Thread history in cockpit: list archived sessions, view conversation logs
+- [x] ~~MCP tool access: load orchestrator MCP tools into agent's tool set via MCP client (→ srw-mcp:8055)~~ *
+  *Implemented differently**: Created a new `orchestrator` tool category (`src/tools/orchestrator/`) with 8 LangChain
+  tools that call the orchestrator REST API directly via httpx. This avoids MCP client protocol overhead and extra
+  dependencies while providing the same functionality. Tools: `create_worker_job`, `list_worker_jobs`,
+  `get_worker_job`, `get_job_workspace_file`, `approve_worker_job`, `resume_worker_job`, `cancel_worker_job`,
+  `pause_worker_job`.
+- [x] Agent can call `create_job`, `get_job`, `pause_job`, `resume_job_with_feedback`, etc. — all implemented as
+  LangChain tools auto-loaded by `PersistentSession`
+- [ ] Job progress monitoring: agent periodically checks job status, streams updates to user — **Deferred** (agent can
+  manually call `get_worker_job` but no auto-polling)
+- [ ] Session forking: `POST /api/persistent/{thread_id}/fork` → new thread, checkpoint copy — **Deferred**
+- [ ] Session archival: git push, memory extraction, thread status update, pod teardown — **Deferred**
+- [ ] Disconnect behavior: configurable `pause` vs `continue` per session — **Deferred**
+- [ ] Token usage tracking per thread (`total_tokens_used`, `total_requests`) — **Deferred**
+- [ ] Thread history in cockpit: list archived sessions, view conversation logs — **Deferred** (Phase 6)
 
-**Risk:** Medium — MCP tool loading is established; session lifecycle has many edge cases.
+**Implementation notes:**
+
+- The `orchestrator` tool category is registered in `src/tools/registry.py` alongside existing categories.
+- `PersistentSession._setup_tools()` always injects orchestrator tools regardless of config — they're fundamental to
+  the persistent agent's delegation capability.
+- Tools use `ORCHESTRATOR_URL` env var (same as the worker's `orchestrator_client.py`).
+- The `orchestrator` list in `config/defaults.yaml` is empty by default (workers don't need them). The persistent
+  session injects them programmatically.
 
 ### Phase 6: Cockpit UI
 
 Frontend for persistent agent sessions.
 
-- [ ] Interactive chat component (WebSocket client)
-- [ ] WebSocket connection management (connect, reconnect, disconnect)
-- [ ] Streaming markdown rendering for agent messages
-- [ ] Tool call display with expandable results
-- [ ] Approval request UI (approve / deny / allow-for-session)
-- [ ] File change diffs (inline)
-- [ ] Mode indicator + switcher (supervised / auto / autonomous)
-- [ ] Slash commands (`/auto`, `/supervised`, `/autonomous`, `/done`)
-- [ ] Session list with resume / fork / archive actions
-- [ ] Status indicator (green = working, orange = waiting, gray = idle)
-- [ ] Worker job monitoring inline (when agent creates a job, show progress)
+- [x] Interactive chat component (WebSocket client) —
+  `cockpit/src/app/shared/components/persistent-chat/persistent-chat.component.ts`
+- [x] WebSocket connection management (connect, reconnect, disconnect) —
+  `cockpit/src/app/core/services/persistent-chat.service.ts` with signals for connection state, messages, streaming
+  text, tool calls, permission requests
+- [x] Streaming markdown rendering for agent messages — ngx-markdown with live `streamingText()` signal, thinking dots
+  animation
+- [x] Tool call display with expandable results — inline cards with spinner while running, collapsible `<details>` for
+  results
+- [x] Approval request UI (approve / deny / ~~allow-for-session~~) — permission request banner with approve/deny
+  buttons, auto-dismissed on response
+- [ ] File change diffs (inline) — **Deferred**
+- [x] Mode indicator + switcher (supervised / auto / autonomous) — dropdown in header, sends `mode.set` over WebSocket
+- [ ] Slash commands (`/auto`, `/supervised`, `/autonomous`, `/done`) — **Deferred** (mode switcher covers the same
+  functionality)
+- [ ] Session list with resume / fork / archive actions — **Deferred** (requires thread CRUD UI + session persistence)
+- [x] Status indicator (green = connected, yellow = connecting, gray = disconnected, red = error) — dot + label in
+  header
+- [ ] Worker job monitoring inline (when agent creates a job, show progress) — **Deferred**
 
-**Risk:** High — substantial frontend work, but can be built incrementally.
+**Implementation notes:**
+
+- Route: `/chat` with "Chat" sidebar entry (Material Symbols `chat` icon)
+- Page wrapper: `cockpit/src/app/simple/pages/chat/chat-page.component.ts`
+- Connection dialog allows direct WebSocket URL for local dev (`ws://localhost:8001/ws/chat`)
+- Service uses native `WebSocket` API (not HttpClient or SSE). All state as Angular signals — no RxJS for chat state.
+- Component is standalone with Catppuccin dark theme, consistent with existing cockpit styling.
+- Interrupt button shown during agent turns, sends `interrupt` method over WebSocket.
+- Angular build clean, 101 existing cockpit tests pass.
 
 ## Open Questions
 

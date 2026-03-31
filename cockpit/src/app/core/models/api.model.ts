@@ -180,6 +180,19 @@ export interface UserSettings {
   default_auxiliary_model?: string | null;
   embedding_provider?: string | null;
   communication?: CommunicationSettings | null;
+    persistent_agent?: PersistentAgentSettings | null;
+}
+
+/**
+ * User settings for persistent agent sessions.
+ */
+export interface PersistentAgentSettings {
+    model?: string | null;
+    permission_mode?: string | null;
+    config_name?: string | null;
+    greeting?: string | null;
+    idle_timeout_minutes?: number | null;
+    command_allowlist?: string[] | null;
 }
 
 /**

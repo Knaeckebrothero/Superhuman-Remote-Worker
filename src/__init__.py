@@ -42,6 +42,11 @@ from .graph import (
     get_managers_from_workspace,
 )
 
+# Persistent agent exports
+from .persistent_graph import run_persistent_loop, PersistentLoopCallbacks
+from .api.persistent_app import create_persistent_app
+from .api.persistent_session import PersistentSession
+
 # Loader exports
 from .core.loader import (
     load_summarization_prompt,
@@ -81,4 +86,9 @@ __all__ = [
     "load_auxiliary_prompt",
     "get_all_tool_names",
     "AgentConfig",
+    # Persistent agent
+    "run_persistent_loop",
+    "PersistentLoopCallbacks",
+    "create_persistent_app",
+    "PersistentSession",
 ]

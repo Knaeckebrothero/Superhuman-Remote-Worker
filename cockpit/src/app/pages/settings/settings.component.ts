@@ -171,6 +171,86 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
           </div>
         </section>
 
+        <!-- Persistent Agent Section -->
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="section-title">Persistent Agent</h2>
+          <p class="section-desc">
+            Default settings for interactive persistent agent sessions. Can be overridden per-session.
+          </p>
+
+          <div class="create-form" style="border-top: none; padding-top: 0;">
+            <div class="form-row">
+              <label class="field-label">Model</label>
+              <input
+                type="text"
+                class="form-input"
+                placeholder="e.g. claude-sonnet-4-6"
+                [(ngModel)]="paModel"
+              />
+            </div>
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Permission Mode</label>
+                <select class="form-input" [(ngModel)]="paPermissionMode">
+                  <option value="">Not set</option>
+                  <option value="supervised">Supervised</option>
+                  <option value="auto_accept">Auto-accept</option>
+                  <option value="autonomous">Autonomous</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Config</label>
+                <select class="form-input" [(ngModel)]="paConfigName">
+                  <option value="">Default (interactive)</option>
+                  <option value="interactive">Interactive</option>
+                  <option value="developer">Developer</option>
+                  <option value="scholar">Scholar</option>
+                  <option value="defaults">Framework Defaults</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-row">
+              <label class="field-label">Greeting</label>
+              <input
+                type="text"
+                class="form-input"
+                placeholder="Hello! I'm ready to help."
+                [(ngModel)]="paGreeting"
+              />
+            </div>
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Idle Timeout (minutes)</label>
+                <input
+                  type="number"
+                  class="form-input"
+                  placeholder="120"
+                  [(ngModel)]="paIdleTimeout"
+                />
+              </div>
+              <div>
+                <label class="field-label">Command Allowlist</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  placeholder="pytest*, npm test, git status"
+                  [(ngModel)]="paCommandAllowlist"
+                />
+              </div>
+            </div>
+            <button
+              class="create-btn"
+              (click)="savePersistentAgent()"
+              [disabled]="savingPA()"
+            >
+              {{ savingPA() ? 'Saving...' : 'Save Persistent Agent Settings' }}
+            </button>
+            @if (paSaved()) {
+              <span class="save-feedback">Saved</span>
+            }
+          </div>
+        </section>
+
         <!-- Communication Preferences Section -->
         <section class="settings-section" style="margin-top: 24px;">
           <h2 class="section-title">Communication</h2>
@@ -837,6 +917,16 @@ export class SettingsComponent implements OnInit {
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
+  // Persistent Agent form state
+  paModel = '';
+  paPermissionMode = '';
+  paConfigName = '';
+  paGreeting = '';
+  paIdleTimeout: number | null = null;
+  paCommandAllowlist = '';
+  readonly savingPA = signal(false);
+  readonly paSaved = signal(false);
+
   // Communication form state
   commDelivery = 'next_strategic_phase';
   commChannelEmail = true;
@@ -867,6 +957,17 @@ export class SettingsComponent implements OnInit {
         this.prefAutonomy = prefs.default_autonomy || '';
         this.prefReasoning = prefs.default_reasoning_level || '';
         this.prefEmbeddingProvider = prefs.embedding_provider || '';
+
+        // Sync persistent agent preferences
+        const pa = prefs.persistent_agent;
+        if (pa) {
+          this.paModel = pa.model || '';
+          this.paPermissionMode = pa.permission_mode || '';
+          this.paConfigName = pa.config_name || '';
+          this.paGreeting = pa.greeting || '';
+          this.paIdleTimeout = pa.idle_timeout_minutes || null;
+          this.paCommandAllowlist = (pa.command_allowlist || []).join(', ');
+        }
 
         // Sync communication preferences
         const comm = prefs.communication;
@@ -1008,6 +1109,37 @@ export class SettingsComponent implements OnInit {
         setTimeout(() => this.prefsSaved.set(false), 2000);
       },
       error: () => this.savingPrefs.set(false),
+    });
+  }
+
+  // ── Persistent Agent Settings ──────────────────────────────────
+
+  savePersistentAgent(): void {
+    this.savingPA.set(true);
+    this.paSaved.set(false);
+
+    const allowlist = this.paCommandAllowlist.trim()
+        ? this.paCommandAllowlist.split(',').map(s => s.trim()).filter(Boolean)
+        : null;
+
+    const settings: Record<string, unknown> = {
+      persistent_agent: {
+        model: this.paModel.trim() || null,
+        permission_mode: this.paPermissionMode || null,
+        config_name: this.paConfigName || null,
+        greeting: this.paGreeting.trim() || null,
+        idle_timeout_minutes: this.paIdleTimeout || null,
+        command_allowlist: allowlist,
+      },
+    };
+
+    this.settingsService.updatePreferences(settings).subscribe({
+      next: () => {
+        this.savingPA.set(false);
+        this.paSaved.set(true);
+        setTimeout(() => this.paSaved.set(false), 2000);
+      },
+      error: () => this.savingPA.set(false),
     });
   }
 

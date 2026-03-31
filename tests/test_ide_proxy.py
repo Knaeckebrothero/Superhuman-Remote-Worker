@@ -149,6 +149,7 @@ class TestResolvePodIp:
     async def test_job_not_found(self, service):
         """Returns None when job doesn't exist."""
         service._db.get_job = AsyncMock(return_value=None)
+        service._db.get_thread = AsyncMock(return_value=None)
 
         result = await service.resolve_pod_ip("nonexistent")
         assert result is None

@@ -27,11 +27,13 @@ class IdeProxyService:
         self._db = db
         logger.info("IDE proxy service initialized")
 
-    async def resolve_pod_ip(self, job_id: str) -> Optional[str]:
-        """Resolve job_id to the pod IP running code-server.
+    async def resolve_pod_ip(self, entity_id: str) -> Optional[str]:
+        """Resolve a job or thread ID to the pod IP running code-server.
 
-        Uses a per-job TTL cache to avoid per-request DB queries.
-        Checks (in order):
+        Uses a per-entity TTL cache to avoid per-request DB queries.
+        Checks jobs first, then falls back to threads (persistent agents).
+
+        For each entity, checks (in order):
           1. ide_session.pod_ip  (restored IDE sessions)
           2. workspace_container.pod_ip  (live workspace containers)
           3. vm.ssh_host / vm.pod_ip  (live VMs)
@@ -40,56 +42,71 @@ class IdeProxyService:
             Pod IP string, or None if not resolvable.
         """
         # Check cache
-        cached = self._pod_ip_cache.get(job_id)
+        cached = self._pod_ip_cache.get(entity_id)
         if cached:
             pod_ip, expires_at = cached
             if time.monotonic() < expires_at:
                 return pod_ip
-            del self._pod_ip_cache[job_id]
+            del self._pod_ip_cache[entity_id]
 
         # DB lookup
         if not self._db:
             return None
 
-        job = await self._db.get_job(job_id)
-        if not job:
+        # Try jobs first, then threads
+        ctx = await self._load_context(entity_id)
+        if ctx is None:
             return None
 
-        ctx = job.get("context") or {}
+        pod_ip = self._extract_pod_ip(ctx)
+
+        if pod_ip:
+            self._pod_ip_cache[entity_id] = (pod_ip, time.monotonic() + self._cache_ttl)
+
+        return pod_ip
+
+    async def _load_context(self, entity_id: str) -> Optional[dict]:
+        """Load context dict from jobs table, falling back to threads."""
+        job = await self._db.get_job(entity_id)
+        if job:
+            ctx = job.get("context") or {}
+        else:
+            thread = await self._db.get_thread(entity_id)
+            if not thread:
+                return None
+            ctx = thread.get("metadata") or {}
+
         if isinstance(ctx, str):
             try:
                 ctx = json.loads(ctx)
             except (json.JSONDecodeError, TypeError):
                 return None
+        return ctx
 
-        pod_ip = None
-
+    @staticmethod
+    def _extract_pod_ip(ctx: dict) -> Optional[str]:
+        """Extract pod IP from a context/metadata dict."""
         # 1. Restored IDE session
         ide_ctx = ctx.get("ide_session", {})
         if ide_ctx.get("status") in ("active", "idle") and ide_ctx.get("pod_ip"):
-            pod_ip = ide_ctx["pod_ip"]
+            return ide_ctx["pod_ip"]
 
         # 2. Live workspace container
-        if not pod_ip:
-            ws_ctx = ctx.get("workspace_container", {})
-            if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
-                pod_ip = ws_ctx["pod_ip"]
+        ws_ctx = ctx.get("workspace_container", {})
+        if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
+            return ws_ctx["pod_ip"]
 
         # 3. Live VM — prefer pod_ip (cluster-internal, reachable from orchestrator)
         #    over ssh_host (Tailscale IP, only reachable from mesh nodes)
-        if not pod_ip:
-            vm_ctx = ctx.get("vm", {})
-            if vm_ctx.get("status") == "ready":
-                pod_ip = vm_ctx.get("pod_ip") or vm_ctx.get("ssh_host")
+        vm_ctx = ctx.get("vm", {})
+        if vm_ctx.get("status") == "ready":
+            return vm_ctx.get("pod_ip") or vm_ctx.get("ssh_host")
 
-        if pod_ip:
-            self._pod_ip_cache[job_id] = (pod_ip, time.monotonic() + self._cache_ttl)
+        return None
 
-        return pod_ip
-
-    def evict(self, job_id: str) -> None:
-        """Remove a job from the cache (call on upstream connection failure)."""
-        self._pod_ip_cache.pop(job_id, None)
+    def evict(self, entity_id: str) -> None:
+        """Remove a job or thread from the cache (call on upstream connection failure)."""
+        self._pod_ip_cache.pop(entity_id, None)
 
 
 # Module-level singleton

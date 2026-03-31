@@ -229,6 +229,7 @@ class RecallStore:
         config=None,
         agent_id: Optional[str] = None,
         project_id: Optional[uuid.UUID] = None,
+            project_ids: Optional[List[uuid.UUID]] = None,
         archiver=None,
     ):
         """Initialize RecallStore.
@@ -240,6 +241,7 @@ class RecallStore:
             config: MemoryConfig dataclass (optional, uses defaults if None)
             agent_id: Optional agent identifier for cross-job memory (Phase 5)
             project_id: Optional project UUID for project-scoped memory sharing
+            project_ids: Optional list of project UUIDs for multi-project sessions
             archiver: Optional LLMArchiver for audit logging
         """
         self.db = db
@@ -247,6 +249,7 @@ class RecallStore:
         self.job_id = job_id
         self.agent_id = agent_id
         self.project_id = project_id
+        self.project_ids = project_ids or ([project_id] if project_id else [])
         self._archiver = archiver
         self.project_scoped = (
             getattr(config, "project_scoped", False) if config else False
@@ -281,9 +284,23 @@ class RecallStore:
     @property
     def _scope_filter(self):
         """Return (column, value) for scoping queries by project or job."""
+        if self.project_scoped and self.project_ids:
+            if len(self.project_ids) == 1:
+                return "project_id", self.project_ids[0]
+            return "project_id", self.project_ids
         if self.project_scoped and self.project_id:
             return "project_id", self.project_id
         return "job_id", self.job_id
+
+    def _scope_where(self, param_index: int):
+        """Return (WHERE clause fragment, param value) for scoping.
+
+        Handles both single-value (= $N) and multi-value (= ANY($N)) scoping.
+        """
+        scope_col, scope_val = self._scope_filter
+        if isinstance(scope_val, list):
+            return f"{scope_col} = ANY(${param_index})", scope_val
+        return f"{scope_col} = ${param_index}", scope_val
 
     # =========================================================================
     # Storage
@@ -514,12 +531,12 @@ class RecallStore:
         """
         threshold = threshold if threshold is not None else self.dedup_threshold
 
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(2)
         row = await self.db.fetchrow(
             f"""
             SELECT *, 1 - (embedding <=> $1) AS similarity
             FROM memories
-            WHERE {scope_col} = $2
+            WHERE {scope_clause}
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> $1) > $3
             ORDER BY similarity DESC
@@ -554,12 +571,12 @@ class RecallStore:
         """
         limit = limit or self.dense_results
 
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         rows = await self.db.fetch(
             f"""
             SELECT *
             FROM memories
-            WHERE {scope_col} = $1 AND embedding IS NOT NULL
+            WHERE {scope_clause} AND embedding IS NOT NULL
             ORDER BY embedding <=> $2
             LIMIT $3
             """,
@@ -599,13 +616,13 @@ class RecallStore:
         """
         limit = limit or self.sparse_results
 
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         rows = await self.db.fetch(
             f"""
             SELECT *,
                    ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $2)) AS rank
             FROM memories
-            WHERE {scope_col} = $1
+            WHERE {scope_clause}
               AND sparse_keywords @@ websearch_to_tsquery('english', $2)
             ORDER BY rank DESC
             LIMIT $3
@@ -631,12 +648,12 @@ class RecallStore:
         """
         limit = limit or self.recent_results
 
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         rows = await self.db.fetch(
             f"""
             SELECT *
             FROM memories
-            WHERE {scope_col} = $1
+            WHERE {scope_clause}
             ORDER BY created_at DESC
             LIMIT $2
             """,
@@ -659,12 +676,12 @@ class RecallStore:
         Returns:
             List of TTL-active MemoryRecord objects ordered by importance
         """
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         rows = await self.db.fetch(
             f"""
             SELECT *
             FROM memories
-            WHERE {scope_col} = $1 AND remaining_turns > 0
+            WHERE {scope_clause} AND remaining_turns > 0
             ORDER BY importance DESC
             """,
             scope_val,
@@ -679,13 +696,13 @@ class RecallStore:
         Returns:
             Number of memories whose TTL was decremented
         """
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         result = await self.db.fetchval(
             f"""
             WITH updated AS (
                 UPDATE memories
                 SET remaining_turns = remaining_turns - 1
-                WHERE {scope_col} = $1 AND remaining_turns > 0
+                WHERE {scope_clause} AND remaining_turns > 0
                 RETURNING id
             )
             SELECT COUNT(*) FROM updated
@@ -774,7 +791,13 @@ class RecallStore:
             else self.retrieval_importance_floor
         )
 
-        if self.project_scoped and self.project_id:
+        if self.project_scoped and self.project_ids and len(self.project_ids) > 1:
+            func_name = "memory_multi_project_hybrid_search"
+            scope_val = self.project_ids
+        elif self.project_scoped and self.project_ids:
+            func_name = "memory_project_hybrid_search"
+            scope_val = self.project_ids[0]
+        elif self.project_scoped and self.project_id:
             func_name = "memory_project_hybrid_search"
             scope_val = self.project_id
         else:
@@ -988,7 +1011,7 @@ class RecallStore:
         Returns:
             Dict with counts by type, source, total tokens, etc.
         """
-        scope_col, scope_val = self._scope_filter
+        scope_clause, scope_val = self._scope_where(1)
         row = await self.db.fetchrow(
             f"""
             SELECT
@@ -1008,7 +1031,7 @@ class RecallStore:
                 AVG(importance) AS avg_importance,
                 COUNT(*) FILTER (WHERE remaining_turns > 0) AS ttl_active
             FROM memories
-            WHERE {scope_col} = $1
+            WHERE {scope_clause}
             """,
             scope_val,
         )

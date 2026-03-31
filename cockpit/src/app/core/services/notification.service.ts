@@ -4,6 +4,20 @@ import { catchError, of } from 'rxjs';
 import { AppNotification } from '../models/api.model';
 import { environment } from '../environment';
 
+/** A session event from a persistent agent (permission request, VM upgrade, etc.). */
+export interface SessionEvent {
+    event_id: string;
+    type: string;
+    thread_id: string;
+    title: string;
+    config_name?: string;
+    tool?: string;
+    args?: Record<string, unknown>;
+    reason?: string;
+    command?: string;
+    created_at: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class NotificationService {
   private readonly http = inject(HttpClient);
@@ -21,6 +35,9 @@ export class NotificationService {
 
   /** Whether notifications are loading. */
   readonly isLoading = signal(false);
+
+    /** Persistent session events (permission requests, VM upgrades, waiting). */
+    readonly sessionEvents = signal<SessionEvent[]>([]);
 
   /** Derived: only unread notifications. */
   readonly unreadNotifications = computed(() =>
@@ -97,6 +114,19 @@ export class NotificationService {
           } else if (data.type === 'reply_delivered') {
             // Optionally refresh to show the updated thread
             this.loadNotifications();
+          } else if (
+              data.type === 'session.permission_request' ||
+              data.type === 'session.vm_upgrade' ||
+              data.type === 'session.waiting'
+          ) {
+              this.sessionEvents.update((events) => [
+                  {...data, created_at: data.created_at || new Date().toISOString()} as SessionEvent,
+                  ...events,
+              ]);
+          } else if (data.type === 'session.resolved') {
+              this.sessionEvents.update((events) =>
+                  events.filter((e) => e.thread_id !== data.thread_id),
+              );
           }
         } catch {
           // Ignore parse errors (keepalive, malformed events)

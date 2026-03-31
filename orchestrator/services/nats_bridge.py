@@ -64,6 +64,8 @@ class NatsBridge:
         self._db: Optional[Any] = None
         self._on_vm_ready: Optional[Callable] = None
         self._available: bool = False
+        # Track which VM IDs correspond to threads (vs jobs) for context routing
+        self._thread_vm_ids: set[str] = set()
 
         if not self._url:
             logger.info("NATS_URL not configured. VM lifecycle features disabled.")
@@ -161,22 +163,29 @@ class NatsBridge:
         cpu_cores: int = 2,
         memory: str = "4Gi",
         description: str = "",
+            entity_type: str = "job",
     ) -> bool:
         """Publish a VM creation request.
 
         Args:
-            job_id: Job UUID to create a VM for.
+            job_id: Job or thread UUID to create a VM for.
             agent_config: Agent config name to run in the VM.
             vm_image: Container disk image (None = controller default).
             cpu_cores: Number of CPU cores.
             memory: Memory allocation (e.g. "4Gi").
             description: Job description passed to the agent.
+            entity_type: "job" (default) or "thread" — controls which DB
+                table receives context updates when the daemon registers.
 
         Returns:
             True if published, False if NATS unavailable.
         """
         if not self._available:
             return False
+
+        # Track thread VMs so NATS callbacks route context to threads table
+        if entity_type == "thread":
+            self._thread_vm_ids.add(job_id)
 
         payload = {
             "job_id": job_id,
@@ -194,14 +203,18 @@ class NatsBridge:
                 "vm.lifecycle.create",
                 json.dumps(payload).encode(),
             )
-            logger.info("Published vm.lifecycle.create for job %s", job_id)
+            logger.info("Published vm.lifecycle.create for %s %s", entity_type, job_id)
 
-            # Update job context to reflect provisioning state
-            await self._set_vm_context(job_id, {"status": "provisioning"})
+            # Update context to reflect provisioning state
+            if entity_type == "thread":
+                await self._set_thread_vm_context(job_id, {"status": "provisioning"})
+            else:
+                await self._set_vm_context(job_id, {"status": "provisioning"})
             return True
         except Exception as e:
             logger.error(
-                "Failed to publish vm.lifecycle.create for job %s: %s", job_id, e
+                "Failed to publish vm.lifecycle.create for %s %s: %s",
+                entity_type, job_id, e,
             )
             return False
 
@@ -307,9 +320,15 @@ class NatsBridge:
                 updates["ssh_nodeport"] = data["ssh_nodeport"]
 
             logger.info(
-                "VM lifecycle status for job %s: %s", job_id, data.get("status")
+                "VM lifecycle status for %s %s: %s",
+                "thread" if job_id in self._thread_vm_ids else "job",
+                job_id,
+                data.get("status"),
             )
-            await self._set_vm_context(job_id, updates)
+            if job_id in self._thread_vm_ids:
+                await self._set_thread_vm_context(job_id, updates)
+            else:
+                await self._set_vm_context(job_id, updates)
         except Exception:
             logger.exception("Error handling vm.lifecycle.status")
 
@@ -332,23 +351,26 @@ class NatsBridge:
             ssh_host = data.get("ip") or data.get("hostname")
             ssh_port = 22
 
+            is_thread = job_id in self._thread_vm_ids
             logger.info(
-                "Daemon registered for job %s (ssh=%s:%d)",
+                "Daemon registered for %s %s (ssh=%s:%d)",
+                "thread" if is_thread else "job",
                 job_id,
                 ssh_host,
                 ssh_port,
             )
-            await self._set_vm_context(
-                job_id,
-                {
-                    "status": "ready",
-                    "ssh_host": ssh_host,
-                    "ssh_port": ssh_port,
-                    "hostname": data.get("hostname"),
-                    "daemon_pid": data.get("pid"),
-                    "recovering": False,  # Clear recovery guard
-                },
-            )
+            vm_updates = {
+                "status": "ready",
+                "ssh_host": ssh_host,
+                "ssh_port": ssh_port,
+                "hostname": data.get("hostname"),
+                "daemon_pid": data.get("pid"),
+                "recovering": False,  # Clear recovery guard
+            }
+            if is_thread:
+                await self._set_thread_vm_context(job_id, vm_updates)
+            else:
+                await self._set_vm_context(job_id, vm_updates)
 
             # Trigger callback (e.g. dispatch)
             if self._on_vm_ready:
@@ -372,17 +394,20 @@ class NatsBridge:
                 return
 
             logger.debug(
-                "Heartbeat for job %s: agent_running=%s",
+                "Heartbeat for %s %s: agent_running=%s",
+                "thread" if job_id in self._thread_vm_ids else "job",
                 job_id,
                 data.get("agent_running"),
             )
             now = datetime.now(timezone.utc).isoformat()
-            await self._set_vm_context(
-                job_id,
-                {
-                    "last_heartbeat": now,
-                },
-            )
+            if job_id in self._thread_vm_ids:
+                await self._set_thread_vm_context(
+                    job_id, {"last_heartbeat": now}
+                )
+            else:
+                await self._set_vm_context(
+                    job_id, {"last_heartbeat": now}
+                )
 
             # Track code-server activity for IDE session idle detection.
             # When the daemon reports active code-server connections, update
@@ -429,6 +454,18 @@ class NatsBridge:
     # =========================================================================
     # Helpers
     # =========================================================================
+
+    async def _set_thread_vm_context(self, thread_id: str, updates: dict) -> None:
+        """Atomically merge updates into a thread's metadata.vm key."""
+        if not self._db:
+            return
+
+        try:
+            await self._db.merge_thread_vm_context(thread_id, updates)
+        except Exception:
+            logger.exception(
+                "Failed to update thread VM context for %s", thread_id
+            )
 
     async def _set_vm_context(self, job_id: str, updates: dict) -> None:
         """Atomically merge updates into the job's context.vm key."""
