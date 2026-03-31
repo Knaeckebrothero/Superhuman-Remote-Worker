@@ -495,7 +495,9 @@ class TestGetKnowledgeGraph:
         result = _get_knowledge_graph()
         assert result is None
 
-    @patch("src.services.knowledge_graph.KnowledgeGraphDB", side_effect=Exception("fail"))
+    @patch(
+        "src.services.knowledge_graph.KnowledgeGraphDB", side_effect=Exception("fail")
+    )
     def test_returns_none_on_exception(self, MockKGDB):
         result = _get_knowledge_graph()
         assert result is None
@@ -650,7 +652,13 @@ class TestGetKnowledgeSummary:
         db = _make_postgres_db()
         conn = _make_conn()
         recent = [
-            {"note_id": "n1", "title": "T1", "note_type": "learning", "status": "active", "modified_at": "2026-01-01"},
+            {
+                "note_id": "n1",
+                "title": "T1",
+                "note_type": "learning",
+                "status": "active",
+                "modified_at": "2026-01-01",
+            },
         ]
         conn.fetch.side_effect = [[], [], recent]
         result = await get_knowledge_summary("proj-1", db, conn)
@@ -689,10 +697,21 @@ class TestListKnowledgeNotes:
         conn = _make_conn()
         conn.fetchrow.return_value = {"cnt": 2}
         conn.fetch.return_value = [
-            {"id": 1, "note_id": "n1", "title": "T1", "note_type": "learning",
-             "status": "active", "confidence": None, "tags": [], "keywords": None,
-             "job_id": None, "phase": None, "content_preview": "text",
-             "created_at": None, "modified_at": None},
+            {
+                "id": 1,
+                "note_id": "n1",
+                "title": "T1",
+                "note_type": "learning",
+                "status": "active",
+                "confidence": None,
+                "tags": [],
+                "keywords": None,
+                "job_id": None,
+                "phase": None,
+                "content_preview": "text",
+                "created_at": None,
+                "modified_at": None,
+            },
         ]
         result = await list_knowledge_notes("proj-1", db, conn)
         assert "notes" in result
@@ -796,8 +815,10 @@ class TestGetKnowledgeNote:
     async def test_removes_embedding_field(self):
         conn = _make_conn()
         conn.fetchrow.return_value = {
-            "note_id": "n1", "content": "text",
-            "embedding": [0.1, 0.2], "search_doc": "tsvec",
+            "note_id": "n1",
+            "content": "text",
+            "embedding": [0.1, 0.2],
+            "search_doc": "tsvec",
         }
         result = await get_knowledge_note("proj-1", "n1", conn)
         assert "embedding" not in result
@@ -807,7 +828,8 @@ class TestGetKnowledgeNote:
     async def test_removes_search_doc_field(self):
         conn = _make_conn()
         conn.fetchrow.return_value = {
-            "note_id": "n1", "content": "text",
+            "note_id": "n1",
+            "content": "text",
             "search_doc": "tsvec",
         }
         result = await get_knowledge_note("proj-1", "n1", conn)
@@ -1038,7 +1060,9 @@ class TestUpdateKnowledgeNote:
         mock_kg = MagicMock()
         mock_kg.update_note.side_effect = Exception("Neo4j down")
         body = KnowledgeNoteUpdate(status="active")
-        result = await update_knowledge_note("proj-1", "n1", body, conn, kg_func=lambda: mock_kg)
+        result = await update_knowledge_note(
+            "proj-1", "n1", body, conn, kg_func=lambda: mock_kg
+        )
         assert result == {"status": "updated"}
 
     @pytest.mark.asyncio
@@ -1103,7 +1127,9 @@ class TestDeleteKnowledgeNote:
         mock_kg = MagicMock()
         mock_kg._db = MagicMock()
         mock_kg._db.execute_write.side_effect = Exception("Neo4j down")
-        result = await delete_knowledge_note("proj-1", "n1", conn, kg_func=lambda: mock_kg)
+        result = await delete_knowledge_note(
+            "proj-1", "n1", conn, kg_func=lambda: mock_kg
+        )
         assert result == {"status": "deleted"}
 
     @pytest.mark.asyncio

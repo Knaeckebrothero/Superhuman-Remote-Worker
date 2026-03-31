@@ -214,7 +214,9 @@ class NatsBridge:
         except Exception as e:
             logger.error(
                 "Failed to publish vm.lifecycle.create for %s %s: %s",
-                entity_type, job_id, e,
+                entity_type,
+                job_id,
+                e,
             )
             return False
 
@@ -401,13 +403,9 @@ class NatsBridge:
             )
             now = datetime.now(timezone.utc).isoformat()
             if job_id in self._thread_vm_ids:
-                await self._set_thread_vm_context(
-                    job_id, {"last_heartbeat": now}
-                )
+                await self._set_thread_vm_context(job_id, {"last_heartbeat": now})
             else:
-                await self._set_vm_context(
-                    job_id, {"last_heartbeat": now}
-                )
+                await self._set_vm_context(job_id, {"last_heartbeat": now})
 
             # Track code-server activity for IDE session idle detection.
             # When the daemon reports active code-server connections, update
@@ -463,9 +461,7 @@ class NatsBridge:
         try:
             await self._db.merge_thread_vm_context(thread_id, updates)
         except Exception:
-            logger.exception(
-                "Failed to update thread VM context for %s", thread_id
-            )
+            logger.exception("Failed to update thread VM context for %s", thread_id)
 
     async def _set_vm_context(self, job_id: str, updates: dict) -> None:
         """Atomically merge updates into the job's context.vm key."""

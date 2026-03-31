@@ -64,7 +64,9 @@ class TestCreateThread:
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         result = await db.create_thread()
@@ -74,7 +76,9 @@ class TestCreateThread:
     @pytest.mark.asyncio
     async def test_passes_all_params_to_query(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         await db.create_thread(
@@ -96,7 +100,9 @@ class TestCreateThread:
     @pytest.mark.asyncio
     async def test_optional_params_default_none(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         await db.create_thread()
@@ -108,7 +114,9 @@ class TestCreateThread:
     @pytest.mark.asyncio
     async def test_default_values(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("aaaaaaaa-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         await db.create_thread()
@@ -236,7 +244,7 @@ class TestEndThread:
 
         await db.end_thread("tid-1")
 
-        sql = conn.execute.call_args[0][0]
+        sql = " ".join(conn.execute.call_args[0][0].split())
         assert "status = 'ended'" in sql
         assert "ended_at = CURRENT_TIMESTAMP" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
@@ -305,7 +313,9 @@ class TestSaveThreadMessage:
     @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         result = await db.save_thread_message("tid-1", "user", "hello")
@@ -314,7 +324,9 @@ class TestSaveThreadMessage:
     @pytest.mark.asyncio
     async def test_tool_calls_serialized_to_json(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         tool_calls = [{"name": "search", "args": {"q": "test"}}]
@@ -328,7 +340,9 @@ class TestSaveThreadMessage:
     @pytest.mark.asyncio
     async def test_tool_calls_none_becomes_sql_null(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         await db.save_thread_message("tid-1", "user", "hi", tool_calls=None)
@@ -339,7 +353,9 @@ class TestSaveThreadMessage:
     @pytest.mark.asyncio
     async def test_updates_thread_last_activity_and_turns(self):
         conn = _mock_conn()
-        conn.fetchrow = AsyncMock(return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")})
+        conn.fetchrow = AsyncMock(
+            return_value={"id": UUID("bbbbbbbb-1111-2222-3333-444444444444")}
+        )
         db = _make_db_with_conn(conn)
 
         await db.save_thread_message("tid-1", "user", "hi", turn_number=5)
@@ -471,7 +487,15 @@ class TestGetThreadMessagesHistory:
         db = _make_db_with_conn(conn)
 
         result = await db.get_thread_messages_history("tid-1")
-        assert set(result[0].keys()) == {"id", "role", "content", "tool_calls", "turn_number", "metrics", "created_at"}
+        assert set(result[0].keys()) == {
+            "id",
+            "role",
+            "content",
+            "tool_calls",
+            "turn_number",
+            "metrics",
+            "created_at",
+        }
 
 
 # =============================================================================
@@ -559,7 +583,9 @@ class TestMergeThreadWorkspaceContext:
         conn = _mock_conn()
         db = _make_db_with_conn(conn)
 
-        result = await db.merge_thread_workspace_context("not-a-uuid", {"pod_ip": "10.0.0.5"})
+        result = await db.merge_thread_workspace_context(
+            "not-a-uuid", {"pod_ip": "10.0.0.5"}
+        )
         assert result is False
         conn.execute.assert_not_awaited()
 

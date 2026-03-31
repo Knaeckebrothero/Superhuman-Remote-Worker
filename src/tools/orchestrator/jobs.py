@@ -228,7 +228,9 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
                 for job in jobs:
                     lines.append(f"--- {job.get('id', '?')[:8]}... ---")
                     lines.append(f"  Status: {job.get('status', '?')}")
-                    lines.append(f"  Description: {(job.get('description') or 'N/A')[:100]}")
+                    lines.append(
+                        f"  Description: {(job.get('description') or 'N/A')[:100]}"
+                    )
                     if job.get("config_name"):
                         lines.append(f"  Config: {job['config_name']}")
                     lines.append("")

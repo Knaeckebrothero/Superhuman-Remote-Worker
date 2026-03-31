@@ -49,7 +49,9 @@ class TestInteractiveConfigDefaults:
 
     def test_greeting_default(self):
         ic = InteractiveConfig()
-        assert ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
+        assert (
+                ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
+        )
 
     def test_agent_config_has_interactive_field(self):
         """AgentConfig includes interactive as a field with default factory."""
@@ -253,9 +255,7 @@ class TestInteractivePromptResolution:
         config.llm.reasoning_method = "prompt"
         config.llm.reasoning_level = "high"
 
-        with patch(
-                "src.core.loader.detect_reasoning_method", return_value="prompt"
-        ):
+        with patch("src.core.loader.detect_reasoning_method", return_value="prompt"):
             result = get_phase_system_prompt(
                 config=config,
                 is_strategic=False,
@@ -271,9 +271,7 @@ class TestInteractivePromptResolution:
             resolved_prompts={"systemprompt_interactive": template}
         )
 
-        with patch(
-                "src.core.loader.detect_reasoning_method", return_value="native"
-        ):
+        with patch("src.core.loader.detect_reasoning_method", return_value="native"):
             result = get_phase_system_prompt(
                 config=config,
                 is_strategic=False,

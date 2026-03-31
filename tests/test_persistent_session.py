@@ -22,6 +22,7 @@ from src.api.persistent_session import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_config(**overrides):
     """Build a minimal AgentConfig mock for PersistentSession."""
     cfg = MagicMock()
@@ -62,6 +63,7 @@ def _make_session(**overrides):
 # 2.1 _EXCLUDED_TOOLS constant
 # ---------------------------------------------------------------------------
 
+
 class TestExcludedTools:
     def test_is_frozenset(self):
         assert isinstance(_EXCLUDED_TOOLS, frozenset)
@@ -84,6 +86,7 @@ class TestExcludedTools:
 # ---------------------------------------------------------------------------
 # 2.2 PersistentSession dataclass defaults
 # ---------------------------------------------------------------------------
+
 
 class TestPersistentSessionDefaults:
     def test_permission_mode_default(self):
@@ -133,6 +136,7 @@ class TestPersistentSessionDefaults:
 # 2.3 setup()
 # ---------------------------------------------------------------------------
 
+
 class TestSetup:
     @pytest.mark.asyncio
     async def test_setup_overwrites_permission_mode_from_config(self):
@@ -147,7 +151,10 @@ class TestSetup:
             patch.object(session, "_setup_context_manager"),
             patch.object(session, "_setup_shell_manager"),
             patch.object(session, "_setup_memory"),
-            patch("src.api.persistent_session.get_phase_system_prompt", return_value="sys prompt"),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="sys prompt",
+            ),
         ):
             await session.setup(llm=MagicMock())
 
@@ -166,7 +173,10 @@ class TestSetup:
             patch.object(session, "_setup_context_manager"),
             patch.object(session, "_setup_shell_manager"),
             patch.object(session, "_setup_memory"),
-            patch("src.api.persistent_session.get_phase_system_prompt", return_value="sys prompt"),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="sys prompt",
+            ),
         ):
             await session.setup(
                 llm=mock_llm,
@@ -197,14 +207,26 @@ class TestSetup:
             patch.object(session, "_setup_workspace", side_effect=track("workspace")),
             patch.object(session, "_setup_tools", side_effect=track("tools")),
             patch.object(session, "_bind_tools", side_effect=track("bind")),
-            patch.object(session, "_setup_context_manager", side_effect=track("context")),
+            patch.object(
+                session, "_setup_context_manager", side_effect=track("context")
+            ),
             patch.object(session, "_setup_shell_manager", side_effect=track("shell")),
             patch.object(session, "_setup_memory", side_effect=track("memory")),
-            patch("src.api.persistent_session.get_phase_system_prompt", return_value="sys prompt"),
+            patch(
+                "src.api.persistent_session.get_phase_system_prompt",
+                return_value="sys prompt",
+            ),
         ):
             await session.setup(llm=MagicMock())
 
-        assert call_order == ["workspace", "tools", "bind", "context", "shell", "memory"]
+        assert call_order == [
+            "workspace",
+            "tools",
+            "bind",
+            "context",
+            "shell",
+            "memory",
+        ]
 
     @pytest.mark.asyncio
     async def test_setup_builds_prompt_with_interactive_type(self):
@@ -227,14 +249,18 @@ class TestSetup:
 
         mock_prompt.assert_called_once()
         call_kwargs = mock_prompt.call_args
-        assert call_kwargs[1].get("prompt_type") == "interactive" or call_kwargs[0][2] if len(
-            call_kwargs[0]) > 2 else True
+        assert (
+            call_kwargs[1].get("prompt_type") == "interactive" or call_kwargs[0][2]
+            if len(call_kwargs[0]) > 2
+            else True
+        )
         assert session.system_prompt == "interactive prompt"
 
 
 # ---------------------------------------------------------------------------
 # 2.4 _setup_workspace()
 # ---------------------------------------------------------------------------
+
 
 class TestSetupWorkspace:
     def test_local_workspace_created_by_default(self):
@@ -295,7 +321,11 @@ class TestSetupWorkspace:
             # Patch the import inside the method
             with patch.dict(
                     "sys.modules",
-                    {"src.core.backends.remote": MagicMock(RemoteBackend=MagicMock(return_value=mock_remote))},
+                    {
+                        "src.core.backends.remote": MagicMock(
+                            RemoteBackend=MagicMock(return_value=mock_remote)
+                        )
+                    },
             ):
                 MockWM.return_value.path = "/tmp/test"
                 MockWM.return_value.initialize = MagicMock()
@@ -360,6 +390,7 @@ class TestSetupWorkspace:
 # 2.5 _setup_tools()
 # ---------------------------------------------------------------------------
 
+
 class TestSetupTools:
     def test_excluded_tools_filtered_out(self):
         """Phase-specific tools are filtered from tool names."""
@@ -371,12 +402,26 @@ class TestSetupTools:
         mock_tool.name = "web_search"
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=[
-                "web_search", "next_phase_todos", "todo_complete", "read_file",
-            ]),
-            patch("src.api.persistent_session.load_tools", return_value=[mock_tool]) as mock_load,
-            patch("src.api.persistent_session.apply_description_overrides", side_effect=lambda x: x),
-            patch("src.api.persistent_session.apply_instruction_enforcement", side_effect=lambda x, y: x),
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "web_search",
+                    "next_phase_todos",
+                    "todo_complete",
+                    "read_file",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[mock_tool]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
             patch("src.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
@@ -393,16 +438,32 @@ class TestSetupTools:
         session.workspace_manager = MagicMock()
 
         orch_tools = [
-            "create_worker_job", "list_worker_jobs", "get_worker_job",
-            "get_job_workspace_file", "approve_worker_job", "resume_worker_job",
-            "cancel_worker_job", "pause_worker_job",
+            "create_worker_job",
+            "list_worker_jobs",
+            "get_worker_job",
+            "get_job_workspace_file",
+            "approve_worker_job",
+            "resume_worker_job",
+            "cancel_worker_job",
+            "pause_worker_job",
         ]
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=["web_search"]),
-            patch("src.api.persistent_session.load_tools", return_value=[]) as mock_load,
-            patch("src.api.persistent_session.apply_description_overrides", side_effect=lambda x: x),
-            patch("src.api.persistent_session.apply_instruction_enforcement", side_effect=lambda x, y: x),
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["web_search"],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
             patch("src.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
@@ -418,12 +479,24 @@ class TestSetupTools:
         session.workspace_manager = MagicMock()
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=[
-                "web_search", "create_worker_job",
-            ]),
-            patch("src.api.persistent_session.load_tools", return_value=[]) as mock_load,
-            patch("src.api.persistent_session.apply_description_overrides", side_effect=lambda x: x),
-            patch("src.api.persistent_session.apply_instruction_enforcement", side_effect=lambda x, y: x),
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=[
+                    "web_search",
+                    "create_worker_job",
+                ],
+            ),
+            patch(
+                "src.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
             patch("src.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
@@ -450,10 +523,19 @@ class TestSetupTools:
             return [mock_tool]
 
         with (
-            patch("src.api.persistent_session.get_all_tool_names", return_value=["web_search"]),
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["web_search"],
+            ),
             patch("src.api.persistent_session.load_tools", side_effect=_load),
-            patch("src.api.persistent_session.apply_description_overrides", side_effect=lambda x: x),
-            patch("src.api.persistent_session.apply_instruction_enforcement", side_effect=lambda x, y: x),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
             patch("src.api.persistent_session.ToolContext"),
         ):
             session._setup_tools(None)
@@ -469,19 +551,29 @@ class TestSetupTools:
         with (
             patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
             patch("src.api.persistent_session.load_tools", return_value=[]),
-            patch("src.api.persistent_session.apply_description_overrides", side_effect=lambda x: x),
-            patch("src.api.persistent_session.apply_instruction_enforcement", side_effect=lambda x, y: x),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
             patch("src.api.persistent_session.ToolContext") as MockTC,
         ):
             session._setup_tools(None)
 
         MockTC.assert_called_once()
-        assert MockTC.call_args[1].get("todo_manager") is None or MockTC.call_args.kwargs.get("todo_manager") is None
+        assert (
+                MockTC.call_args[1].get("todo_manager") is None
+                or MockTC.call_args.kwargs.get("todo_manager") is None
+        )
 
 
 # ---------------------------------------------------------------------------
 # 2.6 _bind_tools()
 # ---------------------------------------------------------------------------
+
 
 class TestBindTools:
     def test_noop_when_llm_none(self):
@@ -591,6 +683,7 @@ class TestBindTools:
 # 2.7 _setup_context_manager()
 # ---------------------------------------------------------------------------
 
+
 class TestSetupContextManager:
     def test_context_manager_created(self):
         """ContextManager created with config values."""
@@ -620,6 +713,7 @@ class TestSetupContextManager:
 # 2.8 _setup_shell_manager()
 # ---------------------------------------------------------------------------
 
+
 class TestSetupShellManager:
     def test_remote_backend_with_supports_shell(self):
         """ShellManager created with backend when supports_shell is True."""
@@ -636,9 +730,12 @@ class TestSetupShellManager:
         with patch("src.api.persistent_session.ShellManager", create=True) as MockSM:
             # Patch the import
             import sys
+
             mock_module = MagicMock()
             mock_module.ShellManager = MockSM
-            with patch.dict(sys.modules, {"src.tools.coding.shell_manager": mock_module}):
+            with patch.dict(
+                    sys.modules, {"src.tools.coding.shell_manager": mock_module}
+            ):
                 session._setup_shell_manager()
 
             if MockSM.called:
@@ -670,10 +767,16 @@ class TestSetupShellManager:
         mock_sm = MagicMock()
 
         with (
-            patch("src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"),
+            patch(
+                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
+            ),
             patch.dict(
                 "sys.modules",
-                {"src.tools.coding.shell_manager": MagicMock(ShellManager=MagicMock(return_value=mock_sm))},
+                {
+                    "src.tools.coding.shell_manager": MagicMock(
+                        ShellManager=MagicMock(return_value=mock_sm)
+                    )
+                },
             ),
         ):
             session._setup_shell_manager()
@@ -690,12 +793,16 @@ class TestSetupShellManager:
         session.config.extra = {"shell": {}}
 
         with (
-            patch("src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"),
+            patch(
+                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
+            ),
             patch.dict(
                 "sys.modules",
-                {"src.tools.coding.shell_manager": MagicMock(
-                    ShellManager=MagicMock(side_effect=RuntimeError("tmux broken")),
-                )},
+                {
+                    "src.tools.coding.shell_manager": MagicMock(
+                        ShellManager=MagicMock(side_effect=RuntimeError("tmux broken")),
+                    )
+                },
             ),
         ):
             # Should not raise
@@ -714,10 +821,16 @@ class TestSetupShellManager:
         mock_sm = MagicMock()
 
         with (
-            patch("src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"),
+            patch(
+                "src.api.persistent_session.shutil.which", return_value="/usr/bin/tmux"
+            ),
             patch.dict(
                 "sys.modules",
-                {"src.tools.coding.shell_manager": MagicMock(ShellManager=MagicMock(return_value=mock_sm))},
+                {
+                    "src.tools.coding.shell_manager": MagicMock(
+                        ShellManager=MagicMock(return_value=mock_sm)
+                    )
+                },
             ),
         ):
             session._setup_shell_manager()
@@ -728,6 +841,7 @@ class TestSetupShellManager:
 # ---------------------------------------------------------------------------
 # 2.9 _setup_memory()
 # ---------------------------------------------------------------------------
+
 
 class TestSetupMemory:
     def test_returns_immediately_when_vector_conn_none(self):
@@ -752,12 +866,20 @@ class TestSetupMemory:
         mock_ks = MagicMock()
 
         with (
-            patch.dict("sys.modules", {
-                "src.services.embedding_service": MagicMock(
-                    get_embedding_service=MagicMock(return_value=mock_embedding)),
-                "src.services.recall_store": MagicMock(RecallStore=MagicMock(return_value=mock_recall)),
-                "src.services.knowledge_store": MagicMock(KnowledgeStore=MagicMock(return_value=mock_ks)),
-            }),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock(return_value=mock_embedding)
+                    ),
+                    "src.services.recall_store": MagicMock(
+                        RecallStore=MagicMock(return_value=mock_recall)
+                    ),
+                    "src.services.knowledge_store": MagicMock(
+                        KnowledgeStore=MagicMock(return_value=mock_ks)
+                    ),
+                },
+            ),
         ):
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
 
@@ -772,10 +894,17 @@ class TestSetupMemory:
         mock_ks = MagicMock()
 
         with (
-            patch.dict("sys.modules", {
-                "src.services.embedding_service": MagicMock(get_embedding_service=MagicMock()),
-                "src.services.knowledge_store": MagicMock(KnowledgeStore=MagicMock(return_value=mock_ks)),
-            }),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock()
+                    ),
+                    "src.services.knowledge_store": MagicMock(
+                        KnowledgeStore=MagicMock(return_value=mock_ks)
+                    ),
+                },
+            ),
         ):
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
 
@@ -790,10 +919,17 @@ class TestSetupMemory:
         mock_ks = MagicMock()
 
         with (
-            patch.dict("sys.modules", {
-                "src.services.embedding_service": MagicMock(get_embedding_service=MagicMock()),
-                "src.services.knowledge_store": MagicMock(KnowledgeStore=MagicMock(return_value=mock_ks)),
-            }),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock()
+                    ),
+                    "src.services.knowledge_store": MagicMock(
+                        KnowledgeStore=MagicMock(return_value=mock_ks)
+                    ),
+                },
+            ),
         ):
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
 
@@ -809,12 +945,19 @@ class TestSetupMemory:
         mock_ks = MagicMock()
 
         with (
-            patch.dict("sys.modules", {
-                "src.services.embedding_service": MagicMock(
-                    get_embedding_service=MagicMock(side_effect=RuntimeError("embedding init failed")),
-                ),
-                "src.services.knowledge_store": MagicMock(KnowledgeStore=MagicMock(return_value=mock_ks)),
-            }),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock(
+                            side_effect=RuntimeError("embedding init failed")
+                        ),
+                    ),
+                    "src.services.knowledge_store": MagicMock(
+                        KnowledgeStore=MagicMock(return_value=mock_ks)
+                    ),
+                },
+            ),
         ):
             # Should not raise
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
@@ -826,11 +969,16 @@ class TestSetupMemory:
         session.tool_context = MagicMock()
 
         with (
-            patch.dict("sys.modules", {
-                "src.services.embedding_service": MagicMock(
-                    get_embedding_service=MagicMock(side_effect=RuntimeError("embedding broke")),
-                ),
-            }),
+            patch.dict(
+                "sys.modules",
+                {
+                    "src.services.embedding_service": MagicMock(
+                        get_embedding_service=MagicMock(
+                            side_effect=RuntimeError("embedding broke")
+                        ),
+                    ),
+                },
+            ),
         ):
             # Should not raise
             session._setup_memory(postgres_conn=MagicMock(), vector_conn=MagicMock())
@@ -839,6 +987,7 @@ class TestSetupMemory:
 # ---------------------------------------------------------------------------
 # 2.10 swap_backend()
 # ---------------------------------------------------------------------------
+
 
 class TestSwapBackend:
     def test_raises_when_workspace_manager_none(self):
@@ -969,6 +1118,7 @@ class TestSwapBackend:
 # 2.11 get_workspace_content()
 # ---------------------------------------------------------------------------
 
+
 class TestGetWorkspaceContent:
     def test_returns_workspace_md_content(self):
         session = _make_session()
@@ -1006,6 +1156,7 @@ class TestGetWorkspaceContent:
 # ---------------------------------------------------------------------------
 # 2.12 cleanup()
 # ---------------------------------------------------------------------------
+
 
 class TestCleanup:
     @pytest.mark.asyncio

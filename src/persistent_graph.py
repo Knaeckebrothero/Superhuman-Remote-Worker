@@ -137,8 +137,12 @@ async def run_persistent_loop(
 
     # Memory extraction config
     memory_config = getattr(config, "memory", None)
-    extraction_interval = getattr(memory_config, "extraction_interval", 5) if memory_config else 5
-    extraction_prompt = getattr(memory_config, "extraction_prompt", "") if memory_config else ""
+    extraction_interval = (
+        getattr(memory_config, "extraction_interval", 5) if memory_config else 5
+    )
+    extraction_prompt = (
+        getattr(memory_config, "extraction_prompt", "") if memory_config else ""
+    )
     _last_extraction_turn = 0
 
     # Send system prompt as first message if not already present
@@ -227,8 +231,8 @@ async def run_persistent_loop(
 
         # Auto-commit workspace changes after tool-executing turns
         if tool_calls_this_turn > 0 and tool_context:
-            ws_mgr = getattr(tool_context, 'workspace_manager', None)
-            git_mgr = getattr(ws_mgr, 'git_manager', None) if ws_mgr else None
+            ws_mgr = getattr(tool_context, "workspace_manager", None)
+            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
             if git_mgr and git_mgr.is_active:
                 try:
                     if git_mgr.has_uncommitted_changes():
@@ -277,7 +281,9 @@ async def _execute_turn(
 
     if recall_store:
         try:
-            await asyncio.wait_for(recall_store.decrement_ttl(), timeout=_RETRIEVAL_TIMEOUT)
+            await asyncio.wait_for(
+                recall_store.decrement_ttl(), timeout=_RETRIEVAL_TIMEOUT
+            )
         except (asyncio.TimeoutError, Exception) as e:
             logger.warning(f"TTL decrement failed (non-fatal): {e}")
 
@@ -285,7 +291,11 @@ async def _execute_turn(
             context_text = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
-                    context_text = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    context_text = (
+                        msg.content
+                        if isinstance(msg.content, str)
+                        else str(msg.content)
+                    )
                     break
 
             memories = await asyncio.wait_for(
@@ -293,6 +303,7 @@ async def _execute_turn(
             )
             if memories:
                 from .services.recall_store import RecallStore as _RS
+
                 memory_block = _RS.assemble_memory_block(memories)
                 logger.debug(f"Memory injection: {len(memories)} memories retrieved")
         except asyncio.TimeoutError:
@@ -304,10 +315,15 @@ async def _execute_turn(
     if knowledge_store and effective_pids:
         try:
             import uuid as _uuid
+
             kb_context = ""
             for msg in reversed(messages):
                 if isinstance(msg, HumanMessage):
-                    kb_context = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    kb_context = (
+                        msg.content
+                        if isinstance(msg.content, str)
+                        else str(msg.content)
+                    )
                     break
 
             kb_notes = await asyncio.wait_for(
@@ -320,6 +336,7 @@ async def _execute_turn(
             )
             if kb_notes:
                 from .services.knowledge_store import KnowledgeStore as _KS
+
                 knowledge_block = _KS.assemble_knowledge_block(kb_notes)
                 logger.debug(f"Knowledge injection: {len(kb_notes)} notes retrieved")
         except asyncio.TimeoutError:
@@ -347,17 +364,26 @@ async def _execute_turn(
                     content=f"<workspace_memory>\n{ws_content}\n</workspace_memory>"
                 )
                 # Find insertion point (after system message, before conversation)
-                insert_idx = 1 if prepared and isinstance(prepared[0], SystemMessage) else 0
+                insert_idx = (
+                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0
+                )
                 prepared.insert(insert_idx, ws_msg)
 
         # Inject memory and knowledge as transient tool-call pairs
         if memory_block:
             try:
                 from .core.memory_injection import create_memory_injection_messages
+
                 mem_ai, mem_tool = create_memory_injection_messages(memory_block)
                 # Insert after workspace injection, before conversation
-                inject_idx = 2 if workspace_content and prepared and len(prepared) > 1 and isinstance(prepared[1],
-                                                                                                      SystemMessage) else 1
+                inject_idx = (
+                    2
+                    if workspace_content
+                       and prepared
+                       and len(prepared) > 1
+                       and isinstance(prepared[1], SystemMessage)
+                    else 1
+                )
                 prepared.insert(inject_idx, mem_ai)
                 prepared.insert(inject_idx + 1, mem_tool)
             except Exception as e:
@@ -365,11 +391,17 @@ async def _execute_turn(
 
         if knowledge_block:
             try:
-                from .core.knowledge_injection import create_knowledge_injection_messages
+                from .core.knowledge_injection import (
+                    create_knowledge_injection_messages,
+                )
+
                 kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
                 # Insert after memory injection
-                inject_idx = len(prepared) - len(messages) + (
-                    1 if prepared and isinstance(prepared[0], SystemMessage) else 0)
+                inject_idx = (
+                        len(prepared)
+                        - len(messages)
+                        + (1 if prepared and isinstance(prepared[0], SystemMessage) else 0)
+                )
                 prepared.insert(inject_idx, kb_ai)
                 prepared.insert(inject_idx + 1, kb_tool)
             except Exception as e:
@@ -387,8 +419,8 @@ async def _execute_turn(
 
         # Auto-compaction happened — commit + push workspace to Gitea as checkpoint
         if len(prepared) < pre_compact_len and tool_context:
-            ws_mgr = getattr(tool_context, 'workspace_manager', None)
-            git_mgr = getattr(ws_mgr, 'git_manager', None) if ws_mgr else None
+            ws_mgr = getattr(tool_context, "workspace_manager", None)
+            git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
             if git_mgr and git_mgr.is_active:
                 try:
                     if git_mgr.has_uncommitted_changes():
@@ -417,7 +449,10 @@ async def _execute_turn(
                         # Anthropic returns content as list of dicts
                         if isinstance(content, list):
                             for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
+                                if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                ):
                                     text = block.get("text", "")
                                     if text:
                                         response_content += text
@@ -463,14 +498,19 @@ async def _execute_turn(
                 # (e.g. ReasoningCapturingClient can't handle stream=True)
                 err_name = type(stream_err).__name__
                 if "ResponseNotRead" in err_name or "APIConnectionError" in err_name:
-                    logger.info(f"Streaming not supported ({err_name}), falling back to ainvoke")
+                    logger.info(
+                        f"Streaming not supported ({err_name}), falling back to ainvoke"
+                    )
                     response = await llm_with_tools.ainvoke(prepared)
                     # Stream the complete response as a single chunk
                     if hasattr(response, "content") and response.content:
                         content = response.content
                         if isinstance(content, list):
                             for block in content:
-                                if isinstance(block, dict) and block.get("type") == "text":
+                                if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                ):
                                     text = block.get("text", "")
                                     if text:
                                         response_content += text
@@ -498,12 +538,18 @@ async def _execute_turn(
         # Extract per-turn metrics from response metadata
         llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
         turn_metrics: Optional[dict] = None
-        if response and hasattr(response, "response_metadata") and response.response_metadata:
+        if (
+                response
+                and hasattr(response, "response_metadata")
+                and response.response_metadata
+        ):
             meta = response.response_metadata
             token_usage = meta.get("token_usage", {})
             turn_metrics = {
-                "input_tokens": token_usage.get("input_tokens") or token_usage.get("prompt_tokens"),
-                "output_tokens": token_usage.get("output_tokens") or token_usage.get("completion_tokens"),
+                "input_tokens": token_usage.get("input_tokens")
+                                or token_usage.get("prompt_tokens"),
+                "output_tokens": token_usage.get("output_tokens")
+                                 or token_usage.get("completion_tokens"),
                 "reasoning_tokens": token_usage.get("reasoning_tokens"),
                 "latency_ms": llm_latency_ms,
                 "model": meta.get("model_name"),
@@ -583,9 +629,7 @@ async def _execute_turn(
                 logger.warning(f"Tool {tool_name} failed: {e}")
                 result_str = f"Tool execution error: {e}"
 
-            messages.append(
-                ToolMessage(content=result_str, tool_call_id=tool_call_id)
-            )
+            messages.append(ToolMessage(content=result_str, tool_call_id=tool_call_id))
             messages_added += 1
             tool_calls_made += 1
 
@@ -594,7 +638,10 @@ async def _execute_turn(
             # Check for freeze request (e.g. sudo intercept → VM upgrade)
             if tool_context and callbacks.on_vm_upgrade_needed:
                 freeze_req = tool_context.consume_freeze_request()
-                if freeze_req and freeze_req.get("freeze_type") == "vm_upgrade_required":
+                if (
+                        freeze_req
+                        and freeze_req.get("freeze_type") == "vm_upgrade_required"
+                ):
                     await callbacks.on_vm_upgrade_needed(freeze_req)
 
         # Continue the inner loop — LLM sees tool results on next iteration

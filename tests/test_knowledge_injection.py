@@ -100,11 +100,13 @@ class TestIsKnowledgeInjectionMessage:
     def test_true_for_matching_ai_message(self):
         msg = AIMessage(
             content="",
-            tool_calls=[{
-                "name": "kb_search",
-                "args": {},
-                "id": f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}abcd1234",
-            }],
+            tool_calls=[
+                {
+                    "name": "kb_search",
+                    "args": {},
+                    "id": f"{KNOWLEDGE_TOOL_CALL_ID_PREFIX}abcd1234",
+                }
+            ],
         )
         assert is_knowledge_injection_message(msg) is True
 
@@ -115,11 +117,13 @@ class TestIsKnowledgeInjectionMessage:
     def test_false_for_ai_with_non_matching_tool_calls(self):
         msg = AIMessage(
             content="",
-            tool_calls=[{
-                "name": "web_search",
-                "args": {},
-                "id": "regular_tool_call_123",
-            }],
+            tool_calls=[
+                {
+                    "name": "web_search",
+                    "args": {},
+                    "id": "regular_tool_call_123",
+                }
+            ],
         )
         assert is_knowledge_injection_message(msg) is False
 

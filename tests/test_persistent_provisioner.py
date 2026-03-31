@@ -82,16 +82,23 @@ class TestInitK8s:
         mock_k8s_config.load_incluster_config = MagicMock()  # succeeds
         mock_k8s_config.ConfigException = Exception
 
-        with patch.dict("sys.modules", {
-            "kubernetes": MagicMock(),
-            "kubernetes.client": MagicMock(),
-            "kubernetes.config": mock_k8s_config,
-        }):
+        with patch.dict(
+                "sys.modules",
+                {
+                    "kubernetes": MagicMock(),
+                    "kubernetes.client": MagicMock(),
+                    "kubernetes.config": mock_k8s_config,
+                },
+        ):
             # Re-import won't work, so patch the import inside _init_k8s
-            with patch("builtins.__import__", side_effect=lambda name, *a, **kw: (
+            with patch(
+                    "builtins.__import__",
+                    side_effect=lambda name, *a, **kw: (
                     MagicMock(config=mock_k8s_config, client=MagicMock())
-                    if name == "kubernetes" else __builtins__.__import__(name, *a, **kw)
-            )):
+                    if name == "kubernetes"
+                    else __builtins__.__import__(name, *a, **kw)
+                    ),
+            ):
                 # Simpler: directly test the logic
                 p._k8s_available = True
 
@@ -113,7 +120,9 @@ class TestInitK8s:
         # Mock kubernetes module where both config loads fail
         mock_k8s_config = MagicMock()
         mock_k8s_config.ConfigException = type("ConfigException", (Exception,), {})
-        mock_k8s_config.load_incluster_config.side_effect = mock_k8s_config.ConfigException
+        mock_k8s_config.load_incluster_config.side_effect = (
+            mock_k8s_config.ConfigException
+        )
         mock_k8s_config.load_kube_config.side_effect = mock_k8s_config.ConfigException
 
         mock_kubernetes = MagicMock()
@@ -144,7 +153,9 @@ class TestCreateAgentPod:
     async def test_log_includes_thread_id_and_config(self):
         """Manual start instruction includes thread_id and config_name."""
         p = PersistentProvisioner()
-        with patch("orchestrator.services.persistent_provisioner.logger") as mock_logger:
+        with patch(
+                "orchestrator.services.persistent_provisioner.logger"
+        ) as mock_logger:
             await p.create_agent_pod("tid-abc", config_name="scholar")
         log_msg = mock_logger.info.call_args[0][0]
         assert "tid-abc" in log_msg
