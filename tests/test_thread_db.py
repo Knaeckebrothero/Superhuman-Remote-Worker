@@ -172,7 +172,7 @@ class TestListThreads:
         result = await db.list_threads()
         assert len(result) == 2
         # SQL should have no WHERE clause
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "WHERE" not in sql
         assert "ORDER BY created_at DESC" in sql
         assert "LIMIT 50" in sql
@@ -185,7 +185,7 @@ class TestListThreads:
         db = _make_db_with_conn(conn)
 
         await db.list_threads(user_id="user-1")
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "user_id = $1 OR user_id IS NULL" in sql
 
     @pytest.mark.asyncio
@@ -195,7 +195,7 @@ class TestListThreads:
         db = _make_db_with_conn(conn)
 
         await db.list_threads(project_id="proj-1")
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "project_id = $1" in sql
 
     @pytest.mark.asyncio
@@ -205,7 +205,7 @@ class TestListThreads:
         db = _make_db_with_conn(conn)
 
         await db.list_threads(status="ended")
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "status = $1" in sql
 
     @pytest.mark.asyncio
@@ -215,7 +215,7 @@ class TestListThreads:
         db = _make_db_with_conn(conn)
 
         await db.list_threads(user_id="u1", project_id="p1", status="active")
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "AND" in sql
 
     @pytest.mark.asyncio
@@ -225,7 +225,7 @@ class TestListThreads:
         db = _make_db_with_conn(conn)
 
         await db.list_threads()
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "LIMIT 50" in sql
 
 
@@ -274,7 +274,7 @@ class TestUpdateThreadStatus:
 
         await db.update_thread_status("tid-1", "idle")
 
-        sql = conn.execute.call_args[0][0]
+        sql = " ".join(conn.execute.call_args[0][0].split())
         assert "status = $2" in sql
         assert "last_activity = CURRENT_TIMESTAMP" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
@@ -296,7 +296,7 @@ class TestUpdateThreadAgent:
 
         await db.update_thread_agent("tid-1", "agent-42")
 
-        sql = conn.execute.call_args[0][0]
+        sql = " ".join(conn.execute.call_args[0][0].split())
         assert "agent_id = $2" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
         assert conn.execute.call_args[0][2] == "agent-42"
@@ -362,7 +362,7 @@ class TestSaveThreadMessage:
 
         # Second call should be the UPDATE
         update_call = conn.execute.call_args
-        sql = update_call[0][0]
+        sql = " ".join(update_call[0][0].split())
         assert "last_activity = CURRENT_TIMESTAMP" in sql
         assert "GREATEST(total_turns" in sql
         assert update_call[0][2] == 5  # turn_number
@@ -383,7 +383,7 @@ class TestGetThreadMessagesHistory:
         db = _make_db_with_conn(conn)
 
         await db.get_thread_messages_history("tid-1")
-        sql = conn.fetch.call_args[0][0]
+        sql = " ".join(conn.fetch.call_args[0][0].split())
         assert "ORDER BY created_at ASC" in sql
 
     @pytest.mark.asyncio
@@ -540,7 +540,7 @@ class TestUpdateThreadTokens:
 
         await db.update_thread_tokens("tid-1", 1500)
 
-        sql = conn.execute.call_args[0][0]
+        sql = " ".join(conn.execute.call_args[0][0].split())
         assert "total_tokens = total_tokens + $2" in sql
         assert conn.execute.call_args[0][1] == "tid-1"
         assert conn.execute.call_args[0][2] == 1500
