@@ -296,7 +296,9 @@ class TestPodManifest:
 
     def test_seccomp_profile(self):
         m = self._build()
-        assert m["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+        assert (
+                m["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+        )
 
     def test_volume_mounts(self):
         m = self._build()
@@ -333,8 +335,12 @@ class TestPodManifest:
         assert container["startupProbe"]["failureThreshold"] == 10
 
     def test_resources(self):
-        m = self._build(cpu_request="500m", memory_request="1Gi",
-                        cpu_limit="2000m", memory_limit="4Gi")
+        m = self._build(
+            cpu_request="500m",
+            memory_request="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
         res = m["spec"]["containers"][0]["resources"]
         assert res["requests"]["cpu"] == "500m"
         assert res["requests"]["memory"] == "1Gi"

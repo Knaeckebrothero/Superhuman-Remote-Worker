@@ -7727,9 +7727,8 @@ async def create_thread(
 
         # Provision persistent agent pod in background
         if persistent_provisioner.is_available:
-            effective_config = (
-                    request_body.config_name
-                    or user_settings.get("config_name", "interactive")
+            effective_config = request_body.config_name or user_settings.get(
+                "config_name", "interactive"
             )
             asyncio.create_task(
                 persistent_provisioner.create_agent_pod(
@@ -7869,9 +7868,7 @@ async def resume_thread(
     if persistent_provisioner.is_available:
         config_name = thread.get("config_name", "interactive")
         asyncio.create_task(
-            persistent_provisioner.create_agent_pod(
-                thread_id, config_name=config_name
-            )
+            persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
 
     metadata = thread.get("metadata") or {}
@@ -8115,9 +8112,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                 break
 
         if not agent_bound:
-            await ws.close(
-                code=4503, reason="Agent failed to start within timeout"
-            )
+            await ws.close(code=4503, reason="Agent failed to start within timeout")
             return
 
     agent = await postgres_db.get_agent(str(thread["agent_id"]))
