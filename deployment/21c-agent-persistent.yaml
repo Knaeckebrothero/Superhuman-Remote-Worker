@@ -27,7 +27,7 @@ spec:
           command: [ "sh", "-c", "until nc -z srw-orchestrator 8085; do sleep 2; done" ]
       containers:
         - name: agent
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-a203a8f
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-63b4e66
           imagePullPolicy: Always
           command: [ "sh", "-c", "python agent.py --mode persistent --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0" ]
           securityContext:
