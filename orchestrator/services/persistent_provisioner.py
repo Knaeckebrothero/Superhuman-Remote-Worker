@@ -495,7 +495,7 @@ class PersistentProvisioner:
                     SET metadata      = jsonb_set(
                             COALESCE(metadata, '{}'),
                             '{agent_pod}',
-                            COALESCE(metadata - > 'agent_pod', '{}') || $2::jsonb
+                            COALESCE(metadata->'agent_pod', '{}'::jsonb) || $2::jsonb
                                         ),
                         last_activity = CURRENT_TIMESTAMP
                     WHERE id = $1

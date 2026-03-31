@@ -9,6 +9,7 @@ available. Gracefully degrades: when S3 is unavailable, containers stay alive.
 """
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -277,6 +278,11 @@ class WorkspaceSuspensionService:
             return False
 
         metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (ValueError, TypeError):
+                metadata = {}
         ws_ctx = metadata.get("workspace_container", {})
         pod_ip = ws_ctx.get("pod_ip")
 
@@ -360,7 +366,13 @@ class WorkspaceSuspensionService:
 
             # Re-read to get new pod IP
             thread = await self._db.get_thread(thread_id)
-            ws_ctx = (thread.get("metadata") or {}).get("workspace_container", {})
+            metadata = thread.get("metadata") or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (ValueError, TypeError):
+                    metadata = {}
+            ws_ctx = metadata.get("workspace_container", {})
             pod_ip = ws_ctx.get("pod_ip")
 
             if not pod_ip:
@@ -419,7 +431,7 @@ class WorkspaceSuspensionService:
                     """
                     SELECT id, metadata, last_activity
                     FROM threads
-                    WHERE metadata - > 'workspace_container' ->>'status' = 'ready'
+                    WHERE metadata->'workspace_container'->>'status' = 'ready'
                       AND status = 'idle'
                     """,
                 )
@@ -486,6 +498,11 @@ class WorkspaceSuspensionService:
         for row in rows:
             job_id = str(row["id"])
             ctx = row.get("context") or {}
+            if isinstance(ctx, str):
+                try:
+                    ctx = json.loads(ctx)
+                except (ValueError, TypeError):
+                    ctx = {}
             ws_ctx = ctx.get("workspace_container", {})
 
             # Determine last activity time
