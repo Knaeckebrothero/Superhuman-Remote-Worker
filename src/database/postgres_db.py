@@ -279,10 +279,10 @@ class PostgresDB:
         return self._pool is not None
 
     async def get_thread_messages_history(
-            self,
-            thread_id: str,
-            limit: int = 200,
-            offset: int = 0,
+        self,
+        thread_id: str,
+        limit: int = 200,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Load thread message history for session resume. Ordered by created_at ASC."""
         rows = await self.fetch(
