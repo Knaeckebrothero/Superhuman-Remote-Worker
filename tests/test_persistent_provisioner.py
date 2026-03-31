@@ -297,7 +297,7 @@ class TestPodManifest:
     def test_seccomp_profile(self):
         m = self._build()
         assert (
-                m["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+            m["spec"]["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
         )
 
     def test_volume_mounts(self):
@@ -355,8 +355,8 @@ class TestPodManifest:
 
     def test_image_from_env(self):
         with patch.dict(
-                "os.environ",
-                {"PERSISTENT_AGENT_IMAGE": "my-registry/agent:v2"},
+            "os.environ",
+            {"PERSISTENT_AGENT_IMAGE": "my-registry/agent:v2"},
         ):
             p = PersistentProvisioner()
         m = p._build_agent_pod_manifest(
@@ -416,8 +416,8 @@ class TestCreateAgentPodK8s:
         p._core_api.read_namespaced_pod.return_value = pod
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.create_agent_pod("thread-abc123def456")
 
@@ -436,8 +436,8 @@ class TestCreateAgentPodK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.create_agent_pod("thread-abc")
 
@@ -455,8 +455,8 @@ class TestCreateAgentPodK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.create_agent_pod("thread-abc")
 
@@ -474,8 +474,8 @@ class TestDeleteAgentPodK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.delete_agent_pod("thread-abc123def456")
 
@@ -498,8 +498,8 @@ class TestDeleteAgentPodK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.delete_agent_pod("thread-abc")
 
@@ -525,8 +525,8 @@ class TestGetPodStatusK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.get_pod_status("thread-abc123def456")
 
@@ -547,8 +547,8 @@ class TestGetPodStatusK8s:
             return fn(*args, **kwargs)
 
         with patch(
-                "orchestrator.services.persistent_provisioner.asyncio.to_thread",
-                side_effect=fake_to_thread,
+            "orchestrator.services.persistent_provisioner.asyncio.to_thread",
+            side_effect=fake_to_thread,
         ):
             result = await p.get_pod_status("thread-abc")
 

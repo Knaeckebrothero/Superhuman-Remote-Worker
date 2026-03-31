@@ -36,7 +36,7 @@ class WorkspaceSuspensionService:
         db: Any,
         snapshot_service: Any,
         container_provisioner: Any,
-            persistent_provisioner: Any = None,
+        persistent_provisioner: Any = None,
     ) -> None:
         self._db = db
         self._snapshot_service = snapshot_service
@@ -309,8 +309,8 @@ class WorkspaceSuspensionService:
 
             # Also delete the persistent agent pod (it's stateless, state is in the workspace)
             if (
-                    self._persistent_provisioner
-                    and self._persistent_provisioner.is_available
+                self._persistent_provisioner
+                and self._persistent_provisioner.is_available
             ):
                 await self._persistent_provisioner.delete_agent_pod(thread_id)
 
