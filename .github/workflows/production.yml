@@ -838,11 +838,11 @@ jobs:
           sed -i 's|superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}|g' \
             deployment/21-agent.yaml
 
-      - name: Update persistent agent image tag
+      - name: Update persistent agent image in ConfigMap
         if: needs.build-agent.result == 'success'
         run: |
-          sed -i 's|superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}|g' \
-            deployment/21c-agent-persistent.yaml
+          sed -i 's|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*"|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}"|g' \
+            deployment/02-configmap.yaml
 
       - name: Update cockpit image tag
         if: needs.build-cockpit.result == 'success'

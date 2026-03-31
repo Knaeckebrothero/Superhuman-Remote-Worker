@@ -101,6 +101,7 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
+from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
@@ -1778,11 +1779,15 @@ async def lifespan(app: FastAPI):
         container_provisioner=container_provisioner,
     )
 
+    # Initialize persistent agent provisioner (on-demand pods per thread)
+    persistent_provisioner.connect(db=postgres_db)
+
     # Initialize workspace suspension service (idle timeout → S3 snapshot → pod deletion)
     workspace_suspension_service.connect(
         db=postgres_db,
         snapshot_service=snapshot_service,
         container_provisioner=container_provisioner,
+        persistent_provisioner=persistent_provisioner,
     )
 
     # Initialize IDE proxy service (pod IP resolution + cache)
@@ -7720,6 +7725,18 @@ async def create_thread(
                 container_provisioner.create_thread_workspace(thread_id)
             )
 
+        # Provision persistent agent pod in background
+        if persistent_provisioner.is_available:
+            effective_config = (
+                    request_body.config_name
+                    or user_settings.get("config_name", "interactive")
+            )
+            asyncio.create_task(
+                persistent_provisioner.create_agent_pod(
+                    thread_id, config_name=effective_config
+                )
+            )
+
         return {"thread_id": thread_id, "status": "created"}
     except HTTPException:
         raise
@@ -7801,6 +7818,10 @@ async def end_thread(
     if container_provisioner.is_available:
         await container_provisioner.delete_thread_workspace(thread_id)
 
+    # Clean up persistent agent pod
+    if persistent_provisioner.is_available:
+        await persistent_provisioner.delete_agent_pod(thread_id)
+
     # Clean up VM if one was provisioned
     vm_ctx = metadata.get("vm") or {}
     if vm_ctx.get("status") in ("provisioning", "created", "ready"):
@@ -7843,6 +7864,28 @@ async def resume_thread(
         )
 
     await postgres_db.resume_thread(thread_id)
+
+    # Re-provision agent pod and restore workspace if suspended
+    if persistent_provisioner.is_available:
+        config_name = thread.get("config_name", "interactive")
+        asyncio.create_task(
+            persistent_provisioner.create_agent_pod(
+                thread_id, config_name=config_name
+            )
+        )
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws_ctx = metadata.get("workspace_container") or {}
+    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
+        asyncio.create_task(
+            workspace_suspension_service.restore_thread_workspace(thread_id)
+        )
+
     return {"status": "created", "thread_id": thread_id}
 
 
@@ -8051,8 +8094,31 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
             return
 
     if not thread.get("agent_id"):
-        await ws.close(code=4404, reason="Thread not active or no agent assigned")
-        return
+        # On-demand: provision agent pod if needed, then wait for registration
+        if persistent_provisioner.is_available:
+            pod_status = await persistent_provisioner.get_pod_status(thread_id)
+            if not pod_status:
+                config_name = thread.get("config_name", "interactive")
+                asyncio.create_task(
+                    persistent_provisioner.create_agent_pod(
+                        thread_id, config_name=config_name
+                    )
+                )
+
+        # Poll for agent registration (agent calls /api/agents/register on startup)
+        agent_bound = False
+        for _ in range(90):  # 180s timeout
+            await asyncio.sleep(2)
+            thread = await postgres_db.get_thread(thread_id)
+            if thread and thread.get("agent_id"):
+                agent_bound = True
+                break
+
+        if not agent_bound:
+            await ws.close(
+                code=4503, reason="Agent failed to start within timeout"
+            )
+            return
 
     agent = await postgres_db.get_agent(str(thread["agent_id"]))
     if not agent:
