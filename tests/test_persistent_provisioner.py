@@ -343,7 +343,6 @@ class TestPodManifest:
 
     def test_pod_name_truncation(self):
         """Pod name uses first 12 chars of thread_id."""
-        p = PersistentProvisioner()
         thread_id = "abcdef123456-7890-full-uuid"
         pod_name = f"persistent-{thread_id[:12]}"
         assert pod_name == "persistent-abcdef123456"
@@ -394,8 +393,6 @@ class TestCreateAgentPodK8s:
     @pytest.mark.asyncio
     async def test_creates_pod_via_k8s_api(self):
         p, _ = _make_provisioner_with_k8s()
-
-        call_count = {"create": 0, "read": 0}
 
         # Mock: to_thread calls the function synchronously
         async def fake_to_thread(fn, *args, **kwargs):
