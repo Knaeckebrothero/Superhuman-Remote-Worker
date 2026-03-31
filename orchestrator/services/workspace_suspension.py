@@ -503,6 +503,8 @@ class WorkspaceSuspensionService:
                     ctx = json.loads(ctx)
                 except (ValueError, TypeError):
                     ctx = {}
+            if not isinstance(ctx, dict):
+                ctx = {}
             ws_ctx = ctx.get("workspace_container", {})
 
             # Determine last activity time

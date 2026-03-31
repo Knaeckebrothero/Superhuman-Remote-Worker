@@ -305,15 +305,28 @@ class TestPodManifest:
         mounts = m["spec"]["containers"][0]["volumeMounts"]
         mount_paths = {vm["mountPath"] for vm in mounts}
         assert "/workspace" in mount_paths
+        assert "/run/secrets/vm-ssh-key" in mount_paths
         assert "/tmp" in mount_paths
         assert "/run" in mount_paths
         assert "/home/srw" in mount_paths
+
+    def test_ssh_key_mount(self):
+        m = self._build()
+        mounts = m["spec"]["containers"][0]["volumeMounts"]
+        ssh_mount = next(vm for vm in mounts if vm["name"] == "vm-ssh-key")
+        assert ssh_mount["subPath"] == "ssh-privatekey"
+        assert ssh_mount["readOnly"] is True
 
     def test_volumes(self):
         m = self._build()
         volumes = m["spec"]["volumes"]
         vol_names = {v["name"] for v in volumes}
-        assert {"workspace", "tmp", "run", "home-srw"} == vol_names
+        assert {"workspace", "vm-ssh-key", "tmp", "run", "home-srw"} == vol_names
+
+    def test_ssh_key_volume(self):
+        m = self._build()
+        volumes = {v["name"]: v for v in m["spec"]["volumes"]}
+        assert volumes["vm-ssh-key"]["secret"]["secretName"] == "vm-ssh-key"
 
     def test_tmpfs_volumes(self):
         m = self._build()

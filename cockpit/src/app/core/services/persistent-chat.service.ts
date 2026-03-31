@@ -1,4 +1,4 @@
-import {Injectable, signal, computed, inject} from '@angular/core';
+import {computed, inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
@@ -63,6 +63,12 @@ export class PersistentChatService {
     readonly currentTurnId = signal<number | null>(null);
     readonly isWaitingForInput = signal(false);
 
+    // --- Session readiness (agent has finished init and is ready for messages) ---
+    readonly sessionReady = signal(false);
+
+    // --- Pending message (submitted before session was ready) ---
+    readonly pendingMessage = signal<string | null>(null);
+
     // --- Error ---
     readonly error = signal<string | null>(null);
 
@@ -81,6 +87,8 @@ export class PersistentChatService {
         this.connectionState.set('connecting');
         this.error.set(null);
         this.historyLoaded.set(false);
+        this.sessionReady.set(false);
+        this.pendingMessage.set(null);
 
         let url: string;
         if ('directUrl' in target) {
@@ -182,12 +190,17 @@ export class PersistentChatService {
         this.connectionState.set('disconnected');
         this.isStreaming.set(false);
         this.isWaitingForInput.set(false);
+        this.sessionReady.set(false);
+        this.pendingMessage.set(null);
         this.pendingPermission.set(null);
     }
 
-    /** Send a user message (with slash command parsing). */
+    /** Send a user message (with slash command parsing).
+     *  If the session isn't ready yet, queues the message and sends it
+     *  automatically once the agent signals readiness.
+     */
     sendMessage(content: string): void {
-        if (!content.trim() || !this.ws) return;
+        if (!content.trim()) return;
 
         // Slash command parsing
         const trimmed = content.trim();
@@ -196,11 +209,17 @@ export class PersistentChatService {
             if (handled) return;
         }
 
-        // Add to local messages immediately
+        // Add to local messages immediately so the user sees their input
         this.messages.update((msgs) => [
             ...msgs,
             {role: 'user', content, timestamp: new Date()},
         ]);
+
+        // If session isn't ready yet, queue and send when ready
+        if (!this.sessionReady() || !this.ws) {
+            this.pendingMessage.set(content);
+            return;
+        }
 
         this.isWaitingForInput.set(false);
         this.send({method: 'message', content});
@@ -297,6 +316,7 @@ export class PersistentChatService {
                     },
                 ]);
                 this.isWaitingForInput.set(true);
+                this.markSessionReady();
                 break;
 
             case 'ready':
@@ -304,6 +324,7 @@ export class PersistentChatService {
                 this.isStreaming.set(false);
                 // Finalize any streaming text into a message
                 this.finalizeStreaming();
+                this.markSessionReady();
                 break;
 
             case 'turn.started':
@@ -417,6 +438,21 @@ export class PersistentChatService {
             case 'error':
                 this.error.set((params['message'] as string) || 'Unknown error');
                 break;
+        }
+    }
+
+    /** Mark the session as ready and flush any pending message. */
+    private markSessionReady(): void {
+        if (this.sessionReady()) return;
+        this.sessionReady.set(true);
+
+        const pending = this.pendingMessage();
+        if (pending) {
+            this.pendingMessage.set(null);
+            // Send directly — the message was already added to the messages array
+            // when the user submitted it, so we skip sendMessage() to avoid duplicates.
+            this.isWaitingForInput.set(false);
+            this.send({method: 'message', content: pending});
         }
     }
 

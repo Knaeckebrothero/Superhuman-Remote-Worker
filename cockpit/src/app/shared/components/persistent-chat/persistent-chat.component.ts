@@ -1,24 +1,19 @@
 import {
-    Component,
-    inject,
-    signal,
-    computed,
-    ViewChild,
-    ElementRef,
     AfterViewChecked,
-    OnInit,
-    OnDestroy,
+    Component,
+    computed,
     effect,
+    ElementRef,
+    inject,
+    OnDestroy,
+    signal,
+    ViewChild,
 } from '@angular/core';
 import {JsonPipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
-import {
-    PersistentChatService,
-    ChatMessage,
-    ToolCallInfo,
-} from '../../../core/services/persistent-chat.service';
+import {PersistentChatService, ToolCallInfo,} from '../../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../../core/services/api.service';
 
 interface SlashCommand {
@@ -273,8 +268,13 @@ const SLASH_COMMANDS: SlashCommand[] = [
           class="send-btn"
           (click)="send()"
           [disabled]="!canSend()"
+          [class.pending]="isPendingSend()"
         >
-          <span class="send-icon">send</span>
+          @if (isPendingSend()) {
+            <span class="send-spinner"></span>
+          } @else {
+            <span class="send-icon">send</span>
+          }
         </button>
       </div>
     </div>
@@ -965,6 +965,24 @@ const SLASH_COMMANDS: SlashCommand[] = [
         font-size: 18px;
       }
 
+      .send-btn.pending {
+        opacity: 0.7;
+        cursor: wait;
+      }
+
+      .send-spinner {
+        width: 16px;
+        height: 16px;
+        border: 2px solid var(--timeline-bg, #11111b);
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+
       /* Slash command autocomplete */
 
       .input-wrapper {
@@ -1137,14 +1155,21 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     readonly inputPlaceholder = computed(() => {
         if (!this.chat.isConnected()) return 'Connect to start chatting...';
+        if (this.chat.isConnected() && !this.chat.sessionReady()) return 'Type your message while the session starts...';
         if (this.chat.isStreaming()) return 'Agent is working...';
         return 'Type a message... (Enter to send, Shift+Enter for newline)';
     });
 
+    /** True when there is a pending message waiting for the session to become ready. */
+    readonly isPendingSend = computed(
+        () => this.chat.pendingMessage() !== null,
+    );
+
     readonly canSend = computed(
         () =>
             this.chat.isConnected() &&
-            this.inputText.trim().length > 0,
+            this.inputText.trim().length > 0 &&
+            !this.isPendingSend(),
     );
 
     ngAfterViewChecked(): void {
@@ -1160,7 +1185,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     send(): void {
         const text = this.inputText.trim();
-        if (!text || !this.chat.isConnected()) return;
+        if (!text) return;
 
         this.showSlashMenu.set(false);
         this.chat.sendMessage(text);
