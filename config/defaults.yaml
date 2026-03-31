@@ -131,6 +131,9 @@ tools:
   # Delegation tools - spawn child jobs as workspace branches (src/tools/delegation/)
   # Not in defaults — opt-in per expert config (e.g. tools.delegation: [delegate_work])
   delegation: []
+  # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
+  # Empty by default; persistent agents auto-load these via PersistentSession
+  orchestrator: [ ]
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -286,4 +289,11 @@ shell:
   sudo_action: freeze          # "freeze" (intercept sudo, offer VM upgrade) or "block" (hard reject)
   sandbox: true                # Restrict working directory to workspace
   auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)
+
+# Interactive persistent agent settings
+# Only used when agent is started with --mode persistent
+interactive:
+  permission_mode: supervised   # supervised | auto_accept | autonomous
+  idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)
+  greeting: "Hello! I'm ready to help. What would you like to work on?"
 

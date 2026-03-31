@@ -36,6 +36,7 @@ from .coding import create_coding_tools, get_coding_metadata
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .communication import create_communication_tools, get_communication_metadata
+from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -66,6 +67,7 @@ TOOL_REGISTRY.update(get_coding_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
+TOOL_REGISTRY.update(get_orchestrator_metadata())
 
 # Register delegation tool (placeholder — implementation in Phase 2)
 TOOL_REGISTRY["delegate_work"] = {
@@ -477,6 +479,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             logger.debug("Delegation tools not yet implemented (Phase 2)")
         except Exception as e:
             logger.warning(f"Could not load delegation tools: {e}")
+
+    # Orchestrator tools (job delegation for persistent agents)
+    if "orchestrator" in tools_by_category:
+        try:
+            orch_tools = create_orchestrator_tools(context)
+            requested = set(tools_by_category["orchestrator"])
+            for tool in orch_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded orchestrator tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load orchestrator tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

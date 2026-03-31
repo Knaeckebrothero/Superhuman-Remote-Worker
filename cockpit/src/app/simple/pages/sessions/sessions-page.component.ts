@@ -1,0 +1,722 @@
+import {Component, inject, signal, OnInit} from '@angular/core';
+import {Router} from '@angular/router';
+import {FormsModule} from '@angular/forms';
+import {HttpClient} from '@angular/common/http';
+import {DatePipe} from '@angular/common';
+import {firstValueFrom} from 'rxjs';
+import {environment} from '../../../core/environment';
+import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {ToastService} from '../../../core/services/toast.service';
+
+interface Thread {
+    id: string;
+    title: string;
+    status: string;
+    config_name: string;
+    permission_mode: string;
+    created_at: string;
+    last_activity: string;
+    ended_at: string | null;
+    total_turns: number;
+    project_id: string | null;
+    project_ids?: string[];
+}
+
+interface Project {
+    id: string;
+    name: string;
+    status: string;
+    description?: string;
+}
+
+@Component({
+    selector: 'app-sessions-page',
+    standalone: true,
+    imports: [FormsModule, DatePipe],
+    template: `
+    <div class="sessions-page">
+      <div class="page-header">
+        <h2>Sessions</h2>
+        <div class="header-actions">
+          <button class="btn btn-primary" (click)="showCreate = true">
+            <span class="icon">add</span> New Session
+          </button>
+          <button class="btn btn-secondary" (click)="connectDirect = !connectDirect">
+            <span class="icon">link</span> Direct Connect
+          </button>
+        </div>
+      </div>
+
+      <!-- Active session banner -->
+      @if (chat.isConnected()) {
+        <div class="active-banner" (click)="returnToActive()">
+          <span class="active-dot"></span>
+          <span>Active session in progress</span>
+          <span class="active-action">Return to chat</span>
+        </div>
+      }
+
+      <!-- Direct connect (local dev) -->
+      @if (connectDirect) {
+        <div class="direct-connect">
+          <div class="direct-hint">Connects directly to a running agent, bypassing the orchestrator. For local dev with <code>python agent.py --mode persistent</code>.</div>
+          <div class="direct-row">
+            <input
+              type="text"
+              [(ngModel)]="directUrl"
+              placeholder="ws://localhost:8001/ws/chat"
+              (keydown.enter)="goDirectConnect()"
+            />
+            <button class="btn btn-primary btn-sm" (click)="goDirectConnect()">Connect</button>
+            <button class="btn btn-secondary btn-sm" (click)="connectDirect = false">Cancel</button>
+          </div>
+        </div>
+      }
+
+      <!-- Create dialog -->
+      @if (showCreate) {
+        <div class="create-dialog">
+          <h3>New Session</h3>
+          <p class="dialog-hint">Creates a thread via the orchestrator and connects through its WebSocket proxy. Requires a persistent agent pod to be registered and bound to the thread.</p>
+          <div class="form-group">
+            <label>Title</label>
+            <input type="text" [(ngModel)]="newTitle" placeholder="Untitled Session" />
+          </div>
+          <div class="form-group">
+            <label>Config</label>
+            <select [(ngModel)]="newConfig">
+              <option value="interactive">Interactive (default)</option>
+              <option value="defaults">Framework Defaults</option>
+              <option value="developer">Developer</option>
+              <option value="scholar">Scholar</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Model</label>
+            <select [(ngModel)]="newModel">
+              <option value="">Config default</option>
+              <optgroup label="Local">
+                <option value="openai/gpt-oss-120b">GPT-OSS 120B (local)</option>
+              </optgroup>
+              <optgroup label="OpenAI">
+                <option value="gpt-4o">GPT-4o</option>
+                <option value="gpt-4o-mini">GPT-4o Mini</option>
+                <option value="o4-mini">o4-mini</option>
+              </optgroup>
+              <optgroup label="Anthropic">
+                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+              </optgroup>
+              <optgroup label="Google">
+                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+              </optgroup>
+              <optgroup label="Groq">
+                <option value="groq/moonshotai/kimi-k2-instruct-0905">Kimi K2 (Groq)</option>
+              </optgroup>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Projects</label>
+            <div class="project-chips">
+              @if (projects().length === 0) {
+                <span class="chip-hint">No projects available</span>
+              } @else {
+                @for (project of projects(); track project.id) {
+                  <button
+                    type="button"
+                    class="project-chip"
+                    [class.selected]="isProjectSelected(project.id)"
+                    (click)="toggleProject(project.id)"
+                    [title]="project.description || project.name"
+                  >{{ project.name }}</button>
+                }
+              }
+            </div>
+            <span class="chip-hint">Select projects for shared knowledge access</span>
+          </div>
+          <div class="form-group">
+            <label>Permission Mode</label>
+            <select [(ngModel)]="newPermission">
+              <option value="supervised">Supervised</option>
+              <option value="auto_accept">Auto-accept</option>
+              <option value="autonomous">Autonomous</option>
+            </select>
+          </div>
+          <div class="dialog-actions">
+            <button class="btn btn-primary" (click)="createSession()" [disabled]="creating()">
+              {{ creating() ? 'Creating...' : 'Create' }}
+            </button>
+            <button class="btn btn-secondary" (click)="showCreate = false">Cancel</button>
+          </div>
+        </div>
+      }
+
+      <!-- Session list -->
+      <div class="session-list">
+        @if (loading()) {
+          <div class="loading">Loading sessions...</div>
+        } @else if (threads().length === 0) {
+          <div class="empty-state">
+            <span class="empty-icon">chat_bubble_outline</span>
+            <p>No sessions yet. Create one to get started.</p>
+          </div>
+        } @else {
+          <!-- Filter tabs -->
+          <div class="filter-tabs">
+            <button
+              class="filter-tab"
+              [class.active]="statusFilter() === null"
+              (click)="statusFilter.set(null)"
+            >All</button>
+            <button
+              class="filter-tab"
+              [class.active]="statusFilter() === 'active'"
+              (click)="statusFilter.set('active')"
+            >Active</button>
+            <button
+              class="filter-tab"
+              [class.active]="statusFilter() === 'ended'"
+              (click)="statusFilter.set('ended')"
+            >Ended</button>
+          </div>
+
+          @for (thread of filteredThreads(); track thread.id) {
+            <div class="session-card" [class.ended]="thread.status === 'ended'">
+              <div class="session-main" (click)="resumeSession(thread)">
+                <div class="session-info">
+                  <span class="session-status-dot" [class]="thread.status"></span>
+                  <span class="session-title">{{ thread.title || 'Untitled Session' }}</span>
+                  <span class="session-config">{{ thread.config_name }}</span>
+                </div>
+                <div class="session-meta">
+                  <span class="meta-item">{{ thread.total_turns || 0 }} turns</span>
+                  <span class="meta-item">{{ thread.last_activity | date:'short' }}</span>
+                </div>
+              </div>
+              <div class="session-actions">
+                <button class="icon-btn" title="Resume" (click)="resumeSession(thread)">
+                  <span class="icon">play_arrow</span>
+                </button>
+                @if (thread.status !== 'ended') {
+                  <button class="icon-btn" title="End" (click)="endSession(thread)">
+                    <span class="icon">stop</span>
+                  </button>
+                }
+                <button class="icon-btn danger" title="Delete" (click)="deleteSession(thread)">
+                  <span class="icon">delete</span>
+                </button>
+              </div>
+            </div>
+          }
+        }
+      </div>
+    </div>
+  `,
+    styles: [`
+    :host {
+      display: block;
+      height: 100%;
+      overflow-y: auto;
+      background: var(--app-bg, #1e1e2e);
+    }
+
+    .sessions-page {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .page-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 20px;
+    }
+
+    .page-header h2 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary, #cdd6f4);
+      margin: 0;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border-color, #313244);
+      font-size: 12px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .btn-sm { padding: 4px 10px; }
+
+    .btn-primary {
+      background: var(--accent-color, #cba6f7);
+      color: var(--timeline-bg, #11111b);
+      border-color: var(--accent-color, #cba6f7);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--text-muted, #6c7086);
+    }
+
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .icon {
+      font-family: 'Material Symbols Outlined';
+      font-size: 16px;
+    }
+
+    /* Active session banner */
+    .active-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      background: rgba(166, 227, 161, 0.08);
+      border: 1px solid #a6e3a1;
+      border-radius: 8px;
+      margin-bottom: 16px;
+      cursor: pointer;
+      font-size: 13px;
+      color: #a6e3a1;
+      transition: background 0.15s ease;
+    }
+
+    .active-banner:hover { background: rgba(166, 227, 161, 0.14); }
+
+    .active-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #a6e3a1;
+      flex-shrink: 0;
+      animation: pulse 1.5s infinite;
+    }
+
+    .active-action {
+      margin-left: auto;
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: underline;
+    }
+
+    /* Direct connect */
+    .direct-connect {
+      padding: 12px;
+      background: var(--panel-bg, #181825);
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+
+    .direct-hint, .dialog-hint {
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+      line-height: 1.5;
+      margin-bottom: 8px;
+    }
+
+    .dialog-hint { margin-top: -4px; }
+
+    .direct-hint code {
+      padding: 1px 4px;
+      border-radius: 3px;
+      background: var(--surface-0, #313244);
+      font-size: 11px;
+    }
+
+    .direct-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .direct-connect input {
+      flex: 1;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color, #313244);
+      background: var(--surface-0, #313244);
+      color: var(--text-primary, #cdd6f4);
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    /* Create dialog */
+    .create-dialog {
+      padding: 16px;
+      background: var(--panel-bg, #181825);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+
+    .create-dialog h3 {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-primary, #cdd6f4);
+      margin: 0 0 12px;
+    }
+
+    .form-group {
+      margin-bottom: 10px;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+      margin-bottom: 4px;
+    }
+
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color, #313244);
+      background: var(--surface-0, #313244);
+      color: var(--text-primary, #cdd6f4);
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    .project-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+
+    .project-chip {
+      padding: 4px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border-color, #313244);
+      background: transparent;
+      color: var(--text-muted, #6c7086);
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .project-chip:hover {
+      border-color: var(--text-color, #cdd6f4);
+      color: var(--text-color, #cdd6f4);
+    }
+
+    .project-chip.selected {
+      background: var(--accent-color, #a6e3a1);
+      border-color: var(--accent-color, #a6e3a1);
+      color: var(--bg-color, #1e1e2e);
+    }
+
+    .chip-hint {
+      font-size: 10px;
+      color: var(--text-muted, #6c7086);
+    }
+
+    .dialog-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    /* Filter tabs */
+    .filter-tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 12px;
+    }
+
+    .filter-tab {
+      padding: 4px 12px;
+      border-radius: 4px;
+      border: 1px solid var(--border-color, #313244);
+      background: transparent;
+      color: var(--text-muted, #6c7086);
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+    }
+
+    .filter-tab.active {
+      background: var(--surface-0, #313244);
+      color: var(--text-primary, #cdd6f4);
+      border-color: var(--accent-color, #cba6f7);
+    }
+
+    /* Session cards */
+    .session-card {
+      display: flex;
+      align-items: center;
+      padding: 12px;
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      background: var(--panel-bg, #181825);
+      margin-bottom: 8px;
+      transition: border-color 0.15s ease;
+    }
+
+    .session-card:hover { border-color: var(--accent-color, #cba6f7); }
+    .session-card.ended { opacity: 0.6; }
+
+    .session-main {
+      flex: 1;
+      cursor: pointer;
+      min-width: 0;
+    }
+
+    .session-info {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    .session-status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .session-status-dot.active, .session-status-dot.created { background: #a6e3a1; }
+    .session-status-dot.idle { background: #f9e2af; }
+    .session-status-dot.ended { background: var(--surface-2, #585b70); }
+
+    .session-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary, #cdd6f4);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .session-config {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      background: var(--surface-0, #313244);
+      color: var(--text-muted, #6c7086);
+      flex-shrink: 0;
+    }
+
+    .session-meta {
+      display: flex;
+      gap: 12px;
+    }
+
+    .meta-item {
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+    }
+
+    .session-actions {
+      display: flex;
+      gap: 4px;
+      flex-shrink: 0;
+      margin-left: 8px;
+    }
+
+    .icon-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 4px;
+      border: none;
+      background: transparent;
+      color: var(--text-muted, #6c7086);
+      cursor: pointer;
+    }
+
+    .icon-btn:hover { background: var(--surface-0, #313244); color: var(--text-primary, #cdd6f4); }
+    .icon-btn.danger:hover { color: #f38ba8; }
+
+    /* Empty / loading */
+    .loading, .empty-state {
+      text-align: center;
+      padding: 40px;
+      color: var(--text-muted, #6c7086);
+      font-size: 13px;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .empty-icon {
+      font-family: 'Material Symbols Outlined';
+      font-size: 48px;
+      display: block;
+      margin-bottom: 12px;
+      opacity: 0.3;
+    }
+  `],
+})
+export class SessionsPageComponent implements OnInit {
+    private readonly http = inject(HttpClient);
+    private readonly router = inject(Router);
+    private readonly toast = inject(ToastService);
+    readonly chat = inject(PersistentChatService);
+
+    threads = signal<Thread[]>([]);
+    projects = signal<Project[]>([]);
+    loading = signal(true);
+    creating = signal(false);
+    statusFilter = signal<string | null>(null);
+    selectedProjectIds = signal<string[]>([]);
+
+    showCreate = false;
+    connectDirect = false;
+    directUrl = 'ws://localhost:8001/ws/chat';
+    newTitle = '';
+    newConfig = 'interactive';
+    newModel = '';
+    newPermission = 'supervised';
+
+    filteredThreads = () => {
+        const filter = this.statusFilter();
+        const all = this.threads();
+        if (!filter) return all;
+        return all.filter(t => t.status === filter);
+    };
+
+    ngOnInit(): void {
+        this.loadThreads();
+        this.loadProjects();
+    }
+
+    async loadThreads(): Promise<void> {
+        this.loading.set(true);
+        try {
+            const data = await firstValueFrom(
+                this.http.get<{ threads: Thread[] }>(`${environment.apiUrl}/persistent/threads`)
+            );
+            this.threads.set(data.threads || []);
+        } catch (e) {
+            // Silent — sessions not available
+        }
+        this.loading.set(false);
+    }
+
+    async loadProjects(): Promise<void> {
+        try {
+            const data = await firstValueFrom(
+                this.http.get<Project[]>(`${environment.apiUrl}/projects`)
+            );
+            this.projects.set(data || []);
+        } catch (e) {
+            // Silent — projects not available
+        }
+    }
+
+    toggleProject(id: string): void {
+        const current = this.selectedProjectIds();
+        if (current.includes(id)) {
+            this.selectedProjectIds.set(current.filter(p => p !== id));
+        } else {
+            this.selectedProjectIds.set([...current, id]);
+        }
+    }
+
+    isProjectSelected(id: string): boolean {
+        return this.selectedProjectIds().includes(id);
+    }
+
+    async createSession(): Promise<void> {
+        this.creating.set(true);
+        try {
+            const body: Record<string, any> = {
+                title: this.newTitle || 'Untitled Session',
+                config_name: this.newConfig,
+                permission_mode: this.newPermission,
+            };
+            if (this.newModel) body['model'] = this.newModel;
+            if (this.selectedProjectIds().length > 0) {
+                body['project_ids'] = this.selectedProjectIds();
+            }
+            const data = await firstValueFrom(
+                this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
+            );
+            this.showCreate = false;
+            this.newTitle = '';
+            this.newModel = '';
+            this.selectedProjectIds.set([]);
+            this.router.navigate(['/sessions', data.thread_id]);
+        } catch (e) {
+            // Handle error
+        }
+        this.creating.set(false);
+    }
+
+    async resumeSession(thread: Thread): Promise<void> {
+        if (thread.status === 'ended') {
+            try {
+                await firstValueFrom(
+                    this.http.post(`${environment.apiUrl}/persistent/threads/${thread.id}/resume`, {})
+                );
+                thread.status = 'created';
+            } catch (e: any) {
+                this.toast.error(e?.error?.detail || 'Failed to resume session');
+                return;
+            }
+        }
+        this.router.navigate(['/sessions', thread.id]);
+    }
+
+    async endSession(thread: Thread): Promise<void> {
+        try {
+            await firstValueFrom(
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}`)
+            );
+            this.loadThreads();
+        } catch (e: any) {
+            this.toast.error(e?.error?.detail || 'Failed to end session');
+        }
+    }
+
+    async deleteSession(thread: Thread): Promise<void> {
+        if (!confirm('Delete this session permanently?')) return;
+        try {
+            await firstValueFrom(
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true`)
+            );
+            this.loadThreads();
+        } catch (e: any) {
+            this.toast.error(e?.error?.detail || 'Failed to delete session');
+        }
+    }
+
+    returnToActive(): void {
+        const threadId = this.chat.threadId();
+        if (threadId === 'local') {
+            this.router.navigate(['/sessions', 'direct']);
+        } else if (threadId) {
+            this.router.navigate(['/sessions', threadId]);
+        }
+    }
+
+    goDirectConnect(): void {
+        if (this.directUrl.trim()) {
+            // Store URL and navigate to chat page with direct flag
+            sessionStorage.setItem('persistentDirectUrl', this.directUrl.trim());
+            this.router.navigate(['/sessions', 'direct']);
+        }
+    }
+}

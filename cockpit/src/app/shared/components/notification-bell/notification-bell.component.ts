@@ -78,6 +78,7 @@ export class NotificationBellComponent {
     if (c.messages > 0) parts.push(`${c.messages} message${c.messages > 1 ? 's' : ''}`);
     if (c.sudo > 0) parts.push(`${c.sudo} sudo`);
     if (c.reviews > 0) parts.push(`${c.reviews} review${c.reviews > 1 ? 's' : ''}`);
+      if (c.sessions > 0) parts.push(`${c.sessions} session${c.sessions > 1 ? 's' : ''}`);
     return parts.join(', ');
   }
 }

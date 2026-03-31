@@ -313,37 +313,51 @@ class KnowledgeStore:
 
     async def hybrid_search(
         self,
-        project_id: uuid.UUID,
-        query: str,
+            project_id: Optional[uuid.UUID] = None,
+            query: str = "",
         match_count: int = 10,
         dense_weight: float = 0.6,
         sparse_weight: float = 0.3,
         recency_weight: float = 0.1,
+            project_ids: Optional[List[uuid.UUID]] = None,
     ) -> List[KnowledgeRecord]:
         """Execute hybrid search (RRF over dense + sparse + recency).
 
         Args:
-            project_id: Project UUID
+            project_id: Single project UUID (backward compat)
             query: Search query text
             match_count: Max results
             dense_weight: Weight for vector similarity
             sparse_weight: Weight for keyword match
             recency_weight: Weight for recency
+            project_ids: List of project UUIDs for multi-project search
 
         Returns:
             List of KnowledgeRecord objects ranked by RRF score
         """
+        # Normalize: project_ids takes priority, fall back to project_id
+        effective_ids = project_ids or ([project_id] if project_id else [])
+        if not effective_ids:
+            return []
+
         query_embedding = await self.embedding_service.embed(query)
 
+        if len(effective_ids) > 1:
+            func_name = "knowledge_multi_project_hybrid_search"
+            scope_val = effective_ids
+        else:
+            func_name = "knowledge_hybrid_search"
+            scope_val = effective_ids[0]
+
         rows = await self.db.fetch(
-            """
-            SELECT * FROM knowledge_hybrid_search(
+            f"""
+            SELECT * FROM {func_name}(
                 $1, $2, $3, $4, $5, $6, $7
             )
             """,
             query,
             query_embedding,
-            project_id,
+            scope_val,
             match_count,
             dense_weight,
             sparse_weight,
@@ -352,17 +366,33 @@ class KnowledgeStore:
 
         return [KnowledgeRecord.from_row(dict(row)) for row in rows]
 
-    async def get_summary(self, project_id: uuid.UUID) -> Dict[str, Any]:
+    async def get_summary(
+            self,
+            project_id: Optional[uuid.UUID] = None,
+            project_ids: Optional[List[uuid.UUID]] = None,
+    ) -> Dict[str, Any]:
         """Get knowledge base summary for context injection.
 
         Args:
-            project_id: Project UUID
+            project_id: Single project UUID (backward compat)
+            project_ids: List of project UUIDs for multi-project summary
 
         Returns:
             Dict with note counts by type, total count, recent notes
         """
+        effective_ids = project_ids or ([project_id] if project_id else [])
+        if not effective_ids:
+            return {"total": 0}
+
+        if len(effective_ids) > 1:
+            scope_clause = "project_id = ANY($1)"
+            scope_val = effective_ids
+        else:
+            scope_clause = "project_id = $1"
+            scope_val = effective_ids[0]
+
         row = await self.db.fetchrow(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE status = 'active') AS active,
@@ -374,23 +404,23 @@ class KnowledgeStore:
                 COUNT(*) FILTER (WHERE note_type = 'state') AS state_notes,
                 MAX(modified_at) AS last_modified
             FROM knowledge_index
-            WHERE project_id = $1
+            WHERE {scope_clause}
             """,
-            project_id,
+            scope_val,
         )
 
         summary = dict(row) if row else {"total": 0}
 
         # Get 5 most recent notes
         recent = await self.db.fetch(
-            """
+            f"""
             SELECT note_id, title, note_type, status, modified_at
             FROM knowledge_index
-            WHERE project_id = $1 AND status = 'active'
+            WHERE {scope_clause} AND status = 'active'
             ORDER BY modified_at DESC
             LIMIT 5
             """,
-            project_id,
+            scope_val,
         )
         summary["recent_notes"] = [dict(r) for r in recent]
 

@@ -16,6 +16,9 @@ spec:
         - podSelector:
             matchLabels:
               app: srw-agent
+        - podSelector:
+            matchLabels:
+              app: srw-agent-persistent
       ports:
         - protocol: TCP
           port: 22

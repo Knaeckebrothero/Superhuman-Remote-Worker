@@ -54,8 +54,6 @@ spec:
                   optional: true
             - name: MCP_OIDC_CONFIG_URL
               value: "http://srw-keycloak:8080/realms/srw/.well-known/openid-configuration"
-            - name: MCP_OIDC_ISSUER
-              value: "https://auth.superhuman-remote-worker.com/realms/srw"
             - name: MCP_BASE_URL
               value: "https://mcp.superhuman-remote-worker.com"
           livenessProbe:

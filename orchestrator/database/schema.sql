@@ -467,6 +467,152 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add agent_mode column for persistent agent support
+DO
+$$
+BEGIN
+ALTER TABLE agents
+    ADD COLUMN agent_mode VARCHAR(20) NOT NULL DEFAULT 'worker';
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add thread_id column for persistent agent sessions
+DO
+$$
+BEGIN
+ALTER TABLE agents
+    ADD COLUMN thread_id UUID;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_agents_thread_id ON agents(thread_id);
+CREATE INDEX IF NOT EXISTS idx_agents_mode ON agents(agent_mode);
+
+-- ============================================================================
+-- 4b. THREADS TABLE
+-- Interactive persistent agent sessions (parallel to jobs for workers).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS threads
+(
+    id
+    UUID
+    PRIMARY
+    KEY
+    DEFAULT
+    uuid_generate_v4
+(
+),
+
+    -- Session identification
+    title TEXT DEFAULT 'Untitled Session',
+
+    -- Owner
+    user_id UUID REFERENCES users
+(
+    id
+) ON DELETE SET NULL,
+    project_id UUID REFERENCES projects
+(
+    id
+)
+  ON DELETE SET NULL,
+
+    -- Agent binding
+    agent_id UUID REFERENCES agents
+(
+    id
+)
+  ON DELETE SET NULL,
+
+    -- Status
+    status VARCHAR
+(
+    20
+) NOT NULL DEFAULT 'created',
+
+    -- Permission mode
+    permission_mode VARCHAR
+(
+    20
+) NOT NULL DEFAULT 'supervised',
+
+    -- Config used for this session
+    config_name VARCHAR
+(
+    100
+),
+
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_activity TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+  WITH TIME ZONE,
+
+      -- Extensible metadata
+      metadata JSONB DEFAULT '{}',
+      CONSTRAINT valid_thread_status CHECK (
+      status IN ('created', 'active', 'idle', 'ended')
+    ),
+    CONSTRAINT valid_permission_mode CHECK
+(
+    permission_mode
+    IN
+(
+    'supervised',
+    'auto_accept',
+    'autonomous'
+)
+    )
+    );
+
+-- Session tracking columns
+ALTER TABLE threads
+    ADD COLUMN IF NOT EXISTS total_turns INTEGER DEFAULT 0;
+ALTER TABLE threads
+    ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id);
+CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
+CREATE INDEX IF NOT EXISTS idx_threads_agent ON threads(agent_id);
+CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id);
+
+-- ============================================================================
+-- 4c. THREAD MESSAGES TABLE
+-- Persistent message storage for interactive agent sessions.
+-- Follows the same pattern as builder_messages.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS thread_messages
+(
+    id
+    UUID
+    PRIMARY
+    KEY
+    DEFAULT
+    uuid_generate_v4
+(
+),
+    thread_id UUID NOT NULL REFERENCES threads
+(
+    id
+) ON DELETE CASCADE,
+    role VARCHAR
+(
+    20
+) NOT NULL,
+    content TEXT,
+    tool_calls JSONB,
+    turn_number INTEGER,
+    metrics JSONB,
+    created_at TIMESTAMP
+  WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+CREATE INDEX IF NOT EXISTS idx_thread_messages_thread ON thread_messages(thread_id);
+
+-- Migration: add metrics column to existing databases
+ALTER TABLE thread_messages
+    ADD COLUMN IF NOT EXISTS metrics JSONB;
+
 -- ============================================================================
 -- 3. DATASOURCES TABLE
 -- External database connections that agents can use during job execution.

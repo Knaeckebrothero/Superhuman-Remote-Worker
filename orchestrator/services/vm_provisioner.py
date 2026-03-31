@@ -385,6 +385,168 @@ class VMProvisioner:
         except Exception:
             logger.exception("Failed to update VM context for job %s", job_id)
 
+    # =========================================================================
+    # Thread VM support (persistent agent sessions)
+    # =========================================================================
+
+    async def create_thread_vm(
+            self,
+            thread_id: str,
+            agent_config: str = "defaults",
+            vm_image: Optional[str] = None,
+            cpu_cores: int = 2,
+            memory: str = "4Gi",
+            description: str = "",
+    ) -> bool:
+        """Create a VM for a persistent thread.
+
+        Mirrors create_vm() but routes context to threads.metadata.vm
+        and uses entity_type="thread" for NATS bridge routing.
+
+        Returns:
+            True if the request was accepted, False otherwise.
+        """
+        if nats_bridge.is_available:
+            return await nats_bridge.request_vm_create(
+                job_id=thread_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
+                entity_type="thread",
+            )
+
+        if self._k8s_available:
+            return await self._create_thread_vm_direct(
+                thread_id=thread_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
+            )
+
+        return False
+
+    async def delete_thread_vm(self, thread_id: str) -> bool:
+        """Delete a VM for a persistent thread.
+
+        Returns:
+            True if the request was accepted, False otherwise.
+        """
+        if nats_bridge.is_available:
+            return await nats_bridge.request_vm_delete(thread_id)
+
+        if self._k8s_available:
+            return await self._delete_thread_vm_direct(thread_id)
+
+        return False
+
+    async def _create_thread_vm_direct(
+            self,
+            thread_id: str,
+            agent_config: str,
+            vm_image: Optional[str],
+            cpu_cores: int,
+            memory: str,
+            description: str,
+    ) -> bool:
+        """Create a thread VM via direct Kubernetes API call."""
+        job_config = {
+            "job_id": thread_id,  # Template uses ${JOB_ID}
+            "agent_config": agent_config,
+            "vm_image": vm_image,
+            "cpu_cores": cpu_cores,
+            "memory": memory,
+            "description": description,
+            "nats_url": os.environ.get("NATS_URL", ""),
+        }
+
+        try:
+            manifest = self._render_template(job_config)
+            vm_name = manifest["metadata"]["name"]
+
+            await asyncio.to_thread(
+                self._k8s.create_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=self._vm_namespace,
+                plural=KUBEVIRT_PLURAL,
+                body=manifest,
+            )
+
+            logger.info(
+                "Thread VM created (direct): %s (thread %s)", vm_name, thread_id
+            )
+            await self._set_thread_vm_context(
+                thread_id,
+                {
+                    "status": "created",
+                    "vm_name": vm_name,
+                    "namespace": self._vm_namespace,
+                    "provisioned_by": "direct",
+                },
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to create thread VM for %s: %s", thread_id, e
+            )
+            await self._set_thread_vm_context(
+                thread_id,
+                {
+                    "status": "failed",
+                    "error": str(e),
+                    "provisioned_by": "direct",
+                },
+            )
+            return False
+
+    async def _delete_thread_vm_direct(self, thread_id: str) -> bool:
+        """Delete a thread VM via direct Kubernetes API call."""
+        vm_name = f"agent-vm-{thread_id}"
+
+        try:
+            await asyncio.to_thread(
+                self._k8s.delete_namespaced_custom_object,
+                group=KUBEVIRT_GROUP,
+                version=KUBEVIRT_VERSION,
+                namespace=self._vm_namespace,
+                plural=KUBEVIRT_PLURAL,
+                name=vm_name,
+            )
+
+            logger.info(
+                "Thread VM deleted (direct): %s (thread %s)", vm_name, thread_id
+            )
+            await self._set_thread_vm_context(thread_id, {"status": "deleted"})
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                logger.debug(
+                    "Thread VM already deleted: %s (thread %s)",
+                    vm_name,
+                    thread_id,
+                )
+                return True
+            logger.error(
+                "Failed to delete thread VM for %s: %s", thread_id, e
+            )
+            return False
+
+    async def _set_thread_vm_context(self, thread_id: str, updates: dict) -> None:
+        """Atomically merge updates into thread's metadata.vm key."""
+        if not self._db:
+            return
+
+        try:
+            await self._db.merge_thread_vm_context(thread_id, updates)
+        except Exception:
+            logger.exception(
+                "Failed to update thread VM context for %s", thread_id
+            )
+
 
 # Module-level singleton
 vm_provisioner = VMProvisioner()

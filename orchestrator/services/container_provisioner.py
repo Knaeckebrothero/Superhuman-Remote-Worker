@@ -530,6 +530,152 @@ class ContainerProvisioner:
                 job_id,
             )
 
+    # =========================================================================
+    # Thread workspace (persistent agent sessions)
+    # =========================================================================
+
+    async def create_thread_workspace(
+            self,
+            thread_id: str,
+            cpu: str = "500m",
+            memory: str = "1Gi",
+            cpu_limit: str = "2000m",
+            memory_limit: str = "4Gi",
+            image: Optional[str] = None,
+    ) -> bool:
+        """Create a workspace container for a persistent thread.
+
+        Same as create_workspace() but stores context in threads.metadata
+        instead of jobs.context.
+
+        Args:
+            thread_id: Thread UUID.
+            cpu: CPU request.
+            memory: Memory request.
+            cpu_limit: CPU limit.
+            memory_limit: Memory limit.
+            image: Workspace image override.
+
+        Returns:
+            True if pod creation succeeded, False otherwise.
+        """
+        if not self._k8s_available:
+            return False
+
+        pod_name = f"ws-thread-{thread_id[:12]}"
+        workspace_image = image or self._workspace_image
+
+        pod_manifest = self._build_pod_manifest(
+            pod_name=pod_name,
+            job_id=thread_id,  # Reuse job_id label slot for thread_id
+            image=workspace_image,
+            cpu=cpu,
+            memory=memory,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+        )
+
+        # Override labels for thread identification
+        pod_manifest["metadata"]["labels"]["srw/thread-id"] = thread_id
+        pod_manifest["metadata"]["labels"]["srw/component"] = "thread-workspace"
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=pod_manifest,
+            )
+            logger.info(
+                "Thread workspace created: %s (thread %s)", pod_name, thread_id
+            )
+            await self._set_thread_context(
+                thread_id,
+                {
+                    "status": "created",
+                    "pod_name": pod_name,
+                    "namespace": self._namespace,
+                },
+            )
+
+            pod_ip = await self._wait_for_ready(pod_name, timeout=120)
+            if pod_ip:
+                await self._set_thread_context(
+                    thread_id,
+                    {"status": "ready", "pod_ip": pod_ip},
+                )
+                logger.info(
+                    "Thread workspace ready: %s @ %s (thread %s)",
+                    pod_name,
+                    pod_ip,
+                    thread_id,
+                )
+            else:
+                logger.warning(
+                    "Thread workspace not ready within timeout: %s (thread %s)",
+                    pod_name,
+                    thread_id,
+                )
+                await self._set_thread_context(thread_id, {"status": "creating"})
+
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to create thread workspace for %s: %s", thread_id, e
+            )
+            await self._set_thread_context(
+                thread_id,
+                {"status": "failed", "error": str(e)},
+            )
+            return False
+
+    async def delete_thread_workspace(self, thread_id: str) -> bool:
+        """Delete the workspace container for a persistent thread.
+
+        Returns:
+            True if deleted, False otherwise.
+        """
+        if not self._k8s_available:
+            return False
+
+        pod_name = f"ws-thread-{thread_id[:12]}"
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+                grace_period_seconds=10,
+            )
+            logger.info(
+                "Thread workspace deleted: %s (thread %s)", pod_name, thread_id
+            )
+            await self._set_thread_context(thread_id, {"status": "deleted"})
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                logger.debug(
+                    "Thread workspace already deleted: %s (thread %s)",
+                    pod_name,
+                    thread_id,
+                )
+                return True
+            logger.error(
+                "Failed to delete thread workspace for %s: %s", thread_id, e
+            )
+            return False
+
+    async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
+        """Atomically merge updates into thread's metadata.workspace_container."""
+        if not self._db:
+            return
+
+        try:
+            await self._db.merge_thread_workspace_context(thread_id, updates)
+        except Exception:
+            logger.exception(
+                "Failed to update thread workspace context for %s", thread_id
+            )
+
 
 # Module-level singleton
 container_provisioner = ContainerProvisioner()

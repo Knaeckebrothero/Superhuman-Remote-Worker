@@ -403,6 +403,69 @@ SELECT memories.* FROM (
     FULL OUTER JOIN sparse s ON d.id = s.id
     FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
 ) ranked
+                           JOIN memories ON ranked.mid = memories.id
+ORDER BY ranked.rrf_score DESC LIMIT match_count
+$$;
+
+-- Multi-project variant: searches memories across multiple projects at once.
+-- Used by persistent sessions scoped to 2+ projects.
+CREATE
+OR REPLACE FUNCTION memory_multi_project_hybrid_search(
+    query_text text,
+    query_embedding vector(4096),
+    project_ids_param uuid[],
+    match_count int DEFAULT 10,
+    dense_weight float DEFAULT 0.6,
+    sparse_weight float DEFAULT 0.3,
+    recency_weight float DEFAULT 0.1,
+    rrf_k int DEFAULT 50,
+    importance_floor float DEFAULT 0.0
+) RETURNS SETOF memories LANGUAGE sql AS $$
+WITH dense AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
+    FROM (
+        SELECT id, MIN(dist) AS best_dist
+        FROM (
+            -- Content embedding matches
+            (SELECT id, embedding <=> query_embedding AS dist
+            FROM memories WHERE project_id = ANY(project_ids_param) AND embedding IS NOT NULL AND importance >= importance_floor
+                AND (remaining_turns IS NULL OR remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 3)
+
+            UNION ALL
+
+            -- Trigger phrase embedding matches → parent memory_id
+            (SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
+            FROM memory_retrieval_messages rm
+            INNER JOIN memories m ON rm.memory_id = m.id
+            WHERE m.project_id = ANY(project_ids_param) AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 5)
+        ) all_matches
+        GROUP BY id
+    ) best_per_memory
+    LIMIT match_count * 2
+),
+sparse AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    FROM memories WHERE project_id = ANY(project_ids_param) AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+recent AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
+    FROM memories WHERE project_id = ANY(project_ids_param) AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT memories.*
+FROM (SELECT COALESCE(d.id, s.id, r.id)                                AS mid,
+             COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+             COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+             COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+      FROM dense d
+               FULL OUTER JOIN sparse s ON d.id = s.id
+               FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id) ranked
 JOIN memories ON ranked.mid = memories.id
 ORDER BY ranked.rrf_score DESC
 LIMIT match_count
@@ -490,6 +553,50 @@ recent AS (
 SELECT ki.* FROM (
     SELECT COALESCE(d.id, s.id, r.id) AS mid,
         COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+    FROM dense d
+             FULL OUTER JOIN sparse s ON d.id = s.id
+             FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id) ranked
+                     JOIN knowledge_index ki ON ranked.mid = ki.id
+ORDER BY ranked.rrf_score DESC LIMIT match_count
+$$;
+
+-- Multi-project variant: searches knowledge across multiple projects at once.
+-- Used by persistent sessions scoped to 2+ projects.
+CREATE
+OR REPLACE FUNCTION knowledge_multi_project_hybrid_search(
+    query_text text,
+    query_embedding vector,
+    project_ids_param uuid[],
+    match_count int DEFAULT 10,
+    dense_weight float DEFAULT 0.6,
+    sparse_weight float DEFAULT 0.3,
+    recency_weight float DEFAULT 0.1,
+    rrf_k int DEFAULT 50
+) RETURNS SETOF knowledge_index LANGUAGE sql AS $$
+WITH dense AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = ANY(project_ids_param) AND status = 'active' AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+sparse AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = ANY(project_ids_param) AND status = 'active'
+      AND search_doc @@ websearch_to_tsquery('english', query_text)
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+recent AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY modified_at DESC) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = ANY(project_ids_param) AND status = 'active'
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT ki.*
+FROM (SELECT COALESCE(d.id, s.id, r.id)                           AS mid,
+             COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
         COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
         COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
     FROM dense d

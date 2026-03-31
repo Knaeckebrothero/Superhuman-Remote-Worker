@@ -10,10 +10,15 @@ import { ProjectDetailPageComponent } from './pages/project-detail/project-detai
 import { SudoPageComponent } from './simple/pages/sudo/sudo-page.component';
 import { InboxPageComponent } from './simple/pages/inbox/inbox-page.component';
 import { MessageRedirectComponent } from './shared/components/message-redirect/message-redirect.component';
+import {ChatPageComponent} from './simple/pages/chat/chat-page.component';
+import {SessionsPageComponent} from './simple/pages/sessions/sessions-page.component';
 import { authGuard } from './core/guards/auth.guard';
 
 export const routes: Routes = [
   { path: '', component: ShellPageComponent, canActivate: [authGuard] },
+    {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
+    {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
+    {path: 'chat', redirectTo: 'sessions'},
   { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },
   { path: 'create', component: CreatePageComponent, canActivate: [authGuard] },
   { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },

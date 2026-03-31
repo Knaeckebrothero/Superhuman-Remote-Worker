@@ -116,8 +116,13 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 def _get_project_id(context: ToolContext) -> Optional[str]:
-    """Get the project ID from context."""
+    """Get primary project ID (for writes)."""
     return context.project_id
+
+
+def _get_project_ids(context: ToolContext) -> List[str]:
+    """Get all project IDs (for reads across multiple projects)."""
+    return context.project_ids
 
 
 def create_kb_tools(context: ToolContext) -> List[Any]:
@@ -352,12 +357,16 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             Full note content with metadata, tags, and relationships
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            data = kg.read_note(project_id, note)
+            data = None
+            for pid in project_ids:
+                data = kg.read_note(pid, note)
+                if data:
+                    break
             if not data:
                 return f"Note '{note}' not found."
 
@@ -428,18 +437,22 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             Formatted list of matching notes
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            notes = kg.list_notes(
-                project_id=project_id,
-                note_type=type,
-                tag=tag,
-                status=status,
-                job_id=job_id,
-            )
+            notes = []
+            for pid in project_ids:
+                notes.extend(
+                    kg.list_notes(
+                        project_id=pid,
+                        note_type=type,
+                        tag=tag,
+                        status=status,
+                        job_id=job_id,
+                    )
+                )
 
             if not notes:
                 filters = []
@@ -482,14 +495,14 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             Ranked search results with note summaries
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
             results = _run_async(
                 ks.hybrid_search(
-                    project_id=uuid.UUID(project_id),
+                    project_ids=[uuid.UUID(p) for p in project_ids],
                     query=query,
                     match_count=max_results,
                 )
@@ -538,16 +551,20 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             List of related notes with relationship types and distance
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            results = kg.get_related(
-                project_id=project_id,
-                note_id=note,
-                max_hops=max_hops,
-            )
+            results = []
+            for pid in project_ids:
+                results.extend(
+                    kg.get_related(
+                        project_id=pid,
+                        note_id=note,
+                        max_hops=max_hops,
+                    )
+                )
 
             if not results:
                 return f"No related notes found for '{note}'."
@@ -581,12 +598,14 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             List of contradiction pairs
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            results = kg.get_contradictions(project_id)
+            results = []
+            for pid in project_ids:
+                results.extend(kg.get_contradictions(pid))
 
             if not results:
                 return "No active contradictions found in the knowledge base."
@@ -618,12 +637,14 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             Ordered provenance chain from the note back to its sources
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            results = kg.get_provenance(project_id, note)
+            results = []
+            for pid in project_ids:
+                results.extend(kg.get_provenance(pid, note))
 
             if not results:
                 return f"No provenance chain found for '{note}'."
@@ -652,12 +673,14 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             List of unanswered questions
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            results = kg.get_unanswered(project_id)
+            results = []
+            for pid in project_ids:
+                results.extend(kg.get_unanswered(pid))
 
             if not results:
                 return "No unanswered questions in the knowledge base."
@@ -693,12 +716,14 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         Returns:
             Summary of exported files
         """
-        project_id = _get_project_id(context)
-        if not project_id:
+        project_ids = _get_project_ids(context)
+        if not project_ids:
             return "Error: No project_id available."
 
         try:
-            notes = kg.get_all_notes_for_export(project_id)
+            notes = []
+            for pid in project_ids:
+                notes.extend(kg.get_all_notes_for_export(pid))
             if not notes:
                 return "Knowledge base is empty — nothing to export."
 

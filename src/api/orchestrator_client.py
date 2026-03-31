@@ -119,8 +119,16 @@ class OrchestratorClient:
             await self._client.aclose()
             self._client = None
 
-    async def register(self) -> bool:
+    async def register(
+            self,
+            agent_mode: str = "worker",
+            thread_id: str | None = None,
+    ) -> bool:
         """Register this agent with the orchestrator.
+
+        Args:
+            agent_mode: "worker" (default, dispatch pool) or "persistent" (interactive session)
+            thread_id: Thread UUID for persistent mode
 
         Returns:
             True if registration succeeded, False otherwise
@@ -135,6 +143,8 @@ class OrchestratorClient:
             "pod_port": self.pod_port,
             "hostname": self.hostname,
             "pid": self.pid,
+            "agent_mode": agent_mode,
+            "thread_id": thread_id,
         }
 
         try:
@@ -161,6 +171,118 @@ class OrchestratorClient:
         except Exception as e:
             logger.error(f"Unexpected error during registration: {e}")
             return False
+
+    async def create_thread(
+            self,
+            config_name: str = "interactive",
+            permission_mode: str = "supervised",
+            title: str = "Local Session",
+    ) -> str | None:
+        """Create a thread in the orchestrator DB (agent-facing, no auth).
+
+        Returns:
+            Thread UUID string, or None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads"
+        payload = {
+            "config_name": config_name,
+            "permission_mode": permission_mode,
+            "title": title,
+        }
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                data = response.json()
+                thread_id = data.get("thread_id")
+                logger.info(f"Created thread via orchestrator: {thread_id}")
+                return thread_id
+            else:
+                logger.error(f"Failed to create thread: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to create thread: {e}")
+            return None
+
+    async def save_thread_message(
+            self,
+            thread_id: str,
+            role: str,
+            content: str | None = None,
+            tool_calls: list | None = None,
+            turn_number: int | None = None,
+            metrics: dict | None = None,
+    ) -> bool:
+        """Save a message to thread history via orchestrator REST. Fire-and-forget safe."""
+        if not self._client:
+            return False
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/messages"
+        payload = {
+            "role": role,
+            "content": content,
+            "tool_calls": tool_calls,
+            "turn_number": turn_number,
+            "metrics": metrics,
+        }
+
+        try:
+            response = await self._client.post(url, json=payload)
+            return response.status_code == 200
+        except Exception as e:
+            logger.warning(f"Failed to save thread message (non-fatal): {e}")
+            return False
+
+    async def request_thread_vm_upgrade(
+            self, thread_id: str, cpu_cores: int = 2, memory: str = "4Gi"
+    ) -> bool:
+        """Request VM provisioning for a persistent thread (upgrade from container).
+
+        Returns:
+            True if accepted, False on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/upgrade-to-vm"
+        payload = {"cpu_cores": cpu_cores, "memory": memory}
+
+        try:
+            response = await self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info(f"VM upgrade requested for thread {thread_id}")
+                return True
+            else:
+                logger.error(
+                    f"VM upgrade request failed: {response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"VM upgrade request error: {e}")
+            return False
+
+    async def get_thread_workspace(self, thread_id: str) -> dict | None:
+        """Poll workspace container status for a thread.
+
+        Returns:
+            Workspace status dict {status, pod_ip, pod_name, namespace},
+            or None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/workspace"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get thread workspace: {e}")
+            return None
 
     async def deregister(self) -> bool:
         """Deregister this agent from the orchestrator.
@@ -195,6 +317,26 @@ class OrchestratorClient:
             return False
         except Exception as e:
             logger.error(f"Unexpected error during deregistration: {e}")
+            return False
+
+    async def update_thread_status(self, thread_id: str, status: str) -> bool:
+        """Update thread status via orchestrator REST.
+
+        Args:
+            thread_id: Thread UUID
+            status: New status ('active' or 'idle')
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/status"
+        try:
+            r = await self._client.put(url, json={"status": status})
+            return r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
     async def heartbeat(

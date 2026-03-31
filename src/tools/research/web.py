@@ -5,7 +5,7 @@ Supports search, extract, crawl, and map operations.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.tools import tool
 
@@ -72,6 +72,8 @@ def _parse_comma_list(value: Optional[str]) -> Optional[List[str]]:
 
 def _truncate_content(content: str, max_words: int = MAX_RAW_CONTENT_WORDS) -> str:
     """Truncate content to max_words, appending a note if truncated."""
+    if not content:
+        return ""
     words = content.split()
     if len(words) > max_words:
         return (
@@ -94,9 +96,9 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     def web_search(
         query: str,
         max_results: int = 5,
-        search_depth: str = "basic",
-        topic: str = "general",
-        time_range: Optional[str] = None,
+            search_depth: Literal["basic", "advanced"] = "basic",
+            topic: Literal["general", "news", "finance"] = "general",
+            time_range: Optional[Literal["day", "week", "month", "year"]] = None,
         include_domains: Optional[str] = None,
         exclude_domains: Optional[str] = None,
         include_raw_content: bool = False,
@@ -110,7 +112,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             query: Search query
             max_results: Maximum results to return (1-20, default 5)
             search_depth: "basic" (fast, 1 credit) or "advanced" (better relevance, 2 credits)
-            topic: "general" (default) or "news" (optimized for recent events)
+            topic: "general" (default), "news" (recent events), or "finance" (financial data)
             time_range: Filter by recency: "day", "week", "month", "year", or None
             include_domains: Comma-separated domains to restrict search to
             exclude_domains: Comma-separated domains to exclude from results
@@ -135,7 +137,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     def extract_webpage(
         urls: str,
         query: Optional[str] = None,
-        extract_depth: str = "basic",
+            extract_depth: Literal["basic", "advanced"] = "basic",
     ) -> str:
         """Extract full content from one or more web pages using Tavily Extract.
 
@@ -316,7 +318,7 @@ def _direct_web_search(
             for r in results:
                 url = r.get("url", "")
                 if url:
-                    content = r.get("raw_content", r.get("content", ""))
+                    content = r.get("raw_content") or r.get("content") or ""
                     if content and len(content) > 50:
                         title = r.get("title", "Untitled")
                         source_id = next(
@@ -347,10 +349,10 @@ def _direct_web_search(
                 result += f"   Source ID: {source_id} (archived)\n"
 
             if include_raw_content:
-                content = r.get("raw_content", r.get("content", ""))
+                content = r.get("raw_content") or r.get("content") or ""
                 result += f"   {_truncate_content(content)}\n\n"
             else:
-                result += f"   {r.get('content', '')[:300]}...\n\n"
+                result += f"   {(r.get('content') or '')[:300]}...\n\n"
 
         if inaccessible_sources:
             result += (
@@ -372,6 +374,7 @@ def _direct_web_search(
     except ImportError:
         return "Error: langchain-tavily package not installed"
     except Exception as e:
+        logger.exception("Web search failed for query: %s", query)
         return f"Error searching web: {str(e)}"
 
 
@@ -447,10 +450,10 @@ def _extract_webpage(
 
         for i, r in enumerate(results, 1):
             url = r.get("url", "N/A")
-            content = r.get("raw_content", "")
+            content = r.get("raw_content") or ""
             source_id = next((sid for u, sid in registered if u == url), None)
 
-            word_count = len(content.split())
+            word_count = len(content.split()) if content else 0
             content = _truncate_content(content)
 
             output += f"{i}. {url}\n"
@@ -475,6 +478,7 @@ def _extract_webpage(
     except ImportError:
         return "Error: langchain-tavily package not installed"
     except Exception as e:
+        logger.exception("Web extract failed for URLs: %s", urls)
         return f"Error extracting content: {str(e)}"
 
 
@@ -569,10 +573,10 @@ def _crawl_website(
 
         for i, r in enumerate(results, 1):
             page_url = r.get("url", "N/A")
-            content = r.get("raw_content", "")
+            content = r.get("raw_content") or ""
             source_id = next((sid for u, sid in registered if u == page_url), None)
 
-            word_count = len(content.split())
+            word_count = len(content.split()) if content else 0
             content = _truncate_content(content)
 
             output += f"{i}. {page_url}\n"
@@ -589,6 +593,7 @@ def _crawl_website(
     except ImportError:
         return "Error: langchain-tavily package not installed"
     except Exception as e:
+        logger.exception("Web crawl failed for URL: %s", url)
         return f"Error crawling website: {str(e)}"
 
 

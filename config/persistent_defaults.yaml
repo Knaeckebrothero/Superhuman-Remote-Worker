@@ -1,0 +1,195 @@
+# yaml-language-server: $schema=schema.json
+# Persistent agent defaults — base for interactive/persistent configs.
+# Worker-mode configs should extend defaults.yaml instead.
+#
+# Does NOT include: instruction_files, phase_settings, delegation, autonomy,
+# verification, scholar, curator, communication. Those are worker-mode only.
+#
+# Model-specific inference params (temperature, top_p, context limits) are
+# injected automatically by the settings matrix — do not set them here.
+
+agent_id: persistent
+display_name: Persistent Agent
+
+llm:
+  model: openai/gpt-oss-120b
+  provider: null
+  temperature: 0.0
+  reasoning_level: high
+  reasoning_method: null
+  base_url: null
+  timeout: 600
+  max_retries: 3
+  max_output_tokens: null
+  multimodal: false
+  parallel_tool_calls: false
+
+workspace:
+  structure:
+    - documents/
+    - notes/
+    - output/
+  max_read_words: 25000
+  max_write_words: 10000
+  git_versioning: false
+  backend: local
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - rename_file
+    - copy_file
+    - get_document_info
+    - create_directory
+    - delete_directory
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - search_papers
+    - download_paper
+    - get_paper_info
+    - browse_website
+    - download_from_website
+    - research_topic
+  citation:
+    - cite_document
+    - cite_web
+    - list_sources
+    - get_citation
+    - list_citations
+    - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
+    - generate_bibliography
+  document:
+    - chunk_document
+  coding:
+    - run_command
+    - shell_read
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+    - kb_export
+  # Orchestrator tools auto-injected by PersistentSession._setup_tools()
+  orchestrator: [ ]
+  # Phase-specific tools not used in persistent mode
+  core: [ ]
+  # Datasource-injected (empty by default)
+  graph: [ ]
+  sql: [ ]
+  mongodb: [ ]
+  # Not used in persistent mode
+  evaluation: [ ]
+  delegation: [ ]
+  communication: [ ]
+
+connections:
+  postgres: true
+
+limits:
+  message_count_threshold: 300
+  tool_retry_count: 3
+  response_validation:
+    enabled: true
+    max_content_length: 50000
+    max_tag_repetitions: 50
+    max_token_repetitions: 20
+    max_line_repetitions: 10
+
+context_management:
+  keep_recent_tool_results: 150
+  keep_recent_messages: 10
+  summarization_template: summarization_prompt.txt
+  reasoning_level: high
+  max_summary_length: 20000
+
+memory:
+  enabled: true
+  budget_tokens: 10000
+  max_memories_per_injection: 150
+  observer_interval: 5
+  assembler_interval: 7
+  default_ttl: 10
+  observer_model: null
+  observer_base_url: null
+  embedding_model: qwen3-embedding-8b
+  dense_results: 30
+  sparse_results: 30
+  recent_results: 15
+  importance_threshold: 0.3
+  dedup_threshold: 0.85
+  retrieval_importance_floor: 0.4
+  project_scoped: true
+  storage: postgres
+
+auxiliary:
+  enabled: true
+  model: openai/gpt-oss-120b
+  base_url: null
+  temperature: 0.0
+  max_iterations: 15
+  timeout: 120
+  tasks:
+    extract_memories:
+      enabled: true
+    curate_knowledge:
+      enabled: true
+    assemble_memories:
+      enabled: true
+
+interactive:
+  permission_mode: supervised
+  idle_timeout_minutes: 30
+  greeting: "Hello! I'm ready to help. What would you like to work on?"
+
+# --- Extra config (flows to config.extra, read by tools) ---
+
+research:
+  proxy:
+    enabled: false
+    type: socks5
+    host: null
+    port: null
+
+browser:
+  headless: true
+  timeout: 60000
+  use_vision: false
+
+claude_code:
+  model: claude-opus-4-6
+
+shell:
+  mode: stateless
+  max_tabs: 15
+  max_read_lines: 200
+  scrollback_limit: 5000
+  default_timeout: 120
+  blocked_commands: [ reboot, shutdown, poweroff, halt, init ]
+  sudo_action: freeze
+  sandbox: true
+  auto_start_claude_code: false

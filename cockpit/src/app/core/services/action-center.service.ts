@@ -1,6 +1,6 @@
 import {computed, DestroyRef, inject, Injectable, signal} from '@angular/core';
 import {SudoRequest, SudoService} from './sudo.service';
-import {NotificationService} from './notification.service';
+import {NotificationService, SessionEvent} from './notification.service';
 import {ApiService} from './api.service';
 import {AppNotification, Job} from '../models/api.model';
 import {ActionItem, ActionItemStatus, MessageActionData, ReviewActionData,} from '../models/action.model';
@@ -61,7 +61,8 @@ export class ActionCenterService {
     const sudoItems = this.sudo.requests().map((r) => this.mapSudo(r));
     const messageItems = this.deduplicateThreads(this.notifications.notifications());
     const reviewItems = this.reviewJobs().map((j) => this.mapReview(j));
-    return [...sudoItems, ...messageItems, ...reviewItems].sort(actionItemComparator);
+      const sessionItems = this.notifications.sessionEvents().map((e) => this.mapSession(e));
+      return [...sudoItems, ...messageItems, ...reviewItems, ...sessionItems].sort(actionItemComparator);
   });
 
   readonly counts = computed(() => {
@@ -70,6 +71,7 @@ export class ActionCenterService {
       sudo: pending.filter((i) => i.type === 'sudo').length,
       messages: pending.filter((i) => i.type === 'message').length,
       reviews: pending.filter((i) => i.type === 'review').length,
+        sessions: pending.filter((i) => i.type === 'session').length,
       total: pending.length,
     };
   });
@@ -206,4 +208,25 @@ export class ActionCenterService {
       } as ReviewActionData,
     };
   }
+
+    private mapSession(e: SessionEvent): ActionItem {
+        const isPermission = e.type === 'session.permission_request';
+        const isVmUpgrade = e.type === 'session.vm_upgrade';
+
+        return {
+            id: `sess:${e.event_id}`,
+            type: 'session',
+            status: 'pending',
+            urgency: isPermission ? 90 : isVmUpgrade ? 70 : 30,
+            timestamp: e.created_at,
+            title: isPermission
+                ? `Approve: ${e.tool}`
+                : isVmUpgrade
+                    ? 'VM Upgrade Needed'
+                    : 'Waiting for Input',
+            subtitle: [e.title, e.config_name].filter(Boolean).join(' \u00B7 '),
+            jobId: null,
+            session: {threadId: e.thread_id, event: e},
+        };
+    }
 }

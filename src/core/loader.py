@@ -525,6 +525,7 @@ class PromptMatrixResolver(MatrixResolver):
     FRAMEWORK_DIR = "config/prompts"
     HARDCODED_DEFAULTS = {
         "systemprompt": "systemprompt.txt",
+        "systemprompt_interactive": "systemprompt_interactive.txt",
         "persona": "persona.txt",
         "strategic": "strategic.txt",
         "tactical": "tactical.txt",
@@ -767,6 +768,7 @@ class ToolsConfig:
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
+    orchestrator: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -898,6 +900,19 @@ class AuxiliaryConfig:
 
 
 @dataclass
+class InteractiveConfig:
+    """Configuration for persistent interactive mode.
+
+    Only used when the agent is started with --mode persistent.
+    Controls permission defaults, idle behavior, and the initial greeting.
+    """
+
+    permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
+    idle_timeout_minutes: int = 60  # 0 = disabled
+    greeting: str = "Hello! I'm ready to help. What would you like to work on?"
+
+
+@dataclass
 class DelegationConfig:
     """Subagent delegation configuration.
 
@@ -941,6 +956,7 @@ class AgentConfig:
     auxiliary: AuxiliaryConfig = field(default_factory=AuxiliaryConfig)
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
+    interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
     autonomy: str = "partial"
 
     # Additional agent-specific config (preserved from JSON)
@@ -1195,6 +1211,7 @@ def load_agent_config(
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         delegation=tools_data.get("delegation", []),
+        orchestrator=tools_data.get("orchestrator", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1287,9 +1304,20 @@ def load_agent_config(
         "auxiliary",
         "instruction_files",
         "delegation",
+        "interactive",
         "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
+
+    # Parse interactive config
+    interactive_data = data.get("interactive", {})
+    interactive_config = InteractiveConfig(
+        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        greeting=interactive_data.get(
+            "greeting", InteractiveConfig.greeting
+        ),
+    )
 
     return AgentConfig(
         agent_id=data["agent_id"],
@@ -1306,6 +1334,7 @@ def load_agent_config(
         auxiliary=auxiliary_config,
         instruction_files=instruction_files,
         delegation=delegation_config,
+        interactive=interactive_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
@@ -1373,6 +1402,7 @@ def load_agent_config_from_dict(
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         delegation=tools_data.get("delegation", []),
+        orchestrator=tools_data.get("orchestrator", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1465,9 +1495,20 @@ def load_agent_config_from_dict(
         "auxiliary",
         "instruction_files",
         "delegation",
+        "interactive",
         "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
+
+    # Parse interactive config
+    interactive_data = data.get("interactive", {})
+    interactive_config = InteractiveConfig(
+        permission_mode=interactive_data.get("permission_mode", "supervised"),
+        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        greeting=interactive_data.get(
+            "greeting", InteractiveConfig.greeting
+        ),
+    )
 
     return AgentConfig(
         agent_id=data["agent_id"],
@@ -1484,6 +1525,7 @@ def load_agent_config_from_dict(
         auxiliary=auxiliary_config,
         instruction_files=instruction_files,
         delegation=delegation_config,
+        interactive=interactive_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
@@ -2296,6 +2338,7 @@ def get_phase_system_prompt(
     phase_number: int = 0,
     model: str = "",
     tool_names: Optional[List[str]] = None,
+        prompt_type: Optional[str] = None,
 ) -> str:
     """Get the complete system prompt for the current phase.
 
@@ -2338,12 +2381,45 @@ def get_phase_system_prompt(
     model_family = detect_model_family(model) if model else "default"
     resolver = PromptMatrixResolver(config._deployment_dir, model_family)
 
-    # 1. Load base template
+    # Interactive mode: single self-contained prompt, no phase component injection
+    if prompt_type == "interactive":
+        template = resolved_prompts.get("systemprompt_interactive") or resolver.load(
+            "systemprompt_interactive"
+        )
+
+        # Load expert persona
+        expert_identity = resolved_prompts.get("persona") or ""
+        if not expert_identity:
+            try:
+                expert_identity = resolver.load("persona")
+            except FileNotFoundError:
+                expert_identity = ""
+
+        # Render Jinja2 conditionals
+        if tool_names is not None:
+            template = render_instruction_content(template, tool_names)
+
+        rendered = template.format(
+            agent_display_name=config.display_name,
+            expert_identity=expert_identity,
+        )
+
+        # Prepend reasoning directive for OSS models
+        method = detect_reasoning_method(
+            model or config.llm.model, config.llm.reasoning_method
+        )
+        if method == "prompt":
+            level = config.llm.reasoning_level or "high"
+            rendered = f"Reasoning: {level}\n\n{rendered}"
+
+        return rendered
+
+    # Worker mode: base template (systemprompt.txt) + phase component (strategic/tactical)
     base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(
         resolver
     )
 
-    # 2. Load expert persona (empty string if no persona file exists)
+    # Load expert persona (empty string if no persona file exists)
     expert_identity = resolved_prompts.get("persona") or ""
     if not expert_identity:
         try:
@@ -2351,22 +2427,22 @@ def get_phase_system_prompt(
         except FileNotFoundError:
             expert_identity = ""
 
-    # 3. Load phase component
-    prompt_type = "strategic" if is_strategic else "tactical"
-    phase_component = resolved_prompts.get(prompt_type) or load_phase_component(
+    # Load phase component
+    prompt_type_key = prompt_type or ("strategic" if is_strategic else "tactical")
+    phase_component = resolved_prompts.get(prompt_type_key) or load_phase_component(
         is_strategic, resolver
     )
 
-    # 4. Render Jinja2 conditionals BEFORE .format() — Python's str.format()
+    # Render Jinja2 conditionals BEFORE .format() — Python's str.format()
     # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
     if tool_names is not None:
         phase_component = render_instruction_content(phase_component, tool_names)
         base_template = render_instruction_content(base_template, tool_names)
 
-    # 5. Render phase component's {phase_number} placeholder
+    # Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)
 
-    # 6. Inject all components and render remaining placeholders
+    # Inject all components and render remaining placeholders
     rendered = base_template.format(
         agent_display_name=config.display_name,
         expert_identity=expert_identity,
@@ -2562,6 +2638,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         + config.tools.evaluation
         + config.tools.knowledge
         + config.tools.delegation
+        + config.tools.orchestrator
     )
 
     # Shell mode aliasing for backward compatibility
@@ -3102,7 +3179,7 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     # Resolve all prompts to full text
     prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
     prompts = {}
-    for pt in ["systemprompt", "persona", "strategic", "tactical", "summarization"]:
+    for pt in ["systemprompt", "systemprompt_interactive", "persona", "strategic", "tactical", "summarization"]:
         try:
             prompts[pt] = prompt_resolver.load(pt)
         except FileNotFoundError:

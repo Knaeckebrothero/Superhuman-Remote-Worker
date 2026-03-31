@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=../../schema.json
+# Interactive — Persistent agent for conversational sessions
+$extends: persistent_defaults
+
+agent_id: interactive
+display_name: Interactive Assistant
+description: |
+  Conversational assistant for interactive persistent sessions.
+  WebSocket transport, permission modes, context compaction,
+  and memory injection. No phases, no todos — just a while(tool_call) loop.
+icon: chat
+color: "#a6e3a1"
+tags:
+  - interactive
+  - persistent
+  - assistant
+
+llm:
+  model: openai/gpt-oss-120b
+  temperature: 0.0
+  reasoning_level: high
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - list_files
+    - search_files
+  research:
+    - web_search
+  coding:
+    - run_command
+    - shell_read
+  git:
+    - git_log
+    - git_status
+    - git_diff
+    - git_show
+  orchestrator: [ ]
+  core: [ ]
+  document: [ ]
+  citation: [ ]
+  graph: [ ]
+  sql: [ ]
+  mongodb: [ ]
+  evaluation: [ ]
+  knowledge: [ ]
+  delegation: [ ]
+
+interactive:
+  permission_mode: supervised
+  idle_timeout_minutes: 120
+  greeting: "Hello! I'm ready to help. What would you like to work on?"
+
+memory:
+  enabled: true
+
+workspace:
+  structure:
+    - documents/
+    - notes/
+  git_versioning: false

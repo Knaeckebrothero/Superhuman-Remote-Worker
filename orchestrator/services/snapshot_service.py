@@ -5,7 +5,8 @@ S3-compatible object storage (MinIO, AWS S3, etc.). Snapshots enable
 on-demand IDE sessions and environment-aware job resume.
 
 Architecture:
-  - Each job's snapshots live under ``s3://<bucket>/jobs/<uuid>/``
+  - Each entity's snapshots live under ``s3://<bucket>/<entity_type>/<uuid>/``
+    (``entity_type`` is ``jobs`` or ``threads``)
   - Phase-boundary snapshots are stored per-phase under ``phases/phase_<n>/``
   - The top-level ``manifest.json`` + ``env.tar.zst`` always point to the latest
 
@@ -128,14 +129,16 @@ class SnapshotService:
         tar_path: str,
         manifest: dict[str, Any],
         phase_number: Optional[int] = None,
+            entity_type: str = "jobs",
     ) -> bool:
         """Upload a snapshot tarball + manifest to S3.
 
         Args:
-            job_id: Job UUID.
+            job_id: Job or thread UUID.
             tar_path: Local path to the env.tar.zst file.
             manifest: Manifest dict (will be serialized to JSON).
             phase_number: If set, store under phases/phase_<n>/ as well.
+            entity_type: S3 prefix namespace ("jobs" or "threads").
 
         Returns:
             True if upload succeeded.
@@ -143,7 +146,7 @@ class SnapshotService:
         if not self._available:
             return False
 
-        prefix = f"jobs/{job_id}"
+        prefix = f"{entity_type}/{job_id}"
         phase_prefix = (
             f"{prefix}/phases/phase_{phase_number}"
             if phase_number is not None
@@ -188,7 +191,7 @@ class SnapshotService:
                 ContentType="application/json",
             )
 
-            # Update job context
+            # Update entity context
             await self._set_snapshot_context(
                 job_id,
                 {
@@ -201,10 +204,12 @@ class SnapshotService:
                     "phase_number": phase_number,
                     "checksum_sha256": sha256,
                 },
+                entity_type=entity_type,
             )
 
             logger.info(
-                "Snapshot uploaded: job=%s phase=%s size=%s",
+                "Snapshot uploaded: %s=%s phase=%s size=%s",
+                entity_type.rstrip("s"),
                 job_id,
                 phase_number,
                 manifest.get("size_compressed_bytes", "?"),
@@ -212,13 +217,14 @@ class SnapshotService:
             return True
 
         except Exception as e:
-            logger.error("Snapshot upload failed for job %s: %s", job_id, e)
+            logger.error("Snapshot upload failed for %s %s: %s", entity_type.rstrip("s"), job_id, e)
             await self._set_snapshot_context(
                 job_id,
                 {
                     "status": "capture_failed",
                     "error": str(e),
                 },
+                entity_type=entity_type,
             )
             return False
 
@@ -230,6 +236,7 @@ class SnapshotService:
         phase_number: Optional[int] = None,
         source_type: str = "vm",
         agent_config: str = "defaults",
+            entity_type: str = "jobs",
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -237,12 +244,13 @@ class SnapshotService:
         streams to a local temp file, then uploads to S3.
 
         Args:
-            job_id: Job UUID.
+            job_id: Job or thread UUID.
             ssh_host: VM SSH host.
             ssh_port: VM SSH port.
             phase_number: Current phase number (for per-phase storage).
             source_type: "vm" or "pod".
             agent_config: Agent config name for manifest.
+            entity_type: S3 prefix namespace ("jobs" or "threads").
 
         Returns:
             True if capture + upload succeeded.
@@ -252,7 +260,7 @@ class SnapshotService:
 
         import tempfile
 
-        await self._set_snapshot_context(job_id, {"status": "capturing"})
+        await self._set_snapshot_context(job_id, {"status": "capturing"}, entity_type=entity_type)
 
         tar_path = None
         try:
@@ -315,7 +323,8 @@ class SnapshotService:
                     if total_bytes > max_size:
                         process.kill()
                         logger.warning(
-                            "Snapshot too large for job %s (>%s GB), aborting",
+                            "Snapshot too large for %s %s (>%s GB), aborting",
+                            entity_type.rstrip("s"),
                             job_id,
                             os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10"),
                         )
@@ -325,6 +334,7 @@ class SnapshotService:
                                 "status": "capture_failed",
                                 "error": "Snapshot exceeds size limit",
                             },
+                            entity_type=entity_type,
                         )
                         return False
                     f.write(chunk)
@@ -333,13 +343,14 @@ class SnapshotService:
 
             if process.returncode != 0 and total_bytes == 0:
                 stderr = (await process.stderr.read()).decode(errors="replace")
-                logger.error("SSH tar failed for job %s: %s", job_id, stderr[:500])
+                logger.error("SSH tar failed for %s %s: %s", entity_type.rstrip("s"), job_id, stderr[:500])
                 await self._set_snapshot_context(
                     job_id,
                     {
                         "status": "capture_failed",
                         "error": f"SSH tar failed (rc={process.returncode})",
                     },
+                    entity_type=entity_type,
                 )
                 return False
 
@@ -375,11 +386,12 @@ class SnapshotService:
                 tar_path=tar_path,
                 manifest=manifest,
                 phase_number=phase_number,
+                entity_type=entity_type,
             )
 
         except Exception as e:
             logger.error(
-                "Snapshot capture failed for job %s: %s", job_id, e, exc_info=True
+                "Snapshot capture failed for %s %s: %s", entity_type.rstrip("s"), job_id, e, exc_info=True
             )
             await self._set_snapshot_context(
                 job_id,
@@ -387,6 +399,7 @@ class SnapshotService:
                     "status": "capture_failed",
                     "error": str(e),
                 },
+                entity_type=entity_type,
             )
             return False
         finally:
@@ -447,13 +460,15 @@ class SnapshotService:
     # =========================================================================
 
     async def get_manifest(
-        self, job_id: str, phase_number: Optional[int] = None
+            self, job_id: str, phase_number: Optional[int] = None,
+            entity_type: str = "jobs",
     ) -> Optional[dict[str, Any]]:
-        """Retrieve the manifest for a job's snapshot.
+        """Retrieve the manifest for a snapshot.
 
         Args:
-            job_id: Job UUID.
+            job_id: Job or thread UUID.
             phase_number: If set, get the phase-specific manifest.
+            entity_type: S3 prefix namespace ("jobs" or "threads").
 
         Returns:
             Parsed manifest dict, or None if not found.
@@ -462,9 +477,9 @@ class SnapshotService:
             return None
 
         if phase_number is not None:
-            key = f"jobs/{job_id}/phases/phase_{phase_number}/manifest.json"
+            key = f"{entity_type}/{job_id}/phases/phase_{phase_number}/manifest.json"
         else:
-            key = f"jobs/{job_id}/manifest.json"
+            key = f"{entity_type}/{job_id}/manifest.json"
 
         try:
             response = await asyncio.to_thread(
@@ -481,14 +496,16 @@ class SnapshotService:
             return None
 
     async def download_snapshot(
-        self, job_id: str, dest_path: str, phase_number: Optional[int] = None
+            self, job_id: str, dest_path: str, phase_number: Optional[int] = None,
+            entity_type: str = "jobs",
     ) -> bool:
         """Download a snapshot tarball from S3.
 
         Args:
-            job_id: Job UUID.
+            job_id: Job or thread UUID.
             dest_path: Local path to write the tarball.
             phase_number: If set, download the phase-specific snapshot.
+            entity_type: S3 prefix namespace ("jobs" or "threads").
 
         Returns:
             True if download succeeded.
@@ -497,9 +514,9 @@ class SnapshotService:
             return False
 
         if phase_number is not None:
-            key = f"jobs/{job_id}/phases/phase_{phase_number}/env.tar.zst"
+            key = f"{entity_type}/{job_id}/phases/phase_{phase_number}/env.tar.zst"
         else:
-            key = f"jobs/{job_id}/env.tar.zst"
+            key = f"{entity_type}/{job_id}/env.tar.zst"
 
         try:
             await asyncio.to_thread(
@@ -553,8 +570,8 @@ class SnapshotService:
     # Delete / GC
     # =========================================================================
 
-    async def delete_snapshot(self, job_id: str) -> bool:
-        """Delete all snapshots for a job from S3.
+    async def delete_snapshot(self, job_id: str, entity_type: str = "jobs") -> bool:
+        """Delete all snapshots for an entity from S3.
 
         Returns:
             True if deletion succeeded (or nothing to delete).
@@ -562,7 +579,7 @@ class SnapshotService:
         if not self._available:
             return False
 
-        prefix = f"jobs/{job_id}/"
+        prefix = f"{entity_type}/{job_id}/"
 
         try:
             # List all objects under the job prefix
@@ -587,11 +604,12 @@ class SnapshotService:
                 )
 
             # Clear snapshot context
-            await self._set_snapshot_context(job_id, {"status": "deleted"})
+            await self._set_snapshot_context(job_id, {"status": "deleted"}, entity_type=entity_type)
 
             logger.info(
-                "Deleted %d snapshot objects for job %s",
+                "Deleted %d snapshot objects for %s %s",
                 len(objects_to_delete),
+                entity_type.rstrip("s"),
                 job_id,
             )
             return True
@@ -913,15 +931,24 @@ class SnapshotService:
     # Helpers
     # =========================================================================
 
-    async def _set_snapshot_context(self, job_id: str, updates: dict) -> None:
-        """Atomically merge updates into the job's context.snapshot key."""
+    async def _set_snapshot_context(
+            self, entity_id: str, updates: dict, entity_type: str = "jobs"
+    ) -> None:
+        """Atomically merge updates into the entity's snapshot context key."""
         if not self._db:
             return
 
         try:
-            await self._db.merge_snapshot_context(job_id, updates)
+            if entity_type == "threads":
+                await self._db.merge_thread_snapshot_context(entity_id, updates)
+            else:
+                await self._db.merge_snapshot_context(entity_id, updates)
         except Exception:
-            logger.exception("Failed to update snapshot context for job %s", job_id)
+            logger.exception(
+                "Failed to update snapshot context for %s %s",
+                entity_type.rstrip("s"),
+                entity_id,
+            )
 
     @staticmethod
     def _compute_sha256(file_path: str) -> str:

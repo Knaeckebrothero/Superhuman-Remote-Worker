@@ -338,6 +338,12 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
+            # Mark threads bound to stale/deleted agents as idle
+            idle_count = await postgres_db.mark_orphaned_threads_idle()
+            if idle_count > 0:
+                logger.info(
+                    f"Marked {idle_count} thread(s) as idle (orphaned)"
+                )
             # Recover orphaned jobs from offline or deleted agents
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
@@ -420,7 +426,10 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
             if workspace_suspension_service.is_enabled:
                 count = await workspace_suspension_service.check_idle_all()
                 if count:
-                    logger.info("Workspace sweeper: suspended %d containers", count)
+                    logger.info("Workspace sweeper: suspended %d job containers", count)
+                thread_count = await workspace_suspension_service.check_idle_threads()
+                if thread_count:
+                    logger.info("Workspace sweeper: suspended %d thread containers", thread_count)
         except Exception as e:
             logger.error("Error in workspace idle sweeper: %s", e)
 
@@ -1345,6 +1354,8 @@ class AgentRegistration(BaseModel):
     hostname: str | None = Field(None, description="Pod/host name")
     pod_port: int = Field(8001, description="Agent API port")
     pid: int | None = Field(None, description="Process ID")
+    agent_mode: str = Field("worker", description="Agent mode: 'worker' or 'persistent'")
+    thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
 
 
 class AgentRegistrationResponse(BaseModel):
@@ -7268,8 +7279,206 @@ async def register_agent(registration: AgentRegistration) -> AgentRegistrationRe
             hostname=registration.hostname,
             pod_port=registration.pod_port,
             pid=registration.pid,
+            agent_mode=registration.agent_mode,
+            thread_id=registration.thread_id,
         )
+        # Bind persistent agent to its thread
+        if registration.agent_mode == "persistent" and registration.thread_id:
+            try:
+                await postgres_db.update_thread_agent(
+                    registration.thread_id, result["agent_id"]
+                )
+            except Exception as bind_err:
+                logger.warning(f"Thread binding failed (non-fatal): {bind_err}")
         return AgentRegistrationResponse(**result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# --- Agent-facing thread endpoints (no auth, same as /api/agents/register) ---
+
+
+class AgentThreadCreateRequest(BaseModel):
+    """Request from agent to create its own thread on startup."""
+
+    config_name: str = Field("interactive", description="Agent config name")
+    permission_mode: str = Field("supervised", description="Permission mode")
+    title: str = Field("Local Session", description="Session title")
+
+
+class AgentThreadMessageRequest(BaseModel):
+    """Request from agent to save a message."""
+
+    role: str
+    content: str | None = None
+    tool_calls: list[dict] | None = None
+    turn_number: int | None = None
+    metrics: dict | None = None
+
+
+@app.post("/api/agents/threads")
+async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, Any]:
+    """Agent creates its own thread on startup (no auth).
+
+    Used by persistent agents starting with ORCHESTRATOR_URL set.
+    Creates a thread with user_id=NULL (visible to all cockpit users).
+    """
+    try:
+        thread_id = await postgres_db.create_thread(
+            user_id=None,
+            config_name=request.config_name,
+            permission_mode=request.permission_mode,
+            title=request.title,
+        )
+
+        # Create Gitea repo for workspace versioning
+        if gitea_client.is_initialized:
+            repo_name = f"thread-{thread_id[:8]}"
+            git_remote_url = await gitea_client.create_repo(repo_name)
+            if git_remote_url:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
+                )
+
+        # Provision workspace container in background if K8s is available
+        if container_provisioner.is_available:
+            asyncio.create_task(
+                container_provisioner.create_thread_workspace(thread_id)
+            )
+
+        return {"thread_id": thread_id, "status": "created"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/agents/threads/{thread_id}/workspace")
+async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
+    """Agent polls workspace container status for a thread (no auth).
+
+    Returns workspace_container metadata from the thread,
+    allowing the agent to wait for the workspace to be ready.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws = metadata.get("workspace_container") or {}
+    vm = metadata.get("vm") or {}
+    return {
+        "status": ws.get("status", "none"),
+        "pod_ip": ws.get("pod_ip"),
+        "pod_name": ws.get("pod_name"),
+        "namespace": ws.get("namespace"),
+        "git_remote_url": ws.get("git_remote_url"),
+        # VM fields (take precedence when present)
+        "vm_status": vm.get("status"),
+        "vm_ssh_host": vm.get("ssh_host"),
+        "vm_ssh_port": vm.get("ssh_port"),
+        "vm_name": vm.get("vm_name"),
+        # Config overrides (model, temperature, etc.)
+        "config_override": metadata.get("config_override"),
+        # Project scoping
+        "project_ids": metadata.get("project_ids"),
+    }
+
+
+class AgentThreadStatusRequest(BaseModel):
+    status: str
+
+
+@app.put("/api/agents/threads/{thread_id}/status")
+async def agent_update_thread_status(
+        thread_id: str, request: AgentThreadStatusRequest
+) -> dict[str, str]:
+    """Update thread status (no auth, agent-facing).
+
+    Used for lifecycle transitions: created → active, active → idle.
+    The 'ended' transition is handled by DELETE /api/persistent/threads/{id}.
+    """
+    valid_statuses = {"active", "idle"}
+    if request.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Status must be one of: {valid_statuses}",
+        )
+    try:
+        await postgres_db.update_thread_status(thread_id, request.status)
+        return {"status": request.status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/agents/threads/{thread_id}/upgrade-to-vm")
+async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
+    """Request VM provisioning for a persistent thread (no auth, agent-facing).
+
+    Called by the persistent agent when a sudo command is detected and the
+    user approves a VM upgrade via WebSocket.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    if not vm_provisioner.is_available:
+        raise HTTPException(
+            status_code=503,
+            detail="VM provisioning not available (no NATS or K8s)",
+        )
+
+    # Check if a VM is already provisioned or in progress
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    vm_ctx = metadata.get("vm") or {}
+    if vm_ctx.get("status") in ("provisioning", "created", "ready"):
+        return {
+            "status": vm_ctx["status"],
+            "thread_id": thread_id,
+            "message": "VM already provisioned or in progress",
+        }
+
+    ok = await vm_provisioner.create_thread_vm(
+        thread_id=thread_id,
+        agent_config=thread.get("config_name", "defaults"),
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=500, detail="Failed to request VM provisioning"
+        )
+
+    return {
+        "status": "provisioning",
+        "thread_id": thread_id,
+        "vm_provisioner_mode": vm_provisioner.mode,
+    }
+
+
+@app.post("/api/agents/threads/{thread_id}/messages")
+async def agent_save_message(
+        thread_id: str, request: AgentThreadMessageRequest
+) -> dict[str, Any]:
+    """Agent saves a message to thread history (no auth).
+
+    Fire-and-forget safe — agents call this after each turn.
+    """
+    try:
+        message_id = await postgres_db.save_thread_message(
+            thread_id=thread_id,
+            role=request.role,
+            content=request.content,
+            tool_calls=request.tool_calls,
+            turn_number=request.turn_number,
+            metrics=request.metrics,
+        )
+        return {"message_id": message_id, "status": "saved"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -7395,6 +7604,512 @@ async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
         ) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Persistent Agent — Thread CRUD + WebSocket Proxy
+# =============================================================================
+
+
+class ThreadCreateRequest(BaseModel):
+    """Request body for creating a persistent thread."""
+
+    config_name: str = Field("defaults", description="Agent config to use")
+    project_id: str | None = Field(None, description="(Legacy) Single project to scope")
+    project_ids: list[str] | None = Field(None, description="List of project UUIDs to scope")
+    permission_mode: str = Field("supervised", description="Initial permission mode")
+    title: str = Field("Untitled Session", description="Session title")
+    model: str | None = Field(None, description="LLM model override (e.g. openai/gpt-oss-120b)")
+    temperature: float | None = Field(None, description="Temperature override")
+
+
+@app.post("/api/persistent/threads")
+async def create_thread(request_body: ThreadCreateRequest, request: Request) -> dict[str, Any]:
+    """Create a new persistent thread (auth required).
+
+    Merges user's persistent_agent settings into thread metadata.config_override
+    so the agent can apply them via the existing deep_merge path.
+    """
+    try:
+        user = await require_approved_user(request, postgres_db)
+
+        # Build config_override: user settings as base, request fields win
+        config_override = {}
+        user_settings = (user.get("settings") or {}).get("persistent_agent", {})
+        if user_settings:
+            if user_settings.get("model"):
+                config_override["llm"] = {"model": user_settings["model"]}
+            if user_settings.get("permission_mode"):
+                config_override["interactive"] = {
+                    "permission_mode": user_settings["permission_mode"]
+                }
+            if user_settings.get("greeting"):
+                config_override.setdefault("interactive", {})["greeting"] = user_settings["greeting"]
+            if user_settings.get("idle_timeout_minutes"):
+                config_override.setdefault("interactive", {})["idle_timeout_minutes"] = user_settings[
+                    "idle_timeout_minutes"]
+            if user_settings.get("command_allowlist"):
+                config_override["command_allowlist"] = user_settings["command_allowlist"]
+
+        # Per-session overrides from request (take priority over user defaults)
+        if request_body.model:
+            config_override.setdefault("llm", {})["model"] = request_body.model
+        if request_body.temperature is not None:
+            config_override.setdefault("llm", {})["temperature"] = request_body.temperature
+
+        # Normalize project_ids (backward compat: project_id → [project_id])
+        effective_project_ids = request_body.project_ids or (
+            [request_body.project_id] if request_body.project_id else []
+        )
+
+        thread_id = await postgres_db.create_thread(
+            user_id=str(user["id"]),
+            project_id=effective_project_ids[0] if effective_project_ids else None,
+            config_name=request_body.config_name or user_settings.get("config_name", "interactive"),
+            permission_mode=request_body.permission_mode,
+            title=request_body.title,
+        )
+
+        # Store config_override and project_ids in thread metadata
+        metadata_patch = {}
+        if config_override:
+            metadata_patch["config_override"] = config_override
+        if effective_project_ids:
+            metadata_patch["project_ids"] = effective_project_ids
+        if metadata_patch:
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET metadata = COALESCE(metadata, '{}') || $2::jsonb
+                    WHERE id = $1
+                    """,
+                    thread_id,
+                    json.dumps(metadata_patch),
+                )
+
+        # Create Gitea repo for workspace versioning
+        if gitea_client.is_initialized:
+            repo_name = f"thread-{thread_id[:8]}"
+            git_remote_url = await gitea_client.create_repo(repo_name)
+            if git_remote_url:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
+                )
+
+        # Provision workspace container in background if K8s is available
+        if container_provisioner.is_available:
+            asyncio.create_task(
+                container_provisioner.create_thread_workspace(thread_id)
+            )
+
+        return {"thread_id": thread_id, "status": "created"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/persistent/threads")
+async def list_threads(
+        request: Request,
+        project_id: str | None = None,
+        status: str | None = None,
+) -> dict[str, Any]:
+    """List persistent threads for the authenticated user."""
+    try:
+        user = await require_approved_user(request, postgres_db)
+        threads = await postgres_db.list_threads(
+            user_id=str(user["id"]),
+            project_id=project_id,
+            status=status,
+        )
+        return {"threads": threads}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/persistent/threads/{thread_id}")
+async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
+    """Get thread status and metadata (auth: owner only)."""
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    return dict(thread)
+
+
+@app.delete("/api/persistent/threads/{thread_id}")
+async def end_thread(
+        thread_id: str, request: Request, permanent: bool = False,
+) -> dict[str, str]:
+    """End (or permanently delete) a persistent thread (auth: owner only).
+
+    Query params:
+        permanent: If true, delete the thread row and all associated messages
+                   from the database. If false (default), just mark as ended.
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws_ctx = metadata.get("workspace_container") or {}
+
+    # Capture S3 snapshot before deleting workspace
+    pod_ip = ws_ctx.get("pod_ip")
+    if snapshot_service.is_available and pod_ip and ws_ctx.get("status") == "ready":
+        await snapshot_service.capture_vm_snapshot(
+            job_id=thread_id, ssh_host=pod_ip, ssh_port=22,
+            source_type="pod", entity_type="threads",
+        )
+
+    # Clean up workspace container if one was provisioned
+    if container_provisioner.is_available:
+        await container_provisioner.delete_thread_workspace(thread_id)
+
+    # Clean up VM if one was provisioned
+    vm_ctx = metadata.get("vm") or {}
+    if vm_ctx.get("status") in ("provisioning", "created", "ready"):
+        if vm_provisioner.is_available:
+            await vm_provisioner.delete_thread_vm(thread_id)
+
+    # Clean up Gitea repo
+    repo_name = ws_ctx.get("repo_name")
+    if repo_name and gitea_client.is_initialized:
+        await gitea_client.delete_repo(repo_name)
+
+    if permanent:
+        await postgres_db.delete_thread(thread_id)
+        return {"status": "deleted"}
+
+    await postgres_db.end_thread(thread_id)
+    return {"status": "ended"}
+
+
+@app.post("/api/persistent/threads/{thread_id}/resume")
+async def resume_thread(
+        thread_id: str, request: Request,
+) -> dict[str, Any]:
+    """Resume an ended or idle thread (auth: owner only).
+
+    Resets thread status to 'created' and clears the stale agent_id so that
+    a new agent can pick it up. The frontend navigates to the chat page after
+    calling this, where the orchestrator will provision or wait for an agent.
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    if thread.get("status") not in ("ended", "idle"):
+        raise HTTPException(
+            status_code=409, detail=f"Thread is already {thread.get('status')}"
+        )
+
+    await postgres_db.resume_thread(thread_id)
+    return {"status": "created", "thread_id": thread_id}
+
+
+@app.get("/api/persistent/threads/{thread_id}/messages")
+async def get_thread_messages_history(
+        thread_id: str,
+        request: Request,
+        limit: int = 200,
+        offset: int = 0,
+) -> dict[str, Any]:
+    """Load message history for a thread (for session resume).
+
+    Returns messages ordered by created_at ASC. Paginated.
+    Load this via REST before opening the WebSocket connection.
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    messages = await postgres_db.get_thread_messages_history(
+        thread_id=thread_id,
+        limit=min(limit, 500),
+        offset=offset,
+    )
+    total = await postgres_db.get_thread_message_count(thread_id)
+    return {
+        "messages": messages,
+        "total": total,
+        "thread_id": thread_id,
+    }
+
+
+@app.get("/api/persistent/threads/{thread_id}/ide")
+async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, Any]:
+    """Get IDE session status for a persistent thread's workspace.
+
+    Returns the workspace container or VM status with a code-server URL
+    when the workspace is ready. The proxy path uses the thread_id in
+    place of job_id: ``/api/ide/{thread_id}/proxy/``.
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        import json as _json
+        try:
+            metadata = _json.loads(metadata)
+        except (ValueError, TypeError):
+            metadata = {}
+
+    # Build Gitea web URL if repo exists
+    ws_ctx = metadata.get("workspace_container", {})
+    repo_name = ws_ctx.get("repo_name")
+    gitea_url = None
+    if repo_name:
+        gitea_base = os.environ.get("GITEA_URL", "").rstrip("/")
+        gitea_user = os.environ.get("GITEA_ADMIN_USER", "srw")
+        if gitea_base:
+            gitea_url = f"{gitea_base}/{gitea_user}/{repo_name}"
+
+    # Check VM first (takes precedence over container)
+    vm_ctx = metadata.get("vm", {})
+    if vm_ctx.get("status") == "ready":
+        ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
+        if ssh_host:
+            proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
+            return {
+                "status": "active",
+                "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
+                "source": "live_vm",
+                "gitea_url": gitea_url,
+            }
+
+    # Check workspace container
+    if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
+        proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
+        return {
+            "status": "active",
+            "code_server_url": f"{proxy_base}/api/ide/{thread_id}/proxy/?folder=/home/agent-host/workspace",
+            "source": "live_workspace",
+            "gitea_url": gitea_url,
+        }
+
+    # Workspace is provisioning
+    if ws_ctx.get("status") == "provisioning" or vm_ctx.get("status") == "provisioning":
+        return {"status": "restoring", "code_server_url": None, "gitea_url": gitea_url}
+
+    return {"status": "unavailable", "code_server_url": None, "gitea_url": gitea_url}
+
+
+# --- Session notification helpers (used by WS proxy) ---
+
+_SESSION_NOTIFY_METHODS = {"permission.request", "vm_upgrade.needed", "ready"}
+_SESSION_RESOLVE_METHODS = {"approve", "deny"}
+
+
+def _inspect_session_event(
+        raw: str,
+        thread_id: str,
+        user_id: str,
+        thread_title: str,
+        config_name: str | None,
+) -> None:
+    """Inspect an agent→browser WS frame and broadcast SSE if notification-worthy."""
+    if not user_id:
+        return
+    try:
+        event = json.loads(raw)
+        method = event.get("method")
+        if method not in _SESSION_NOTIFY_METHODS:
+            return
+
+        from services.notification_feed import notification_feed
+        import uuid as _uuid
+
+        params = event.get("params") or {}
+        event_id = str(_uuid.uuid4())
+
+        type_map = {
+            "permission.request": "session.permission_request",
+            "vm_upgrade.needed": "session.vm_upgrade",
+            "ready": "session.waiting",
+        }
+
+        notification_feed.broadcast(
+            user_id=user_id,
+            event_type=type_map[method],
+            data={
+                "event_id": event_id,
+                "thread_id": thread_id,
+                "title": thread_title,
+                "config_name": config_name,
+                "tool": params.get("tool"),
+                "args": params.get("args"),
+                "reason": params.get("reason"),
+                "command": params.get("command"),
+            },
+        )
+    except (json.JSONDecodeError, Exception):
+        pass
+
+
+def _inspect_browser_event(
+        raw: str,
+        thread_id: str,
+        user_id: str,
+) -> None:
+    """Inspect a browser→agent WS frame and broadcast resolve if approve/deny."""
+    if not user_id:
+        return
+    try:
+        event = json.loads(raw)
+        method = event.get("method")
+        if method not in _SESSION_RESOLVE_METHODS:
+            return
+
+        from services.notification_feed import notification_feed
+
+        notification_feed.broadcast(
+            user_id=user_id,
+            event_type="session.resolved",
+            data={"thread_id": thread_id, "resolution": method},
+        )
+    except (json.JSONDecodeError, Exception):
+        pass
+
+
+@app.websocket("/ws/persistent/{thread_id}")
+async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
+    """Proxy WebSocket connection to a persistent agent pod.
+
+    Looks up the agent serving this thread and forwards WebSocket frames
+    bidirectionally. Follows the same pattern as the IDE proxy.
+    """
+    # Must accept before we can send/close — FastAPI raises 500 otherwise
+    await ws.accept()
+
+    # Resolve thread → agent → pod_ip
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        await ws.close(code=4404, reason="Thread not found")
+        return
+
+    # Restore suspended workspace before connecting to agent
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws_ctx = metadata.get("workspace_container") or {}
+    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
+        logger.info("Restoring suspended workspace for thread %s", thread_id)
+        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
+        if not ok:
+            await ws.close(code=4503, reason="Failed to restore workspace")
+            return
+
+    if not thread.get("agent_id"):
+        await ws.close(code=4404, reason="Thread not active or no agent assigned")
+        return
+
+    agent = await postgres_db.get_agent(str(thread["agent_id"]))
+    if not agent:
+        await ws.close(code=4503, reason="Agent not available")
+        return
+
+    pod_ip = agent.get("pod_ip")
+    pod_port = agent.get("pod_port", 8001)
+    if not pod_ip:
+        await ws.close(code=4503, reason="Agent has no IP")
+        return
+
+    upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
+    logger.info(
+        f"Proxying WS for thread {thread_id} to {upstream_url}"
+    )
+
+    try:
+        import websockets
+
+        async with websockets.connect(
+                upstream_url,
+                max_size=16 * 1024 * 1024,
+                ping_interval=30,
+                close_timeout=5,
+        ) as upstream:
+
+            async def agent_to_browser():
+                try:
+                    async for message in upstream:
+                        if isinstance(message, str):
+                            # Inspect for notification-worthy events
+                            _inspect_session_event(
+                                message, thread_id,
+                                str(thread.get("user_id") or ""),
+                                thread.get("title") or "Session",
+                                thread.get("config_name"),
+                            )
+                            await ws.send_text(message)
+                        else:
+                            await ws.send_bytes(message)
+                except Exception:
+                    pass
+
+            async def browser_to_agent_with_inspect():
+                """Relay browser→agent, inspecting for approve/deny to clear notifications."""
+                try:
+                    while True:
+                        data = await ws.receive_text()
+                        _inspect_browser_event(
+                            data, thread_id,
+                            str(thread.get("user_id") or ""),
+                        )
+                        await upstream.send(data)
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+
+            # Run both directions concurrently
+            done, pending = await asyncio.wait(
+                [
+                    asyncio.create_task(browser_to_agent_with_inspect()),
+                    asyncio.create_task(agent_to_browser()),
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+
+    except ImportError:
+        logger.error("websockets package not installed — WS proxy unavailable")
+        await ws.close(code=4500, reason="Server misconfigured")
+    except Exception as e:
+        logger.error(f"WS proxy error for thread {thread_id}: {e}")
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
+        logger.info(f"WS proxy ended for thread {thread_id}")
 
 
 @app.get("/api/jobs/{job_id}/logs")

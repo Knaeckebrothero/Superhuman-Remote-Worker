@@ -1,6 +1,7 @@
 import {SudoRequest} from '../services/sudo.service';
+import {SessionEvent} from '../services/notification.service';
 
-export type ActionItemType = 'sudo' | 'message' | 'review';
+export type ActionItemType = 'sudo' | 'message' | 'review' | 'session';
 export type ActionItemStatus = 'pending' | 'resolved';
 
 export interface ActionItem {
@@ -20,6 +21,12 @@ export interface ActionItem {
   sudo?: SudoRequest;
   message?: MessageActionData;
   review?: ReviewActionData;
+    session?: SessionActionData;
+}
+
+export interface SessionActionData {
+    threadId: string;
+    event: SessionEvent;
 }
 
 export interface MessageActionData {
