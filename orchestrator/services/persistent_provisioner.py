@@ -40,12 +40,8 @@ class PersistentProvisioner:
             "PERSISTENT_AGENT_IMAGE",
             "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
         )
-        self._configmap_name: str = os.environ.get(
-            "AGENT_CONFIGMAP", "srw-config"
-        )
-        self._secret_name: str = os.environ.get(
-            "AGENT_SECRET", "srw-secrets"
-        )
+        self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
+        self._secret_name: str = os.environ.get("AGENT_SECRET", "srw-secrets")
 
     @property
     def is_available(self) -> bool:
@@ -93,8 +89,7 @@ class PersistentProvisioner:
                     k8s_config.load_kube_config()
                 except k8s_config.ConfigException:
                     logger.info(
-                        "K8s not available — persistent agents must be "
-                        "started manually"
+                        "K8s not available — persistent agents must be started manually"
                     )
                     return
 
@@ -159,9 +154,7 @@ class PersistentProvisioner:
                 namespace=self._namespace,
                 body=manifest,
             )
-            logger.info(
-                "Agent pod created: %s (thread %s)", pod_name, thread_id
-            )
+            logger.info("Agent pod created: %s (thread %s)", pod_name, thread_id)
             await self._set_thread_context(
                 thread_id,
                 {
@@ -190,9 +183,7 @@ class PersistentProvisioner:
                     pod_name,
                     thread_id,
                 )
-                await self._set_thread_context(
-                    thread_id, {"status": "creating"}
-                )
+                await self._set_thread_context(thread_id, {"status": "creating"})
 
             return True
         except Exception as e:
@@ -205,9 +196,7 @@ class PersistentProvisioner:
                 )
                 return True
 
-            logger.error(
-                "Failed to create agent pod for thread %s: %s", thread_id, e
-            )
+            logger.error("Failed to create agent pod for thread %s: %s", thread_id, e)
             await self._set_thread_context(
                 thread_id,
                 {"status": "failed", "error": str(e)},
@@ -235,9 +224,7 @@ class PersistentProvisioner:
                 namespace=self._namespace,
                 grace_period_seconds=30,
             )
-            logger.info(
-                "Agent pod deleted: %s (thread %s)", pod_name, thread_id
-            )
+            logger.info("Agent pod deleted: %s (thread %s)", pod_name, thread_id)
             await self._set_thread_context(thread_id, {"status": "deleted"})
             return True
         except Exception as e:
@@ -248,14 +235,10 @@ class PersistentProvisioner:
                     thread_id,
                 )
                 return True
-            logger.error(
-                "Failed to delete agent pod for thread %s: %s", thread_id, e
-            )
+            logger.error("Failed to delete agent pod for thread %s: %s", thread_id, e)
             return False
 
-    async def get_pod_status(
-            self, thread_id: str
-    ) -> Optional[Dict[str, Any]]:
+    async def get_pod_status(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """Query pod status for a thread.
 
         Args:
@@ -278,9 +261,7 @@ class PersistentProvisioner:
 
             ready = False
             if pod.status.container_statuses:
-                ready = all(
-                    cs.ready for cs in pod.status.container_statuses
-                )
+                ready = all(cs.ready for cs in pod.status.container_statuses)
 
             return {
                 "thread_id": thread_id,
@@ -292,9 +273,7 @@ class PersistentProvisioner:
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
                 return None
-            logger.error(
-                "Failed to query agent pod for thread %s: %s", thread_id, e
-            )
+            logger.error("Failed to query agent pod for thread %s: %s", thread_id, e)
             return None
 
     # =========================================================================
@@ -344,8 +323,7 @@ class PersistentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            "until nc -z srw-orchestrator 8085; "
-                            "do sleep 2; done",
+                            "until nc -z srw-orchestrator 8085; do sleep 2; done",
                         ],
                     }
                 ],
@@ -466,9 +444,7 @@ class PersistentProvisioner:
             },
         }
 
-    async def _wait_for_ready(
-            self, pod_name: str, timeout: int = 120
-    ) -> Optional[str]:
+    async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
         """Poll until the agent pod is Running and has an IP.
 
         Returns:
@@ -495,9 +471,7 @@ class PersistentProvisioner:
 
         return None
 
-    async def _set_thread_context(
-            self, thread_id: str, updates: dict
-    ) -> None:
+    async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
         """Store agent pod status in thread metadata.
 
         Uses the existing ``merge_thread_workspace_context`` with an
