@@ -108,11 +108,11 @@ class PersistentProvisioner:
     async def create_agent_pod(
         self,
         thread_id: str,
-            config_name: str = "interactive",
-            cpu_request: str = "250m",
-            memory_request: str = "512Mi",
-            cpu_limit: str = "1000m",
-            memory_limit: str = "2Gi",
+        config_name: str = "interactive",
+        cpu_request: str = "250m",
+        memory_request: str = "512Mi",
+        cpu_limit: str = "1000m",
+        memory_limit: str = "2Gi",
     ) -> bool:
         """Create a K8s pod running a persistent agent for *thread_id*.
 
@@ -281,14 +281,14 @@ class PersistentProvisioner:
     # =========================================================================
 
     def _build_agent_pod_manifest(
-            self,
-            pod_name: str,
-            thread_id: str,
-            config_name: str,
-            cpu_request: str,
-            memory_request: str,
-            cpu_limit: str,
-            memory_limit: str,
+        self,
+        pod_name: str,
+        thread_id: str,
+        config_name: str,
+        cpu_request: str,
+        memory_request: str,
+        cpu_limit: str,
+        memory_limit: str,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -461,7 +461,7 @@ class PersistentProvisioner:
                 )
                 if pod.status.phase == "Running" and pod.status.pod_ip:
                     if pod.status.container_statuses and all(
-                            cs.ready for cs in pod.status.container_statuses
+                        cs.ready for cs in pod.status.container_statuses
                     ):
                         return pod.status.pod_ip
             except Exception:
