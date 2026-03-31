@@ -158,8 +158,8 @@ class TestApplySettingsMatrixLimits:
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Settings matrix overrides: family values override default
-        assert data["limits"]["model_max_context_tokens"] == 150000
-        assert data["limits"]["context_threshold_tokens"] == 100000
+        assert data["limits"]["model_max_context_tokens"] == 170000
+        assert data["limits"]["context_threshold_tokens"] == 130000
 
     def test_limits_key_not_leaked_to_llm(self):
         """The 'limits' sub-dict must NOT be set on data['llm']."""
@@ -204,8 +204,8 @@ class TestApplySettingsMatrixLimits:
         data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # minimax entry overrides default
-        assert data["limits"]["context_threshold_tokens"] == 100000
-        assert data["limits"]["model_max_context_tokens"] == 150000
+        assert data["limits"]["context_threshold_tokens"] == 130000
+        assert data["limits"]["model_max_context_tokens"] == 170000
 
     def test_matrix_is_sole_source_for_limits(self):
         """Matrix limits always win — no expert_limits_keys check."""
@@ -215,7 +215,7 @@ class TestApplySettingsMatrixLimits:
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Matrix overwrites even pre-existing limits values
-        assert data["limits"]["context_threshold_tokens"] == 100000
+        assert data["limits"]["context_threshold_tokens"] == 130000
 
 
 # =============================================================================
@@ -249,7 +249,7 @@ class TestPerExpertMatrix:
         # Expert matrix overrides context_threshold_tokens
         assert data["limits"]["context_threshold_tokens"] == 90000
         # Other limits still come from base matrix minimax entry
-        assert data["limits"]["model_max_context_tokens"] == 150000
+        assert data["limits"]["model_max_context_tokens"] == 170000
 
     def test_no_expert_matrix_uses_base(self, tmp_path):
         """Missing expert settings_matrix.yaml falls back to base."""
@@ -422,10 +422,10 @@ class TestSettingsMatrixIntegration:
         config = loader.load_agent_config(str(config_file))
 
         # Settings matrix should have overridden defaults.yaml limits
-        assert config.limits.context_threshold_tokens == 100000
-        assert config.limits.model_max_context_tokens == 150000
-        assert config.limits.summarization_safe_limit == 150000
-        assert config.limits.summarization_chunk_size == 100000
+        assert config.limits.context_threshold_tokens == 130000
+        assert config.limits.model_max_context_tokens == 170000
+        assert config.limits.summarization_safe_limit == 160000
+        assert config.limits.summarization_chunk_size == 110000
         assert config.limits.message_count_min_tokens == 80000
 
     def test_unknown_model_gets_default_limits(self, tmp_path):
@@ -483,7 +483,7 @@ class TestSettingsMatrixIntegration:
         # Expert matrix overrides this one limit
         assert config.limits.context_threshold_tokens == 95000
         # Other minimax limits from base matrix unchanged
-        assert config.limits.model_max_context_tokens == 150000
+        assert config.limits.model_max_context_tokens == 170000
 
 
 # =============================================================================
@@ -743,7 +743,7 @@ class TestRealMatrixFamilies:
     @pytest.mark.parametrize(
         "model,expected_ctx,expected_max",
         [
-            ("minimax-m2.7", 100000, 150000),  # Updated minimax limits
+            ("minimax-m2.7", 130000, 170000),  # M2.7: 204K context
             ("o3-mini", 130000, 170000),
             ("deepseek-r1", 40000, 55000),
             ("gemini-2.0-flash", 150000, 200000),
