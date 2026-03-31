@@ -199,14 +199,14 @@ class WorkspaceSuspensionService:
             return False
 
     async def _extract_snapshot(
-            self, entity_id: str, ssh_host: str, entity_type: str = "jobs"
+        self, entity_id: str, ssh_host: str, entity_type: str = "jobs"
     ) -> None:
         """Download snapshot from S3 and extract into the pod via SSH.
 
         Mirrors ide_session.py:_extract_snapshot_to_vm (lines 782-836).
         """
         with tempfile.NamedTemporaryFile(
-                suffix=".tar.zst", delete=True, prefix=f"restore_{entity_id[:8]}_"
+            suffix=".tar.zst", delete=True, prefix=f"restore_{entity_id[:8]}_"
         ) as tmp:
             tar_path = tmp.name
 

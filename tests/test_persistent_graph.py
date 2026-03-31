@@ -758,8 +758,8 @@ class TestMemoryExtractionTrigger:
         mock_recall.retrieve = AsyncMock(return_value=[])
 
         with patch(
-                "src.persistent_graph.asyncio.create_task",
-                side_effect=RuntimeError("task creation failed"),
+            "src.persistent_graph.asyncio.create_task",
+            side_effect=RuntimeError("task creation failed"),
         ):
             # Should not raise
             await run_persistent_loop(

@@ -87,13 +87,13 @@ class PersistentSession:
         return self.project_ids[0] if self.project_ids else None
 
     async def setup(
-            self,
-            llm: BaseChatModel,
-            auxiliary_llm: Optional[Any] = None,
-            postgres_conn: Optional[Any] = None,
-            vector_conn: Optional[Any] = None,
-            workspace_override: Optional[Dict[str, Any]] = None,
-            git_remote_url: Optional[str] = None,
+        self,
+        llm: BaseChatModel,
+        auxiliary_llm: Optional[Any] = None,
+        postgres_conn: Optional[Any] = None,
+        vector_conn: Optional[Any] = None,
+        workspace_override: Optional[Dict[str, Any]] = None,
+        git_remote_url: Optional[str] = None,
     ) -> None:
         """Initialize session resources.
 
@@ -152,9 +152,9 @@ class PersistentSession:
         )
 
     def _setup_workspace(
-            self,
-            workspace_override: Optional[Dict[str, Any]] = None,
-            git_remote_url: Optional[str] = None,
+        self,
+        workspace_override: Optional[Dict[str, Any]] = None,
+        git_remote_url: Optional[str] = None,
     ) -> None:
         """Create workspace, optionally using a remote backend.
 
@@ -326,9 +326,9 @@ class PersistentSession:
             logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
 
     def _setup_memory(
-            self,
-            postgres_conn: Optional[Any],
-            vector_conn: Optional[Any],
+        self,
+        postgres_conn: Optional[Any],
+        vector_conn: Optional[Any],
     ) -> None:
         """Initialize RecallStore and KnowledgeStore if enabled."""
         if not vector_conn:
@@ -395,8 +395,8 @@ class PersistentSession:
 
         # Connect new backend first (fail fast)
         if (
-                hasattr(new_backend, "connect")
-                and not getattr(new_backend, "is_connected", lambda: False)()
+            hasattr(new_backend, "connect")
+            and not getattr(new_backend, "is_connected", lambda: False)()
         ):
             new_backend.connect()
 

@@ -50,7 +50,7 @@ class TestInteractiveConfigDefaults:
     def test_greeting_default(self):
         ic = InteractiveConfig()
         assert (
-                ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
+            ic.greeting == "Hello! I'm ready to help. What would you like to work on?"
         )
 
     def test_agent_config_has_interactive_field(self):
@@ -180,8 +180,8 @@ class TestInteractivePromptResolution:
 
         # Also patch resolver.load to raise FileNotFoundError for persona
         with patch(
-                "src.core.loader.PromptMatrixResolver.load",
-                side_effect=FileNotFoundError("no persona"),
+            "src.core.loader.PromptMatrixResolver.load",
+            side_effect=FileNotFoundError("no persona"),
         ):
             result = get_phase_system_prompt(
                 config=config,
@@ -197,8 +197,8 @@ class TestInteractivePromptResolution:
         config = self._make_config(resolved_prompts={})
 
         with patch(
-                "src.core.loader.PromptMatrixResolver.load",
-                return_value=template,
+            "src.core.loader.PromptMatrixResolver.load",
+            return_value=template,
         ):
             result = get_phase_system_prompt(
                 config=config,

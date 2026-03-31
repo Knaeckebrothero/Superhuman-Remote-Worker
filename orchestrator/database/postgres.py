@@ -1141,7 +1141,7 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_thread_workspace_context(
-            self, thread_id: str, container_updates: Dict[str, Any]
+        self, thread_id: str, container_updates: Dict[str, Any]
     ) -> bool:
         """Atomically merge updates into threads.metadata.workspace_container.
 
@@ -1180,7 +1180,7 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_thread_vm_context(
-            self, thread_id: str, vm_updates: Dict[str, Any]
+        self, thread_id: str, vm_updates: Dict[str, Any]
     ) -> bool:
         """Atomically merge updates into threads.metadata.vm.
 
@@ -1217,7 +1217,7 @@ class PostgresDB:
         return result == "UPDATE 1"
 
     async def merge_thread_snapshot_context(
-            self, thread_id: str, snapshot_updates: Dict[str, Any]
+        self, thread_id: str, snapshot_updates: Dict[str, Any]
     ) -> bool:
         """Atomically merge updates into threads.metadata.snapshot.
 
@@ -1401,8 +1401,8 @@ class PostgresDB:
         hostname: str | None = None,
         pod_port: int = 8001,
         pid: int | None = None,
-            agent_mode: str = "worker",
-            thread_id: str | None = None,
+        agent_mode: str = "worker",
+        thread_id: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -1838,12 +1838,12 @@ class PostgresDB:
     # ------------------------------------------------------------------
 
     async def create_thread(
-            self,
-            user_id: str | None = None,
-            project_id: str | None = None,
-            config_name: str = "defaults",
-            permission_mode: str = "supervised",
-            title: str = "Untitled Session",
+        self,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        config_name: str = "defaults",
+        permission_mode: str = "supervised",
+        title: str = "Untitled Session",
     ) -> str:
         """Create a new persistent thread."""
         async with self.acquire() as conn:
@@ -1870,10 +1870,10 @@ class PostgresDB:
         return dict(row) if row else None
 
     async def list_threads(
-            self,
-            user_id: str | None = None,
-            project_id: str | None = None,
-            status: str | None = None,
+        self,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        status: str | None = None,
     ) -> List[Dict[str, Any]]:
         """List threads with optional filters."""
         conditions = []
@@ -1996,13 +1996,13 @@ class PostgresDB:
     # --- Thread message persistence ---
 
     async def save_thread_message(
-            self,
-            thread_id: str,
-            role: str,
-            content: Optional[str],
-            tool_calls: Optional[Any] = None,
-            turn_number: Optional[int] = None,
-            metrics: Optional[dict] = None,
+        self,
+        thread_id: str,
+        role: str,
+        content: Optional[str],
+        tool_calls: Optional[Any] = None,
+        turn_number: Optional[int] = None,
+        metrics: Optional[dict] = None,
     ) -> str:
         """Save a message to thread_messages. Fire-and-forget safe."""
         async with self.acquire() as conn:
@@ -2032,10 +2032,10 @@ class PostgresDB:
         return str(row["id"])
 
     async def get_thread_messages_history(
-            self,
-            thread_id: str,
-            limit: int = 200,
-            offset: int = 0,
+        self,
+        thread_id: str,
+        limit: int = 200,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Load thread message history for session resume. Ordered by created_at ASC."""
         async with self.acquire() as conn:

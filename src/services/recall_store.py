@@ -229,7 +229,7 @@ class RecallStore:
         config=None,
         agent_id: Optional[str] = None,
         project_id: Optional[uuid.UUID] = None,
-            project_ids: Optional[List[uuid.UUID]] = None,
+        project_ids: Optional[List[uuid.UUID]] = None,
         archiver=None,
     ):
         """Initialize RecallStore.

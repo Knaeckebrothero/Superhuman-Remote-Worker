@@ -120,9 +120,9 @@ class OrchestratorClient:
             self._client = None
 
     async def register(
-            self,
-            agent_mode: str = "worker",
-            thread_id: str | None = None,
+        self,
+        agent_mode: str = "worker",
+        thread_id: str | None = None,
     ) -> bool:
         """Register this agent with the orchestrator.
 
@@ -173,10 +173,10 @@ class OrchestratorClient:
             return False
 
     async def create_thread(
-            self,
-            config_name: str = "interactive",
-            permission_mode: str = "supervised",
-            title: str = "Local Session",
+        self,
+        config_name: str = "interactive",
+        permission_mode: str = "supervised",
+        title: str = "Local Session",
     ) -> str | None:
         """Create a thread in the orchestrator DB (agent-facing, no auth).
 
@@ -210,13 +210,13 @@ class OrchestratorClient:
             return None
 
     async def save_thread_message(
-            self,
-            thread_id: str,
-            role: str,
-            content: str | None = None,
-            tool_calls: list | None = None,
-            turn_number: int | None = None,
-            metrics: dict | None = None,
+        self,
+        thread_id: str,
+        role: str,
+        content: str | None = None,
+        tool_calls: list | None = None,
+        turn_number: int | None = None,
+        metrics: dict | None = None,
     ) -> bool:
         """Save a message to thread history via orchestrator REST. Fire-and-forget safe."""
         if not self._client:
@@ -239,7 +239,7 @@ class OrchestratorClient:
             return False
 
     async def request_thread_vm_upgrade(
-            self, thread_id: str, cpu_cores: int = 2, memory: str = "4Gi"
+        self, thread_id: str, cpu_cores: int = 2, memory: str = "4Gi"
     ) -> bool:
         """Request VM provisioning for a persistent thread (upgrade from container).
 
