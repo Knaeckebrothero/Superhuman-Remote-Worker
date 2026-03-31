@@ -85,6 +85,9 @@ class ToolContext:
     )
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
+    _project_ids: List[str] = field(
+        default_factory=list
+    )  # Multi-project UUIDs for persistent sessions
     _pending_memories: List[Dict[str, Any]] = field(
         default_factory=list
     )  # Sync-safe memory queue
@@ -183,6 +186,21 @@ class ToolContext:
     def project_id(self, value: Optional[str]) -> None:
         """Set the project ID."""
         self._project_id = value
+
+    @property
+    def project_ids(self) -> List[str]:
+        """Get all project IDs for multi-project scoping."""
+        if self._project_ids:
+            return self._project_ids
+        if self._project_id:
+            return [self._project_id]
+        return []
+
+    @project_ids.setter
+    def project_ids(self, value: List[str]) -> None:
+        """Set project IDs (also updates primary project_id)."""
+        self._project_ids = value or []
+        self._project_id = value[0] if value else None
 
     @property
     def db(self) -> Optional["PostgresDB"]:

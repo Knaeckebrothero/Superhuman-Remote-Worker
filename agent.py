@@ -181,6 +181,19 @@ def parse_args():
         default="0.0.0.0",
         help="Host to bind to (default: 0.0.0.0)",
     )
+
+    # Agent mode
+    parser.add_argument(
+        "--mode",
+        choices=["worker", "persistent"],
+        default="worker",
+        help="Agent mode: 'worker' (job dispatch, default) or 'persistent' (interactive session)",
+    )
+    parser.add_argument(
+        "--thread-id",
+        help="Thread UUID for persistent mode (auto-generated if omitted)",
+    )
+
     parser.add_argument(
         "--no-server",
         action="store_true",
@@ -499,7 +512,7 @@ async def recover_and_resume(
 
 
 def run_server(config_path: str, host: str, port: int):
-    """Run the FastAPI server."""
+    """Run the FastAPI server (worker mode)."""
     logger = logging.getLogger(__name__)
 
     logger.info(f"Starting Universal Agent API server on {host}:{port}")
@@ -507,6 +520,28 @@ def run_server(config_path: str, host: str, port: int):
 
     # Create and run app
     app = create_app(config_path)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+    )
+
+
+def run_persistent_server(config_path: str, host: str, port: int, thread_id: str | None):
+    """Run the persistent-mode FastAPI server.
+
+    Starts an interactive agent with WebSocket transport.
+    Connect via: ws://{host}:{port}/ws/chat
+    """
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Starting Persistent Agent on {host}:{port}")
+    logger.info(f"Config: {config_path}, Thread: {thread_id or '(auto-create)'}")
+
+    from src.api.persistent_app import create_persistent_app
+
+    app = create_persistent_app(config_path, thread_id)
     uvicorn.run(
         app,
         host=host,
@@ -619,7 +654,13 @@ def main():
         )
         return
 
-    # API server mode (default)
+    # Persistent mode
+    if args.mode == "persistent":
+        thread_id = args.thread_id  # None → lifespan auto-creates via orchestrator
+        run_persistent_server(config_path, args.host, args.port, thread_id)
+        return
+
+    # API server mode (default — worker)
     if args.no_server:
         logger.error("Specify --job-id or --description with --no-server")
         sys.exit(1)

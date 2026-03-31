@@ -363,6 +363,22 @@
           },
           "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/)",
           "examples": [["delegate_work"]]
+        },
+        "orchestrator": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Orchestrator tools: create/monitor/manage worker jobs via the orchestrator REST API. Primarily for persistent agents (src/tools/orchestrator/)",
+          "examples": [
+            [
+              "create_worker_job",
+              "list_worker_jobs",
+              "get_worker_job",
+              "approve_worker_job",
+              "resume_worker_job"
+            ]
+          ]
         }
       }
     },
@@ -636,6 +652,34 @@
           "type": "boolean",
           "default": false,
           "description": "Auto-open a Claude Code tab on job start (requires claude CLI in PATH)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "interactive": {
+      "type": "object",
+      "description": "Settings for persistent interactive mode (--mode persistent). Controls permission defaults, idle behavior, and the initial greeting.",
+      "properties": {
+        "permission_mode": {
+          "type": "string",
+          "enum": [
+            "supervised",
+            "auto_accept",
+            "autonomous"
+          ],
+          "default": "supervised",
+          "description": "Default permission mode for tool execution in interactive sessions"
+        },
+        "idle_timeout_minutes": {
+          "type": "integer",
+          "default": 60,
+          "minimum": 0,
+          "description": "Auto-end session after idle period in minutes (0 = disabled)"
+        },
+        "greeting": {
+          "type": "string",
+          "default": "Hello! I'm ready to help. What would you like to work on?",
+          "description": "Initial greeting message sent to user on session start"
         }
       },
       "additionalProperties": false

@@ -97,6 +97,7 @@ export interface JobVersionInfo {
 export interface IdeSessionStatus {
   status: 'unavailable' | 'available' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
   code_server_url?: string | null;
+    gitea_url?: string | null;
   snapshot_type?: string;
   estimated_seconds?: number;
   expires_at?: string;
@@ -843,6 +844,20 @@ export class ApiService {
         }),
       );
   }
+
+    /**
+     * Get IDE status for a persistent thread's workspace.
+     */
+    getThreadIdeStatus(threadId: string): Observable<IdeSessionStatus | null> {
+        return this.http
+            .get<IdeSessionStatus>(`${this.baseUrl}/persistent/threads/${threadId}/ide`)
+            .pipe(
+                catchError((error) => {
+                    console.error(`Failed to get IDE status for thread ${threadId}:`, error);
+                    return of(null);
+                }),
+            );
+    }
 
   /**
    * Get snapshot storage statistics (total count, size, GC pending).

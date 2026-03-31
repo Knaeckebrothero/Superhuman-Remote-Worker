@@ -7,6 +7,7 @@ import { SidebarService } from '../../core/services/sidebar.service';
 import { LayoutService } from '../../debug/services/layout.service';
 import { LayoutPickerComponent } from '../../debug/components/layout-picker/layout-picker.component';
 import { NotificationBellComponent } from '../../shared/components/notification-bell/notification-bell.component';
+import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import { environment } from '../../core/environment';
 
 @Component({
@@ -33,6 +34,14 @@ import { environment } from '../../core/environment';
           >
             <span class="nav-icon">construction</span>
             Builder
+          </a>
+          <a
+            class="nav-link"
+            [routerLink]="sessionsLink()"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">chat</span>
+            Sessions
           </a>
           <a
             class="nav-link"
@@ -406,6 +415,16 @@ export class SidebarComponent {
   readonly sidebar = inject(SidebarService);
   readonly layoutService = inject(LayoutService);
   private readonly router = inject(Router);
+    private readonly chatService = inject(PersistentChatService);
+
+    /** Dynamic sessions link — goes to active session if connected, otherwise to list. */
+    readonly sessionsLink = computed(() => {
+        const threadId = this.chatService.threadId();
+        if (this.chatService.isConnected() && threadId) {
+            return threadId === 'local' ? '/sessions/direct' : `/sessions/${threadId}`;
+        }
+        return '/sessions';
+    });
 
   private readonly currentUrl = toSignal(
     this.router.events.pipe(
