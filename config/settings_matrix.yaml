@@ -16,15 +16,14 @@ default:
     message_count_min_tokens: 50000
 
 minimax:
-  temperature: 1.0
+  temperature: 1.0  # M2.7 is a reasoning model; use default
   top_p: 0.95
-  top_k: 40
-  model_max_context_tokens: 196608
+  model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
   limits:
-    model_max_context_tokens: 150000
-    context_threshold_tokens: 100000
-    summarization_safe_limit: 150000
-    summarization_chunk_size: 100000
+    model_max_context_tokens: 170000
+    context_threshold_tokens: 130000
+    summarization_safe_limit: 160000
+    summarization_chunk_size: 110000
     message_count_min_tokens: 80000
 
 o-series:
@@ -58,9 +57,19 @@ gemini:
     summarization_chunk_size: 120000
     message_count_min_tokens: 100000
 
+claude-opus:
+  temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
+  model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
+  limits:
+    model_max_context_tokens: 200000
+    context_threshold_tokens: 150000
+    summarization_safe_limit: 180000
+    summarization_chunk_size: 120000
+    message_count_min_tokens: 100000
+
 gpt-5:
-  temperature: 1.0
-  model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, gpt-5.3-codex: 400K, spark: 128K
+  temperature: 1.0  # Reasoning model: only default 1.0 is supported
+  model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
   limits:
     model_max_context_tokens: 200000
     context_threshold_tokens: 150000
