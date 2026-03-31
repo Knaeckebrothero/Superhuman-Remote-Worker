@@ -189,7 +189,7 @@ class TestApplySettingsMatrixLimits:
         data = {"llm": {"model": "minimax-m2.7"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert "limits" in data
-        assert data["limits"]["context_threshold_tokens"] == 100000
+        assert data["limits"]["context_threshold_tokens"] == 130000
 
     def test_default_entry_used_for_unknown_family(self):
         """Unknown model gets default entry limits."""
@@ -261,7 +261,7 @@ class TestPerExpertMatrix:
 
         # Values come from base matrix
         assert data["llm"]["temperature"] == 1.0
-        assert data["limits"]["context_threshold_tokens"] == 100000
+        assert data["limits"]["context_threshold_tokens"] == 130000
 
 
 # =============================================================================
@@ -627,7 +627,7 @@ class TestApplySettingsMatrixEdgeCases:
         assert data["limits"]["message_count_threshold"] == 300
         assert data["limits"]["tool_retry_count"] == 5
         # But matrix limits are also applied
-        assert data["limits"]["context_threshold_tokens"] == 100000
+        assert data["limits"]["context_threshold_tokens"] == 130000
 
     def test_all_real_families_have_limits(self):
         """Every family in the real settings_matrix.yaml has a limits sub-dict."""
