@@ -320,12 +320,12 @@ class TestSetupWorkspace:
         ):
             # Patch the import inside the method
             with patch.dict(
-                    "sys.modules",
-                    {
-                        "src.core.backends.remote": MagicMock(
-                            RemoteBackend=MagicMock(return_value=mock_remote)
-                        )
-                    },
+                "sys.modules",
+                {
+                    "src.core.backends.remote": MagicMock(
+                        RemoteBackend=MagicMock(return_value=mock_remote)
+                    )
+                },
             ):
                 MockWM.return_value.path = "/tmp/test"
                 MockWM.return_value.initialize = MagicMock()
@@ -565,8 +565,8 @@ class TestSetupTools:
 
         MockTC.assert_called_once()
         assert (
-                MockTC.call_args[1].get("todo_manager") is None
-                or MockTC.call_args.kwargs.get("todo_manager") is None
+            MockTC.call_args[1].get("todo_manager") is None
+            or MockTC.call_args.kwargs.get("todo_manager") is None
         )
 
 
@@ -734,7 +734,7 @@ class TestSetupShellManager:
             mock_module = MagicMock()
             mock_module.ShellManager = MockSM
             with patch.dict(
-                    sys.modules, {"src.tools.coding.shell_manager": mock_module}
+                sys.modules, {"src.tools.coding.shell_manager": mock_module}
             ):
                 session._setup_shell_manager()
 

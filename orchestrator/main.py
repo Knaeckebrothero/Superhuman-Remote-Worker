@@ -7397,7 +7397,7 @@ class AgentThreadStatusRequest(BaseModel):
 
 @app.put("/api/agents/threads/{thread_id}/status")
 async def agent_update_thread_status(
-        thread_id: str, request: AgentThreadStatusRequest
+    thread_id: str, request: AgentThreadStatusRequest
 ) -> dict[str, str]:
     """Update thread status (no auth, agent-facing).
 
@@ -7465,7 +7465,7 @@ async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
 
 @app.post("/api/agents/threads/{thread_id}/messages")
 async def agent_save_message(
-        thread_id: str, request: AgentThreadMessageRequest
+    thread_id: str, request: AgentThreadMessageRequest
 ) -> dict[str, Any]:
     """Agent saves a message to thread history (no auth).
 
@@ -7631,7 +7631,7 @@ class ThreadCreateRequest(BaseModel):
 
 @app.post("/api/persistent/threads")
 async def create_thread(
-        request_body: ThreadCreateRequest, request: Request
+    request_body: ThreadCreateRequest, request: Request
 ) -> dict[str, Any]:
     """Create a new persistent thread (auth required).
 
@@ -7681,7 +7681,7 @@ async def create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
             config_name=request_body.config_name
-                        or user_settings.get("config_name", "interactive"),
+            or user_settings.get("config_name", "interactive"),
             permission_mode=request_body.permission_mode,
             title=request_body.title,
         )
@@ -7729,9 +7729,9 @@ async def create_thread(
 
 @app.get("/api/persistent/threads")
 async def list_threads(
-        request: Request,
-        project_id: str | None = None,
-        status: str | None = None,
+    request: Request,
+    project_id: str | None = None,
+    status: str | None = None,
 ) -> dict[str, Any]:
     """List persistent threads for the authenticated user."""
     try:
@@ -7762,9 +7762,9 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
 
 @app.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
-        thread_id: str,
-        request: Request,
-        permanent: bool = False,
+    thread_id: str,
+    request: Request,
+    permanent: bool = False,
 ) -> dict[str, str]:
     """End (or permanently delete) a persistent thread (auth: owner only).
 
@@ -7822,8 +7822,8 @@ async def end_thread(
 
 @app.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
-        thread_id: str,
-        request: Request,
+    thread_id: str,
+    request: Request,
 ) -> dict[str, Any]:
     """Resume an ended or idle thread (auth: owner only).
 
@@ -7848,10 +7848,10 @@ async def resume_thread(
 
 @app.get("/api/persistent/threads/{thread_id}/messages")
 async def get_thread_messages_history(
-        thread_id: str,
-        request: Request,
-        limit: int = 200,
-        offset: int = 0,
+    thread_id: str,
+    request: Request,
+    limit: int = 200,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Load message history for a thread (for session resume).
 
@@ -7949,11 +7949,11 @@ _SESSION_RESOLVE_METHODS = {"approve", "deny"}
 
 
 def _inspect_session_event(
-        raw: str,
-        thread_id: str,
-        user_id: str,
-        thread_title: str,
-        config_name: str | None,
+    raw: str,
+    thread_id: str,
+    user_id: str,
+    thread_title: str,
+    config_name: str | None,
 ) -> None:
     """Inspect an agent→browser WS frame and broadcast SSE if notification-worthy."""
     if not user_id:
@@ -7995,9 +7995,9 @@ def _inspect_session_event(
 
 
 def _inspect_browser_event(
-        raw: str,
-        thread_id: str,
-        user_id: str,
+    raw: str,
+    thread_id: str,
+    user_id: str,
 ) -> None:
     """Inspect a browser→agent WS frame and broadcast resolve if approve/deny."""
     if not user_id:
@@ -8072,10 +8072,10 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         import websockets
 
         async with websockets.connect(
-                upstream_url,
-                max_size=16 * 1024 * 1024,
-                ping_interval=30,
-                close_timeout=5,
+            upstream_url,
+            max_size=16 * 1024 * 1024,
+            ping_interval=30,
+            close_timeout=5,
         ) as upstream:
 
             async def agent_to_browser():

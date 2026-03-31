@@ -34,13 +34,13 @@ import pytest
 
 
 async def agent_create_thread(
-        db,
-        gitea,
-        provisioner,
-        *,
-        config_name="interactive",
-        permission_mode="supervised",
-        title="Local Session",
+    db,
+    gitea,
+    provisioner,
+    *,
+    config_name="interactive",
+    permission_mode="supervised",
+    title="Local Session",
 ):
     """5.1: POST /api/agents/threads"""
     thread_id = await db.create_thread(
@@ -125,7 +125,7 @@ async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
 
 
 async def agent_save_message(
-        db, thread_id, role, content=None, tool_calls=None, turn_number=None
+    db, thread_id, role, content=None, tool_calls=None, turn_number=None
 ):
     """5.4: POST /api/agents/threads/{thread_id}/messages"""
     message_id = await db.save_thread_message(
@@ -148,14 +148,14 @@ def check_thread_ownership(thread, user_id):
 
 
 async def end_thread(
-        db,
-        thread,
-        user_id,
-        container_provisioner,
-        vm_provisioner,
-        snapshot_service,
-        gitea_client,
-        thread_id,
+    db,
+    thread,
+    user_id,
+    container_provisioner,
+    vm_provisioner,
+    snapshot_service,
+    gitea_client,
+    thread_id,
 ):
     """5.8: DELETE /api/persistent/threads/{thread_id}"""
     status = check_thread_ownership(thread, user_id)
@@ -290,7 +290,7 @@ _SESSION_RESOLVE_METHODS = {"approve", "deny"}
 
 
 def inspect_session_event(
-        raw, thread_id, user_id, thread_title, config_name, broadcast_fn
+    raw, thread_id, user_id, thread_title, config_name, broadcast_fn
 ):
     """5.12: _inspect_session_event"""
     if not user_id:
@@ -402,13 +402,13 @@ def _mock_suspension(enabled=False):
 
 
 def _make_thread(
-        thread_id="aaaaaaaa-1111-2222-3333-444444444444",
-        user_id=None,
-        agent_id=None,
-        config_name="interactive",
-        title="Test Session",
-        metadata=None,
-        status="active",
+    thread_id="aaaaaaaa-1111-2222-3333-444444444444",
+    user_id=None,
+    agent_id=None,
+    config_name="interactive",
+    title="Test Session",
+    metadata=None,
+    status="active",
 ):
     return {
         "id": thread_id,
@@ -1034,7 +1034,7 @@ class TestGetThreadIdeStatus:
             "workspace_container": {"repo_name": "thread-aaaa"},
         }
         with patch.dict(
-                os.environ, {"GITEA_URL": "http://gitea:3000", "GITEA_ADMIN_USER": "srw"}
+            os.environ, {"GITEA_URL": "http://gitea:3000", "GITEA_ADMIN_USER": "srw"}
         ):
             result = get_thread_ide_status(thread, metadata)
         assert result["status"] == "active"

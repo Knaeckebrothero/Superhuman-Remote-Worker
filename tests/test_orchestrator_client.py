@@ -402,6 +402,7 @@ class TestCreateThread:
         mock_response.json.return_value = {"thread_id": "tid-2"}
 
         with patch.object(client, "connect", AsyncMock()) as mock_connect:
+
             async def set_client():
                 mock_http = AsyncMock()
                 mock_http.post = AsyncMock(return_value=mock_response)
@@ -595,6 +596,7 @@ class TestRequestThreadVmUpgrade:
         mock_response.status_code = 200
 
         with patch.object(client, "connect", AsyncMock()) as mock_connect:
+
             async def set_client():
                 mock_http = AsyncMock()
                 mock_http.post = AsyncMock(return_value=mock_response)
@@ -695,6 +697,7 @@ class TestGetThreadWorkspace:
         mock_response.json.return_value = {"status": "pending"}
 
         with patch.object(client, "connect", AsyncMock()) as mock_connect:
+
             async def set_client():
                 mock_http = AsyncMock()
                 mock_http.get = AsyncMock(return_value=mock_response)

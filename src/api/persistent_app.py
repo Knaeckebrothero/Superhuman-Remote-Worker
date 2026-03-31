@@ -378,7 +378,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                         {
                             "thread_id": _thread_id,
                             "message": "Session paused due to inactivity. "
-                                       "Your work has been saved.",
+                            "Your work has been saved.",
                             "timeout_minutes": idle_timeout_minutes,
                         },
                     )
@@ -395,7 +395,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             await _ws_send(ws, "token", {"content": token})
 
         async def on_tool_start(
-                tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
         ) -> None:
             await _ws_send(
                 ws,
@@ -408,7 +408,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             )
 
         async def on_tool_result(
-                tool_name: str, result: str, tool_call_id: str
+            tool_name: str, result: str, tool_call_id: str
         ) -> None:
             # Truncate large results for WS (full result is in message history)
             display_result = result[:2000] + "..." if len(result) > 2000 else result
@@ -718,12 +718,12 @@ async def _restore_session_messages() -> None:
 
 
 async def _save_message(
-        client: Any,
-        thread_id: str,
-        role: str,
-        content: Optional[str],
-        tool_calls: Optional[Any],
-        turn_number: int,
+    client: Any,
+    thread_id: str,
+    role: str,
+    content: Optional[str],
+    tool_calls: Optional[Any],
+    turn_number: int,
 ) -> None:
     """Fire-and-forget: save a single message via orchestrator REST."""
     try:
@@ -739,11 +739,11 @@ async def _save_message(
 
 
 async def _save_turn_ai_messages(
-        client: Any,
-        thread_id: str,
-        messages: List[Any],
-        turn_number: int,
-        metrics: dict | None = None,
+    client: Any,
+    thread_id: str,
+    messages: List[Any],
+    turn_number: int,
+    metrics: dict | None = None,
 ) -> None:
     """Fire-and-forget: save AI + tool messages from the most recent turn via orchestrator REST."""
     try:
@@ -852,7 +852,7 @@ async def _handle_archive(ws: WebSocket) -> None:
                     recall_store=recall_store,
                     messages=_session.messages,
                     memory_extraction_prompt=_session.config.memory.extraction_prompt
-                                             or "",
+                    or "",
                 )
                 logger.info("Final memory extraction complete")
             except Exception as e:
@@ -926,7 +926,7 @@ async def _handle_idle_archive() -> None:
                     recall_store=recall_store,
                     messages=_session.messages,
                     memory_extraction_prompt=_session.config.memory.extraction_prompt
-                                             or "",
+                    or "",
                 )
                 logger.info("Idle archive: memory extraction complete")
             except Exception as e:
@@ -937,9 +937,9 @@ async def _handle_idle_archive() -> None:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
                 if thread and thread.get("title") in (
-                        None,
-                        "Untitled Session",
-                        "",
+                    None,
+                    "Untitled Session",
+                    "",
                 ):
                     title = await _generate_title(
                         _session.messages, _session.auxiliary_llm
@@ -974,10 +974,10 @@ async def _handle_idle_archive() -> None:
 
 
 async def _poll_workspace_ready(
-        client: Any,
-        thread_id: str,
-        timeout: int = 120,
-        poll_interval: float = 2.0,
+    client: Any,
+    thread_id: str,
+    timeout: int = 120,
+    poll_interval: float = 2.0,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for workspace container readiness.
 
@@ -1111,10 +1111,10 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
 
 
 async def _poll_vm_ready(
-        client: Any,
-        thread_id: str,
-        timeout: int = 300,
-        poll_interval: float = 3.0,
+    client: Any,
+    thread_id: str,
+    timeout: int = 300,
+    poll_interval: float = 3.0,
 ) -> Optional[Dict[str, Any]]:
     """Poll orchestrator for VM readiness.
 

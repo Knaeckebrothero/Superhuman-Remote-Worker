@@ -147,11 +147,11 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def create_worker_job(
-            description: str,
-            config_name: str = "defaults",
-            instructions: Optional[str] = None,
-            priority: int = 5,
-            project_id: Optional[str] = None,
+        description: str,
+        config_name: str = "defaults",
+        instructions: Optional[str] = None,
+        priority: int = 5,
+        project_id: Optional[str] = None,
     ) -> str:
         """Create a new worker job on the orchestrator.
 
@@ -197,8 +197,8 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def list_worker_jobs(
-            status: Optional[str] = None,
-            limit: int = 20,
+        status: Optional[str] = None,
+        limit: int = 20,
     ) -> str:
         """List jobs on the orchestrator.
 
@@ -316,8 +316,8 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
 
     @tool
     async def resume_worker_job(
-            job_id: str,
-            feedback: Optional[str] = None,
+        job_id: str,
+        feedback: Optional[str] = None,
     ) -> str:
         """Resume a paused or frozen job with optional feedback.
 

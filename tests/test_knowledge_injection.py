@@ -64,7 +64,7 @@ class TestCreateKnowledgeInjectionMessages:
     def test_tool_call_id_has_hex_suffix(self):
         ai, _ = create_knowledge_injection_messages("content")
         tc_id = ai.tool_calls[0]["id"]
-        suffix = tc_id[len(KNOWLEDGE_TOOL_CALL_ID_PREFIX):]
+        suffix = tc_id[len(KNOWLEDGE_TOOL_CALL_ID_PREFIX) :]
         assert len(suffix) == 8
         int(suffix, 16)  # Should not raise — valid hex
 

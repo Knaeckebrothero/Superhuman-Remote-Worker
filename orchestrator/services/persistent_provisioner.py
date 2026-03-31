@@ -81,12 +81,12 @@ class PersistentProvisioner:
             )
 
     async def create_agent_pod(
-            self,
-            thread_id: str,
-            config_name: str = "defaults",
-            cpu_request: str = "500m",
-            memory_request: str = "1Gi",
-            memory_limit: str = "4Gi",
+        self,
+        thread_id: str,
+        config_name: str = "defaults",
+        cpu_request: str = "500m",
+        memory_request: str = "1Gi",
+        memory_limit: str = "4Gi",
     ) -> bool:
         """Create a K8s pod running a persistent agent.
 

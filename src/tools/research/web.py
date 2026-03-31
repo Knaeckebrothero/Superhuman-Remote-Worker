@@ -96,9 +96,9 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     def web_search(
         query: str,
         max_results: int = 5,
-            search_depth: Literal["basic", "advanced"] = "basic",
-            topic: Literal["general", "news", "finance"] = "general",
-            time_range: Optional[Literal["day", "week", "month", "year"]] = None,
+        search_depth: Literal["basic", "advanced"] = "basic",
+        topic: Literal["general", "news", "finance"] = "general",
+        time_range: Optional[Literal["day", "week", "month", "year"]] = None,
         include_domains: Optional[str] = None,
         exclude_domains: Optional[str] = None,
         include_raw_content: bool = False,
@@ -137,7 +137,7 @@ def create_web_tools(context: ToolContext) -> List[Any]:
     def extract_webpage(
         urls: str,
         query: Optional[str] = None,
-            extract_depth: Literal["basic", "advanced"] = "basic",
+        extract_depth: Literal["basic", "advanced"] = "basic",
     ) -> str:
         """Extract full content from one or more web pages using Tavily Extract.
 
