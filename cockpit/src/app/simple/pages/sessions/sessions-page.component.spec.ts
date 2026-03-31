@@ -1,4 +1,4 @@
-import {describe, it, expect, beforeEach, vi, afterEach} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {Router} from '@angular/router';
@@ -225,13 +225,13 @@ describe('SessionsPageComponent', () => {
         });
 
         it('should include model when specified', async () => {
-            component.newModel = 'gpt-4o';
+            component.newModel = 'gpt-5.4';
             mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
             const body = mockHttp.post.mock.calls[0][1];
-            expect(body.model).toBe('gpt-4o');
+            expect(body.model).toBe('gpt-5.4');
         });
 
         it('should NOT include model when empty', async () => {
@@ -264,7 +264,7 @@ describe('SessionsPageComponent', () => {
 
         it('should reset form state after creation', async () => {
             component.newTitle = 'Title';
-            component.newModel = 'gpt-4o';
+            component.newModel = 'gpt-5.4';
             component.selectedProjectIds.set(['proj-1']);
             component.showCreate = true;
 

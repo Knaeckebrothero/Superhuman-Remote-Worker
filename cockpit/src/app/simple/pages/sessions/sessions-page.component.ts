@@ -1,4 +1,4 @@
-import {Component, inject, signal, OnInit} from '@angular/core';
+import {Component, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {FormsModule} from '@angular/forms';
 import {HttpClient} from '@angular/common/http';
@@ -99,20 +99,14 @@ interface Project {
                 <option value="openai/gpt-oss-120b">GPT-OSS 120B (local)</option>
               </optgroup>
               <optgroup label="OpenAI">
-                <option value="gpt-4o">GPT-4o</option>
-                <option value="gpt-4o-mini">GPT-4o Mini</option>
-                <option value="o4-mini">o4-mini</option>
+                <option value="gpt-5.4">GPT-5.4</option>
+                <option value="codex/gpt-5.4">GPT-5.4 (Codex)</option>
               </optgroup>
               <optgroup label="Anthropic">
-                <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
-                <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+                <option value="claude-opus-4-6">Claude Opus 4.6</option>
               </optgroup>
-              <optgroup label="Google">
-                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-              </optgroup>
-              <optgroup label="Groq">
-                <option value="groq/moonshotai/kimi-k2-instruct-0905">Kimi K2 (Groq)</option>
+              <optgroup label="OpenRouter">
+                <option value="openrouter/minimax/minimax-m2.7">MiniMax M2.7</option>
               </optgroup>
             </select>
           </div>
