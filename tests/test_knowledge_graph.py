@@ -59,8 +59,17 @@ class TestConstants:
         assert len(NOTE_TYPES) == 9
 
     def test_note_types_members(self):
-        expected = {"goal", "plan", "decision", "learning", "code",
-                    "source", "question", "state", "retrospective"}
+        expected = {
+            "goal",
+            "plan",
+            "decision",
+            "learning",
+            "code",
+            "source",
+            "question",
+            "state",
+            "retrospective",
+        }
         assert NOTE_TYPES == expected
 
     def test_note_statuses_count(self):
@@ -79,8 +88,16 @@ class TestConstants:
         assert len(RELATIONSHIP_TYPES) == 8
 
     def test_relationship_types_members(self):
-        expected = {"REFERENCES", "DERIVED_FROM", "SUPPORTS", "CONTRADICTS",
-                    "ANSWERS", "DEPENDS_ON", "SUPERSEDES", "IMPLEMENTS"}
+        expected = {
+            "REFERENCES",
+            "DERIVED_FROM",
+            "SUPPORTS",
+            "CONTRADICTS",
+            "ANSWERS",
+            "DEPENDS_ON",
+            "SUPERSEDES",
+            "IMPLEMENTS",
+        }
         assert RELATIONSHIP_TYPES == expected
 
     def test_constants_are_frozensets(self):
@@ -143,21 +160,20 @@ class TestInit:
         # Constructor params override env, but let's test env defaults
         with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
             KnowledgeGraphDB()
-            MockDB.assert_called_once_with(
-                "bolt://localhost:7687", "neo4j", ""
-            )
+            MockDB.assert_called_once_with("bolt://localhost:7687", "neo4j", "")
 
-    @patch.dict("os.environ", {
-        "NEO4J_URL": "bolt://custom:7687",
-        "NEO4J_USERNAME": "admin",
-        "NEO4J_PASSWORD": "secret",
-    })
+    @patch.dict(
+        "os.environ",
+        {
+            "NEO4J_URL": "bolt://custom:7687",
+            "NEO4J_USERNAME": "admin",
+            "NEO4J_PASSWORD": "secret",
+        },
+    )
     def test_reads_env_vars(self):
         with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
             KnowledgeGraphDB()
-            MockDB.assert_called_once_with(
-                "bolt://custom:7687", "admin", "secret"
-            )
+            MockDB.assert_called_once_with("bolt://custom:7687", "admin", "secret")
 
     def test_constructor_params_override_env(self):
         with patch("src.services.knowledge_graph.Neo4jDB") as MockDB:
@@ -213,14 +229,14 @@ class TestCreateNote:
     def test_invalid_confidence_raises(self):
         kg, _ = _make_kg()
         with pytest.raises(ValueError, match="Invalid confidence"):
-            kg.create_note("proj-1", "Title", "decision", "content",
-                           confidence="ultra")
+            kg.create_note("proj-1", "Title", "decision", "content", confidence="ultra")
 
     def test_none_confidence_is_valid(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []  # no slug collision
-        result = kg.create_note("proj-1", "Title", "decision", "content",
-                                confidence=None)
+        result = kg.create_note(
+            "proj-1", "Title", "decision", "content", confidence=None
+        )
         assert isinstance(result, str)
 
     def test_generates_slug_from_title(self):
@@ -255,11 +271,13 @@ class TestCreateNote:
     def test_creates_tags(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       tags=["Auth", "Security"])
+        kg.create_note(
+            "proj-1", "Title", "decision", "content", tags=["Auth", "Security"]
+        )
         # Note creation + 2 tag creations = 3 execute_write calls
-        tag_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "TAGGED" in c[0][0]]
+        tag_calls = [
+            c for c in mock_db.execute_write.call_args_list if "TAGGED" in c[0][0]
+        ]
         assert len(tag_calls) == 2
         # Tags should be lowercased
         assert tag_calls[0][0][1]["tag"] == "auth"
@@ -268,48 +286,66 @@ class TestCreateNote:
     def test_creates_keywords(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       keywords=["JWT", "OAuth"])
-        kw_calls = [c for c in mock_db.execute_write.call_args_list
-                    if "HAS_KEYWORD" in c[0][0]]
+        kg.create_note(
+            "proj-1", "Title", "decision", "content", keywords=["JWT", "OAuth"]
+        )
+        kw_calls = [
+            c for c in mock_db.execute_write.call_args_list if "HAS_KEYWORD" in c[0][0]
+        ]
         assert len(kw_calls) == 2
         assert kw_calls[0][0][1]["kw"] == "jwt"
 
     def test_creates_relationships(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       links=[{"target": "other-note", "type": "SUPPORTS"}])
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "SUPPORTS" in c[0][0]]
+        kg.create_note(
+            "proj-1",
+            "Title",
+            "decision",
+            "content",
+            links=[{"target": "other-note", "type": "SUPPORTS"}],
+        )
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "SUPPORTS" in c[0][0]
+        ]
         assert len(rel_calls) == 1
 
     def test_skips_links_with_missing_target(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       links=[{"type": "SUPPORTS"}])  # no target
+        kg.create_note(
+            "proj-1", "Title", "decision", "content", links=[{"type": "SUPPORTS"}]
+        )  # no target
         # Only the Note creation call, no relationship calls
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "SUPPORTS" in c[0][0]]
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "SUPPORTS" in c[0][0]
+        ]
         assert len(rel_calls) == 0
 
     def test_skips_links_with_invalid_rel_type(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       links=[{"target": "other", "type": "INVALID"}])
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "INVALID" in c[0][0]]
+        kg.create_note(
+            "proj-1",
+            "Title",
+            "decision",
+            "content",
+            links=[{"target": "other", "type": "INVALID"}],
+        )
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "INVALID" in c[0][0]
+        ]
         assert len(rel_calls) == 0
 
     def test_defaults_link_type_to_references(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = []
-        kg.create_note("proj-1", "Title", "decision", "content",
-                       links=[{"target": "other-note"}])  # no type
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "REFERENCES" in c[0][0]]
+        kg.create_note(
+            "proj-1", "Title", "decision", "content", links=[{"target": "other-note"}]
+        )  # no type
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "REFERENCES" in c[0][0]
+        ]
         assert len(rel_calls) == 1
 
     def test_returns_slug(self):
@@ -338,8 +374,16 @@ class TestReadNote:
         mock_node.items.return_value = [("id", "note-1"), ("title", "Test")]
         mock_db.execute_query.side_effect = [
             [{"n": mock_node, "tags": ["auth"], "keywords": ["jwt"]}],  # main query
-            [{"rel_type": "SUPPORTS", "target_id": "other", "target_title": "Other"}],  # outgoing
-            [{"rel_type": "DERIVED_FROM", "source_id": "parent", "source_title": "Parent"}],  # incoming
+            [
+                {"rel_type": "SUPPORTS", "target_id": "other", "target_title": "Other"}
+            ],  # outgoing
+            [
+                {
+                    "rel_type": "DERIVED_FROM",
+                    "source_id": "parent",
+                    "source_title": "Parent",
+                }
+            ],  # incoming
         ]
         result = kg.read_note("proj-1", "note-1")
         assert result is not None
@@ -407,7 +451,8 @@ class TestListNotes:
     def test_returns_all_notes_for_project(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [
-            {"id": "n1", "title": "A"}, {"id": "n2", "title": "B"}
+            {"id": "n1", "title": "A"},
+            {"id": "n2", "title": "B"},
         ]
         result = kg.list_notes("proj-1")
         assert len(result) == 2
@@ -532,36 +577,37 @@ class TestUpdateNote:
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [{"n.id": "n1"}]
         kg.update_note("proj-1", "n1", add_tags=["NewTag"])
-        tag_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "TAGGED" in c[0][0]]
+        tag_calls = [
+            c for c in mock_db.execute_write.call_args_list if "TAGGED" in c[0][0]
+        ]
         assert len(tag_calls) == 1
         assert tag_calls[0][0][1]["tag"] == "newtag"
 
     def test_creates_new_relationships(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [{"n.id": "n1"}]
-        kg.update_note("proj-1", "n1",
-                       add_links=[{"target": "n2", "type": "SUPPORTS"}])
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "SUPPORTS" in c[0][0]]
+        kg.update_note("proj-1", "n1", add_links=[{"target": "n2", "type": "SUPPORTS"}])
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "SUPPORTS" in c[0][0]
+        ]
         assert len(rel_calls) == 1
 
     def test_skips_links_missing_target(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [{"n.id": "n1"}]
-        kg.update_note("proj-1", "n1",
-                       add_links=[{"type": "SUPPORTS"}])
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "SUPPORTS" in c[0][0]]
+        kg.update_note("proj-1", "n1", add_links=[{"type": "SUPPORTS"}])
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "SUPPORTS" in c[0][0]
+        ]
         assert len(rel_calls) == 0
 
     def test_skips_links_invalid_rel_type(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [{"n.id": "n1"}]
-        kg.update_note("proj-1", "n1",
-                       add_links=[{"target": "n2", "type": "INVALID"}])
-        rel_calls = [c for c in mock_db.execute_write.call_args_list
-                     if "INVALID" in c[0][0]]
+        kg.update_note("proj-1", "n1", add_links=[{"target": "n2", "type": "INVALID"}])
+        rel_calls = [
+            c for c in mock_db.execute_write.call_args_list if "INVALID" in c[0][0]
+        ]
         assert len(rel_calls) == 0
 
     def test_returns_true_on_success(self):
@@ -595,8 +641,14 @@ class TestGetRelated:
     def test_returns_results(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [
-            {"id": "n2", "title": "Note 2", "type": "learning",
-             "status": "active", "distance": 1, "rel_types": ["SUPPORTS"]}
+            {
+                "id": "n2",
+                "title": "Note 2",
+                "type": "learning",
+                "status": "active",
+                "distance": 1,
+                "rel_types": ["SUPPORTS"],
+            }
         ]
         result = kg.get_related("proj-1", "n1")
         assert len(result) == 1
@@ -716,8 +768,13 @@ class TestGetUnanswered:
     def test_returns_expected_fields(self):
         kg, mock_db = _make_kg()
         mock_db.execute_query.return_value = [
-            {"id": "q1", "title": "Why?", "content": "Details",
-             "created": "2026-01-01", "job_id": "j1"}
+            {
+                "id": "q1",
+                "title": "Why?",
+                "content": "Details",
+                "created": "2026-01-01",
+                "job_id": "j1",
+            }
         ]
         result = kg.get_unanswered("proj-1")
         assert result[0]["id"] == "q1"

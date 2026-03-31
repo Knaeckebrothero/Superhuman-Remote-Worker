@@ -29,14 +29,16 @@ from ..tools.description_manager import apply_description_overrides
 logger = logging.getLogger(__name__)
 
 # Phase-specific tools that don't apply to interactive mode
-_EXCLUDED_TOOLS = frozenset({
-    "next_phase_todos",
-    "todo_complete",
-    "todo_list",
-    "todo_rewind",
-    "mark_complete",
-    "job_complete",
-})
+_EXCLUDED_TOOLS = frozenset(
+    {
+        "next_phase_todos",
+        "todo_complete",
+        "todo_list",
+        "todo_rewind",
+        "mark_complete",
+        "job_complete",
+    }
+)
 
 
 @dataclass
@@ -115,7 +117,9 @@ class PersistentSession:
         self.permission_mode = self.config.interactive.permission_mode
 
         # 1. Create workspace (with optional remote backend + git)
-        self._setup_workspace(workspace_override=workspace_override, git_remote_url=git_remote_url)
+        self._setup_workspace(
+            workspace_override=workspace_override, git_remote_url=git_remote_url
+        )
 
         # 2. Create tool context and load tools
         self._setup_tools(postgres_conn)
@@ -164,14 +168,8 @@ class PersistentSession:
 
         # Determine backend: override > config > default (local)
         workspace_backend = None
-        effective_backend = (
-                (workspace_override or {}).get("backend")
-                or ws_data.backend
-        )
-        remote_cfg = (
-                (workspace_override or {}).get("remote")
-                or ws_data.remote
-        )
+        effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
+        remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
 
         if effective_backend == "remote" and remote_cfg:
             try:
@@ -298,15 +296,11 @@ class PersistentSession:
 
     def _setup_shell_manager(self) -> None:
         """Initialize shell manager, delegating to remote backend if available."""
-        ws_backend = (
-            self.workspace_manager.backend if self.workspace_manager else None
-        )
+        ws_backend = self.workspace_manager.backend if self.workspace_manager else None
         use_remote_shell = getattr(ws_backend, "supports_shell", False)
 
         if not use_remote_shell and not shutil.which("tmux"):
-            logger.debug(
-                "tmux not found and no remote backend — shell tools disabled"
-            )
+            logger.debug("tmux not found and no remote backend — shell tools disabled")
             return
 
         try:
@@ -327,9 +321,7 @@ class PersistentSession:
             )
             if self.tool_context:
                 self.tool_context.shell_manager = self.shell_manager
-            logger.info(
-                f"ShellManager initialized (remote={use_remote_shell})"
-            )
+            logger.info(f"ShellManager initialized (remote={use_remote_shell})")
         except Exception as e:
             logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
 
@@ -356,8 +348,12 @@ class PersistentSession:
                     job_id=_uuid.UUID(self.thread_id),
                     config=self.config.memory,
                     agent_id=self.config.agent_id,
-                    project_id=_uuid.UUID(self.project_ids[0]) if self.project_ids else None,
-                    project_ids=[_uuid.UUID(p) for p in self.project_ids] if self.project_ids else None,
+                    project_id=_uuid.UUID(self.project_ids[0])
+                    if self.project_ids
+                    else None,
+                    project_ids=[_uuid.UUID(p) for p in self.project_ids]
+                    if self.project_ids
+                    else None,
                 )
                 if self.tool_context:
                     self.tool_context.recall_store = self.recall_store
@@ -398,15 +394,14 @@ class PersistentSession:
         old_backend = self.workspace_manager.backend
 
         # Connect new backend first (fail fast)
-        if hasattr(new_backend, "connect") and not getattr(
-                new_backend, "is_connected", lambda: False
-        )():
+        if (
+                hasattr(new_backend, "connect")
+                and not getattr(new_backend, "is_connected", lambda: False)()
+        ):
             new_backend.connect()
 
         # Disconnect old backend
-        if hasattr(old_backend, "disconnect") and hasattr(
-                old_backend, "is_connected"
-        ):
+        if hasattr(old_backend, "disconnect") and hasattr(old_backend, "is_connected"):
             try:
                 if old_backend.is_connected():
                     old_backend.disconnect()

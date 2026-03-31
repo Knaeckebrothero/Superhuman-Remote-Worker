@@ -324,8 +324,16 @@ class TestInferLinks:
 
     def test_creates_references_link(self):
         sections = [
-            {"slug": "auth-setup", "title": "Auth Setup", "body": "See database config below"},
-            {"slug": "database-config", "title": "Database Config", "body": "PostgreSQL setup"},
+            {
+                "slug": "auth-setup",
+                "title": "Auth Setup",
+                "body": "See database config below",
+            },
+            {
+                "slug": "database-config",
+                "title": "Database Config",
+                "body": "PostgreSQL setup",
+            },
         ]
         links = _infer_links(sections)
         assert "auth-setup" in links
@@ -334,7 +342,11 @@ class TestInferLinks:
 
     def test_does_not_self_link(self):
         sections = [
-            {"slug": "auth-setup", "title": "Auth Setup", "body": "Auth Setup is important"},
+            {
+                "slug": "auth-setup",
+                "title": "Auth Setup",
+                "body": "Auth Setup is important",
+            },
         ]
         links = _infer_links(sections)
         assert "auth-setup" not in links
@@ -359,14 +371,22 @@ class TestInferLinks:
     def test_case_insensitive_matching(self):
         sections = [
             {"slug": "database", "title": "Database", "body": "PostgreSQL setup"},
-            {"slug": "overview", "title": "Overview", "body": "The DATABASE handles state"},
+            {
+                "slug": "overview",
+                "title": "Overview",
+                "body": "The DATABASE handles state",
+            },
         ]
         links = _infer_links(sections)
         assert "overview" in links
 
     def test_no_links_when_no_references(self):
         sections = [
-            {"slug": "alpha", "title": "Alpha Section", "body": "Completely unrelated text"},
+            {
+                "slug": "alpha",
+                "title": "Alpha Section",
+                "body": "Completely unrelated text",
+            },
             {"slug": "beta", "title": "Beta Section", "body": "Also totally different"},
         ]
         links = _infer_links(sections)
@@ -375,7 +395,11 @@ class TestInferLinks:
     def test_bidirectional_references(self):
         sections = [
             {"slug": "auth", "title": "Auth System", "body": "Depends on user manager"},
-            {"slug": "user-manager", "title": "User Manager", "body": "Used by auth system"},
+            {
+                "slug": "user-manager",
+                "title": "User Manager",
+                "body": "Used by auth system",
+            },
         ]
         links = _infer_links(sections)
         assert "auth" in links

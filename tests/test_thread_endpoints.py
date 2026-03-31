@@ -34,7 +34,13 @@ import pytest
 
 
 async def agent_create_thread(
-        db, gitea, provisioner, *, config_name="interactive", permission_mode="supervised", title="Local Session"
+        db,
+        gitea,
+        provisioner,
+        *,
+        config_name="interactive",
+        permission_mode="supervised",
+        title="Local Session",
 ):
     """5.1: POST /api/agents/threads"""
     thread_id = await db.create_thread(
@@ -118,7 +124,9 @@ async def agent_upgrade_to_vm(db, vm_provisioner, thread_id):
     }
 
 
-async def agent_save_message(db, thread_id, role, content=None, tool_calls=None, turn_number=None):
+async def agent_save_message(
+        db, thread_id, role, content=None, tool_calls=None, turn_number=None
+):
     """5.4: POST /api/agents/threads/{thread_id}/messages"""
     message_id = await db.save_thread_message(
         thread_id=thread_id,
@@ -140,7 +148,14 @@ def check_thread_ownership(thread, user_id):
 
 
 async def end_thread(
-        db, thread, user_id, container_provisioner, vm_provisioner, snapshot_service, gitea_client, thread_id,
+        db,
+        thread,
+        user_id,
+        container_provisioner,
+        vm_provisioner,
+        snapshot_service,
+        gitea_client,
+        thread_id,
 ):
     """5.8: DELETE /api/persistent/threads/{thread_id}"""
     status = check_thread_ownership(thread, user_id)
@@ -159,8 +174,11 @@ async def end_thread(
     pod_ip = ws_ctx.get("pod_ip")
     if snapshot_service.is_available and pod_ip and ws_ctx.get("status") == "ready":
         await snapshot_service.capture_vm_snapshot(
-            job_id=thread_id, ssh_host=pod_ip, ssh_port=22,
-            source_type="pod", entity_type="threads",
+            job_id=thread_id,
+            ssh_host=pod_ip,
+            ssh_port=22,
+            source_type="pod",
+            entity_type="threads",
         )
 
     # Container cleanup
@@ -271,7 +289,9 @@ _SESSION_NOTIFY_METHODS = {"permission.request", "vm_upgrade.needed", "ready"}
 _SESSION_RESOLVE_METHODS = {"approve", "deny"}
 
 
-def inspect_session_event(raw, thread_id, user_id, thread_title, config_name, broadcast_fn):
+def inspect_session_event(
+        raw, thread_id, user_id, thread_title, config_name, broadcast_fn
+):
     """5.12: _inspect_session_event"""
     if not user_id:
         return
@@ -423,7 +443,10 @@ class TestAgentCreateThread:
             permission_mode="supervised",
             title="Local Session",
         )
-        assert result == {"thread_id": "aaaaaaaa-1111-2222-3333-444444444444", "status": "created"}
+        assert result == {
+            "thread_id": "aaaaaaaa-1111-2222-3333-444444444444",
+            "status": "created",
+        }
 
     @pytest.mark.asyncio
     async def test_creates_gitea_repo_when_initialized(self):
@@ -436,7 +459,10 @@ class TestAgentCreateThread:
         gitea.create_repo.assert_awaited_once_with("thread-aaaaaaaa")
         db.merge_thread_workspace_context.assert_awaited_once_with(
             "aaaaaaaa-1111-2222-3333-444444444444",
-            {"git_remote_url": "http://gitea:3000/srw/thread-aaaaaaaa.git", "repo_name": "thread-aaaaaaaa"},
+            {
+                "git_remote_url": "http://gitea:3000/srw/thread-aaaaaaaa.git",
+                "repo_name": "thread-aaaaaaaa",
+            },
         )
 
     @pytest.mark.asyncio
@@ -459,7 +485,9 @@ class TestAgentCreateThread:
 
         # Give the background task a chance to be scheduled
         await asyncio.sleep(0)
-        prov.create_thread_workspace.assert_awaited_once_with("aaaaaaaa-1111-2222-3333-444444444444")
+        prov.create_thread_workspace.assert_awaited_once_with(
+            "aaaaaaaa-1111-2222-3333-444444444444"
+        )
 
     @pytest.mark.asyncio
     async def test_skips_container_when_not_available(self):
@@ -501,15 +529,17 @@ class TestAgentGetThreadWorkspace:
         assert result["pod_ip"] is None
 
     def test_parses_workspace_container_fields(self):
-        thread = _make_thread(metadata={
-            "workspace_container": {
-                "status": "ready",
-                "pod_ip": "10.0.0.50",
-                "pod_name": "ws-pod-1",
-                "namespace": "agent-vms",
-                "git_remote_url": "http://gitea/repo.git",
+        thread = _make_thread(
+            metadata={
+                "workspace_container": {
+                    "status": "ready",
+                    "pod_ip": "10.0.0.50",
+                    "pod_name": "ws-pod-1",
+                    "namespace": "agent-vms",
+                    "git_remote_url": "http://gitea/repo.git",
+                }
             }
-        })
+        )
         result = parse_workspace_metadata(thread)
         assert result["status"] == "ready"
         assert result["pod_ip"] == "10.0.0.50"
@@ -518,14 +548,16 @@ class TestAgentGetThreadWorkspace:
         assert result["git_remote_url"] == "http://gitea/repo.git"
 
     def test_parses_vm_fields(self):
-        thread = _make_thread(metadata={
-            "vm": {
-                "status": "ready",
-                "ssh_host": "192.168.1.10",
-                "ssh_port": 2222,
-                "vm_name": "agent-vm-1",
+        thread = _make_thread(
+            metadata={
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "192.168.1.10",
+                    "ssh_port": 2222,
+                    "vm_name": "agent-vm-1",
+                }
             }
-        })
+        )
         result = parse_workspace_metadata(thread)
         assert result["vm_status"] == "ready"
         assert result["vm_ssh_host"] == "192.168.1.10"
@@ -534,9 +566,9 @@ class TestAgentGetThreadWorkspace:
 
     def test_handles_json_string_metadata(self):
         """Legacy format: metadata stored as JSON string instead of dict."""
-        metadata_str = json.dumps({
-            "workspace_container": {"status": "ready", "pod_ip": "10.0.0.1"}
-        })
+        metadata_str = json.dumps(
+            {"workspace_container": {"status": "ready", "pod_ip": "10.0.0.1"}}
+        )
         thread = _make_thread(metadata=metadata_str)
         result = parse_workspace_metadata(thread)
         assert result["status"] == "ready"
@@ -548,10 +580,12 @@ class TestAgentGetThreadWorkspace:
         assert result["status"] == "none"
 
     def test_returns_config_override_and_project_ids(self):
-        thread = _make_thread(metadata={
-            "config_override": {"llm": {"model": "gpt-4o"}},
-            "project_ids": ["proj-1", "proj-2"],
-        })
+        thread = _make_thread(
+            metadata={
+                "config_override": {"llm": {"model": "gpt-4o"}},
+                "project_ids": ["proj-1", "proj-2"],
+            }
+        )
         result = parse_workspace_metadata(thread)
         assert result["config_override"] == {"llm": {"model": "gpt-4o"}}
         assert result["project_ids"] == ["proj-1", "proj-2"]
@@ -753,13 +787,17 @@ class TestListThreads:
     async def test_supports_project_id_filter(self):
         db = _mock_db()
         await db.list_threads(user_id="user-1", project_id="proj-1", status=None)
-        db.list_threads.assert_awaited_once_with(user_id="user-1", project_id="proj-1", status=None)
+        db.list_threads.assert_awaited_once_with(
+            user_id="user-1", project_id="proj-1", status=None
+        )
 
     @pytest.mark.asyncio
     async def test_supports_status_filter(self):
         db = _mock_db()
         await db.list_threads(user_id="user-1", project_id=None, status="active")
-        db.list_threads.assert_awaited_once_with(user_id="user-1", project_id=None, status="active")
+        db.list_threads.assert_awaited_once_with(
+            user_id="user-1", project_id=None, status="active"
+        )
 
 
 # =============================================================================
@@ -798,8 +836,14 @@ class TestEndThread:
     @pytest.mark.asyncio
     async def test_returns_404_when_not_found(self):
         result = await end_thread(
-            _mock_db(), None, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            _mock_db(),
+            None,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         assert result["error"] == 404
 
@@ -807,8 +851,14 @@ class TestEndThread:
     async def test_returns_403_for_non_owner(self):
         thread = _make_thread(user_id="user-2")
         result = await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         assert result["error"] == 403
 
@@ -820,8 +870,14 @@ class TestEndThread:
         )
         snap = _mock_snapshot(available=True)
         result = await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            snap, _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            snap,
+            _mock_gitea(),
+            "tid-1",
         )
         assert result["status"] == "ended"
         snap.capture_vm_snapshot.assert_awaited_once()
@@ -834,8 +890,14 @@ class TestEndThread:
         )
         snap = _mock_snapshot(available=True)
         await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            snap, _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            snap,
+            _mock_gitea(),
+            "tid-1",
         )
         snap.capture_vm_snapshot.assert_not_awaited()
 
@@ -844,8 +906,14 @@ class TestEndThread:
         thread = _make_thread(user_id="user-1")
         prov = _mock_provisioner(available=True)
         await end_thread(
-            _mock_db(), thread, "user-1", prov, _mock_vm_provisioner(),
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            prov,
+            _mock_vm_provisioner(),
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         prov.delete_thread_workspace.assert_awaited_once_with("tid-1")
 
@@ -857,8 +925,14 @@ class TestEndThread:
         )
         vm = _mock_vm_provisioner(available=True)
         await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), vm,
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            vm,
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         vm.delete_thread_vm.assert_awaited_once_with("tid-1")
 
@@ -867,8 +941,14 @@ class TestEndThread:
         thread = _make_thread(user_id="user-1", metadata={})
         vm = _mock_vm_provisioner(available=True)
         await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), vm,
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            vm,
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         vm.delete_thread_vm.assert_not_awaited()
 
@@ -880,8 +960,14 @@ class TestEndThread:
         )
         gitea = _mock_gitea(initialized=True)
         await end_thread(
-            _mock_db(), thread, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            _mock_snapshot(), gitea, "tid-1",
+            _mock_db(),
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            _mock_snapshot(),
+            gitea,
+            "tid-1",
         )
         gitea.delete_repo.assert_awaited_once_with("thread-aaaa")
 
@@ -890,8 +976,14 @@ class TestEndThread:
         thread = _make_thread(user_id="user-1")
         db = _mock_db()
         await end_thread(
-            db, thread, "user-1", _mock_provisioner(), _mock_vm_provisioner(),
-            _mock_snapshot(), _mock_gitea(), "tid-1",
+            db,
+            thread,
+            "user-1",
+            _mock_provisioner(),
+            _mock_vm_provisioner(),
+            _mock_snapshot(),
+            _mock_gitea(),
+            "tid-1",
         )
         db.end_thread.assert_awaited_once_with("tid-1")
 
@@ -916,7 +1008,9 @@ class TestGetThreadMessages:
         db.get_thread_messages_history = AsyncMock(return_value=[{"id": "m1"}])
         db.get_thread_message_count = AsyncMock(return_value=42)
 
-        messages = await db.get_thread_messages_history(thread_id="tid-1", limit=200, offset=0)
+        messages = await db.get_thread_messages_history(
+            thread_id="tid-1", limit=200, offset=0
+        )
         total = await db.get_thread_message_count("tid-1")
 
         result = {"messages": messages, "total": total, "thread_id": "tid-1"}
@@ -939,7 +1033,9 @@ class TestGetThreadIdeStatus:
             "vm": {"status": "ready", "ssh_host": "10.0.0.99"},
             "workspace_container": {"repo_name": "thread-aaaa"},
         }
-        with patch.dict(os.environ, {"GITEA_URL": "http://gitea:3000", "GITEA_ADMIN_USER": "srw"}):
+        with patch.dict(
+                os.environ, {"GITEA_URL": "http://gitea:3000", "GITEA_ADMIN_USER": "srw"}
+        ):
             result = get_thread_ide_status(thread, metadata)
         assert result["status"] == "active"
         assert result["source"] == "live_vm"
@@ -968,7 +1064,9 @@ class TestGetThreadIdeStatus:
     def test_provisioning_returns_restoring(self):
         """Provisioning → restoring."""
         thread = _make_thread()
-        result = get_thread_ide_status(thread, {"workspace_container": {"status": "provisioning"}})
+        result = get_thread_ide_status(
+            thread, {"workspace_container": {"status": "provisioning"}}
+        )
         assert result["status"] == "restoring"
         assert result["code_server_url"] is None
 
@@ -1099,16 +1197,31 @@ class TestInspectSessionEvent:
 
     def test_returns_immediately_when_user_id_falsy(self):
         broadcast = MagicMock()
-        inspect_session_event('{"method": "permission.request"}', "tid-1", "", "Title", "interactive", broadcast)
+        inspect_session_event(
+            '{"method": "permission.request"}',
+            "tid-1",
+            "",
+            "Title",
+            "interactive",
+            broadcast,
+        )
         broadcast.assert_not_called()
 
     def test_broadcasts_permission_request(self):
         broadcast = MagicMock()
-        raw = json.dumps({
-            "method": "permission.request",
-            "params": {"tool": "run_command", "args": {"cmd": "ls"}, "reason": "needs shell"},
-        })
-        inspect_session_event(raw, "tid-1", "user-1", "My Session", "interactive", broadcast)
+        raw = json.dumps(
+            {
+                "method": "permission.request",
+                "params": {
+                    "tool": "run_command",
+                    "args": {"cmd": "ls"},
+                    "reason": "needs shell",
+                },
+            }
+        )
+        inspect_session_event(
+            raw, "tid-1", "user-1", "My Session", "interactive", broadcast
+        )
         broadcast.assert_called_once()
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["event_type"] == "session.permission_request"
@@ -1118,7 +1231,12 @@ class TestInspectSessionEvent:
 
     def test_broadcasts_vm_upgrade_needed(self):
         broadcast = MagicMock()
-        raw = json.dumps({"method": "vm_upgrade.needed", "params": {"command": "sudo apt install vim"}})
+        raw = json.dumps(
+            {
+                "method": "vm_upgrade.needed",
+                "params": {"command": "sudo apt install vim"},
+            }
+        )
         inspect_session_event(raw, "tid-1", "user-1", "Title", None, broadcast)
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["event_type"] == "session.vm_upgrade"
@@ -1139,7 +1257,9 @@ class TestInspectSessionEvent:
 
     def test_ignores_invalid_json(self):
         broadcast = MagicMock()
-        inspect_session_event("not-json{", "tid-1", "user-1", "Title", "interactive", broadcast)
+        inspect_session_event(
+            "not-json{", "tid-1", "user-1", "Title", "interactive", broadcast
+        )
         broadcast.assert_not_called()
 
     def test_handles_missing_params_gracefully(self):

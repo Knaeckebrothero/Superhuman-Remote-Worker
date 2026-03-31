@@ -79,9 +79,16 @@ class TestMetadataRegistry:
 
     def test_expected_tool_names(self):
         expected = {
-            "kb_write", "kb_update", "kb_read", "kb_list", "kb_search",
-            "kb_related", "kb_contradictions", "kb_provenance",
-            "kb_unanswered", "kb_export",
+            "kb_write",
+            "kb_update",
+            "kb_read",
+            "kb_list",
+            "kb_search",
+            "kb_related",
+            "kb_contradictions",
+            "kb_provenance",
+            "kb_unanswered",
+            "kb_export",
         }
         assert set(KNOWLEDGE_TOOLS_METADATA.keys()) == expected
 
@@ -91,7 +98,9 @@ class TestMetadataRegistry:
 
     def test_all_have_both_phases(self):
         for name, meta in KNOWLEDGE_TOOLS_METADATA.items():
-            assert meta["phases"] == ["strategic", "tactical"], f"{name} phases mismatch"
+            assert meta["phases"] == ["strategic", "tactical"], (
+                f"{name} phases mismatch"
+            )
 
 
 # =============================================================================
@@ -135,9 +144,14 @@ class TestKbWrite:
         ctx = _make_context()
         ctx.project_id = None
         tools, _ = _make_tools(ctx)
-        result = _invoke(_get_tool(tools, "kb_write"), {
-            "title": "Test", "type": "decision", "content": "body",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {
+                "title": "Test",
+                "type": "decision",
+                "content": "body",
+            },
+        )
         assert "Error" in result
 
     def test_calls_kg_create_note(self):
@@ -147,10 +161,15 @@ class TestKbWrite:
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
         with patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            _invoke(_get_tool(tools, "kb_write"), {
-                "title": "Test", "type": "decision", "content": "body",
-                "tags": ["auth"],
-            })
+            _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "Test",
+                    "type": "decision",
+                    "content": "body",
+                    "tags": ["auth"],
+                },
+            )
 
         kg.create_note.assert_called_once()
         call_kwargs = kg.create_note.call_args[1]
@@ -164,9 +183,14 @@ class TestKbWrite:
         ctx.knowledge_store.upsert_note = AsyncMock(return_value=uuid.uuid4())
 
         with patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            result = _invoke(_get_tool(tools, "kb_write"), {
-                "title": "My Note", "type": "learning", "content": "body",
-            })
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "My Note",
+                    "type": "learning",
+                    "content": "body",
+                },
+            )
         assert "my-note" in result
         assert "learning" in result
 
@@ -177,18 +201,28 @@ class TestKbWrite:
 
         # _run_async uses asyncio.run since no loop; mock it
         with patch("asyncio.run", side_effect=Exception("db error")):
-            result = _invoke(_get_tool(tools, "kb_write"), {
-                "title": "T", "type": "decision", "content": "x",
-            })
+            result = _invoke(
+                _get_tool(tools, "kb_write"),
+                {
+                    "title": "T",
+                    "type": "decision",
+                    "content": "x",
+                },
+            )
         assert "slug" in result  # Still returns success
 
     def test_returns_error_on_value_error(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.create_note.side_effect = ValueError("Invalid note_type")
 
-        result = _invoke(_get_tool(tools, "kb_write"), {
-            "title": "T", "type": "invalid", "content": "x",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {
+                "title": "T",
+                "type": "invalid",
+                "content": "x",
+            },
+        )
         assert "Error" in result
         assert "Invalid note_type" in result
 
@@ -196,9 +230,14 @@ class TestKbWrite:
         tools, ctx = _make_tools()
         ctx.knowledge_graph.create_note.side_effect = RuntimeError("boom")
 
-        result = _invoke(_get_tool(tools, "kb_write"), {
-            "title": "T", "type": "decision", "content": "x",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_write"),
+            {
+                "title": "T",
+                "type": "decision",
+                "content": "x",
+            },
+        )
         assert "Error" in result
 
 
@@ -223,9 +262,13 @@ class TestKbUpdate:
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
         with patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            _invoke(_get_tool(tools, "kb_update"), {
-                "note": "n1", "content": "new body",
-            })
+            _invoke(
+                _get_tool(tools, "kb_update"),
+                {
+                    "note": "n1",
+                    "content": "new body",
+                },
+            )
         ctx.knowledge_graph.update_note.assert_called_once()
 
     def test_error_when_note_not_found(self):
@@ -241,10 +284,15 @@ class TestKbUpdate:
         ctx.knowledge_graph.read_note.return_value = {"title": "T", "content": "x"}
 
         with patch("src.tools.knowledge.knowledge_tools.asyncio"):
-            result = _invoke(_get_tool(tools, "kb_update"), {
-                "note": "n1", "content": "new", "status": "resolved",
-                "add_tags": ["a", "b"],
-            })
+            result = _invoke(
+                _get_tool(tools, "kb_update"),
+                {
+                    "note": "n1",
+                    "content": "new",
+                    "status": "resolved",
+                    "add_tags": ["a", "b"],
+                },
+            )
         assert "content replaced" in result
         assert "status → resolved" in result
         assert "+2 tag(s)" in result
@@ -254,9 +302,13 @@ class TestKbUpdate:
         ctx.knowledge_graph.update_note.return_value = True
         ctx.knowledge_graph.read_note.side_effect = Exception("read failed")
 
-        result = _invoke(_get_tool(tools, "kb_update"), {
-            "note": "n1", "append": "extra",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_update"),
+            {
+                "note": "n1",
+                "append": "extra",
+            },
+        )
         assert "Updated" in result
         assert "content appended" in result
 
@@ -264,9 +316,13 @@ class TestKbUpdate:
         tools, ctx = _make_tools()
         ctx.knowledge_graph.update_note.side_effect = ValueError("Invalid status")
 
-        result = _invoke(_get_tool(tools, "kb_update"), {
-            "note": "n1", "status": "invalid",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_update"),
+            {
+                "note": "n1",
+                "status": "invalid",
+            },
+        )
         assert "Error" in result
 
 
@@ -290,7 +346,10 @@ class TestKbRead:
         ctx = _make_context(project_ids=[pid1, pid2])
         tools, _ = _make_tools(ctx)
         kg = ctx.knowledge_graph
-        kg.read_note.side_effect = [None, {"id": "n1", "title": "Found", "content": "x"}]
+        kg.read_note.side_effect = [
+            None,
+            {"id": "n1", "title": "Found", "content": "x"},
+        ]
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
         assert "Found" in result
@@ -299,12 +358,20 @@ class TestKbRead:
     def test_returns_formatted_markdown(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.read_note.return_value = {
-            "id": "n1", "title": "My Note", "type": "decision",
-            "status": "active", "confidence": "high",
-            "tags": ["auth"], "keywords": ["jwt"],
+            "id": "n1",
+            "title": "My Note",
+            "type": "decision",
+            "status": "active",
+            "confidence": "high",
+            "tags": ["auth"],
+            "keywords": ["jwt"],
             "content": "Full body text",
-            "relationships": [{"type": "SUPPORTS", "target": "n2", "target_title": "N2"}],
-            "incoming_relationships": [{"type": "DERIVED_FROM", "source": "n0", "source_title": "N0"}],
+            "relationships": [
+                {"type": "SUPPORTS", "target": "n2", "target_title": "N2"}
+            ],
+            "incoming_relationships": [
+                {"type": "DERIVED_FROM", "source": "n0", "source_title": "N0"}
+            ],
         }
 
         result = _invoke(_get_tool(tools, "kb_read"), {"note": "n1"})
@@ -353,9 +420,13 @@ class TestKbList:
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = []
 
-        result = _invoke(_get_tool(tools, "kb_list"), {
-            "type": "decision", "tag": "auth",
-        })
+        result = _invoke(
+            _get_tool(tools, "kb_list"),
+            {
+                "type": "decision",
+                "tag": "auth",
+            },
+        )
         assert "No knowledge notes found" in result
         assert "type=decision" in result
         assert "tag=auth" in result
@@ -363,10 +434,14 @@ class TestKbList:
     def test_formats_with_status_icon(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.list_notes.return_value = [
-            {"id": "n1", "title": "Active", "type": "decision",
-             "status": "active", "confidence": "high"},
-            {"id": "n2", "title": "Archived", "type": "learning",
-             "status": "archived"},
+            {
+                "id": "n1",
+                "title": "Active",
+                "type": "decision",
+                "status": "active",
+                "confidence": "high",
+            },
+            {"id": "n2", "title": "Archived", "type": "learning", "status": "archived"},
         ]
 
         result = _invoke(_get_tool(tools, "kb_list"), {})
@@ -448,8 +523,14 @@ class TestKbRelated:
     def test_formats_hop_singular(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.get_related.return_value = [
-            {"id": "n2", "title": "T", "type": "decision",
-             "status": "active", "distance": 1, "rel_types": ["SUPPORTS"]},
+            {
+                "id": "n2",
+                "title": "T",
+                "type": "decision",
+                "status": "active",
+                "distance": 1,
+                "rel_types": ["SUPPORTS"],
+            },
         ]
 
         result = _invoke(_get_tool(tools, "kb_related"), {"note": "n1"})
@@ -458,8 +539,14 @@ class TestKbRelated:
     def test_formats_hops_plural(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.get_related.return_value = [
-            {"id": "n2", "title": "T", "type": "decision",
-             "status": "active", "distance": 2, "rel_types": ["SUPPORTS", "REFERENCES"]},
+            {
+                "id": "n2",
+                "title": "T",
+                "type": "decision",
+                "status": "active",
+                "distance": 2,
+                "rel_types": ["SUPPORTS", "REFERENCES"],
+            },
         ]
 
         result = _invoke(_get_tool(tools, "kb_related"), {"note": "n1"})
@@ -468,8 +555,14 @@ class TestKbRelated:
     def test_shows_relationship_chain(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.get_related.return_value = [
-            {"id": "n2", "title": "T", "type": "learning",
-             "status": "active", "distance": 2, "rel_types": ["SUPPORTS", "DERIVED_FROM"]},
+            {
+                "id": "n2",
+                "title": "T",
+                "type": "learning",
+                "status": "active",
+                "distance": 2,
+                "rel_types": ["SUPPORTS", "DERIVED_FROM"],
+            },
         ]
 
         result = _invoke(_get_tool(tools, "kb_related"), {"note": "n1"})
@@ -478,8 +571,14 @@ class TestKbRelated:
     def test_shows_non_active_status(self):
         tools, ctx = _make_tools()
         ctx.knowledge_graph.get_related.return_value = [
-            {"id": "n2", "title": "T", "type": "decision",
-             "status": "archived", "distance": 1, "rel_types": ["REFERENCES"]},
+            {
+                "id": "n2",
+                "title": "T",
+                "type": "decision",
+                "status": "archived",
+                "distance": 1,
+                "rel_types": ["REFERENCES"],
+            },
         ]
 
         result = _invoke(_get_tool(tools, "kb_related"), {"note": "n1"})
@@ -616,9 +715,13 @@ class TestKbExport:
         export_dir = str(tmp_path / "kb_export")
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
-                "id": "chose-jwt", "title": "Chose JWT", "type": "decision",
-                "status": "active", "confidence": "high",
-                "tags": ["auth"], "keywords": ["jwt"],
+                "id": "chose-jwt",
+                "title": "Chose JWT",
+                "type": "decision",
+                "status": "active",
+                "confidence": "high",
+                "tags": ["auth"],
+                "keywords": ["jwt"],
                 "content": "We chose JWT because...",
                 "relationships": [{"type": "SUPPORTS", "target": "auth-design"}],
             },
@@ -628,7 +731,7 @@ class TestKbExport:
         assert "1 note" in result
 
         # Verify file exists
-        exported = (tmp_path / "kb_export" / "chose-jwt.md")
+        exported = tmp_path / "kb_export" / "chose-jwt.md"
         assert exported.exists()
 
         content = exported.read_text()
@@ -644,8 +747,11 @@ class TestKbExport:
         export_dir = str(tmp_path / "kb_export2")
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
-                "id": "n1", "title": "N1", "type": "decision",
-                "status": "active", "content": "body",
+                "id": "n1",
+                "title": "N1",
+                "type": "decision",
+                "status": "active",
+                "content": "body",
                 "relationships": [
                     {"type": "SUPPORTS", "target": "a"},
                     {"type": "SUPPORTS", "target": "b"},

@@ -58,7 +58,13 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize persistent agent, register with orchestrator, start heartbeat."""
-    global _agent, _session, _orchestrator_client, _heartbeat_task, _started_at, _thread_id
+    global \
+        _agent, \
+        _session, \
+        _orchestrator_client, \
+        _heartbeat_task, \
+        _started_at, \
+        _thread_id
 
     _started_at = datetime.now()
     logger.info(
@@ -94,6 +100,7 @@ async def lifespan(app: FastAPI):
             # Register with the (now known) thread_id
             if _thread_id is None:
                 import uuid
+
                 _thread_id = str(uuid.uuid4())
 
             await _orchestrator_client.register(
@@ -119,6 +126,7 @@ async def lifespan(app: FastAPI):
     # Fallback: generate UUID if still None (standalone mode)
     if _thread_id is None:
         import uuid
+
         _thread_id = str(uuid.uuid4())
 
     # 2b. Wait for workspace container (if orchestrator is provisioning one)
@@ -180,7 +188,9 @@ async def lifespan(app: FastAPI):
     )
     if project_ids:
         logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
-    git_remote_url = workspace_override.get("git_remote_url") if workspace_override else None
+    git_remote_url = (
+        workspace_override.get("git_remote_url") if workspace_override else None
+    )
     await _session.setup(
         llm=llm,
         auxiliary_llm=_agent._auxiliary_llm,
@@ -208,7 +218,7 @@ async def lifespan(app: FastAPI):
 
     # Final git commit + push before cleanup
     if _session and _session.workspace_manager:
-        git_mgr = getattr(_session.workspace_manager, 'git_manager', None)
+        git_mgr = getattr(_session.workspace_manager, "git_manager", None)
         if git_mgr and git_mgr.is_active:
             try:
                 if git_mgr.has_uncommitted_changes():
@@ -265,14 +275,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/health")
     async def health():
-        return JSONResponse({
-            "status": "healthy",
-            "mode": "persistent",
-            "thread_id": _thread_id,
-            "uptime_seconds": (datetime.now() - _started_at).total_seconds()
-            if _started_at
-            else 0,
-        })
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "mode": "persistent",
+                "thread_id": _thread_id,
+                "uptime_seconds": (datetime.now() - _started_at).total_seconds()
+                if _started_at
+                else 0,
+            }
+        )
 
     @app.get("/ready")
     async def ready():
@@ -284,15 +296,19 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/status")
     async def status():
-        return JSONResponse({
-            "mode": "persistent",
-            "thread_id": _thread_id,
-            "config": _config_path,
-            "permission_mode": _session.permission_mode if _session else None,
-            "turn_count": _session.turn_count if _session else 0,
-            "message_count": len(_session.messages) if _session else 0,
-            "tools": [t.name for t in _session.tools] if _session and _session.tools else [],
-        })
+        return JSONResponse(
+            {
+                "mode": "persistent",
+                "thread_id": _thread_id,
+                "config": _config_path,
+                "permission_mode": _session.permission_mode if _session else None,
+                "turn_count": _session.turn_count if _session else 0,
+                "message_count": len(_session.messages) if _session else 0,
+                "tools": [t.name for t in _session.tools]
+                if _session and _session.tools
+                else [],
+            }
+        )
 
     # --- WebSocket endpoint ---
 
@@ -308,12 +324,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         logger.info(f"WebSocket connected: thread={_thread_id}")
 
         # Send current session state so the client can sync
-        await _ws_send(ws, "session.state", {
-            "thread_id": _thread_id,
-            "permission_mode": _session.permission_mode,
-            "turn_count": _session.turn_count,
-            "message_count": len(_session.messages),
-        })
+        await _ws_send(
+            ws,
+            "session.state",
+            {
+                "thread_id": _thread_id,
+                "permission_mode": _session.permission_mode,
+                "turn_count": _session.turn_count,
+                "message_count": len(_session.messages),
+            },
+        )
 
         # Send greeting only on first connect (no messages yet)
         if not _session.messages or _session.turn_count == 0:
@@ -402,9 +422,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 },
             )
 
-        async def permission_check(
-                tool_name: str, tool_args: Dict[str, Any]
-        ) -> bool:
+        async def permission_check(tool_name: str, tool_args: Dict[str, Any]) -> bool:
             mode = _session.permission_mode
 
             if mode == "autonomous":
@@ -439,10 +457,17 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # Save user message to DB (bounded await — no messages lost on crash)
             if _orchestrator_client and _last_user_content[0]:
                 try:
-                    await asyncio.wait_for(_save_message(
-                        _orchestrator_client, _thread_id, "user",
-                        _last_user_content[0], None, turn_id,
-                    ), timeout=5.0)
+                    await asyncio.wait_for(
+                        _save_message(
+                            _orchestrator_client,
+                            _thread_id,
+                            "user",
+                            _last_user_content[0],
+                            None,
+                            turn_id,
+                        ),
+                        timeout=5.0,
+                    )
                 except asyncio.TimeoutError:
                     logger.warning("User message save timed out (5s) — proceeding")
 
@@ -451,10 +476,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # Save AI messages from this turn to DB (bounded await)
             if _orchestrator_client:
                 try:
-                    await asyncio.wait_for(_save_turn_ai_messages(
-                        _orchestrator_client, _thread_id,
-                        _session.messages, turn_id, metrics=metrics,
-                    ), timeout=5.0)
+                    await asyncio.wait_for(
+                        _save_turn_ai_messages(
+                            _orchestrator_client,
+                            _thread_id,
+                            _session.messages,
+                            turn_id,
+                            metrics=metrics,
+                        ),
+                        timeout=5.0,
+                    )
                 except asyncio.TimeoutError:
                     logger.warning("AI message save timed out (5s) — proceeding")
 
@@ -463,10 +494,14 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
         async def on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
             """Notify client that sudo was detected and VM upgrade is available."""
-            await _ws_send(ws, "vm_upgrade.needed", {
-                "reason": freeze_data.get("reason", "sudo detected"),
-                "command": freeze_data.get("command"),
-            })
+            await _ws_send(
+                ws,
+                "vm_upgrade.needed",
+                {
+                    "reason": freeze_data.get("reason", "sudo detected"),
+                    "command": freeze_data.get("command"),
+                },
+            )
 
         callbacks = PersistentLoopCallbacks(
             get_user_input=get_user_input,
@@ -533,9 +568,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     new_mode = data.get("mode", "supervised")
                     if new_mode in ("supervised", "auto_accept", "autonomous"):
                         _session.permission_mode = new_mode
-                        await _ws_send(
-                            ws, "mode.changed", {"mode": new_mode}
-                        )
+                        await _ws_send(ws, "mode.changed", {"mode": new_mode})
                         logger.info(f"Permission mode changed to: {new_mode}")
                     else:
                         await _ws_send(
@@ -663,7 +696,9 @@ async def _restore_session_messages() -> None:
 
             elif role == "tool":
                 # Pair with the next pending tool_call_id from the last AIMessage
-                tool_call_id = pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+                tool_call_id = (
+                    pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
+                )
                 restored.append(ToolMessage(content=content, tool_call_id=tool_call_id))
 
             # Skip system messages — the loop adds a fresh one from current config
@@ -671,9 +706,7 @@ async def _restore_session_messages() -> None:
         if restored:
             _session.messages.extend(restored)
             # Set turn_count from the last message's turn_number
-            last_turn = max(
-                (m.get("turn_number") or 0 for m in db_messages), default=0
-            )
+            last_turn = max((m.get("turn_number") or 0 for m in db_messages), default=0)
             _session.turn_count = last_turn
             logger.info(
                 f"Restored {len(restored)} messages for thread {_thread_id} "
@@ -769,20 +802,26 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         )
         after_count = len(_session.messages)
 
-        await _ws_send(ws, "context.compacted", {
-            "before": before_count,
-            "after": after_count,
-            "focus": focus,
-        })
+        await _ws_send(
+            ws,
+            "context.compacted",
+            {
+                "before": before_count,
+                "after": after_count,
+                "focus": focus,
+            },
+        )
         logger.info(f"Manual compaction: {before_count} → {after_count} messages")
 
         # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
         if _session.workspace_manager:
-            git_mgr = getattr(_session.workspace_manager, 'git_manager', None)
+            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
             if git_mgr and git_mgr.is_active:
                 try:
                     if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Compaction checkpoint ({before_count} → {after_count} msgs)")
+                        git_mgr.commit(
+                            f"Compaction checkpoint ({before_count} → {after_count} msgs)"
+                        )
                     git_mgr.push()
                 except Exception as e:
                     logger.debug(f"Git push on compaction failed (non-fatal): {e}")
@@ -799,15 +838,21 @@ async def _handle_archive(ws: WebSocket) -> None:
             return
 
         # 1. Extract final memories
-        recall_store = getattr(_session.tool_context, "recall_store", None) if _session.tool_context else None
+        recall_store = (
+            getattr(_session.tool_context, "recall_store", None)
+            if _session.tool_context
+            else None
+        )
         if recall_store and _session.auxiliary_llm and _session.messages:
             try:
                 from ..services.auxiliary import extract_and_store_memories
+
                 await extract_and_store_memories(
                     auxiliary_llm=_session.auxiliary_llm,
                     recall_store=recall_store,
                     messages=_session.messages,
-                    memory_extraction_prompt=_session.config.memory.extraction_prompt or "",
+                    memory_extraction_prompt=_session.config.memory.extraction_prompt
+                                             or "",
                 )
                 logger.info("Final memory extraction complete")
             except Exception as e:
@@ -818,12 +863,15 @@ async def _handle_archive(ws: WebSocket) -> None:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
                 if thread and thread.get("title") in (None, "Untitled Session", ""):
-                    title = await _generate_title(_session.messages, _session.auxiliary_llm)
+                    title = await _generate_title(
+                        _session.messages, _session.auxiliary_llm
+                    )
                     if title:
                         async with _session.postgres_conn.acquire() as conn:
                             await conn.execute(
                                 "UPDATE threads SET title = $2 WHERE id = $1",
-                                _thread_id, title,
+                                _thread_id,
+                                title,
                             )
             except Exception as e:
                 logger.warning(f"Title generation failed (non-fatal): {e}")
@@ -1008,7 +1056,8 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
         ok = await _orchestrator_client.request_thread_vm_upgrade(_thread_id)
         if not ok:
             await _ws_send(
-                ws, "vm_upgrade.failed",
+                ws,
+                "vm_upgrade.failed",
                 {"reason": "Orchestrator rejected VM upgrade request"},
             )
             return
@@ -1017,7 +1066,8 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
         vm_config = await _poll_vm_ready(_orchestrator_client, _thread_id, timeout=300)
         if not vm_config:
             await _ws_send(
-                ws, "vm_upgrade.failed",
+                ws,
+                "vm_upgrade.failed",
                 {"reason": "VM did not become ready in time"},
             )
             return
@@ -1044,11 +1094,15 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
         if _session.shell_manager and hasattr(_session.shell_manager, "sudo_action"):
             _session.shell_manager.sudo_action = "allow"
 
-        await _ws_send(ws, "vm_upgrade.complete", {
-            "thread_id": _thread_id,
-            "ssh_host": vm_config["ssh_host"],
-            "ssh_port": vm_config.get("ssh_port", 22),
-        })
+        await _ws_send(
+            ws,
+            "vm_upgrade.complete",
+            {
+                "thread_id": _thread_id,
+                "ssh_host": vm_config["ssh_host"],
+                "ssh_port": vm_config.get("ssh_port", 22),
+            },
+        )
         logger.info(f"VM upgrade complete for thread {_thread_id}")
 
     except Exception as e:
@@ -1099,6 +1153,7 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         return None
     try:
         from ..services.auxiliary import SummarizeTask
+
         # Grab first few exchanges for title generation
         sample = []
         for m in messages[:10]:

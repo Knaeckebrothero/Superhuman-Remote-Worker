@@ -35,6 +35,7 @@ from src.persistent_graph import (
 # Helpers / fixtures
 # ---------------------------------------------------------------------------
 
+
 def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
     """Build a PersistentLoopCallbacks with sane defaults (all no-op)."""
     defaults = dict(
@@ -96,6 +97,7 @@ def _make_tool(name="test_tool", result="tool result"):
 # 1.1 Sentinel constants
 # ---------------------------------------------------------------------------
 
+
 class TestSentinelConstants:
     def test_sentinels_are_distinct(self):
         assert INTERRUPT_SENTINEL != APPROVE_SENTINEL
@@ -117,6 +119,7 @@ class TestSentinelConstants:
 # 1.2 TurnResult dataclass
 # ---------------------------------------------------------------------------
 
+
 class TestTurnResult:
     def test_required_fields(self):
         tr = TurnResult(turn_id=1, messages_added=2, tool_calls_made=3)
@@ -134,8 +137,11 @@ class TestTurnResult:
 
     def test_custom_interrupted_and_error(self):
         tr = TurnResult(
-            turn_id=5, messages_added=1, tool_calls_made=0,
-            interrupted=True, error="timeout",
+            turn_id=5,
+            messages_added=1,
+            tool_calls_made=0,
+            interrupted=True,
+            error="timeout",
         )
         assert tr.interrupted is True
         assert tr.error == "timeout"
@@ -144,6 +150,7 @@ class TestTurnResult:
 # ---------------------------------------------------------------------------
 # 1.3 run_persistent_loop — system prompt insertion
 # ---------------------------------------------------------------------------
+
 
 class TestRunPersistentLoopSystemPrompt:
     @pytest.mark.asyncio
@@ -168,7 +175,9 @@ class TestRunPersistentLoopSystemPrompt:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="You are helpful.",
             callbacks=callbacks,
@@ -193,7 +202,9 @@ class TestRunPersistentLoopSystemPrompt:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="system",
             callbacks=callbacks,
@@ -218,7 +229,9 @@ class TestRunPersistentLoopSystemPrompt:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="new system",
             callbacks=callbacks,
@@ -232,6 +245,7 @@ class TestRunPersistentLoopSystemPrompt:
 # ---------------------------------------------------------------------------
 # 1.3 run_persistent_loop — input handling
 # ---------------------------------------------------------------------------
+
 
 class TestRunPersistentLoopInputHandling:
     @pytest.mark.asyncio
@@ -251,7 +265,9 @@ class TestRunPersistentLoopInputHandling:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -281,7 +297,9 @@ class TestRunPersistentLoopInputHandling:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -309,7 +327,9 @@ class TestRunPersistentLoopInputHandling:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -335,7 +355,9 @@ class TestRunPersistentLoopInputHandling:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -350,6 +372,7 @@ class TestRunPersistentLoopInputHandling:
 # 1.3 run_persistent_loop — cancellation
 # ---------------------------------------------------------------------------
 
+
 class TestRunPersistentLoopCancellation:
     @pytest.mark.asyncio
     async def test_cancelled_during_get_user_input_exits_cleanly(self):
@@ -362,7 +385,9 @@ class TestRunPersistentLoopCancellation:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -395,7 +420,9 @@ class TestRunPersistentLoopCancellation:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -406,6 +433,7 @@ class TestRunPersistentLoopCancellation:
 # ---------------------------------------------------------------------------
 # 1.3 run_persistent_loop — error handling
 # ---------------------------------------------------------------------------
+
 
 class TestRunPersistentLoopErrorHandling:
     @pytest.mark.asyncio
@@ -437,7 +465,9 @@ class TestRunPersistentLoopErrorHandling:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -474,7 +504,9 @@ class TestRunPersistentLoopErrorHandling:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -488,6 +520,7 @@ class TestRunPersistentLoopErrorHandling:
 # ---------------------------------------------------------------------------
 # 1.3 run_persistent_loop — config extraction
 # ---------------------------------------------------------------------------
+
 
 class TestConfigExtraction:
     @pytest.mark.asyncio
@@ -504,7 +537,9 @@ class TestConfigExtraction:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=config,
             system_prompt="sys",
             callbacks=callbacks,
@@ -523,7 +558,9 @@ class TestConfigExtraction:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=config,
             system_prompt="sys",
             callbacks=callbacks,
@@ -546,7 +583,9 @@ class TestConfigExtraction:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=config,
             system_prompt="sys",
             callbacks=callbacks,
@@ -557,6 +596,7 @@ class TestConfigExtraction:
 # ---------------------------------------------------------------------------
 # 1.4 Memory extraction trigger
 # ---------------------------------------------------------------------------
+
 
 class TestMemoryExtractionTrigger:
     @pytest.mark.asyncio
@@ -584,7 +624,9 @@ class TestMemoryExtractionTrigger:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 config=config,
                 system_prompt="sys",
                 callbacks=callbacks,
@@ -616,7 +658,9 @@ class TestMemoryExtractionTrigger:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 config=config,
                 system_prompt="sys",
                 callbacks=callbacks,
@@ -647,7 +691,9 @@ class TestMemoryExtractionTrigger:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 config=config,
                 system_prompt="sys",
                 callbacks=callbacks,
@@ -678,7 +724,9 @@ class TestMemoryExtractionTrigger:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 config=config,
                 system_prompt="sys",
                 callbacks=callbacks,
@@ -717,7 +765,9 @@ class TestMemoryExtractionTrigger:
             await run_persistent_loop(
                 llm_with_tools=llm,
                 tools=[],
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 config=config,
                 system_prompt="sys",
                 callbacks=callbacks,
@@ -730,6 +780,7 @@ class TestMemoryExtractionTrigger:
 # ---------------------------------------------------------------------------
 # 1.5 Auto-commit git logic
 # ---------------------------------------------------------------------------
+
 
 class TestAutoCommitGit:
     @pytest.mark.asyncio
@@ -782,7 +833,9 @@ class TestAutoCommitGit:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[tool],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -820,7 +873,9 @@ class TestAutoCommitGit:
         await run_persistent_loop(
             llm_with_tools=_make_streaming_llm(response),
             tools=[],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -880,7 +935,9 @@ class TestAutoCommitGit:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[tool],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -943,7 +1000,9 @@ class TestAutoCommitGit:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[tool],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -989,7 +1048,9 @@ class TestAutoCommitGit:
         await run_persistent_loop(
             llm_with_tools=llm,
             tools=[tool],
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             config=_make_config(),
             system_prompt="sys",
             callbacks=callbacks,
@@ -1002,6 +1063,7 @@ class TestAutoCommitGit:
 # 1.6 _execute_turn — interrupt handling
 # ---------------------------------------------------------------------------
 
+
 class TestExecuteTurnInterrupt:
     @pytest.mark.asyncio
     async def test_interrupt_returns_interrupted_result(self):
@@ -1012,7 +1074,9 @@ class TestExecuteTurnInterrupt:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response()),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1068,7 +1132,9 @@ class TestExecuteTurnInterrupt:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={"test_tool": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1086,6 +1152,7 @@ class TestExecuteTurnInterrupt:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — memory retrieval
 # ---------------------------------------------------------------------------
+
 
 class TestExecuteTurnMemoryRetrieval:
     @pytest.mark.asyncio
@@ -1106,7 +1173,9 @@ class TestExecuteTurnMemoryRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1131,7 +1200,9 @@ class TestExecuteTurnMemoryRetrieval:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1156,7 +1227,9 @@ class TestExecuteTurnMemoryRetrieval:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1181,7 +1254,9 @@ class TestExecuteTurnMemoryRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1207,7 +1282,9 @@ class TestExecuteTurnMemoryRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1224,6 +1301,7 @@ class TestExecuteTurnMemoryRetrieval:
 # 1.6 _execute_turn — knowledge retrieval
 # ---------------------------------------------------------------------------
 
+
 class TestExecuteTurnKnowledgeRetrieval:
     @pytest.mark.asyncio
     async def test_knowledge_search_called_with_project_ids(self):
@@ -1237,7 +1315,9 @@ class TestExecuteTurnKnowledgeRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1265,7 +1345,9 @@ class TestExecuteTurnKnowledgeRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1288,7 +1370,9 @@ class TestExecuteTurnKnowledgeRetrieval:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1313,7 +1397,9 @@ class TestExecuteTurnKnowledgeRetrieval:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1341,7 +1427,9 @@ class TestExecuteTurnKnowledgeRetrieval:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1360,6 +1448,7 @@ class TestExecuteTurnKnowledgeRetrieval:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — transient injection
 # ---------------------------------------------------------------------------
+
 
 class TestTransientInjection:
     @pytest.mark.asyncio
@@ -1453,7 +1542,9 @@ class TestTransientInjection:
         await _execute_turn(
             llm_with_tools=_make_streaming_llm(_make_llm_response("ok")),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1464,7 +1555,8 @@ class TestTransientInjection:
 
         # Original messages should have gained the AI response but NOT workspace injection
         ws_messages = [
-            m for m in messages
+            m
+            for m in messages
             if isinstance(m, SystemMessage) and "<workspace_memory>" in m.content
         ]
         assert len(ws_messages) == 0
@@ -1473,6 +1565,7 @@ class TestTransientInjection:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — context compaction
 # ---------------------------------------------------------------------------
+
 
 class TestContextCompaction:
     @pytest.mark.asyncio
@@ -1562,6 +1655,7 @@ class TestContextCompaction:
 # 1.6 _execute_turn — LLM streaming
 # ---------------------------------------------------------------------------
 
+
 class TestLLMStreaming:
     @pytest.mark.asyncio
     async def test_string_content_streamed_token_by_token(self):
@@ -1582,7 +1676,9 @@ class TestLLMStreaming:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1598,10 +1694,12 @@ class TestLLMStreaming:
     @pytest.mark.asyncio
     async def test_anthropic_list_content_streamed(self):
         """Anthropic list-of-dicts content blocks are streamed."""
-        chunk = AIMessage(content=[
-            {"type": "text", "text": "Hello"},
-            {"type": "tool_use", "id": "x"},  # non-text block
-        ])
+        chunk = AIMessage(
+            content=[
+                {"type": "text", "text": "Hello"},
+                {"type": "tool_use", "id": "x"},  # non-text block
+            ]
+        )
 
         async def _astream(msgs, **kw):
             yield chunk
@@ -1615,7 +1713,9 @@ class TestLLMStreaming:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1643,7 +1743,9 @@ class TestLLMStreaming:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1671,7 +1773,9 @@ class TestLLMStreaming:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1686,6 +1790,7 @@ class TestLLMStreaming:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — LLM streaming fallback
 # ---------------------------------------------------------------------------
+
 
 class TestLLMStreamingFallback:
     @pytest.mark.asyncio
@@ -1710,7 +1815,9 @@ class TestLLMStreamingFallback:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1744,7 +1851,9 @@ class TestLLMStreamingFallback:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1774,7 +1883,9 @@ class TestLLMStreamingFallback:
             await _execute_turn(
                 llm_with_tools=llm,
                 tool_map={},
-                context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+                context_manager=AsyncMock(
+                    ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+                ),
                 messages=messages,
                 callbacks=callbacks,
                 llm_timeout=600,
@@ -1805,7 +1916,9 @@ class TestLLMStreamingFallback:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1820,6 +1933,7 @@ class TestLLMStreamingFallback:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — LLM timeout
 # ---------------------------------------------------------------------------
+
 
 class TestLLMTimeout:
     @pytest.mark.asyncio
@@ -1839,7 +1953,9 @@ class TestLLMTimeout:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=10,
@@ -1856,6 +1972,7 @@ class TestLLMTimeout:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — tool execution loop
 # ---------------------------------------------------------------------------
+
 
 class TestToolExecutionLoop:
     @pytest.mark.asyncio
@@ -1890,7 +2007,9 @@ class TestToolExecutionLoop:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={"search": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1905,7 +2024,9 @@ class TestToolExecutionLoop:
 
         tool.ainvoke.assert_called_once_with({"q": "test"})
         callbacks.on_tool_start.assert_called_once_with("search", {"q": "test"}, "tc1")
-        callbacks.on_tool_result.assert_called_once_with("search", "search results", "tc1")
+        callbacks.on_tool_result.assert_called_once_with(
+            "search", "search results", "tc1"
+        )
 
     @pytest.mark.asyncio
     async def test_permission_denied_tool(self):
@@ -1937,7 +2058,9 @@ class TestToolExecutionLoop:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={"dangerous": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -1982,7 +2105,9 @@ class TestToolExecutionLoop:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={},  # no tools
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2028,7 +2153,9 @@ class TestToolExecutionLoop:
         result = await _execute_turn(
             llm_with_tools=llm,
             tool_map={"broken": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2074,7 +2201,9 @@ class TestToolExecutionLoop:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"noop": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2123,7 +2252,9 @@ class TestToolExecutionLoop:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"simple": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2167,7 +2298,9 @@ class TestToolExecutionLoop:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"search": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2190,7 +2323,9 @@ class TestToolExecutionLoop:
         result = await _execute_turn(
             llm_with_tools=_make_streaming_llm(response),
             tool_map={},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2206,6 +2341,7 @@ class TestToolExecutionLoop:
 # ---------------------------------------------------------------------------
 # 1.6 _execute_turn — VM upgrade detection
 # ---------------------------------------------------------------------------
+
 
 class TestVMUpgradeDetection:
     @pytest.mark.asyncio
@@ -2243,7 +2379,9 @@ class TestVMUpgradeDetection:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"run_cmd": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2290,7 +2428,9 @@ class TestVMUpgradeDetection:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"run_cmd": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2335,7 +2475,9 @@ class TestVMUpgradeDetection:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"run_cmd": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2379,7 +2521,9 @@ class TestVMUpgradeDetection:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"run_cmd": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,
@@ -2424,7 +2568,9 @@ class TestVMUpgradeDetection:
         await _execute_turn(
             llm_with_tools=llm,
             tool_map={"run_cmd": tool},
-            context_manager=AsyncMock(ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)),
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
             messages=messages,
             callbacks=callbacks,
             llm_timeout=600,

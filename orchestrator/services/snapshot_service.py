@@ -217,7 +217,12 @@ class SnapshotService:
             return True
 
         except Exception as e:
-            logger.error("Snapshot upload failed for %s %s: %s", entity_type.rstrip("s"), job_id, e)
+            logger.error(
+                "Snapshot upload failed for %s %s: %s",
+                entity_type.rstrip("s"),
+                job_id,
+                e,
+            )
             await self._set_snapshot_context(
                 job_id,
                 {
@@ -260,7 +265,9 @@ class SnapshotService:
 
         import tempfile
 
-        await self._set_snapshot_context(job_id, {"status": "capturing"}, entity_type=entity_type)
+        await self._set_snapshot_context(
+            job_id, {"status": "capturing"}, entity_type=entity_type
+        )
 
         tar_path = None
         try:
@@ -343,7 +350,12 @@ class SnapshotService:
 
             if process.returncode != 0 and total_bytes == 0:
                 stderr = (await process.stderr.read()).decode(errors="replace")
-                logger.error("SSH tar failed for %s %s: %s", entity_type.rstrip("s"), job_id, stderr[:500])
+                logger.error(
+                    "SSH tar failed for %s %s: %s",
+                    entity_type.rstrip("s"),
+                    job_id,
+                    stderr[:500],
+                )
                 await self._set_snapshot_context(
                     job_id,
                     {
@@ -391,7 +403,11 @@ class SnapshotService:
 
         except Exception as e:
             logger.error(
-                "Snapshot capture failed for %s %s: %s", entity_type.rstrip("s"), job_id, e, exc_info=True
+                "Snapshot capture failed for %s %s: %s",
+                entity_type.rstrip("s"),
+                job_id,
+                e,
+                exc_info=True,
             )
             await self._set_snapshot_context(
                 job_id,
@@ -460,7 +476,9 @@ class SnapshotService:
     # =========================================================================
 
     async def get_manifest(
-            self, job_id: str, phase_number: Optional[int] = None,
+            self,
+            job_id: str,
+            phase_number: Optional[int] = None,
             entity_type: str = "jobs",
     ) -> Optional[dict[str, Any]]:
         """Retrieve the manifest for a snapshot.
@@ -496,7 +514,10 @@ class SnapshotService:
             return None
 
     async def download_snapshot(
-            self, job_id: str, dest_path: str, phase_number: Optional[int] = None,
+            self,
+            job_id: str,
+            dest_path: str,
+            phase_number: Optional[int] = None,
             entity_type: str = "jobs",
     ) -> bool:
         """Download a snapshot tarball from S3.
@@ -604,7 +625,9 @@ class SnapshotService:
                 )
 
             # Clear snapshot context
-            await self._set_snapshot_context(job_id, {"status": "deleted"}, entity_type=entity_type)
+            await self._set_snapshot_context(
+                job_id, {"status": "deleted"}, entity_type=entity_type
+            )
 
             logger.info(
                 "Deleted %d snapshot objects for %s %s",

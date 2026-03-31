@@ -1314,9 +1314,7 @@ def load_agent_config(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
-        greeting=interactive_data.get(
-            "greeting", InteractiveConfig.greeting
-        ),
+        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(
@@ -1505,9 +1503,7 @@ def load_agent_config_from_dict(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
-        greeting=interactive_data.get(
-            "greeting", InteractiveConfig.greeting
-        ),
+        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(
@@ -3179,7 +3175,14 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     # Resolve all prompts to full text
     prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
     prompts = {}
-    for pt in ["systemprompt", "systemprompt_interactive", "persona", "strategic", "tactical", "summarization"]:
+    for pt in [
+        "systemprompt",
+        "systemprompt_interactive",
+        "persona",
+        "strategic",
+        "tactical",
+        "summarization",
+    ]:
         try:
             prompts[pt] = prompt_resolver.load(pt)
         except FileNotFoundError:

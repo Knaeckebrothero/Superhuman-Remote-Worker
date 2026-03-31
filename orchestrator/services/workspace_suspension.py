@@ -216,7 +216,8 @@ class WorkspaceSuspensionService:
             if not ok:
                 logger.warning(
                     "Failed to download snapshot for %s %s",
-                    entity_type.rstrip("s"), entity_id,
+                    entity_type.rstrip("s"),
+                    entity_id,
                 )
                 return
 
@@ -340,9 +341,7 @@ class WorkspaceSuspensionService:
         try:
             ok = await self._container_provisioner.create_thread_workspace(thread_id)
             if not ok:
-                logger.error(
-                    "Failed to create pod for restore of thread %s", thread_id
-                )
+                logger.error("Failed to create pod for restore of thread %s", thread_id)
                 await self._db.merge_thread_workspace_context(
                     thread_id,
                     {"status": "failed", "error": "pod creation failed on restore"},
@@ -375,7 +374,8 @@ class WorkspaceSuspensionService:
             )
             logger.info(
                 "Workspace restored from S3 for thread %s (pod_ip=%s)",
-                thread_id, pod_ip,
+                thread_id,
+                pod_ip,
             )
             return True
 

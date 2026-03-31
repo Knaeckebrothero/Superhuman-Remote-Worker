@@ -1212,9 +1212,7 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(
-                query, json_module.dumps(vm_updates), uuid_val
-            )
+            result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
 
         return result == "UPDATE 1"
 
@@ -2060,10 +2058,14 @@ class PostgresDB:
                 "id": str(row["id"]),
                 "role": row["role"],
                 "content": row["content"],
-                "tool_calls": json.loads(row["tool_calls"]) if row["tool_calls"] else None,
+                "tool_calls": json.loads(row["tool_calls"])
+                if row["tool_calls"]
+                else None,
                 "turn_number": row["turn_number"],
                 "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "created_at": row["created_at"].isoformat()
+                if row["created_at"]
+                else None,
             }
             result.append(msg)
         return result

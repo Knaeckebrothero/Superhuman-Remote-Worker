@@ -490,9 +490,7 @@ class VMProvisioner:
             )
             return True
         except Exception as e:
-            logger.error(
-                "Failed to create thread VM for %s: %s", thread_id, e
-            )
+            logger.error("Failed to create thread VM for %s: %s", thread_id, e)
             await self._set_thread_vm_context(
                 thread_id,
                 {
@@ -530,9 +528,7 @@ class VMProvisioner:
                     thread_id,
                 )
                 return True
-            logger.error(
-                "Failed to delete thread VM for %s: %s", thread_id, e
-            )
+            logger.error("Failed to delete thread VM for %s: %s", thread_id, e)
             return False
 
     async def _set_thread_vm_context(self, thread_id: str, updates: dict) -> None:
@@ -543,9 +539,7 @@ class VMProvisioner:
         try:
             await self._db.merge_thread_vm_context(thread_id, updates)
         except Exception:
-            logger.exception(
-                "Failed to update thread VM context for %s", thread_id
-            )
+            logger.exception("Failed to update thread VM context for %s", thread_id)
 
 
 # Module-level singleton

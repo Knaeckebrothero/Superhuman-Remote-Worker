@@ -549,9 +549,7 @@ class TestMigrateMemories:
         assert stats["migrated"] == 1
 
     @pytest.mark.asyncio
-    async def test_dry_run_does_not_write(
-            self, mock_db, mock_kg, mock_ks, mock_embed
-    ):
+    async def test_dry_run_does_not_write(self, mock_db, mock_kg, mock_ks, mock_embed):
         row = _make_memory(content="Test memory content")
         mock_db.fetch.return_value = [row]
         stats = await migrate_memories(
@@ -567,9 +565,7 @@ class TestMigrateMemories:
         mock_ks.upsert_note.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_writes_to_neo4j_first(
-            self, mock_db, mock_kg, mock_ks, mock_embed
-    ):
+    async def test_writes_to_neo4j_first(self, mock_db, mock_kg, mock_ks, mock_embed):
         row = _make_memory(content="Test memory content")
         mock_db.fetch.return_value = [row]
         await migrate_memories(
@@ -647,9 +643,7 @@ class TestMigrateMemories:
         assert stats["skipped"] == 1
 
     @pytest.mark.asyncio
-    async def test_importance_boundary_08(
-            self, mock_db, mock_kg, mock_ks, mock_embed
-    ):
+    async def test_importance_boundary_08(self, mock_db, mock_kg, mock_ks, mock_embed):
         """Exactly 0.8 should be 'high'."""
         row = _make_memory(importance=0.8)
         mock_db.fetch.return_value = [row]
@@ -664,9 +658,7 @@ class TestMigrateMemories:
         assert call_kwargs["confidence"] == "high"
 
     @pytest.mark.asyncio
-    async def test_importance_boundary_05(
-            self, mock_db, mock_kg, mock_ks, mock_embed
-    ):
+    async def test_importance_boundary_05(self, mock_db, mock_kg, mock_ks, mock_embed):
         """Exactly 0.5 should be 'medium'."""
         row = _make_memory(importance=0.5)
         mock_db.fetch.return_value = [row]
@@ -681,9 +673,7 @@ class TestMigrateMemories:
         assert call_kwargs["confidence"] == "medium"
 
     @pytest.mark.asyncio
-    async def test_importance_boundary_049(
-            self, mock_db, mock_kg, mock_ks, mock_embed
-    ):
+    async def test_importance_boundary_049(self, mock_db, mock_kg, mock_ks, mock_embed):
         """Below 0.5 should be 'low'."""
         row = _make_memory(importance=0.49)
         mock_db.fetch.return_value = [row]
