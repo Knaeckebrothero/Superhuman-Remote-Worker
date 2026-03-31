@@ -15,6 +15,7 @@ Reuses the same shared infrastructure as the worker graph:
 import asyncio
 import logging
 import time
+import uuid as _uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -30,6 +31,31 @@ from langchain_core.messages import (
 from .core.context import ContextManager
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_ai_response(response: AIMessage) -> AIMessage:
+    """Normalize AI message for Responses API compatibility.
+
+    OpenRouter (and other non-OpenAI providers) may return ``null`` for
+    message/block IDs in the Responses API output format.  When these
+    messages are later included in the ``input`` array of a subsequent
+    Responses API call, langchain-openai emits ``"id": null`` which the
+    API rejects with a 400.
+
+    This helper ensures every AIMessage has a valid ``id`` and that list-
+    style content blocks carry a non-null ``id`` so the round-trip is
+    valid.
+    """
+    if not response.id:
+        response.id = f"msg_{_uuid.uuid4().hex[:24]}"
+
+    if isinstance(response.content, list):
+        for block in response.content:
+            if isinstance(block, dict) and block.get("id") is None:
+                block["id"] = response.id
+
+    return response
+
 
 # Sentinel values for user input queue
 INTERRUPT_SENTINEL = "__INTERRUPT__"
@@ -563,6 +589,9 @@ async def _execute_turn(
                 tool_calls_made=tool_calls_made,
                 error="Empty LLM response",
             )
+
+        # Sanitize for Responses API compatibility (null IDs from OpenRouter)
+        response = _sanitize_ai_response(response)
 
         # Add AI response to message history
         messages.append(response)
