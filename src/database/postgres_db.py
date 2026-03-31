@@ -9,14 +9,14 @@ This module provides a modern async PostgreSQL interface using asyncpg with:
 Part of Phase 1 database refactoring - see docs/db_refactor.md
 """
 
-import os
+import json
 import logging
+import os
 import re
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Any, List, Dict
-from contextlib import asynccontextmanager
-import json
-import uuid
 
 try:
     import asyncpg
@@ -277,6 +277,44 @@ class PostgresDB:
     def is_connected(self) -> bool:
         """Check if connected to database."""
         return self._pool is not None
+
+    async def get_thread_messages_history(
+            self,
+            thread_id: str,
+            limit: int = 200,
+            offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Load thread message history for session resume. Ordered by created_at ASC."""
+        rows = await self.fetch(
+            """
+            SELECT id, role, content, tool_calls, turn_number, metrics, created_at
+            FROM thread_messages
+            WHERE thread_id = $1
+            ORDER BY created_at ASC
+                LIMIT $2
+            OFFSET $3
+            """,
+            thread_id,
+            limit,
+            offset,
+        )
+        result = []
+        for row in rows:
+            msg = {
+                "id": str(row["id"]),
+                "role": row["role"],
+                "content": row["content"],
+                "tool_calls": json.loads(row["tool_calls"])
+                if row["tool_calls"]
+                else None,
+                "turn_number": row["turn_number"],
+                "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
+                "created_at": row["created_at"].isoformat()
+                if row["created_at"]
+                else None,
+            }
+            result.append(msg)
+        return result
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

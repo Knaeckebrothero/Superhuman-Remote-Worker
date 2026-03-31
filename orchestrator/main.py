@@ -8126,6 +8126,23 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         await ws.close(code=4503, reason="Agent has no IP")
         return
 
+    # Wait for agent readiness before proxying WS
+    agent_ready = False
+    for _ in range(30):  # 60s timeout
+        try:
+            async with httpx.AsyncClient(timeout=2) as client:
+                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
+                if resp.status_code == 200:
+                    agent_ready = True
+                    break
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+    if not agent_ready:
+        await ws.close(code=4503, reason="Agent not ready within timeout")
+        return
+
     upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
     logger.info(f"Proxying WS for thread {thread_id} to {upstream_url}")
 
