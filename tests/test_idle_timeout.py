@@ -117,7 +117,10 @@ class TestIdleTimeoutCallback:
 
 
 async def _handle_idle_archive(
-        session, orchestrator_client, thread_id, generate_title_fn=None,
+        session,
+        orchestrator_client,
+        thread_id,
+        generate_title_fn=None,
 ):
     """Replicated idle archive logic from persistent_app.py."""
     if not session:
@@ -142,7 +145,8 @@ async def _handle_idle_archive(
                     async with session.postgres_conn.acquire() as conn:
                         await conn.execute(
                             "UPDATE threads SET title = $2 WHERE id = $1",
-                            thread_id, title,
+                            thread_id,
+                            title,
                         )
 
     # 3. Set thread to 'idle'
@@ -161,8 +165,12 @@ async def _handle_idle_archive(
 
 
 def _mock_session(
-        has_recall=False, has_messages=True, has_postgres=True,
-        has_workspace=True, has_git=True, thread_title="Untitled Session",
+        has_recall=False,
+        has_messages=True,
+        has_postgres=True,
+        has_workspace=True,
+        has_git=True,
+        thread_title="Untitled Session",
 ):
     session = MagicMock()
     session.messages = [MagicMock()] if has_messages else []
@@ -187,7 +195,9 @@ def _mock_session(
 
     if has_workspace and has_git:
         session.workspace_manager.git_manager.is_active = True
-        session.workspace_manager.git_manager.has_uncommitted_changes.return_value = True
+        session.workspace_manager.git_manager.has_uncommitted_changes.return_value = (
+            True
+        )
         session.workspace_manager.git_manager.commit = MagicMock()
         session.workspace_manager.git_manager.push = MagicMock()
     elif has_workspace:
@@ -240,7 +250,9 @@ class TestHandleIdleArchive:
     @pytest.mark.asyncio
     async def test_skips_git_when_no_changes(self):
         session = _mock_session(has_git=True)
-        session.workspace_manager.git_manager.has_uncommitted_changes.return_value = False
+        session.workspace_manager.git_manager.has_uncommitted_changes.return_value = (
+            False
+        )
         await _handle_idle_archive(session, AsyncMock(), "tid-1")
         session.workspace_manager.git_manager.commit.assert_not_called()
         session.workspace_manager.git_manager.push.assert_called_once()
@@ -263,7 +275,10 @@ class TestHandleIdleArchive:
 
 
 async def _update_thread_status(
-        orchestrator_client, session, thread_id, status,
+        orchestrator_client,
+        session,
+        thread_id,
+        status,
 ):
     """Replicated from persistent_app.py."""
     if orchestrator_client and thread_id:
@@ -464,8 +479,12 @@ class TestStaleDetectorSweep:
 
         # Ensure thread sweep is called AFTER agent marking
         calls = db.method_calls
-        agent_idx = next(i for i, c in enumerate(calls) if c[0] == "mark_stale_agents_offline")
-        thread_idx = next(i for i, c in enumerate(calls) if c[0] == "mark_orphaned_threads_idle")
+        agent_idx = next(
+            i for i, c in enumerate(calls) if c[0] == "mark_stale_agents_offline"
+        )
+        thread_idx = next(
+            i for i, c in enumerate(calls) if c[0] == "mark_orphaned_threads_idle"
+        )
         assert agent_idx < thread_idx
 
     @pytest.mark.asyncio
@@ -630,6 +649,7 @@ class TestOrchestratorClientUpdateStatus:
 class TestIdleTimeoutConfig:
     def test_interactive_config_has_idle_timeout(self):
         from src.core.loader import InteractiveConfig
+
         ic = InteractiveConfig()
         assert hasattr(ic, "idle_timeout_minutes")
         assert isinstance(ic.idle_timeout_minutes, int)

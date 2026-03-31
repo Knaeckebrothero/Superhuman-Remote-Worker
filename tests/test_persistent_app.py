@@ -34,6 +34,7 @@ from src.api.persistent_app import (
 # 3.1 _get_agent_metrics()
 # ---------------------------------------------------------------------------
 
+
 class TestGetAgentMetrics:
     def test_returns_dict_with_memory_and_cpu(self):
         """Returns dict with memory_mb and cpu_percent when psutil available."""
@@ -56,6 +57,7 @@ class TestGetAgentMetrics:
     def test_returns_none_when_psutil_not_installed(self):
         """Returns None when psutil import fails."""
         import builtins
+
         original_import = builtins.__import__
 
         def _mock_import(name, *args, **kwargs):
@@ -80,6 +82,7 @@ class TestGetAgentMetrics:
 # ---------------------------------------------------------------------------
 # 3.2 _safe_serialize()
 # ---------------------------------------------------------------------------
+
 
 class TestSafeSerialize:
     def test_dict_unchanged(self):
@@ -123,14 +126,18 @@ class TestSafeSerialize:
 # 3.3 _save_message()
 # ---------------------------------------------------------------------------
 
+
 class TestSaveMessage:
     @pytest.mark.asyncio
     async def test_calls_client_save_thread_message(self):
         client = AsyncMock()
         await _save_message(client, "tid", "user", "hello", None, 1)
         client.save_thread_message.assert_called_once_with(
-            thread_id="tid", role="user", content="hello",
-            tool_calls=None, turn_number=1,
+            thread_id="tid",
+            role="user",
+            content="hello",
+            tool_calls=None,
+            turn_number=1,
         )
 
     @pytest.mark.asyncio
@@ -144,6 +151,7 @@ class TestSaveMessage:
 # ---------------------------------------------------------------------------
 # 3.4 _save_turn_ai_messages()
 # ---------------------------------------------------------------------------
+
 
 class TestSaveTurnAiMessages:
     @pytest.mark.asyncio
@@ -195,10 +203,12 @@ class TestSaveTurnAiMessages:
     async def test_anthropic_list_content_normalized(self):
         """Anthropic list-of-dicts content joined into string."""
         client = AsyncMock()
-        ai_msg = AIMessage(content=[
-            {"type": "text", "text": "Hello "},
-            {"type": "text", "text": "world"},
-        ])
+        ai_msg = AIMessage(
+            content=[
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "world"},
+            ]
+        )
         messages = [HumanMessage(content="hi"), ai_msg]
 
         await _save_turn_ai_messages(client, "tid", messages, 1)
@@ -221,6 +231,7 @@ class TestSaveTurnAiMessages:
 # ---------------------------------------------------------------------------
 # 3.5 _generate_title()
 # ---------------------------------------------------------------------------
+
 
 class TestGenerateTitle:
     @pytest.mark.asyncio
@@ -286,7 +297,8 @@ class TestGenerateTitle:
 
         with patch("src.api.persistent_app.SummarizeTask", create=True):
             result = await _generate_title(
-                [HumanMessage(content="hi")], mock_llm,
+                [HumanMessage(content="hi")],
+                mock_llm,
             )
 
         assert len(result) <= 100
@@ -300,7 +312,8 @@ class TestGenerateTitle:
 
         with patch("src.api.persistent_app.SummarizeTask", create=True):
             result = await _generate_title(
-                [HumanMessage(content="hi")], mock_llm,
+                [HumanMessage(content="hi")],
+                mock_llm,
             )
 
         assert result is None
@@ -313,7 +326,8 @@ class TestGenerateTitle:
 
         with patch("src.api.persistent_app.SummarizeTask", create=True):
             result = await _generate_title(
-                [HumanMessage(content="hi")], mock_llm,
+                [HumanMessage(content="hi")],
+                mock_llm,
             )
 
         assert result is None
@@ -322,6 +336,7 @@ class TestGenerateTitle:
 # ---------------------------------------------------------------------------
 # 3.6 _poll_workspace_ready()
 # ---------------------------------------------------------------------------
+
 
 class TestPollWorkspaceReady:
     @pytest.mark.asyncio
@@ -404,7 +419,9 @@ class TestPollWorkspaceReady:
         client.get_thread_workspace = _get_workspace
 
         with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
-            result = await _poll_workspace_ready(client, "tid", timeout=30, poll_interval=0.01)
+            result = await _poll_workspace_ready(
+                client, "tid", timeout=30, poll_interval=0.01
+            )
 
         assert result is not None
         assert call_count == 3
@@ -418,7 +435,9 @@ class TestPollWorkspaceReady:
         with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             # Use a very short timeout and mock time.monotonic to expire immediately
             with patch("time.monotonic", side_effect=[0, 100]):
-                result = await _poll_workspace_ready(client, "tid", timeout=5, poll_interval=0.01)
+                result = await _poll_workspace_ready(
+                    client, "tid", timeout=5, poll_interval=0.01
+                )
 
         assert result is None
 
@@ -440,6 +459,7 @@ class TestPollWorkspaceReady:
 # ---------------------------------------------------------------------------
 # 3.7 _poll_vm_ready()
 # ---------------------------------------------------------------------------
+
 
 class TestPollVmReady:
     @pytest.mark.asyncio
@@ -493,7 +513,9 @@ class TestPollVmReady:
 
         with patch("src.api.persistent_app.asyncio.sleep", new_callable=AsyncMock):
             with patch("time.monotonic", side_effect=[0, 100]):
-                result = await _poll_vm_ready(client, "tid", timeout=5, poll_interval=0.01)
+                result = await _poll_vm_ready(
+                    client, "tid", timeout=5, poll_interval=0.01
+                )
 
         assert result is None
 
@@ -501,6 +523,7 @@ class TestPollVmReady:
 # ---------------------------------------------------------------------------
 # 3.8 _handle_compact()
 # ---------------------------------------------------------------------------
+
 
 class TestHandleCompact:
     @pytest.mark.asyncio
@@ -553,7 +576,10 @@ class TestHandleCompact:
         """Sends context.compacted event with before/after/focus."""
         ws = AsyncMock()
         mock_session = MagicMock()
-        mock_session.messages = [SystemMessage(content="sys"), HumanMessage(content="q")]
+        mock_session.messages = [
+            SystemMessage(content="sys"),
+            HumanMessage(content="q"),
+        ]
         mock_session.context_manager.summarize_and_compact = AsyncMock(
             return_value=[SystemMessage(content="sys")]
         )
@@ -602,9 +628,7 @@ class TestHandleCompact:
         ws = AsyncMock()
         mock_session = MagicMock()
         mock_session.messages = [SystemMessage(content="s")]
-        mock_session.context_manager.summarize_and_compact = AsyncMock(
-            return_value=[]
-        )
+        mock_session.context_manager.summarize_and_compact = AsyncMock(return_value=[])
         mock_session.config.context_management.max_summary_length = 10000
         git_mgr = MagicMock()
         git_mgr.is_active = True
@@ -619,6 +643,7 @@ class TestHandleCompact:
 # ---------------------------------------------------------------------------
 # 3.9 _handle_archive()
 # ---------------------------------------------------------------------------
+
 
 class TestHandleArchive:
     @pytest.mark.asyncio
@@ -698,7 +723,8 @@ class TestHandleArchive:
 
         # session.ended should still be sent
         ended_calls = [
-            c for c in ws.send_json.call_args_list
+            c
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "session.ended"
         ]
         assert len(ended_calls) == 1
@@ -715,14 +741,18 @@ class TestHandleArchive:
         mock_conn.get_thread = AsyncMock(return_value={"title": "Untitled Session"})
         mock_conn.end_thread = AsyncMock()
         mock_conn_ctx = AsyncMock()
-        mock_conn.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn_ctx)
+        mock_conn.acquire.return_value.__aenter__ = AsyncMock(
+            return_value=mock_conn_ctx
+        )
         mock_conn.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
         mock_session.postgres_conn = mock_conn
 
         with (
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._generate_title", return_value="Generated Title"),
+            patch(
+                "src.api.persistent_app._generate_title", return_value="Generated Title"
+            ),
         ):
             await _handle_archive(ws)
 
@@ -747,7 +777,8 @@ class TestHandleArchive:
 
         # session.ended should still be sent
         ended_calls = [
-            c for c in ws.send_json.call_args_list
+            c
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "session.ended"
         ]
         assert len(ended_calls) == 1
@@ -769,7 +800,8 @@ class TestHandleArchive:
             await _handle_archive(ws)
 
         ended_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "session.ended"
         ]
         assert len(ended_calls) == 1
@@ -779,6 +811,7 @@ class TestHandleArchive:
 # ---------------------------------------------------------------------------
 # 3.10 permission_check() logic (tested via closure behavior)
 # ---------------------------------------------------------------------------
+
 
 class TestPermissionCheck:
     """Tests the permission_check closure behavior.
@@ -811,6 +844,7 @@ class TestPermissionCheck:
 # 3.11 on_tool_result truncation
 # ---------------------------------------------------------------------------
 
+
 class TestOnToolResultTruncation:
     def test_short_result_unchanged(self):
         """Results <= 2000 chars not truncated."""
@@ -830,6 +864,7 @@ class TestOnToolResultTruncation:
 # ---------------------------------------------------------------------------
 # 3.12 check_interrupt() closure
 # ---------------------------------------------------------------------------
+
 
 class TestCheckInterrupt:
     def test_returns_true_and_resets_flag(self):
@@ -879,6 +914,7 @@ class TestCheckInterrupt:
 # 3.13 WebSocket message routing (tested via data parsing logic)
 # ---------------------------------------------------------------------------
 
+
 class TestWSMessageRouting:
     def test_json_parsing_valid(self):
         """Valid JSON parsed normally."""
@@ -918,6 +954,7 @@ class TestWSMessageRouting:
 # 3.15 _handle_vm_upgrade()
 # ---------------------------------------------------------------------------
 
+
 class TestHandleVmUpgrade:
     @pytest.mark.asyncio
     async def test_sends_failed_when_session_none(self):
@@ -930,7 +967,8 @@ class TestHandleVmUpgrade:
             await _handle_vm_upgrade(ws)
 
         failed_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.failed"
         ]
         assert len(failed_calls) == 1
@@ -946,7 +984,8 @@ class TestHandleVmUpgrade:
             await _handle_vm_upgrade(ws)
 
         failed_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.failed"
         ]
         assert len(failed_calls) == 1
@@ -984,7 +1023,8 @@ class TestHandleVmUpgrade:
             await _handle_vm_upgrade(ws)
 
         failed_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.failed"
         ]
         assert len(failed_calls) == 1
@@ -1006,7 +1046,8 @@ class TestHandleVmUpgrade:
             await _handle_vm_upgrade(ws)
 
         failed_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.failed"
         ]
         assert len(failed_calls) == 1
@@ -1029,9 +1070,13 @@ class TestHandleVmUpgrade:
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._poll_vm_ready", return_value={
-                "ssh_host": "10.0.0.5", "ssh_port": 22,
-            }),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                return_value={
+                    "ssh_host": "10.0.0.5",
+                    "ssh_port": 22,
+                },
+            ),
             patch(
                 "src.api.persistent_app.RemoteBackend",
                 return_value=mock_backend,
@@ -1040,13 +1085,15 @@ class TestHandleVmUpgrade:
         ):
             # Patch the import inside the function
             import sys
+
             mock_remote_mod = MagicMock()
             mock_remote_mod.RemoteBackend.return_value = mock_backend
             with patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}):
                 await _handle_vm_upgrade(ws)
 
         complete_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.complete"
         ]
         assert len(complete_calls) == 1
@@ -1067,6 +1114,7 @@ class TestHandleVmUpgrade:
         mock_backend = MagicMock()
 
         import sys
+
         mock_remote_mod = MagicMock()
         mock_remote_mod.RemoteBackend.return_value = mock_backend
 
@@ -1074,9 +1122,13 @@ class TestHandleVmUpgrade:
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._poll_vm_ready", return_value={
-                "ssh_host": "host", "ssh_port": 22,
-            }),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                return_value={
+                    "ssh_host": "host",
+                    "ssh_port": 22,
+                },
+            ),
             patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
         ):
             await _handle_vm_upgrade(ws)
@@ -1094,6 +1146,7 @@ class TestHandleVmUpgrade:
         mock_session.config.extra = {"shell": {}}
 
         import sys
+
         mock_remote_mod = MagicMock()
         mock_remote_mod.RemoteBackend.side_effect = RuntimeError("connect failed")
 
@@ -1101,15 +1154,20 @@ class TestHandleVmUpgrade:
             patch("src.api.persistent_app._session", mock_session),
             patch("src.api.persistent_app._orchestrator_client", mock_client),
             patch("src.api.persistent_app._thread_id", "tid"),
-            patch("src.api.persistent_app._poll_vm_ready", return_value={
-                "ssh_host": "host", "ssh_port": 22,
-            }),
+            patch(
+                "src.api.persistent_app._poll_vm_ready",
+                return_value={
+                    "ssh_host": "host",
+                    "ssh_port": 22,
+                },
+            ),
             patch.dict(sys.modules, {"src.core.backends.remote": mock_remote_mod}),
         ):
             await _handle_vm_upgrade(ws)
 
         failed_calls = [
-            c[0][0] for c in ws.send_json.call_args_list
+            c[0][0]
+            for c in ws.send_json.call_args_list
             if c[0][0].get("method") == "vm_upgrade.failed"
         ]
         assert len(failed_calls) == 1
@@ -1119,15 +1177,18 @@ class TestHandleVmUpgrade:
 # 3.17 _ws_send()
 # ---------------------------------------------------------------------------
 
+
 class TestWsSend:
     @pytest.mark.asyncio
     async def test_sends_json_with_method_and_params(self):
         ws = AsyncMock()
         await _ws_send(ws, "test.event", {"key": "value"})
-        ws.send_json.assert_called_once_with({
-            "method": "test.event",
-            "params": {"key": "value"},
-        })
+        ws.send_json.assert_called_once_with(
+            {
+                "method": "test.event",
+                "params": {"key": "value"},
+            }
+        )
 
     @pytest.mark.asyncio
     async def test_silently_drops_on_runtime_error(self):
@@ -1155,6 +1216,7 @@ class TestWsSend:
 # 3.18 create_persistent_app()
 # ---------------------------------------------------------------------------
 
+
 class TestCreatePersistentApp:
     def test_sets_module_globals(self):
         """create_persistent_app sets _config_path and _thread_id."""
@@ -1167,11 +1229,13 @@ class TestCreatePersistentApp:
 
     def test_returns_fastapi_instance(self):
         from fastapi import FastAPI
+
         app = create_persistent_app("config", "tid")
         assert isinstance(app, FastAPI)
 
     def test_thread_id_optional(self):
         """thread_id can be None."""
         import src.api.persistent_app as mod
+
         create_persistent_app("config")
         assert mod._thread_id is None

@@ -585,9 +585,7 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 body=pod_manifest,
             )
-            logger.info(
-                "Thread workspace created: %s (thread %s)", pod_name, thread_id
-            )
+            logger.info("Thread workspace created: %s (thread %s)", pod_name, thread_id)
             await self._set_thread_context(
                 thread_id,
                 {
@@ -619,9 +617,7 @@ class ContainerProvisioner:
 
             return True
         except Exception as e:
-            logger.error(
-                "Failed to create thread workspace for %s: %s", thread_id, e
-            )
+            logger.error("Failed to create thread workspace for %s: %s", thread_id, e)
             await self._set_thread_context(
                 thread_id,
                 {"status": "failed", "error": str(e)},
@@ -646,9 +642,7 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 grace_period_seconds=10,
             )
-            logger.info(
-                "Thread workspace deleted: %s (thread %s)", pod_name, thread_id
-            )
+            logger.info("Thread workspace deleted: %s (thread %s)", pod_name, thread_id)
             await self._set_thread_context(thread_id, {"status": "deleted"})
             return True
         except Exception as e:
@@ -659,9 +653,7 @@ class ContainerProvisioner:
                     thread_id,
                 )
                 return True
-            logger.error(
-                "Failed to delete thread workspace for %s: %s", thread_id, e
-            )
+            logger.error("Failed to delete thread workspace for %s: %s", thread_id, e)
             return False
 
     async def _set_thread_context(self, thread_id: str, updates: dict) -> None:

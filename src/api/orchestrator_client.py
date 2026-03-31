@@ -201,7 +201,9 @@ class OrchestratorClient:
                 logger.info(f"Created thread via orchestrator: {thread_id}")
                 return thread_id
             else:
-                logger.error(f"Failed to create thread: {response.status_code} - {response.text}")
+                logger.error(
+                    f"Failed to create thread: {response.status_code} - {response.text}"
+                )
                 return None
         except Exception as e:
             logger.error(f"Failed to create thread: {e}")

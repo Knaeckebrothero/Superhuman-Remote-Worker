@@ -341,9 +341,7 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             # Mark threads bound to stale/deleted agents as idle
             idle_count = await postgres_db.mark_orphaned_threads_idle()
             if idle_count > 0:
-                logger.info(
-                    f"Marked {idle_count} thread(s) as idle (orphaned)"
-                )
+                logger.info(f"Marked {idle_count} thread(s) as idle (orphaned)")
             # Recover orphaned jobs from offline or deleted agents
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
@@ -429,7 +427,10 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
                     logger.info("Workspace sweeper: suspended %d job containers", count)
                 thread_count = await workspace_suspension_service.check_idle_threads()
                 if thread_count:
-                    logger.info("Workspace sweeper: suspended %d thread containers", thread_count)
+                    logger.info(
+                        "Workspace sweeper: suspended %d thread containers",
+                        thread_count,
+                    )
         except Exception as e:
             logger.error("Error in workspace idle sweeper: %s", e)
 
@@ -1354,7 +1355,9 @@ class AgentRegistration(BaseModel):
     hostname: str | None = Field(None, description="Pod/host name")
     pod_port: int = Field(8001, description="Agent API port")
     pid: int | None = Field(None, description="Process ID")
-    agent_mode: str = Field("worker", description="Agent mode: 'worker' or 'persistent'")
+    agent_mode: str = Field(
+        "worker", description="Agent mode: 'worker' or 'persistent'"
+    )
     thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
 
 
@@ -7337,7 +7340,8 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
             git_remote_url = await gitea_client.create_repo(repo_name)
             if git_remote_url:
                 await postgres_db.merge_thread_workspace_context(
-                    thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
+                    thread_id,
+                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
         # Provision workspace container in background if K8s is available
@@ -7450,9 +7454,7 @@ async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
         agent_config=thread.get("config_name", "defaults"),
     )
     if not ok:
-        raise HTTPException(
-            status_code=500, detail="Failed to request VM provisioning"
-        )
+        raise HTTPException(status_code=500, detail="Failed to request VM provisioning")
 
     return {
         "status": "provisioning",
@@ -7616,15 +7618,21 @@ class ThreadCreateRequest(BaseModel):
 
     config_name: str = Field("defaults", description="Agent config to use")
     project_id: str | None = Field(None, description="(Legacy) Single project to scope")
-    project_ids: list[str] | None = Field(None, description="List of project UUIDs to scope")
+    project_ids: list[str] | None = Field(
+        None, description="List of project UUIDs to scope"
+    )
     permission_mode: str = Field("supervised", description="Initial permission mode")
     title: str = Field("Untitled Session", description="Session title")
-    model: str | None = Field(None, description="LLM model override (e.g. openai/gpt-oss-120b)")
+    model: str | None = Field(
+        None, description="LLM model override (e.g. openai/gpt-oss-120b)"
+    )
     temperature: float | None = Field(None, description="Temperature override")
 
 
 @app.post("/api/persistent/threads")
-async def create_thread(request_body: ThreadCreateRequest, request: Request) -> dict[str, Any]:
+async def create_thread(
+        request_body: ThreadCreateRequest, request: Request
+) -> dict[str, Any]:
     """Create a new persistent thread (auth required).
 
     Merges user's persistent_agent settings into thread metadata.config_override
@@ -7644,18 +7652,25 @@ async def create_thread(request_body: ThreadCreateRequest, request: Request) -> 
                     "permission_mode": user_settings["permission_mode"]
                 }
             if user_settings.get("greeting"):
-                config_override.setdefault("interactive", {})["greeting"] = user_settings["greeting"]
+                config_override.setdefault("interactive", {})["greeting"] = (
+                    user_settings["greeting"]
+                )
             if user_settings.get("idle_timeout_minutes"):
-                config_override.setdefault("interactive", {})["idle_timeout_minutes"] = user_settings[
-                    "idle_timeout_minutes"]
+                config_override.setdefault("interactive", {})[
+                    "idle_timeout_minutes"
+                ] = user_settings["idle_timeout_minutes"]
             if user_settings.get("command_allowlist"):
-                config_override["command_allowlist"] = user_settings["command_allowlist"]
+                config_override["command_allowlist"] = user_settings[
+                    "command_allowlist"
+                ]
 
         # Per-session overrides from request (take priority over user defaults)
         if request_body.model:
             config_override.setdefault("llm", {})["model"] = request_body.model
         if request_body.temperature is not None:
-            config_override.setdefault("llm", {})["temperature"] = request_body.temperature
+            config_override.setdefault("llm", {})["temperature"] = (
+                request_body.temperature
+            )
 
         # Normalize project_ids (backward compat: project_id → [project_id])
         effective_project_ids = request_body.project_ids or (
@@ -7665,7 +7680,8 @@ async def create_thread(request_body: ThreadCreateRequest, request: Request) -> 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
-            config_name=request_body.config_name or user_settings.get("config_name", "interactive"),
+            config_name=request_body.config_name
+                        or user_settings.get("config_name", "interactive"),
             permission_mode=request_body.permission_mode,
             title=request_body.title,
         )
@@ -7694,7 +7710,8 @@ async def create_thread(request_body: ThreadCreateRequest, request: Request) -> 
             git_remote_url = await gitea_client.create_repo(repo_name)
             if git_remote_url:
                 await postgres_db.merge_thread_workspace_context(
-                    thread_id, {"git_remote_url": git_remote_url, "repo_name": repo_name}
+                    thread_id,
+                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
         # Provision workspace container in background if K8s is available
@@ -7745,7 +7762,9 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
 
 @app.delete("/api/persistent/threads/{thread_id}")
 async def end_thread(
-        thread_id: str, request: Request, permanent: bool = False,
+        thread_id: str,
+        request: Request,
+        permanent: bool = False,
 ) -> dict[str, str]:
     """End (or permanently delete) a persistent thread (auth: owner only).
 
@@ -7771,8 +7790,11 @@ async def end_thread(
     pod_ip = ws_ctx.get("pod_ip")
     if snapshot_service.is_available and pod_ip and ws_ctx.get("status") == "ready":
         await snapshot_service.capture_vm_snapshot(
-            job_id=thread_id, ssh_host=pod_ip, ssh_port=22,
-            source_type="pod", entity_type="threads",
+            job_id=thread_id,
+            ssh_host=pod_ip,
+            ssh_port=22,
+            source_type="pod",
+            entity_type="threads",
         )
 
     # Clean up workspace container if one was provisioned
@@ -7800,7 +7822,8 @@ async def end_thread(
 
 @app.post("/api/persistent/threads/{thread_id}/resume")
 async def resume_thread(
-        thread_id: str, request: Request,
+        thread_id: str,
+        request: Request,
 ) -> dict[str, Any]:
     """Resume an ended or idle thread (auth: owner only).
 
@@ -7873,6 +7896,7 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         import json as _json
+
         try:
             metadata = _json.loads(metadata)
         except (ValueError, TypeError):
@@ -8042,9 +8066,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         return
 
     upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
-    logger.info(
-        f"Proxying WS for thread {thread_id} to {upstream_url}"
-    )
+    logger.info(f"Proxying WS for thread {thread_id} to {upstream_url}")
 
     try:
         import websockets
@@ -8062,7 +8084,8 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                         if isinstance(message, str):
                             # Inspect for notification-worthy events
                             _inspect_session_event(
-                                message, thread_id,
+                                message,
+                                thread_id,
                                 str(thread.get("user_id") or ""),
                                 thread.get("title") or "Session",
                                 thread.get("config_name"),
@@ -8079,7 +8102,8 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                     while True:
                         data = await ws.receive_text()
                         _inspect_browser_event(
-                            data, thread_id,
+                            data,
+                            thread_id,
                             str(thread.get("user_id") or ""),
                         )
                         await upstream.send(data)

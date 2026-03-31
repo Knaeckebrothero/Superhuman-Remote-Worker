@@ -5,6 +5,7 @@ import {Router} from '@angular/router';
 import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {ToastService} from '../../../core/services/toast.service';
 
 /**
  * Create a SessionsPageComponent in a minimal injection context.
@@ -25,11 +26,19 @@ function createComponent() {
         threadId: () => null,
     };
 
+    const mockToast: any = {
+        show: vi.fn(),
+        success: vi.fn(),
+        error: vi.fn(),
+        dismiss: vi.fn(),
+    };
+
     const injector = Injector.create({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: Router, useValue: mockRouter},
             {provide: PersistentChatService, useValue: mockChat},
+            {provide: ToastService, useValue: mockToast},
         ],
     });
 

@@ -27,6 +27,7 @@ from src.services.knowledge_store import KnowledgeRecord, KnowledgeStore
 # Helpers
 # =============================================================================
 
+
 def _make_store():
     """Create a KnowledgeStore with mocked db and embedding_service."""
     mock_db = AsyncMock()
@@ -179,8 +180,11 @@ class TestUpsertMetadataOnly:
         mock_db.fetchval.side_effect = [content_hash, row_id]
 
         result = await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content=content,
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content=content,
         )
         assert result == row_id
         mock_embed.embed.assert_not_called()
@@ -195,10 +199,16 @@ class TestUpsertMetadataOnly:
         mock_db.fetchval.side_effect = [content_hash, row_id]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="Updated Title", note_type="learning", content=content,
-            status="resolved", confidence="high",
-            tags=["a"], keywords=["b"], retrieval_messages=["q"],
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="Updated Title",
+            note_type="learning",
+            content=content,
+            status="resolved",
+            confidence="high",
+            tags=["a"],
+            keywords=["b"],
+            retrieval_messages=["q"],
         )
 
         # Second fetchval call is the UPDATE
@@ -212,13 +222,14 @@ class TestUpsertMetadataOnly:
         store, mock_db, _ = _make_store()
         content = "body"
         row_id = uuid.uuid4()
-        mock_db.fetchval.side_effect = [
-            KnowledgeStore._content_hash(content), row_id
-        ]
+        mock_db.fetchval.side_effect = [KnowledgeStore._content_hash(content), row_id]
 
         result = await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content=content,
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content=content,
         )
         assert result == row_id
 
@@ -237,8 +248,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = ["old-hash", uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="new content",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="new content",
         )
         mock_embed.embed.assert_called_once()
 
@@ -248,8 +262,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="content",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="content",
         )
         mock_embed.embed.assert_called_once()
 
@@ -259,8 +276,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="body",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
             retrieval_messages=["What is X?", "How does Y work?"],
         )
         embed_text = mock_embed.embed.call_args[0][0]
@@ -274,8 +294,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="just content",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="just content",
         )
         embed_text = mock_embed.embed.call_args[0][0]
         assert embed_text == "just content"
@@ -286,8 +309,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="body",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
         )
         # Second fetchval is the INSERT ... ON CONFLICT
         query = mock_db.fetchval.call_args_list[1][0][0]
@@ -300,8 +326,11 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, row_id]
 
         result = await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="body",
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
         )
         assert result == row_id
 
@@ -311,9 +340,14 @@ class TestUpsertContentChanged:
         mock_db.fetchval.side_effect = [None, uuid.uuid4()]
 
         await store.upsert_note(
-            note_id="n1", project_id=uuid.uuid4(),
-            title="T", note_type="decision", content="body",
-            tags=None, keywords=None, retrieval_messages=None,
+            note_id="n1",
+            project_id=uuid.uuid4(),
+            title="T",
+            note_type="decision",
+            content="body",
+            tags=None,
+            keywords=None,
+            retrieval_messages=None,
         )
         # Should not raise — None normalized to []
         mock_db.fetchval.assert_called()
@@ -401,8 +435,11 @@ class TestHybridSearch:
         mock_row.__iter__ = MagicMock(return_value=iter([]))
         # dict(row) must work
         mock_row_dict = {
-            "note_id": "n1", "title": "A", "note_type": "decision",
-            "status": "active", "content": "body",
+            "note_id": "n1",
+            "title": "A",
+            "note_type": "decision",
+            "status": "active",
+            "content": "body",
         }
         mock_db.fetch.return_value = [mock_row_dict]
 
@@ -462,9 +499,15 @@ class TestGetSummary:
     async def test_returns_expected_count_fields(self):
         store, mock_db, _ = _make_store()
         mock_db.fetchrow.return_value = {
-            "total": 10, "active": 8, "decisions": 3,
-            "learnings": 2, "open_questions": 1, "goals": 1,
-            "code_notes": 2, "state_notes": 1, "last_modified": None,
+            "total": 10,
+            "active": 8,
+            "decisions": 3,
+            "learnings": 2,
+            "open_questions": 1,
+            "goals": 1,
+            "code_notes": 2,
+            "state_notes": 1,
+            "last_modified": None,
         }
         mock_db.fetch.return_value = []
 
@@ -478,8 +521,13 @@ class TestGetSummary:
         store, mock_db, _ = _make_store()
         mock_db.fetchrow.return_value = {"total": 2}
         mock_db.fetch.return_value = [
-            {"note_id": "n1", "title": "A", "note_type": "decision",
-             "status": "active", "modified_at": None},
+            {
+                "note_id": "n1",
+                "title": "A",
+                "note_type": "decision",
+                "status": "active",
+                "modified_at": None,
+            },
         ]
 
         result = await store.get_summary(project_id=uuid.uuid4())
@@ -527,8 +575,15 @@ class TestRebuildFromNotes:
         mock_dt = MagicMock()
         mock_dt.to_native.return_value = "2026-01-01T00:00:00"
 
-        notes = [{"id": "n1", "type": "decision", "content": "body",
-                  "created": mock_dt, "modified": mock_dt}]
+        notes = [
+            {
+                "id": "n1",
+                "type": "decision",
+                "content": "body",
+                "created": mock_dt,
+                "modified": mock_dt,
+            }
+        ]
         count = await store.rebuild_from_notes(uuid.uuid4(), notes)
         assert count == 1
         mock_dt.to_native.assert_called()
@@ -539,8 +594,7 @@ class TestRebuildFromNotes:
         mock_db.fetchval.return_value = uuid.uuid4()
         job_uuid = str(uuid.uuid4())
 
-        notes = [{"id": "n1", "type": "decision", "content": "x",
-                  "job_id": job_uuid}]
+        notes = [{"id": "n1", "type": "decision", "content": "x", "job_id": job_uuid}]
         count = await store.rebuild_from_notes(uuid.uuid4(), notes)
         assert count == 1
 
