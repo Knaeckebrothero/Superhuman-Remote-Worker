@@ -110,7 +110,7 @@ class TestApplySettingsMatrix:
         # temperature was NOT in expert_llm_keys, so settings matrix overrides it
         assert data["llm"]["temperature"] == 1.0
         assert data["llm"]["top_p"] == 0.95
-        assert data["llm"]["top_k"] == 40
+        assert "top_k" not in data["llm"]  # M2.7 does not support top_k
 
     def test_expert_wins(self):
         """Expert-set keys are NOT overridden by settings matrix."""
@@ -358,7 +358,7 @@ class TestSettingsMatrixIntegration:
         # Settings matrix should have overridden defaults.yaml temperature
         assert config.llm.temperature == 1.0
         assert config.llm.top_p == 0.95
-        assert config.llm.top_k == 40
+        assert config.llm.top_k is None  # M2.7 does not support top_k
 
     def test_expert_override_wins_over_matrix(self, tmp_path):
         """Expert config values take priority over settings matrix."""
@@ -379,9 +379,9 @@ class TestSettingsMatrixIntegration:
 
         # Expert temperature wins over settings matrix
         assert config.llm.temperature == 0.5
-        # But top_p/top_k still come from settings matrix
+        # top_p still comes from settings matrix
         assert config.llm.top_p == 0.95
-        assert config.llm.top_k == 40
+        assert config.llm.top_k is None  # M2.7 does not support top_k
 
     def test_non_minimax_model_gets_default_limits(self, tmp_path):
         """Non-minimax model without specific entry: gets default limits."""
