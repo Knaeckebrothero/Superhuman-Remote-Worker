@@ -2638,9 +2638,7 @@ async def list_persistent_threads(
         Formatted list of persistent threads
     """
     client = _get_client()
-    data = await client.list_persistent_threads(
-        project_id=project_id, status=status
-    )
+    data = await client.list_persistent_threads(project_id=project_id, status=status)
     return fmt.format_persistent_threads(data.get("threads", []))
 
 
@@ -2663,9 +2661,7 @@ async def get_persistent_thread(thread_id: str) -> str:
 
 
 @mcp.tool
-async def end_persistent_thread(
-    thread_id: str, permanent: bool = False
-) -> str:
+async def end_persistent_thread(thread_id: str, permanent: bool = False) -> str:
     """End or permanently delete a persistent thread.
 
     MUTATION: If permanent=False (default), the thread is soft-ended and

@@ -2405,9 +2405,7 @@ def format_persistent_thread_detail(thread: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_created_thread(
-    result: dict[str, Any], config_name: str, title: str
-) -> str:
+def format_created_thread(result: dict[str, Any], config_name: str, title: str) -> str:
     """Format a newly created persistent thread."""
     thread_id = result.get("thread_id", "N/A")
     return (
