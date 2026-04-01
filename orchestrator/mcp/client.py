@@ -16,7 +16,6 @@ from tenacity import (
     retry_if_exception_type,
 )
 
-
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 
 
@@ -2220,6 +2219,135 @@ class AsyncCockpitClient:
         resp = await self._client.post(
             f"/api/jobs/{job_id}/messages/{thread_id}/reply",
             json={"message": message, "urgent": urgent},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Persistent Threads
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def create_persistent_thread(
+        self,
+        config_name: str = "defaults",
+        title: str = "Untitled Session",
+        permission_mode: str = "supervised",
+        project_id: str | None = None,
+        project_ids: list[str] | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """Create a new persistent thread.
+
+        Returns:
+            Dict with ``thread_id`` and ``status``.
+        """
+        body: dict[str, Any] = {
+            "config_name": config_name,
+            "title": title,
+            "permission_mode": permission_mode,
+        }
+        if project_id:
+            body["project_id"] = project_id
+        if project_ids:
+            body["project_ids"] = project_ids
+        if model:
+            body["model"] = model
+        if temperature is not None:
+            body["temperature"] = temperature
+        resp = await self._client.post("/api/persistent/threads", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_persistent_threads(
+        self,
+        project_id: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """List persistent threads for the authenticated user.
+
+        Returns:
+            Dict with ``threads`` list.
+        """
+        params: dict[str, Any] = {}
+        if project_id:
+            params["project_id"] = project_id
+        if status:
+            params["status"] = status
+        resp = await self._client.get("/api/persistent/threads", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_persistent_thread(self, thread_id: str) -> dict[str, Any]:
+        """Get persistent thread details.
+
+        Returns:
+            Full thread dict.
+        """
+        resp = await self._client.get(f"/api/persistent/threads/{thread_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def end_persistent_thread(
+        self, thread_id: str, permanent: bool = False
+    ) -> dict[str, Any]:
+        """End or permanently delete a persistent thread.
+
+        Returns:
+            Dict with ``status`` ('ended' or 'deleted').
+        """
+        resp = await self._client.delete(
+            f"/api/persistent/threads/{thread_id}",
+            params={"permanent": permanent},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def resume_persistent_thread(self, thread_id: str) -> dict[str, Any]:
+        """Resume an ended or idle persistent thread.
+
+        Returns:
+            Dict with ``status`` and ``thread_id``.
+        """
+        resp = await self._client.post(
+            f"/api/persistent/threads/{thread_id}/resume"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_persistent_thread_messages(
+        self,
+        thread_id: str,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Get message history for a persistent thread.
+
+        Returns:
+            Dict with ``messages``, ``total``, and ``thread_id``.
+        """
+        resp = await self._client.get(
+            f"/api/persistent/threads/{thread_id}/messages",
+            params={"limit": limit, "offset": offset},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_persistent_thread_ide(self, thread_id: str) -> dict[str, Any]:
+        """Get IDE session status for a persistent thread.
+
+        Returns:
+            Dict with ``status``, ``code_server_url``, ``source``, ``gitea_url``.
+        """
+        resp = await self._client.get(
+            f"/api/persistent/threads/{thread_id}/ide"
         )
         resp.raise_for_status()
         return resp.json()

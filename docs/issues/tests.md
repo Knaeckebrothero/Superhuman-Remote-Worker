@@ -514,11 +514,13 @@ The framework layer that tools depend on — registry, dependency injection, doc
 
 | Module | Lines | Tests | Status |
 |--------|-------|-------|--------|
-| `src/tools/registry.py` | 537 | 0 | No tests |
-| `src/tools/context.py` | 511 | 0 | No tests |
+| `src/tools/registry.py` | 537 | 64 | Covered (`test_tool_registry.py`) |
+| `src/tools/context.py` | 511 | 60 | Covered (`test_tool_context.py`) |
 | `src/tools/description_manager.py` | 366 | 0 | No tests |
+| `src/api/persistent_session.py` | 451 | 68 | Covered (`test_persistent_session.py`) |
+| `src/tools/coding/shell_manager.py` | ~550 | 63 | Covered (`test_shell_manager.py`) |
 
-### 2.1 `src/tools/registry.py` — Tool Registry + Phase Filtering (537 lines, 0 tests)
+### 2.1 `src/tools/registry.py` — Tool Registry + Phase Filtering (537 lines, 64 tests)
 
 Controls which tools are available per phase. A bug here could expose `job_complete` to tactical phases or block strategic-only tools. Also handles tool loading with dependency injection, category grouping, custom tool registration, and instruction enforcement wrappers.
 
@@ -1252,8 +1254,27 @@ _`mongo_update` tool:_
 
 | Module | Lines | Tests | Status |
 |--------|-------|-------|--------|
+| `src/tools/coding/__init__.py` | 52 | 2 | Covered (`test_persistent_session.py` integration tests) |
 | `src/tools/coding/coding_tools.py` | 218 | 0 | No tests |
+| `src/tools/coding/shell_tools.py` | ~400 | 0 | No dedicated tests (run_command tested in `test_run_command.py` via ShellManager) |
 | `src/tools/coding/claude_code.py` | 254 | 0 | No tests |
+
+> **Known bug (fixed 2026-04-01):** `src/tools/coding/__init__.py:38` gates shell tool
+> inclusion on `context.shell_manager is not None`. In `persistent_session.py`,
+> `_setup_shell_manager()` was called AFTER `_setup_tools()`, so the gate always
+> failed and `run_command`/`shell_read` were silently excluded from persistent
+> agent sessions. The existing order-assertion test enforced the wrong order.
+> Fix: moved shell init before tool loading; added integration tests that exercise
+> the real gate rather than mocking it.
+>
+> **Lesson — shallow mocks hide ordering bugs:** `test_persistent_session.py` had
+> 63 tests at the time and appeared comprehensive, but every `_setup_*` method was
+> tested in isolation with `patch.object`, never exercising the real cross-method
+> dependencies. The order-assertion test (`test_setup_calls_submethods_in_order`)
+> tracked call sequence but couldn't detect that the sequence was wrong because it
+> never ran the real code. Integration-style tests that call `create_coding_tools()`
+> with a real `ToolContext` (shell_manager set vs None) caught the issue immediately.
+> This pattern likely exists in other areas — see systemic note in Coverage Summary.
 
 #### 3f.1 `src/tools/coding/coding_tools.py` — Shell Command Execution (218 lines, 0 tests)
 
@@ -2067,8 +2088,8 @@ _What to test:_
 | Category | Covered Modules | Tests | Status |
 |----------|----------------|-------|--------|
 | Core Engine | graph.py, loader.py, context.py, state.py | 246 | Good |
-| Tool Infrastructure | — | 0 | None |
-| Tool Implementations | research/*, workspace (partial), git | 210 | Research good, rest sparse |
+| Tool Infrastructure | registry.py, context.py, persistent_session.py, shell_manager.py | 255 | Good |
+| Tool Implementations | research/*, workspace (partial), git, run_command | 210 | Research good, rest sparse |
 | LLM Layer | key_ring.py, overflow detection | 60 | Good |
 | Services | — | 0 | None |
 | Database & Archival | postgres, neo4j, mongo (init only) | 19 | Minimal |
@@ -2076,7 +2097,30 @@ _What to test:_
 | API Layer | orchestrator_client, app (partial) | 27 | Sparse |
 | Orchestrator Backend | — | 0 | None |
 | **Managers** | **todo, git, plan, memory** | **190** | **Comprehensive** |
-| **Total** | | **746** | |
+| **Total** | | **~1000+** | |
+
+### Systemic issue: shallow mock-based tests
+
+Many test files (especially `test_persistent_session.py`, `test_tool_registry.py`)
+test each method in isolation by mocking all collaborators. This inflates test counts
+but misses **cross-cutting integration bugs** where the correctness of one method
+depends on another having run first, or on the real behavior of a dependency.
+
+**Example:** 63 tests for `PersistentSession` all passed while `run_command` and
+`shell_read` were silently missing from every persistent agent session. The
+order-assertion test tracked the (wrong) call sequence, and `_setup_tools` tests
+mocked `load_tools` so they never hit the real `create_coding_tools()` gate.
+
+**What's needed:** For modules with init-order dependencies or gating logic, add
+integration-style tests that use real objects (or minimal fakes) instead of
+`patch.object` for the critical path. Priority areas:
+
+- `persistent_session.py` setup flow (partially addressed — shell tool gate now tested)
+- `agent.py` `_setup_job_tools` — same tool-loading pattern, same risk of ordering bugs
+- `registry.py` `load_tools` with real `create_*_tools()` factories — verify that
+  datasource/context gates produce the expected tool sets
+- Any factory function gated on optional context fields (`has_shell`, `has_git`,
+  `has_knowledge`, `has_datasource`)
 
 ---
 
@@ -2084,8 +2128,8 @@ _What to test:_
 
 Prioritized by risk, value, and ease of testing:
 
-1. **Tool registry + phase filtering** (Cat. 2) — Safety gate, self-contained, easy to test
-2. **ToolContext** (Cat. 2) — Dependency injection backbone, enables testing everything else
+1. ~~**Tool registry + phase filtering** (Cat. 2)~~ — Done: 64 tests in `test_tool_registry.py`
+2. ~~**ToolContext** (Cat. 2)~~ — Done: 60 tests in `test_tool_context.py`
 3. **Phase snapshot recovery** (Cat. 1) — User-facing feature, purely file-based
 4. **Workspace file operations** (Cat. 3a) — Expand existing tests with actual read/write/edit
 5. **ReasoningChatOpenAI** (Cat. 4) — Layer 0 overflow protection, prevents crashes

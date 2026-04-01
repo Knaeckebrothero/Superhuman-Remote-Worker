@@ -192,7 +192,11 @@ class TestSetup:
 
     @pytest.mark.asyncio
     async def test_setup_calls_submethods_in_order(self):
-        """Verifies setup calls sub-methods: workspace → tools → bind → context → prompt → shell → memory."""
+        """Verifies setup calls sub-methods: workspace → shell → tools → bind → context → prompt → memory.
+
+        Shell must come before tools so that create_coding_tools() sees a
+        non-None shell_manager and includes run_command/shell_read.
+        """
         cfg = _make_config()
         session = _make_session(config=cfg)
         call_order = []
@@ -221,10 +225,10 @@ class TestSetup:
 
         assert call_order == [
             "workspace",
+            "shell",
             "tools",
             "bind",
             "context",
-            "shell",
             "memory",
         ]
 
@@ -255,6 +259,94 @@ class TestSetup:
             else True
         )
         assert session.system_prompt == "interactive prompt"
+
+
+# ---------------------------------------------------------------------------
+# 2.3b Shell-before-tools integration
+# ---------------------------------------------------------------------------
+
+
+class TestShellToolsIncludedWhenShellManagerAvailable:
+    """Integration-style tests: verify that run_command/shell_read actually
+    appear in the final tool list when shell_manager is initialised before
+    tool loading.
+
+    These tests exercise the real create_coding_tools() gate
+    (``if context.shell_manager is not None``) rather than mocking it away.
+    """
+
+    def test_coding_tools_include_shell_when_shell_manager_set(self):
+        """create_coding_tools returns shell tools when context.shell_manager is set."""
+        from src.tools.context import ToolContext
+
+        mock_wm = MagicMock()
+        mock_wm.is_initialized = True
+        mock_sm = MagicMock()
+
+        ctx = ToolContext(
+            workspace_manager=mock_wm,
+            shell_manager=mock_sm,
+        )
+
+        from src.tools.coding import create_coding_tools
+
+        tools = create_coding_tools(ctx)
+        tool_names = [t.name for t in tools]
+        assert "run_command" in tool_names
+        assert "shell_read" in tool_names
+
+    def test_coding_tools_exclude_shell_when_shell_manager_none(self):
+        """create_coding_tools omits shell tools when context.shell_manager is None."""
+        from src.tools.context import ToolContext
+
+        mock_wm = MagicMock()
+        mock_wm.is_initialized = True
+
+        ctx = ToolContext(
+            workspace_manager=mock_wm,
+            shell_manager=None,
+        )
+
+        from src.tools.coding import create_coding_tools
+
+        tools = create_coding_tools(ctx)
+        tool_names = [t.name for t in tools]
+        assert "run_command" not in tool_names
+        assert "shell_read" not in tool_names
+
+    def test_setup_tools_passes_shell_manager_to_load_tools(self):
+        """_setup_tools creates ToolContext with session.shell_manager so that
+        the coding tool gate sees a non-None value."""
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        mock_sm = MagicMock()
+        session.shell_manager = mock_sm
+
+        captured_context = {}
+
+        def spy_load_tools(names, ctx):
+            captured_context["shell_manager"] = ctx.shell_manager
+            return []
+
+        with (
+            patch(
+                "src.api.persistent_session.get_all_tool_names",
+                return_value=["run_command", "shell_read"],
+            ),
+            patch("src.api.persistent_session.load_tools", side_effect=spy_load_tools),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+        ):
+            session._setup_tools(None)
+
+        assert captured_context["shell_manager"] is mock_sm
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +660,57 @@ class TestSetupTools:
             MockTC.call_args[1].get("todo_manager") is None
             or MockTC.call_args.kwargs.get("todo_manager") is None
         )
+
+    def test_tool_context_receives_shell_manager(self):
+        """ToolContext is created with shell_manager from session (set by _setup_shell_manager)."""
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        mock_sm = MagicMock()
+        session.shell_manager = mock_sm
+
+        with (
+            patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
+            patch("src.api.persistent_session.load_tools", return_value=[]),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext") as MockTC,
+        ):
+            session._setup_tools(None)
+
+        MockTC.assert_called_once()
+        assert MockTC.call_args[1].get("shell_manager") is mock_sm
+
+    def test_tool_context_gets_none_shell_manager_when_unset(self):
+        """ToolContext receives shell_manager=None when no shell is available."""
+        cfg = _make_config()
+        session = _make_session(config=cfg)
+        session.workspace_manager = MagicMock()
+        session.shell_manager = None
+
+        with (
+            patch("src.api.persistent_session.get_all_tool_names", return_value=[]),
+            patch("src.api.persistent_session.load_tools", return_value=[]),
+            patch(
+                "src.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "src.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("src.api.persistent_session.ToolContext") as MockTC,
+        ):
+            session._setup_tools(None)
+
+        MockTC.assert_called_once()
+        assert MockTC.call_args[1].get("shell_manager") is None
 
 
 # ---------------------------------------------------------------------------

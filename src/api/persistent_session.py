@@ -121,16 +121,19 @@ class PersistentSession:
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
 
-        # 2. Create tool context and load tools
+        # 2. Set up shell manager BEFORE tools so coding tools can detect it
+        self._setup_shell_manager()
+
+        # 3. Create tool context and load tools
         self._setup_tools(postgres_conn)
 
-        # 3. Bind tools to LLM
+        # 4. Bind tools to LLM
         self._bind_tools()
 
-        # 4. Create context manager
+        # 5. Create context manager
         self._setup_context_manager()
 
-        # 5. Build system prompt (interactive mode has its own prompt files)
+        # 6. Build system prompt (interactive mode has its own prompt files)
         self.system_prompt = get_phase_system_prompt(
             self.config,
             is_strategic=False,
@@ -138,9 +141,6 @@ class PersistentSession:
             tool_names=[t.name for t in self.tools] if self.tools else None,
             prompt_type="interactive",
         )
-
-        # 6. Set up shell manager
-        self._setup_shell_manager()
 
         # 7. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
@@ -232,6 +232,7 @@ class PersistentSession:
             _job_id=self.thread_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
+            shell_manager=self.shell_manager,  # Set before tool loading
         )
 
         # Get all tool names and filter out phase-specific ones
