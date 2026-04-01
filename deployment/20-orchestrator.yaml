@@ -416,7 +416,10 @@ spec:
             - name: CODEX_PROXY_URL
               value: "http://srw-codex-proxy:8317"
             - name: CODEX_BASE_URL
-              value: "http://srw-codex-proxy:8317/v1"
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CODEX_BASE_URL
             - name: CODEX_MANAGEMENT_KEY
               valueFrom:
                 secretKeyRef:
