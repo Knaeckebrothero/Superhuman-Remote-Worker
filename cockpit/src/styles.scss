@@ -119,7 +119,11 @@ textarea:focus-visible {
     -webkit-overflow-scrolling: touch;
   }
 
-  button,
+  /* Only enforce touch-target size on primary/nav buttons, not inline action buttons */
+  .mobile-tab-bar button,
+  .send-btn,
+  .stop-btn,
+  button.btn-primary,
   .btn {
     min-height: 44px;
     min-width: 44px;

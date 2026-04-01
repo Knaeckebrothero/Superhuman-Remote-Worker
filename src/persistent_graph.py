@@ -46,6 +46,9 @@ def _sanitize_ai_response(response: AIMessage) -> AIMessage:
     style content blocks carry a non-null ``id`` so the round-trip is
     valid.
     """
+    if not isinstance(response, AIMessage):
+        return response
+
     if not response.id:
         response.id = f"msg_{_uuid.uuid4().hex[:24]}"
 
