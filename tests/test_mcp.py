@@ -170,9 +170,7 @@ class TestFormatPersistentThreadDetail:
         assert "supervised" in result
 
     def test_shows_project_and_agent(self):
-        thread = _make_thread(
-            project_id="proj-123", agent_id="agent-456"
-        )
+        thread = _make_thread(project_id="proj-123", agent_id="agent-456")
         result = self.fmt(thread)
         assert "proj-123" in result
         assert "agent-456" in result
@@ -184,17 +182,13 @@ class TestFormatPersistentThreadDetail:
         assert "Ended: 2026-03-15T14:00:00Z" in result
 
     def test_shows_metadata_project_ids(self):
-        thread = _make_thread(
-            metadata={"project_ids": ["p1", "p2", "p3"]}
-        )
+        thread = _make_thread(metadata={"project_ids": ["p1", "p2", "p3"]})
         result = self.fmt(thread)
         assert "p1" in result
         assert "p2" in result
 
     def test_shows_config_override(self):
-        thread = _make_thread(
-            metadata={"config_override": {"llm": {"model": "gpt-4"}}}
-        )
+        thread = _make_thread(metadata={"config_override": {"llm": {"model": "gpt-4"}}})
         result = self.fmt(thread)
         assert "Config override" in result
         assert "gpt-4" in result
@@ -207,9 +201,7 @@ class TestFormatPersistentThreadDetail:
 
     def test_shows_workspace_status(self):
         thread = _make_thread(
-            metadata={
-                "workspace_container": {"status": "ready", "pod_ip": "10.0.0.5"}
-            }
+            metadata={"workspace_container": {"status": "ready", "pod_ip": "10.0.0.5"}}
         )
         result = self.fmt(thread)
         assert "Workspace: ready" in result
@@ -448,9 +440,7 @@ class TestAsyncCockpitClientPersistentThreads:
         resp = _mock_response({"threads": []})
 
         with patch.object(client._client, "get", AsyncMock(return_value=resp)) as mock:
-            await client.list_persistent_threads(
-                project_id="proj-1", status="active"
-            )
+            await client.list_persistent_threads(project_id="proj-1", status="active")
 
             params = mock.call_args[1]["params"]
             assert params["project_id"] == "proj-1"
@@ -589,9 +579,7 @@ class TestMcpPersistentThreadTools:
             "status": "created",
         }
 
-        result = await create_persistent_thread(
-            title="Test", config_name="defaults"
-        )
+        result = await create_persistent_thread(title="Test", config_name="defaults")
 
         mock_client.create_persistent_thread.assert_awaited_once_with(
             config_name="defaults",
@@ -812,11 +800,13 @@ class TestMcpAuthFallback:
         user_id = str(uuid4())
         user_record = {"id": user_id, "display_name": "MCP User", "email": "u@t.com"}
 
-        mock_request = _mock_request_with_headers({
-            "Authorization": "",
-            "X-MCP-User-Id": user_id,
-            "X-Internal-Key": "test-secret",
-        })
+        mock_request = _mock_request_with_headers(
+            {
+                "Authorization": "",
+                "X-MCP-User-Id": user_id,
+                "X-Internal-Key": "test-secret",
+            }
+        )
 
         mock_db = AsyncMock()
         mock_db.get_user = AsyncMock(return_value=dict(user_record))
@@ -835,11 +825,13 @@ class TestMcpAuthFallback:
 
         from security.auth import get_current_user
 
-        mock_request = _mock_request_with_headers({
-            "Authorization": "",
-            "X-MCP-User-Id": "some-user",
-            "X-Internal-Key": "wrong-key",
-        })
+        mock_request = _mock_request_with_headers(
+            {
+                "Authorization": "",
+                "X-MCP-User-Id": "some-user",
+                "X-Internal-Key": "wrong-key",
+            }
+        )
 
         mock_db = AsyncMock()
 
@@ -871,11 +863,13 @@ class TestMcpAuthFallback:
 
         from security.auth import get_current_user
 
-        mock_request = _mock_request_with_headers({
-            "Authorization": "",
-            "X-MCP-User-Id": "missing-user",
-            "X-Internal-Key": "test-secret",
-        })
+        mock_request = _mock_request_with_headers(
+            {
+                "Authorization": "",
+                "X-MCP-User-Id": "missing-user",
+                "X-Internal-Key": "test-secret",
+            }
+        )
 
         mock_db = AsyncMock()
         mock_db.get_user = AsyncMock(return_value=None)

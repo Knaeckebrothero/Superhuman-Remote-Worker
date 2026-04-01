@@ -2314,9 +2314,7 @@ class AsyncCockpitClient:
         Returns:
             Dict with ``status`` and ``thread_id``.
         """
-        resp = await self._client.post(
-            f"/api/persistent/threads/{thread_id}/resume"
-        )
+        resp = await self._client.post(f"/api/persistent/threads/{thread_id}/resume")
         resp.raise_for_status()
         return resp.json()
 
@@ -2346,8 +2344,6 @@ class AsyncCockpitClient:
         Returns:
             Dict with ``status``, ``code_server_url``, ``source``, ``gitea_url``.
         """
-        resp = await self._client.get(
-            f"/api/persistent/threads/{thread_id}/ide"
-        )
+        resp = await self._client.get(f"/api/persistent/threads/{thread_id}/ide")
         resp.raise_for_status()
         return resp.json()
