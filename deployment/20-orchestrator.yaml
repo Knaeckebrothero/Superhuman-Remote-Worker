@@ -412,6 +412,17 @@ spec:
                   name: srw-config
                   key: PERSISTENT_AGENT_IMAGE
                   optional: true
+            # Codex OAuth Proxy
+            - name: CODEX_PROXY_URL
+              value: "http://srw-codex-proxy:8317"
+            - name: CODEX_BASE_URL
+              value: "http://srw-codex-proxy:8317/v1"
+            - name: CODEX_MANAGEMENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: CODEX_MANAGEMENT_KEY
+                  optional: true
             # Orchestrator settings
             - name: AUTO_ASSIGN_ENABLED
               valueFrom:
