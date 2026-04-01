@@ -2,93 +2,68 @@
 Superhuman Remote Worker — Universal Agent System
 
 Universal Agent architecture for requirement extraction and validation.
+
+Exports are lazy-loaded via ``__getattr__`` so that importing a submodule
+(e.g. ``from src.core.loader import create_llm``) does NOT pull in the
+full agent dependency tree (aiosqlite, langgraph, etc.).  Direct imports
+like ``from src import UniversalAgent`` still work — they simply trigger
+the relevant import on first access.
 """
 
 __version__ = "2.0.0"
 
-# Universal Agent
-from .agent import UniversalAgent
-from .core.state import UniversalAgentState
-from .api.app import create_app
-
-# Shared utilities
-from .core.workspace import WorkspaceManager
-from .core.context import ContextManager
-
-# Managers package (nested loop architecture)
-from .managers import (
-    TodoManager,
-    TodoItem,
-    TodoStatus,
-    PlanManager,
-    MemoryManager,
-)
-
-# Context management exports (for tests)
-from .core.context import (
-    ContextConfig,
-    ContextManagementState,
-    ToolRetryManager,
-    count_tokens_tiktoken,
-    count_tokens_approximate,
-    get_token_counter,
-    write_error_to_workspace,
-)
-
-# Graph exports
-from .graph import (
-    build_nested_loop_graph,
-    run_graph_with_streaming,
-    get_managers_from_workspace,
-)
-
-# Persistent agent exports
-from .persistent_graph import run_persistent_loop, PersistentLoopCallbacks
-from .api.persistent_app import create_persistent_app
-from .api.persistent_session import PersistentSession
-
-# Loader exports
-from .core.loader import (
-    load_summarization_prompt,
-    load_auxiliary_prompt,
-    get_all_tool_names,
-    AgentConfig,
-)
-
-__all__ = [
+# ---------------------------------------------------------------------------
+# Lazy attribute mapping: name → (module, attribute)
+# ---------------------------------------------------------------------------
+_LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     # Universal Agent
-    "UniversalAgent",
-    "UniversalAgentState",
-    "create_app",
-    # Managers (nested loop architecture)
-    "TodoManager",
-    "TodoItem",
-    "TodoStatus",
-    "PlanManager",
-    "MemoryManager",
+    "UniversalAgent": (".agent", "UniversalAgent"),
+    "UniversalAgentState": (".core.state", "UniversalAgentState"),
+    "create_app": (".api.app", "create_app"),
     # Shared utilities
-    "WorkspaceManager",
-    "ContextManager",
-    # Context management
-    "ContextConfig",
-    "ContextManagementState",
-    "ToolRetryManager",
-    "count_tokens_tiktoken",
-    "count_tokens_approximate",
-    "get_token_counter",
-    "write_error_to_workspace",
-    # Graph
-    "build_nested_loop_graph",
-    "run_graph_with_streaming",
-    "get_managers_from_workspace",
-    # Loader
-    "load_summarization_prompt",
-    "load_auxiliary_prompt",
-    "get_all_tool_names",
-    "AgentConfig",
-    # Persistent agent
-    "run_persistent_loop",
-    "PersistentLoopCallbacks",
-    "create_persistent_app",
-    "PersistentSession",
-]
+    "WorkspaceManager": (".core.workspace", "WorkspaceManager"),
+    "ContextManager": (".core.context", "ContextManager"),
+    # Managers package (nested loop architecture)
+    "TodoManager": (".managers", "TodoManager"),
+    "TodoItem": (".managers", "TodoItem"),
+    "TodoStatus": (".managers", "TodoStatus"),
+    "PlanManager": (".managers", "PlanManager"),
+    "MemoryManager": (".managers", "MemoryManager"),
+    # Context management exports (for tests)
+    "ContextConfig": (".core.context", "ContextConfig"),
+    "ContextManagementState": (".core.context", "ContextManagementState"),
+    "ToolRetryManager": (".core.context", "ToolRetryManager"),
+    "count_tokens_tiktoken": (".core.context", "count_tokens_tiktoken"),
+    "count_tokens_approximate": (".core.context", "count_tokens_approximate"),
+    "get_token_counter": (".core.context", "get_token_counter"),
+    "write_error_to_workspace": (".core.context", "write_error_to_workspace"),
+    # Graph exports
+    "build_nested_loop_graph": (".graph", "build_nested_loop_graph"),
+    "run_graph_with_streaming": (".graph", "run_graph_with_streaming"),
+    "get_managers_from_workspace": (".graph", "get_managers_from_workspace"),
+    # Persistent agent exports
+    "run_persistent_loop": (".persistent_graph", "run_persistent_loop"),
+    "PersistentLoopCallbacks": (".persistent_graph", "PersistentLoopCallbacks"),
+    "create_persistent_app": (".api.persistent_app", "create_persistent_app"),
+    "PersistentSession": (".api.persistent_session", "PersistentSession"),
+    # Loader exports
+    "load_summarization_prompt": (".core.loader", "load_summarization_prompt"),
+    "load_auxiliary_prompt": (".core.loader", "load_auxiliary_prompt"),
+    "get_all_tool_names": (".core.loader", "get_all_tool_names"),
+    "AgentConfig": (".core.loader", "AgentConfig"),
+}
+
+__all__ = list(_LAZY_IMPORTS.keys())
+
+
+def __getattr__(name: str):
+    if name in _LAZY_IMPORTS:
+        module_path, attr = _LAZY_IMPORTS[name]
+        import importlib
+
+        mod = importlib.import_module(module_path, package=__name__)
+        value = getattr(mod, attr)
+        # Cache on the module so __getattr__ is only called once per name
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
