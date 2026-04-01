@@ -57,6 +57,9 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy orchestrator source code with correct ownership
 COPY --chown=srw:srw orchestrator/ ./
 
+# Copy agent src package (builder LLM factory, knowledge graph, embedding service)
+COPY --chown=srw:srw src/ ./src/
+
 # Copy agent config directory (expert definitions, defaults, prompts, templates)
 COPY --chown=srw:srw config/ ./config/
 
