@@ -2319,3 +2319,168 @@ def format_thread_messages(messages: list[dict[str, Any]], thread_id: str) -> st
         lines.append("")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# Persistent Thread Formatters
+# =============================================================================
+
+
+def format_persistent_threads(threads: list[dict[str, Any]]) -> str:
+    """Format persistent thread list for display."""
+    if not threads:
+        return "No persistent threads found."
+
+    lines = [f"Found {len(threads)} persistent thread(s):\n"]
+    for t in threads:
+        tid = t.get("id", "?")
+        title = t.get("title", "Untitled")
+        status = t.get("status", "unknown")
+        config = t.get("config_name", "N/A")
+        mode = t.get("permission_mode", "N/A")
+        created = t.get("created_at", "")
+        last_activity = t.get("last_activity", "")
+        turns = t.get("total_turns", 0)
+        tokens = t.get("total_tokens", 0)
+
+        lines.append(f"  [{status}] {tid}: {title}")
+        lines.append(f"    Config: {config} | Mode: {mode}")
+        lines.append(f"    Created: {created} | Last activity: {last_activity}")
+        lines.append(f"    Turns: {turns} | Tokens: {tokens}")
+
+    return "\n".join(lines)
+
+
+def format_persistent_thread_detail(thread: dict[str, Any]) -> str:
+    """Format single persistent thread details."""
+    import json as _json
+
+    lines = [
+        f"Thread: {thread.get('id', 'N/A')}",
+        f"Title: {thread.get('title', 'N/A')}",
+        f"Status: {thread.get('status', 'N/A')}",
+        f"Config: {thread.get('config_name', 'N/A')}",
+        f"Permission mode: {thread.get('permission_mode', 'N/A')}",
+        f"Created: {thread.get('created_at', 'N/A')}",
+        f"Last activity: {thread.get('last_activity', 'N/A')}",
+        f"Turns: {thread.get('total_turns', 0)}",
+        f"Tokens: {thread.get('total_tokens', 0)}",
+    ]
+
+    if thread.get("project_id"):
+        lines.append(f"Project: {thread['project_id']}")
+    if thread.get("agent_id"):
+        lines.append(f"Agent: {thread['agent_id']}")
+    if thread.get("ended_at"):
+        lines.append(f"Ended: {thread['ended_at']}")
+
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = _json.loads(metadata)
+        except (ValueError, TypeError):
+            metadata = {}
+
+    project_ids = metadata.get("project_ids")
+    if project_ids:
+        lines.append(f"Project IDs: {', '.join(str(p) for p in project_ids)}")
+
+    config_override = metadata.get("config_override")
+    if config_override:
+        snippet = _json.dumps(config_override)
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        lines.append(f"\nConfig override:\n{snippet}")
+
+    ws_ctx = metadata.get("workspace_container") or {}
+    if ws_ctx.get("status"):
+        lines.append(f"\nWorkspace: {ws_ctx.get('status', 'N/A')}")
+        if ws_ctx.get("pod_ip"):
+            lines.append(f"  Pod IP: {ws_ctx['pod_ip']}")
+
+    vm_ctx = metadata.get("vm") or {}
+    if vm_ctx.get("status"):
+        lines.append(f"VM: {vm_ctx.get('status', 'N/A')}")
+
+    return "\n".join(lines)
+
+
+def format_created_thread(
+    result: dict[str, Any], config_name: str, title: str
+) -> str:
+    """Format a newly created persistent thread."""
+    thread_id = result.get("thread_id", "N/A")
+    return (
+        f"Thread created successfully.\n"
+        f"Thread ID: {thread_id}\n"
+        f"Title: {title}\n"
+        f"Config: {config_name}\n"
+        f"Status: {result.get('status', 'created')}\n\n"
+        f"The session is provisioning. "
+        f"Use get_persistent_thread({thread_id}) to check status."
+    )
+
+
+def format_persistent_thread_messages(data: dict[str, Any]) -> str:
+    """Format persistent thread message history."""
+    thread_id = data.get("thread_id", "?")
+    messages = data.get("messages", [])
+    total = data.get("total", len(messages))
+
+    if not messages:
+        return f"No messages found for thread {thread_id}."
+
+    lines = [f"Thread {thread_id} — showing {len(messages)} of {total} message(s):\n"]
+    for m in messages:
+        turn = m.get("turn_number", "?")
+        role = m.get("role", "?")
+        created = m.get("created_at", "")
+        content = m.get("content", "")
+
+        lines.append(f"  [{turn}] {role} ({created}):")
+        if content:
+            preview = content[:500] + "..." if len(content) > 500 else content
+            for line in preview.split("\n"):
+                lines.append(f"    {line}")
+
+        tool_calls = m.get("tool_calls")
+        if tool_calls and isinstance(tool_calls, list):
+            names = [tc.get("name", "?") for tc in tool_calls if isinstance(tc, dict)]
+            if names:
+                lines.append(f"    Tools: {', '.join(names)}")
+        lines.append("")
+
+    if len(messages) < total:
+        lines.append(f"... more messages available (use offset={len(messages)})")
+
+    return "\n".join(lines)
+
+
+def format_persistent_thread_ide(data: dict[str, Any]) -> str:
+    """Format IDE session status for a persistent thread."""
+    lines = [
+        f"Status: {data.get('status', 'N/A')}",
+    ]
+    if data.get("source"):
+        lines.append(f"Source: {data['source']}")
+    lines.append(f"Code Server URL: {data.get('code_server_url') or 'N/A'}")
+    if data.get("gitea_url"):
+        lines.append(f"Gitea URL: {data['gitea_url']}")
+    return "\n".join(lines)
+
+
+def format_thread_action_result(
+    action: str, thread_id: str, result: dict[str, Any]
+) -> str:
+    """Format a generic thread action result."""
+    status = result.get("status", "unknown")
+    lines = [f"Action: {action}", f"Thread: {thread_id}", f"Status: {status}"]
+
+    for key, value in result.items():
+        if key in ("status", "thread_id"):
+            continue
+        if isinstance(value, str) and len(value) > 300:
+            value = value[:300] + "..."
+        lines.append(f"{key}: {value}")
+
+    return "\n".join(lines)
