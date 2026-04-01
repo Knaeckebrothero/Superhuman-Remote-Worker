@@ -28,3 +28,6 @@ gpt-5:
 o-series:
   temperature: 1.0
   reasoning_effort: high
+
+codex:
+  reasoning_effort: high

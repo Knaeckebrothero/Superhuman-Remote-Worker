@@ -1,18 +1,11 @@
-import {
-  Component,
-  inject,
-  signal,
-  ViewContainerRef,
-  viewChild,
-  effect,
-} from '@angular/core';
-import { ComponentRegistryService } from '../../../core/services/component-registry.service';
-import { DataService } from '../../../core/services/data.service';
-import { JobContextService } from '../../../core/services/job-context.service';
-import { JobArtifactService } from '../../../core/services/job-artifact.service';
-import { SidebarToggleComponent } from '../sidebar-toggle/sidebar-toggle.component';
-import { ComponentType } from '../../../debug/layout.model';
-import { environment } from '../../../core/environment';
+import {Component, effect, inject, signal, viewChild, ViewContainerRef,} from '@angular/core';
+import {ComponentRegistryService} from '../../../core/services/component-registry.service';
+import {DataService} from '../../../core/services/data.service';
+import {JobContextService} from '../../../core/services/job-context.service';
+import {JobArtifactService} from '../../../core/services/job-artifact.service';
+import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component';
+import {ComponentType} from '../../../debug/layout.model';
+import {environment} from '../../../core/environment';
 
 interface MobileTab {
   id: string;
@@ -108,17 +101,20 @@ const TABS: MobileTab[] = [
         height: 100vh;
         height: 100dvh;
         background: var(--app-bg, #1e1e2e);
+        overflow-x: hidden;
+        max-width: 100vw;
       }
 
       .mobile-header {
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
         height: 48px;
-        padding: 0 12px;
+        padding: 0 10px;
         background: var(--timeline-bg, #11111b);
         border-bottom: 1px solid var(--border-color, #313244);
         flex-shrink: 0;
+        overflow: hidden;
       }
 
       .mobile-title {
@@ -133,12 +129,15 @@ const TABS: MobileTab[] = [
         color: var(--text-secondary, #a6adc8);
         border: 1px solid var(--border-color, #313244);
         border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 12px;
+        padding: 4px 6px;
+        font-size: 11px;
+        min-width: 0;
+        flex: 1 1 auto;
         max-width: 200px;
-        min-height: 36px;
+        min-height: 32px;
         cursor: pointer;
         outline: none;
+        text-overflow: ellipsis;
       }
 
       .mobile-job-select:focus {
@@ -150,12 +149,15 @@ const TABS: MobileTab[] = [
         color: var(--text-secondary, #a6adc8);
         border: 1px solid var(--border-color, #313244);
         border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 12px;
-        max-width: 160px;
-        min-height: 36px;
+        padding: 4px 6px;
+        font-size: 11px;
+        min-width: 0;
+        flex: 1 1 auto;
+        max-width: 140px;
+        min-height: 32px;
         cursor: pointer;
         outline: none;
+        text-overflow: ellipsis;
       }
 
       .mobile-model-select:focus {

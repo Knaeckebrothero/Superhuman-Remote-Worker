@@ -88,15 +88,20 @@ from services.builder_tools import (  # noqa: E402
     WORKSPACE_EDIT_TOOLS,
     build_message_context,
     build_summarization_prompt,
-    get_builder_api_key,
     get_builder_base_url,
     get_builder_model,
-    is_auth_or_quota_error,
-    rotate_builder_key,
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_config import resolve_builder_settings  # noqa: E402
+from langchain_core.messages import (  # noqa: E402
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+from src.core.loader import LLMConfig, create_llm  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
@@ -10475,18 +10480,18 @@ async def send_builder_message(
         Artifact mutation tools are forwarded to the frontend via SSE.
         """
         MAX_ITERATIONS = 50
-        loop_messages = list(context_messages)
         final_text = ""
         final_tool_calls = []
         final_steps = []
 
         try:
             raw_model = body.model or get_builder_model()
-            provider = _detect_provider(raw_model)
-            model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
-            api_key = resolved_key or _get_api_key_for_provider(provider)
-            use_responses_api = raw_model in RESPONSES_API_MODELS
-            builder_settings = resolve_builder_settings(raw_model)
+            llm = _create_builder_llm(raw_model)
+            llm_with_tools = llm.bind_tools(BUILDER_TOOLS)
+
+            # Convert dict messages to LangChain types
+            loop_messages: list[BaseMessage] = [SystemMessage(content=system_prompt)]
+            loop_messages.extend(_dicts_to_langchain_messages(context_messages))
 
             for iteration in range(MAX_ITERATIONS):
                 step_title = (
@@ -10500,36 +10505,9 @@ async def send_builder_message(
                 turn_tool_calls = []  # {"name", "args", "id"} dicts
                 error_occurred = False
 
-                # Select streaming function based on provider and API type
-                if provider == "anthropic":
-                    stream_fn = _stream_anthropic(
-                        system_prompt,
-                        loop_messages,
-                        model_name,
-                        api_key,
-                        settings=builder_settings,
-                    )
-                elif use_responses_api:
-                    input_items = _chat_messages_to_responses_input(loop_messages)
-                    stream_fn = _stream_openai_responses(
-                        system_prompt,
-                        input_items,
-                        model_name,
-                        api_key,
-                        base_url=base_url,
-                        settings=builder_settings,
-                    )
-                else:
-                    stream_fn = _stream_openai(
-                        system_prompt,
-                        loop_messages,
-                        model_name,
-                        api_key,
-                        base_url=base_url,
-                        settings=builder_settings,
-                    )
-
-                async for evt_type, evt_data in stream_fn:
+                async for evt_type, evt_data in _stream_llm(
+                        llm_with_tools, loop_messages
+                ):
                     if evt_type == "token":
                         turn_text += evt_data["text"]
                         yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
@@ -10592,145 +10570,60 @@ async def send_builder_message(
                 if not turn_tool_calls:
                     break
 
-                # Build assistant message and tool results for next iteration
-                if provider == "anthropic":
-                    # Anthropic format: assistant content blocks + user tool_result blocks
-                    assistant_content = []
-                    if turn_text:
-                        assistant_content.append({"type": "text", "text": turn_text})
-                    for tc in turn_tool_calls:
-                        assistant_content.append(
-                            {
-                                "type": "tool_use",
-                                "id": tc["id"],
-                                "name": tc["name"],
-                                "input": tc["args"],
-                            }
+                # Build assistant AIMessage with tool calls for context
+                ai_msg = AIMessage(
+                    content=turn_text,
+                    tool_calls=[
+                        {"name": tc["name"], "args": tc["args"], "id": tc["id"]}
+                        for tc in turn_tool_calls
+                    ],
+                )
+                loop_messages.append(ai_msg)
+
+                # Execute tools and append ToolMessages (provider-agnostic)
+                for tc in turn_tool_calls:
+                    result = "OK"
+                    if tc["name"] in SERVER_SIDE_TOOLS:
+                        result, full_content = await _execute_server_tool(
+                            tc["name"],
+                            tc["args"],
+                            user_id=_session_user_id,
+                            active_project_id=body.active_project_id,
                         )
+                        result_evt: dict[str, Any] = {
+                            "tool": tc["name"],
+                            "summary": result[:200],
+                        }
+                        if full_content is not None:
+                            result_evt["content"] = full_content
+                        yield f"event: tool_result\ndata: {json.dumps(result_evt)}\n\n"
+                        formatted = _format_tool_name(tc["name"])
+                        if full_content and tc["name"] in _INSPECTION_TOOLS:
+                            final_steps.append(
+                                {
+                                    "type": "inspection_result",
+                                    "title": formatted,
+                                    "content": full_content,
+                                }
+                            )
+                        else:
+                            final_steps.append(
+                                {
+                                    "type": "tool_result",
+                                    "title": f"Result: {formatted}",
+                                    "content": "",
+                                }
+                            )
+                    elif tc["name"] in WORKSPACE_EDIT_TOOLS:
+                        proposal = _build_workspace_proposal(tc["name"], tc["args"])
+                        if proposal.get("error"):
+                            result = f"Error: {proposal['error']}"
+                        else:
+                            result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
+
                     loop_messages.append(
-                        {"role": "assistant", "content": assistant_content}
+                        ToolMessage(content=result, tool_call_id=tc["id"])
                     )
-
-                    # Execute server-side tools and build tool_result blocks
-                    tool_results = []
-                    for tc in turn_tool_calls:
-                        if tc["name"] in SERVER_SIDE_TOOLS:
-                            result, full_content = await _execute_server_tool(
-                                tc["name"],
-                                tc["args"],
-                                user_id=_session_user_id,
-                                active_project_id=body.active_project_id,
-                            )
-                            evt_data: dict[str, Any] = {
-                                "tool": tc["name"],
-                                "summary": result[:200],
-                            }
-                            if full_content is not None:
-                                evt_data["content"] = full_content
-                            yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
-                            formatted = _format_tool_name(tc["name"])
-                            if full_content and tc["name"] in _INSPECTION_TOOLS:
-                                final_steps.append(
-                                    {
-                                        "type": "inspection_result",
-                                        "title": formatted,
-                                        "content": full_content,
-                                    }
-                                )
-                            else:
-                                final_steps.append(
-                                    {
-                                        "type": "tool_result",
-                                        "title": f"Result: {formatted}",
-                                        "content": "",
-                                    }
-                                )
-                        elif tc["name"] in WORKSPACE_EDIT_TOOLS:
-                            proposal = _build_workspace_proposal(tc["name"], tc["args"])
-                            if proposal.get("error"):
-                                result = f"Error: {proposal['error']}"
-                            else:
-                                result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
-                        else:
-                            result = "OK"
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tc["id"],
-                                "content": result,
-                            }
-                        )
-                    loop_messages.append({"role": "user", "content": tool_results})
-                else:
-                    # OpenAI format: assistant message with tool_calls + tool role messages
-                    openai_tool_calls = []
-                    for tc in turn_tool_calls:
-                        openai_tool_calls.append(
-                            {
-                                "id": tc["id"],
-                                "type": "function",
-                                "function": {
-                                    "name": tc["name"],
-                                    "arguments": json.dumps(tc["args"]),
-                                },
-                            }
-                        )
-                    assistant_msg: dict[str, Any] = {
-                        "role": "assistant",
-                        "tool_calls": openai_tool_calls,
-                    }
-                    if turn_text:
-                        assistant_msg["content"] = turn_text
-                    loop_messages.append(assistant_msg)
-
-                    # Execute server-side tools and append tool results
-                    for tc in turn_tool_calls:
-                        if tc["name"] in SERVER_SIDE_TOOLS:
-                            result, full_content = await _execute_server_tool(
-                                tc["name"],
-                                tc["args"],
-                                user_id=_session_user_id,
-                                active_project_id=body.active_project_id,
-                            )
-                            evt_data_oai: dict[str, Any] = {
-                                "tool": tc["name"],
-                                "summary": result[:200],
-                            }
-                            if full_content is not None:
-                                evt_data_oai["content"] = full_content
-                            yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
-                            formatted = _format_tool_name(tc["name"])
-                            if full_content and tc["name"] in _INSPECTION_TOOLS:
-                                final_steps.append(
-                                    {
-                                        "type": "inspection_result",
-                                        "title": formatted,
-                                        "content": full_content,
-                                    }
-                                )
-                            else:
-                                final_steps.append(
-                                    {
-                                        "type": "tool_result",
-                                        "title": f"Result: {formatted}",
-                                        "content": "",
-                                    }
-                                )
-                        elif tc["name"] in WORKSPACE_EDIT_TOOLS:
-                            proposal = _build_workspace_proposal(tc["name"], tc["args"])
-                            if proposal.get("error"):
-                                result = f"Error: {proposal['error']}"
-                            else:
-                                result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
-                        else:
-                            result = "OK"
-                        loop_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result,
-                            }
-                        )
 
             # Store assistant message
             await postgres_db.create_builder_message(
@@ -10784,482 +10677,130 @@ async def _execute_server_tool(
 
 
 # =============================================================================
-# Responses API support (GPT-5.2 Pro and future models)
+# LangChain-based builder LLM helpers
 # =============================================================================
 
-RESPONSES_API_MODELS = {"gpt-5.2-pro"}
 
+def _create_builder_llm(raw_model: str):
+    """Create a LangChain LLM for the builder using the shared factory.
 
-def _detect_provider(model: str) -> str:
-    """Detect LLM provider from model name."""
-    if model.startswith("claude-"):
-        return "anthropic"
-    if model.startswith("codex/"):
-        return "openai"  # Codex proxy is OpenAI-compatible
-    return "openai"
-
-
-def _get_api_key_for_provider(provider: str) -> str | None:
-    """Get API key for the given provider via the KeyRing system.
-
-    Routes through get_builder_api_key() which handles comma-separated keys
-    and KeyRing-based rotation.
+    Maps builder env vars and settings matrix into an LLMConfig, then
+    delegates to ``create_llm()`` from ``src/core/loader``.
     """
-    return get_builder_api_key(provider)
+    settings = resolve_builder_settings(raw_model)
 
-
-def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]:
-    """Resolve a prefixed model ID into (model_name, base_url, api_key).
-
-    Handles model routing for different providers:
-    - ``openrouter/`` prefix → OpenRouter API
-    - ``codex/`` prefix → CLIProxyAPI OAuth proxy (CODEX_BASE_URL)
-    - ``openai/`` prefix → local vLLM at BUILDER_BASE_URL / OPENAI_BASE_URL / LLM_BASE_URL
-    - ``claude-`` prefix → Anthropic (base_url/api_key left to Anthropic client)
-    - No prefix → default OpenAI provider
-    """
-    if raw_model.startswith("openrouter/"):
-        model_name = raw_model[len("openrouter/") :]
-        base_url = "https://openrouter.ai/api/v1"
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        return model_name, base_url, api_key
-    if raw_model.startswith("codex/"):
-        model_name = raw_model[len("codex/") :]
-        base_url = os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1")
-        api_key = os.getenv("CODEX_API_KEY", "not-needed")
-        return model_name, base_url, api_key
-    if raw_model.startswith("openai/"):
-        model_name = raw_model[len("openai/") :]
-        base_url = (
-            os.getenv("BUILDER_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("LLM_BASE_URL")
+    # Resolve API key from builder-specific env vars
+    api_key: str | None = None
+    provider_lower = raw_model.lower()
+    if provider_lower.startswith("claude"):
+        api_key = (
+                os.getenv("BUILDER_ANTHROPIC_API_KEY")
+                or os.getenv("BUILDER_API_KEY")
+                or os.getenv("ANTHROPIC_API_KEY")
         )
-        # Use provider-specific key only — skip generic BUILDER_API_KEY which
-        # may contain a key for a different provider (e.g. Anthropic key when
-        # the default builder model is Claude but user selects a local model)
+    elif provider_lower.startswith("codex/"):
+        api_key = os.getenv("CODEX_API_KEY", "not-needed")
+    elif provider_lower.startswith("openrouter/"):
+        api_key = os.getenv("OPENROUTER_API_KEY")
+    else:
         api_key = (
             os.getenv("BUILDER_OPENAI_API_KEY")
+            or os.getenv("BUILDER_API_KEY")
             or os.getenv("OPENAI_API_KEY")
-            or "not-needed"
         )
-        return model_name, base_url, api_key
-    # No prefix — use existing defaults
-    return raw_model, get_builder_base_url(), None
+
+    config = LLMConfig(
+        model=raw_model,
+        temperature=settings.get("temperature", 0.0),
+        top_p=settings.get("top_p"),
+        top_k=settings.get("top_k"),
+        reasoning_level=settings.get("reasoning_effort", "none"),
+        base_url=get_builder_base_url(),
+        api_key=api_key,
+        max_output_tokens=settings.get("max_tokens"),
+    )
+    return create_llm(config)
 
 
-def _chat_messages_to_responses_input(
-    messages: list[dict],
-) -> list[dict]:
-    """Convert Chat Completions format messages to Responses API input items.
-
-    - {role: user, content: ...} → kept as-is
-    - {role: assistant, content: ..., tool_calls: [...]} → text item + function_call items
-    - {role: tool, tool_call_id: ..., content: ...} → function_call_output items
-    - {role: system, ...} → skipped (goes to `instructions` param)
-    """
-    items: list[dict] = []
+def _dicts_to_langchain_messages(
+        messages: list[dict[str, Any]],
+) -> list[BaseMessage]:
+    """Convert dict-format messages from ``build_message_context()`` to LangChain types."""
+    result: list[BaseMessage] = []
     for msg in messages:
         role = msg.get("role", "")
+        content = msg.get("content", "") or ""
         if role == "system":
-            continue
+            result.append(SystemMessage(content=content))
         elif role == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                items.append({"role": "user", "content": content})
-            elif isinstance(content, list):
-                # Anthropic-style tool_result blocks from multi-turn — skip for Responses API
-                # These are handled separately
-                items.append({"role": "user", "content": str(content)})
+            result.append(HumanMessage(content=content))
         elif role == "assistant":
-            content = msg.get("content")
-            if content:
-                items.append(
-                    {"type": "message", "role": "assistant", "content": content}
-                )
-            tool_calls = msg.get("tool_calls", [])
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": tc.get("id", ""),
-                        "name": func.get("name", ""),
-                        "arguments": func.get("arguments", "{}"),
-                    }
-                )
+            result.append(AIMessage(content=content))
         elif role == "tool":
-            items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": msg.get("tool_call_id", ""),
-                    "output": msg.get("content", ""),
-                }
+            result.append(
+                ToolMessage(
+                    content=content,
+                    tool_call_id=msg.get("tool_call_id", ""),
+                )
             )
-    return items
+    return result
 
 
-async def _stream_openai_responses(
-    system_prompt: str,
-    input_items: list[dict],
-    model: str,
-    api_key: str | None = None,
-    _retried: bool = False,
-    base_url: str | None = None,
-    settings: dict[str, Any] | None = None,
+async def _stream_llm(
+        llm_with_tools,
+        messages: list[BaseMessage],
 ):
-    """Stream from OpenAI Responses API, yielding structured events.
+    """Stream from a LangChain LLM, yielding builder event tuples.
 
-    Uses client.responses.create() instead of chat.completions.create().
-    System prompt goes in `instructions` parameter.
+    Streams text tokens in real-time. Tool calls are extracted from the
+    merged response after the stream completes (LangChain assembles them
+    across chunks internally).
 
-    Yields tuples of (event_type, event_data):
-    - ("token", {"text": str})
-    - ("tool_call", {"name": str, "args": dict, "id": str})
-    - ("error", {"message": str})
+    Yields:
+        ("token", {"text": str})      — streamed text chunk
+        ("tool_call", {"name", "args", "id"})  — completed tool call
+        ("error", {"message": str})    — error occurred
     """
     try:
-        from openai import AsyncOpenAI
-    except ImportError:
-        yield ("error", {"message": "openai package not installed"})
-        return
+        chunks: list[AIMessage] = []
+        async for chunk in llm_with_tools.astream(messages):
+            chunks.append(chunk)
+            # Stream text content in real-time
+            if hasattr(chunk, "content") and chunk.content:
+                content = chunk.content
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                yield ("token", {"text": text})
+                        elif isinstance(block, str) and block:
+                            yield ("token", {"text": block})
+                elif isinstance(content, str) and content:
+                    yield ("token", {"text": content})
 
-    client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key("openai"),
-        base_url=base_url or get_builder_base_url(),
-    )
+        if not chunks:
+            return
 
-    # Convert BUILDER_TOOLS to Responses API function tool format
-    response_tools = []
-    for tool in BUILDER_TOOLS:
-        func = tool["function"]
-        response_tools.append(
-            {
-                "type": "function",
-                "name": func["name"],
-                "description": func["description"],
-                "parameters": func["parameters"],
-            }
-        )
+        # Merge chunks into final response to extract tool calls
+        response = chunks[0]
+        for chunk in chunks[1:]:
+            response = response + chunk
 
-    try:
-        create_kwargs: dict[str, Any] = dict(
-            model=model,
-            instructions=system_prompt,
-            input=input_items,
-            tools=response_tools,
-            stream=True,
-        )
-        # Apply inference params from settings matrix
-        if settings:
-            reasoning_effort = settings.get("reasoning_effort")
-            if reasoning_effort:
-                create_kwargs["reasoning"] = {"effort": reasoning_effort}
-            if settings.get("temperature") is not None:
-                create_kwargs["temperature"] = settings["temperature"]
-            if settings.get("top_p") is not None:
-                create_kwargs["top_p"] = settings["top_p"]
-            if settings.get("max_tokens") is not None:
-                create_kwargs["max_output_tokens"] = settings["max_tokens"]
-
-        stream = await client.responses.create(**create_kwargs)
-
-        # Track function call assembly
-        function_calls: dict[str, dict] = {}  # call_id -> {name, arguments}
-
-        async for event in stream:
-            event_type = event.type
-
-            # Text deltas
-            if event_type == "response.output_text.delta":
-                yield ("token", {"text": event.delta})
-
-            # Function call starts — capture name
-            elif event_type == "response.output_item.added":
-                item = event.item
-                if hasattr(item, "type") and item.type == "function_call":
-                    call_id = getattr(item, "call_id", "") or ""
-                    name = getattr(item, "name", "") or ""
-                    function_calls[call_id] = {"name": name, "arguments": ""}
-
-            # Function call argument deltas
-            elif event_type == "response.function_call_arguments.delta":
-                call_id = getattr(event, "call_id", "") or getattr(event, "item_id", "")
-                if call_id in function_calls:
-                    function_calls[call_id]["arguments"] += event.delta
-
-            # Function call done
-            elif event_type == "response.function_call_arguments.done":
-                call_id = getattr(event, "call_id", "") or getattr(event, "item_id", "")
-                if call_id in function_calls:
-                    tc = function_calls[call_id]
-                    try:
-                        args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        yield (
-                            "tool_call",
-                            {"name": tc["name"], "args": args, "id": call_id},
-                        )
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            f"Failed to parse Responses API tool args: {tc['arguments'][:100]}"
-                        )
-
-            # Output item done — emit function calls if not already emitted
-            elif event_type == "response.output_item.done":
-                item = event.item
-                if hasattr(item, "type") and item.type == "function_call":
-                    call_id = getattr(item, "call_id", "") or ""
-                    if call_id in function_calls:
-                        # Already emitted via arguments.done
-                        pass
-
-    except Exception as e:
-        if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e), provider="openai")
-            if new_key:
-                logger.info("Builder: retrying OpenAI Responses API with rotated key")
-                async for event in _stream_openai_responses(
-                    system_prompt,
-                    input_items,
-                    model,
-                    api_key=new_key,
-                    _retried=True,
-                    base_url=base_url,
-                    settings=settings,
-                ):
-                    yield event
-                return
-        yield ("error", {"message": str(e)})
-
-
-async def _stream_openai(
-    system_prompt: str,
-    context_messages: list[dict],
-    model: str,
-    api_key: str | None = None,
-    _retried: bool = False,
-    base_url: str | None = None,
-    settings: dict[str, Any] | None = None,
-):
-    """Stream from OpenAI Chat Completions API, yielding structured events.
-
-    Yields tuples of (event_type, event_data):
-    - ("token", {"text": str})
-    - ("tool_call", {"name": str, "args": dict, "id": str})
-    - ("error", {"message": str})
-    """
-    try:
-        from openai import AsyncOpenAI
-    except ImportError:
-        yield ("error", {"message": "openai package not installed"})
-        return
-
-    client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key("openai"),
-        base_url=base_url or get_builder_base_url(),
-    )
-
-    llm_messages = [{"role": "system", "content": system_prompt}]
-    llm_messages.extend(context_messages)
-
-    try:
-        create_kwargs: dict[str, Any] = dict(
-            model=model,
-            messages=llm_messages,
-            tools=BUILDER_TOOLS,
-            stream=True,
-        )
-        # Apply inference params from settings matrix
-        if settings:
-            if settings.get("temperature") is not None:
-                create_kwargs["temperature"] = settings["temperature"]
-            if settings.get("top_p") is not None:
-                create_kwargs["top_p"] = settings["top_p"]
-            if settings.get("max_tokens") is not None:
-                create_kwargs["max_tokens"] = settings["max_tokens"]
-            # Provider-specific params via extra_body (top_k, min_p, etc.)
-            extra_body: dict[str, Any] = {}
-            if settings.get("top_k") is not None:
-                extra_body["top_k"] = settings["top_k"]
-            if settings.get("min_p") is not None:
-                extra_body["min_p"] = settings["min_p"]
-            if extra_body:
-                create_kwargs["extra_body"] = extra_body
-
-        stream = await client.chat.completions.create(**create_kwargs)
-
-        # Track tool call assembly across chunks
-        tool_call_buffers: dict[int, dict] = {}
-
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if not delta:
-                continue
-
-            # Text content
-            if delta.content:
-                yield ("token", {"text": delta.content})
-
-            # Tool calls (streamed incrementally)
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_call_buffers:
-                        tool_call_buffers[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc.id:
-                        tool_call_buffers[idx]["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        tool_call_buffers[idx]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_call_buffers[idx]["arguments"] += tc.function.arguments
-
-        # Emit completed tool calls
-        for _idx, tc_buf in sorted(tool_call_buffers.items()):
-            try:
-                args = json.loads(tc_buf["arguments"])
+        # Yield completed tool calls
+        if hasattr(response, "tool_calls") and response.tool_calls:
+            for tc in response.tool_calls:
                 yield (
                     "tool_call",
-                    {"name": tc_buf["name"], "args": args, "id": tc_buf["id"]},
-                )
-            except json.JSONDecodeError:
-                logger.warning(
-                    f"Failed to parse tool call args: {tc_buf['arguments'][:100]}"
+                    {
+                        "name": tc["name"],
+                        "args": tc.get("args", {}),
+                        "id": tc["id"],
+                    },
                 )
 
     except Exception as e:
-        if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e), provider="openai")
-            if new_key:
-                logger.info("Builder: retrying OpenAI Chat API with rotated key")
-                async for event in _stream_openai(
-                    system_prompt,
-                    context_messages,
-                    model,
-                    api_key=new_key,
-                    _retried=True,
-                    base_url=base_url,
-                    settings=settings,
-                ):
-                    yield event
-                return
-        yield ("error", {"message": str(e)})
-
-
-async def _stream_anthropic(
-    system_prompt: str,
-    context_messages: list[dict],
-    model: str,
-    api_key: str | None = None,
-    _retried: bool = False,
-    settings: dict[str, Any] | None = None,
-):
-    """Stream from Anthropic API, yielding structured events.
-
-    Yields tuples of (event_type, event_data):
-    - ("token", {"text": str})
-    - ("tool_call", {"name": str, "args": dict, "id": str})
-    - ("error", {"message": str})
-    """
-    try:
-        from anthropic import AsyncAnthropic
-    except ImportError:
-        yield ("error", {"message": "anthropic package not installed"})
-        return
-
-    client = AsyncAnthropic(api_key=api_key or get_builder_api_key("anthropic"))
-
-    # Convert OpenAI tool format to Anthropic format
-    anthropic_tools = []
-    for tool in BUILDER_TOOLS:
-        func = tool["function"]
-        anthropic_tools.append(
-            {
-                "name": func["name"],
-                "description": func["description"],
-                "input_schema": func["parameters"],
-            }
-        )
-
-    # Separate system messages from conversation messages
-    filtered_messages = [m for m in context_messages if m.get("role") != "system"]
-    extra_system = "\n".join(
-        m["content"]
-        for m in context_messages
-        if m.get("role") == "system" and isinstance(m.get("content"), str)
-    )
-    full_system = system_prompt
-    if extra_system:
-        full_system += "\n\n" + extra_system
-
-    try:
-        stream_kwargs: dict[str, Any] = dict(
-            model=model,
-            system=full_system,
-            messages=filtered_messages,
-            tools=anthropic_tools,
-            max_tokens=(settings or {}).get("max_tokens", 4096),
-        )
-        if (settings or {}).get("temperature") is not None:
-            stream_kwargs["temperature"] = settings["temperature"]
-        if (settings or {}).get("top_p") is not None:
-            stream_kwargs["top_p"] = settings["top_p"]
-
-        async with client.messages.stream(**stream_kwargs) as stream:
-            current_tool_id = ""
-            current_tool_name = ""
-            current_tool_args = ""
-
-            async for event in stream:
-                if event.type == "content_block_start":
-                    if hasattr(event.content_block, "type"):
-                        if event.content_block.type == "tool_use":
-                            current_tool_id = event.content_block.id
-                            current_tool_name = event.content_block.name
-                            current_tool_args = ""
-                elif event.type == "content_block_delta":
-                    if hasattr(event.delta, "text"):
-                        yield ("token", {"text": event.delta.text})
-                    elif hasattr(event.delta, "partial_json"):
-                        current_tool_args += event.delta.partial_json
-                elif event.type == "content_block_stop":
-                    if current_tool_name:
-                        try:
-                            args = (
-                                json.loads(current_tool_args)
-                                if current_tool_args
-                                else {}
-                            )
-                            yield (
-                                "tool_call",
-                                {
-                                    "name": current_tool_name,
-                                    "args": args,
-                                    "id": current_tool_id,
-                                },
-                            )
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                f"Failed to parse Anthropic tool args: {current_tool_args[:100]}"
-                            )
-                        current_tool_id = ""
-                        current_tool_name = ""
-                        current_tool_args = ""
-
-    except Exception as e:
-        if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e), provider="anthropic")
-            if new_key:
-                logger.info("Builder: retrying Anthropic API with rotated key")
-                async for event in _stream_anthropic(
-                    system_prompt,
-                    context_messages,
-                    model,
-                    api_key=new_key,
-                    _retried=True,
-                    settings=settings,
-                ):
-                    yield event
-                return
+        logger.error(f"Builder LLM stream error: {e}", exc_info=True)
         yield ("error", {"message": str(e)})
 
 
@@ -11269,108 +10810,25 @@ async def _summarize_builder_session(
 ) -> None:
     """Summarize older builder messages to compress context.
 
-    Uses the same builder model for summarization.
+    Uses the shared LangChain factory for provider-agnostic summarization.
     """
-
-    # Only summarize if we have enough messages
     if len(messages) < 6:
         return
 
-    # Summarize all but the last 4 messages
     to_summarize = messages[:-4]
     summary_prompt = build_summarization_prompt(to_summarize)
 
-    raw_model = get_builder_model()
-    provider = _detect_provider(raw_model)
-    model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
-    builder_settings = resolve_builder_settings(raw_model)
-    max_summary_tokens = builder_settings.get("max_summary_tokens", 1024)
-
-    summary_text = ""
-
-    if provider == "anthropic":
-        api_key = resolved_key or get_builder_api_key(provider)
-        try:
-            from anthropic import AsyncAnthropic
-
-            client = AsyncAnthropic(api_key=api_key)
-            response = await client.messages.create(
-                model=model_name,
-                system=summary_prompt[0]["content"],
-                messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
-                max_tokens=max_summary_tokens,
-            )
-            summary_text = response.content[0].text
-        except Exception as e:
-            if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e), provider=provider)
-                if new_key:
-                    try:
-                        client = AsyncAnthropic(api_key=new_key)
-                        response = await client.messages.create(
-                            model=model_name,
-                            system=summary_prompt[0]["content"],
-                            messages=[
-                                {
-                                    "role": "user",
-                                    "content": summary_prompt[1]["content"],
-                                }
-                            ],
-                            max_tokens=max_summary_tokens,
-                        )
-                        summary_text = response.content[0].text
-                    except Exception as e2:
-                        logger.warning(
-                            f"Anthropic summarization failed after key rotation: {e2}"
-                        )
-                        return
-                else:
-                    logger.warning(f"Anthropic summarization failed (no alt keys): {e}")
-                    return
-            else:
-                logger.warning(f"Anthropic summarization failed: {e}")
-                return
-    else:
-        api_key = resolved_key or get_builder_api_key(provider)
-        try:
-            from openai import AsyncOpenAI
-
-            client = AsyncOpenAI(
-                api_key=api_key,
-                base_url=base_url or get_builder_base_url(),
-            )
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=summary_prompt,
-                max_tokens=max_summary_tokens,
-            )
-            summary_text = response.choices[0].message.content or ""
-        except Exception as e:
-            if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e), provider=provider)
-                if new_key:
-                    try:
-                        client = AsyncOpenAI(
-                            api_key=new_key,
-                            base_url=base_url or get_builder_base_url(),
-                        )
-                        response = await client.chat.completions.create(
-                            model=model_name,
-                            messages=summary_prompt,
-                            max_tokens=max_summary_tokens,
-                        )
-                        summary_text = response.choices[0].message.content or ""
-                    except Exception as e2:
-                        logger.warning(
-                            f"OpenAI summarization failed after key rotation: {e2}"
-                        )
-                        return
-                else:
-                    logger.warning(f"OpenAI summarization failed (no alt keys): {e}")
-                    return
-            else:
-                logger.warning(f"OpenAI summarization failed: {e}")
-                return
+    try:
+        llm = _create_builder_llm(get_builder_model())
+        lc_messages = [
+            SystemMessage(content=summary_prompt[0]["content"]),
+            HumanMessage(content=summary_prompt[1]["content"]),
+        ]
+        response = await llm.ainvoke(lc_messages)
+        summary_text = response.content if isinstance(response.content, str) else ""
+    except Exception as e:
+        logger.warning(f"Builder summarization failed: {e}")
+        return
 
     if summary_text:
         await postgres_db.update_builder_session_summary(session_id, summary_text)
