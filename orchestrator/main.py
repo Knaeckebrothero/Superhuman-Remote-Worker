@@ -9211,7 +9211,11 @@ async def codex_login(request: Request) -> dict[str, Any]:
         params={"is_webui": "true"},
         timeout=15.0,
     )
-    return resp.json()
+    data = resp.json()
+    # Proxy returns "url"; cockpit expects "auth_url"
+    if "url" in data and "auth_url" not in data:
+        data["auth_url"] = data.pop("url")
+    return data
 
 
 @app.get("/api/codex/login/poll")
