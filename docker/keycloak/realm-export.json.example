@@ -211,6 +211,31 @@
         "profile",
         "email"
       ]
+    },
+    {
+      "clientId": "mcp-server",
+      "name": "MCP OAuth Bridge",
+      "description": "MCP server OAuth proxy — enables Claude.ai, ChatGPT, and other OAuth-based AI platforms to connect via OIDC",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "${env.MCP_OIDC_CLIENT_SECRET}",
+      "redirectUris": [
+        "http://localhost:8055/auth/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:8055"
+      ],
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "roles"
+      ]
     }
   ],
   "users": [

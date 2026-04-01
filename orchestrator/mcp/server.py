@@ -2569,3 +2569,193 @@ async def get_message_thread(job_id: str, thread_id: str) -> str:
         return fmt.format_message_threads([target])
 
     return fmt.format_thread_messages(messages, thread_id)
+
+
+# =============================================================================
+# Persistent Session/Thread Management
+# =============================================================================
+
+
+@mcp.tool
+async def create_persistent_thread(
+    title: str = "Untitled Session",
+    config_name: str = "defaults",
+    permission_mode: Literal["supervised", "auto_accept", "autonomous"] = "supervised",
+    project_id: str | None = None,
+    project_ids: list[str] | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
+    """Create a new persistent thread (interactive agent session).
+
+    MUTATION: This creates a persistent thread, provisions a workspace
+    container and agent pod. The thread starts in 'created' status and
+    waits for an agent to connect.
+
+    Args:
+        title: Human-readable session title
+        config_name: Agent config to use (default: "defaults")
+        permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
+        project_id: Single project UUID to scope (legacy)
+        project_ids: List of project UUIDs to scope
+        model: LLM model override (e.g. "openai/gpt-oss-120b")
+        temperature: Temperature override
+
+    Returns:
+        Created thread ID and status
+    """
+    client = _get_client()
+    try:
+        result = await client.create_persistent_thread(
+            config_name=config_name,
+            title=title,
+            permission_mode=permission_mode,
+            project_id=project_id,
+            project_ids=project_ids,
+            model=model,
+            temperature=temperature,
+        )
+        return fmt.format_created_thread(result, config_name, title)
+    except Exception as e:
+        return fmt.format_action_error("create_thread", "N/A", e)
+
+
+@mcp.tool
+async def list_persistent_threads(
+    project_id: str | None = None,
+    status: Literal["created", "active", "idle", "ended"] | None = None,
+) -> str:
+    """List persistent threads for the authenticated user.
+
+    Returns all persistent sessions with status, config, and activity info.
+    Use filters to narrow results.
+
+    Args:
+        project_id: Filter by project UUID
+        status: Filter by thread status (created, active, idle, ended)
+
+    Returns:
+        Formatted list of persistent threads
+    """
+    client = _get_client()
+    data = await client.list_persistent_threads(
+        project_id=project_id, status=status
+    )
+    return fmt.format_persistent_threads(data.get("threads", []))
+
+
+@mcp.tool
+async def get_persistent_thread(thread_id: str) -> str:
+    """Get detailed information about a specific persistent thread.
+
+    Returns full thread details including status, config, workspace state,
+    and metadata.
+
+    Args:
+        thread_id: Thread UUID to retrieve
+
+    Returns:
+        Formatted thread details
+    """
+    client = _get_client()
+    thread = await client.get_persistent_thread(thread_id)
+    return fmt.format_persistent_thread_detail(thread)
+
+
+@mcp.tool
+async def end_persistent_thread(
+    thread_id: str, permanent: bool = False
+) -> str:
+    """End or permanently delete a persistent thread.
+
+    MUTATION: If permanent=False (default), the thread is soft-ended and
+    can be resumed later. If permanent=True, the thread and ALL its
+    messages are permanently deleted along with workspace containers,
+    agent pods, and VMs.
+
+    Args:
+        thread_id: Thread UUID to end or delete
+        permanent: If true, permanently delete instead of soft-end
+
+    Returns:
+        Action result with status
+    """
+    client = _get_client()
+    try:
+        result = await client.end_persistent_thread(thread_id, permanent=permanent)
+        return fmt.format_thread_action_result(
+            "delete_thread" if permanent else "end_thread", thread_id, result
+        )
+    except Exception as e:
+        return fmt.format_action_error("end_thread", thread_id, e)
+
+
+@mcp.tool
+async def resume_persistent_thread(thread_id: str) -> str:
+    """Resume an ended or idle persistent thread.
+
+    MUTATION: Resets the thread status to 'created', clears the stale
+    agent binding, and re-provisions the agent pod. The thread must be
+    in 'ended' or 'idle' status.
+
+    Args:
+        thread_id: Thread UUID to resume
+
+    Returns:
+        Action result with new status
+    """
+    client = _get_client()
+    try:
+        result = await client.resume_persistent_thread(thread_id)
+        return fmt.format_thread_action_result("resume_thread", thread_id, result)
+    except Exception as e:
+        return fmt.format_action_error("resume_thread", thread_id, e)
+
+
+@mcp.tool
+async def get_persistent_thread_messages(
+    thread_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Get message history for a persistent thread session.
+
+    Returns conversation messages in chronological order with role,
+    content preview, and tool call info. Paginated.
+
+    Args:
+        thread_id: Thread UUID to get messages for
+        limit: Maximum messages to return (1-500, default 50)
+        offset: Pagination offset (default 0)
+
+    Returns:
+        Formatted message history
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 500:
+        limit = 500
+
+    client = _get_client()
+    data = await client.get_persistent_thread_messages(
+        thread_id, limit=limit, offset=offset
+    )
+    return fmt.format_persistent_thread_messages(data)
+
+
+@mcp.tool
+async def get_persistent_thread_ide(thread_id: str) -> str:
+    """Get IDE/workspace session status for a persistent thread.
+
+    Returns the workspace container or VM status with a code-server URL
+    when the workspace is ready.
+
+    Args:
+        thread_id: Thread UUID to check IDE status for
+
+    Returns:
+        IDE session status with URLs
+    """
+    client = _get_client()
+    data = await client.get_persistent_thread_ide(thread_id)
+    return fmt.format_persistent_thread_ide(data)

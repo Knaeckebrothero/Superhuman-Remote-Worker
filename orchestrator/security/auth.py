@@ -1,17 +1,19 @@
 """Authentication for the orchestrator API.
 
-Two auth paths:
+Three auth paths:
 1. Bearer token (OIDC) — Keycloak access token from the cockpit
 2. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged)
+3. X-MCP-User-Id + X-Internal-Key — forwarded by the MCP server after
+   it has already authenticated the caller via OAuth or API token.
 
 Session-based auth has been replaced by Keycloak OIDC (Phase 2).
 """
 
 import asyncio
 import logging
+import os
 
 from fastapi import HTTPException, Request
-
 from security.oidc import oidc_validator
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,9 @@ async def get_current_user(request: Request, db) -> dict:
     """
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        # Fallback: MCP internal header auth (the MCP server has already
+        # authenticated the caller and forwards the resolved user ID).
+        return await _get_user_from_mcp_headers(request, db)
 
     token = auth_header[7:]
     claims = oidc_validator.validate_token(token)
@@ -101,6 +105,28 @@ async def get_current_user(request: Request, db) -> dict:
     # Attach transient approval flag (not stored in DB)
     user["is_approved"] = is_approved
     return user
+
+
+async def _get_user_from_mcp_headers(request: Request, db) -> dict:
+    """Authenticate via MCP internal headers.
+
+    The MCP server validates the caller (OAuth / API token) and then
+    forwards requests to the orchestrator with X-MCP-User-Id and
+    X-Internal-Key headers.  We trust these headers only when the
+    internal key matches MCP_INTERNAL_KEY.
+    """
+    mcp_user_id = request.headers.get("X-MCP-User-Id")
+    internal_key = request.headers.get("X-Internal-Key", "")
+    expected_key = os.environ.get("MCP_INTERNAL_KEY", "")
+
+    if mcp_user_id and expected_key and internal_key == expected_key:
+        user = await db.get_user(mcp_user_id)
+        if user:
+            user["is_approved"] = True  # MCP tokens are pre-validated
+            return user
+        logger.warning("MCP header auth: user %s not found in DB", mcp_user_id)
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 
 async def require_approved_user(request: Request, db) -> dict:
