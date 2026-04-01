@@ -1,10 +1,10 @@
-import { Component, inject, signal, computed, ElementRef, ViewChild, AfterViewChecked, OnInit } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { MarkdownComponent } from 'ngx-markdown';
-import { AgentStepsComponent, IAgentStep, AgentStepType } from '../agent-steps/agent-steps.component';
-import { JobArtifactService, PendingWorkspaceEdit } from '../../../core/services/job-artifact.service';
-import { BuilderStreamService, BuilderMessage, WorkspaceProposal } from '../../../core/services/builder-stream.service';
-import { ApiService } from '../../../core/services/api.service';
+import {AfterViewChecked, Component, computed, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {MarkdownComponent} from 'ngx-markdown';
+import {AgentStepsComponent, AgentStepType, IAgentStep} from '../agent-steps/agent-steps.component';
+import {JobArtifactService, PendingWorkspaceEdit} from '../../../core/services/job-artifact.service';
+import {BuilderStreamService} from '../../../core/services/builder-stream.service';
+import {ApiService} from '../../../core/services/api.service';
 
 type BuilderStepStatus = 'active' | 'complete';
 
@@ -210,6 +210,7 @@ interface ChatMessage {
         flex-direction: column;
         height: 100%;
         background: var(--panel-bg, #181825);
+        overflow-x: hidden;
       }
 
       /* Empty state */
@@ -255,6 +256,7 @@ interface ChatMessage {
       .messages-container {
         flex: 1;
         overflow-y: auto;
+        overflow-x: hidden;
         padding: 12px;
         display: flex;
         flex-direction: column;
@@ -265,6 +267,7 @@ interface ChatMessage {
         display: flex;
         gap: 10px;
         max-width: 90%;
+        min-width: 0;
       }
 
       .message-user {
@@ -302,6 +305,8 @@ interface ChatMessage {
         display: flex;
         flex-direction: column;
         gap: 6px;
+        min-width: 0;
+        overflow: hidden;
       }
 
       .message-content {
@@ -311,6 +316,7 @@ interface ChatMessage {
         line-height: 1.5;
         white-space: pre-wrap;
         word-break: break-word;
+        overflow-x: auto;
       }
 
       .message-user .message-content {
@@ -748,6 +754,31 @@ interface ChatMessage {
       :host ::ng-deep .token.boolean,
       :host ::ng-deep .token.constant {
         color: #569cd6;
+      }
+
+      /* Mobile overrides */
+      @media (max-width: 768px) {
+        .message {
+          max-width: 95%;
+        }
+
+        .input-area {
+          padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+        }
+
+        .chat-input {
+          font-size: 16px; /* prevents iOS zoom on focus */
+        }
+
+        :host ::ng-deep .markdown-body pre {
+          max-width: calc(100vw - 80px);
+        }
+
+        :host ::ng-deep .markdown-body table {
+          display: block;
+          overflow-x: auto;
+          max-width: calc(100vw - 80px);
+        }
       }
 
       /* Workspace Proposal Card */

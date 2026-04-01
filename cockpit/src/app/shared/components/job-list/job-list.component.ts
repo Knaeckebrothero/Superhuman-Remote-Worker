@@ -891,12 +891,70 @@ interface JobRow {
           display: none;
         }
 
-        .job-table tr {
-          min-height: 44px;
+        .created-cell {
+          display: none;
+        }
+
+        .job-id {
+          display: none;
+        }
+
+        .job-table td {
+          padding: 8px 6px;
+        }
+
+        .job-table th {
+          padding: 8px 6px;
+        }
+
+        .job-table {
+          table-layout: fixed;
+        }
+
+        .col-prompt {
+          width: 40%;
+        }
+
+        .col-status {
+          width: 25%;
         }
 
         .col-actions {
-          width: 80px;
+          width: 35%;
+        }
+
+        .actions-cell {
+          white-space: normal;
+        }
+
+        .action-btn {
+          padding: 3px 5px;
+          font-size: 9px;
+          margin-right: 1px;
+          margin-bottom: 2px;
+          display: inline-block;
+        }
+
+        .prompt-text {
+          font-size: 11px;
+        }
+
+        .header-bar {
+          padding: 8px;
+          gap: 6px;
+        }
+
+        .filter-chips {
+          gap: 3px;
+        }
+
+        .filter-chip {
+          padding: 3px 7px;
+          font-size: 10px;
+        }
+
+        .table-container {
+          overflow-x: hidden;
         }
       }
     `,
