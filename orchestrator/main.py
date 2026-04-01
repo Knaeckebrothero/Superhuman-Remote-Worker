@@ -101,7 +101,6 @@ from langchain_core.messages import (  # noqa: E402
     SystemMessage,
     ToolMessage,
 )
-from src.core.loader import LLMConfig, create_llm  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
@@ -10687,6 +10686,14 @@ def _create_builder_llm(raw_model: str):
     Maps builder env vars and settings matrix into an LLMConfig, then
     delegates to ``create_llm()`` from ``src/core/loader``.
     """
+    import sys
+
+    project_root = str(Path(__file__).parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from src.core.loader import LLMConfig, create_llm
+
     settings = resolve_builder_settings(raw_model)
 
     # Resolve API key from builder-specific env vars
