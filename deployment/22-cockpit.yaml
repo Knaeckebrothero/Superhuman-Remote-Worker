@@ -14,6 +14,7 @@ data:
       window['env']['neo4jUrl'] = 'https://neo4j.superhuman-remote-worker.com';
       window['env']['pgadminUrl'] = 'https://pgadmin.superhuman-remote-worker.com';
       window['env']['mongoExpressUrl'] = 'https://mongo.superhuman-remote-worker.com';
+      window['env']['mcpUrl'] = 'https://mcp.superhuman-remote-worker.com/mcp';
 
       // Keycloak SSO
       window['env']['keycloakUrl'] = 'https://auth.superhuman-remote-worker.com';

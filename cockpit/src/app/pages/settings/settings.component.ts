@@ -6,11 +6,11 @@ import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
 import {SettingsService} from '../../core/services/settings.service';
 import {
-  ApiKeyProvider,
-  CodexStatus,
-  CommunicationSettings,
-  McpTokenCreateResponse,
-  Project
+    ApiKeyProvider,
+    CodexStatus,
+    CommunicationSettings,
+    McpTokenCreateResponse,
+    Project
 } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
@@ -424,13 +424,42 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
           <!-- Connection Instructions (shown after token creation) -->
           @if (newToken()) {
             <div class="instructions">
-              <h3 class="form-title">Connection</h3>
+              <h3 class="form-title">Claude Code / CLI</h3>
               <p class="section-desc">
                 Add this to your <code>.mcp.json</code> file:
               </p>
-              <pre class="code-block">{{mcpJsonSnippet()}}</pre>
+              <div class="code-block-wrapper">
+                <pre class="code-block">{{mcpJsonSnippet()}}</pre>
+                <button class="code-copy-btn" (click)="copyText(mcpJsonSnippet())">
+                  {{ snippetCopied() ? 'Copied' : 'Copy' }}
+                </button>
+              </div>
             </div>
           }
+
+          <!-- Web UI Connector Instructions -->
+          <div class="instructions">
+            <h3 class="form-title">Claude.ai / ChatGPT / Web Connectors</h3>
+            <p class="section-desc">
+              Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.
+            </p>
+            <div class="connector-url-row">
+              <input
+                type="text"
+                class="form-input mono"
+                [value]="mcpServerUrl()"
+                readonly
+                #mcpUrlInput
+              />
+              <button class="copy-btn" (click)="copyText(mcpUrlInput.value, 'connector')">
+                {{ connectorCopied() ? 'Copied' : 'Copy' }}
+              </button>
+            </div>
+            <p class="section-hint">
+              Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE).
+              Leave the Client ID and Client Secret fields empty — the server handles registration automatically.
+            </p>
+          </div>
         </section>
 
         <!-- Codex Proxy Section (Admin Only) -->
@@ -498,7 +527,37 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 {{ codexConnecting() ? 'Waiting for OAuth...' : 'Connect ChatGPT Account' }}
               </button>
               @if (codexConnecting()) {
-                <span class="save-feedback">Complete sign-in in the opened tab</span>
+                <div class="codex-callback-help">
+                  <p class="codex-callback-title">Complete sign-in</p>
+                  <ol class="codex-callback-steps">
+                    <li>Sign in with your OpenAI account in the tab that just opened.</li>
+                    <li>After sign-in, the browser will try to redirect to <code>localhost</code> and show an error &mdash; this is expected.</li>
+                    <li>Copy the <strong>full URL</strong> from your browser's address bar.</li>
+                    <li>Paste it below and click <strong>Complete Login</strong>.</li>
+                  </ol>
+                  <div class="codex-callback-input-row">
+                    <input
+                      type="text"
+                      class="form-input"
+                      placeholder="Paste callback URL here..."
+                      [ngModel]="codexCallbackUrl()"
+                      (ngModelChange)="codexCallbackUrl.set($event)"
+                    />
+                    <button
+                      class="create-btn"
+                      (click)="submitCodexCallback()"
+                      [disabled]="codexCallbackSubmitting()"
+                    >
+                      {{ codexCallbackSubmitting() ? 'Submitting...' : 'Complete Login' }}
+                    </button>
+                  </div>
+                  @if (codexCallbackError()) {
+                    <p class="codex-callback-error">{{ codexCallbackError() }}</p>
+                  }
+                  <p class="codex-callback-hint">
+                    If you have <code>kubectl port-forward</code> active, login will complete automatically.
+                  </p>
+                </div>
               }
             </div>
           </section>
@@ -782,17 +841,56 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       padding-top: 20px;
     }
 
+    .code-block-wrapper {
+      position: relative;
+    }
+
     .code-block {
       background: var(--surface-0, #313244);
       border: 1px solid var(--border-color, #313244);
       border-radius: 8px;
       padding: 14px;
+      padding-right: 80px;
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
       font-size: 12px;
       line-height: 1.5;
       color: var(--text-primary, #cdd6f4);
       overflow-x: auto;
       white-space: pre;
+    }
+
+    .code-copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 4px 12px;
+      background: var(--accent-color, #cba6f7);
+      color: var(--timeline-bg, #11111b);
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      min-width: 60px;
+    }
+
+    .code-copy-btn:hover { opacity: 0.9; }
+
+    .connector-url-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .connector-url-row .form-input {
+      flex: 1;
+    }
+
+    .section-hint {
+      font-size: 12px;
+      color: var(--text-secondary, #a6adc8);
+      line-height: 1.5;
     }
 
     /* Codex Proxy */
@@ -881,6 +979,71 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       font-size: 12px;
       color: var(--text-secondary, #a6adc8);
     }
+
+    /* Codex callback paste flow */
+    .codex-callback-help {
+      margin-top: 16px;
+      padding: 16px;
+      background: rgba(203, 166, 247, 0.06);
+      border: 1px solid var(--accent-color, #cba6f7);
+      border-radius: 8px;
+    }
+
+    .codex-callback-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent-color, #cba6f7);
+      margin-bottom: 10px;
+    }
+
+    .codex-callback-steps {
+      font-size: 13px;
+      color: var(--text-secondary, #a6adc8);
+      line-height: 1.6;
+      margin: 0 0 14px 0;
+      padding-left: 20px;
+    }
+
+    .codex-callback-steps code {
+      background: var(--surface-0, #313244);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .codex-callback-input-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .codex-callback-input-row .form-input {
+      flex: 1;
+    }
+
+    .codex-callback-input-row .create-btn {
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    .codex-callback-error {
+      font-size: 13px;
+      color: var(--red, #f38ba8);
+      margin: 6px 0 0 0;
+    }
+
+    .codex-callback-hint {
+      font-size: 12px;
+      color: var(--text-muted, #6c7086);
+      margin: 10px 0 0 0;
+    }
+
+    .codex-callback-hint code {
+      background: var(--surface-0, #313244);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
@@ -900,6 +1063,8 @@ export class SettingsComponent implements OnInit {
   readonly creating = signal(false);
   readonly newToken = signal<McpTokenCreateResponse | null>(null);
   readonly copied = signal(false);
+  readonly snippetCopied = signal(false);
+  readonly connectorCopied = signal(false);
   readonly projects = signal<Project[]>([]);
 
   // API key form state
@@ -945,6 +1110,9 @@ export class SettingsComponent implements OnInit {
   readonly codexModels = signal<string[]>([]);
   readonly codexLoading = signal(false);
   readonly codexConnecting = signal(false);
+  readonly codexCallbackUrl = signal('');
+  readonly codexCallbackSubmitting = signal(false);
+  readonly codexCallbackError = signal('');
   private codexPollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
@@ -1047,12 +1215,13 @@ export class SettingsComponent implements OnInit {
 
   mcpJsonSnippet = () => {
     const token = this.newToken()?.token ?? 'srw_YOUR_TOKEN_HERE';
+    const mcpUrl = (window as any)['env']?.['mcpUrl'] || 'http://localhost:8055/mcp';
     return JSON.stringify(
       {
         mcpServers: {
           orchestrator: {
             type: 'http',
-            url: `${window.location.origin.replace(/:\d+$/, ':8055')}/mcp`,
+            url: mcpUrl,
             headers: {
               Authorization: `Bearer ${token}`,
             },
@@ -1063,6 +1232,22 @@ export class SettingsComponent implements OnInit {
       2,
     );
   };
+
+  mcpServerUrl = () => {
+    return (window as any)['env']?.['mcpUrl'] || 'http://localhost:8055/mcp';
+  };
+
+  copyText(text: string, target: string = 'snippet'): void {
+    navigator.clipboard.writeText(text).then(() => {
+      if (target === 'connector') {
+        this.connectorCopied.set(true);
+        setTimeout(() => this.connectorCopied.set(false), 2000);
+      } else {
+        this.snippetCopied.set(true);
+        setTimeout(() => this.snippetCopied.set(false), 2000);
+      }
+    });
+  }
 
   // ── API Keys ──────────────────────────────────────────────────────
 
@@ -1243,6 +1428,42 @@ export class SettingsComponent implements OnInit {
         }, 2000);
       },
       error: () => this.codexConnecting.set(false),
+    });
+  }
+
+  submitCodexCallback(): void {
+    const url = this.codexCallbackUrl().trim();
+    if (!url) return;
+
+    try {
+      const parsed = new URL(url);
+      if (!parsed.searchParams.get('code') || !parsed.searchParams.get('state')) {
+        this.codexCallbackError.set(
+          'URL is missing required parameters. Please paste the complete URL from your browser address bar.'
+        );
+        return;
+      }
+    } catch {
+      this.codexCallbackError.set('Invalid URL. Please paste the complete URL from your browser address bar.');
+      return;
+    }
+
+    this.codexCallbackError.set('');
+    this.codexCallbackSubmitting.set(true);
+
+    this.settingsService.completeCodexLogin(url).subscribe({
+      next: () => {
+        this.codexCallbackSubmitting.set(false);
+        this.codexCallbackUrl.set('');
+        this.stopCodexPoll();
+        this.codexConnecting.set(false);
+        this.loadCodexStatus();
+      },
+      error: (err) => {
+        this.codexCallbackSubmitting.set(false);
+        const detail = err?.error?.detail || 'Failed to complete login. Please try again.';
+        this.codexCallbackError.set(detail);
+      },
     });
   }
 
