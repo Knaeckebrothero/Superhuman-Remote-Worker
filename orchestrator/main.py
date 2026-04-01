@@ -10505,7 +10505,7 @@ async def send_builder_message(
                 error_occurred = False
 
                 async for evt_type, evt_data in _stream_llm(
-                        llm_with_tools, loop_messages
+                    llm_with_tools, loop_messages
                 ):
                     if evt_type == "token":
                         turn_text += evt_data["text"]
@@ -10701,9 +10701,9 @@ def _create_builder_llm(raw_model: str):
     provider_lower = raw_model.lower()
     if provider_lower.startswith("claude"):
         api_key = (
-                os.getenv("BUILDER_ANTHROPIC_API_KEY")
-                or os.getenv("BUILDER_API_KEY")
-                or os.getenv("ANTHROPIC_API_KEY")
+            os.getenv("BUILDER_ANTHROPIC_API_KEY")
+            or os.getenv("BUILDER_API_KEY")
+            or os.getenv("ANTHROPIC_API_KEY")
         )
     elif provider_lower.startswith("codex/"):
         api_key = os.getenv("CODEX_API_KEY", "not-needed")
@@ -10730,7 +10730,7 @@ def _create_builder_llm(raw_model: str):
 
 
 def _dicts_to_langchain_messages(
-        messages: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
 ) -> list[BaseMessage]:
     """Convert dict-format messages from ``build_message_context()`` to LangChain types."""
     result: list[BaseMessage] = []
@@ -10754,8 +10754,8 @@ def _dicts_to_langchain_messages(
 
 
 async def _stream_llm(
-        llm_with_tools,
-        messages: list[BaseMessage],
+    llm_with_tools,
+    messages: list[BaseMessage],
 ):
     """Stream from a LangChain LLM, yielding builder event tuples.
 
