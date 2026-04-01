@@ -44,6 +44,7 @@ export const environment = {
     { label: 'GPT OSS 120B (Local)', id: 'openai/gpt-oss-120b' },
     { label: 'MiniMax M2.7', id: 'openrouter/minimax/minimax-m2.7' },
     { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
+    { label: 'GPT-5.4 Pro (Codex)', id: 'codex/gpt-5.4-pro' },
     { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
   ]),
 };
