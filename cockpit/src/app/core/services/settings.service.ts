@@ -1,8 +1,8 @@
-import { Injectable, inject, signal } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { Observable, catchError, of, tap } from 'rxjs';
-import { ApiKeyEntry, ApiKeySetRequest, UserSettings, CodexStatus } from '../models/api.model';
-import { environment } from '../environment';
+import {inject, Injectable, signal} from '@angular/core';
+import {HttpClient} from '@angular/common/http';
+import {catchError, Observable, of, tap} from 'rxjs';
+import {ApiKeyEntry, ApiKeySetRequest, CodexStatus, UserSettings} from '../models/api.model';
+import {environment} from '../environment';
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
@@ -91,6 +91,11 @@ export class SettingsService {
   pollCodexLogin(state: string): Observable<{ status: string }> {
     return this.http
       .get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, { params: { state } });
+  }
+
+  completeCodexLogin(callbackUrl: string): Observable<Record<string, unknown>> {
+    return this.http
+      .post<Record<string, unknown>>(`${this.baseUrl}/codex/callback`, { url: callbackUrl });
   }
 
   deleteCodexCredential(name: string): Observable<{ status: string }> {

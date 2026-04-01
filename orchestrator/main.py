@@ -16,6 +16,7 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -1326,6 +1327,14 @@ def _trigger_dispatch() -> None:
 # =============================================================================
 # Pydantic Models for Agent Orchestration
 # =============================================================================
+
+
+class CodexCallbackRequest(BaseModel):
+    """Request body for manually completing a Codex OAuth callback."""
+
+    url: str | None = Field(None, description="Full callback URL from browser address bar")
+    code: str | None = Field(None, description="OAuth authorization code")
+    state: str | None = Field(None, description="OAuth state parameter")
 
 
 class DatasourceCreate(BaseModel):
@@ -9227,6 +9236,43 @@ async def codex_login_poll(request: Request, state: str) -> dict[str, Any]:
         "GET",
         "/v0/management/get-auth-status",
         params={"state": state},
+    )
+    return resp.json()
+
+
+@app.post("/api/codex/callback")
+async def codex_callback(
+    body: CodexCallbackRequest, request: Request
+) -> dict[str, Any]:
+    """Relay an OAuth callback to the Codex proxy (admin-only).
+
+    Accepts the full localhost callback URL (or explicit code+state).
+    Parses the authorization code and state, then relays the callback
+    to the proxy internally so no port-forward is needed.
+    """
+    await _require_admin(request)
+
+    code = body.code
+    state = body.state
+
+    if body.url:
+        parsed = urlparse(body.url)
+        qs = parse_qs(parsed.query)
+        code = code or (qs.get("code", [None])[0])
+        state = state or (qs.get("state", [None])[0])
+
+    if not code or not state:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract 'code' and 'state' from the provided URL. "
+            "Please paste the complete URL from your browser address bar.",
+        )
+
+    resp = await _codex_proxy_request(
+        "GET",
+        "/codex/callback",
+        params={"code": code, "state": state},
+        timeout=15.0,
     )
     return resp.json()
 
