@@ -1332,7 +1332,9 @@ def _trigger_dispatch() -> None:
 class CodexCallbackRequest(BaseModel):
     """Request body for manually completing a Codex OAuth callback."""
 
-    url: str | None = Field(None, description="Full callback URL from browser address bar")
+    url: str | None = Field(
+        None, description="Full callback URL from browser address bar"
+    )
     code: str | None = Field(None, description="OAuth authorization code")
     state: str | None = Field(None, description="OAuth state parameter")
 
