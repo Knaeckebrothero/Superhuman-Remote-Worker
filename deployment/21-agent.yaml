@@ -126,6 +126,12 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: SEMANTIC_SCHOLAR_API_KEY
+            # Codex proxy (CLIProxyAPI)
+            - name: CODEX_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CODEX_BASE_URL
             # Vision model
             - name: VISION_API_KEY
               valueFrom:

@@ -69,6 +69,9 @@ data:
   EMBEDDING_MODEL: "qwen3-embedding-8b"
   EMBEDDING_BASE_URL: "http://srw-vpn-workstation:8080/v1"
 
+  # Codex proxy (CLIProxyAPI — ChatGPT subscription via OAuth proxy)
+  CODEX_BASE_URL: "http://srw-codex-proxy:8317/v1"
+
   # Instruction Builder (Cockpit AI Chat)
   BUILDER_MODEL: "gpt-5.2-pro"
   BUILDER_LLM_PROVIDER: "openai"
