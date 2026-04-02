@@ -14,6 +14,8 @@ Usage:
 """
 
 import logging
+import posixpath
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -46,14 +48,32 @@ class GitManager:
     DEFAULT_MAX_LINES = 500
     DEFAULT_MAX_WORDS = 10000
 
-    def __init__(self, workspace_path: Path):
+    def __init__(self, workspace_path: Path, backend=None, remote_cwd=None):
         """Initialize GitManager for a workspace directory.
 
         Args:
             workspace_path: Path to the workspace directory
+            backend: Optional WorkspaceBackend instance. When provided and
+                the backend supports shell execution, git commands are
+                delegated to the backend (e.g. via SSH on a remote VM)
+                instead of running locally via subprocess.
+            remote_cwd: Relative path within the backend root to use as the
+                git working directory. Used for auxiliary repos cloned into
+                subdirectories (e.g. "repos/my-repo"). When None, commands
+                run in the backend's root directory.
         """
         self._workspace_path = Path(workspace_path)
-        self._git_available = self._check_git_available()
+        self._backend = backend
+        self._remote_cwd = remote_cwd
+        self._use_backend = backend is not None and getattr(
+            backend, "supports_shell", False
+        )
+
+        if self._use_backend:
+            # Git is available on the remote — skip local check
+            self._git_available = True
+        else:
+            self._git_available = self._check_git_available()
 
         if not self._git_available:
             logger.warning("Git not available, workspace versioning disabled")
@@ -65,7 +85,16 @@ class GitManager:
         Returns True only if git is available AND the workspace has been
         initialized as a git repository.
         """
-        return self._git_available and (self._workspace_path / ".git").exists()
+        if not self._git_available:
+            return False
+        if self._use_backend:
+            git_path = (
+                posixpath.join(self._remote_cwd, ".git")
+                if self._remote_cwd
+                else ".git"
+            )
+            return self._backend.exists(git_path)
+        return (self._workspace_path / ".git").exists()
 
     @property
     def workspace_path(self) -> Path:
@@ -98,7 +127,17 @@ class GitManager:
             return False
 
         # Skip if already initialized
-        if (self._workspace_path / ".git").exists():
+        if self._use_backend:
+            git_path = (
+                posixpath.join(self._remote_cwd, ".git")
+                if self._remote_cwd
+                else ".git"
+            )
+            already_init = self._backend.exists(git_path)
+        else:
+            already_init = (self._workspace_path / ".git").exists()
+
+        if already_init:
             logger.info("Git repository already exists, skipping initialization")
             return True
 
@@ -114,9 +153,17 @@ class GitManager:
             self._run_git(["config", "user.name", "Agent"])
 
             # Create .gitignore with sensible defaults
-            gitignore_path = self._workspace_path / ".gitignore"
             gitignore_content = "\n".join(self.DEFAULT_IGNORE_PATTERNS) + "\n"
-            gitignore_path.write_text(gitignore_content)
+            if self._use_backend:
+                gitignore_path = (
+                    posixpath.join(self._remote_cwd, ".gitignore")
+                    if self._remote_cwd
+                    else ".gitignore"
+                )
+                self._backend.write_file(gitignore_path, gitignore_content)
+            else:
+                gitignore_path = self._workspace_path / ".gitignore"
+                gitignore_path.write_text(gitignore_content)
 
             # Stage all files
             result = self._run_git(["add", "-A"])
@@ -664,17 +711,69 @@ class GitManager:
             return False
 
     @classmethod
-    def clone(cls, url: str, target_path: Path) -> Optional["GitManager"]:
+    def clone(
+        cls,
+        url: str,
+        target_path: Path,
+        backend=None,
+        remote_cwd=None,
+    ) -> Optional["GitManager"]:
         """Clone a repository to a target path.
 
         Args:
             url: Repository URL (may contain credentials)
-            target_path: Local path to clone into
+            target_path: Local path to clone into (used for the GitManager
+                instance; ignored for the actual clone when backend is active)
+            backend: Optional WorkspaceBackend for remote execution
+            remote_cwd: Relative path within backend root for the clone
+                target (e.g. "repos/my-repo"). When None, clones into
+                the backend's root directory.
 
         Returns:
             GitManager instance for the cloned repo, or None on failure
         """
         masked = cls._mask_url_static(url)
+        use_backend = backend is not None and getattr(
+            backend, "supports_shell", False
+        )
+
+        if use_backend:
+            try:
+                if remote_cwd:
+                    remote_target = posixpath.join(backend.root, remote_cwd)
+                else:
+                    remote_target = backend.root
+
+                cmd = (
+                    f"git clone {shlex.quote(url)}"
+                    f" {shlex.quote(remote_target)}"
+                )
+                output = backend.shell_run(cmd, timeout=120, tab_name="git")
+
+                # Parse exit code
+                first_line = output.split("\n", 1)[0].strip()
+                if not first_line.startswith("Exit code: 0"):
+                    logger.warning(
+                        f"git clone failed for {masked}: {output}"
+                    )
+                    return None
+
+                mgr = cls(
+                    target_path, backend=backend, remote_cwd=remote_cwd
+                )
+                mgr._run_git(
+                    ["config", "user.email", "agent@workspace.local"]
+                )
+                mgr._run_git(["config", "user.name", "Agent"])
+
+                logger.info(f"Cloned {masked} to {remote_target}")
+                return mgr
+
+            except Exception as e:
+                logger.warning(f"Failed to clone {masked}: {e}")
+                return None
+
+        # --- Local subprocess path (no backend) ---
 
         if shutil.which("git") is None:
             logger.warning("Cannot clone: git not available")
@@ -708,7 +807,9 @@ class GitManager:
             return None
 
     @classmethod
-    def from_worktree(cls, worktree_path: Path) -> Optional["GitManager"]:
+    def from_worktree(
+        cls, worktree_path: Path, backend=None, remote_cwd=None
+    ) -> Optional["GitManager"]:
         """Create a GitManager for an existing git worktree.
 
         Git worktrees have a `.git` file (not directory) that points to the
@@ -717,17 +818,35 @@ class GitManager:
 
         Args:
             worktree_path: Path to the worktree directory
+            backend: Optional WorkspaceBackend for remote execution
+            remote_cwd: Relative path within backend root for the worktree
 
         Returns:
             GitManager instance, or None if path is not a valid git worktree
         """
         worktree_path = Path(worktree_path)
-        git_marker = worktree_path / ".git"
-        if not git_marker.exists():
-            logger.warning(f"Not a git worktree (no .git): {worktree_path}")
-            return None
+        use_backend = backend is not None and getattr(
+            backend, "supports_shell", False
+        )
 
-        mgr = cls(worktree_path)
+        if use_backend:
+            git_path = (
+                posixpath.join(remote_cwd, ".git") if remote_cwd else ".git"
+            )
+            if not backend.exists(git_path):
+                logger.warning(
+                    f"Not a git worktree (no .git): {worktree_path}"
+                )
+                return None
+        else:
+            git_marker = worktree_path / ".git"
+            if not git_marker.exists():
+                logger.warning(
+                    f"Not a git worktree (no .git): {worktree_path}"
+                )
+                return None
+
+        mgr = cls(worktree_path, backend=backend, remote_cwd=remote_cwd)
         if not mgr._git_available:
             return None
 
@@ -754,6 +873,10 @@ class GitManager:
     ) -> subprocess.CompletedProcess:
         """Execute git command in workspace directory with timeout.
 
+        When a workspace backend with shell support is available, the command
+        is delegated to the backend (e.g. executed via SSH on a remote VM).
+        Otherwise falls back to local subprocess execution.
+
         Args:
             args: Git command arguments (without 'git' prefix)
             timeout: Command timeout in seconds (default: 60)
@@ -761,6 +884,23 @@ class GitManager:
         Returns:
             CompletedProcess with stdout, stderr, and returncode
         """
+        if self._use_backend:
+            cmd_str = "git " + " ".join(shlex.quote(a) for a in args)
+            try:
+                output = self._backend.shell_run(
+                    cmd_str,
+                    timeout=timeout,
+                    tab_name="git",
+                    working_dir=self._remote_cwd,
+                )
+                return self._parse_shell_run_output(output, args)
+            except Exception as e:
+                logger.error(f"Backend git command failed: {e}")
+                return subprocess.CompletedProcess(
+                    ["git"] + args, returncode=1, stdout="", stderr=str(e)
+                )
+
+        # --- Local subprocess path (no backend) ---
         cmd = ["git"] + args
         try:
             result = subprocess.run(
@@ -773,7 +913,6 @@ class GitManager:
             return result
         except subprocess.TimeoutExpired:
             logger.error(f"Git command timed out after {timeout}s: {' '.join(cmd)}")
-            # Return a fake CompletedProcess with error
             return subprocess.CompletedProcess(
                 cmd,
                 returncode=1,
@@ -785,6 +924,60 @@ class GitManager:
             return subprocess.CompletedProcess(
                 cmd, returncode=1, stdout="", stderr=str(e)
             )
+
+    def _parse_shell_run_output(
+        self, output: str, args: Optional[List[str]] = None
+    ) -> subprocess.CompletedProcess:
+        """Parse shell_run formatted output into a CompletedProcess.
+
+        The backend's shell_run returns formatted strings like:
+            "Exit code: 0\\n--- stdout ---\\nactual output..."
+            "Exit code: 1\\n--- stdout ---\\nerror message..."
+            "Exit code: 0\\n(no output)"
+
+        Error cases (timeout, interactive prompt) lack the "Exit code:" prefix
+        and are treated as failures.
+
+        Args:
+            output: Raw shell_run output string
+            args: Git command args for the CompletedProcess.args field
+
+        Returns:
+            CompletedProcess with parsed returncode, stdout, and stderr
+        """
+        cmd = ["git"] + (args or [])
+        lines = output.split("\n", 1)
+        first_line = lines[0].strip()
+
+        if first_line.startswith("Exit code:"):
+            try:
+                exit_code = int(first_line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                exit_code = 1
+
+            rest = lines[1] if len(lines) > 1 else ""
+            stdout_marker = "--- stdout ---\n"
+            if rest.startswith(stdout_marker):
+                stdout = rest[len(stdout_marker):]
+            elif rest.strip() == "(no output)":
+                stdout = ""
+            else:
+                stdout = rest
+
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=exit_code,
+                stdout=stdout,
+                stderr="",
+            )
+
+        # No "Exit code:" prefix — timeout, stall, or other error
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr=output,
+        )
 
     def _truncate_output(
         self,

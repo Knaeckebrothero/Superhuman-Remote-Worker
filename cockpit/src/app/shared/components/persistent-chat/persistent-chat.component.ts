@@ -9,7 +9,7 @@ import {
     signal,
     ViewChild,
 } from '@angular/core';
-import {JsonPipe} from '@angular/common';
+import {JsonPipe, TitleCasePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -24,6 +24,7 @@ interface SlashCommand {
 const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/compact', description: 'Compress conversation history to free up context'},
     {command: '/done', description: 'End session — extract memories and archive'},
+    {command: '/undo', description: 'Undo file changes from the last turn'},
     {command: '/auto', description: 'Switch to auto-accept mode (approve all except shell)'},
     {command: '/supervised', description: 'Switch to supervised mode (approve all writes)'},
     {command: '/autonomous', description: 'Switch to autonomous mode (approve nothing)'},
@@ -32,7 +33,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
-    imports: [FormsModule, JsonPipe, RouterLink, MarkdownComponent],
+    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent],
     template: `
     <div class="chat-container">
       <!-- Header -->
@@ -42,7 +43,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
             <span class="back-icon">arrow_back</span>
           </a>
           <span class="header-icon">smart_toy</span>
-          <span class="header-title">Persistent Agent</span>
+          <span class="header-title">{{ chat.sessionTitle() || 'Persistent Agent' }}</span>
           <span class="status-dot" [class]="connectionClass()"></span>
           <span class="status-label">{{ connectionLabel() }}</span>
         </div>
@@ -85,14 +86,54 @@ const SLASH_COMMANDS: SlashCommand[] = [
         </div>
       </div>
 
+      <!-- Status bar -->
+      @if (chat.isConnected()) {
+        <div class="status-bar">
+          @if (chat.modelName()) {
+            <span class="status-chip model-chip">{{ chat.modelName() }}</span>
+          }
+          <span class="status-chip turn-chip">Turn {{ chat.turnCount() }}</span>
+          <span class="status-chip mode-chip">{{ chat.permissionMode() | titlecase }}</span>
+        </div>
+      }
+
+      <!-- Task bar -->
+      @if (chat.tasks().length) {
+        <div class="task-bar">
+          <div class="task-header">
+            <span class="task-header-icon">checklist</span>
+            Tasks {{ completedTaskCount() }}/{{ chat.tasks().length }}
+          </div>
+          <div class="task-list">
+            @for (task of chat.tasks(); track task.id) {
+              <div class="task-item" [class.task-completed]="task.status === 'completed'">
+                <span class="task-check">{{ task.status === 'completed' ? 'check_circle' : 'radio_button_unchecked' }}</span>
+                <span class="task-desc">{{ task.description }}</span>
+              </div>
+            }
+          </div>
+        </div>
+      }
+
       <!-- Messages -->
-      <div class="messages" #messagesContainer>
+      <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
         @for (msg of chat.messages(); track $index) {
-          <div class="message" [class]="'message-' + msg.role" [class.historical]="msg.historical">
+          <div class="message" [class]="'message-' + msg.role"
+               [class.historical]="msg.historical"
+               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length">
             @if (msg.role === 'system') {
               <div class="system-message">
                 <span class="system-icon">info</span>
                 {{ msg.content }}
+              </div>
+            } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
+              <!-- Tool-only message: compact inline indicator -->
+              <div class="tool-only-row">
+                <span class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</span>
+                <span class="tool-only-label">
+                  {{ groupToolCalls(msg.toolCalls!) }}
+                </span>
+                <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
               </div>
             } @else {
               <div class="avatar">
@@ -119,11 +160,13 @@ const SLASH_COMMANDS: SlashCommand[] = [
                         @for (tc of msg.toolCalls; track tc.id) {
                           <details class="tool-detail-item">
                             <summary class="tool-detail-header">
+                              <span class="tool-icon">{{ toolIcon(tc.tool) }}</span>
                               <span class="tool-detail-name">{{ tc.tool }}</span>
                               <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
                               <span class="tool-detail-status" [class]="'status-' + tc.status">{{ tc.status }}</span>
                             </summary>
                             @if (tc.result) {
+                              <div class="tool-preview">{{ previewResult(tc.result) }}</div>
                               <pre class="tool-detail-result">{{ tc.result }}</pre>
                             }
                           </details>
@@ -359,6 +402,75 @@ const SLASH_COMMANDS: SlashCommand[] = [
       .status-label {
         font-size: 11px;
         color: var(--text-muted, #6c7086);
+      }
+
+      /* Status bar */
+
+      .status-bar {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 16px;
+        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg, #181825);
+        flex-shrink: 0;
+      }
+
+      .status-chip {
+        font-size: 10px;
+        padding: 2px 8px;
+        border-radius: 10px;
+        background: var(--surface-0, #313244);
+        color: var(--text-muted, #6c7086);
+      }
+
+      .model-chip {
+        color: var(--accent-color, #cba6f7);
+        font-family: 'JetBrains Mono', monospace;
+      }
+
+      /* Task bar */
+      .task-bar {
+        padding: 6px 16px;
+        border-bottom: 1px solid #313244;
+        background: #181825;
+        flex-shrink: 0;
+      }
+      .task-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: #6c7086;
+        margin-bottom: 4px;
+      }
+      .task-header-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+      }
+      .task-list {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .task-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: #cdd6f4;
+      }
+      .task-item .task-check {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+        color: #6c7086;
+      }
+      .task-completed {
+        color: #6c7086;
+        text-decoration: line-through;
+      }
+      .task-completed .task-check {
+        color: #a6e3a1;
       }
 
       .header-right {
@@ -600,6 +712,32 @@ const SLASH_COMMANDS: SlashCommand[] = [
         font-size: 14px;
       }
 
+      /* Tool-only messages: compact inline indicators (no avatar/bubble) */
+
+      .message.tool-only {
+        max-width: none;
+        gap: 0;
+      }
+
+      .tool-only-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 2px 8px 2px 40px;  /* indent to align with message body (avatar 30px + gap 10px) */
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+      }
+
+      .tool-only-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+        color: var(--text-muted, #6c7086);
+      }
+
+      .tool-only-label {
+        white-space: nowrap;
+      }
+
       /* Tool summary (collapsed by default) */
 
       .tool-summary {
@@ -697,6 +835,28 @@ const SLASH_COMMANDS: SlashCommand[] = [
       .tool-detail-status.status-running { color: #f9e2af; }
       .tool-detail-status.status-denied { color: #f38ba8; }
       .tool-detail-status.status-pending { color: var(--text-muted, #6c7086); }
+
+      .tool-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 12px;
+        color: var(--text-muted, #6c7086);
+        width: 16px;
+        text-align: center;
+        flex-shrink: 0;
+      }
+
+      .tool-preview {
+        padding: 2px 8px 2px 28px;
+        font-size: 10px;
+        color: var(--text-muted, #6c7086);
+        opacity: 0.6;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: 'JetBrains Mono', monospace;
+      }
+
+      .tool-detail-item[open] > .tool-preview { display: none; }
 
       .tool-detail-result {
         margin: 4px 0 4px 8px;
@@ -1054,12 +1214,95 @@ const SLASH_COMMANDS: SlashCommand[] = [
         padding: 0;
       }
 
+      .message-body ::ng-deep .code-copy-btn {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 4px;
+        padding: 2px 4px;
+        cursor: pointer;
+        opacity: 0;
+        transition: opacity 0.15s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .message-body ::ng-deep pre:hover .code-copy-btn {
+        opacity: 1;
+      }
+
+      .message-body ::ng-deep .code-copy-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+        color: var(--text-muted, #6c7086);
+      }
+
       .message-body ::ng-deep code {
         background: rgba(203, 166, 247, 0.12);
         padding: 1px 5px;
         border-radius: 4px;
         font-family: 'JetBrains Mono', monospace;
         font-size: 0.9em;
+      }
+
+      /* Collapsible code blocks */
+      .message-body ::ng-deep .code-collapse {
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 8px;
+        margin: 8px 0;
+        overflow: hidden;
+      }
+
+      .message-body ::ng-deep .code-collapse > pre {
+        margin: 0;
+        border: none;
+        border-radius: 0;
+      }
+
+      .message-body ::ng-deep .code-collapse:not([open]) > pre {
+        display: none;
+      }
+
+      .message-body ::ng-deep .code-collapse-summary {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: var(--panel-bg, #181825);
+        cursor: pointer;
+        font-size: 12px;
+        color: var(--text-muted, #6c7086);
+        user-select: none;
+        list-style: none;
+      }
+
+      .message-body ::ng-deep .code-collapse-summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .message-body ::ng-deep .code-collapse-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+        color: var(--accent-color, #cba6f7);
+      }
+
+      .message-body ::ng-deep .code-collapse-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 600;
+        color: var(--text-color, #cdd6f4);
+      }
+
+      .message-body ::ng-deep .code-collapse-hint {
+        margin-left: auto;
+        font-size: 11px;
+        opacity: 0.6;
+      }
+
+      .message-body ::ng-deep .code-collapse[open] .code-collapse-hint {
+        display: none;
       }
 
       .message-body ::ng-deep table {
@@ -1103,6 +1346,23 @@ const SLASH_COMMANDS: SlashCommand[] = [
         padding: 4px 12px;
         color: var(--text-secondary, #a6adc8);
       }
+
+      .message-body ::ng-deep .citation-web {
+        color: var(--accent-color, #cba6f7);
+        text-decoration: underline dotted;
+        text-underline-offset: 2px;
+      }
+
+      .message-body ::ng-deep .citation-web:hover {
+        text-decoration-style: solid;
+      }
+
+      .message-body ::ng-deep .citation-doc {
+        color: #89b4fa;
+        font-style: italic;
+        cursor: help;
+        border-bottom: 1px dashed #89b4fa;
+      }
     `,
     ],
 })
@@ -1123,8 +1383,9 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
+    private idePollingAttempts = 0;
 
-    private shouldScroll = true;
+    private autoScroll = true;
 
     constructor() {
         // Start/stop IDE polling when connection state changes
@@ -1137,7 +1398,23 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
                 this.stopIdePolling();
             }
         });
+
+        // Auto-scroll when messages, streaming, or tool calls change
+        effect(() => {
+            this.chat.messages();
+            this.chat.streamingText();
+            this.chat.currentToolCalls();
+            this.chat.pendingPermission();
+
+            if (this.autoScroll) {
+                setTimeout(() => this.scrollToBottom(), 0);
+            }
+        });
     }
+
+    readonly completedTaskCount = computed(() =>
+        this.chat.tasks().filter(t => t.status === 'completed').length
+    );
 
     readonly connectionClass = computed(() => this.chat.connectionState());
     readonly connectionLabel = computed(() => {
@@ -1173,9 +1450,8 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     );
 
     ngAfterViewChecked(): void {
-        if (this.shouldScroll) {
-            this.scrollToBottom();
-        }
+        this.collapseCodeBlocks();
+        this.addCopyButtons();
     }
 
     ngOnDestroy(): void {
@@ -1190,7 +1466,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.showSlashMenu.set(false);
         this.chat.sendMessage(text);
         this.inputText = '';
-        this.shouldScroll = true;
+        this.autoScroll = true;
 
         // Resize textarea back
         setTimeout(() => {
@@ -1211,6 +1487,13 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         } else {
             this.showSlashMenu.set(false);
         }
+    }
+
+    onMessagesScroll(): void {
+        const el = this.messagesContainer?.nativeElement;
+        if (!el) return;
+        // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
+        this.autoScroll = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     }
 
     selectSlashCommand(cmd: SlashCommand): void {
@@ -1269,6 +1552,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     private startIdePolling(threadId: string): void {
         this.stopIdePolling();
+        this.idePollingAttempts = 0;
         // Fetch immediately, then poll every 10s
         this.fetchIdeStatus(threadId);
         this.idePollingTimer = setInterval(() => this.fetchIdeStatus(threadId), 10_000);
@@ -1282,10 +1566,11 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     private fetchIdeStatus(threadId: string): void {
+        this.idePollingAttempts++;
         this.api.getThreadIdeStatus(threadId).subscribe(status => {
             this.ideStatus.set(status);
-            // Stop polling once active (status won't change)
-            if (status?.status === 'active') {
+            // Stop polling once active or after 30 attempts (5 min)
+            if (status?.status === 'active' || this.idePollingAttempts >= 30) {
                 this.stopIdePolling();
             }
         });
@@ -1295,6 +1580,57 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         const el = this.messagesContainer?.nativeElement;
         if (el) {
             el.scrollTop = el.scrollHeight;
+        }
+    }
+
+    /** Wrap tall <pre> blocks in a collapsed <details> element. */
+    private collapseCodeBlocks(): void {
+        const container = this.messagesContainer?.nativeElement;
+        if (!container) return;
+        const blocks = container.querySelectorAll<HTMLPreElement>(
+            '.message-body pre:not([data-collapsed])',
+        );
+        for (const pre of Array.from(blocks)) {
+            pre.setAttribute('data-collapsed', '');
+            if (pre.scrollHeight <= 200) continue;
+            const lang = pre.querySelector('code')?.className?.match(/language-(\S+)/)?.[1] || '';
+            const wrapper = document.createElement('details');
+            wrapper.className = 'code-collapse';
+            const summary = document.createElement('summary');
+            summary.className = 'code-collapse-summary';
+            summary.innerHTML = `<span class="code-collapse-icon">code</span>`
+                + `<span class="code-collapse-label">${lang || 'code'}</span>`
+                + `<span class="code-collapse-hint">Click to expand</span>`;
+            wrapper.appendChild(summary);
+            pre.parentNode!.insertBefore(wrapper, pre);
+            wrapper.appendChild(pre);
+        }
+    }
+
+    /** Add a copy-to-clipboard button to every <pre> block that doesn't have one yet. */
+    private addCopyButtons(): void {
+        const container = this.messagesContainer?.nativeElement;
+        if (!container) return;
+        const blocks = container.querySelectorAll<HTMLPreElement>(
+            '.message-body pre:not([data-copy-btn])',
+        );
+        for (const pre of Array.from(blocks)) {
+            pre.setAttribute('data-copy-btn', '');
+            const btn = document.createElement('button');
+            btn.className = 'code-copy-btn';
+            btn.innerHTML = '<span class="code-copy-icon">content_copy</span>';
+            btn.title = 'Copy to clipboard';
+            btn.addEventListener('click', () => {
+                const code = pre.querySelector('code')?.textContent || pre.textContent || '';
+                navigator.clipboard.writeText(code).then(() => {
+                    btn.innerHTML = '<span class="code-copy-icon">check</span>';
+                    setTimeout(() => {
+                        btn.innerHTML = '<span class="code-copy-icon">content_copy</span>';
+                    }, 1500);
+                });
+            });
+            pre.style.position = 'relative';
+            pre.appendChild(btn);
         }
     }
 
@@ -1351,5 +1687,20 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         if (running.length === 1) return running[0].tool;
         const unique = [...new Set(running.map(tc => tc.tool))];
         return unique.length === 1 ? `${unique[0]} (${running.length})` : unique.join(', ');
+    }
+
+    toolIcon(name: string): string {
+        const t = name.toLowerCase();
+        if (t.includes('read') || t.includes('write') || t.includes('edit') || t.includes('list_files')) return 'description';
+        if (t.includes('git')) return 'history';
+        if (t.includes('bash') || t.includes('shell') || t.includes('run_command')) return 'terminal';
+        if (t.includes('web') || t.includes('search') || t.includes('fetch')) return 'public';
+        if (t.includes('grep') || t.includes('search_files')) return 'search';
+        return 'build';
+    }
+
+    previewResult(result: string): string {
+        const line = result.trim().split('\n')[0];
+        return line.length > 120 ? line.substring(0, 120) + '...' : line;
     }
 }

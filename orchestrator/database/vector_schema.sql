@@ -502,10 +502,21 @@ CREATE TABLE IF NOT EXISTS knowledge_index (
     CONSTRAINT uq_knowledge_project_note UNIQUE (project_id, note_id),
     CONSTRAINT valid_note_type CHECK (note_type IN (
         'goal', 'plan', 'decision', 'learning', 'code',
-        'source', 'question', 'state', 'retrospective'
+        'source', 'question', 'state', 'retrospective', 'datasource'
     )),
     CONSTRAINT valid_note_status CHECK (status IN ('active', 'resolved', 'superseded', 'archived'))
 );
+
+-- Migration: update valid_note_type constraint to include 'datasource'
+DO $$ BEGIN
+    ALTER TABLE knowledge_index DROP CONSTRAINT IF EXISTS valid_note_type;
+    ALTER TABLE knowledge_index ADD CONSTRAINT valid_note_type CHECK (note_type IN (
+        'goal', 'plan', 'decision', 'learning', 'code',
+        'source', 'question', 'state', 'retrospective', 'datasource'
+    ));
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Could not update valid_note_type constraint: %', SQLERRM;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_index(project_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_project_type ON knowledge_index(project_id, note_type);

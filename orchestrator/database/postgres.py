@@ -2162,7 +2162,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 f"""
                 SELECT id, name, description, type, connection_url, credentials,
-                       read_only, job_id, created_at, updated_at
+                       cli_hint, default_branch, job_id, created_at, updated_at
                 FROM datasources
                 {where_clause}
                 ORDER BY created_at DESC
@@ -2191,7 +2191,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, name, description, type, connection_url, credentials,
-                       read_only, job_id, created_at, updated_at
+                       cli_hint, default_branch, job_id, created_at, updated_at
                 FROM datasources
                 WHERE id = $1
                 """,
@@ -2204,22 +2204,27 @@ class PostgresDB:
         self,
         name: str,
         ds_type: str,
-        connection_url: str,
+        connection_url: str | None = None,
         description: str | None = None,
         credentials: Dict[str, Any] | None = None,
-        read_only: bool = True,
         job_id: str | None = None,
+        cli_hint: str | None = None,
+        default_branch: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new datasource.
 
         Args:
             name: User-provided label
-            ds_type: Datasource type ('postgresql', 'neo4j', 'mongodb')
-            connection_url: Full connection string
+            ds_type: Datasource type ('generic', 'repository', 'postgresql',
+                     'neo4j', 'mongodb', 'webdav')
+            connection_url: Connection string (nullable for generic)
             description: What this datasource contains
-            credentials: Additional auth details (JSONB)
-            read_only: Whether the agent is allowed to write
+            credentials: Auth details (env_vars dict for generic,
+                         auth_method+token/ssh_key for repository,
+                         type-specific for managed connectors)
             job_id: Job UUID (None for global)
+            cli_hint: Suggested CLI command
+            default_branch: Branch to clone (repository type)
 
         Returns:
             Created datasource dict
@@ -2234,18 +2239,19 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, description, type, connection_url,
-                                         credentials, read_only, job_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                         credentials, job_id, cli_hint, default_branch)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id, name, description, type, connection_url, credentials,
-                          read_only, job_id, created_at, updated_at
+                          job_id, cli_hint, default_branch, created_at, updated_at
                 """,
                 name,
                 description,
                 ds_type,
                 connection_url,
                 json.dumps(credentials) if credentials else "{}",
-                read_only,
                 job_uuid,
+                cli_hint,
+                default_branch,
             )
 
         return dict(row)
@@ -2257,7 +2263,8 @@ class PostgresDB:
         description: str | None = None,
         connection_url: str | None = None,
         credentials: Dict[str, Any] | None = None,
-        read_only: bool | None = None,
+        cli_hint: str | None = None,
+        default_branch: str | None = None,
     ) -> bool:
         """Update a datasource.
 
@@ -2267,7 +2274,8 @@ class PostgresDB:
             description: New description
             connection_url: New connection URL
             credentials: New credentials
-            read_only: New read_only flag
+            cli_hint: New CLI hint
+            default_branch: New default branch
 
         Returns:
             True if updated, False if not found
@@ -2301,10 +2309,15 @@ class PostgresDB:
             updates.append(f"credentials = ${param_count}")
             values.append(json.dumps(credentials))
 
-        if read_only is not None:
+        if cli_hint is not None:
             param_count += 1
-            updates.append(f"read_only = ${param_count}")
-            values.append(read_only)
+            updates.append(f"cli_hint = ${param_count}")
+            values.append(cli_hint)
+
+        if default_branch is not None:
+            param_count += 1
+            updates.append(f"default_branch = ${param_count}")
+            values.append(default_branch)
 
         if not updates:
             return False
@@ -2344,10 +2357,15 @@ class PostgresDB:
     async def resolve_datasources_for_job(
         self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
-        """Resolve datasources for a job (job > project > global).
+        """Resolve datasources for a job.
 
-        For each datasource type, returns the most specific one:
-        job-specific first, then project-level, then global.
+        Returns all applicable datasources: job-specific, then any linked
+        to the project via the project_datasources junction table, then
+        global ones. For each type, job-specific takes priority over
+        project-level which takes priority over global.
+
+        For project-linked datasources, includes the project-level
+        read_only setting which controls the access mode (CLI vs tools).
 
         Args:
             job_id: Job UUID
@@ -2367,14 +2385,21 @@ class PostgresDB:
             if project_uuid:
                 rows = await conn.fetch(
                     """
-                    SELECT DISTINCT ON (type)
-                        id, name, description, type, connection_url, credentials,
-                        read_only, job_id, project_id, created_at, updated_at
-                    FROM datasources
-                    WHERE job_id = $1 OR project_id = $2 OR (job_id IS NULL AND project_id IS NULL)
-                    ORDER BY type,
-                             CASE WHEN job_id IS NOT NULL THEN 0
-                                  WHEN project_id IS NOT NULL THEN 1
+                    SELECT DISTINCT ON (d.type)
+                        d.id, d.name, d.description, d.type, d.connection_url,
+                        d.credentials, d.job_id, d.project_id,
+                        d.cli_hint, d.default_branch,
+                        d.created_at, d.updated_at,
+                        pd.read_only AS project_read_only
+                    FROM datasources d
+                    LEFT JOIN project_datasources pd
+                        ON pd.datasource_id = d.id AND pd.project_id = $2
+                    WHERE d.job_id = $1
+                       OR pd.project_id IS NOT NULL
+                       OR (d.job_id IS NULL AND d.project_id IS NULL)
+                    ORDER BY d.type,
+                             CASE WHEN d.job_id IS NOT NULL THEN 0
+                                  WHEN pd.project_id IS NOT NULL THEN 1
                                   ELSE 2
                              END
                     """,
@@ -2386,7 +2411,9 @@ class PostgresDB:
                     """
                     SELECT DISTINCT ON (type)
                         id, name, description, type, connection_url, credentials,
-                        read_only, job_id, project_id, created_at, updated_at
+                        job_id, project_id, cli_hint, default_branch,
+                        created_at, updated_at,
+                        NULL::boolean AS project_read_only
                     FROM datasources
                     WHERE job_id = $1 OR job_id IS NULL
                     ORDER BY type, job_id NULLS LAST
@@ -2396,13 +2423,167 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
+    # -- Project ↔ Datasource junction (N:M) ----------------------------------
+
+    async def link_datasource_to_project(
+        self,
+        project_id: str,
+        datasource_id: str,
+        read_only: bool | None = None,
+        description: str | None = None,
+    ) -> bool:
+        """Link a datasource to a project with optional overrides.
+
+        Returns True if newly linked, False if already linked.
+        """
+        try:
+            p_uuid = UUID(project_id)
+            d_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                INSERT INTO project_datasources (project_id, datasource_id, read_only, description)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (project_id, datasource_id) DO UPDATE SET
+                    read_only = EXCLUDED.read_only,
+                    description = EXCLUDED.description
+                """,
+                p_uuid,
+                d_uuid,
+                read_only,
+                description,
+            )
+
+        return "INSERT" in result or "UPDATE" in result
+
+    async def unlink_datasource_from_project(
+        self, project_id: str, datasource_id: str
+    ) -> bool:
+        """Unlink a datasource from a project.
+
+        Returns True if unlinked, False if not found.
+        """
+        try:
+            p_uuid = UUID(project_id)
+            d_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM project_datasources WHERE project_id = $1 AND datasource_id = $2",
+                p_uuid,
+                d_uuid,
+            )
+
+        return result == "DELETE 1"
+
+    async def list_project_datasources(
+        self, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """List all datasources linked to a project.
+
+        Returns datasource details with project-level settings (read_only,
+        description override).
+        """
+        try:
+            p_uuid = UUID(project_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT d.id, d.name,
+                       COALESCE(pd.description, d.description) AS description,
+                       d.type, d.connection_url, d.credentials,
+                       d.cli_hint, d.default_branch,
+                       d.job_id, d.created_at, d.updated_at,
+                       pd.linked_at,
+                       pd.read_only AS project_read_only,
+                       pd.description AS project_description
+                FROM datasources d
+                JOIN project_datasources pd ON pd.datasource_id = d.id
+                WHERE pd.project_id = $1
+                ORDER BY pd.linked_at DESC
+                """,
+                p_uuid,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def update_project_datasource(
+        self,
+        project_id: str,
+        datasource_id: str,
+        read_only: bool | None = ...,
+        description: str | None = ...,
+    ) -> bool:
+        """Update project-level overrides for a linked datasource.
+
+        Pass None to clear an override (fall back to datasource default).
+        Uses sentinel default (...) so None is a valid value to set.
+        """
+        try:
+            p_uuid = UUID(project_id)
+            d_uuid = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        set_parts = []
+        values: list = [p_uuid, d_uuid]
+        idx = 3
+
+        if read_only is not ...:
+            set_parts.append(f"read_only = ${idx}")
+            values.append(read_only)
+            idx += 1
+
+        if description is not ...:
+            set_parts.append(f"description = ${idx}")
+            values.append(description)
+            idx += 1
+
+        if not set_parts:
+            return True
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                f"""
+                UPDATE project_datasources SET {', '.join(set_parts)}
+                WHERE project_id = $1 AND datasource_id = $2
+                """,
+                *values,
+            )
+
+        return result == "UPDATE 1"
+
+    async def list_datasource_projects(
+        self, datasource_id: str
+    ) -> List[str]:
+        """Return project IDs linked to a datasource."""
+        try:
+            d_uuid = UUID(datasource_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT project_id FROM project_datasources WHERE datasource_id = $1",
+                d_uuid,
+            )
+
+        return [str(row["project_id"]) for row in rows]
+
     async def upsert_default_datasource(
         self,
         name: str,
         ds_type: str,
         connection_url: str,
         credentials: Dict[str, Any] | None = None,
-        read_only: bool = True,
     ) -> Dict[str, Any]:
         """Create or update a global (job_id=NULL) datasource.
 
@@ -2413,7 +2594,6 @@ class PostgresDB:
             ds_type: Datasource type
             connection_url: Connection URL
             credentials: Additional auth details
-            read_only: Read-only flag
 
         Returns:
             Created or updated datasource dict
@@ -2423,22 +2603,21 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO datasources (name, type, connection_url, credentials, read_only, job_id, project_id)
-                VALUES ($1, $2, $3, $4, $5, NULL, NULL)
-                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'), COALESCE(project_id, '00000000-0000-0000-0000-000000000000'))
+                INSERT INTO datasources (name, type, connection_url, credentials, job_id, project_id)
+                VALUES ($1, $2, $3, $4, NULL, NULL)
+                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'))
+                WHERE project_id IS NULL
                 DO UPDATE SET
                     name = EXCLUDED.name,
                     connection_url = EXCLUDED.connection_url,
-                    credentials = EXCLUDED.credentials,
-                    read_only = EXCLUDED.read_only
+                    credentials = EXCLUDED.credentials
                 RETURNING id, name, description, type, connection_url, credentials,
-                          read_only, job_id, created_at, updated_at
+                          job_id, created_at, updated_at
                 """,
                 name,
                 ds_type,
                 connection_url,
                 creds_json,
-                read_only,
             )
 
         return dict(row)
@@ -2783,7 +2962,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, user_id, name, token_prefix, scope, origin,
+                SELECT id, user_id, name, token_prefix, scope,
                        expires_at, revoked_at, last_used_at, created_at
                 FROM mcp_tokens
                 WHERE user_id = $1

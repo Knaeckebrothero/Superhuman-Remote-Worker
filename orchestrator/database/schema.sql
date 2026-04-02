@@ -627,12 +627,11 @@ CREATE TABLE IF NOT EXISTS datasources (
     description TEXT,                      -- What this datasource contains (included in agent context)
 
     -- Connection details
-    type TEXT NOT NULL,                    -- 'postgresql', 'neo4j', 'mongodb'
-    connection_url TEXT NOT NULL,          -- Full connection string
-    credentials JSONB DEFAULT '{}',       -- Additional auth details beyond the URL
-
-    -- Access control
-    read_only BOOLEAN NOT NULL DEFAULT TRUE,
+    type TEXT NOT NULL,                    -- 'generic', 'repository', 'postgresql', 'neo4j', 'mongodb', 'webdav'
+    connection_url TEXT,                   -- Connection string (nullable for generic datasources using env vars only)
+    credentials JSONB DEFAULT '{}',       -- Auth details: env_vars dict (generic), auth_method+token/ssh_key (repository), type-specific (managed)
+    cli_hint TEXT,                         -- Suggested CLI command (e.g. "psql $DATABASE_URL")
+    default_branch TEXT,                   -- Default branch to clone (repository type only)
 
     -- Scope: NULL = global (available to all jobs), UUID = job-specific
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
@@ -649,17 +648,57 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_datasources_project_id ON datasources(project_id);
 
--- Three-level scope uniqueness: one datasource of each type per (job, project, global).
--- Drop old index if it exists, then create the new scope-aware one.
+-- Migration: Add cli_hint and default_branch columns
+DO $$ BEGIN
+    ALTER TABLE datasources ADD COLUMN cli_hint TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE datasources ADD COLUMN default_branch TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Make connection_url nullable
+ALTER TABLE datasources ALTER COLUMN connection_url DROP NOT NULL;
+
+-- Migration: Drop read_only from datasources (now project-level only via project_datasources)
+ALTER TABLE datasources DROP COLUMN IF EXISTS read_only;
+
+-- Job-scoped uniqueness: one datasource of each type per job (or one global per type).
+-- Project scoping is handled via the project_datasources junction table (N:M).
+DROP INDEX IF EXISTS uq_datasource_type_scope;
 DROP INDEX IF EXISTS uq_datasource_type_job;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_scope ON datasources (
+CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_job ON datasources (
     type,
-    COALESCE(job_id, '00000000-0000-0000-0000-000000000000'),
-    COALESCE(project_id, '00000000-0000-0000-0000-000000000000')
-);
+    COALESCE(job_id, '00000000-0000-0000-0000-000000000000')
+) WHERE project_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_datasources_type ON datasources(type);
 CREATE INDEX IF NOT EXISTS idx_datasources_job_id ON datasources(job_id);
+
+-- ============================================================================
+-- 3b. PROJECT ↔ DATASOURCE JUNCTION TABLE (N:M)
+-- A datasource can be shared across multiple projects.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS project_datasources (
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    datasource_id UUID NOT NULL REFERENCES datasources(id) ON DELETE CASCADE,
+    linked_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+    -- Project-level settings
+    read_only BOOLEAN,                     -- Managed connectors: TRUE = tools only (no CLI/env vars), FALSE/NULL = CLI mode
+    description TEXT,                      -- Project-specific usage context for the AI
+
+    PRIMARY KEY (project_id, datasource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_datasources_ds ON project_datasources(datasource_id);
+
+-- Migrate legacy datasources.project_id rows into junction table
+INSERT INTO project_datasources (project_id, datasource_id)
+SELECT project_id, id FROM datasources WHERE project_id IS NOT NULL
+ON CONFLICT DO NOTHING;
 
 -- ============================================================================
 -- 5. BUILDER TABLES (Instruction Builder Chat)

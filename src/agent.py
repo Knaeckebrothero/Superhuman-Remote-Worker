@@ -1063,7 +1063,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             logger.info(f"Pod handoff: cloning workspace for job {job_id}")
             git_mgr = GitManager.clone(
-                metadata["git_remote_url"], self._workspace_manager.path
+                metadata["git_remote_url"],
+                self._workspace_manager.path,
+                backend=self._workspace_manager.backend,
             )
             if git_mgr:
                 # Checkout the correct branch for project jobs
@@ -1480,7 +1482,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         Also creates datasource connections from job metadata (sent by orchestrator)
         and injects them into the ToolContext.
         """
-        # Create datasource connections from job metadata (sent by orchestrator)
+        # Process datasources from job metadata (sent by orchestrator)
         datasources_dict: Dict[str, Any] = {}
         ds_configs = (
             self._job_metadata.get("datasources", []) if self._job_metadata else []
@@ -1489,6 +1491,37 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             ds_type = ds.get("type")
             if not ds_type:
                 continue
+
+            # Generic datasources: inject env vars into process environment
+            if ds_type == "generic":
+                creds = ds.get("credentials") or {}
+                env_vars = creds.get("env_vars", {})
+                for key, value in env_vars.items():
+                    os.environ[key] = str(value)
+                logger.info(
+                    f"Injected {len(env_vars)} env vars for generic datasource: {ds.get('name', 'unnamed')}"
+                )
+                continue
+
+            # Repository datasources: clone repo and configure git credentials
+            if ds_type == "repository":
+                try:
+                    self._setup_repository_datasource(ds)
+                except Exception as e:
+                    logger.warning(f"Failed to setup repository datasource: {e}")
+                continue
+
+            # Managed connectors: connect via typed drivers (for read-only tools)
+            # In read-write mode, inject env vars instead (no tool connection needed)
+            is_read_only = ds.get("project_read_only", False)
+            if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
+                # Read-write: inject env vars for CLI access, skip tool connection
+                self._inject_typed_env_vars(ds_type, ds)
+                logger.info(
+                    f"Injected env vars for {ds_type} CLI access: {ds.get('name', 'unnamed')}"
+                )
+                continue
+
             try:
                 conn = self._create_datasource_connection(ds)
                 datasources_dict[ds_type] = conn
@@ -1498,6 +1531,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 )
             except Exception as e:
                 logger.warning(f"Failed to connect to {ds_type} datasource: {e}")
+
+        # Inject datasource index into workspace.md for agent discovery
+        if ds_configs:
+            self._inject_datasource_index(ds_configs)
 
         # Create tool context with dependencies
         # Merge agent_id and LLM settings into config for tools
@@ -1942,6 +1979,145 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 except Exception:
                     pass
 
+    def _inject_datasource_index(self, ds_configs: list) -> None:
+        """Inject a compact datasource index into workspace.md.
+
+        This ensures the agent always knows what datasources are available,
+        even before KB retrieval fires. Full details are in the knowledge base.
+        """
+        lines = ["\n\n## Available Datasources\n"]
+        for ds in ds_configs:
+            ds_type = ds.get("type", "unknown")
+            name = ds.get("name", "Unnamed")
+            is_ro = ds.get("project_read_only", False)
+
+            if ds_type == "generic":
+                cli = ds.get("cli_hint", "CLI via env vars")
+                lines.append(f"- **{name}** (generic) — {cli}")
+            elif ds_type == "repository":
+                import re
+                slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+                lines.append(f"- **{name}** (repository) — cloned at `./repos/{slug}/`")
+            elif ds_type == "webdav":
+                access = "read-only tools" if is_ro else "read-write tools"
+                lines.append(f"- **{name}** (webdav, {access})")
+            elif ds_type in ("postgresql", "neo4j", "mongodb"):
+                if is_ro:
+                    lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
+                else:
+                    cli_map = {"postgresql": "psql", "neo4j": "cypher-shell", "mongodb": "mongosh"}
+                    lines.append(f"- **{name}** ({ds_type}, read-write) — `{cli_map.get(ds_type)}` via env vars")
+            else:
+                lines.append(f"- **{name}** ({ds_type})")
+
+        try:
+            existing = self._workspace_manager.read_file("workspace.md")
+            self._workspace_manager.write_file("workspace.md", existing + "\n".join(lines))
+            logger.info(f"Injected datasource index ({len(ds_configs)} entries) into workspace.md")
+        except Exception as e:
+            logger.warning(f"Failed to inject datasource index: {e}")
+
+    def _setup_repository_datasource(self, ds: Dict[str, Any]) -> None:
+        """Clone a repository into the workspace and configure git credentials.
+
+        The agent never sees raw tokens/SSH keys — credentials are
+        configured transparently via git credential helpers or SSH config.
+        """
+        import re
+        import subprocess
+
+        repo_url = ds.get("connection_url", "")
+        creds = ds.get("credentials") or {}
+        name = re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+        branch = ds.get("default_branch")
+
+        # Determine workspace path
+        ws = self._workspace_manager
+        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
+        repos_dir = os.path.join(workspace_dir, "repos")
+        os.makedirs(repos_dir, exist_ok=True)
+        clone_path = os.path.join(repos_dir, name)
+
+        if os.path.exists(clone_path):
+            logger.info(f"Repository already exists at {clone_path}, skipping clone")
+            return
+
+        auth_method = creds.get("auth_method", "token")
+
+        if auth_method == "ssh":
+            # Write SSH key and configure
+            ssh_dir = os.path.expanduser("~/.ssh")
+            os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+            key_file = os.path.join(ssh_dir, f"repo_{name}")
+            with open(key_file, "w") as f:
+                f.write(creds.get("ssh_key", ""))
+            os.chmod(key_file, 0o600)
+
+            # Parse host from SSH URL
+            from urllib.parse import urlparse
+            parsed = urlparse(repo_url)
+            host = parsed.hostname or "github.com"
+
+            config_path = os.path.join(ssh_dir, "config")
+            with open(config_path, "a") as f:
+                f.write(f"\nHost {host}\n  IdentityFile {key_file}\n  StrictHostKeyChecking accept-new\n")
+
+        elif auth_method == "token" and creds.get("token"):
+            # Configure git credential helper
+            cred_file = os.path.expanduser("~/.git-credentials")
+            from urllib.parse import urlparse
+            parsed = urlparse(repo_url)
+            host = parsed.hostname or "github.com"
+            scheme = parsed.scheme or "https"
+            cred_line = f"{scheme}://oauth2:{creds['token']}@{host}"
+            with open(cred_file, "a") as f:
+                f.write(cred_line + "\n")
+            os.chmod(cred_file, 0o600)
+            subprocess.run(
+                ["git", "config", "--global", "credential.helper", "store"],
+                check=False, capture_output=True,
+            )
+
+        # Clone
+        cmd = ["git", "clone", repo_url, clone_path]
+        if branch:
+            cmd.extend(["--branch", branch])
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            logger.warning(f"Git clone failed: {result.stderr}")
+            raise RuntimeError(f"Failed to clone repository: {result.stderr}")
+        logger.info(f"Cloned repository to {clone_path}")
+
+    def _inject_typed_env_vars(self, ds_type: str, ds: Dict[str, Any]) -> None:
+        """Inject well-known environment variables for managed connector CLI access."""
+        url = ds.get("connection_url", "")
+        creds = ds.get("credentials") or {}
+
+        if ds_type == "postgresql":
+            # Parse connection URL into PG* env vars
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.hostname:
+                os.environ["PGHOST"] = parsed.hostname
+            if parsed.port:
+                os.environ["PGPORT"] = str(parsed.port)
+            if parsed.username:
+                os.environ["PGUSER"] = parsed.username
+            password = parsed.password or creds.get("password", "")
+            if password:
+                os.environ["PGPASSWORD"] = password
+            db_name = parsed.path.lstrip("/").split("?")[0]
+            if db_name:
+                os.environ["PGDATABASE"] = db_name
+
+        elif ds_type == "neo4j":
+            os.environ["NEO4J_URI"] = url
+            os.environ["NEO4J_USERNAME"] = creds.get("username", "neo4j")
+            os.environ["NEO4J_PASSWORD"] = creds.get("password", "")
+
+        elif ds_type == "mongodb":
+            os.environ["MONGOSH_URI"] = url
+
     def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
         """Create a connection to an external datasource.
 
@@ -1956,7 +2132,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             ValueError: If datasource type is unknown
         """
         ds_type = ds["type"]
-        url = ds["connection_url"]
+        url = ds.get("connection_url") or ""
         creds = ds.get("credentials") or {}
 
         if ds_type == "neo4j":

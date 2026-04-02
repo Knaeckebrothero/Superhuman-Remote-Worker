@@ -18,8 +18,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from .persistent_session import PersistentSession
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
+from .persistent_session import PersistentSession
 from ..agent import UniversalAgent
 from ..persistent_graph import (
     APPROVE_SENTINEL,
@@ -422,6 +422,21 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 },
             )
 
+            # Notify frontend of file checkpoint availability after writes
+            if tool_name in ("write_file", "edit_file"):
+                await _ws_send(ws, "file.checkpoint", {
+                    "turn_id": _session.turn_count,
+                })
+
+            # Broadcast task state after task tool calls
+            if (
+                tool_name in ("task_add", "task_complete", "task_list")
+                and _session.session_task_manager
+            ):
+                await _ws_send(ws, "tasks.updated", {
+                    "tasks": _session.session_task_manager.to_dict_list(),
+                })
+
         async def permission_check(tool_name: str, tool_args: Dict[str, Any]) -> bool:
             mode = _session.permission_mode
 
@@ -489,6 +504,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 except asyncio.TimeoutError:
                     logger.warning("AI message save timed out (5s) — proceeding")
 
+            # Auto-generate title after first turn (fire-and-forget)
+            if turn_id == 1 and _session.postgres_conn:
+                asyncio.create_task(_auto_title_after_first_turn(ws))
+
         async def on_error(message: str) -> None:
             await _ws_send(ws, "error", {"message": message})
 
@@ -534,6 +553,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 project_ids=_session.project_ids,
                 tool_context=_session.tool_context,
                 initial_turn_count=_session.turn_count,
+                get_current_tools=lambda: (_session.llm_with_tools, _session.tools),
             )
         )
 
@@ -589,6 +609,20 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 elif method == "upgrade-to-vm":
                     # Upgrade workspace from container to VM
                     asyncio.create_task(_handle_vm_upgrade(ws))
+
+                elif method == "undo":
+                    turn_id = data.get("turn_id")
+                    restored = _session.undo_turn(turn_id)
+                    if restored:
+                        await _ws_send(ws, "files.restored", {
+                            "paths": restored,
+                            "turn_id": turn_id,
+                        })
+                    else:
+                        await _ws_send(
+                            ws, "error",
+                            {"message": "No checkpoints available to undo"},
+                        )
 
                 else:
                     await _ws_send(
@@ -862,7 +896,8 @@ async def _handle_archive(ws: WebSocket) -> None:
         if _session.postgres_conn:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
-                if thread and thread.get("title") in (None, "Untitled Session", ""):
+                current = thread.get("title", "") if thread else ""
+                if not current or current.startswith("Local Session") or current == "Untitled Session":
                     title = await _generate_title(
                         _session.messages, _session.auxiliary_llm
                     )
@@ -936,11 +971,8 @@ async def _handle_idle_archive() -> None:
         if _session.postgres_conn:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
-                if thread and thread.get("title") in (
-                    None,
-                    "Untitled Session",
-                    "",
-                ):
+                current = thread.get("title", "") if thread else ""
+                if not current or current.startswith("Local Session") or current == "Untitled Session":
                     title = await _generate_title(
                         _session.messages, _session.auxiliary_llm
                     )
@@ -1172,3 +1204,28 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
     except Exception as e:
         logger.warning(f"Title generation error: {e}")
         return None
+
+
+async def _auto_title_after_first_turn(ws: WebSocket) -> None:
+    """Generate and push a title after the first assistant turn (fire-and-forget)."""
+    try:
+        if not _session or not _session.postgres_conn or not _thread_id:
+            return
+        # Check current title is still a default placeholder
+        thread = await _session.postgres_conn.get_thread(_thread_id)
+        current = thread.get("title", "") if thread else ""
+        if current and not current.startswith("Local Session") and current != "Untitled Session":
+            return  # already has a real title
+        title = await _generate_title(_session.messages, _session.auxiliary_llm)
+        if not title:
+            return
+        async with _session.postgres_conn.acquire() as conn:
+            await conn.execute(
+                "UPDATE threads SET title = $2 WHERE id = $1",
+                _thread_id,
+                title,
+            )
+        await _ws_send(ws, "title.updated", {"title": title})
+        logger.info(f"Auto-titled thread {_thread_id}: {title}")
+    except Exception as e:
+        logger.warning(f"Auto-title generation failed (non-fatal): {e}")

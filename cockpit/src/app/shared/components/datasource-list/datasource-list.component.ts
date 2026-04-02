@@ -1,12 +1,12 @@
-import { Component, inject, signal, computed, OnInit } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { ApiService } from '../../../core/services/api.service';
+import {Component, computed, inject, OnInit, signal} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {ApiService} from '../../../core/services/api.service';
 import {
-  Datasource,
-  DatasourceType,
-  DatasourceCreateRequest,
-  DatasourceUpdateRequest,
-  DatasourceTestResult,
+    Datasource,
+    DatasourceCreateRequest,
+    DatasourceTestResult,
+    DatasourceType,
+    DatasourceUpdateRequest,
 } from '../../../core/models/api.model';
 
 /**
@@ -85,35 +85,170 @@ import {
                   [disabled]="isSaving() || !!editingId()"
                   (ngModelChange)="onTypeChange()"
                 >
-                  <option value="postgresql">PostgreSQL</option>
-                  <option value="neo4j">Neo4j</option>
-                  <option value="mongodb">MongoDB</option>
-                  <option value="webdav">WebDAV</option>
+                  <optgroup label="CLI-based (standard CLI tools)">
+                    <option value="generic">Generic</option>
+                    <option value="repository">Repository</option>
+                  </optgroup>
+                  <optgroup label="Managed connectors (read-only enforcement)">
+                    <option value="postgresql">PostgreSQL</option>
+                    <option value="neo4j">Neo4j</option>
+                    <option value="mongodb">MongoDB</option>
+                    <option value="webdav">WebDAV</option>
+                  </optgroup>
                 </select>
               </div>
             </div>
 
-            <div class="form-group">
-              <label class="form-label">Connection URL <span class="required">*</span></label>
-              <input
-                class="form-input mono"
-                [(ngModel)]="formData.connection_url"
-                [placeholder]="urlPlaceholder()"
-                [disabled]="isSaving()"
-              >
-            </div>
+            <!-- Connection URL (required for non-generic types) -->
+            @if (formData.type !== 'generic') {
+              <div class="form-group">
+                <label class="form-label">
+                  {{ formData.type === 'repository' ? 'Repository URL' : 'Connection URL' }}
+                  <span class="required">*</span>
+                </label>
+                <input
+                  class="form-input mono"
+                  [(ngModel)]="formData.connection_url"
+                  [placeholder]="urlPlaceholder()"
+                  [disabled]="isSaving()"
+                >
+              </div>
+            }
+
+            <!-- Generic: optional connection URL -->
+            @if (formData.type === 'generic') {
+              <div class="form-group">
+                <label class="form-label">Connection URL <span class="hint-inline">(optional)</span></label>
+                <input
+                  class="form-input mono"
+                  [(ngModel)]="formData.connection_url"
+                  placeholder="e.g. postgresql://host:5432/db or https://api.example.com"
+                  [disabled]="isSaving()"
+                >
+              </div>
+            }
 
             <div class="form-group">
-              <label class="form-label">Description</label>
+              <label class="form-label">
+                Description
+                @if (formData.type === 'generic') { <span class="required">*</span> }
+              </label>
               <textarea
                 class="form-textarea"
                 [(ngModel)]="formData.description"
-                placeholder="What this datasource contains (included in agent context)"
-                rows="2"
+                [placeholder]="formData.type === 'generic' ? 'Describe this resource for the AI — what it is, how to use it, what data it contains' : 'What this datasource contains (included in agent context)'"
+                [rows]="formData.type === 'generic' ? 3 : 2"
                 [disabled]="isSaving()"
               ></textarea>
             </div>
 
+            <!-- Generic: CLI hint -->
+            @if (formData.type === 'generic') {
+              <div class="form-group">
+                <label class="form-label">CLI Hint <span class="hint-inline">(optional)</span></label>
+                <input
+                  class="form-input mono"
+                  [(ngModel)]="formData.cli_hint"
+                  placeholder="e.g. psql $DATABASE_URL"
+                  [disabled]="isSaving()"
+                >
+              </div>
+            }
+
+            <!-- Generic: Environment Variables -->
+            @if (formData.type === 'generic') {
+              <div class="form-group">
+                <label class="form-label">Environment Variables</label>
+                <div class="env-vars-editor">
+                  @for (envVar of envVars; track $index) {
+                    <div class="env-var-row">
+                      <input
+                        class="form-input mono env-key"
+                        [(ngModel)]="envVar.key"
+                        placeholder="ENV_VAR_NAME"
+                        [disabled]="isSaving()"
+                      >
+                      <span class="env-eq">=</span>
+                      <input
+                        class="form-input mono env-val"
+                        type="password"
+                        [(ngModel)]="envVar.value"
+                        placeholder="value"
+                        [disabled]="isSaving()"
+                      >
+                      <button class="icon-btn delete" (click)="removeEnvVar($index)" [disabled]="isSaving()" title="Remove">
+                        <span class="mat-icon">close</span>
+                      </button>
+                    </div>
+                  }
+                  <button class="btn btn-add-env" (click)="addEnvVar()" [disabled]="isSaving()">
+                    <span class="mat-icon">add</span> Add variable
+                  </button>
+                </div>
+                <div class="form-hint">
+                  Credentials are injected as environment variables into the agent workspace.
+                  Read-only access cannot be enforced — use a database account with restricted permissions if needed.
+                </div>
+              </div>
+            }
+
+            <!-- Repository: default branch -->
+            @if (formData.type === 'repository') {
+              <div class="form-group">
+                <label class="form-label">Default Branch <span class="hint-inline">(optional)</span></label>
+                <input
+                  class="form-input"
+                  [(ngModel)]="formData.default_branch"
+                  placeholder="main"
+                  [disabled]="isSaving()"
+                >
+              </div>
+            }
+
+            <!-- Repository: auth method -->
+            @if (formData.type === 'repository') {
+              <div class="form-group">
+                <label class="form-label">Auth Method <span class="required">*</span></label>
+                <select
+                  class="form-input form-select"
+                  [(ngModel)]="gitAuthMethod"
+                  [disabled]="isSaving()"
+                >
+                  <option value="token">HTTPS Token</option>
+                  <option value="ssh">SSH Key</option>
+                </select>
+              </div>
+              @if (gitAuthMethod === 'token') {
+                <div class="form-group">
+                  <label class="form-label">Access Token</label>
+                  <input
+                    class="form-input mono"
+                    type="password"
+                    [(ngModel)]="formCredentials.password"
+                    placeholder="ghp_xxxx or personal access token"
+                    [disabled]="isSaving()"
+                  >
+                </div>
+              }
+              @if (gitAuthMethod === 'ssh') {
+                <div class="form-group">
+                  <label class="form-label">SSH Private Key</label>
+                  <textarea
+                    class="form-textarea mono"
+                    [(ngModel)]="gitSshKey"
+                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+                    rows="5"
+                    [disabled]="isSaving()"
+                  ></textarea>
+                </div>
+              }
+              <div class="form-hint">
+                The repository will be cloned into the workspace and git credentials configured automatically.
+                The agent uses standard git commands — no credential setup required.
+              </div>
+            }
+
+            <!-- Managed connectors: credentials -->
             @if (formData.type === 'neo4j' || formData.type === 'webdav') {
               <div class="form-row">
                 <div class="form-group flex-1">
@@ -139,31 +274,25 @@ import {
             }
 
             <div class="form-row form-footer">
-              <label class="toggle-label">
-                <input
-                  type="checkbox"
-                  [(ngModel)]="formData.read_only"
-                  [disabled]="isSaving()"
-                >
-                <span>Read Only</span>
-              </label>
               <div class="form-actions">
-                <button
-                  class="btn btn-test"
-                  (click)="testFromForm()"
-                  [disabled]="!formData.connection_url || isTesting()"
-                >
-                  @if (isTesting()) {
-                    <span class="spinner-small"></span> Testing...
-                  } @else {
-                    <span class="mat-icon">cable</span> Test
-                  }
-                </button>
+                @if (formData.type !== 'generic' && formData.type !== 'repository') {
+                  <button
+                    class="btn btn-test"
+                    (click)="testFromForm()"
+                    [disabled]="!formData.connection_url || isTesting()"
+                  >
+                    @if (isTesting()) {
+                      <span class="spinner-small"></span> Testing...
+                    } @else {
+                      <span class="mat-icon">cable</span> Test
+                    }
+                  </button>
+                }
                 <button class="btn btn-secondary" (click)="closeForm()" [disabled]="isSaving()">Cancel</button>
                 <button
                   class="btn btn-primary"
                   (click)="saveForm()"
-                  [disabled]="!formData.name || !formData.connection_url || isSaving()"
+                  [disabled]="!canSave() || isSaving()"
                 >
                   @if (isSaving()) {
                     <span class="spinner-small"></span> Saving...
@@ -214,7 +343,6 @@ import {
                 <th>Type</th>
                 <th>Name</th>
                 <th>URL</th>
-                <th>Read Only</th>
                 <th>Scope</th>
                 <th>Actions</th>
               </tr>
@@ -234,12 +362,7 @@ import {
                       <span class="ds-desc">{{ ds.description }}</span>
                     }
                   </td>
-                  <td class="url-cell mono">{{ maskUrl(ds.connection_url) }}</td>
-                  <td>
-                    <span class="ro-badge" [class.ro-true]="ds.read_only" [class.ro-false]="!ds.read_only">
-                      {{ ds.read_only ? 'Yes' : 'No' }}
-                    </span>
-                  </td>
+                  <td class="url-cell mono">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
                   <td>
                     <span class="scope-badge" [class.scope-global]="!ds.job_id" [class.scope-job]="!!ds.job_id">
                       {{ ds.job_id ? 'Job' : 'Global' }}
@@ -539,8 +662,72 @@ import {
 
       .form-footer {
         align-items: center;
-        justify-content: space-between;
+        justify-content: flex-end;
         margin-bottom: 0;
+      }
+
+      .hint-inline {
+        font-weight: 400;
+        color: var(--text-muted, #6c7086);
+        font-size: 11px;
+      }
+
+      .form-hint {
+        margin-top: 6px;
+        padding: 8px 10px;
+        background: rgba(137, 180, 250, 0.08);
+        border: 1px solid rgba(137, 180, 250, 0.15);
+        border-radius: 4px;
+        font-size: 11px;
+        color: var(--text-secondary, #a6adc8);
+        line-height: 1.5;
+      }
+
+      /* Env var editor */
+      .env-vars-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .env-var-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .env-key {
+        flex: 0 0 200px;
+        text-transform: uppercase;
+      }
+
+      .env-eq {
+        color: var(--text-muted, #6c7086);
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+      }
+
+      .env-val {
+        flex: 1;
+      }
+
+      .btn-add-env {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 10px;
+        border: 1px dashed var(--border-color, #45475a);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--text-secondary, #a6adc8);
+        font-size: 11px;
+        cursor: pointer;
+        align-self: flex-start;
+      }
+
+      .btn-add-env:hover:not(:disabled) {
+        background: var(--surface-0, #313244);
+        color: var(--text-primary, #cdd6f4);
       }
 
       .toggle-label {
@@ -753,6 +940,16 @@ import {
         color: #fab387;
       }
 
+      .type-generic {
+        background: rgba(203, 166, 247, 0.2);
+        color: #cba6f7;
+      }
+
+      .type-repository {
+        background: rgba(137, 180, 250, 0.2);
+        color: #89b4fa;
+      }
+
       /* Name cell */
       .name-cell {
         max-width: 200px;
@@ -886,9 +1083,12 @@ export class DatasourceListComponent implements OnInit {
   // Filter options
   readonly typeFilters = [
     { label: 'All', value: 'all' },
+    { label: 'Generic', value: 'generic' },
+    { label: 'Repository', value: 'repository' },
     { label: 'PostgreSQL', value: 'postgresql' },
     { label: 'Neo4j', value: 'neo4j' },
     { label: 'MongoDB', value: 'mongodb' },
+    { label: 'WebDAV', value: 'webdav' },
   ];
 
   // Computed filtered list
@@ -902,6 +1102,8 @@ export class DatasourceListComponent implements OnInit {
   // URL placeholder based on type
   readonly urlPlaceholder = computed(() => {
     const placeholders: Record<string, string> = {
+      generic: 'e.g. postgresql://host:5432/db or https://api.example.com',
+      repository: 'https://github.com/org/repo.git',
       postgresql: 'postgres://user:pass@host:5432/dbname',
       neo4j: 'bolt://host:7687',
       mongodb: 'mongodb://user:pass@host:27017/dbname',
@@ -910,25 +1112,45 @@ export class DatasourceListComponent implements OnInit {
     return placeholders[this.formData.type] || '';
   });
 
+  // Whether the form can be saved
+  readonly canSave = computed(() => {
+    if (!this.formData.name) return false;
+    if (this.formData.type === 'generic') {
+      // Generic needs either env vars or a connection URL
+      return !!(this.formData.description);
+    }
+    // All other types need a connection URL
+    return !!this.formData.connection_url;
+  });
+
   // Form data (mutable object, not a signal, matching job-create pattern)
   formData: {
     name: string;
     type: DatasourceType;
     connection_url: string;
     description: string;
-    read_only: boolean;
+    cli_hint: string;
+    default_branch: string;
   } = {
     name: '',
-    type: 'postgresql',
+    type: 'generic',
     connection_url: '',
     description: '',
-    read_only: true,
+    cli_hint: '',
+    default_branch: '',
   };
 
   formCredentials: { username: string; password: string } = {
     username: '',
     password: '',
   };
+
+  // Repository auth form state
+  gitAuthMethod: 'token' | 'ssh' = 'token';
+  gitSshKey = '';
+
+  // Generic env var editor
+  envVars: { key: string; value: string }[] = [];
 
   ngOnInit(): void {
     this.refresh();
@@ -955,15 +1177,31 @@ export class DatasourceListComponent implements OnInit {
     this.formData = {
       name: ds.name,
       type: ds.type,
-      connection_url: ds.connection_url,
+      connection_url: ds.connection_url || '',
       description: ds.description || '',
-      read_only: ds.read_only,
+      cli_hint: ds.cli_hint || '',
+      default_branch: ds.default_branch || '',
     };
     const creds = ds.credentials || {};
     this.formCredentials = {
       username: (creds['username'] as string) || '',
-      password: (creds['password'] as string) || '',
+      password: (creds['password'] as string) || (creds['token'] as string) || '',
     };
+    // Populate repository auth fields
+    if (ds.type === 'repository') {
+      this.gitAuthMethod = (creds['auth_method'] as 'token' | 'ssh') || 'token';
+      this.gitSshKey = (creds['ssh_key'] as string) || '';
+    } else {
+      this.gitAuthMethod = 'token';
+      this.gitSshKey = '';
+    }
+    // Populate generic env vars
+    if (ds.type === 'generic') {
+      const envVarsObj = (creds['env_vars'] as Record<string, string>) || {};
+      this.envVars = Object.entries(envVarsObj).map(([key, value]) => ({ key, value }));
+    } else {
+      this.envVars = [];
+    }
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -982,24 +1220,23 @@ export class DatasourceListComponent implements OnInit {
   }
 
   saveForm(): void {
-    if (!this.formData.name || !this.formData.connection_url) return;
+    if (!this.formData.name) return;
 
     this.isSaving.set(true);
     this.clearMessages();
 
     const editId = this.editingId();
+    const creds = this.buildCredentials();
 
     if (editId) {
-      // Update
       const update: DatasourceUpdateRequest = {
         name: this.formData.name,
         description: this.formData.description || undefined,
-        connection_url: this.formData.connection_url,
-        read_only: this.formData.read_only,
+        connection_url: this.formData.connection_url || undefined,
+        credentials: creds,
+        cli_hint: this.formData.cli_hint || undefined,
+        default_branch: this.formData.default_branch || undefined,
       };
-      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
-        update.credentials = this.buildCredentials();
-      }
 
       this.api.updateDatasource(editId, update).subscribe({
         next: (result) => {
@@ -1018,17 +1255,15 @@ export class DatasourceListComponent implements OnInit {
         },
       });
     } else {
-      // Create
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
         type: this.formData.type,
-        connection_url: this.formData.connection_url,
+        connection_url: this.formData.connection_url || undefined,
         description: this.formData.description || undefined,
-        read_only: this.formData.read_only,
+        credentials: creds,
+        cli_hint: this.formData.cli_hint || undefined,
+        default_branch: this.formData.default_branch || undefined,
       };
-      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
-        create.credentials = this.buildCredentials();
-      }
 
       this.api.createDatasource(create).subscribe({
         next: (result) => {
@@ -1074,13 +1309,10 @@ export class DatasourceListComponent implements OnInit {
       const create: DatasourceCreateRequest = {
         name: this.formData.name,
         type: this.formData.type,
-        connection_url: this.formData.connection_url,
+        connection_url: this.formData.connection_url || undefined,
         description: this.formData.description || undefined,
-        read_only: this.formData.read_only,
+        credentials: this.buildCredentials(),
       };
-      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
-        create.credentials = this.buildCredentials();
-      }
 
       this.api.createDatasource(create).subscribe({
         next: (created) => {
@@ -1162,6 +1394,8 @@ export class DatasourceListComponent implements OnInit {
 
   getTypeIcon(type: DatasourceType | string): string {
     const icons: Record<string, string> = {
+      generic: 'settings_input_component',
+      repository: 'code',
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',
@@ -1172,14 +1406,41 @@ export class DatasourceListComponent implements OnInit {
 
   maskUrl(url: string): string {
     try {
-      // Mask password in URLs like postgres://user:pass@host/db
       return url.replace(/:([^/:@]+)@/, ':***@');
     } catch {
       return url;
     }
   }
 
+  // Env var editor methods
+  addEnvVar(): void {
+    this.envVars.push({ key: '', value: '' });
+  }
+
+  removeEnvVar(index: number): void {
+    this.envVars.splice(index, 1);
+  }
+
   private buildCredentials(): Record<string, unknown> | undefined {
+    if (this.formData.type === 'generic') {
+      const envVarsObj: Record<string, string> = {};
+      for (const ev of this.envVars) {
+        if (ev.key.trim()) {
+          envVarsObj[ev.key.trim()] = ev.value;
+        }
+      }
+      if (Object.keys(envVarsObj).length === 0) return undefined;
+      return { env_vars: envVarsObj };
+    }
+    if (this.formData.type === 'repository') {
+      if (this.gitAuthMethod === 'ssh') {
+        if (!this.gitSshKey) return undefined;
+        return { auth_method: 'ssh', ssh_key: this.gitSshKey };
+      } else {
+        if (!this.formCredentials.password) return undefined;
+        return { auth_method: 'token', token: this.formCredentials.password };
+      }
+    }
     if (!this.formCredentials.username && !this.formCredentials.password) return undefined;
     return {
       username: this.formCredentials.username || undefined,
@@ -1190,12 +1451,16 @@ export class DatasourceListComponent implements OnInit {
   private resetFormData(): void {
     this.formData = {
       name: '',
-      type: 'postgresql',
+      type: 'generic',
       connection_url: '',
       description: '',
-      read_only: true,
+      cli_hint: '',
+      default_branch: '',
     };
     this.formCredentials = { username: '', password: '' };
+    this.gitAuthMethod = 'token';
+    this.gitSshKey = '';
+    this.envVars = [];
   }
 
   private clearMessages(): void {

@@ -1,14 +1,14 @@
-import { Component, inject, signal, computed } from '@angular/core';
-import { Router, RouterLink, RouterLinkActive, NavigationEnd } from '@angular/router';
-import { toSignal } from '@angular/core/rxjs-interop';
-import { filter, map } from 'rxjs';
-import { UserService } from '../../core/services/user.service';
-import { SidebarService } from '../../core/services/sidebar.service';
-import { LayoutService } from '../../debug/services/layout.service';
-import { LayoutPickerComponent } from '../../debug/components/layout-picker/layout-picker.component';
-import { NotificationBellComponent } from '../../shared/components/notification-bell/notification-bell.component';
+import {Component, computed, inject, signal} from '@angular/core';
+import {NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
+import {toSignal} from '@angular/core/rxjs-interop';
+import {filter, map} from 'rxjs';
+import {UserService} from '../../core/services/user.service';
+import {SidebarService} from '../../core/services/sidebar.service';
+import {LayoutService} from '../../debug/services/layout.service';
+import {LayoutPickerComponent} from '../../debug/components/layout-picker/layout-picker.component';
+import {NotificationBellComponent} from '../../shared/components/notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
-import { environment } from '../../core/environment';
+import {environment} from '../../core/environment';
 
 @Component({
   selector: 'app-sidebar',
@@ -58,6 +58,14 @@ import { environment } from '../../core/environment';
           >
             <span class="nav-icon">folder_shared</span>
             Projects
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/datasources"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">database</span>
+            Data Sources
           </a>
           <a
             class="nav-link"
@@ -417,14 +425,8 @@ export class SidebarComponent {
   private readonly router = inject(Router);
     private readonly chatService = inject(PersistentChatService);
 
-    /** Dynamic sessions link — goes to active session if connected, otherwise to list. */
-    readonly sessionsLink = computed(() => {
-        const threadId = this.chatService.threadId();
-        if (this.chatService.isConnected() && threadId) {
-            return threadId === 'local' ? '/sessions/direct' : `/sessions/${threadId}`;
-        }
-        return '/sessions';
-    });
+    /** Sessions link — always goes to the session list. */
+    readonly sessionsLink = computed(() => '/sessions');
 
   private readonly currentUrl = toSignal(
     this.router.events.pipe(

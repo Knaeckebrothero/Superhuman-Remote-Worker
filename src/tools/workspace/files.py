@@ -17,8 +17,8 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from ..context import ToolContext
 from src.utils.pdf import PDFReader, format_read_info
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -816,6 +816,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Read the file first, then call write_file again."
                 )
 
+            # Snapshot for undo before writing
+            if context._snapshot_callback:
+                context._snapshot_callback(path)
+
             workspace.write_file(path, content)
             size = len(content.encode("utf-8"))
 
@@ -893,6 +897,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 )
 
             content = workspace.read_file(path)
+
+            # Snapshot for undo before editing
+            if context._snapshot_callback:
+                context._snapshot_callback(path)
 
             # Position-based insert modes
             if position == "end":

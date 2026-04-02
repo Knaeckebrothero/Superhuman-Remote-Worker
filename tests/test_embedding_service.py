@@ -9,6 +9,10 @@ import pytest
 def mock_env(monkeypatch):
     """Set up environment variables for testing."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-123")
+    monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("EMBEDDING_BASE_URL", raising=False)
+    monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+    monkeypatch.delenv("EMBEDDING_PROVIDER", raising=False)
 
 
 @pytest.fixture

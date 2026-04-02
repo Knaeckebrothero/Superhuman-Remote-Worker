@@ -25,6 +25,7 @@ import {
     MemoryStats,
     Project,
     ProjectCreateRequest,
+    ProjectDatasource,
     ProjectMember,
     ProjectMemberAddRequest,
     ProjectMemberUpdateRequest,
@@ -598,6 +599,60 @@ export class ApiService {
       catchError((error) => {
         console.error(`Failed to fetch datasources for job ${jobId}:`, error);
         return of([]);
+      }),
+    );
+  }
+
+  // ===== Project Datasources (N:M) =====
+
+  /**
+   * List datasources linked to a project.
+   */
+  getProjectDatasources(projectId: string): Observable<ProjectDatasource[]> {
+    return this.http.get<ProjectDatasource[]>(`${this.baseUrl}/projects/${projectId}/datasources`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch project datasources:`, error);
+        return of([]);
+      }),
+    );
+  }
+
+  /**
+   * Link a datasource to a project.
+   */
+  linkProjectDatasource(projectId: string, datasourceId: string): Observable<{ status: string } | null> {
+    return this.http.post<{ status: string }>(`${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`, {}).pipe(
+      catchError((error) => {
+        console.error(`Failed to link datasource:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Update project-level settings for a linked datasource.
+   */
+  updateProjectDatasource(
+    projectId: string,
+    datasourceId: string,
+    body: { read_only?: boolean | null; description?: string | null },
+  ): Observable<{ status: string } | null> {
+    return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`, body).pipe(
+      catchError((error) => {
+        console.error(`Failed to update project datasource:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Unlink a datasource from a project.
+   */
+  unlinkProjectDatasource(projectId: string, datasourceId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/projects/${projectId}/datasources/${datasourceId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to unlink datasource:`, error);
+        return of(null);
       }),
     );
   }
