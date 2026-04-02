@@ -6,6 +6,7 @@ import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ToastService} from '../../../core/services/toast.service';
+import {UserService} from '../../../core/services/user.service';
 
 /**
  * Create a SessionsPageComponent in a minimal injection context.
@@ -33,12 +34,22 @@ function createComponent() {
         dismiss: vi.fn(),
     };
 
+    const mockUserService: any = {
+        currentUserId: () => null,
+        currentUser: () => null,
+        users: () => [],
+        isAuthenticated: () => false,
+        isApproved: () => false,
+        sessionReady: () => true,
+    };
+
     const injector = Injector.create({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
             {provide: Router, useValue: mockRouter},
             {provide: PersistentChatService, useValue: mockChat},
             {provide: ToastService, useValue: mockToast},
+            {provide: UserService, useValue: mockUserService},
         ],
     });
 
@@ -320,6 +331,7 @@ describe('SessionsPageComponent', () => {
 
     describe('endSession()', () => {
         it('should call DELETE endpoint', async () => {
+            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
             const thread = makeThread({id: 'thread-xyz'});
             await component.endSession(thread);
 
@@ -329,6 +341,7 @@ describe('SessionsPageComponent', () => {
         });
 
         it('should reload threads after ending', async () => {
+            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
             const loadSpy = vi.spyOn(component, 'loadThreads');
             await component.endSession(makeThread());
 

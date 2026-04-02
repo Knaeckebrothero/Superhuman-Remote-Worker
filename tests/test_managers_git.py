@@ -693,9 +693,7 @@ class TestGitManagerBackendIsActive:
         """is_active checks .git relative to remote_cwd."""
         backend = _make_mock_backend()
         backend.exists.return_value = True
-        gm = GitManager(
-            Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo"
-        )
+        gm = GitManager(Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo")
         assert gm.is_active is True
         backend.exists.assert_called_with("repos/myrepo/.git")
 
@@ -782,9 +780,7 @@ class TestGitManagerBackendRunGit:
         """_run_git passes remote_cwd as working_dir."""
         backend = _make_mock_backend()
         backend.shell_run.return_value = "Exit code: 0\n(no output)"
-        gm = GitManager(
-            Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo"
-        )
+        gm = GitManager(Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo")
 
         gm._run_git(["status"])
 
@@ -988,9 +984,7 @@ class TestGitManagerBackendCommit:
     def test_commit_returns_false_on_add_failure(self):
         """commit() returns False when git add fails."""
         gm, backend = self._make_active_gm()
-        backend.shell_run.return_value = (
-            "Exit code: 1\n--- stdout ---\nfatal: error"
-        )
+        backend.shell_run.return_value = "Exit code: 1\n--- stdout ---\nfatal: error"
 
         result = gm.commit("Should fail")
         assert result is False
@@ -1075,8 +1069,7 @@ class TestGitManagerBackendPush:
 
         # Find the actual push call (3rd call: after has_remote + branch detect)
         push_calls = [
-            c for c in backend.shell_run.call_args_list
-            if "git push -u" in c[0][0]
+            c for c in backend.shell_run.call_args_list if "git push -u" in c[0][0]
         ]
         if push_calls:
             assert push_calls[0].kwargs["timeout"] == 120
@@ -1108,8 +1101,7 @@ class TestGitManagerBackendLogStatusDiff:
         """log() returns parsed stdout from backend."""
         gm, backend = self._make_active_gm()
         backend.shell_run.return_value = (
-            "Exit code: 0\n--- stdout ---\n"
-            "abc1234 Initial commit\ndef5678 Add notes"
+            "Exit code: 0\n--- stdout ---\nabc1234 Initial commit\ndef5678 Add notes"
         )
 
         result = gm.log()
@@ -1140,8 +1132,7 @@ class TestGitManagerBackendLogStatusDiff:
         """diff() returns parsed diff from backend."""
         gm, backend = self._make_active_gm()
         backend.shell_run.return_value = (
-            "Exit code: 0\n--- stdout ---\n"
-            "diff --git a/file.md b/file.md\n+new line"
+            "Exit code: 0\n--- stdout ---\ndiff --git a/file.md b/file.md\n+new line"
         )
 
         result = gm.diff()
@@ -1251,9 +1242,7 @@ class TestGitManagerBackendFromWorktree:
         backend.exists.return_value = True
         backend.shell_run.return_value = "Exit code: 0\n(no output)"
 
-        mgr = GitManager.from_worktree(
-            Path("/tmp/wt"), backend=backend
-        )
+        mgr = GitManager.from_worktree(Path("/tmp/wt"), backend=backend)
 
         assert mgr is not None
         backend.exists.assert_any_call(".git")
@@ -1263,9 +1252,7 @@ class TestGitManagerBackendFromWorktree:
         backend = _make_mock_backend()
         backend.exists.return_value = False
 
-        mgr = GitManager.from_worktree(
-            Path("/tmp/wt"), backend=backend
-        )
+        mgr = GitManager.from_worktree(Path("/tmp/wt"), backend=backend)
 
         assert mgr is None
 

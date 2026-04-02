@@ -2176,9 +2176,7 @@ async def list_project_datasources(project_id: str) -> str:
 
 
 @mcp.tool
-async def link_datasource_to_project(
-    project_id: str, datasource_id: str
-) -> str:
+async def link_datasource_to_project(project_id: str, datasource_id: str) -> str:
     """Link a datasource to a project.
 
     Creates a knowledge entry so agents can discover the datasource
@@ -2198,9 +2196,7 @@ async def link_datasource_to_project(
 
 
 @mcp.tool
-async def unlink_datasource_from_project(
-    project_id: str, datasource_id: str
-) -> str:
+async def unlink_datasource_from_project(project_id: str, datasource_id: str) -> str:
     """Unlink a datasource from a project.
 
     Removes the corresponding knowledge entry.
@@ -2213,9 +2209,7 @@ async def unlink_datasource_from_project(
         Unlink confirmation
     """
     client = _get_client()
-    result = await client.unlink_datasource_from_project(
-        project_id, datasource_id
-    )
+    result = await client.unlink_datasource_from_project(project_id, datasource_id)
     status = result.get("status", "unknown")
     return f"Datasource {datasource_id} unlinked from project {project_id} ({status})."
 
