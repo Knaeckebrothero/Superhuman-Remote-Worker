@@ -2481,9 +2481,7 @@ class PostgresDB:
 
         return result == "DELETE 1"
 
-    async def list_project_datasources(
-        self, project_id: str
-    ) -> List[Dict[str, Any]]:
+    async def list_project_datasources(self, project_id: str) -> List[Dict[str, Any]]:
         """List all datasources linked to a project.
 
         Returns datasource details with project-level settings (read_only,
@@ -2553,7 +2551,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(
                 f"""
-                UPDATE project_datasources SET {', '.join(set_parts)}
+                UPDATE project_datasources SET {", ".join(set_parts)}
                 WHERE project_id = $1 AND datasource_id = $2
                 """,
                 *values,
@@ -2561,9 +2559,7 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def list_datasource_projects(
-        self, datasource_id: str
-    ) -> List[str]:
+    async def list_datasource_projects(self, datasource_id: str) -> List[str]:
         """Return project IDs linked to a datasource."""
         try:
             d_uuid = UUID(datasource_id)

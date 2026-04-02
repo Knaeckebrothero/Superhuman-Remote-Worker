@@ -321,9 +321,13 @@ class PersistentSession:
             content = self.workspace_manager.read_file(path)
         except (FileNotFoundError, OSError):
             content = None  # File doesn't exist yet
-        self.file_checkpoints[turn_id].append({
-            "path": path, "original_content": content, "timestamp": time.time(),
-        })
+        self.file_checkpoints[turn_id].append(
+            {
+                "path": path,
+                "original_content": content,
+                "timestamp": time.time(),
+            }
+        )
 
     def undo_turn(self, turn_id: Optional[int] = None) -> List[str]:
         """Restore files from the given turn's checkpoints. Defaults to latest."""
@@ -338,7 +342,9 @@ class PersistentSession:
                 if cp["original_content"] is None:
                     self.workspace_manager.delete_file(cp["path"])
                 else:
-                    self.workspace_manager.write_file(cp["path"], cp["original_content"])
+                    self.workspace_manager.write_file(
+                        cp["path"], cp["original_content"]
+                    )
                 restored.append(cp["path"])
             except Exception as e:
                 logger.warning(f"Failed to restore {cp['path']}: {e}")

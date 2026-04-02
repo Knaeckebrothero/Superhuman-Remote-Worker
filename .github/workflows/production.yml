@@ -84,7 +84,51 @@ jobs:
           --ignore-vuln CVE-2026-25645
       - name: Audit npm dependencies
         working-directory: cockpit
-        run: npm audit --audit-level=high
+        # lodash-es 4.17.23 is the latest release; no fix available.
+        # Transitive via mermaid → langium → chevrotain → lodash-es.
+        # GHSA-r5fr-rjxr-66jc: Code Injection via _.template (high)
+        # GHSA-f23m-r3pf-42rh: Prototype Pollution via _.unset/_.omit (moderate)
+        run: |
+          npm audit --json | python3 -c "
+          import json, sys
+          IGNORE_ADVISORIES = {'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh'}
+          data = json.load(sys.stdin)
+          vulns = data.get('vulnerabilities', {})
+
+          # Mark packages whose only root-cause advisories are all ignored
+          ignored_pkgs = set()
+          changed = True
+          while changed:
+              changed = False
+              for name, vuln in vulns.items():
+                  if name in ignored_pkgs:
+                      continue
+                  dominated = True
+                  for v in vuln.get('via', []):
+                      if isinstance(v, dict):
+                          ghsa = v.get('url', '').split('/')[-1]
+                          if ghsa not in IGNORE_ADVISORIES:
+                              dominated = False
+                              break
+                      elif isinstance(v, str) and v not in ignored_pkgs:
+                          dominated = False
+                          break
+                  if dominated:
+                      ignored_pkgs.add(name)
+                      changed = True
+
+          found = 0
+          for name, vuln in vulns.items():
+              if name in ignored_pkgs:
+                  continue
+              if vuln.get('severity') in ('high', 'critical'):
+                  found += 1
+                  print(f'{name}: {vuln[\"severity\"]}')
+          if found:
+              print(f'{found} unignored high/critical vulnerabilities')
+              sys.exit(1)
+          print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
+          "
 
   # ---------------------------------------------------------------------------
   # Python tests

@@ -2013,13 +2013,9 @@ class AsyncCockpitClient:
     # Project ↔ Datasource (N:M)
     # =========================================================================
 
-    async def list_project_datasources(
-        self, project_id: str
-    ) -> list[dict[str, Any]]:
+    async def list_project_datasources(self, project_id: str) -> list[dict[str, Any]]:
         """List datasources linked to a project."""
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/datasources"
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/datasources")
         resp.raise_for_status()
         return resp.json()
 

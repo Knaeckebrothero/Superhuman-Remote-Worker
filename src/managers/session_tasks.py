@@ -33,7 +33,9 @@ class SessionTask:
             "priority": self.priority,
             "notes": self.notes,
             "created_at": self.created_at.isoformat(),
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
         }
 
 
@@ -104,6 +106,8 @@ class SessionTaskManager:
             icon = {"pending": "○", "in_progress": "◑", "completed": "●"}[task.status]
             priority_tag = f" [{task.priority}]" if task.priority != "medium" else ""
             notes_tag = f"  — {task.notes}" if task.notes else ""
-            lines.append(f"  {icon} {task.id}: {task.description}{priority_tag}{notes_tag}")
+            lines.append(
+                f"  {icon} {task.id}: {task.description}{priority_tag}{notes_tag}"
+            )
 
         return "\n".join(lines)

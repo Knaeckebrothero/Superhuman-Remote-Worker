@@ -80,7 +80,9 @@ class ToolContext:
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
-    session_task_manager: Optional[Any] = None  # SessionTaskManager (persistent session todos)
+    session_task_manager: Optional[Any] = (
+        None  # SessionTaskManager (persistent session todos)
+    )
     knowledge_graph: Optional[Any] = (
         None  # KnowledgeGraphDB (system Neo4j for knowledge base)
     )

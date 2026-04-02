@@ -1347,14 +1347,21 @@ class DatasourceCreate(BaseModel):
         ...,
         description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav",
     )
-    connection_url: str | None = Field(None, description="Connection string (nullable for generic)")
+    connection_url: str | None = Field(
+        None, description="Connection string (nullable for generic)"
+    )
     description: str | None = Field(None, description="What this datasource contains")
     credentials: dict[str, Any] | None = Field(
-        None, description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)"
+        None,
+        description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)",
     )
     job_id: str | None = Field(None, description="Job UUID (null for global)")
-    cli_hint: str | None = Field(None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')")
-    default_branch: str | None = Field(None, description="Branch to clone (repository type)")
+    cli_hint: str | None = Field(
+        None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')"
+    )
+    default_branch: str | None = Field(
+        None, description="Branch to clone (repository type)"
+    )
 
 
 class DatasourceUpdate(BaseModel):
@@ -1371,7 +1378,10 @@ class DatasourceUpdate(BaseModel):
 class ProjectDatasourceSettings(BaseModel):
     """Project-level settings when linking a datasource."""
 
-    read_only: bool | None = Field(None, description="Managed connectors: true = read-only tools, false/null = CLI mode")
+    read_only: bool | None = Field(
+        None,
+        description="Managed connectors: true = read-only tools, false/null = CLI mode",
+    )
     description: str | None = Field(None, description="Project-specific usage context")
 
 
@@ -10189,6 +10199,7 @@ def _build_generic_note(name: str, desc: str, ds: dict) -> str:
 def _build_repository_note(name: str, desc: str, ds: dict) -> str:
     """KB entry for repository datasources."""
     import re
+
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     lines = [f"## Repository: {name}"]
     if desc:
@@ -10222,7 +10233,7 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
             "env_vars": "`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`",
             "examples": [
                 '`cypher-shell "MATCH (n) RETURN n LIMIT 10"`',
-                '`cypher-shell "CREATE (n:Label {name: \'test\'})"`',
+                "`cypher-shell \"CREATE (n:Label {name: 'test'})\"`",
             ],
         },
         "mongodb": {
@@ -10242,9 +10253,13 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
     if desc:
         lines.append(f"\n{desc}")
     lines.append("\n### Connection")
-    lines.append(f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables.")
+    lines.append(
+        f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables."
+    )
     lines.append("\n### Environment Variables")
-    lines.append(f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured")
+    lines.append(
+        f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured"
+    )
     if info.get("examples"):
         lines.append("\n### Examples")
         for ex in info["examples"]:
@@ -10255,9 +10270,19 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
 def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
     """KB entry for managed connectors in read-only (tools) mode."""
     tool_info = {
-        "postgresql": ["- `sql_query` — execute SELECT queries", "- `sql_schema` — inspect tables, columns, types, constraints"],
-        "neo4j": ["- `execute_cypher_query` — execute read-only Cypher queries", "- `get_database_schema` — inspect labels, relationships, properties"],
-        "mongodb": ["- `mongo_query` — document queries with filters", "- `mongo_aggregate` — aggregation pipelines", "- `mongo_schema` — collections, fields, indexes"],
+        "postgresql": [
+            "- `sql_query` — execute SELECT queries",
+            "- `sql_schema` — inspect tables, columns, types, constraints",
+        ],
+        "neo4j": [
+            "- `execute_cypher_query` — execute read-only Cypher queries",
+            "- `get_database_schema` — inspect labels, relationships, properties",
+        ],
+        "mongodb": [
+            "- `mongo_query` — document queries with filters",
+            "- `mongo_aggregate` — aggregation pipelines",
+            "- `mongo_schema` — collections, fields, indexes",
+        ],
     }
     tools = tool_info.get(ds_type, ["- Check available tools for this datasource type"])
     lines = [
@@ -10399,9 +10424,7 @@ async def _sync_datasource_knowledge(
         logger.warning(f"pgvector datasource knowledge sync failed: {e}")
 
 
-async def _delete_datasource_knowledge(
-    project_id: str, datasource_id: str
-) -> None:
+async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> None:
     """Remove the knowledge entry for a datasource from a project."""
     ds_id = datasource_id.replace("-", "")[:8]
     note_id = f"ds-{ds_id}"

@@ -480,6 +480,7 @@ class TestStats:
 # Integration Tests (require DATABASE_URL)
 # =============================================================================
 
+
 @pytest.mark.skipif(
     not os.getenv("RUN_INTEGRATION_TESTS"),
     reason="Set RUN_INTEGRATION_TESTS=1 to run integration tests",
