@@ -424,18 +424,26 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
             # Notify frontend of file checkpoint availability after writes
             if tool_name in ("write_file", "edit_file"):
-                await _ws_send(ws, "file.checkpoint", {
-                    "turn_id": _session.turn_count,
-                })
+                await _ws_send(
+                    ws,
+                    "file.checkpoint",
+                    {
+                        "turn_id": _session.turn_count,
+                    },
+                )
 
             # Broadcast task state after task tool calls
             if (
                 tool_name in ("task_add", "task_complete", "task_list")
                 and _session.session_task_manager
             ):
-                await _ws_send(ws, "tasks.updated", {
-                    "tasks": _session.session_task_manager.to_dict_list(),
-                })
+                await _ws_send(
+                    ws,
+                    "tasks.updated",
+                    {
+                        "tasks": _session.session_task_manager.to_dict_list(),
+                    },
+                )
 
         async def permission_check(tool_name: str, tool_args: Dict[str, Any]) -> bool:
             mode = _session.permission_mode
@@ -614,13 +622,18 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     turn_id = data.get("turn_id")
                     restored = _session.undo_turn(turn_id)
                     if restored:
-                        await _ws_send(ws, "files.restored", {
-                            "paths": restored,
-                            "turn_id": turn_id,
-                        })
+                        await _ws_send(
+                            ws,
+                            "files.restored",
+                            {
+                                "paths": restored,
+                                "turn_id": turn_id,
+                            },
+                        )
                     else:
                         await _ws_send(
-                            ws, "error",
+                            ws,
+                            "error",
                             {"message": "No checkpoints available to undo"},
                         )
 
@@ -897,7 +910,11 @@ async def _handle_archive(ws: WebSocket) -> None:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
                 current = thread.get("title", "") if thread else ""
-                if not current or current.startswith("Local Session") or current == "Untitled Session":
+                if (
+                    not current
+                    or current.startswith("Local Session")
+                    or current == "Untitled Session"
+                ):
                     title = await _generate_title(
                         _session.messages, _session.auxiliary_llm
                     )
@@ -972,7 +989,11 @@ async def _handle_idle_archive() -> None:
             try:
                 thread = await _session.postgres_conn.get_thread(_thread_id)
                 current = thread.get("title", "") if thread else ""
-                if not current or current.startswith("Local Session") or current == "Untitled Session":
+                if (
+                    not current
+                    or current.startswith("Local Session")
+                    or current == "Untitled Session"
+                ):
                     title = await _generate_title(
                         _session.messages, _session.auxiliary_llm
                     )
@@ -1214,7 +1235,11 @@ async def _auto_title_after_first_turn(ws: WebSocket) -> None:
         # Check current title is still a default placeholder
         thread = await _session.postgres_conn.get_thread(_thread_id)
         current = thread.get("title", "") if thread else ""
-        if current and not current.startswith("Local Session") and current != "Untitled Session":
+        if (
+            current
+            and not current.startswith("Local Session")
+            and current != "Untitled Session"
+        ):
             return  # already has a real title
         title = await _generate_title(_session.messages, _session.auxiliary_llm)
         if not title:

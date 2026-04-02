@@ -89,9 +89,7 @@ class GitManager:
             return False
         if self._use_backend:
             git_path = (
-                posixpath.join(self._remote_cwd, ".git")
-                if self._remote_cwd
-                else ".git"
+                posixpath.join(self._remote_cwd, ".git") if self._remote_cwd else ".git"
             )
             return self._backend.exists(git_path)
         return (self._workspace_path / ".git").exists()
@@ -129,9 +127,7 @@ class GitManager:
         # Skip if already initialized
         if self._use_backend:
             git_path = (
-                posixpath.join(self._remote_cwd, ".git")
-                if self._remote_cwd
-                else ".git"
+                posixpath.join(self._remote_cwd, ".git") if self._remote_cwd else ".git"
             )
             already_init = self._backend.exists(git_path)
         else:
@@ -733,9 +729,7 @@ class GitManager:
             GitManager instance for the cloned repo, or None on failure
         """
         masked = cls._mask_url_static(url)
-        use_backend = backend is not None and getattr(
-            backend, "supports_shell", False
-        )
+        use_backend = backend is not None and getattr(backend, "supports_shell", False)
 
         if use_backend:
             try:
@@ -744,26 +738,17 @@ class GitManager:
                 else:
                     remote_target = backend.root
 
-                cmd = (
-                    f"git clone {shlex.quote(url)}"
-                    f" {shlex.quote(remote_target)}"
-                )
+                cmd = f"git clone {shlex.quote(url)} {shlex.quote(remote_target)}"
                 output = backend.shell_run(cmd, timeout=120, tab_name="git")
 
                 # Parse exit code
                 first_line = output.split("\n", 1)[0].strip()
                 if not first_line.startswith("Exit code: 0"):
-                    logger.warning(
-                        f"git clone failed for {masked}: {output}"
-                    )
+                    logger.warning(f"git clone failed for {masked}: {output}")
                     return None
 
-                mgr = cls(
-                    target_path, backend=backend, remote_cwd=remote_cwd
-                )
-                mgr._run_git(
-                    ["config", "user.email", "agent@workspace.local"]
-                )
+                mgr = cls(target_path, backend=backend, remote_cwd=remote_cwd)
+                mgr._run_git(["config", "user.email", "agent@workspace.local"])
                 mgr._run_git(["config", "user.name", "Agent"])
 
                 logger.info(f"Cloned {masked} to {remote_target}")
@@ -825,25 +810,17 @@ class GitManager:
             GitManager instance, or None if path is not a valid git worktree
         """
         worktree_path = Path(worktree_path)
-        use_backend = backend is not None and getattr(
-            backend, "supports_shell", False
-        )
+        use_backend = backend is not None and getattr(backend, "supports_shell", False)
 
         if use_backend:
-            git_path = (
-                posixpath.join(remote_cwd, ".git") if remote_cwd else ".git"
-            )
+            git_path = posixpath.join(remote_cwd, ".git") if remote_cwd else ".git"
             if not backend.exists(git_path):
-                logger.warning(
-                    f"Not a git worktree (no .git): {worktree_path}"
-                )
+                logger.warning(f"Not a git worktree (no .git): {worktree_path}")
                 return None
         else:
             git_marker = worktree_path / ".git"
             if not git_marker.exists():
-                logger.warning(
-                    f"Not a git worktree (no .git): {worktree_path}"
-                )
+                logger.warning(f"Not a git worktree (no .git): {worktree_path}")
                 return None
 
         mgr = cls(worktree_path, backend=backend, remote_cwd=remote_cwd)
@@ -958,7 +935,7 @@ class GitManager:
             rest = lines[1] if len(lines) > 1 else ""
             stdout_marker = "--- stdout ---\n"
             if rest.startswith(stdout_marker):
-                stdout = rest[len(stdout_marker):]
+                stdout = rest[len(stdout_marker) :]
             elif rest.strip() == "(no output)":
                 stdout = ""
             else:

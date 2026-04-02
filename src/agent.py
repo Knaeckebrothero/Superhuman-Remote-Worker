@@ -1996,6 +1996,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 lines.append(f"- **{name}** (generic) — {cli}")
             elif ds_type == "repository":
                 import re
+
                 slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
                 lines.append(f"- **{name}** (repository) — cloned at `./repos/{slug}/`")
             elif ds_type == "webdav":
@@ -2005,15 +2006,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if is_ro:
                     lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
                 else:
-                    cli_map = {"postgresql": "psql", "neo4j": "cypher-shell", "mongodb": "mongosh"}
-                    lines.append(f"- **{name}** ({ds_type}, read-write) — `{cli_map.get(ds_type)}` via env vars")
+                    cli_map = {
+                        "postgresql": "psql",
+                        "neo4j": "cypher-shell",
+                        "mongodb": "mongosh",
+                    }
+                    lines.append(
+                        f"- **{name}** ({ds_type}, read-write) — `{cli_map.get(ds_type)}` via env vars"
+                    )
             else:
                 lines.append(f"- **{name}** ({ds_type})")
 
         try:
             existing = self._workspace_manager.read_file("workspace.md")
-            self._workspace_manager.write_file("workspace.md", existing + "\n".join(lines))
-            logger.info(f"Injected datasource index ({len(ds_configs)} entries) into workspace.md")
+            self._workspace_manager.write_file(
+                "workspace.md", existing + "\n".join(lines)
+            )
+            logger.info(
+                f"Injected datasource index ({len(ds_configs)} entries) into workspace.md"
+            )
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
 
@@ -2055,17 +2066,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Parse host from SSH URL
             from urllib.parse import urlparse
+
             parsed = urlparse(repo_url)
             host = parsed.hostname or "github.com"
 
             config_path = os.path.join(ssh_dir, "config")
             with open(config_path, "a") as f:
-                f.write(f"\nHost {host}\n  IdentityFile {key_file}\n  StrictHostKeyChecking accept-new\n")
+                f.write(
+                    f"\nHost {host}\n  IdentityFile {key_file}\n  StrictHostKeyChecking accept-new\n"
+                )
 
         elif auth_method == "token" and creds.get("token"):
             # Configure git credential helper
             cred_file = os.path.expanduser("~/.git-credentials")
             from urllib.parse import urlparse
+
             parsed = urlparse(repo_url)
             host = parsed.hostname or "github.com"
             scheme = parsed.scheme or "https"
@@ -2075,7 +2090,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             os.chmod(cred_file, 0o600)
             subprocess.run(
                 ["git", "config", "--global", "credential.helper", "store"],
-                check=False, capture_output=True,
+                check=False,
+                capture_output=True,
             )
 
         # Clone
@@ -2096,6 +2112,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if ds_type == "postgresql":
             # Parse connection URL into PG* env vars
             from urllib.parse import urlparse
+
             parsed = urlparse(url)
             if parsed.hostname:
                 os.environ["PGHOST"] = parsed.hostname

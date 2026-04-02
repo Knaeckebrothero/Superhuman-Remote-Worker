@@ -48,7 +48,9 @@ def _build_generic_note(name: str, desc: str, ds: dict) -> str:
 
 
 def _build_repository_note(name: str, desc: str, ds: dict) -> str:
-    slug = re.sub(r"[^a-z0-9]+", name.lower(), "").strip("-")  # intentional bug check below
+    slug = re.sub(r"[^a-z0-9]+", name.lower(), "").strip(
+        "-"
+    )  # intentional bug check below
     # Fix: use correct re.sub argument order
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     lines = [f"## Repository: {name}"]
@@ -100,9 +102,13 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
     if desc:
         lines.append(f"\n{desc}")
     lines.append("\n### Connection")
-    lines.append(f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables.")
+    lines.append(
+        f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables."
+    )
     lines.append("\n### Environment Variables")
-    lines.append(f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured")
+    lines.append(
+        f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured"
+    )
     if info.get("examples"):
         lines.append("\n### Examples")
         for ex in info["examples"]:
@@ -112,9 +118,19 @@ def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
 
 def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
     tool_info = {
-        "postgresql": ["- `sql_query` — execute SELECT queries", "- `sql_schema` — inspect tables, columns, types, constraints"],
-        "neo4j": ["- `execute_cypher_query` — execute read-only Cypher queries", "- `get_database_schema` — inspect labels, relationships, properties"],
-        "mongodb": ["- `mongo_query` — document queries with filters", "- `mongo_aggregate` — aggregation pipelines", "- `mongo_schema` — collections, fields, indexes"],
+        "postgresql": [
+            "- `sql_query` — execute SELECT queries",
+            "- `sql_schema` — inspect tables, columns, types, constraints",
+        ],
+        "neo4j": [
+            "- `execute_cypher_query` — execute read-only Cypher queries",
+            "- `get_database_schema` — inspect labels, relationships, properties",
+        ],
+        "mongodb": [
+            "- `mongo_query` — document queries with filters",
+            "- `mongo_aggregate` — aggregation pipelines",
+            "- `mongo_schema` — collections, fields, indexes",
+        ],
     }
     tools = tool_info.get(ds_type, ["- Check available tools for this datasource type"])
     lines = [
@@ -213,7 +229,9 @@ class TestGenericNote:
             "description": "Analytics database with user events",
             "connection_url": "postgresql://host:5432/analytics",
             "cli_hint": "psql $DATABASE_URL",
-            "credentials": {"env_vars": {"DATABASE_URL": "secret", "DB_SCHEMA": "public"}},
+            "credentials": {
+                "env_vars": {"DATABASE_URL": "secret", "DB_SCHEMA": "public"}
+            },
         }
         content = _build_generic_note("Production DB", ds["description"], ds)
         assert "## Datasource: Production DB" in content
@@ -394,12 +412,16 @@ class TestBuildDatasourcesPayload:
         assert _build_datasources_payload(None) is None
 
     def test_basic_payload(self):
-        ds = [{
-            "type": "postgresql", "name": "DB", "description": "Test",
-            "connection_url": "postgres://host/db",
-            "credentials": '{"password": "secret"}',
-            "project_read_only": False,
-        }]
+        ds = [
+            {
+                "type": "postgresql",
+                "name": "DB",
+                "description": "Test",
+                "connection_url": "postgres://host/db",
+                "credentials": '{"password": "secret"}',
+                "project_read_only": False,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert len(result) == 1
         assert result[0]["type"] == "postgresql"
@@ -408,82 +430,127 @@ class TestBuildDatasourcesPayload:
     def test_readonly_managed_withholds_credentials(self):
         """Read-only managed connectors must NOT receive credentials."""
         for ds_type in ("postgresql", "neo4j", "mongodb", "webdav"):
-            ds = [{
-                "type": ds_type, "name": f"RO {ds_type}",
-                "connection_url": "some://url",
-                "credentials": '{"password": "secret"}',
-                "project_read_only": True,
-            }]
+            ds = [
+                {
+                    "type": ds_type,
+                    "name": f"RO {ds_type}",
+                    "connection_url": "some://url",
+                    "credentials": '{"password": "secret"}',
+                    "project_read_only": True,
+                }
+            ]
             result = _build_datasources_payload(ds)
-            assert result[0]["credentials"] == {}, f"{ds_type} should withhold creds in read-only"
+            assert result[0]["credentials"] == {}, (
+                f"{ds_type} should withhold creds in read-only"
+            )
 
     def test_readwrite_managed_keeps_credentials(self):
-        ds = [{
-            "type": "postgresql", "name": "RW DB",
-            "connection_url": "postgres://host/db",
-            "credentials": {"password": "secret"},
-            "project_read_only": False,
-        }]
+        ds = [
+            {
+                "type": "postgresql",
+                "name": "RW DB",
+                "connection_url": "postgres://host/db",
+                "credentials": {"password": "secret"},
+                "project_read_only": False,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["credentials"]["password"] == "secret"
 
     def test_generic_always_keeps_credentials(self):
-        ds = [{
-            "type": "generic", "name": "API",
-            "connection_url": None,
-            "credentials": {"env_vars": {"API_KEY": "abc"}},
-            "project_read_only": False,
-        }]
+        ds = [
+            {
+                "type": "generic",
+                "name": "API",
+                "connection_url": None,
+                "credentials": {"env_vars": {"API_KEY": "abc"}},
+                "project_read_only": False,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["credentials"]["env_vars"]["API_KEY"] == "abc"
 
     def test_repository_always_keeps_credentials(self):
-        ds = [{
-            "type": "repository", "name": "Repo",
-            "connection_url": "https://github.com/org/repo.git",
-            "credentials": {"auth_method": "token", "token": "ghp_xxx"},
-            "project_read_only": False,
-        }]
+        ds = [
+            {
+                "type": "repository",
+                "name": "Repo",
+                "connection_url": "https://github.com/org/repo.git",
+                "credentials": {"auth_method": "token", "token": "ghp_xxx"},
+                "project_read_only": False,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["credentials"]["token"] == "ghp_xxx"
 
     def test_cli_hint_included_when_present(self):
-        ds = [{
-            "type": "generic", "name": "DB",
-            "connection_url": None, "credentials": {},
-            "project_read_only": False,
-            "cli_hint": "psql $DB_URL", "default_branch": None,
-        }]
+        ds = [
+            {
+                "type": "generic",
+                "name": "DB",
+                "connection_url": None,
+                "credentials": {},
+                "project_read_only": False,
+                "cli_hint": "psql $DB_URL",
+                "default_branch": None,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["cli_hint"] == "psql $DB_URL"
         assert "default_branch" not in result[0]
 
     def test_default_branch_included_when_present(self):
-        ds = [{
-            "type": "repository", "name": "Repo",
-            "connection_url": "url", "credentials": {},
-            "project_read_only": False,
-            "cli_hint": None, "default_branch": "develop",
-        }]
+        ds = [
+            {
+                "type": "repository",
+                "name": "Repo",
+                "connection_url": "url",
+                "credentials": {},
+                "project_read_only": False,
+                "cli_hint": None,
+                "default_branch": "develop",
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["default_branch"] == "develop"
         assert "cli_hint" not in result[0]
 
     def test_invalid_json_credentials_handled(self):
-        ds = [{
-            "type": "postgresql", "name": "DB",
-            "connection_url": "postgres://host/db",
-            "credentials": "not-valid-json",
-            "project_read_only": False,
-        }]
+        ds = [
+            {
+                "type": "postgresql",
+                "name": "DB",
+                "connection_url": "postgres://host/db",
+                "credentials": "not-valid-json",
+                "project_read_only": False,
+            }
+        ]
         result = _build_datasources_payload(ds)
         assert result[0]["credentials"] == {}
 
     def test_multiple_datasources(self):
         ds = [
-            {"type": "generic", "name": "A", "connection_url": None, "credentials": {}, "project_read_only": False},
-            {"type": "repository", "name": "B", "connection_url": "url", "credentials": {}, "project_read_only": False},
-            {"type": "postgresql", "name": "C", "connection_url": "pg://h/d", "credentials": {}, "project_read_only": True},
+            {
+                "type": "generic",
+                "name": "A",
+                "connection_url": None,
+                "credentials": {},
+                "project_read_only": False,
+            },
+            {
+                "type": "repository",
+                "name": "B",
+                "connection_url": "url",
+                "credentials": {},
+                "project_read_only": False,
+            },
+            {
+                "type": "postgresql",
+                "name": "C",
+                "connection_url": "pg://h/d",
+                "credentials": {},
+                "project_read_only": True,
+            },
         ]
         result = _build_datasources_payload(ds)
         assert len(result) == 3
@@ -501,8 +568,17 @@ class TestInjectTypedEnvVars:
     @pytest.fixture(autouse=True)
     def _clean_env(self):
         """Remove PG/NEO4J/MONGO env vars before and after each test."""
-        keys = ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE",
-                "NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD", "MONGOSH_URI"]
+        keys = [
+            "PGHOST",
+            "PGPORT",
+            "PGUSER",
+            "PGPASSWORD",
+            "PGDATABASE",
+            "NEO4J_URI",
+            "NEO4J_USERNAME",
+            "NEO4J_PASSWORD",
+            "MONGOSH_URI",
+        ]
         saved = {k: os.environ.pop(k, None) for k in keys}
         yield
         for k in keys:
@@ -512,15 +588,19 @@ class TestInjectTypedEnvVars:
 
     def _get_inject_fn(self):
         from src.agent import UniversalAgent
+
         agent = UniversalAgent.__new__(UniversalAgent)
         return agent._inject_typed_env_vars
 
     def test_postgresql_full_url(self):
         inject = self._get_inject_fn()
-        inject("postgresql", {
-            "connection_url": "postgresql://myuser:mypass@db.example.com:5433/analytics",
-            "credentials": {},
-        })
+        inject(
+            "postgresql",
+            {
+                "connection_url": "postgresql://myuser:mypass@db.example.com:5433/analytics",
+                "credentials": {},
+            },
+        )
         assert os.environ["PGHOST"] == "db.example.com"
         assert os.environ["PGPORT"] == "5433"
         assert os.environ["PGUSER"] == "myuser"
@@ -529,29 +609,41 @@ class TestInjectTypedEnvVars:
 
     def test_postgresql_password_from_credentials(self):
         inject = self._get_inject_fn()
-        inject("postgresql", {
-            "connection_url": "postgresql://user@host:5432/db",
-            "credentials": {"password": "from-creds"},
-        })
+        inject(
+            "postgresql",
+            {
+                "connection_url": "postgresql://user@host:5432/db",
+                "credentials": {"password": "from-creds"},
+            },
+        )
         assert os.environ["PGPASSWORD"] == "from-creds"
 
     def test_neo4j_env_vars(self):
         inject = self._get_inject_fn()
-        inject("neo4j", {
-            "connection_url": "bolt://neo4j.example.com:7687",
-            "credentials": {"username": "neo4j", "password": "secret"},
-        })
+        inject(
+            "neo4j",
+            {
+                "connection_url": "bolt://neo4j.example.com:7687",
+                "credentials": {"username": "neo4j", "password": "secret"},
+            },
+        )
         assert os.environ["NEO4J_URI"] == "bolt://neo4j.example.com:7687"
         assert os.environ["NEO4J_USERNAME"] == "neo4j"
         assert os.environ["NEO4J_PASSWORD"] == "secret"
 
     def test_mongodb_env_vars(self):
         inject = self._get_inject_fn()
-        inject("mongodb", {
-            "connection_url": "mongodb+srv://user:pass@cluster.mongodb.net/mydb",
-            "credentials": {},
-        })
-        assert os.environ["MONGOSH_URI"] == "mongodb+srv://user:pass@cluster.mongodb.net/mydb"
+        inject(
+            "mongodb",
+            {
+                "connection_url": "mongodb+srv://user:pass@cluster.mongodb.net/mydb",
+                "credentials": {},
+            },
+        )
+        assert (
+            os.environ["MONGOSH_URI"]
+            == "mongodb+srv://user:pass@cluster.mongodb.net/mydb"
+        )
 
 
 # =============================================================================
@@ -564,6 +656,7 @@ class TestDatasourceIndex:
 
     def _make_agent(self):
         from src.agent import UniversalAgent
+
         agent = UniversalAgent.__new__(UniversalAgent)
         ws = MagicMock()
         ws.read_file.return_value = "# Workspace\n\nExisting content."
@@ -623,7 +716,10 @@ class TestCredentialStructures:
         assert "ssh_key" not in creds
 
     def test_repository_ssh(self):
-        creds = {"auth_method": "ssh", "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\ndata"}
+        creds = {
+            "auth_method": "ssh",
+            "ssh_key": "-----BEGIN OPENSSH PRIVATE KEY-----\ndata",
+        }
         assert creds["auth_method"] == "ssh"
         assert "token" not in creds
 
