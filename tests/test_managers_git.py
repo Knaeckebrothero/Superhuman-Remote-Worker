@@ -3,13 +3,14 @@
 Tests git versioning functionality for agent workspaces.
 """
 
-import pytest
 import shutil
 import subprocess
-import tempfile
 import sys
+import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -626,3 +627,696 @@ class TestGitManagerExistingRepo:
         # Should still see existing commit
         log = gm.log()
         assert "Existing commit" in log
+
+
+# ============================================================================
+# Backend delegation tests (no real git needed)
+# ============================================================================
+
+
+def _make_mock_backend(root="/home/agent-host/workspace"):
+    """Create a mock workspace backend with shell support."""
+    backend = MagicMock()
+    backend.supports_shell = True
+    backend.root = root
+    return backend
+
+
+class TestGitManagerBackendInit:
+    """Tests for GitManager initialization with a backend."""
+
+    def test_use_backend_flag_set(self):
+        """When backend has shell support, _use_backend is True."""
+        backend = _make_mock_backend()
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+        assert gm._use_backend is True
+        assert gm._git_available is True
+
+    def test_use_backend_flag_not_set_without_shell(self):
+        """When backend lacks shell support, _use_backend is False."""
+        backend = MagicMock()
+        backend.supports_shell = False
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+        assert gm._use_backend is False
+
+    def test_use_backend_flag_not_set_without_backend(self, temp_workspace):
+        """When no backend, _use_backend is False."""
+        gm = GitManager(temp_workspace)
+        assert gm._use_backend is False
+
+    def test_remote_cwd_stored(self):
+        """remote_cwd is stored for use in _run_git."""
+        backend = _make_mock_backend()
+        gm = GitManager(Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo")
+        assert gm._remote_cwd == "repos/myrepo"
+
+
+class TestGitManagerBackendIsActive:
+    """Tests for is_active with a backend."""
+
+    def test_is_active_checks_backend_exists(self):
+        """is_active should call backend.exists('.git')."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+        assert gm.is_active is True
+        backend.exists.assert_called_with(".git")
+
+    def test_is_active_false_when_no_git_dir(self):
+        """is_active returns False when backend says .git doesn't exist."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+        assert gm.is_active is False
+
+    def test_is_active_with_remote_cwd(self):
+        """is_active checks .git relative to remote_cwd."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        gm = GitManager(
+            Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo"
+        )
+        assert gm.is_active is True
+        backend.exists.assert_called_with("repos/myrepo/.git")
+
+
+class TestParseShellRunOutput:
+    """Tests for _parse_shell_run_output."""
+
+    def _make_gm(self):
+        backend = _make_mock_backend()
+        return GitManager(Path("/tmp/ws"), backend=backend)
+
+    def test_parse_success_with_output(self):
+        """Parse normal success output with stdout."""
+        gm = self._make_gm()
+        output = "Exit code: 0\n--- stdout ---\nOn branch main\nnothing to commit"
+        result = gm._parse_shell_run_output(output, ["status"])
+        assert result.returncode == 0
+        assert "On branch main" in result.stdout
+        assert "nothing to commit" in result.stdout
+
+    def test_parse_success_no_output(self):
+        """Parse success with no output."""
+        gm = self._make_gm()
+        output = "Exit code: 0\n(no output)"
+        result = gm._parse_shell_run_output(output, ["add", "-A"])
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_parse_error_exit_code(self):
+        """Parse non-zero exit code."""
+        gm = self._make_gm()
+        output = "Exit code: 128\n--- stdout ---\nfatal: not a git repository"
+        result = gm._parse_shell_run_output(output, ["status"])
+        assert result.returncode == 128
+        assert "fatal" in result.stdout
+
+    def test_parse_timeout(self):
+        """Parse timeout output (no Exit code prefix)."""
+        gm = self._make_gm()
+        output = "Command timed out after 60s"
+        result = gm._parse_shell_run_output(output, ["push"])
+        assert result.returncode == 1
+        assert "timed out" in result.stderr
+
+    def test_parse_interactive_prompt(self):
+        """Parse interactive prompt detection."""
+        gm = self._make_gm()
+        output = (
+            "Command appears to be waiting for input "
+            "(no output change for 5s).\nUse keys mode..."
+        )
+        result = gm._parse_shell_run_output(output, ["commit"])
+        assert result.returncode == 1
+        assert "waiting for input" in result.stderr
+
+    def test_parse_malformed_exit_code(self):
+        """Parse malformed Exit code line."""
+        gm = self._make_gm()
+        output = "Exit code: abc\n--- stdout ---\nsome output"
+        result = gm._parse_shell_run_output(output, ["log"])
+        assert result.returncode == 1
+
+
+class TestGitManagerBackendRunGit:
+    """Tests for _run_git delegation to backend."""
+
+    def test_run_git_delegates_to_shell_run(self):
+        """_run_git calls backend.shell_run with correct command."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm._run_git(["add", "-A"])
+
+        backend.shell_run.assert_called_once_with(
+            "git add -A",
+            timeout=60,
+            tab_name="git",
+            working_dir=None,
+        )
+        assert result.returncode == 0
+
+    def test_run_git_with_remote_cwd(self):
+        """_run_git passes remote_cwd as working_dir."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(
+            Path("/tmp/ws"), backend=backend, remote_cwd="repos/myrepo"
+        )
+
+        gm._run_git(["status"])
+
+        backend.shell_run.assert_called_once_with(
+            "git status",
+            timeout=60,
+            tab_name="git",
+            working_dir="repos/myrepo",
+        )
+
+    def test_run_git_quotes_special_chars(self):
+        """_run_git properly quotes arguments with special characters."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        gm._run_git(["commit", "-m", "Fix: handle 'quotes' & $pecial chars"])
+
+        cmd = backend.shell_run.call_args[0][0]
+        # shlex.quote wraps the message in single quotes
+        assert "git commit -m" in cmd
+        assert "Fix: handle" in cmd
+
+    def test_run_git_custom_timeout(self):
+        """_run_git passes timeout to backend.shell_run."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        gm._run_git(["push", "-u", "origin", "main"], timeout=120)
+
+        assert backend.shell_run.call_args.kwargs["timeout"] == 120
+
+    def test_run_git_backend_exception(self):
+        """_run_git handles backend exceptions gracefully."""
+        backend = _make_mock_backend()
+        backend.shell_run.side_effect = ConnectionError("SSH disconnected")
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm._run_git(["status"])
+
+        assert result.returncode == 1
+        assert "SSH disconnected" in result.stderr
+
+
+class TestGitManagerBackendInitRepository:
+    """Tests for init_repository with a backend."""
+
+    def test_init_checks_git_via_backend(self):
+        """init_repository checks .git existence via backend."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True  # Already initialized
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.init_repository()
+
+        assert result is True
+        backend.exists.assert_called_with(".git")
+
+    def test_init_writes_gitignore_via_backend(self):
+        """init_repository writes .gitignore through backend."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False  # Not initialized yet
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        gm.init_repository()
+
+        # Should write .gitignore through backend
+        backend.write_file.assert_called_once()
+        call_args = backend.write_file.call_args
+        assert call_args[0][0] == ".gitignore"
+        content = call_args[0][1]
+        for pattern in GitManager.DEFAULT_IGNORE_PATTERNS:
+            assert pattern in content
+
+
+class TestGitManagerBackendClone:
+    """Tests for clone() with a backend."""
+
+    def test_clone_runs_on_backend(self):
+        """clone() runs git clone via backend.shell_run."""
+        backend = _make_mock_backend(root="/home/agent/workspace")
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        backend.exists.return_value = True  # .git exists after clone
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git",
+            Path("/tmp/ws"),
+            backend=backend,
+        )
+
+        assert mgr is not None
+        # First call should be the clone command
+        first_call = backend.shell_run.call_args_list[0]
+        cmd = first_call[0][0]
+        assert "git clone" in cmd
+        assert "/home/agent/workspace" in cmd
+        assert first_call.kwargs["timeout"] == 120
+
+    def test_clone_with_remote_cwd(self):
+        """clone() with remote_cwd clones into subdirectory."""
+        backend = _make_mock_backend(root="/home/agent/workspace")
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        backend.exists.return_value = True
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git",
+            Path("/tmp/ws/repos/myrepo"),
+            backend=backend,
+            remote_cwd="repos/myrepo",
+        )
+
+        assert mgr is not None
+        first_call = backend.shell_run.call_args_list[0]
+        cmd = first_call[0][0]
+        assert "repos/myrepo" in cmd
+        assert mgr._remote_cwd == "repos/myrepo"
+
+    def test_clone_failure_returns_none(self):
+        """clone() returns None when git clone fails on backend."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = (
+            "Exit code: 128\n--- stdout ---\nfatal: repository not found"
+        )
+
+        mgr = GitManager.clone(
+            "https://git.example.com/bad.git",
+            Path("/tmp/ws"),
+            backend=backend,
+        )
+
+        assert mgr is None
+
+    def test_clone_backend_exception_returns_none(self):
+        """clone() returns None when backend raises."""
+        backend = _make_mock_backend()
+        backend.shell_run.side_effect = ConnectionError("SSH failed")
+
+        mgr = GitManager.clone(
+            "https://git.example.com/repo.git",
+            Path("/tmp/ws"),
+            backend=backend,
+        )
+
+        assert mgr is None
+
+    def test_clone_masks_credentials_in_logs(self):
+        """clone() masks credentials in URL for logging."""
+        backend = _make_mock_backend()
+        backend.shell_run.return_value = (
+            "Exit code: 128\n--- stdout ---\nfatal: auth failed"
+        )
+
+        # Should not raise or leak credentials
+        mgr = GitManager.clone(
+            "https://user:secret-token@git.example.com/repo.git",
+            Path("/tmp/ws"),
+            backend=backend,
+        )
+        assert mgr is None
+        # The actual shell_run call DOES contain the real URL (needed for clone)
+        cmd = backend.shell_run.call_args[0][0]
+        assert "secret-token" in cmd  # Real URL passed to git
+
+
+class TestGitManagerBackendCommit:
+    """Tests for commit() via backend — the core bug scenario."""
+
+    def _make_active_gm(self):
+        """Create a GitManager with backend that reports .git exists."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True  # .git exists → is_active
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        return GitManager(Path("/tmp/ws"), backend=backend), backend
+
+    def test_commit_calls_add_then_commit(self):
+        """commit() runs git add -A then git commit via backend."""
+        gm, backend = self._make_active_gm()
+
+        result = gm.commit("Add research notes")
+
+        assert result is True
+        calls = backend.shell_run.call_args_list
+        # First call: git add -A
+        assert "git add -A" in calls[0][0][0]
+        # Second call: git commit -m ... --allow-empty
+        assert "git commit" in calls[1][0][0]
+        assert "Add research notes" in calls[1][0][0]
+        assert "--allow-empty" in calls[1][0][0]
+
+    def test_commit_without_allow_empty(self):
+        """commit(allow_empty=False) omits --allow-empty flag."""
+        gm, backend = self._make_active_gm()
+
+        gm.commit("Real changes", allow_empty=False)
+
+        commit_call = backend.shell_run.call_args_list[1][0][0]
+        assert "--allow-empty" not in commit_call
+
+    def test_commit_returns_false_on_add_failure(self):
+        """commit() returns False when git add fails."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 1\n--- stdout ---\nfatal: error"
+        )
+
+        result = gm.commit("Should fail")
+        assert result is False
+
+    def test_commit_nothing_to_commit_allow_empty_false(self):
+        """commit(allow_empty=False) returns False on 'nothing to commit'."""
+        gm, backend = self._make_active_gm()
+        # add succeeds, commit says nothing to commit
+        backend.shell_run.side_effect = [
+            "Exit code: 0\n(no output)",  # git add -A
+            "Exit code: 1\n--- stdout ---\nnothing to commit, working tree clean",
+        ]
+
+        result = gm.commit("No changes", allow_empty=False)
+        assert result is False
+
+    def test_commit_message_with_special_chars(self):
+        """commit() properly quotes messages with quotes and special chars."""
+        gm, backend = self._make_active_gm()
+
+        gm.commit("[Phase 1] todo_1: Search for 'Rehabilitation' & $costs")
+
+        commit_call = backend.shell_run.call_args_list[1][0][0]
+        # shlex.quote should wrap the message safely
+        assert "git commit -m" in commit_call
+
+    def test_commit_message_with_newlines(self):
+        """commit() handles multiline commit messages."""
+        gm, backend = self._make_active_gm()
+
+        gm.commit("Line one\nLine two\nLine three")
+
+        commit_call = backend.shell_run.call_args_list[1][0][0]
+        assert "git commit -m" in commit_call
+
+    def test_commit_not_active_returns_false(self):
+        """commit() returns False when git is not active."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False  # .git doesn't exist
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.commit("test")
+        assert result is False
+        backend.shell_run.assert_not_called()
+
+
+class TestGitManagerBackendPush:
+    """Tests for push() via backend."""
+
+    def test_push_delegates_to_backend(self):
+        """push() runs git push via backend shell_run."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            # has_remote → git remote get-url origin
+            "Exit code: 0\n--- stdout ---\nhttps://git.example.com/repo.git",
+            # auto-detect branch → git branch --show-current
+            "Exit code: 0\n--- stdout ---\nmain",
+            # git push -u origin main
+            "Exit code: 0\n(no output)",
+            # git push origin --tags
+            "Exit code: 0\n(no output)",
+        ]
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.push()
+
+        assert result is True
+        push_call = backend.shell_run.call_args_list[2][0][0]
+        assert "git push -u origin main" in push_call
+
+    def test_push_with_120s_timeout(self):
+        """push() uses 120s timeout for the push command."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\nhttps://example.com"
+        )
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        gm.push(branch="main")
+
+        # Find the actual push call (3rd call: after has_remote + branch detect)
+        push_calls = [
+            c for c in backend.shell_run.call_args_list
+            if "git push -u" in c[0][0]
+        ]
+        if push_calls:
+            assert push_calls[0].kwargs["timeout"] == 120
+
+    def test_push_returns_false_on_failure(self):
+        """push() returns False when git push fails."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            "Exit code: 0\n--- stdout ---\nhttps://example.com",  # has_remote
+            "Exit code: 0\n--- stdout ---\nmain",  # branch
+            "Exit code: 1\n--- stdout ---\nfatal: remote rejected",  # push
+        ]
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.push()
+        assert result is False
+
+
+class TestGitManagerBackendLogStatusDiff:
+    """Tests for read-only operations via backend."""
+
+    def _make_active_gm(self):
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        return GitManager(Path("/tmp/ws"), backend=backend), backend
+
+    def test_log_returns_backend_output(self):
+        """log() returns parsed stdout from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\n"
+            "abc1234 Initial commit\ndef5678 Add notes"
+        )
+
+        result = gm.log()
+
+        assert "Initial commit" in result
+        assert "Add notes" in result
+        cmd = backend.shell_run.call_args[0][0]
+        assert "git log" in cmd
+        assert "--oneline" in cmd
+
+    def test_status_returns_backend_output(self):
+        """status() parses porcelain output from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.side_effect = [
+            # git status --porcelain (M_ = staged modified, ?? = untracked)
+            "Exit code: 0\n--- stdout ---\nM  notes/research.md\n?? output/new.md",
+            # git branch --show-current
+            "Exit code: 0\n--- stdout ---\nmain",
+        ]
+
+        result = gm.status()
+
+        assert "main" in result
+        assert "notes/research.md" in result
+        assert "output/new.md" in result
+
+    def test_diff_returns_backend_output(self):
+        """diff() returns parsed diff from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\n"
+            "diff --git a/file.md b/file.md\n+new line"
+        )
+
+        result = gm.diff()
+
+        assert "diff --git" in result
+        assert "+new line" in result
+
+    def test_diff_no_changes(self):
+        """diff() returns 'No differences' when output is empty."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+
+        result = gm.diff()
+        assert "No differences" in result
+
+    def test_show_returns_backend_output(self):
+        """show() returns parsed commit details from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\n"
+            "commit abc1234\nAuthor: Agent\n\n    Add research notes\n\n"
+            "diff --git a/notes/research.md b/notes/research.md"
+        )
+
+        result = gm.show()
+
+        assert "Add research notes" in result
+
+
+class TestGitManagerBackendBranch:
+    """Tests for branch operations via backend."""
+
+    def _make_active_gm(self):
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        return GitManager(Path("/tmp/ws"), backend=backend), backend
+
+    def test_checkout_branch_create(self):
+        """checkout_branch(create=True) creates and checks out branch."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.side_effect = [
+            "Exit code: 0\n(no output)",  # branch --list (not found locally)
+            "Exit code: 0\n(no output)",  # branch -r --list (not found remotely)
+            "Exit code: 0\n(no output)",  # checkout -b new-branch
+        ]
+
+        result = gm.checkout_branch("feature/research", create=True)
+
+        assert result is True
+        checkout_call = backend.shell_run.call_args_list[2][0][0]
+        assert "git checkout -b" in checkout_call
+        assert "feature/research" in checkout_call
+
+    def test_current_branch(self):
+        """current_branch() returns branch name from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\nsubjob/abc123/scholar"
+        )
+
+        result = gm.current_branch()
+
+        assert result == "subjob/abc123/scholar"
+
+
+class TestGitManagerBackendTag:
+    """Tests for tag operations via backend."""
+
+    def _make_active_gm(self):
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        return GitManager(Path("/tmp/ws"), backend=backend), backend
+
+    def test_create_tag(self):
+        """tag() creates a tag via backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+
+        result = gm.tag("phase-1-complete")
+
+        assert result is True
+        cmd = backend.shell_run.call_args[0][0]
+        assert "git tag" in cmd
+        assert "phase-1-complete" in cmd
+
+    def test_list_tags(self):
+        """list_tags() returns tags from backend."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\n"
+            "phase-1-complete\nphase-2-complete\njob-completed"
+        )
+
+        tags = gm.list_tags()
+
+        assert "phase-1-complete" in tags
+        assert "phase-2-complete" in tags
+        assert len(tags) == 3
+
+
+class TestGitManagerBackendFromWorktree:
+    """Tests for from_worktree() with a backend."""
+
+    def test_from_worktree_checks_git_via_backend(self):
+        """from_worktree() checks .git via backend.exists."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+
+        mgr = GitManager.from_worktree(
+            Path("/tmp/wt"), backend=backend
+        )
+
+        assert mgr is not None
+        backend.exists.assert_any_call(".git")
+
+    def test_from_worktree_returns_none_when_no_git(self):
+        """from_worktree() returns None when backend says no .git."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False
+
+        mgr = GitManager.from_worktree(
+            Path("/tmp/wt"), backend=backend
+        )
+
+        assert mgr is None
+
+    def test_from_worktree_with_remote_cwd(self):
+        """from_worktree() checks .git relative to remote_cwd."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+
+        mgr = GitManager.from_worktree(
+            Path("/tmp/wt"),
+            backend=backend,
+            remote_cwd="repos/myrepo",
+        )
+
+        assert mgr is not None
+        backend.exists.assert_any_call("repos/myrepo/.git")
+        assert mgr._remote_cwd == "repos/myrepo"
+
+
+class TestGitManagerBackendInitFullFlow:
+    """Test init_repository full flow through backend."""
+
+    def test_init_full_sequence(self):
+        """init_repository runs init, config, write .gitignore, add, commit."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False  # Not yet initialized
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.init_repository()
+
+        assert result is True
+        cmds = [c[0][0] for c in backend.shell_run.call_args_list]
+        # Verify the sequence: init, config email, config name, add, commit
+        assert cmds[0] == "git init"
+        assert "user.email" in cmds[1]
+        assert "user.name" in cmds[2]
+        assert "git add -A" in cmds[3]
+        assert "git commit" in cmds[4] and "Initialize workspace" in cmds[4]
+        # .gitignore written via backend
+        backend.write_file.assert_called_once()
+
+    def test_init_fails_on_git_init_error(self):
+        """init_repository returns False when git init fails."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = False
+        backend.shell_run.return_value = (
+            "Exit code: 128\n--- stdout ---\nfatal: cannot create"
+        )
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        result = gm.init_repository()
+        assert result is False

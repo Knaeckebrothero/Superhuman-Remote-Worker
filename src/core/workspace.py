@@ -23,9 +23,9 @@ Backend abstraction:
 import logging
 import os
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, List
-from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
     from ..managers.git_manager import GitManager
@@ -247,6 +247,11 @@ class WorkspaceManager:
         """Git managers for source/reference repos, keyed by repo name."""
         return self._source_repos
 
+    @property
+    def _backend_has_shell(self) -> bool:
+        """Check if the workspace backend supports shell execution."""
+        return getattr(self._backend, "supports_shell", False)
+
     def initialize(self) -> None:
         """Initialize the workspace directory structure.
 
@@ -266,7 +271,8 @@ class WorkspaceManager:
         # When we have a remote, clone first (needs empty/non-existent dir),
         # then layer subdirectories on top.
         if self.config.git_versioning and self.config.git_remote_url:
-            self._workspace_path.parent.mkdir(parents=True, exist_ok=True)
+            if not self._backend_has_shell:
+                self._workspace_path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize_git()
             # Create any subdirectories the clone didn't provide
             for subdir in self.config.structure:
@@ -303,7 +309,11 @@ class WorkspaceManager:
 
         if self.config.git_remote_url:
             # Clone from remote so histories stay connected.
-            git_mgr = GitManager.clone(self.config.git_remote_url, self._workspace_path)
+            git_mgr = GitManager.clone(
+                self.config.git_remote_url,
+                self._workspace_path,
+                backend=self._backend,
+            )
             if git_mgr:
                 self._git_manager = git_mgr
                 # Checkout job branch if specified
@@ -320,7 +330,7 @@ class WorkspaceManager:
             logger.warning("Failed to clone remote repo, falling back to git init")
 
         # No remote URL or clone failed: plain git init
-        self._git_manager = GitManager(self._workspace_path)
+        self._git_manager = GitManager(self._workspace_path, backend=self._backend)
         success = self._git_manager.init_repository()
 
         if success:
@@ -366,7 +376,9 @@ class WorkspaceManager:
             from src.managers.git_manager import GitManager
 
         # 1. Clone jobs repo as workspace root
-        git_mgr = GitManager.clone(jobs_repo["repo_url"], self._workspace_path)
+        git_mgr = GitManager.clone(
+            jobs_repo["repo_url"], self._workspace_path, backend=self._backend
+        )
         if not git_mgr:
             logger.warning("Failed to clone jobs repo, falling back to standard init")
             self.initialize()
@@ -406,8 +418,8 @@ class WorkspaceManager:
         except ImportError:
             from src.managers.git_manager import GitManager
 
+        self._backend.mkdir("repos")
         repos_dir = self._workspace_path / "repos"
-        repos_dir.mkdir(exist_ok=True)
 
         for repo in self.config.repositories:
             if repo["role"] == "jobs":
@@ -415,8 +427,9 @@ class WorkspaceManager:
 
             repo_name = repo["name"]
             target = repos_dir / repo_name
+            remote_cwd = f"repos/{repo_name}"
 
-            if target.exists():
+            if self._backend.exists(remote_cwd):
                 logger.debug(f"Repo {repo_name} already cloned, skipping")
                 continue
 
@@ -426,7 +439,12 @@ class WorkspaceManager:
                 continue
 
             try:
-                git_mgr = GitManager.clone(repo_url, target)
+                git_mgr = GitManager.clone(
+                    repo_url,
+                    target,
+                    backend=self._backend,
+                    remote_cwd=remote_cwd,
+                )
                 if git_mgr:
                     branch = repo.get("branch", "main")
                     if branch and branch != "main":
@@ -439,14 +457,16 @@ class WorkspaceManager:
                 logger.warning(f"Error cloning repo {repo_name}: {e}")
 
         # Update .gitignore to exclude repos/ directory
-        gitignore = self._workspace_path / ".gitignore"
-        if gitignore.exists():
-            content = gitignore.read_text()
+        if self._backend.exists(".gitignore"):
+            content = self._backend.read_file(".gitignore")
             if "repos/" not in content:
-                with open(gitignore, "a") as f:
-                    f.write("\n# Cloned project repositories\nrepos/\n")
+                self._backend.append_file(
+                    ".gitignore", "\n# Cloned project repositories\nrepos/\n"
+                )
         else:
-            gitignore.write_text("# Cloned project repositories\nrepos/\n")
+            self._backend.write_file(
+                ".gitignore", "# Cloned project repositories\nrepos/\n"
+            )
 
         if self._git_manager:
             self._git_manager.commit("Add repos/ to .gitignore", allow_empty=False)

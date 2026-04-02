@@ -18,28 +18,26 @@ import functools
 import logging
 from typing import Any, Dict, List
 
-from .context import ToolContext
-
-# Import workspace tools from new package
-from .workspace import create_workspace_tools, get_workspace_metadata
-
-# Import domain tools
-from .document import create_document_tools, get_document_metadata
-from .research import create_research_tools, get_research_metadata
 from .citation import create_citation_tools, get_citation_metadata
-from .graph import create_graph_tools, get_graph_metadata
-from .sql import create_sql_tools, get_sql_metadata
-from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .cloud import create_cloud_tools, get_cloud_metadata
-from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
-from .evaluation import create_evaluation_tools, get_evaluation_metadata
-from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .communication import create_communication_tools, get_communication_metadata
-from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
-
+from .context import ToolContext
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
+from .core.session_task_tools import create_session_task_tools, get_session_task_metadata
+# Import domain tools
+from .document import create_document_tools, get_document_metadata
+from .evaluation import create_evaluation_tools, get_evaluation_metadata
+from .git import create_git_tools, get_git_metadata
+from .graph import create_graph_tools, get_graph_metadata
+from .knowledge import create_knowledge_tools, get_knowledge_metadata
+from .mongodb import create_mongodb_tools, get_mongodb_metadata
+from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
+from .research import create_research_tools, get_research_metadata
+from .sql import create_sql_tools, get_sql_metadata
+# Import workspace tools from new package
+from .workspace import create_workspace_tools, get_workspace_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +66,9 @@ TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
 TOOL_REGISTRY.update(get_orchestrator_metadata())
+
+# Register session task tools (lightweight todos for persistent sessions)
+TOOL_REGISTRY.update(get_session_task_metadata())
 
 # Register delegation tool (placeholder — implementation in Phase 2)
 TOOL_REGISTRY["delegate_work"] = {
@@ -294,6 +295,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             if tool.name in requested:
                 all_tools.append(tool)
                 logger.debug(f"Loaded core tool: {tool.name}")
+
+    # Session task tools (lightweight todos for persistent sessions)
+    if "session_task" in tools_by_category:
+        try:
+            st_tools = create_session_task_tools(context)
+            requested = set(tools_by_category["session_task"])
+            for tool in st_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded session task tool: {tool.name}")
+        except Exception as e:
+            logger.debug(f"Session task tools not available: {e}")
 
     # Document tools
     if "document" in tools_by_category:

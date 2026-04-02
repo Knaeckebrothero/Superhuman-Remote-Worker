@@ -1343,14 +1343,18 @@ class DatasourceCreate(BaseModel):
     """Request body for creating a datasource."""
 
     name: str = Field(..., description="User-provided label")
-    type: str = Field(..., description="Datasource type: postgresql, neo4j, mongodb")
-    connection_url: str = Field(..., description="Full connection string")
+    type: str = Field(
+        ...,
+        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav",
+    )
+    connection_url: str | None = Field(None, description="Connection string (nullable for generic)")
     description: str | None = Field(None, description="What this datasource contains")
     credentials: dict[str, Any] | None = Field(
-        None, description="Additional auth details"
+        None, description="Auth details (env_vars for generic, auth_method+token/ssh_key for repository, type-specific for managed)"
     )
-    read_only: bool = Field(True, description="Whether the agent is allowed to write")
     job_id: str | None = Field(None, description="Job UUID (null for global)")
+    cli_hint: str | None = Field(None, description="Suggested CLI command (e.g. 'psql $DATABASE_URL')")
+    default_branch: str | None = Field(None, description="Branch to clone (repository type)")
 
 
 class DatasourceUpdate(BaseModel):
@@ -1360,7 +1364,15 @@ class DatasourceUpdate(BaseModel):
     description: str | None = Field(None, description="New description")
     connection_url: str | None = Field(None, description="New connection string")
     credentials: dict[str, Any] | None = Field(None, description="New auth details")
-    read_only: bool | None = Field(None, description="New read_only flag")
+    cli_hint: str | None = Field(None, description="New CLI hint")
+    default_branch: str | None = Field(None, description="New default branch")
+
+
+class ProjectDatasourceSettings(BaseModel):
+    """Project-level settings when linking a datasource."""
+
+    read_only: bool | None = Field(None, description="Managed connectors: true = read-only tools, false/null = CLI mode")
+    description: str | None = Field(None, description="Project-specific usage context")
 
 
 class AgentRegistration(BaseModel):
@@ -2335,11 +2347,12 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                         await postgres_db.create_datasource(
                             name=ds["name"],
                             ds_type=ds["type"],
-                            connection_url=ds["connection_url"],
+                            connection_url=ds.get("connection_url"),
                             description=ds.get("description"),
                             credentials=creds if creds else None,
-                            read_only=ds.get("read_only", True),
                             job_id=new_job_id,
+                            cli_hint=ds.get("cli_hint"),
+                            default_branch=ds.get("default_branch"),
                         )
                     else:
                         logger.warning(
@@ -6333,14 +6346,18 @@ def _build_datasource_tool_override(
     for ds_type, tool_info in DS_TOOL_MAP.items():
         category = tool_info["category"]
         if ds_type in attached_types:
-            # Find the datasource to check read_only
             ds = next(d for d in datasources if d["type"] == ds_type)
-            tools = (
-                tool_info["write"]
-                if not ds.get("read_only", True)
-                else tool_info["read"]
-            )
-            tools_override[category] = tools
+            is_read_only = ds.get("project_read_only", False)
+
+            if is_read_only:
+                # Read-only: register read-only tools, no CLI/env vars
+                tools_override[category] = tool_info["read"]
+            elif ds_type == "webdav":
+                # WebDAV always uses tools (no good CLI)
+                tools_override[category] = tool_info["write"]
+            else:
+                # Read-write managed connectors: CLI mode, no custom tools
+                tools_override[category] = []
         else:
             # No datasource attached — strip the category
             tools_override[category] = []
@@ -6355,7 +6372,8 @@ def _build_datasources_payload(
     """Build the datasources payload for sending to the agent.
 
     Strips internal fields (id, job_id, created_at, updated_at) that the
-    agent doesn't need.
+    agent doesn't need. For read-only managed connectors, credentials are
+    withheld (tools hold them internally).
 
     Args:
         resolved_ds: List of resolved datasource dicts from the database
@@ -6366,6 +6384,7 @@ def _build_datasources_payload(
     if not resolved_ds:
         return None
 
+    managed_types = {"postgresql", "neo4j", "mongodb", "webdav"}
     payload = []
     for ds in resolved_ds:
         creds = ds.get("credentials") or {}
@@ -6377,16 +6396,27 @@ def _build_datasources_payload(
             except (json.JSONDecodeError, ValueError):
                 creds = {}
 
-        payload.append(
-            {
-                "type": ds["type"],
-                "name": ds["name"],
-                "description": ds.get("description"),
-                "connection_url": ds["connection_url"],
-                "credentials": creds,
-                "read_only": ds.get("read_only", True),
-            }
-        )
+        is_read_only = ds.get("project_read_only", False)
+        ds_type = ds["type"]
+
+        # Read-only managed connectors: withhold credentials (tools hold them)
+        if ds_type in managed_types and is_read_only:
+            creds = {}
+
+        entry = {
+            "type": ds_type,
+            "name": ds["name"],
+            "description": ds.get("description"),
+            "connection_url": ds.get("connection_url"),
+            "credentials": creds,
+            "project_read_only": is_read_only,
+        }
+        if ds.get("cli_hint"):
+            entry["cli_hint"] = ds["cli_hint"]
+        if ds.get("default_branch"):
+            entry["default_branch"] = ds["default_branch"]
+
+        payload.append(entry)
 
     return payload or None
 
@@ -6491,7 +6521,7 @@ async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
 
     Use job_id=null for global datasources (available to all jobs).
     """
-    valid_types = {"postgresql", "neo4j", "mongodb"}
+    valid_types = {"generic", "repository", "postgresql", "neo4j", "mongodb", "webdav"}
     if body.type not in valid_types:
         raise HTTPException(
             status_code=400,
@@ -6505,8 +6535,9 @@ async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
             connection_url=body.connection_url,
             description=body.description,
             credentials=body.credentials,
-            read_only=body.read_only,
             job_id=body.job_id,
+            cli_hint=body.cli_hint,
+            default_branch=body.default_branch,
         )
     except Exception as e:
         error_msg = str(e)
@@ -6531,12 +6562,22 @@ async def update_datasource(
             description=body.description,
             connection_url=body.connection_url,
             credentials=body.credentials,
-            read_only=body.read_only,
+            cli_hint=body.cli_hint,
+            default_branch=body.default_branch,
         )
         if not success:
             raise HTTPException(
                 status_code=404, detail=f"Datasource '{datasource_id}' not found"
             )
+
+        # Re-sync knowledge entries for all linked projects
+        linked_projects = await postgres_db.list_datasource_projects(datasource_id)
+        if linked_projects:
+            updated_ds = await postgres_db.get_datasource(datasource_id)
+            if updated_ds:
+                for pid in linked_projects:
+                    await _sync_datasource_knowledge(pid, updated_ds)
+
         return {"status": "updated"}
     except HTTPException:
         raise
@@ -6548,6 +6589,11 @@ async def update_datasource(
 async def delete_datasource(datasource_id: str) -> dict[str, str]:
     """Delete a datasource."""
     try:
+        # Clean up knowledge entries for all linked projects before deletion
+        linked_projects = await postgres_db.list_datasource_projects(datasource_id)
+        for pid in linked_projects:
+            await _delete_datasource_knowledge(pid, datasource_id)
+
         success = await postgres_db.delete_datasource(datasource_id)
         if not success:
             raise HTTPException(
@@ -9276,7 +9322,9 @@ async def codex_callback(
         params={"code": code, "state": state},
         timeout=15.0,
     )
-    return resp.json()
+    if resp.content:
+        return resp.json()
+    return {"status": "ok"}
 
 
 @app.delete("/api/codex/credentials/{name}")
@@ -9707,6 +9755,117 @@ async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, 
     return {"status": "removed"}
 
 
+# -- Project Datasources (N:M) -----------------------------------------------
+
+
+@app.get("/api/projects/{project_id}/datasources")
+async def list_project_datasources(project_id: str) -> list[dict[str, Any]]:
+    """List datasources linked to a project."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    try:
+        return await postgres_db.list_project_datasources(project_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/datasources/{datasource_id}")
+async def link_datasource_to_project(
+    project_id: str,
+    datasource_id: str,
+    body: ProjectDatasourceSettings | None = None,
+) -> dict[str, str]:
+    """Link an existing datasource to a project.
+
+    Optionally pass project-level overrides (read_only, description).
+    Also creates a knowledge entry so agents discover the datasource.
+    """
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    ds = await postgres_db.get_datasource(datasource_id)
+    if not ds:
+        raise HTTPException(
+            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+
+    try:
+        await postgres_db.link_datasource_to_project(
+            project_id,
+            datasource_id,
+            read_only=body.read_only if body else None,
+            description=body.description if body else None,
+        )
+        # Build effective datasource dict for KB entry (apply overrides)
+        effective_ds = dict(ds)
+        if body:
+            if body.read_only is not None:
+                effective_ds["project_read_only"] = body.read_only
+            if body.description is not None:
+                effective_ds["description"] = body.description
+        await _sync_datasource_knowledge(project_id, effective_ds)
+        return {"status": "linked"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/projects/{project_id}/datasources/{datasource_id}")
+async def update_project_datasource(
+    project_id: str,
+    datasource_id: str,
+    body: ProjectDatasourceSettings,
+) -> dict[str, str]:
+    """Update project-level settings for a linked datasource.
+
+    Pass null to clear an override and fall back to datasource defaults.
+    """
+    success = await postgres_db.update_project_datasource(
+        project_id,
+        datasource_id,
+        read_only=body.read_only,
+        description=body.description,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Link between project '{project_id}' and datasource '{datasource_id}' not found",
+        )
+
+    # Re-sync knowledge entry with updated overrides
+    ds = await postgres_db.get_datasource(datasource_id)
+    if ds:
+        effective_ds = dict(ds)
+        if body.read_only is not None:
+            effective_ds["project_read_only"] = body.read_only
+        if body.description is not None:
+            effective_ds["description"] = body.description
+        await _sync_datasource_knowledge(project_id, effective_ds)
+
+    return {"status": "updated"}
+
+
+@app.delete("/api/projects/{project_id}/datasources/{datasource_id}")
+async def unlink_datasource_from_project(
+    project_id: str, datasource_id: str
+) -> dict[str, str]:
+    """Unlink a datasource from a project.
+
+    Also removes the knowledge entry.
+    """
+    removed = await postgres_db.unlink_datasource_from_project(
+        project_id, datasource_id
+    )
+    if not removed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Link between project '{project_id}' and datasource '{datasource_id}' not found",
+        )
+
+    await _delete_datasource_knowledge(project_id, datasource_id)
+    return {"status": "unlinked"}
+
+
 @app.post("/api/projects/{project_id}/jobs")
 async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
     """Create a job within a project — delegates to create_job."""
@@ -9965,6 +10124,307 @@ def _get_knowledge_graph():
         logger.warning(f"KnowledgeGraphDB not available: {e}")
         _knowledge_graph_db = None
     return _knowledge_graph_db
+
+
+def _build_datasource_note_content(ds: dict[str, Any]) -> str:
+    """Build markdown content for a datasource knowledge entry.
+
+    Content varies by type and access mode:
+    - generic: lists env var names + CLI hint
+    - repository: cloned path + git usage
+    - managed connectors (read-write): CLI tool + env vars
+    - managed connectors (read-only): available tools list
+    - webdav: always tools
+    """
+    ds_type = ds.get("type", "unknown")
+    ds_name = ds.get("name", "Unnamed")
+    desc = ds.get("description") or ""
+    is_read_only = ds.get("project_read_only", False)
+
+    if ds_type == "generic":
+        return _build_generic_note(ds_name, desc, ds)
+    elif ds_type == "repository":
+        return _build_repository_note(ds_name, desc, ds)
+    elif ds_type == "webdav":
+        return _build_webdav_note(ds_name, desc, is_read_only)
+    elif ds_type in ("postgresql", "neo4j", "mongodb"):
+        if is_read_only:
+            return _build_managed_readonly_note(ds_name, desc, ds_type)
+        else:
+            return _build_managed_readwrite_note(ds_name, desc, ds_type)
+    else:
+        return f"## Datasource: {ds_name}\n{desc}"
+
+
+def _build_generic_note(name: str, desc: str, ds: dict) -> str:
+    """KB entry for generic datasources."""
+    lines = [f"## Datasource: {name}"]
+    if desc:
+        lines.append(desc)
+
+    url = ds.get("connection_url")
+    cli_hint = ds.get("cli_hint")
+    if url or cli_hint:
+        lines.append("\n### Connection")
+        if url:
+            lines.append(f"- **URL:** {url} (credentials via env vars)")
+        if cli_hint:
+            lines.append(f"- **CLI:** `{cli_hint}`")
+
+    creds = ds.get("credentials") or {}
+    if isinstance(creds, str):
+        try:
+            creds = json.loads(creds)
+        except (json.JSONDecodeError, ValueError):
+            creds = {}
+    env_vars = creds.get("env_vars", {})
+    if env_vars:
+        lines.append("\n### Environment Variables")
+        for key in env_vars:
+            lines.append(f"- `{key}` — available in workspace")
+
+    return "\n".join(lines)
+
+
+def _build_repository_note(name: str, desc: str, ds: dict) -> str:
+    """KB entry for repository datasources."""
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    lines = [f"## Repository: {name}"]
+    if desc:
+        lines.append(desc)
+    lines.append("\n### Location")
+    lines.append(f"Cloned to `./repos/{slug}/` — git is pre-authenticated.")
+    lines.append("\n### Usage")
+    lines.append("Use standard git commands:")
+    lines.append(f"- `cd repos/{slug} && git status`")
+    lines.append("- `git pull`, `git commit`, `git push`")
+    lines.append("- No login or credential setup required.")
+    branch = ds.get("default_branch")
+    if branch:
+        lines.append(f"- Default branch: `{branch}`")
+    return "\n".join(lines)
+
+
+def _build_managed_readwrite_note(name: str, desc: str, ds_type: str) -> str:
+    """KB entry for managed connectors in read-write (CLI) mode."""
+    cli_info = {
+        "postgresql": {
+            "tool": "psql",
+            "env_vars": "`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`",
+            "examples": [
+                '`psql -c "SELECT * FROM users LIMIT 10"`',
+                '`psql -c "CREATE TABLE ..."`',
+            ],
+        },
+        "neo4j": {
+            "tool": "cypher-shell",
+            "env_vars": "`NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`",
+            "examples": [
+                '`cypher-shell "MATCH (n) RETURN n LIMIT 10"`',
+                '`cypher-shell "CREATE (n:Label {name: \'test\'})"`',
+            ],
+        },
+        "mongodb": {
+            "tool": "mongosh",
+            "env_vars": "`MONGOSH_URI`",
+            "examples": [
+                '`mongosh --eval "db.users.find().limit(10)"`',
+                '`mongosh --eval "db.users.insertOne({...})"`',
+            ],
+        },
+    }
+    info = cli_info.get(ds_type, {})
+    lines = [
+        f"## Datasource: {name}",
+        f"**Type:** {ds_type} | **Access:** full (CLI)",
+    ]
+    if desc:
+        lines.append(f"\n{desc}")
+    lines.append("\n### Connection")
+    lines.append(f"Use `{info.get('tool', ds_type)}` to connect — credentials are pre-configured via environment variables.")
+    lines.append("\n### Environment Variables")
+    lines.append(f"- {info.get('env_vars', 'Check environment for connection details')} — pre-configured")
+    if info.get("examples"):
+        lines.append("\n### Examples")
+        for ex in info["examples"]:
+            lines.append(f"- {ex}")
+    return "\n".join(lines)
+
+
+def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
+    """KB entry for managed connectors in read-only (tools) mode."""
+    tool_info = {
+        "postgresql": ["- `sql_query` — execute SELECT queries", "- `sql_schema` — inspect tables, columns, types, constraints"],
+        "neo4j": ["- `execute_cypher_query` — execute read-only Cypher queries", "- `get_database_schema` — inspect labels, relationships, properties"],
+        "mongodb": ["- `mongo_query` — document queries with filters", "- `mongo_aggregate` — aggregation pipelines", "- `mongo_schema` — collections, fields, indexes"],
+    }
+    tools = tool_info.get(ds_type, ["- Check available tools for this datasource type"])
+    lines = [
+        f"## Datasource: {name}",
+        f"**Type:** {ds_type} | **Access:** read-only (tools)",
+    ]
+    if desc:
+        lines.append(f"\n{desc}")
+    lines.append("\n### Available Tools")
+    lines.extend(tools)
+    lines.append("\nNo CLI access or write operations available.")
+    return "\n".join(lines)
+
+
+def _build_webdav_note(name: str, desc: str, is_read_only: bool) -> str:
+    """KB entry for WebDAV datasources (always tools)."""
+    access = "read-only" if is_read_only else "read-write"
+    lines = [
+        f"## Datasource: {name}",
+        f"**Type:** webdav | **Access:** {access}",
+    ]
+    if desc:
+        lines.append(f"\n{desc}")
+    lines.append("\n### Available Tools")
+    lines.append("- `cloud_list` — list files and directories")
+    lines.append("- `cloud_read` — read file contents")
+    lines.append("- `cloud_info` — get file metadata")
+    if not is_read_only:
+        lines.append("- `cloud_write` — write/upload files")
+        lines.append("- `cloud_delete` — delete files")
+    return "\n".join(lines)
+
+
+async def _sync_datasource_knowledge(
+    project_id: str, datasource: dict[str, Any]
+) -> None:
+    """Create or update a knowledge entry for a datasource in a project."""
+    ds_id = str(datasource["id"]).replace("-", "")[:8]
+    note_id = f"ds-{ds_id}"
+    ds_name = datasource.get("name", "Unnamed")
+    ds_type = datasource.get("type", "unknown")
+    content = _build_datasource_note_content(datasource)
+
+    if ds_type == "repository":
+        retrieval_messages = [
+            f"{ds_name} repository",
+            f"git repo {ds_name}",
+            f"How to access {ds_name} code",
+            "available repositories",
+        ]
+    elif ds_type == "generic":
+        retrieval_messages = [
+            f"{ds_name} connection",
+            f"How to access {ds_name}",
+            "available datasources",
+        ]
+    else:
+        retrieval_messages = [
+            f"{ds_name} database connection",
+            f"{ds_type} access",
+            f"How do I connect to {ds_name}?",
+            "What databases are available?",
+        ]
+
+    # Write to Neo4j (upsert with deterministic note_id)
+    kg = _get_knowledge_graph()
+    if kg:
+        try:
+            title = f"Datasource: {ds_name} ({ds_type})"
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc).isoformat()
+            kg._db.execute_write(
+                """
+                MERGE (n:Note {project_id: $pid, id: $nid})
+                ON CREATE SET
+                    n.type = 'datasource',
+                    n.title = $title,
+                    n.content = $content,
+                    n.status = 'active',
+                    n.confidence = 'high',
+                    n.retrieval_messages = $retrieval_messages,
+                    n.created = datetime($now),
+                    n.modified = datetime($now)
+                ON MATCH SET
+                    n.title = $title,
+                    n.content = $content,
+                    n.retrieval_messages = $retrieval_messages,
+                    n.modified = datetime($now)
+                """,
+                {
+                    "pid": project_id,
+                    "nid": note_id,
+                    "title": title,
+                    "content": content,
+                    "retrieval_messages": retrieval_messages,
+                    "now": now,
+                },
+            )
+            # Ensure tags exist
+            for tag_name in ["datasource", ds_type]:
+                kg._db.execute_write(
+                    """
+                    MATCH (n:Note {project_id: $pid, id: $nid})
+                    MERGE (t:Tag {name: $tag, project_id: $pid})
+                    MERGE (n)-[:TAGGED]->(t)
+                    """,
+                    {"pid": project_id, "nid": note_id, "tag": tag_name},
+                )
+        except Exception as e:
+            logger.warning(f"Neo4j datasource knowledge sync failed: {e}")
+
+    # Write to pgvector search index
+    try:
+        async with vector_db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO knowledge_index (
+                    note_id, project_id, title, note_type, status,
+                    confidence, tags, content, retrieval_messages, modified_at
+                ) VALUES ($1, $2::uuid, $3, 'datasource', 'active', 'high',
+                          $4::text[], $5, $6::text[], NOW())
+                ON CONFLICT (project_id, note_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    content = EXCLUDED.content,
+                    retrieval_messages = EXCLUDED.retrieval_messages,
+                    tags = EXCLUDED.tags,
+                    modified_at = NOW(),
+                    content_hash = NULL
+                """,
+                note_id,
+                project_id,
+                f"Datasource: {ds_name} ({ds_type})",
+                ["datasource", ds_type],
+                content,
+                retrieval_messages,
+            )
+    except Exception as e:
+        logger.warning(f"pgvector datasource knowledge sync failed: {e}")
+
+
+async def _delete_datasource_knowledge(
+    project_id: str, datasource_id: str
+) -> None:
+    """Remove the knowledge entry for a datasource from a project."""
+    ds_id = datasource_id.replace("-", "")[:8]
+    note_id = f"ds-{ds_id}"
+
+    kg = _get_knowledge_graph()
+    if kg:
+        try:
+            kg._db.execute_write(
+                "MATCH (n:Note {project_id: $pid, id: $nid}) DETACH DELETE n",
+                {"pid": project_id, "nid": note_id},
+            )
+        except Exception as e:
+            logger.warning(f"Neo4j datasource knowledge delete failed: {e}")
+
+    try:
+        async with vector_db.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM knowledge_index WHERE project_id = $1::uuid AND note_id = $2",
+                project_id,
+                note_id,
+            )
+    except Exception as e:
+        logger.warning(f"pgvector datasource knowledge delete failed: {e}")
 
 
 @app.get("/api/projects/{project_id}/knowledge/summary")

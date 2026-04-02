@@ -28,6 +28,15 @@ export interface PermissionRequest {
     args: Record<string, unknown>;
 }
 
+/** A task tracked during the session. */
+export interface SessionTask {
+    id: string;
+    description: string;
+    status: 'pending' | 'in_progress' | 'completed';
+    priority: string;
+    notes: string;
+}
+
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 
@@ -63,11 +72,22 @@ export class PersistentChatService {
     readonly currentTurnId = signal<number | null>(null);
     readonly isWaitingForInput = signal(false);
 
+    // --- Session metadata (loaded from REST on connect) ---
+    readonly sessionTitle = signal<string | null>(null);
+    readonly modelName = signal<string | null>(null);
+    readonly turnCount = signal<number>(0);
+
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
 
     // --- Pending message (submitted before session was ready) ---
     readonly pendingMessage = signal<string | null>(null);
+
+    // --- Session tasks ---
+    readonly tasks = signal<SessionTask[]>([]);
+
+    // --- File undo ---
+    readonly undoAvailable = signal(false);
 
     // --- Error ---
     readonly error = signal<string | null>(null);
@@ -89,15 +109,21 @@ export class PersistentChatService {
         this.historyLoaded.set(false);
         this.sessionReady.set(false);
         this.pendingMessage.set(null);
+        this.sessionTitle.set(null);
+        this.modelName.set(null);
+        this.turnCount.set(0);
+        this.tasks.set([]);
+        this.undoAvailable.set(false);
 
         let url: string;
         if ('directUrl' in target) {
             url = target.directUrl;
             this.threadId.set('local');
         } else {
-            // Load history via REST before opening WS
+            // Load history and metadata via REST before opening WS
             this.threadId.set(target.threadId);
             await this.loadHistory(target.threadId);
+            await this.loadThreadMeta(target.threadId);
 
             // Derive WS URL from API URL
             const apiUrl = environment.apiUrl;
@@ -140,6 +166,21 @@ export class PersistentChatService {
         } catch (e) {
             // History load failure is non-fatal — proceed with empty history
             this.historyLoaded.set(true);
+        }
+    }
+
+    /** Load thread metadata (title, model, turn count) from REST. */
+    private async loadThreadMeta(threadId: string): Promise<void> {
+        try {
+            const thread = await firstValueFrom(
+                this.http.get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`)
+            );
+            this.sessionTitle.set(thread.title || null);
+            const model = thread.metadata?.config_override?.llm?.model;
+            this.modelName.set(model || thread.config_name || null);
+            this.turnCount.set(thread.total_turns || 0);
+        } catch {
+            // Non-fatal — UI will show fallback values
         }
     }
 
@@ -193,6 +234,11 @@ export class PersistentChatService {
         this.sessionReady.set(false);
         this.pendingMessage.set(null);
         this.pendingPermission.set(null);
+        this.sessionTitle.set(null);
+        this.modelName.set(null);
+        this.turnCount.set(0);
+        this.tasks.set([]);
+        this.undoAvailable.set(false);
     }
 
     /** Send a user message (with slash command parsing).
@@ -254,6 +300,12 @@ export class PersistentChatService {
             case '/autonomous':
                 this.setMode('autonomous');
                 return true;
+            case '/undo':
+                this.send({method: 'undo'});
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system', content: 'Undoing last file changes...', timestamp: new Date(),
+                }]);
+                return true;
             default:
                 return false;
         }
@@ -304,6 +356,9 @@ export class PersistentChatService {
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
                 }
+                if (params['turn_count'] != null) {
+                    this.turnCount.set(params['turn_count'] as number);
+                }
                 break;
 
             case 'greeting':
@@ -329,6 +384,7 @@ export class PersistentChatService {
 
             case 'turn.started':
                 this.currentTurnId.set((params['turn_id'] as number) ?? null);
+                this.turnCount.update(c => c + 1);
                 this.isStreaming.set(true);
                 this.streamingText.set('');
                 this.currentToolCalls.set([]);
@@ -376,6 +432,12 @@ export class PersistentChatService {
 
             case 'mode.changed':
                 this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+                break;
+
+            case 'title.updated':
+                if (params['title']) {
+                    this.sessionTitle.set(params['title'] as string);
+                }
                 break;
 
             case 'context.compacted':
@@ -431,6 +493,23 @@ export class PersistentChatService {
                 this.messages.update(msgs => [...msgs, {
                     role: 'system',
                     content: `VM upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+                    timestamp: new Date(),
+                }]);
+                break;
+
+            case 'tasks.updated':
+                this.tasks.set((params['tasks'] as SessionTask[]) || []);
+                break;
+
+            case 'file.checkpoint':
+                this.undoAvailable.set(true);
+                break;
+
+            case 'files.restored':
+                this.undoAvailable.set(false);
+                this.messages.update(msgs => [...msgs, {
+                    role: 'system',
+                    content: `Restored ${(params['paths'] as string[])?.length || 0} file(s) to pre-edit state.`,
                     timestamp: new Date(),
                 }]);
                 break;

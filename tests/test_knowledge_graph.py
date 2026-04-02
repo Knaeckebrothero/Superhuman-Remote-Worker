@@ -56,7 +56,7 @@ class TestConstants:
     """Tests for module-level constant sets."""
 
     def test_note_types_count(self):
-        assert len(NOTE_TYPES) == 9
+        assert len(NOTE_TYPES) == 10
 
     def test_note_types_members(self):
         expected = {
@@ -69,6 +69,7 @@ class TestConstants:
             "question",
             "state",
             "retrospective",
+            "datasource",
         }
         assert NOTE_TYPES == expected
 

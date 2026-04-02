@@ -137,6 +137,7 @@ async def run_persistent_loop(
     project_ids: Optional[List[str]] = None,
     tool_context: Optional[Any] = None,
     initial_turn_count: int = 0,
+    get_current_tools: Optional[Callable[[], tuple]] = None,
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -158,6 +159,9 @@ async def run_persistent_loop(
         knowledge_store: KnowledgeStore instance for knowledge injection
         project_id: Project UUID string for scoped knowledge queries (backward compat)
         project_ids: List of project UUID strings for multi-project sessions
+        get_current_tools: Optional callback returning (llm_with_tools, tools) —
+            called at the start of each turn to pick up tool set changes
+            (e.g. plan mode toggle).
     """
     # Build tool lookup map
     tool_map: Dict[str, Any] = {tool.name: tool for tool in tools}
@@ -184,6 +188,12 @@ async def run_persistent_loop(
     )
 
     while True:
+        # Refresh tools if the session swapped them (e.g. plan mode toggle)
+        if get_current_tools:
+            new_llm, new_tools = get_current_tools()
+            llm_with_tools = new_llm
+            tool_map = {tool.name: tool for tool in new_tools}
+
         # --- Wait for user input ---
         try:
             user_input = await callbacks.get_user_input()

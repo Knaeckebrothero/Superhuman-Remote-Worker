@@ -81,6 +81,12 @@ class PersistentSession:
     # Raw LLM (without tools bound, for summarization fallback)
     _llm: Optional[BaseChatModel] = None
 
+    # Session task manager (lightweight in-session todos)
+    session_task_manager: Optional[Any] = None
+
+    # File checkpoints for undo (turn_id -> list of snapshots)
+    file_checkpoints: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
+
     @property
     def project_id(self) -> Optional[str]:
         """Primary project (first in list) for backward compat."""
@@ -224,6 +230,11 @@ class PersistentSession:
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,
         }
+        # Initialize session task manager
+        from ..managers.session_tasks import SessionTaskManager
+
+        self.session_task_manager = SessionTaskManager()
+
         self.tool_context = ToolContext(
             workspace_manager=self.workspace_manager,
             todo_manager=None,  # No TodoManager in persistent mode
@@ -233,11 +244,22 @@ class PersistentSession:
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
             shell_manager=self.shell_manager,  # Set before tool loading
+            session_task_manager=self.session_task_manager,
+        )
+
+        # Wire file checkpoint callback for undo support
+        self.tool_context._snapshot_callback = lambda path: self.snapshot_file(
+            path, self.turn_count
         )
 
         # Get all tool names and filter out phase-specific ones
         all_names = get_all_tool_names(self.config)
         tool_names = [n for n in all_names if n not in _EXCLUDED_TOOLS]
+
+        # Always include session task tools in persistent mode
+        for name in ["task_add", "task_complete", "task_list"]:
+            if name not in tool_names:
+                tool_names.append(name)
 
         # Always include orchestrator tools in persistent mode (job delegation)
         _ORCHESTRATOR_TOOLS = [
@@ -283,6 +305,44 @@ class PersistentSession:
             bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
 
         self.llm_with_tools = self._llm.bind_tools(self.tools, **bind_kwargs)
+
+    # --- File checkpoints / undo ---
+
+    def snapshot_file(self, path: str, turn_id: int) -> None:
+        """Record original file content before a write/edit for undo."""
+        import time
+
+        if turn_id not in self.file_checkpoints:
+            self.file_checkpoints[turn_id] = []
+        # Don't snapshot same file twice in one turn
+        if any(cp["path"] == path for cp in self.file_checkpoints[turn_id]):
+            return
+        try:
+            content = self.workspace_manager.read_file(path)
+        except (FileNotFoundError, OSError):
+            content = None  # File doesn't exist yet
+        self.file_checkpoints[turn_id].append({
+            "path": path, "original_content": content, "timestamp": time.time(),
+        })
+
+    def undo_turn(self, turn_id: Optional[int] = None) -> List[str]:
+        """Restore files from the given turn's checkpoints. Defaults to latest."""
+        if turn_id is None:
+            if not self.file_checkpoints:
+                return []
+            turn_id = max(self.file_checkpoints.keys())
+        checkpoints = self.file_checkpoints.pop(turn_id, [])
+        restored = []
+        for cp in checkpoints:
+            try:
+                if cp["original_content"] is None:
+                    self.workspace_manager.delete_file(cp["path"])
+                else:
+                    self.workspace_manager.write_file(cp["path"], cp["original_content"])
+                restored.append(cp["path"])
+            except Exception as e:
+                logger.warning(f"Failed to restore {cp['path']}: {e}")
+        return restored
 
     def _setup_context_manager(self) -> None:
         """Create context manager for token counting and compaction."""

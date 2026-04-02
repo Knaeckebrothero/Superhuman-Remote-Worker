@@ -1913,22 +1913,24 @@ class AsyncCockpitClient:
         self,
         name: str,
         ds_type: str,
-        connection_url: str,
+        connection_url: str | None = None,
         description: str | None = None,
         credentials: dict[str, Any] | None = None,
-        read_only: bool = True,
         job_id: str | None = None,
+        cli_hint: str | None = None,
+        default_branch: str | None = None,
     ) -> dict[str, Any]:
         """Create a new datasource.
 
         Args:
             name: User-provided label
-            ds_type: Type (postgresql, neo4j, mongodb)
-            connection_url: Full connection string
+            ds_type: Type (generic, repository, postgresql, neo4j, mongodb, webdav)
+            connection_url: Connection string (nullable for generic)
             description: What this datasource contains
-            credentials: Additional auth details (e.g. username/password for Neo4j)
-            read_only: Whether the agent is allowed to write
+            credentials: Auth details
             job_id: Job UUID for job-scoped, None for global
+            cli_hint: Suggested CLI command
+            default_branch: Branch to clone (repository type)
 
         Returns:
             Created datasource record with ID
@@ -1936,15 +1938,19 @@ class AsyncCockpitClient:
         body: dict[str, Any] = {
             "name": name,
             "type": ds_type,
-            "connection_url": connection_url,
-            "read_only": read_only,
         }
+        if connection_url:
+            body["connection_url"] = connection_url
         if description:
             body["description"] = description
         if credentials:
             body["credentials"] = credentials
         if job_id:
             body["job_id"] = job_id
+        if cli_hint:
+            body["cli_hint"] = cli_hint
+        if default_branch:
+            body["default_branch"] = default_branch
         resp = await self._client.post("/api/datasources", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -1956,7 +1962,8 @@ class AsyncCockpitClient:
         description: str | None = None,
         connection_url: str | None = None,
         credentials: dict[str, Any] | None = None,
-        read_only: bool | None = None,
+        cli_hint: str | None = None,
+        default_branch: str | None = None,
     ) -> dict[str, str]:
         """Update a datasource.
 
@@ -1966,7 +1973,8 @@ class AsyncCockpitClient:
             description: New description
             connection_url: New connection string
             credentials: New auth details
-            read_only: New read-only flag
+            cli_hint: New CLI hint
+            default_branch: New default branch
 
         Returns:
             Status dict
@@ -1980,8 +1988,10 @@ class AsyncCockpitClient:
             body["connection_url"] = connection_url
         if credentials is not None:
             body["credentials"] = credentials
-        if read_only is not None:
-            body["read_only"] = read_only
+        if cli_hint is not None:
+            body["cli_hint"] = cli_hint
+        if default_branch is not None:
+            body["default_branch"] = default_branch
         resp = await self._client.put(f"/api/datasources/{datasource_id}", json=body)
         resp.raise_for_status()
         return resp.json()
@@ -1996,6 +2006,60 @@ class AsyncCockpitClient:
             Status dict
         """
         resp = await self._client.delete(f"/api/datasources/{datasource_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Project ↔ Datasource (N:M)
+    # =========================================================================
+
+    async def list_project_datasources(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        """List datasources linked to a project."""
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/datasources"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def link_datasource_to_project(
+        self, project_id: str, datasource_id: str
+    ) -> dict[str, str]:
+        """Link a datasource to a project."""
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/datasources/{datasource_id}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_project_datasource(
+        self,
+        project_id: str,
+        datasource_id: str,
+        read_only: bool | None = None,
+        description: str | None = None,
+    ) -> dict[str, str]:
+        """Update project-level settings for a linked datasource."""
+        body: dict[str, Any] = {}
+        if read_only is not None:
+            body["read_only"] = read_only
+        if description is not None:
+            body["description"] = description
+        resp = await self._client.patch(
+            f"/api/projects/{project_id}/datasources/{datasource_id}",
+            json=body,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def unlink_datasource_from_project(
+        self, project_id: str, datasource_id: str
+    ) -> dict[str, str]:
+        """Unlink a datasource from a project."""
+        resp = await self._client.delete(
+            f"/api/projects/{project_id}/datasources/{datasource_id}"
+        )
         resp.raise_for_status()
         return resp.json()
 
