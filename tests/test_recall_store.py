@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from src.services.recall_store import MemoryRecord, RecallStore
 
@@ -479,14 +480,14 @@ class TestStats:
 # Integration Tests (require DATABASE_URL)
 # =============================================================================
 
-HAS_DATABASE = bool(os.getenv("DATABASE_URL"))
-
-
-@pytest.mark.skipif(not HAS_DATABASE, reason="DATABASE_URL not set")
+@pytest.mark.skipif(
+    not os.getenv("RUN_INTEGRATION_TESTS"),
+    reason="Set RUN_INTEGRATION_TESTS=1 to run integration tests",
+)
 class TestIntegration:
     """Integration tests requiring a live PostgreSQL database with pgvector."""
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def live_db(self):
         """Create a live database connection."""
         from src.database.postgres_db import PostgresDB
@@ -496,20 +497,18 @@ class TestIntegration:
 
         # Ensure schema exists
         async with db.acquire() as conn:
-            schema_path = (
+            db_dir = (
                 __import__("pathlib").Path(__file__).parent.parent
-                / "src"
+                / "orchestrator"
                 / "database"
-                / "queries"
-                / "postgres"
-                / "schema.sql"
             )
-            await conn.execute(schema_path.read_text())
+            await conn.execute((db_dir / "schema.sql").read_text())
+            await conn.execute((db_dir / "vector_schema.sql").read_text())
 
         yield db
         await db.close()
 
-    @pytest.fixture
+    @pytest_asyncio.fixture
     async def live_store(self, live_db):
         """Create a RecallStore with live database."""
         from src.services.embedding_service import get_embedding_service

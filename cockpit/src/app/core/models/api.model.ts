@@ -73,7 +73,7 @@ export interface ExpertDetail extends Expert {
 /**
  * Supported datasource types.
  */
-export type DatasourceType = 'postgresql' | 'neo4j' | 'mongodb' | 'webdav';
+export type DatasourceType = 'generic' | 'repository' | 'postgresql' | 'neo4j' | 'mongodb' | 'webdav';
 
 /**
  * Datasource configuration from the orchestrator.
@@ -83,9 +83,10 @@ export interface Datasource {
   name: string;
   description: string | null;
   type: DatasourceType;
-  connection_url: string;
+  connection_url: string | null;
   credentials: Record<string, unknown>;
-  read_only: boolean;
+  cli_hint: string | null;
+  default_branch: string | null;
   job_id: string | null;
   created_at: string;
   updated_at: string;
@@ -97,11 +98,12 @@ export interface Datasource {
 export interface DatasourceCreateRequest {
   name: string;
   type: DatasourceType;
-  connection_url: string;
+  connection_url?: string;
   description?: string;
   credentials?: Record<string, unknown>;
-  read_only?: boolean;
   job_id?: string;
+  cli_hint?: string;
+  default_branch?: string;
 }
 
 /**
@@ -112,7 +114,17 @@ export interface DatasourceUpdateRequest {
   description?: string;
   connection_url?: string;
   credentials?: Record<string, unknown>;
-  read_only?: boolean;
+  cli_hint?: string;
+  default_branch?: string;
+}
+
+/**
+ * Datasource linked to a project, with project-level overrides.
+ */
+export interface ProjectDatasource extends Datasource {
+  linked_at: string;
+  project_read_only: boolean | null;
+  project_description: string | null;
 }
 
 /**

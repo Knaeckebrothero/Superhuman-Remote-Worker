@@ -3,8 +3,10 @@
 Tests the new PostgresDB, Neo4jDB, and MongoDB classes.
 """
 
-import pytest
 from unittest.mock import patch
+
+import pytest
+
 from src.database import PostgresDB, Neo4jDB, MongoDB
 
 
@@ -112,8 +114,9 @@ class TestMongoDB:
             assert db._url is None
             assert not db.is_connected
 
-    def test_archive_returns_none_when_not_connected(self):
+    def test_archive_returns_none_when_not_connected(self, monkeypatch):
         """Test that archive operations return None when unavailable."""
+        monkeypatch.delenv("MONGODB_URL", raising=False)
         db = MongoDB(url=None)
 
         result = db.archive_llm_request(
@@ -121,8 +124,9 @@ class TestMongoDB:
         )
         assert result is None
 
-    def test_audit_returns_none_when_not_connected(self):
+    def test_audit_returns_none_when_not_connected(self, monkeypatch):
         """Test that audit operations return None when unavailable."""
+        monkeypatch.delenv("MONGODB_URL", raising=False)
         db = MongoDB(url=None)
 
         result = db.audit_tool_call(
@@ -130,8 +134,9 @@ class TestMongoDB:
         )
         assert result is None
 
-    def test_get_trail_returns_empty_when_not_connected(self):
+    def test_get_trail_returns_empty_when_not_connected(self, monkeypatch):
         """Test that get operations return empty list when unavailable."""
+        monkeypatch.delenv("MONGODB_URL", raising=False)
         db = MongoDB(url=None)
 
         result = db.get_job_audit_trail("test")

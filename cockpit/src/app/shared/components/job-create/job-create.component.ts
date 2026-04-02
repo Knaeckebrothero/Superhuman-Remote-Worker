@@ -599,9 +599,7 @@ import {ConfigEditorComponent} from '../config-editor/config-editor.component';
                             <span class="ds-desc">{{ ds.description }}</span>
                           }
                         </span>
-                        @if (ds.read_only) {
-                          <span class="ds-ro-badge">RO</span>
-                        }
+                        <span class="ds-type-badge">{{ ds.type }}</span>
                       </label>
                     }
                   </div>

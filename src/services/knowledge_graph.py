@@ -54,6 +54,7 @@ NOTE_TYPES = frozenset(
         "question",
         "state",
         "retrospective",
+        "datasource",
     }
 )
 

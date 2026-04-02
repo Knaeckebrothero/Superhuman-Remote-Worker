@@ -2055,25 +2055,28 @@ async def get_project_expert(
 async def create_datasource(
     name: str,
     type: str,
-    connection_url: str,
+    connection_url: str | None = None,
     description: str | None = None,
     credentials: dict[str, Any] | None = None,
-    read_only: bool = True,
     job_id: str | None = None,
+    cli_hint: str | None = None,
+    default_branch: str | None = None,
 ) -> str:
-    """Create a new datasource (PostgreSQL, Neo4j, or MongoDB).
+    """Create a new datasource.
 
+    Types: generic (CLI via env vars), repository (git repo),
+    postgresql, neo4j, mongodb, webdav (managed connectors).
     Use job_id=null for global datasources available to all jobs.
-    Connection URLs are masked in the response for security.
 
     Args:
         name: User-provided label
-        type: Datasource type (postgresql, neo4j, mongodb)
-        connection_url: Full connection string
+        type: Datasource type (generic, repository, postgresql, neo4j, mongodb, webdav)
+        connection_url: Connection string (optional for generic)
         description: What this datasource contains (optional)
-        credentials: Additional auth details (optional)
-        read_only: Restrict agent to read-only access (default true)
+        credentials: Auth details (optional)
         job_id: Job UUID for job-scoped datasource (omit for global)
+        cli_hint: Suggested CLI command (optional, for generic type)
+        default_branch: Branch to clone (optional, for repository type)
 
     Returns:
         Created datasource summary with masked URL
@@ -2085,8 +2088,9 @@ async def create_datasource(
         connection_url=connection_url,
         description=description,
         credentials=credentials,
-        read_only=read_only,
         job_id=job_id,
+        cli_hint=cli_hint,
+        default_branch=default_branch,
     )
     return fmt.format_created_datasource(result)
 
@@ -2098,7 +2102,8 @@ async def update_datasource(
     description: str | None = None,
     connection_url: str | None = None,
     credentials: dict[str, Any] | None = None,
-    read_only: bool | None = None,
+    cli_hint: str | None = None,
+    default_branch: str | None = None,
 ) -> str:
     """Update an existing datasource's connection details or metadata.
 
@@ -2110,7 +2115,8 @@ async def update_datasource(
         description: New description (optional)
         connection_url: New connection string (optional)
         credentials: New auth details (optional)
-        read_only: New read-only flag (optional)
+        cli_hint: New CLI hint (optional)
+        default_branch: New default branch (optional)
 
     Returns:
         Update confirmation
@@ -2122,7 +2128,8 @@ async def update_datasource(
         description=description,
         connection_url=connection_url,
         credentials=credentials,
-        read_only=read_only,
+        cli_hint=cli_hint,
+        default_branch=default_branch,
     )
     status = result.get("status", "unknown")
     return f"Datasource {datasource_id} updated ({status})."
@@ -2144,6 +2151,73 @@ async def delete_datasource(datasource_id: str) -> str:
     result = await client.delete_datasource(datasource_id)
     status = result.get("status", "unknown")
     return f"Datasource {datasource_id} deleted ({status})."
+
+
+# =============================================================================
+# Project ↔ Datasource (N:M)
+# =============================================================================
+
+
+@mcp.tool
+async def list_project_datasources(project_id: str) -> str:
+    """List datasources linked to a project.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Formatted datasource list
+    """
+    client = _get_client()
+    datasources = await client.list_project_datasources(project_id)
+    if not datasources:
+        return f"No datasources linked to project {project_id}."
+    return fmt.format_datasources(datasources)
+
+
+@mcp.tool
+async def link_datasource_to_project(
+    project_id: str, datasource_id: str
+) -> str:
+    """Link a datasource to a project.
+
+    Creates a knowledge entry so agents can discover the datasource
+    through the project's knowledge base.
+
+    Args:
+        project_id: Project UUID
+        datasource_id: Datasource UUID
+
+    Returns:
+        Link confirmation
+    """
+    client = _get_client()
+    result = await client.link_datasource_to_project(project_id, datasource_id)
+    status = result.get("status", "unknown")
+    return f"Datasource {datasource_id} linked to project {project_id} ({status})."
+
+
+@mcp.tool
+async def unlink_datasource_from_project(
+    project_id: str, datasource_id: str
+) -> str:
+    """Unlink a datasource from a project.
+
+    Removes the corresponding knowledge entry.
+
+    Args:
+        project_id: Project UUID
+        datasource_id: Datasource UUID
+
+    Returns:
+        Unlink confirmation
+    """
+    client = _get_client()
+    result = await client.unlink_datasource_from_project(
+        project_id, datasource_id
+    )
+    status = result.get("status", "unknown")
+    return f"Datasource {datasource_id} unlinked from project {project_id} ({status})."
 
 
 # =============================================================================

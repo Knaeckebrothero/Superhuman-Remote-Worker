@@ -1,23 +1,25 @@
-import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
-import { ActivatedRoute, Router } from '@angular/router';
-import { ApiService } from '../../core/services/api.service';
-import { UserService } from '../../core/services/user.service';
-import { SidebarToggleComponent } from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {ActivatedRoute, Router} from '@angular/router';
+import {ApiService} from '../../core/services/api.service';
+import {UserService} from '../../core/services/user.service';
+import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 import {
-  Project,
-  ProjectMember,
-  ProjectRepository,
-  Job,
-  User,
-  Expert,
-  ProjectRepoRole,
-  ProjectMemberRole,
-  KnowledgeNote,
-  KnowledgeNoteDetail,
-  KnowledgeSummary,
+    Datasource,
+    Expert,
+    Job,
+    KnowledgeNote,
+    KnowledgeNoteDetail,
+    KnowledgeSummary,
+    Project,
+    ProjectDatasource,
+    ProjectMember,
+    ProjectMemberRole,
+    ProjectRepoRole,
+    ProjectRepository,
+    User,
 } from '../../core/models/api.model';
 
-type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' | 'settings';
+type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'experts' | 'members' | 'settings';
 
 @Component({
   selector: 'app-project-detail-page',
@@ -100,6 +102,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' |
                 <div class="stat-card">
                   <span class="stat-value">{{ jobs().length }}</span>
                   <span class="stat-label">Jobs</span>
+                </div>
+                <div class="stat-card">
+                  <span class="stat-value">{{ projectDatasources().length }}</span>
+                  <span class="stat-label">Data Sources</span>
                 </div>
                 <div class="stat-card">
                   <span class="stat-value">{{ repos().length }}</span>
@@ -330,6 +336,82 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' |
                     </div>
                   }
                 }
+              }
+            </div>
+          }
+
+          <!-- DATASOURCES TAB -->
+          @if (activeTab() === 'datasources') {
+            <div class="table-section">
+              <!-- Link Datasource Form -->
+              <div class="inline-form">
+                <select
+                  class="form-input-sm"
+                  [value]="dsLinkId()"
+                  (change)="dsLinkId.set(asInputValue($event))"
+                >
+                  <option value="">Select a datasource...</option>
+                  @for (ds of availableDatasources(); track ds.id) {
+                    <option [value]="ds.id">{{ ds.name }} ({{ ds.type }})</option>
+                  }
+                </select>
+                <button
+                  class="btn btn-primary btn-sm"
+                  [disabled]="!dsLinkId()"
+                  (click)="linkDatasource()"
+                >
+                  Link
+                </button>
+              </div>
+
+              @if (projectDatasources().length === 0) {
+                <div class="empty-inline">No datasources linked to this project</div>
+              } @else {
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Project Description</th>
+                      <th>Access</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (ds of projectDatasources(); track ds.id) {
+                      <tr>
+                        <td>{{ ds.name }}</td>
+                        <td>
+                          <span class="role-badge" [class]="'role-' + ds.type">{{ ds.type }}</span>
+                        </td>
+                        <td>
+                          <input
+                            class="form-input-sm"
+                            [value]="ds.project_description || ds.description || ''"
+                            placeholder="Usage context for this project..."
+                            (change)="updateDatasourceDescription(ds.id, asInputValue($event))"
+                          />
+                        </td>
+                        <td>
+                          <select
+                            class="form-input-sm"
+                            [value]="ds.project_read_only != null ? ds.project_read_only : ''"
+                            (change)="updateDatasourceReadOnly(ds.id, asInputValue($event))"
+                          >
+                            <option value="">Default (Read-write)</option>
+                            <option value="true">Read-only</option>
+                            <option value="false">Read-write</option>
+                          </select>
+                        </td>
+                        <td>
+                          <button class="action-btn delete" (click)="unlinkDatasource(ds.id)">
+                            Unlink
+                          </button>
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
               }
             </div>
           }
@@ -1406,6 +1488,16 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     return this.allUsers().filter((u) => !memberIds.has(u.id));
   });
 
+  // Datasources tab
+  readonly projectDatasources = signal<ProjectDatasource[]>([]);
+  readonly allDatasources = signal<Datasource[]>([]);
+  readonly dsLinkId = signal('');
+
+  readonly availableDatasources = computed(() => {
+    const linked = new Set(this.projectDatasources().map((d) => d.id));
+    return this.allDatasources().filter((d) => !linked.has(d.id));
+  });
+
   // Experts tab
   readonly projectExperts = signal<Expert[]>([]);
   readonly isLoadingExperts = signal(false);
@@ -1440,6 +1532,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     { id: 'overview', label: 'Overview' },
     { id: 'jobs', label: 'Jobs' },
     { id: 'knowledge', label: 'Knowledge' },
+    { id: 'datasources', label: 'Data Sources' },
     { id: 'repos', label: 'Repos' },
     { id: 'experts', label: 'Experts' },
     { id: 'members', label: 'Members' },
@@ -1490,6 +1583,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.loadRepos();
     this.loadMembers();
     this.loadExperts();
+    this.loadProjectDatasources();
     this.loadKBSummary();
   }
 
@@ -1513,6 +1607,45 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.isLoadingExperts.set(false);
       },
       error: () => this.isLoadingExperts.set(false),
+    });
+  }
+
+  // Datasources
+  loadProjectDatasources(): void {
+    this.api.getProjectDatasources(this.projectId).subscribe((ds) => this.projectDatasources.set(ds));
+    this.api.getDatasources().subscribe((ds) => this.allDatasources.set(ds));
+  }
+
+  linkDatasource(): void {
+    const dsId = this.dsLinkId();
+    if (!dsId) return;
+    this.api.linkProjectDatasource(this.projectId, dsId).subscribe((res) => {
+      if (res) {
+        this.dsLinkId.set('');
+        this.loadProjectDatasources();
+      }
+    });
+  }
+
+  unlinkDatasource(datasourceId: string): void {
+    this.api.unlinkProjectDatasource(this.projectId, datasourceId).subscribe((res) => {
+      if (res) {
+        this.loadProjectDatasources();
+      }
+    });
+  }
+
+  updateDatasourceReadOnly(datasourceId: string, value: string): void {
+    const readOnly = value === '' ? null : value === 'true';
+    this.api.updateProjectDatasource(this.projectId, datasourceId, { read_only: readOnly }).subscribe((res) => {
+      if (res) this.loadProjectDatasources();
+    });
+  }
+
+  updateDatasourceDescription(datasourceId: string, value: string): void {
+    const desc = value.trim() || null;
+    this.api.updateProjectDatasource(this.projectId, datasourceId, { description: desc }).subscribe((res) => {
+      if (res) this.loadProjectDatasources();
     });
   }
 

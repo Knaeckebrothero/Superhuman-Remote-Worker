@@ -80,6 +80,7 @@ class ToolContext:
     )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
+    session_task_manager: Optional[Any] = None  # SessionTaskManager (persistent session todos)
     knowledge_graph: Optional[Any] = (
         None  # KnowledgeGraphDB (system Neo4j for knowledge base)
     )
@@ -93,6 +94,9 @@ class ToolContext:
     )  # Sync-safe memory queue
     _freeze_request: Optional[Dict[str, Any]] = (
         None  # Tool-requested job freeze (blocking send_message)
+    )
+    _snapshot_callback: Optional[Any] = (
+        None  # Callable[[str], None] — pre-write file snapshot for undo
     )
 
     def __post_init__(self):

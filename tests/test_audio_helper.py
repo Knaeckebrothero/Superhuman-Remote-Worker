@@ -35,6 +35,9 @@ from src.services.audio_helper import (
 def mock_env(monkeypatch):
     """Set up minimal environment for AudioHelper."""
     monkeypatch.setenv("OPENAI_API_KEY", "test-key-123")
+    monkeypatch.delenv("WHISPER_API_KEY", raising=False)
+    monkeypatch.delenv("WHISPER_BASE_URL", raising=False)
+    monkeypatch.delenv("WHISPER_MODEL", raising=False)
 
 
 @pytest.fixture

@@ -1,12 +1,13 @@
-import {Component, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {FormsModule} from '@angular/forms';
 import {HttpClient} from '@angular/common/http';
-import {DatePipe} from '@angular/common';
+import {DatePipe, TitleCasePipe} from '@angular/common';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ToastService} from '../../../core/services/toast.service';
+import {UserService} from '../../../core/services/user.service';
 
 interface Thread {
     id: string;
@@ -32,7 +33,7 @@ interface Project {
 @Component({
     selector: 'app-sessions-page',
     standalone: true,
-    imports: [FormsModule, DatePipe],
+    imports: [FormsModule, DatePipe, TitleCasePipe],
     template: `
     <div class="sessions-page">
       <div class="page-header">
@@ -47,8 +48,8 @@ interface Project {
         </div>
       </div>
 
-      <!-- Active session banner -->
-      @if (chat.isConnected()) {
+      <!-- Active session banner (hidden when filtering to ended sessions) -->
+      @if (chat.isConnected() && statusFilter() !== 'ended') {
         <div class="active-banner" (click)="returnToActive()">
           <span class="active-dot"></span>
           <span>Active session in progress</span>
@@ -100,7 +101,8 @@ interface Project {
               </optgroup>
               <optgroup label="OpenAI">
                 <option value="gpt-5.4">GPT-5.4</option>
-                <option value="codex/gpt-5.4">GPT-5.4 (Codex)</option>
+                <option value="codex/gpt-5.3-codex">Codex (coding)</option>
+                <option value="codex/gpt-5.3-codex-spark">Codex Spark (ultra-fast)</option>
               </optgroup>
               <optgroup label="Anthropic">
                 <option value="claude-opus-4-6">Claude Opus 4.6</option>
@@ -162,18 +164,30 @@ interface Project {
               class="filter-tab"
               [class.active]="statusFilter() === null"
               (click)="statusFilter.set(null)"
-            >All</button>
+            >All ({{ threads().length }})</button>
             <button
               class="filter-tab"
               [class.active]="statusFilter() === 'active'"
               (click)="statusFilter.set('active')"
-            >Active</button>
+            >Active ({{ activeCount() }})</button>
             <button
               class="filter-tab"
               [class.active]="statusFilter() === 'ended'"
               (click)="statusFilter.set('ended')"
-            >Ended</button>
+            >Ended ({{ endedCount() }})</button>
           </div>
+
+          @if (filteredThreads().length === 0) {
+            <div class="filter-empty">
+              @if (statusFilter() === 'active') {
+                <span class="empty-icon">check_circle</span>
+                <p>No active sessions.</p>
+              } @else if (statusFilter() === 'ended') {
+                <span class="empty-icon">history</span>
+                <p>No ended sessions.</p>
+              }
+            </div>
+          }
 
           @for (thread of filteredThreads(); track thread.id) {
             <div class="session-card" [class.ended]="thread.status === 'ended'">
@@ -181,10 +195,10 @@ interface Project {
                 <div class="session-info">
                   <span class="session-status-dot" [class]="thread.status"></span>
                   <span class="session-title">{{ thread.title || 'Untitled Session' }}</span>
-                  <span class="session-config">{{ thread.config_name }}</span>
+                  <span class="session-config">{{ thread.config_name | titlecase }}</span>
                 </div>
                 <div class="session-meta">
-                  <span class="meta-item">{{ thread.total_turns || 0 }} turns</span>
+                  <span class="meta-item">{{ thread.total_turns || 0 }} {{ (thread.total_turns || 0) === 1 ? 'turn' : 'turns' }}</span>
                   <span class="meta-item">{{ thread.last_activity | date:'short' }}</span>
                 </div>
               </div>
@@ -561,12 +575,20 @@ interface Project {
       margin-bottom: 12px;
       opacity: 0.3;
     }
+
+    .filter-empty {
+      text-align: center;
+      padding: 32px;
+      color: var(--text-muted, #6c7086);
+      font-size: 13px;
+    }
   `],
 })
 export class SessionsPageComponent implements OnInit {
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
     private readonly toast = inject(ToastService);
+    private readonly userService = inject(UserService);
     readonly chat = inject(PersistentChatService);
 
     threads = signal<Thread[]>([]);
@@ -591,6 +613,9 @@ export class SessionsPageComponent implements OnInit {
         return all.filter(t => t.status === filter);
     };
 
+    readonly activeCount = computed(() => this.threads().filter(t => t.status !== 'ended').length);
+    readonly endedCount = computed(() => this.threads().filter(t => t.status === 'ended').length);
+
     ngOnInit(): void {
         this.loadThreads();
         this.loadProjects();
@@ -611,8 +636,10 @@ export class SessionsPageComponent implements OnInit {
 
     async loadProjects(): Promise<void> {
         try {
+            const userId = this.userService.currentUserId();
+            const params = userId ? `?user_id=${userId}` : '';
             const data = await firstValueFrom(
-                this.http.get<Project[]>(`${environment.apiUrl}/projects`)
+                this.http.get<Project[]>(`${environment.apiUrl}/projects${params}`)
             );
             this.projects.set(data || []);
         } catch (e) {
@@ -653,8 +680,9 @@ export class SessionsPageComponent implements OnInit {
             this.newModel = '';
             this.selectedProjectIds.set([]);
             this.router.navigate(['/sessions', data.thread_id]);
-        } catch (e) {
-            // Handle error
+        } catch (e: any) {
+            console.error('Failed to create session:', e);
+            this.toast.error(e?.error?.detail || 'Failed to create session');
         }
         this.creating.set(false);
     }
@@ -675,6 +703,7 @@ export class SessionsPageComponent implements OnInit {
     }
 
     async endSession(thread: Thread): Promise<void> {
+        if (!confirm('End this session? Work will be saved but the agent will stop.')) return;
         try {
             await firstValueFrom(
                 this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}`)
