@@ -807,10 +807,14 @@ async def _save_turn_ai_messages(
             raw_type = getattr(msg, "type", "unknown")
             # Normalize LangChain chunk types: AIMessageChunk → ai, etc.
             _role_map = {
-                "ai": "ai", "AIMessageChunk": "ai",
-                "human": "human", "HumanMessageChunk": "human",
-                "tool": "tool", "ToolMessageChunk": "tool",
-                "system": "system", "SystemMessageChunk": "system",
+                "ai": "ai",
+                "AIMessageChunk": "ai",
+                "human": "human",
+                "HumanMessageChunk": "human",
+                "tool": "tool",
+                "ToolMessageChunk": "tool",
+                "system": "system",
+                "SystemMessageChunk": "system",
             }
             role = _role_map.get(raw_type, raw_type)
             content = msg.content if hasattr(msg, "content") else None

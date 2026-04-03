@@ -98,9 +98,7 @@ def _start_remote_chromium(backend, downloads_path: str) -> str:
         " --remote-debugging-address=0.0.0.0"
         " --user-data-dir=/tmp/chromium-cdp-profile"
     )
-    backend.exec_command(
-        f"nohup {cmd} > /tmp/chromium-cdp.log 2>&1 &", timeout=10
-    )
+    backend.exec_command(f"nohup {cmd} > /tmp/chromium-cdp.log 2>&1 &", timeout=10)
 
     # Poll for the CDP WebSocket URL
     for attempt in range(10):
@@ -113,17 +111,14 @@ def _start_remote_chromium(backend, downloads_path: str) -> str:
                 data = json.loads(output)
                 ws_url = data["webSocketDebuggerUrl"]
                 # Replace loopback with actual host so agent pod can reach it
-                ws_url = ws_url.replace("localhost", host).replace(
-                    "127.0.0.1", host
-                )
+                ws_url = ws_url.replace("localhost", host).replace("127.0.0.1", host)
                 logger.info(f"Remote Chromium ready at {ws_url}")
                 return ws_url
         except Exception:
             continue
 
     raise RuntimeError(
-        f"Chromium failed to start on {host}:{CDP_PORT} "
-        f"(checked {10} times over 5s)"
+        f"Chromium failed to start on {host}:{CDP_PORT} (checked {10} times over 5s)"
     )
 
 
@@ -399,15 +394,12 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
             else:
                 dest_dir = _get_documents_dir(context)
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                browser_kwargs = _get_browser_config(
-                    context, downloads_path=dest_dir
-                )
+                browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
 
             browser = Browser(**browser_kwargs)
 
             full_task = (
-                f"Go to {url} and {download_task}. "
-                f"Wait for the download to complete."
+                f"Go to {url} and {download_task}. Wait for the download to complete."
             )
             agent = Agent(
                 task=full_task,
@@ -427,9 +419,7 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
                     rel_path = new_files[0]
                     file_size = backend.stat(rel_path)
                     file_name = Path(rel_path).name
-                    _register_downloaded_file(
-                        context, rel_path, name=file_name
-                    )
+                    _register_downloaded_file(context, rel_path, name=file_name)
                     return (
                         f"Downloaded file: {file_name}\n"
                         f"Path: {rel_path}\n"

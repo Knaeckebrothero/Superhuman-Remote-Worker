@@ -427,7 +427,9 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 body=pvc_manifest,
             )
-            logger.info("PVC created: %s (storageClass=%s)", pvc_name, self._storage_class)
+            logger.info(
+                "PVC created: %s (storageClass=%s)", pvc_name, self._storage_class
+            )
             return True
         except Exception as e:
             if hasattr(e, "status") and e.status == 409:

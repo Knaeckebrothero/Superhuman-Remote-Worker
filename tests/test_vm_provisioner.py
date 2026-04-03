@@ -528,7 +528,9 @@ class TestTemplateRendering:
             == "8Gi"
         )
         assert (
-            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"][
+                "url"
+            ]
             == "docker://ghcr.io/example/vm:v1"
         )
         assert result["spec"]["config"]["agentConfig"] == "scholar"

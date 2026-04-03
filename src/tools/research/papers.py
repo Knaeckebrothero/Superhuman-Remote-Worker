@@ -90,7 +90,9 @@ def _get_local_documents_dir(context: ToolContext) -> Path:
     return context.workspace_manager.get_path("documents")
 
 
-def _transfer_to_workspace(context: ToolContext, local_path: Path, dest_rel: str) -> str:
+def _transfer_to_workspace(
+    context: ToolContext, local_path: Path, dest_rel: str
+) -> str:
     """Transfer a local file to the workspace and return the workspace-relative path.
 
     Args:
@@ -193,7 +195,9 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
                             f"Path: {ws_path}\n"
                             f"Source: Unpaywall (OA copy)"
                         )
-                    elif result.paper and result.paper.access_status.value == "paywalled":
+                    elif (
+                        result.paper and result.paper.access_status.value == "paywalled"
+                    ):
                         paywalled_title = result.paper.title
                     elif result.error:
                         logger.debug(f"Unpaywall download failed: {result.error}")
