@@ -79,6 +79,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
         yarn
 
 # ---------------------------------------------------------------------------
+# 2b. Chromium (headless browser for CDP-based remote automation)
+# ---------------------------------------------------------------------------
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    chromium-browser \
+    fonts-liberation \
+    fonts-noto-core \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
 # 3. code-server (IDE)
 # ---------------------------------------------------------------------------
 RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_amd64.deb" \
@@ -170,6 +179,6 @@ RUN chown -R agent-host:agent-host /home/agent-host/.config
 COPY docker/workspace-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-EXPOSE 22 8080
+EXPOSE 22 8080 9222
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

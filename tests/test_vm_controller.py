@@ -101,6 +101,20 @@ metadata:
   labels:
     job-id: ${JOB_ID}
 spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: agent-vm-${JOB_ID}-rootdisk
+      spec:
+        storage:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: ${VM_STORAGE_CLASS}
+          resources:
+            requests:
+              storage: ${VM_DISK_SIZE}
+        source:
+          registry:
+            url: docker://${VM_IMAGE}
   template:
     spec:
       domain:
@@ -110,8 +124,8 @@ spec:
           guest: ${MEMORY}
       volumes:
         - name: rootdisk
-          containerDisk:
-            image: ${VM_IMAGE}
+          dataVolume:
+            name: agent-vm-${JOB_ID}-rootdisk
         - name: cloud-init
           cloudInitNoCloud:
             userData: |
@@ -278,8 +292,8 @@ class TestRenderTemplate:
         assert spec["domain"]["cpu"]["cores"] == 4
         assert spec["domain"]["memory"]["guest"] == "8Gi"
         assert (
-            spec["volumes"][0]["containerDisk"]["image"]
-            == SAMPLE_JOB_CONFIG["vm_image"]
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            == f"docker://{SAMPLE_JOB_CONFIG['vm_image']}"
         )
 
         user_data = spec["volumes"][1]["cloudInitNoCloud"]["userData"]
@@ -303,7 +317,10 @@ class TestRenderTemplate:
         spec = result["spec"]["template"]["spec"]
         assert spec["domain"]["cpu"]["cores"] == 2
         assert spec["domain"]["memory"]["guest"] == "4Gi"
-        assert spec["volumes"][0]["containerDisk"]["image"] == "default-image:v1"
+        assert (
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            == "docker://default-image:v1"
+        )
 
     def test_render_default_agent_config(self, controller):
         """agent_config defaults to 'defaults' when not specified."""

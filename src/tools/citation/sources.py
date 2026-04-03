@@ -969,18 +969,15 @@ Similarity Score: {similarity}
                 )
                 return header + "\n" + bibliography
 
-            # Write to file in workspace
+            # Write to file in workspace (uses backend abstraction for remote support)
             if workspace is None:
                 return "Error: no workspace available for file output"
-
-            resolved = workspace.get_path(output_path)
-            resolved.parent.mkdir(parents=True, exist_ok=True)
 
             new_count = len(entries)
             skipped = 0
 
-            if resolved.exists():
-                existing_content = resolved.read_text(encoding="utf-8")
+            if workspace.exists(output_path):
+                existing_content = workspace.read_file(output_path)
 
                 if effective_style == "bibtex":
                     # Extract existing BibTeX keys to avoid duplicates
@@ -996,8 +993,7 @@ Similarity Score: {similarity}
 
                     if new_entries:
                         append_text = "\n\n" + "\n\n".join(new_entries)
-                        with open(resolved, "a", encoding="utf-8") as f:
-                            f.write(append_text)
+                        workspace.append_file(output_path, append_text)
                 else:
                     # For non-bibtex styles, use exact string matching
                     existing_entries = set(existing_content.strip().split("\n\n"))
@@ -1011,16 +1007,14 @@ Similarity Score: {similarity}
 
                     if new_entries:
                         append_text = "\n\n" + "\n\n".join(new_entries)
-                        with open(resolved, "a", encoding="utf-8") as f:
-                            f.write(append_text)
+                        workspace.append_file(output_path, append_text)
 
                 return (
                     f"Updated {output_path}: {new_count} new entries appended, "
                     f"{skipped} duplicates skipped"
                 )
             else:
-                with open(resolved, "w", encoding="utf-8") as f:
-                    f.write(bibliography + "\n")
+                workspace.write_file(output_path, bibliography + "\n")
                 return f"Written {output_path}: {len(entries)} entries ({effective_style} style)"
 
         except Exception as e:

@@ -4,12 +4,17 @@ Provides tools for navigating websites and downloading files using
 AI-driven browser automation. Supports both DOM-based (text-only LLM)
 and vision-based (multimodal LLM) modes.
 
-Requires: pip install browser-use playwright
-          playwright install chromium
+When the workspace uses a remote backend (container pod or VM), Chromium
+is started on the workspace and controlled via CDP over the network.
+Downloads land directly on the workspace filesystem.
+
+Requires: pip install browser-use
 """
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +23,8 @@ from langchain_core.tools import tool
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+CDP_PORT = 9222
 
 
 BROWSER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
@@ -38,6 +45,137 @@ BROWSER_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "phases": ["tactical"],
     },
 }
+
+
+# ── Remote Chromium lifecycle ─────────────────────────────────────────
+
+
+def _is_remote_browser(context: ToolContext) -> bool:
+    """Check if browser should run on the remote workspace."""
+    browser_config = context.config.get("browser", {})
+    remote_mode = browser_config.get("remote", "auto")
+    if remote_mode == "local":
+        return False
+
+    if not context.has_workspace():
+        return False
+
+    backend = context.workspace_manager.backend
+    return backend.host is not None
+
+
+def _start_remote_chromium(backend, downloads_path: str) -> str:
+    """Start Chromium on the remote workspace and return the CDP URL.
+
+    Kills any leftover Chromium, starts a fresh headless instance with
+    ``--remote-debugging-port``, and polls until the CDP endpoint is ready.
+
+    Args:
+        backend: WorkspaceBackend with exec_command and host.
+        downloads_path: Absolute path on the remote host for downloads.
+
+    Returns:
+        CDP WebSocket URL (e.g. ``ws://10.42.0.50:9222/devtools/browser/...``).
+
+    Raises:
+        RuntimeError: If Chromium fails to start within the timeout.
+    """
+    host = backend.host
+
+    # Kill any existing Chromium (idempotent)
+    backend.exec_command(
+        "pkill -f 'chromium.*remote-debugging-port' || true", timeout=5
+    )
+
+    # Start Chromium headless with CDP
+    cmd = (
+        "chromium-browser"
+        " --headless=new"
+        " --no-sandbox"
+        " --disable-gpu"
+        " --disable-dev-shm-usage"
+        f" --remote-debugging-port={CDP_PORT}"
+        " --remote-debugging-address=0.0.0.0"
+        " --user-data-dir=/tmp/chromium-cdp-profile"
+    )
+    backend.exec_command(
+        f"nohup {cmd} > /tmp/chromium-cdp.log 2>&1 &", timeout=10
+    )
+
+    # Poll for the CDP WebSocket URL
+    for attempt in range(10):
+        time.sleep(0.5)
+        try:
+            output = backend.exec_command(
+                f"curl -s http://localhost:{CDP_PORT}/json/version", timeout=5
+            )
+            if "webSocketDebuggerUrl" in output:
+                data = json.loads(output)
+                ws_url = data["webSocketDebuggerUrl"]
+                # Replace loopback with actual host so agent pod can reach it
+                ws_url = ws_url.replace("localhost", host).replace(
+                    "127.0.0.1", host
+                )
+                logger.info(f"Remote Chromium ready at {ws_url}")
+                return ws_url
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        f"Chromium failed to start on {host}:{CDP_PORT} "
+        f"(checked {10} times over 5s)"
+    )
+
+
+def _stop_remote_chromium(backend) -> None:
+    """Stop Chromium on the remote workspace."""
+    try:
+        backend.exec_command(
+            "pkill -f 'chromium.*remote-debugging-port' || true", timeout=5
+        )
+    except Exception:
+        pass
+
+
+def _find_new_files_remote(
+    backend, relative_dir: str, max_age_seconds: int = 120
+) -> List[str]:
+    """Find recently created files on a remote workspace.
+
+    Args:
+        backend: WorkspaceBackend with exec_command.
+        relative_dir: Directory relative to workspace root.
+        max_age_seconds: Maximum file age.
+
+    Returns:
+        List of workspace-relative paths, newest first.
+    """
+    try:
+        abs_dir = backend.resolve_path(relative_dir)
+        minutes = max(max_age_seconds / 60, 0.1)
+        output = backend.exec_command(
+            f"find {abs_dir} -maxdepth 1 -type f "
+            f"-mmin -{minutes:.1f} -printf '%T@ %p\\n' 2>/dev/null | sort -rn",
+            timeout=10,
+        )
+        files = []
+        root = backend.root.rstrip("/")
+        for line in output.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = line.split(" ", 1)
+            if len(parts) == 2:
+                abs_path = parts[1]
+                if abs_path.startswith(root):
+                    rel = abs_path[len(root) :].lstrip("/")
+                    files.append(rel)
+        return files
+    except Exception as e:
+        logger.debug(f"Remote file scan failed: {e}")
+        return []
+
+
+# ── LLM + config helpers ─────────────────────────────────────────────
 
 
 def _get_browser_llm():
@@ -74,21 +212,36 @@ def _get_browser_config(
 ) -> Dict[str, Any]:
     """Build browser configuration kwargs.
 
-    Reads settings from agent config (extra.browser section) and env vars.
+    For remote backends: starts Chromium on the workspace and returns a
+    ``cdp_url`` for Browser() to connect to.
+    For local backends: returns headless/downloads config (existing behavior).
 
     Args:
-        context: ToolContext with config
-        downloads_path: Override download directory
+        context: ToolContext with config and workspace_manager.
+        downloads_path: Override download directory (local mode only).
 
     Returns:
-        Dict of kwargs for Browser() constructor
+        Dict of kwargs for Browser() constructor. Contains either
+        ``cdp_url`` (remote) or ``headless``/``downloads_path`` (local).
     """
     from .utils.network import ProxyConfig
 
-    # Get browser config from agent config extras
     browser_config = context.config.get("browser", {})
 
-    # Headless mode: config -> env -> default True
+    # ── Remote browser (workspace pod / VM) ──
+    if _is_remote_browser(context):
+        backend = context.workspace_manager.backend
+        remote_docs = backend.resolve_path("documents")
+
+        # Ensure documents dir exists on remote
+        backend.mkdir("documents")
+
+        cdp_url = _start_remote_chromium(backend, remote_docs)
+
+        kwargs: Dict[str, Any] = {"cdp_url": cdp_url}
+        return kwargs
+
+    # ── Local browser (existing behavior) ──
     headless_env = os.getenv("BROWSER_HEADLESS", "").lower()
     if headless_env in ("true", "1", "yes"):
         headless = True
@@ -97,7 +250,6 @@ def _get_browser_config(
     else:
         headless = browser_config.get("headless", True)
 
-    # Downloads directory
     if downloads_path is None:
         if context.has_workspace():
             downloads_path = context.workspace_manager.get_path("documents")
@@ -107,14 +259,14 @@ def _get_browser_config(
     # Ensure downloads directory exists
     downloads_path.mkdir(parents=True, exist_ok=True)
 
-    kwargs: Dict[str, Any] = {
+    kwargs = {
         "headless": headless,
         "accept_downloads": True,
         "downloads_path": str(downloads_path),
         "auto_download_pdfs": True,
     }
 
-    # Proxy configuration (uses browser-use ProxySettings)
+    # Proxy configuration (local browser only — remote Chromium handles its own network)
     proxy_config_data = context.config.get("research", {}).get("proxy", {})
     proxy = ProxyConfig.from_config(proxy_config_data)
     if proxy.is_configured:
@@ -133,6 +285,9 @@ def _get_documents_dir(context: ToolContext) -> Path:
     if context.has_workspace():
         return context.workspace_manager.get_path("documents")
     return Path("./downloads")
+
+
+# ── Tool factory ──────────────────────────────────────────────────────
 
 
 def create_browser_tools(context: ToolContext) -> List[Any]:
@@ -170,22 +325,17 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
         except ImportError:
             return (
                 "Error: browser-use package not installed.\n"
-                "Install with: pip install browser-use && playwright install chromium"
+                "Install with: pip install browser-use"
             )
 
+        remote = _is_remote_browser(context)
         browser = None
         try:
-            # Create LLM for browser agent
             llm = _get_browser_llm()
-
-            # Configure browser
             browser_kwargs = _get_browser_config(context)
             browser = Browser(**browser_kwargs)
 
-            # Build full task with starting URL
             full_task = f"Go to {url} and {task}"
-
-            # Create and run browser agent
             agent = Agent(
                 task=full_task,
                 llm=llm,
@@ -195,8 +345,6 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
             )
 
             history = await agent.run()
-
-            # Extract final result from history
             result = _extract_result(history)
             return result
 
@@ -209,6 +357,8 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
                     await browser.stop()
                 except Exception:
                     pass
+            if remote:
+                _stop_remote_chromium(context.workspace_manager.backend)
 
     @tool
     async def download_from_website(
@@ -236,50 +386,70 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
         except ImportError:
             return (
                 "Error: browser-use package not installed.\n"
-                "Install with: pip install browser-use && playwright install chromium"
+                "Install with: pip install browser-use"
             )
 
-        dest_dir = _get_documents_dir(context)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
+        remote = _is_remote_browser(context)
         browser = None
         try:
-            # Create LLM for browser agent
             llm = _get_browser_llm()
 
-            # Configure browser with downloads path
-            browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
+            if remote:
+                browser_kwargs = _get_browser_config(context)
+            else:
+                dest_dir = _get_documents_dir(context)
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                browser_kwargs = _get_browser_config(
+                    context, downloads_path=dest_dir
+                )
+
             browser = Browser(**browser_kwargs)
 
-            # Build download task
             full_task = (
-                f"Go to {url} and {download_task}. Wait for the download to complete."
+                f"Go to {url} and {download_task}. "
+                f"Wait for the download to complete."
             )
-
-            # Create and run browser agent
             agent = Agent(
                 task=full_task,
                 llm=llm,
                 browser=browser,
-                use_vision=False,  # DOM-based is more reliable for downloads
+                use_vision=False,
                 max_actions_per_step=4,
             )
 
             history = await agent.run()
 
             # Check for downloaded files
-            downloaded_files = _find_new_files(dest_dir)
-            if downloaded_files:
-                # Register the first downloaded file as a citation source
-                downloaded_path = downloaded_files[0]
-                _register_downloaded_file(context, downloaded_path)
-                return (
-                    f"Downloaded file: {downloaded_path.name}\n"
-                    f"Path: {downloaded_path}\n"
-                    f"Size: {downloaded_path.stat().st_size:,} bytes"
-                )
+            if remote:
+                backend = context.workspace_manager.backend
+                new_files = _find_new_files_remote(backend, "documents")
+                if new_files:
+                    rel_path = new_files[0]
+                    file_size = backend.stat(rel_path)
+                    file_name = Path(rel_path).name
+                    _register_downloaded_file(
+                        context, rel_path, name=file_name
+                    )
+                    return (
+                        f"Downloaded file: {file_name}\n"
+                        f"Path: {rel_path}\n"
+                        f"Size: {file_size:,} bytes"
+                    )
+            else:
+                downloaded_files = _find_new_files(dest_dir)
+                if downloaded_files:
+                    downloaded_path = downloaded_files[0]
+                    _register_downloaded_file(
+                        context,
+                        str(downloaded_path),
+                        name=downloaded_path.name,
+                    )
+                    return (
+                        f"Downloaded file: {downloaded_path.name}\n"
+                        f"Path: {downloaded_path}\n"
+                        f"Size: {downloaded_path.stat().st_size:,} bytes"
+                    )
 
-            # No files found - return what the agent reported
             result = _extract_result(history)
             return f"Download may have failed. Agent report:\n{result}"
 
@@ -292,8 +462,13 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
                     await browser.stop()
                 except Exception:
                     pass
+            if remote:
+                _stop_remote_chromium(context.workspace_manager.backend)
 
     return [browse_website, download_from_website]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _extract_result(history) -> str:
@@ -341,7 +516,7 @@ def _extract_result(history) -> str:
 
 
 def _find_new_files(directory: Path, max_age_seconds: int = 60) -> List[Path]:
-    """Find recently created files in directory.
+    """Find recently created files in a local directory.
 
     Args:
         directory: Directory to scan
@@ -350,8 +525,6 @@ def _find_new_files(directory: Path, max_age_seconds: int = 60) -> List[Path]:
     Returns:
         List of recently created file paths, sorted by modification time (newest first)
     """
-    import time
-
     now = time.time()
     new_files = []
 
@@ -365,19 +538,25 @@ def _find_new_files(directory: Path, max_age_seconds: int = 60) -> List[Path]:
     return sorted(new_files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _register_downloaded_file(context: ToolContext, file_path: Path) -> None:
+def _register_downloaded_file(
+    context: ToolContext, file_path: str, name: str = ""
+) -> None:
     """Register a downloaded file as a citation source.
 
+    Works for both local paths and workspace-relative paths (remote).
+
     Args:
-        context: ToolContext with citation engine
-        file_path: Path to the downloaded file
+        context: ToolContext with citation engine.
+        file_path: Path to the file (absolute local or workspace-relative).
+        name: Display name for the citation source.
     """
     try:
         source_id = context.get_or_register_doc_source(
-            str(file_path), name=file_path.name
+            file_path, name=name or Path(file_path).name
         )
         logger.info(
-            f"Registered downloaded file as citation source {source_id}: {file_path.name}"
+            f"Registered downloaded file as citation source {source_id}: "
+            f"{name or file_path}"
         )
     except Exception as e:
         logger.debug(f"Could not register downloaded file as citation source: {e}")

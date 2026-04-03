@@ -720,6 +720,8 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         if not project_ids:
             return "Error: No project_id available."
 
+        workspace = context.workspace_manager if context.has_workspace() else None
+
         try:
             notes = []
             for pid in project_ids:
@@ -727,8 +729,10 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             if not notes:
                 return "Knowledge base is empty — nothing to export."
 
-            export_dir = Path(path)
-            export_dir.mkdir(parents=True, exist_ok=True)
+            # Ensure export directory exists via workspace backend
+            export_rel = path.rstrip("/")
+            if workspace is not None:
+                workspace.create_directory(export_rel)
 
             exported = 0
             for note in notes:
@@ -777,7 +781,16 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
                         body_lines.append(f"**{rel_type}:** {links}")
 
                 file_content = "\n".join(fm_lines) + "\n".join(body_lines) + "\n"
-                (export_dir / filename).write_text(file_content)
+                file_rel = f"{export_rel}/{filename}"
+
+                if workspace is not None:
+                    workspace.write_file(file_rel, file_content)
+                else:
+                    # Fallback: no workspace, write locally
+                    local_path = Path(file_rel)
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_text(file_content)
+
                 exported += 1
 
             return (

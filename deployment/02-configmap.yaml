@@ -24,6 +24,7 @@ data:
 
   # Workspace
   WORKSPACE_PATH: "/workspace"
+  WORKSPACE_STORAGE_CLASS: "longhorn-ephemeral"
 
   # Agent
   AGENT_CONFIG: "defaults"

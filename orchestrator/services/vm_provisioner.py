@@ -162,6 +162,9 @@ class VMProvisioner:
             "${MEMORY}": job_config.get("memory", "4Gi"),
             "${NATS_URL}": job_config.get("nats_url", ""),
             "${DESCRIPTION}": job_config.get("description", ""),
+            # CDI DataVolume storage
+            "${VM_STORAGE_CLASS}": os.environ.get("VM_STORAGE_CLASS", "local-path"),
+            "${VM_DISK_SIZE}": os.environ.get("VM_DISK_SIZE", "20Gi"),
         }
 
         rendered = self._template_text

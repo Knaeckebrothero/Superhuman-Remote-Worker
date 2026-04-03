@@ -147,9 +147,9 @@ export class PersistentChatService {
 
             if (resp.messages?.length) {
                 const historical: ChatMessage[] = resp.messages
-                    .filter(m => m.role === 'user' || m.role === 'ai' || m.role === 'assistant' || m.role === 'human')
+                    .filter(m => ['user', 'human', 'HumanMessageChunk', 'ai', 'assistant', 'AIMessageChunk'].includes(m.role))
                     .map(m => ({
-                        role: (m.role === 'human' || m.role === 'user') ? 'user' as const : 'assistant' as const,
+                        role: ['human', 'user', 'HumanMessageChunk'].includes(m.role) ? 'user' as const : 'assistant' as const,
                         content: m.content || '',
                         toolCalls: m.tool_calls?.map(tc => ({
                             id: tc.id || '',

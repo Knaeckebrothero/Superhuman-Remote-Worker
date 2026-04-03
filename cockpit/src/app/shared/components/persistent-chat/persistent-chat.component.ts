@@ -1347,6 +1347,30 @@ const SLASH_COMMANDS: SlashCommand[] = [
         color: var(--text-secondary, #a6adc8);
       }
 
+      .message-body ::ng-deep ul,
+      .message-body ::ng-deep ol {
+        margin: 6px 0;
+        padding-left: 20px;
+      }
+
+      .message-body ::ng-deep ul {
+        list-style-type: disc;
+      }
+
+      .message-body ::ng-deep ol {
+        list-style-type: decimal;
+      }
+
+      .message-body ::ng-deep li {
+        margin: 3px 0;
+        line-height: 1.5;
+      }
+
+      .message-body ::ng-deep li > ul,
+      .message-body ::ng-deep li > ol {
+        margin: 2px 0;
+      }
+
       .message-body ::ng-deep .citation-web {
         color: var(--accent-color, #cba6f7);
         text-decoration: underline dotted;

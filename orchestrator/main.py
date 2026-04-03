@@ -1144,44 +1144,73 @@ async def _try_dispatch_pending_jobs() -> None:
             if not pending_jobs:
                 return
 
-            # Pre-filter: auto-provision VMs for jobs that need one
+            # Pre-filter: auto-provision VMs/containers for jobs that need one
             dispatchable_jobs = []
             for job in pending_jobs:
                 job_id = str(job["id"])
                 if _job_needs_vm(job):
                     vm_ctx = _get_vm_context(job)
                     if not vm_ctx.get("status"):
-                        # VM needed but not provisioned yet — provision now
-                        if vm_provisioner.is_available:
-                            config_override = job.get("config_override") or {}
-                            if isinstance(config_override, str):
-                                config_override = json.loads(config_override)
-                            vm_cfg = config_override.get("workspace", {}).get("vm", {})
-                            ok = await vm_provisioner.create_vm(
-                                job_id=job_id,
-                                agent_config=job.get("config_name", "defaults"),
-                                vm_image=vm_cfg.get("image"),
-                                cpu_cores=vm_cfg.get("cpu_cores", 2),
-                                memory=vm_cfg.get("memory", "4Gi"),
-                                description=job.get("description", ""),
+                        # VM needed but not provisioned yet
+                        if not vm_provisioner.is_available:
+                            # VM explicitly requested but no provisioner — fail
+                            logger.error(
+                                "Dispatcher: job %s requires VM workspace but VM "
+                                "provisioner is not available (no NATS or KubeVirt). "
+                                "Failing job.",
+                                job_id,
                             )
-                            if ok:
-                                logger.info(
-                                    f"Dispatcher: auto-provisioned VM for job {job_id}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Dispatcher: VM provisioning failed for job {job_id}"
-                                )
+                            await postgres_db.update_job_status(
+                                job_id,
+                                status="failed",
+                                error_message=(
+                                    "VM workspace requested but VM provisioner is not "
+                                    "available. This deployment has no NATS or KubeVirt "
+                                    "configured. Use workspace.backend='container' or "
+                                    "remove the explicit backend override."
+                                ),
+                            )
+                            continue
+                        config_override = job.get("config_override") or {}
+                        if isinstance(config_override, str):
+                            config_override = json.loads(config_override)
+                        vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                        ok = await vm_provisioner.create_vm(
+                            job_id=job_id,
+                            agent_config=job.get("config_name", "defaults"),
+                            vm_image=vm_cfg.get("image"),
+                            cpu_cores=vm_cfg.get("cpu_cores", 2),
+                            memory=vm_cfg.get("memory", "4Gi"),
+                            description=job.get("description", ""),
+                        )
+                        if ok:
+                            logger.info(
+                                "Dispatcher: auto-provisioned VM for job %s",
+                                job_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Dispatcher: VM provisioning failed for job %s",
+                                job_id,
+                            )
                         continue  # Skip this job — wait for VM to register
                     elif vm_ctx.get("status") not in ("ready",):
                         # VM is provisioning/creating — skip, wait
                         continue
                     # else: VM is ready, proceed with dispatch
+                    logger.info(
+                        "Dispatcher: job %s using VM workspace", job_id
+                    )
                 elif _job_needs_container(job):
                     container_ctx = _get_container_context(job)
-                    if not container_ctx.get("status"):
+                    container_status = container_ctx.get("status")
+                    if not container_status:
                         # Container needed but not provisioned — provision now
+                        logger.info(
+                            "Dispatcher: job %s provisioning workspace container "
+                            "(VM not available or not requested)",
+                            job_id,
+                        )
                         config_override = job.get("config_override") or {}
                         if isinstance(config_override, str):
                             config_override = json.loads(config_override)
@@ -1198,30 +1227,73 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         if ok:
                             logger.info(
-                                f"Dispatcher: auto-provisioned workspace container for job {job_id}"
+                                "Dispatcher: auto-provisioned workspace container for job %s",
+                                job_id,
                             )
                         else:
-                            logger.warning(
-                                f"Dispatcher: workspace container provisioning failed for job {job_id}"
+                            logger.error(
+                                "Dispatcher: workspace container provisioning failed "
+                                "for job %s. Failing job.",
+                                job_id,
+                            )
+                            await postgres_db.update_job_status(
+                                job_id,
+                                status="failed",
+                                error_message=(
+                                    "Workspace container could not be created. "
+                                    "Check orchestrator logs for details (image pull "
+                                    "failures, insufficient resources, RBAC issues)."
+                                ),
                             )
                         continue  # Skip — wait for container to become ready
-                    elif container_ctx.get("status") == "suspended":
+                    elif container_status == "suspended":
                         # Container was suspended to S3 — restore it
                         asyncio.create_task(
                             workspace_suspension_service.restore_workspace(job_id)
                         )
                         continue
-                    elif container_ctx.get("status") in (
+                    elif container_status in (
                         "restoring",
                         "suspending",
                         "creating",
                     ):
                         # In-progress lifecycle operation — wait
                         continue
-                    elif container_ctx.get("status") not in ("ready",):
-                        # Unknown or failed status — skip
+                    elif container_status == "failed":
+                        # Provisioning failed — fail the job with the error
+                        error = container_ctx.get("error", "unknown error")
+                        logger.error(
+                            "Dispatcher: workspace container failed for job %s: %s. "
+                            "Failing job.",
+                            job_id,
+                            error,
+                        )
+                        await postgres_db.update_job_status(
+                            job_id,
+                            status="failed",
+                            error_message=(
+                                f"Workspace container failed: {error}"
+                            ),
+                        )
+                        continue
+                    elif container_status != "ready":
+                        # Unknown status — log and skip
+                        logger.warning(
+                            "Dispatcher: job %s has unexpected workspace container "
+                            "status '%s' — skipping",
+                            job_id,
+                            container_status,
+                        )
                         continue
                     # else: container is ready, proceed with dispatch
+                    logger.info(
+                        "Dispatcher: job %s using workspace container", job_id
+                    )
+                else:
+                    logger.info(
+                        "Dispatcher: job %s using local workspace (no provisioner)",
+                        job_id,
+                    )
                 dispatchable_jobs.append(job)
 
             if not dispatchable_jobs:
@@ -2579,6 +2651,7 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             None,
         ):
             await container_provisioner.delete_workspace(job_id)
+            await container_provisioner.delete_workspace_pvc(job_id)
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -5336,6 +5409,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 None,
             ):
                 await container_provisioner.delete_workspace(job_id)
+                await container_provisioner.delete_workspace_pvc(job_id)
                 actions.append("workspace container deletion requested")
 
         return {
@@ -7792,8 +7866,25 @@ async def create_thread(
 
         # Provision workspace container in background if K8s is available
         if container_provisioner.is_available:
-            asyncio.create_task(
-                container_provisioner.create_thread_workspace(thread_id)
+
+            async def _provision_thread_workspace(tid: str) -> None:
+                ok = await container_provisioner.create_thread_workspace(tid)
+                if not ok:
+                    logger.error(
+                        "Thread %s: workspace container provisioning failed. "
+                        "Check image availability, RBAC, and node resources.",
+                        tid,
+                    )
+
+            asyncio.create_task(_provision_thread_workspace(thread_id))
+        else:
+            logger.warning(
+                "Thread %s: workspace container not provisioned — "
+                "container provisioner unavailable (no K8s). "
+                "Start the agent manually: python agent.py --mode persistent "
+                "--thread-id %s",
+                thread_id,
+                thread_id,
             )
 
         # Provision persistent agent pod in background
@@ -7801,10 +7892,28 @@ async def create_thread(
             effective_config = request_body.config_name or user_settings.get(
                 "config_name", "interactive"
             )
-            asyncio.create_task(
-                persistent_provisioner.create_agent_pod(
-                    thread_id, config_name=effective_config
+
+            async def _provision_agent_pod(tid: str, cfg: str) -> None:
+                ok = await persistent_provisioner.create_agent_pod(
+                    tid, config_name=cfg
                 )
+                if not ok:
+                    logger.error(
+                        "Thread %s: persistent agent pod provisioning failed. "
+                        "Check image availability, RBAC, and node resources.",
+                        tid,
+                    )
+
+            asyncio.create_task(
+                _provision_agent_pod(thread_id, effective_config)
+            )
+        else:
+            logger.warning(
+                "Thread %s: persistent agent pod not provisioned — "
+                "K8s unavailable. Start the agent manually: python agent.py "
+                "--mode persistent --thread-id %s",
+                thread_id,
+                thread_id,
             )
 
         return {"thread_id": thread_id, "status": "created"}
@@ -7887,10 +7996,12 @@ async def end_thread(
     # Clean up workspace container if one was provisioned
     if container_provisioner.is_available:
         await container_provisioner.delete_thread_workspace(thread_id)
+        await container_provisioner.delete_thread_workspace_pvc(thread_id)
 
     # Clean up persistent agent pod
     if persistent_provisioner.is_available:
         await persistent_provisioner.delete_agent_pod(thread_id)
+        await persistent_provisioner.delete_agent_pvc(thread_id)
 
     # Clean up VM if one was provisioned
     vm_ctx = metadata.get("vm") or {}
@@ -8154,7 +8265,18 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         except (json.JSONDecodeError, TypeError):
             metadata = {}
     ws_ctx = metadata.get("workspace_container") or {}
-    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
+    ws_status = ws_ctx.get("status")
+    if ws_status == "failed":
+        error = ws_ctx.get("error", "unknown error")
+        logger.error(
+            "Thread %s workspace container failed: %s", thread_id, error
+        )
+        await ws.close(
+            code=4503,
+            reason=f"Workspace container failed: {error}",
+        )
+        return
+    if ws_status == "suspended" and workspace_suspension_service.is_enabled:
         logger.info("Restoring suspended workspace for thread %s", thread_id)
         ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
         if not ok:
