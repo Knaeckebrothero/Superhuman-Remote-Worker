@@ -494,7 +494,6 @@ class TestStartRemoteChromium:
 
         # Make exec_command return empty for the curl polls
         call_count = [0]
-        original_side_effect = None
 
         def side_effect(cmd, timeout=30):
             call_count[0] += 1
