@@ -1,0 +1,56 @@
+# Cockpit env.js local patch: localhost URLs + imagePullPolicy
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srw-cockpit-env
+  namespace: superhuman-remote-worker
+data:
+  env.js: |
+    (function(window) {
+      window['env'] = window['env'] || {};
+      window['env']['apiUrl'] = 'http://localhost:8085/api';
+      window['env']['giteaUrl'] = 'http://localhost:3000/srw';
+      window['env']['dozzleUrl'] = 'http://localhost:9999';
+      window['env']['minioConsoleUrl'] = 'http://localhost:9001';
+      window['env']['neo4jUrl'] = 'http://localhost:7474';
+      window['env']['pgadminUrl'] = 'http://localhost:5050';
+      window['env']['mongoExpressUrl'] = 'http://localhost:8081';
+      window['env']['mcpUrl'] = 'http://localhost:8055/mcp';
+
+      // Keycloak SSO
+      window['env']['keycloakUrl'] = 'http://localhost:8180';
+      window['env']['keycloakRealm'] = 'srw';
+      window['env']['keycloakClientId'] = 'cockpit';
+
+      // Available models
+      window['env']['models'] = [
+        { group: 'OpenAI', models: ['gpt-4o-mini', 'gpt-4o'] },
+        { group: 'Anthropic', models: ['claude-sonnet-4-5-20250929', 'claude-opus-4-6'] },
+        { group: 'Google', models: ['gemini-2.5-pro', 'gemini-2.5-flash'] },
+        { group: 'Groq', models: ['groq/moonshotai/kimi-k2-instruct-0905'] },
+      ];
+
+      window['env']['modelPresets'] = [
+        { label: 'Opus + Sonnet', strategic: 'claude-opus-4-6', tactical: 'claude-sonnet-4-5-20250929' },
+        { label: 'Gemini Pro + Flash', strategic: 'gemini-2.5-pro', tactical: 'gemini-2.5-flash' },
+        { label: 'GPT-4o (both)', strategic: 'gpt-4o', tactical: 'gpt-4o-mini' },
+      ];
+
+      window['env']['builderModels'] = [
+        { label: 'GPT-4o Mini', id: 'gpt-4o-mini' },
+        { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
+        { label: 'Gemini 2.5 Pro', id: 'gemini-2.5-pro' },
+      ];
+    })(this);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-cockpit
+  namespace: superhuman-remote-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: cockpit
+          imagePullPolicy: IfNotPresent

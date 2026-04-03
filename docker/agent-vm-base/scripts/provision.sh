@@ -65,7 +65,10 @@ sudo apt-get install -y \
     python3 \
     python3-venv \
     python3-dev \
-    python3-pip
+    python3-pip \
+    chromium-browser \
+    fonts-liberation \
+    fonts-noto-core
 
 # -----------------------------------------------------------------------------
 # 2. Tailscale (mesh VPN — joins Headscale tailnet at VM boot via cloud-init)

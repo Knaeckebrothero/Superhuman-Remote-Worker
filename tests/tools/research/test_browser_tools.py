@@ -423,6 +423,187 @@ class TestCreateBrowserTools:
         assert "failed" in result.lower() or "error" in result.lower()
 
 
+# ── Remote browser (CDP) tests ────────────────────────────────────
+
+
+class TestIsRemoteBrowser:
+    """Tests for _is_remote_browser detection."""
+
+    def test_returns_true_for_remote_backend(self, mock_remote_tool_context):
+        from src.tools.research.browser import _is_remote_browser
+
+        assert _is_remote_browser(mock_remote_tool_context) is True
+
+    def test_returns_false_for_local_backend(self, mock_tool_context):
+        from src.tools.research.browser import _is_remote_browser
+
+        mock_tool_context.config = {"browser": {}}
+        assert _is_remote_browser(mock_tool_context) is False
+
+    def test_returns_false_when_forced_local(self, mock_remote_tool_context):
+        from src.tools.research.browser import _is_remote_browser
+
+        mock_remote_tool_context.config = {"browser": {"remote": "local"}}
+        assert _is_remote_browser(mock_remote_tool_context) is False
+
+    def test_returns_false_without_workspace(self):
+        from src.tools.context import ToolContext
+        from src.tools.research.browser import _is_remote_browser
+
+        ctx = MagicMock(spec=ToolContext)
+        ctx.has_workspace.return_value = False
+        ctx.config = {"browser": {}}
+        assert _is_remote_browser(ctx) is False
+
+
+class TestStartRemoteChromium:
+    """Tests for _start_remote_chromium lifecycle."""
+
+    def test_starts_chromium_and_returns_ws_url(self, mock_remote_backend):
+        from src.tools.research.browser import _start_remote_chromium
+
+        url = _start_remote_chromium(
+            mock_remote_backend,
+            "/home/agent-host/workspace/job_abc123/documents",
+        )
+
+        assert url.startswith("ws://10.42.0.50:9222/")
+        assert "abc-def" in url
+
+        # Verify pkill was called first (cleanup)
+        first_call = mock_remote_backend.exec_command.call_args_list[0]
+        assert "pkill" in first_call[0][0]
+
+        # Verify chromium-browser was started
+        second_call = mock_remote_backend.exec_command.call_args_list[1]
+        assert "chromium-browser" in second_call[0][0]
+        assert "--remote-debugging-port=9222" in second_call[0][0]
+        assert "--headless=new" in second_call[0][0]
+
+    def test_replaces_localhost_with_host(self, mock_remote_backend):
+        from src.tools.research.browser import _start_remote_chromium
+
+        url = _start_remote_chromium(mock_remote_backend, "/tmp/docs")
+
+        assert "127.0.0.1" not in url
+        assert "localhost" not in url
+        assert "10.42.0.50" in url
+
+    def test_raises_on_timeout(self, mock_remote_backend):
+        from src.tools.research.browser import _start_remote_chromium
+
+        # Make exec_command return empty for the curl polls
+        call_count = [0]
+        original_side_effect = None
+
+        def side_effect(cmd, timeout=30):
+            call_count[0] += 1
+            if "pkill" in cmd or "nohup" in cmd:
+                return ""
+            # curl polls return nothing useful
+            return ""
+
+        mock_remote_backend.exec_command = MagicMock(side_effect=side_effect)
+
+        with pytest.raises(RuntimeError, match="Chromium failed to start"):
+            _start_remote_chromium(mock_remote_backend, "/tmp/docs")
+
+
+class TestStopRemoteChromium:
+    """Tests for _stop_remote_chromium."""
+
+    def test_sends_pkill(self, mock_remote_backend):
+        from src.tools.research.browser import _stop_remote_chromium
+
+        _stop_remote_chromium(mock_remote_backend)
+
+        mock_remote_backend.exec_command.assert_called_once()
+        assert "pkill" in mock_remote_backend.exec_command.call_args[0][0]
+
+    def test_swallows_exceptions(self, mock_remote_backend):
+        from src.tools.research.browser import _stop_remote_chromium
+
+        mock_remote_backend.exec_command.side_effect = Exception("SSH down")
+        _stop_remote_chromium(mock_remote_backend)  # Should not raise
+
+
+class TestFindNewFilesRemote:
+    """Tests for _find_new_files_remote."""
+
+    def test_finds_recent_files(self, mock_remote_backend):
+        from src.tools.research.browser import _find_new_files_remote
+
+        mock_remote_backend.exec_command.return_value = (
+            "1712000000.0 /home/agent-host/workspace/job_abc123/documents/paper.pdf\n"
+            "1711999000.0 /home/agent-host/workspace/job_abc123/documents/data.csv\n"
+        )
+
+        files = _find_new_files_remote(mock_remote_backend, "documents")
+
+        assert len(files) == 2
+        assert files[0] == "documents/paper.pdf"
+        assert files[1] == "documents/data.csv"
+
+    def test_returns_empty_on_no_files(self, mock_remote_backend):
+        from src.tools.research.browser import _find_new_files_remote
+
+        mock_remote_backend.exec_command.return_value = ""
+
+        files = _find_new_files_remote(mock_remote_backend, "documents")
+        assert files == []
+
+    def test_returns_empty_on_error(self, mock_remote_backend):
+        from src.tools.research.browser import _find_new_files_remote
+
+        mock_remote_backend.exec_command.side_effect = Exception("SSH error")
+
+        files = _find_new_files_remote(mock_remote_backend, "documents")
+        assert files == []
+
+
+class TestGetBrowserConfigRemote:
+    """Tests for _get_browser_config with remote backend."""
+
+    def test_returns_cdp_url_for_remote_backend(self, mock_remote_tool_context):
+        from src.tools.research.browser import _get_browser_config
+
+        config = _get_browser_config(mock_remote_tool_context)
+
+        assert "cdp_url" in config
+        assert config["cdp_url"].startswith("ws://10.42.0.50:9222/")
+        # Should NOT contain local browser keys
+        assert "headless" not in config
+        assert "downloads_path" not in config
+
+    def test_local_override_returns_local_config(
+        self, mock_remote_tool_context, temp_docs_dir
+    ):
+        from src.tools.research.browser import _get_browser_config
+
+        mock_remote_tool_context.config = {
+            "browser": {"remote": "local"},
+            "research": {"proxy": {}},
+        }
+        # Make get_path return a real path so mkdir works
+        mock_remote_tool_context.workspace_manager.get_path.return_value = (
+            temp_docs_dir / "documents"
+        )
+
+        with patch.dict("os.environ", {}, clear=True):
+            config = _get_browser_config(mock_remote_tool_context)
+
+        assert "headless" in config
+        assert "cdp_url" not in config
+
+    def test_ensures_documents_dir_on_remote(self, mock_remote_tool_context):
+        from src.tools.research.browser import _get_browser_config
+
+        _get_browser_config(mock_remote_tool_context)
+
+        backend = mock_remote_tool_context.workspace_manager.backend
+        backend.mkdir.assert_called_with("documents")
+
+
 # ── Workflow tools tests ───────────────────────────────────────────
 
 

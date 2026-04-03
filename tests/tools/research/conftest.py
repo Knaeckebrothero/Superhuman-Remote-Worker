@@ -22,12 +22,25 @@ def temp_docs_dir():
 
 
 @pytest.fixture
-def mock_workspace_manager(temp_docs_dir):
+def mock_local_backend(temp_docs_dir):
+    """Create a mock LocalBackend (host=None)."""
+    backend = MagicMock()
+    backend.host = None
+    backend.root = str(temp_docs_dir)
+    backend.resolve_path = MagicMock(
+        side_effect=lambda p: str(temp_docs_dir / p) if p else str(temp_docs_dir)
+    )
+    return backend
+
+
+@pytest.fixture
+def mock_workspace_manager(temp_docs_dir, mock_local_backend):
     """Create a mock WorkspaceManager with temp directory."""
     manager = MagicMock()
     manager.is_initialized = True
     manager.workspace_dir = str(temp_docs_dir)
     manager.job_id = "test-job-123"
+    manager.backend = mock_local_backend
     return manager
 
 
@@ -39,6 +52,41 @@ def mock_tool_context(mock_workspace_manager):
     ctx = MagicMock(spec=ToolContext)
     ctx.workspace_manager = mock_workspace_manager
     ctx.config = {}
+    ctx.has_workspace.return_value = True
+    ctx.get_or_register_doc_source.return_value = 1
+    return ctx
+
+
+@pytest.fixture
+def mock_remote_backend():
+    """Create a mock RemoteBackend for CDP browser tests."""
+    backend = MagicMock()
+    backend.host = "10.42.0.50"
+    backend.root = "/home/agent-host/workspace/job_abc123"
+    backend.resolve_path = MagicMock(
+        side_effect=lambda p: f"/home/agent-host/workspace/job_abc123/{p}" if p else backend.root
+    )
+    backend.mkdir = MagicMock()
+    backend.stat = MagicMock(return_value=1024)
+    backend.exec_command = MagicMock(
+        return_value='{"webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc-def"}'
+    )
+    return backend
+
+
+@pytest.fixture
+def mock_remote_tool_context(mock_remote_backend):
+    """Create a mock ToolContext with a remote workspace backend."""
+    from src.tools.context import ToolContext
+
+    manager = MagicMock()
+    manager.is_initialized = True
+    manager.job_id = "test-job-remote"
+    manager.backend = mock_remote_backend
+
+    ctx = MagicMock(spec=ToolContext)
+    ctx.workspace_manager = manager
+    ctx.config = {"browser": {}, "research": {"proxy": {}}}
     ctx.has_workspace.return_value = True
     ctx.get_or_register_doc_source.return_value = 1
     return ctx

@@ -1,6 +1,8 @@
 """Tests for paper tools (search_papers, download_paper, get_paper_info)."""
 
-from unittest.mock import AsyncMock, patch
+import tempfile
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -8,6 +10,10 @@ from src.tools.research.papers import (
     DOI_PATTERN,
     ARXIV_PATTERN,
     _detect_identifier_type,
+    _is_remote_workspace,
+    _get_local_documents_dir,
+    _transfer_to_workspace,
+    _maybe_transfer,
     create_paper_tools,
 )
 from src.tools.research.utils.paper_types import (
@@ -424,3 +430,135 @@ class TestPaperToolsMetadata:
         for name, meta in PAPER_TOOLS_METADATA.items():
             assert "phases" in meta, f"{name} missing phases"
             assert "tactical" in meta["phases"], f"{name} not in tactical phase"
+
+
+# ── Remote workspace awareness tests ─────────────────────────────────
+
+
+class TestIsRemoteWorkspace:
+    """Tests for _is_remote_workspace detection."""
+
+    def test_remote_when_backend_has_host(self, mock_remote_tool_context):
+        assert _is_remote_workspace(mock_remote_tool_context) is True
+
+    def test_local_when_backend_has_no_host(self, mock_tool_context):
+        assert _is_remote_workspace(mock_tool_context) is False
+
+    def test_local_when_no_workspace(self):
+        ctx = MagicMock()
+        ctx.has_workspace.return_value = False
+        assert _is_remote_workspace(ctx) is False
+
+
+class TestGetLocalDocumentsDir:
+    """Tests for _get_local_documents_dir — always returns a local path."""
+
+    def test_local_workspace_returns_workspace_path(self, mock_tool_context, temp_docs_dir):
+        mock_tool_context.workspace_manager.get_path.return_value = temp_docs_dir / "documents"
+        result = _get_local_documents_dir(mock_tool_context)
+        assert str(temp_docs_dir) in str(result)
+
+    def test_remote_workspace_returns_temp_dir(self, mock_remote_tool_context):
+        result = _get_local_documents_dir(mock_remote_tool_context)
+        # Must be a real local path, not the remote path
+        assert result.exists()
+        assert "agent-host" not in str(result)
+        # Clean up
+        result.rmdir()
+
+    def test_no_workspace_returns_fallback(self):
+        ctx = MagicMock()
+        ctx.has_workspace.return_value = False
+        result = _get_local_documents_dir(ctx)
+        assert result == Path("./downloads")
+
+
+class TestTransferToWorkspace:
+    """Tests for _transfer_to_workspace."""
+
+    def test_transfers_file_via_backend(self, mock_remote_tool_context):
+        backend = mock_remote_tool_context.workspace_manager.backend
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"%PDF-1.4 test content")
+            local_path = Path(f.name)
+
+        try:
+            result = _transfer_to_workspace(
+                mock_remote_tool_context, local_path, "documents/test.pdf"
+            )
+            assert result == "documents/test.pdf"
+            backend.write_file.assert_called_once_with(
+                "documents/test.pdf", b"%PDF-1.4 test content"
+            )
+        finally:
+            local_path.unlink(missing_ok=True)
+
+
+class TestMaybeTransfer:
+    """Tests for _maybe_transfer — conditional transfer."""
+
+    def test_local_mode_returns_local_path(self, mock_tool_context, temp_docs_dir):
+        local_file = temp_docs_dir / "test.pdf"
+        local_file.write_bytes(b"test")
+        result = _maybe_transfer(mock_tool_context, False, local_file)
+        assert result == str(local_file)
+
+    def test_remote_mode_transfers_and_returns_relative(self, mock_remote_tool_context):
+        backend = mock_remote_tool_context.workspace_manager.backend
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"test pdf")
+            local_path = Path(f.name)
+
+        try:
+            result = _maybe_transfer(mock_remote_tool_context, True, local_path)
+            assert result == f"documents/{local_path.name}"
+            backend.write_file.assert_called_once()
+        finally:
+            local_path.unlink(missing_ok=True)
+
+    def test_none_path_returns_empty(self, mock_tool_context):
+        assert _maybe_transfer(mock_tool_context, False, None) == ""
+
+
+class TestDownloadPaperRemote:
+    """Tests for download_paper with remote workspace."""
+
+    @pytest.mark.asyncio
+    async def test_download_arxiv_transfers_to_workspace(
+        self, mock_remote_tool_context, sample_paper
+    ):
+        """On remote workspace, downloaded file should be transferred via backend."""
+        tools = create_paper_tools(mock_remote_tool_context)
+        download_paper = next(t for t in tools if t.name == "download_paper")
+        backend = mock_remote_tool_context.workspace_manager.backend
+
+        # Create a real temp file that the mock will "download"
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"%PDF-1.4 test content")
+            temp_pdf = Path(f.name)
+
+        mock_result = DownloadResult(
+            success=True,
+            path=temp_pdf,
+            source=PaperSource.ARXIV,
+            paper=sample_paper,
+        )
+
+        try:
+            with patch(
+                "src.tools.research.papers._try_arxiv_download",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ):
+                result = await download_paper.ainvoke(
+                    {"identifier": "1706.03762", "identifier_type": "arxiv"}
+                )
+
+            assert "Downloaded" in result
+            assert "documents/" in result
+            # Verify the backend.write_file was called (transfer happened)
+            backend.write_file.assert_called_once()
+        finally:
+            temp_pdf.unlink(missing_ok=True)

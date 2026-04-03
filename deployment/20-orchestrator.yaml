@@ -62,6 +62,11 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: WORKSPACE_PATH
+            - name: WORKSPACE_STORAGE_CLASS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: WORKSPACE_STORAGE_CLASS
             # Gitea
             - name: GITEA_URL
               valueFrom:

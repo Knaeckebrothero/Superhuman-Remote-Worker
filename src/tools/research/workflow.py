@@ -6,6 +6,8 @@ databases, deduplicate results, and download available papers.
 
 import asyncio
 import logging
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -240,14 +242,24 @@ async def _download_available_papers(
     Only attempts download for papers with known PDF URLs or arXiv IDs.
     Limits concurrent downloads to avoid rate limiting.
 
+    For remote workspaces, downloads to a local temp dir first, then
+    transfers each file to the workspace via the backend.
+
     Returns:
         List of result messages for each download attempt
     """
     from .utils.paper_types import AccessStatus
 
     results = []
-    dest_dir = context.workspace_manager.get_path("documents")
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    backend = context.workspace_manager.backend
+    remote = backend.host is not None
+
+    if remote:
+        dest_dir = Path(tempfile.mkdtemp(prefix="paper_dl_"))
+        backend.mkdir("documents")
+    else:
+        dest_dir = context.workspace_manager.get_path("documents")
+        dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloadable = [
         p
@@ -260,30 +272,44 @@ async def _download_available_papers(
     if not downloadable:
         return ["No open access papers available for download."]
 
-    for paper in downloadable[:5]:  # Limit to 5 downloads per research call
-        try:
-            if paper.arxiv_id:
-                result = await _download_single_arxiv(paper.arxiv_id, dest_dir)
-            elif paper.pdf_url:
-                result = await _download_single_url(
-                    paper.pdf_url, paper.title, dest_dir, proxy=proxy
-                )
-            else:
-                continue
+    try:
+        for paper in downloadable[:5]:  # Limit to 5 downloads per research call
+            try:
+                if paper.arxiv_id:
+                    result = await _download_single_arxiv(paper.arxiv_id, dest_dir)
+                elif paper.pdf_url:
+                    result = await _download_single_url(
+                        paper.pdf_url, paper.title, dest_dir, proxy=proxy
+                    )
+                else:
+                    continue
 
-            if result:
-                # Register as citation source
-                try:
-                    context.get_or_register_doc_source(str(result), name=paper.title)
-                except Exception:
-                    pass
-                results.append(f"  Downloaded: {paper.title} -> {result.name}")
-            else:
-                results.append(f"  Failed: {paper.title}")
+                if result:
+                    # Transfer to workspace if remote
+                    if remote:
+                        ws_rel = f"documents/{result.name}"
+                        backend.write_file(ws_rel, result.read_bytes())
+                        display_path = ws_rel
+                    else:
+                        display_path = str(result)
 
-        except Exception as e:
-            logger.debug(f"Download failed for {paper.title}: {e}")
-            results.append(f"  Failed: {paper.title} ({e})")
+                    # Register as citation source
+                    try:
+                        context.get_or_register_doc_source(
+                            display_path, name=paper.title
+                        )
+                    except Exception:
+                        pass
+                    results.append(f"  Downloaded: {paper.title} -> {result.name}")
+                else:
+                    results.append(f"  Failed: {paper.title}")
+
+            except Exception as e:
+                logger.debug(f"Download failed for {paper.title}: {e}")
+                results.append(f"  Failed: {paper.title} ({e})")
+    finally:
+        if remote:
+            shutil.rmtree(dest_dir, ignore_errors=True)
 
     return results
 

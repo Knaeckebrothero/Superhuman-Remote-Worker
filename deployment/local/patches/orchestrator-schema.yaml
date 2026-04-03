@@ -1,0 +1,19 @@
+# Mount fixed schema.sql into orchestrator (workaround until image is rebuilt)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-orchestrator
+  namespace: superhuman-remote-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: orchestrator
+          volumeMounts:
+            - name: schema-fix
+              mountPath: /app/database/schema.sql
+              subPath: schema.sql
+      volumes:
+        - name: schema-fix
+          configMap:
+            name: srw-schema-fix

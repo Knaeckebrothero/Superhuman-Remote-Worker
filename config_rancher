@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Config
+clusters:
+- name: "local"
+  cluster:
+    server: "https://rancher.h4ll.app/k8s/clusters/local"
+
+users:
+- name: "local"
+  user:
+    token: "kubeconfig-user-4f5bz68md6:tpkpt56t9z8lrn89qpthms59j65vbtfnjw7pw29xjxft9sjvw49nts"
+
+
+contexts:
+- name: "local"
+  context:
+    user: "local"
+    cluster: "local"
+
+current-context: "local"

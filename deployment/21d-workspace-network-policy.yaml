@@ -11,7 +11,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # SSH from agent pods (RemoteBackend)
+    # SSH + CDP from agent pods (RemoteBackend + browser automation)
     - from:
         - podSelector:
             matchLabels:
@@ -22,6 +22,8 @@ spec:
       ports:
         - protocol: TCP
           port: 22
+        - protocol: TCP
+          port: 9222
     # code-server from orchestrator (IDE session proxying)
     - from:
         - podSelector:
@@ -48,6 +50,12 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    # HTTP/HTTPS for browser automation (agent-controlled browsing via CDP)
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
     # Gitea (workspace git repos)
     - to:
         - podSelector:
