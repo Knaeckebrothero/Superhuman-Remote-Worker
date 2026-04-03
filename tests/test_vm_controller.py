@@ -292,7 +292,9 @@ class TestRenderTemplate:
         assert spec["domain"]["cpu"]["cores"] == 4
         assert spec["domain"]["memory"]["guest"] == "8Gi"
         assert (
-            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"][
+                "url"
+            ]
             == f"docker://{SAMPLE_JOB_CONFIG['vm_image']}"
         )
 
@@ -318,7 +320,9 @@ class TestRenderTemplate:
         assert spec["domain"]["cpu"]["cores"] == 2
         assert spec["domain"]["memory"]["guest"] == "4Gi"
         assert (
-            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"][
+                "url"
+            ]
             == "docker://default-image:v1"
         )
 

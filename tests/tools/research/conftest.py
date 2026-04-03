@@ -64,7 +64,9 @@ def mock_remote_backend():
     backend.host = "10.42.0.50"
     backend.root = "/home/agent-host/workspace/job_abc123"
     backend.resolve_path = MagicMock(
-        side_effect=lambda p: f"/home/agent-host/workspace/job_abc123/{p}" if p else backend.root
+        side_effect=lambda p: f"/home/agent-host/workspace/job_abc123/{p}"
+        if p
+        else backend.root
     )
     backend.mkdir = MagicMock()
     backend.stat = MagicMock(return_value=1024)
