@@ -712,6 +712,7 @@ class TestKbExport:
 
     def test_creates_directory_and_writes_files(self, tmp_path):
         tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = False
         export_dir = str(tmp_path / "kb_export")
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
@@ -744,6 +745,7 @@ class TestKbExport:
 
     def test_groups_relationships_by_type(self, tmp_path):
         tools, ctx = _make_tools()
+        ctx.has_workspace.return_value = False
         export_dir = str(tmp_path / "kb_export2")
         ctx.knowledge_graph.get_all_notes_for_export.return_value = [
             {
