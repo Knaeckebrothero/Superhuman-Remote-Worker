@@ -1198,9 +1198,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         # VM is provisioning/creating — skip, wait
                         continue
                     # else: VM is ready, proceed with dispatch
-                    logger.info(
-                        "Dispatcher: job %s using VM workspace", job_id
-                    )
+                    logger.info("Dispatcher: job %s using VM workspace", job_id)
                 elif _job_needs_container(job):
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
@@ -1271,9 +1269,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         await postgres_db.update_job_status(
                             job_id,
                             status="failed",
-                            error_message=(
-                                f"Workspace container failed: {error}"
-                            ),
+                            error_message=(f"Workspace container failed: {error}"),
                         )
                         continue
                     elif container_status != "ready":
@@ -1286,9 +1282,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         continue
                     # else: container is ready, proceed with dispatch
-                    logger.info(
-                        "Dispatcher: job %s using workspace container", job_id
-                    )
+                    logger.info("Dispatcher: job %s using workspace container", job_id)
                 else:
                     logger.info(
                         "Dispatcher: job %s using local workspace (no provisioner)",
@@ -7894,9 +7888,7 @@ async def create_thread(
             )
 
             async def _provision_agent_pod(tid: str, cfg: str) -> None:
-                ok = await persistent_provisioner.create_agent_pod(
-                    tid, config_name=cfg
-                )
+                ok = await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
                 if not ok:
                     logger.error(
                         "Thread %s: persistent agent pod provisioning failed. "
@@ -7904,9 +7896,7 @@ async def create_thread(
                         tid,
                     )
 
-            asyncio.create_task(
-                _provision_agent_pod(thread_id, effective_config)
-            )
+            asyncio.create_task(_provision_agent_pod(thread_id, effective_config))
         else:
             logger.warning(
                 "Thread %s: persistent agent pod not provisioned — "
@@ -8268,9 +8258,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
     ws_status = ws_ctx.get("status")
     if ws_status == "failed":
         error = ws_ctx.get("error", "unknown error")
-        logger.error(
-            "Thread %s workspace container failed: %s", thread_id, error
-        )
+        logger.error("Thread %s workspace container failed: %s", thread_id, error)
         await ws.close(
             code=4503,
             reason=f"Workspace container failed: {error}",

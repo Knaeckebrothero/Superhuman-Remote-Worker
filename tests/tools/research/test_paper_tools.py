@@ -453,8 +453,12 @@ class TestIsRemoteWorkspace:
 class TestGetLocalDocumentsDir:
     """Tests for _get_local_documents_dir — always returns a local path."""
 
-    def test_local_workspace_returns_workspace_path(self, mock_tool_context, temp_docs_dir):
-        mock_tool_context.workspace_manager.get_path.return_value = temp_docs_dir / "documents"
+    def test_local_workspace_returns_workspace_path(
+        self, mock_tool_context, temp_docs_dir
+    ):
+        mock_tool_context.workspace_manager.get_path.return_value = (
+            temp_docs_dir / "documents"
+        )
         result = _get_local_documents_dir(mock_tool_context)
         assert str(temp_docs_dir) in str(result)
 
