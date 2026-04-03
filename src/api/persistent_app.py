@@ -798,13 +798,21 @@ async def _save_turn_ai_messages(
         # (after the last HumanMessage)
         to_save = []
         for msg in reversed(messages):
-            if hasattr(msg, "type") and msg.type == "human":
+            if hasattr(msg, "type") and msg.type in ("human", "HumanMessageChunk"):
                 break
             to_save.append(msg)
         to_save.reverse()
 
         for msg in to_save:
-            role = getattr(msg, "type", "unknown")
+            raw_type = getattr(msg, "type", "unknown")
+            # Normalize LangChain chunk types: AIMessageChunk → ai, etc.
+            _role_map = {
+                "ai": "ai", "AIMessageChunk": "ai",
+                "human": "human", "HumanMessageChunk": "human",
+                "tool": "tool", "ToolMessageChunk": "tool",
+                "system": "system", "SystemMessageChunk": "system",
+            }
+            role = _role_map.get(raw_type, raw_type)
             content = msg.content if hasattr(msg, "content") else None
             tc = None
             if hasattr(msg, "tool_calls") and msg.tool_calls:

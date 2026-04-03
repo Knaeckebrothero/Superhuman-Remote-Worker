@@ -238,6 +238,29 @@ class WorkspaceBackend(ABC):
         """
         ...
 
+    # --- Properties ---
+
+    @property
+    def host(self) -> Optional[str]:
+        """Remote host address, or None for local backends."""
+        return None
+
+    # --- Command execution ---
+
+    def exec_command(self, command: str, timeout: int = 30) -> str:
+        """Execute a command on the workspace host and return stdout.
+
+        For remote backends, runs the command via SSH.
+
+        Args:
+            command: Shell command to execute.
+            timeout: Timeout in seconds.
+
+        Returns:
+            Command stdout as string.
+        """
+        raise NotImplementedError("exec_command not supported by this backend")
+
     # --- Shell operations ---
     #
     # Non-abstract: default to NotImplementedError. Override in backends

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -66,11 +67,43 @@ def _detect_identifier_type(identifier: str) -> str:
     return "doi"  # Default assumption
 
 
-def _get_documents_dir(context: ToolContext) -> Path:
-    """Get the documents directory from workspace, or a fallback."""
-    if context.has_workspace():
-        return context.workspace_manager.get_path("documents")
-    return Path("./downloads")
+def _is_remote_workspace(context: ToolContext) -> bool:
+    """Check if the workspace lives on a remote host."""
+    if not context.has_workspace():
+        return False
+    return context.workspace_manager.backend.host is not None
+
+
+def _get_local_documents_dir(context: ToolContext) -> Path:
+    """Get a local directory for downloads.
+
+    For local workspaces, returns the workspace documents/ dir directly.
+    For remote workspaces, returns a local temp dir (caller must transfer
+    files to the workspace via the backend).
+    """
+    if not context.has_workspace():
+        return Path("./downloads")
+    if _is_remote_workspace(context):
+        # Remote workspace — download locally first, transfer after
+        d = Path(tempfile.mkdtemp(prefix="paper_dl_"))
+        return d
+    return context.workspace_manager.get_path("documents")
+
+
+def _transfer_to_workspace(context: ToolContext, local_path: Path, dest_rel: str) -> str:
+    """Transfer a local file to the workspace and return the workspace-relative path.
+
+    Args:
+        context: ToolContext with workspace.
+        local_path: Path to the file on the agent pod.
+        dest_rel: Workspace-relative destination (e.g. "documents/paper.pdf").
+
+    Returns:
+        Workspace-relative path of the written file.
+    """
+    content = local_path.read_bytes()
+    context.workspace_manager.backend.write_file(dest_rel, content)
+    return dest_rel
 
 
 def create_paper_tools(context: ToolContext) -> List[Any]:
@@ -126,48 +159,58 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if identifier_type == "auto":
             identifier_type = _detect_identifier_type(identifier)
 
-        dest_dir = _get_documents_dir(context)
+        remote = _is_remote_workspace(context)
+        dest_dir = _get_local_documents_dir(context)
 
         # Track whether we found a paywalled paper (for messaging)
         paywalled_title = None
 
-        # Try arXiv first (for arXiv IDs, or DOIs that might be arXiv)
-        if identifier_type == "arxiv" or "arxiv" in identifier.lower():
-            result = await _try_arxiv_download(identifier, dest_dir)
-            if result.success:
-                _register_downloaded_paper(context, result)
-                return (
-                    f"Downloaded: {result.paper.title}\n"
-                    f"Path: {result.path}\n"
-                    f"Source: arXiv ({result.paper.arxiv_id})"
-                )
-
-        # Try Unpaywall for DOIs
-        if identifier_type == "doi":
-            doi = DOI_PATTERN.search(identifier)
-            if doi:
-                result = await _try_unpaywall_download(
-                    doi.group(), dest_dir, proxy=proxy
-                )
+        try:
+            # Try arXiv first (for arXiv IDs, or DOIs that might be arXiv)
+            if identifier_type == "arxiv" or "arxiv" in identifier.lower():
+                result = await _try_arxiv_download(identifier, dest_dir)
                 if result.success:
-                    _register_downloaded_paper(context, result)
+                    ws_path = _maybe_transfer(context, remote, result.path)
+                    _register_downloaded_paper(context, result, ws_path)
                     return (
                         f"Downloaded: {result.paper.title}\n"
-                        f"Path: {result.path}\n"
-                        f"Source: Unpaywall (OA copy)"
+                        f"Path: {ws_path}\n"
+                        f"Source: arXiv ({result.paper.arxiv_id})"
                     )
-                elif result.paper and result.paper.access_status.value == "paywalled":
-                    paywalled_title = result.paper.title
-                elif result.error:
-                    logger.debug(f"Unpaywall download failed: {result.error}")
 
-        # Try browser automation as final fallback
-        if use_browser_fallback:
-            browser_result = await _try_browser_download(
-                identifier, identifier_type, dest_dir, context, proxy=proxy
-            )
-            if browser_result:
-                return browser_result
+            # Try Unpaywall for DOIs
+            if identifier_type == "doi":
+                doi = DOI_PATTERN.search(identifier)
+                if doi:
+                    result = await _try_unpaywall_download(
+                        doi.group(), dest_dir, proxy=proxy
+                    )
+                    if result.success:
+                        ws_path = _maybe_transfer(context, remote, result.path)
+                        _register_downloaded_paper(context, result, ws_path)
+                        return (
+                            f"Downloaded: {result.paper.title}\n"
+                            f"Path: {ws_path}\n"
+                            f"Source: Unpaywall (OA copy)"
+                        )
+                    elif result.paper and result.paper.access_status.value == "paywalled":
+                        paywalled_title = result.paper.title
+                    elif result.error:
+                        logger.debug(f"Unpaywall download failed: {result.error}")
+
+            # Try browser automation as final fallback
+            if use_browser_fallback:
+                browser_result = await _try_browser_download(
+                    identifier, identifier_type, dest_dir, context, proxy=proxy
+                )
+                if browser_result:
+                    return browser_result
+        finally:
+            # Clean up temp dir if we created one for remote downloads
+            if remote and dest_dir.exists():
+                import shutil
+
+                shutil.rmtree(dest_dir, ignore_errors=True)
 
         # All methods failed
         if paywalled_title:
@@ -384,7 +427,10 @@ async def _try_browser_download(
             _get_browser_config,
             _get_browser_llm,
             _find_new_files,
+            _find_new_files_remote,
+            _is_remote_browser,
             _register_downloaded_file,
+            _stop_remote_chromium,
         )
         from browser_use import Agent, Browser
     except ImportError:
@@ -409,10 +455,17 @@ async def _try_browser_download(
 
     logger.info(f"Trying browser download from: {url}")
 
+    remote = _is_remote_browser(context)
     browser = None
     try:
         llm = _get_browser_llm()
-        browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
+
+        if remote:
+            browser_kwargs = _get_browser_config(context)
+        else:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            browser_kwargs = _get_browser_config(context, downloads_path=dest_dir)
+
         browser = Browser(**browser_kwargs)
 
         agent = Agent(
@@ -430,17 +483,34 @@ async def _try_browser_download(
 
         await agent.run()
 
-        # Check for downloaded files
-        downloaded_files = _find_new_files(dest_dir)
-        if downloaded_files:
-            downloaded_path = downloaded_files[0]
-            _register_downloaded_file(context, downloaded_path)
-            return (
-                f"Downloaded via browser: {downloaded_path.name}\n"
-                f"Path: {downloaded_path}\n"
-                f"Size: {downloaded_path.stat().st_size:,} bytes\n"
-                f"Source: Browser automation ({url})"
-            )
+        # Check for downloaded files — remote vs local detection
+        if remote:
+            backend = context.workspace_manager.backend
+            new_files = _find_new_files_remote(backend, "documents")
+            if new_files:
+                rel_path = new_files[0]
+                file_size = backend.stat(rel_path)
+                file_name = Path(rel_path).name
+                _register_downloaded_file(context, rel_path, name=file_name)
+                return (
+                    f"Downloaded via browser: {file_name}\n"
+                    f"Path: {rel_path}\n"
+                    f"Size: {file_size:,} bytes\n"
+                    f"Source: Browser automation ({url})"
+                )
+        else:
+            downloaded_files = _find_new_files(dest_dir)
+            if downloaded_files:
+                downloaded_path = downloaded_files[0]
+                _register_downloaded_file(
+                    context, str(downloaded_path), name=downloaded_path.name
+                )
+                return (
+                    f"Downloaded via browser: {downloaded_path.name}\n"
+                    f"Path: {downloaded_path}\n"
+                    f"Size: {downloaded_path.stat().st_size:,} bytes\n"
+                    f"Source: Browser automation ({url})"
+                )
 
         return None
 
@@ -453,6 +523,8 @@ async def _try_browser_download(
                 await browser.stop()
             except Exception:
                 pass
+        if remote:
+            _stop_remote_chromium(context.workspace_manager.backend)
 
 
 async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional[str]:
@@ -564,14 +636,33 @@ async def _get_arxiv_info(identifier: str) -> str:
     return "\n".join(lines)
 
 
-def _register_downloaded_paper(context: ToolContext, result) -> None:
+def _maybe_transfer(
+    context: ToolContext, remote: bool, local_path: Optional[Path]
+) -> str:
+    """If remote, transfer a locally downloaded file to the workspace.
+
+    Returns a display path (workspace-relative for remote, absolute for local).
+    """
+    if local_path is None:
+        return ""
+    if not remote:
+        return str(local_path)
+    dest_rel = f"documents/{local_path.name}"
+    _transfer_to_workspace(context, local_path, dest_rel)
+    return dest_rel
+
+
+def _register_downloaded_paper(
+    context: ToolContext, result, display_path: Optional[str] = None
+) -> None:
     """Register a downloaded paper as a citation source."""
     if not result.success or not result.path or not result.paper:
         return
 
+    path_str = display_path or str(result.path)
     try:
         source_id = context.get_or_register_doc_source(
-            str(result.path), name=result.paper.title
+            path_str, name=result.paper.title
         )
         logger.info(
             f"Registered downloaded paper as citation source {source_id}: {result.paper.title}"

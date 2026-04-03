@@ -35,8 +35,9 @@ except ImportError:
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
-    Creates per-job pods with SSH server + code-server. Pods are ephemeral
-    (emptyDir storage) and deleted when the job completes or is cancelled.
+    Creates per-job pods with SSH server + code-server. Workspace data is
+    stored on PVCs so it survives pod crashes. PVCs are deleted on final
+    cleanup (job completion/cancellation) but retained during suspension.
     """
 
     def __init__(self):
@@ -52,6 +53,9 @@ class ContainerProvisioner:
         )
         self._ssh_secret_name: str = os.environ.get(
             "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
+        self._storage_class: str = os.environ.get(
+            "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
 
     @property
@@ -137,7 +141,18 @@ class ContainerProvisioner:
             return False
 
         pod_name = f"workspace-{job_id[:12]}"
+        pvc_name = f"pvc-workspace-{job_id[:12]}"
         workspace_image = image or self._workspace_image
+
+        # Create PVC for workspace data (idempotent — reuses existing on restore)
+        pvc_ok = await self._create_pvc(
+            pvc_name, size="10Gi", labels={"srw/job-id": job_id}
+        )
+        if not pvc_ok:
+            await self._set_context(
+                job_id, {"status": "failed", "error": "PVC creation failed"}
+            )
+            return False
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
@@ -147,6 +162,7 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            pvc_name=pvc_name,
         )
 
         try:
@@ -231,6 +247,14 @@ class ContainerProvisioner:
                 "Failed to delete workspace container for job %s: %s", job_id, e
             )
             return False
+
+    async def delete_workspace_pvc(self, job_id: str) -> bool:
+        """Delete the PVC for a job workspace (final cleanup only).
+
+        Called on job completion/cancellation — NOT during suspension.
+        """
+        pvc_name = f"pvc-workspace-{job_id[:12]}"
+        return await self._delete_pvc(pvc_name)
 
     async def get_workspace_status(self, job_id: str) -> Optional[dict]:
         """Query the workspace container status.
@@ -371,6 +395,67 @@ class ContainerProvisioner:
     # Internal helpers
     # =========================================================================
 
+    async def _create_pvc(
+        self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
+    ) -> bool:
+        """Create a PVC for workspace data. Idempotent — 409 treated as success."""
+        if not self._k8s_available:
+            return False
+
+        pvc_labels = {"app": "srw-workspace", "srw/component": "workspace-pvc"}
+        if labels:
+            pvc_labels.update(labels)
+
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": self._namespace,
+                "labels": pvc_labels,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": self._storage_class,
+                "resources": {"requests": {"storage": size}},
+            },
+        }
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_persistent_volume_claim,
+                namespace=self._namespace,
+                body=pvc_manifest,
+            )
+            logger.info("PVC created: %s (storageClass=%s)", pvc_name, self._storage_class)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                logger.debug("PVC already exists: %s", pvc_name)
+                return True
+            logger.error("Failed to create PVC %s: %s", pvc_name, e)
+            return False
+
+    async def _delete_pvc(self, pvc_name: str) -> bool:
+        """Delete a PVC. Idempotent — 404 treated as success."""
+        if not self._k8s_available:
+            return False
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            logger.info("PVC deleted: %s", pvc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                logger.debug("PVC already deleted: %s", pvc_name)
+                return True
+            logger.error("Failed to delete PVC %s: %s", pvc_name, e)
+            return False
+
     def _build_pod_manifest(
         self,
         pod_name: str,
@@ -380,6 +465,7 @@ class ContainerProvisioner:
         memory: str,
         cpu_limit: str,
         memory_limit: str,
+        pvc_name: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container."""
         return {
@@ -408,6 +494,7 @@ class ContainerProvisioner:
                         "ports": [
                             {"containerPort": 22, "name": "ssh"},
                             {"containerPort": 8080, "name": "code-server"},
+                            {"containerPort": 9222, "name": "cdp"},
                         ],
                         "resources": {
                             "requests": {"cpu": cpu, "memory": memory},
@@ -468,6 +555,11 @@ class ContainerProvisioner:
                 ],
                 "volumes": [
                     {
+                        "name": "workspace-data",
+                        "persistentVolumeClaim": {"claimName": pvc_name},
+                    }
+                    if pvc_name
+                    else {
                         "name": "workspace-data",
                         "emptyDir": {"sizeLimit": "10Gi"},
                     },
@@ -563,7 +655,18 @@ class ContainerProvisioner:
             return False
 
         pod_name = f"ws-thread-{thread_id[:12]}"
+        pvc_name = f"pvc-ws-thread-{thread_id[:12]}"
         workspace_image = image or self._workspace_image
+
+        # Create PVC for workspace data (idempotent — reuses existing on restore)
+        pvc_ok = await self._create_pvc(
+            pvc_name, size="10Gi", labels={"srw/thread-id": thread_id}
+        )
+        if not pvc_ok:
+            await self._set_thread_context(
+                thread_id, {"status": "failed", "error": "PVC creation failed"}
+            )
+            return False
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
@@ -573,6 +676,7 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            pvc_name=pvc_name,
         )
 
         # Override labels for thread identification
@@ -655,6 +759,14 @@ class ContainerProvisioner:
                 return True
             logger.error("Failed to delete thread workspace for %s: %s", thread_id, e)
             return False
+
+    async def delete_thread_workspace_pvc(self, thread_id: str) -> bool:
+        """Delete the PVC for a thread workspace (final cleanup only).
+
+        Called on thread end/deletion — NOT during suspension.
+        """
+        pvc_name = f"pvc-ws-thread-{thread_id[:12]}"
+        return await self._delete_pvc(pvc_name)
 
     async def _set_thread_context(self, thread_id: str, updates: dict) -> None:
         """Atomically merge updates into thread's metadata.workspace_container."""

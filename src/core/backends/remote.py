@@ -161,8 +161,20 @@ class RemoteBackend(WorkspaceBackend):
         return self._remote_root
 
     @property
+    def host(self) -> str | None:
+        return self._host
+
+    @property
     def supports_shell(self) -> bool:
         return True
+
+    def exec_command(self, command: str, timeout: int = 30) -> str:
+        """Execute a command via SSH and return stdout.
+
+        Public wrapper around _exec for use by tools that need to run
+        commands on the workspace host (e.g., starting Chromium for CDP).
+        """
+        return self._exec(command, timeout=timeout)
 
     # =========================================================================
     # Lifecycle

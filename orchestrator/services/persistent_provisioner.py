@@ -42,6 +42,9 @@ class PersistentProvisioner:
         )
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
         self._secret_name: str = os.environ.get("AGENT_SECRET", "srw-secrets")
+        self._storage_class: str = os.environ.get(
+            "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
+        )
 
     @property
     def is_available(self) -> bool:
@@ -138,6 +141,18 @@ class PersistentProvisioner:
             return False
 
         pod_name = f"persistent-{thread_id[:12]}"
+        pvc_name = f"pvc-persistent-{thread_id[:12]}"
+
+        # Create PVC for agent workspace (idempotent — reuses existing on restore)
+        pvc_ok = await self._create_pvc(
+            pvc_name, size="10Gi", labels={"srw/thread-id": thread_id}
+        )
+        if not pvc_ok:
+            await self._set_thread_context(
+                thread_id, {"status": "failed", "error": "PVC creation failed"}
+            )
+            return False
+
         manifest = self._build_agent_pod_manifest(
             pod_name=pod_name,
             thread_id=thread_id,
@@ -146,6 +161,7 @@ class PersistentProvisioner:
             memory_request=memory_request,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            pvc_name=pvc_name,
         )
 
         try:
@@ -238,6 +254,14 @@ class PersistentProvisioner:
             logger.error("Failed to delete agent pod for thread %s: %s", thread_id, e)
             return False
 
+    async def delete_agent_pvc(self, thread_id: str) -> bool:
+        """Delete the PVC for an agent pod (final cleanup only).
+
+        Called on thread end/deletion — NOT during suspension.
+        """
+        pvc_name = f"pvc-persistent-{thread_id[:12]}"
+        return await self._delete_pvc(pvc_name)
+
     async def get_pod_status(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """Query pod status for a thread.
 
@@ -280,6 +304,72 @@ class PersistentProvisioner:
     # Internal helpers
     # =========================================================================
 
+    async def _create_pvc(
+        self, pvc_name: str, size: str = "10Gi", labels: Optional[dict] = None
+    ) -> bool:
+        """Create a PVC for agent workspace data. Idempotent — 409 treated as success."""
+        if not self._k8s_available:
+            return False
+
+        pvc_labels = {
+            "app": "srw-persistent-agent",
+            "srw/component": "agent-workspace-pvc",
+        }
+        if labels:
+            pvc_labels.update(labels)
+
+        pvc_manifest = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "namespace": self._namespace,
+                "labels": pvc_labels,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": self._storage_class,
+                "resources": {"requests": {"storage": size}},
+            },
+        }
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_persistent_volume_claim,
+                namespace=self._namespace,
+                body=pvc_manifest,
+            )
+            logger.info(
+                "PVC created: %s (storageClass=%s)", pvc_name, self._storage_class
+            )
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 409:
+                logger.debug("PVC already exists: %s", pvc_name)
+                return True
+            logger.error("Failed to create PVC %s: %s", pvc_name, e)
+            return False
+
+    async def _delete_pvc(self, pvc_name: str) -> bool:
+        """Delete a PVC. Idempotent — 404 treated as success."""
+        if not self._k8s_available:
+            return False
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            logger.info("PVC deleted: %s", pvc_name)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                logger.debug("PVC already deleted: %s", pvc_name)
+                return True
+            logger.error("Failed to delete PVC %s: %s", pvc_name, e)
+            return False
+
     def _build_agent_pod_manifest(
         self,
         pod_name: str,
@@ -289,6 +379,7 @@ class PersistentProvisioner:
         memory_request: str,
         cpu_limit: str,
         memory_limit: str,
+        pvc_name: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a persistent agent.
 
@@ -425,6 +516,11 @@ class PersistentProvisioner:
                 ],
                 "volumes": [
                     {
+                        "name": "workspace",
+                        "persistentVolumeClaim": {"claimName": pvc_name},
+                    }
+                    if pvc_name
+                    else {
                         "name": "workspace",
                         "emptyDir": {"sizeLimit": "10Gi"},
                     },

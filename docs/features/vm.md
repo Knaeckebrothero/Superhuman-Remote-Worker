@@ -367,7 +367,7 @@ See also: [Agent Cluster Setup Guide](./vm_agent_cluster_setup.md), [Packer Temp
 
 - [Cloud Workspace Architecture](../cloud_workspace.md) — k3s deployment, NATS communication, storage
 - [Security Checklist](../security_checklist.md) — container hardening checklist (partially superseded by VM approach)
-- [Deployment](../deployment.md) — current containerized deployment
+- [Deployment](../deployment_checklist.md) — current containerized deployment
 - [Datasources](../datasources.md) — external database/repo connections
 
 ## Related

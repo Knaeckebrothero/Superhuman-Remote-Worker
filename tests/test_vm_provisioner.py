@@ -42,6 +42,20 @@ metadata:
     job-id: "${JOB_ID}"
 spec:
   running: true
+  dataVolumeTemplates:
+    - metadata:
+        name: agent-vm-${JOB_ID}-rootdisk
+      spec:
+        storage:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: ${VM_STORAGE_CLASS}
+          resources:
+            requests:
+              storage: ${VM_DISK_SIZE}
+        source:
+          registry:
+            url: "docker://${VM_IMAGE}"
   template:
     metadata:
       labels:
@@ -56,10 +70,9 @@ spec:
             memory: "${MEMORY}"
       volumes:
         - name: rootdisk
-          containerDisk:
-            image: "${VM_IMAGE}"
+          dataVolume:
+            name: agent-vm-${JOB_ID}-rootdisk
       nodeSelector: {}
-  dataVolumeTemplates: []
   config:
     agentConfig: "${AGENT_CONFIG}"
     natsUrl: "${NATS_URL}"
@@ -74,6 +87,8 @@ SAMPLE_RENDERED = yaml.safe_load(
     .replace("${MEMORY}", "4Gi")
     .replace("${NATS_URL}", "nats://nats:4222")
     .replace("${DESCRIPTION}", "Test task")
+    .replace("${VM_STORAGE_CLASS}", "local-path")
+    .replace("${VM_DISK_SIZE}", "20Gi")
 )
 
 
@@ -513,8 +528,8 @@ class TestTemplateRendering:
             == "8Gi"
         )
         assert (
-            result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"]["image"]
-            == "ghcr.io/example/vm:v1"
+            result["spec"]["dataVolumeTemplates"][0]["spec"]["source"]["registry"]["url"]
+            == "docker://ghcr.io/example/vm:v1"
         )
         assert result["spec"]["config"]["agentConfig"] == "scholar"
         assert result["spec"]["config"]["natsUrl"] == "nats://nats:4222"
@@ -547,10 +562,10 @@ class TestTemplateRendering:
         result = provisioner_with_k8s._render_template(job_config)
 
         # Should use the default image from the provisioner
-        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"][
-            "image"
-        ]
-        assert image == provisioner_with_k8s._default_vm_image
+        image_url = result["spec"]["dataVolumeTemplates"][0]["spec"]["source"][
+            "registry"
+        ]["url"]
+        assert image_url == f"docker://{provisioner_with_k8s._default_vm_image}"
 
     def test_render_template_custom_vm_image(self, provisioner_with_k8s):
         """Template uses explicit vm_image when provided."""
@@ -561,10 +576,10 @@ class TestTemplateRendering:
         }
         result = provisioner_with_k8s._render_template(job_config)
 
-        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"][
-            "image"
-        ]
-        assert image == custom_image
+        image_url = result["spec"]["dataVolumeTemplates"][0]["spec"]["source"][
+            "registry"
+        ]["url"]
+        assert image_url == f"docker://{custom_image}"
 
     def test_render_template_cpu_cores_as_int(self, provisioner_with_k8s):
         """CPU cores are rendered as integers in YAML."""

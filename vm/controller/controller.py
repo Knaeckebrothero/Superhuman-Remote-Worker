@@ -54,6 +54,8 @@ DEFAULT_VM_IMAGE = os.environ.get(
 )
 DEFAULT_CPU = int(os.environ.get("DEFAULT_CPU", "2"))
 DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
+VM_STORAGE_CLASS = os.environ.get("VM_STORAGE_CLASS", "local-path")
+VM_DISK_SIZE = os.environ.get("VM_DISK_SIZE", "20Gi")
 
 # KubeVirt API coordinates
 KUBEVIRT_GROUP = "kubevirt.io"
@@ -111,6 +113,9 @@ class VMController:
             # not the orchestrator's cluster where the job's nats_url points.
             "${NATS_URL}": NATS_URL,
             "${DESCRIPTION}": job_config.get("description", ""),
+            # CDI DataVolume storage
+            "${VM_STORAGE_CLASS}": VM_STORAGE_CLASS,
+            "${VM_DISK_SIZE}": VM_DISK_SIZE,
             # Headscale mesh VPN — VM joins tailnet on boot
             "${TAILSCALE_AUTH_KEY}": tailscale_auth_key,
             "${HEADSCALE_URL}": headscale_url,

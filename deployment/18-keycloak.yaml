@@ -592,6 +592,10 @@ spec:
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080 \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
+                    # --- Set realm admin password ---
+                    # ${env.VAR} substitution in realm import doesn't resolve for
+                    # credentials, so set the password explicitly on every start.
+                    $KC set-password -r srw --username admin --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
                     # --- Sync client secrets ---
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \

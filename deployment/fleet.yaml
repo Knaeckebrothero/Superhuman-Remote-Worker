@@ -11,3 +11,4 @@ ignorePaths:
   - "deploy.sh"
   - "fleet-gitrepo.yaml"
   - "nats/"
+  - "local/"

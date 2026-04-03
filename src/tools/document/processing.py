@@ -5,6 +5,8 @@ and text splitters.
 """
 
 import logging
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -170,6 +172,43 @@ def _chunk_text(
     ]
 
 
+@contextmanager
+def _local_copy(workspace, file_path: str):
+    """Ensure a workspace file is available locally for third-party loaders.
+
+    For local workspaces, yields the resolved local path directly.
+    For remote workspaces, fetches the file into a temp file with the
+    correct extension and yields that, cleaning up afterwards.
+
+    Args:
+        workspace: WorkspaceManager instance (or None for no-workspace mode).
+        file_path: Workspace-relative or absolute path.
+
+    Yields:
+        Local filesystem path (str) suitable for LangChain loaders.
+    """
+    if workspace is None:
+        yield file_path
+        return
+
+    backend = workspace.backend
+    if backend.host is None:
+        # Local backend — resolve and yield directly
+        yield str(workspace.get_path(file_path))
+        return
+
+    # Remote backend — fetch to temp file
+    suffix = Path(file_path).suffix
+    content = backend.read_file(file_path, binary=True)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+    try:
+        yield tmp_path
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
 def create_processing_tools(context: ToolContext) -> List[Any]:
     """Create document processing tools with injected context.
 
@@ -181,13 +220,6 @@ def create_processing_tools(context: ToolContext) -> List[Any]:
     """
     # Get workspace manager if available for path resolution
     workspace = context.workspace_manager if context.has_workspace() else None
-
-    def resolve_path(path: str) -> str:
-        """Resolve a path relative to workspace if available."""
-        if workspace is not None:
-            resolved = workspace.get_path(path)
-            return str(resolved)
-        return path
 
     @tool
     def chunk_document(
@@ -208,8 +240,8 @@ def create_processing_tools(context: ToolContext) -> List[Any]:
             Summary of chunking results
         """
         try:
-            resolved_path = resolve_path(file_path)
-            doc = _load_document(resolved_path)
+            with _local_copy(workspace, file_path) as local_path:
+                doc = _load_document(local_path)
             chunks = _chunk_text(doc["text"], strategy, max_chunk_size, overlap)
 
             # Persist ALL chunks to workspace

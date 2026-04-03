@@ -267,11 +267,12 @@ communication:
   max_message_length: 5000         # Max chars per message body
   allowed_recipients: project      # "owner" (job owner only) or "project" (all project members)
 
-# Browser automation settings (browser-use + Playwright)
+# Browser automation settings (browser-use + CDP)
 browser:
   headless: true
   timeout: 60000  # Milliseconds
   use_vision: false  # DOM-based by default (works with any LLM)
+  remote: auto  # "auto" (use remote Chromium when workspace is remote), "local" (always local)
 
 # Claude Code delegation settings (model for auto-started claude-code shell tab)
 claude_code:

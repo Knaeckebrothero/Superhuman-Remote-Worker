@@ -764,11 +764,6 @@ CREATE TRIGGER update_jobs_updated_at
     BEFORE UPDATE ON jobs
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-DROP TRIGGER IF EXISTS update_requirements_updated_at ON requirements;
-CREATE TRIGGER update_requirements_updated_at
-    BEFORE UPDATE ON requirements
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-
 DROP TRIGGER IF EXISTS update_datasources_updated_at ON datasources;
 CREATE TRIGGER update_datasources_updated_at
     BEFORE UPDATE ON datasources

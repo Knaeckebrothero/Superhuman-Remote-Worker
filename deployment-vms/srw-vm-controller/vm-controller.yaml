@@ -83,6 +83,20 @@ data:
         job-id: ${JOB_ID}
     spec:
       runStrategy: RerunOnFailure
+      dataVolumeTemplates:
+        - metadata:
+            name: agent-vm-${JOB_ID}-rootdisk
+          spec:
+            storage:
+              accessModes:
+                - ReadWriteOnce
+              storageClassName: ${VM_STORAGE_CLASS}
+              resources:
+                requests:
+                  storage: ${VM_DISK_SIZE}
+            source:
+              registry:
+                url: docker://${VM_IMAGE}
       template:
         metadata:
           labels:
@@ -112,8 +126,8 @@ data:
               pod: {}
           volumes:
             - name: rootdisk
-              containerDisk:
-                image: ${VM_IMAGE}
+              dataVolume:
+                name: agent-vm-${JOB_ID}-rootdisk
             - name: cloud-init
               cloudInitNoCloud:
                 userData: |
@@ -195,6 +209,11 @@ spec:
               value: "2"
             - name: DEFAULT_MEMORY
               value: "4Gi"
+            # CDI DataVolume storage (persistent VM disks)
+            - name: VM_STORAGE_CLASS
+              value: "local-path"
+            - name: VM_DISK_SIZE
+              value: "20Gi"
             # Headscale mesh VPN (auth key generation for VMs)
             - name: HEADSCALE_URL
               value: "https://headscale.superhuman-remote-worker.com"

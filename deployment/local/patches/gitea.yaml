@@ -1,0 +1,42 @@
+# Gitea local patch: localhost URLs for ROOT_URL and Keycloak OIDC
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: srw-gitea
+  namespace: superhuman-remote-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: gitea
+          env:
+            - name: GITEA__server__ROOT_URL
+              value: "http://localhost:3000"
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    until wget -qO- http://localhost:3000/api/v1/version >/dev/null 2>&1; do sleep 2; done
+                    gitea admin user create --admin \
+                      --username "$GITEA_ADMIN_USER" \
+                      --password "$GITEA_ADMIN_PASSWORD" \
+                      --email "${GITEA_ADMIN_USER}@srw.local" \
+                      --must-change-password=false 2>/dev/null || true
+                    if ! gitea admin auth list 2>/dev/null | grep -q "Keycloak"; then
+                      KI="http://srw-keycloak:8080"
+                      KP="http://localhost:8180"
+                      R="srw"
+                      gitea admin auth add-oauth \
+                        --name "Keycloak" --provider "openidConnect" \
+                        --key "gitea" --secret "$GITEA_OIDC_CLIENT_SECRET" \
+                        --auto-discover-url "${KI}/realms/${R}/.well-known/openid-configuration" \
+                        --use-custom-urls \
+                        --custom-auth-url "${KP}/realms/${R}/protocol/openid-connect/auth" \
+                        --custom-token-url "${KI}/realms/${R}/protocol/openid-connect/token" \
+                        --custom-profile-url "${KI}/realms/${R}/protocol/openid-connect/userinfo" \
+                        --group-claim-name "groups" --admin-group "admin" \
+                        --skip-local-2fa 2>/dev/null || true
+                    fi
