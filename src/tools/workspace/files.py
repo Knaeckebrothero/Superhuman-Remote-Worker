@@ -680,6 +680,11 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             lines = content.splitlines()
             total_lines = len(lines)
 
+            # Handle empty files: record as read and return informative message
+            if total_lines == 0:
+                context.record_file_read(path)
+                return f"File '{path}' is empty (0 lines)."
+
             # Validate offset
             if start_line > total_lines:
                 return (
@@ -808,13 +813,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             )
 
         try:
-            # Enforce read-before-write for existing files
+            # Enforce read-before-write for existing non-empty files
             if workspace.exists(path) and not context.was_recently_read(path):
-                return (
-                    f"Error: You must read_file('{path}') before overwriting an existing file. "
-                    f"This ensures you understand the current contents before replacing them. "
-                    f"Read the file first, then call write_file again."
-                )
+                existing = workspace.read_file(path)
+                if existing.strip():
+                    return (
+                        f"Error: You must read_file('{path}') before overwriting an existing file. "
+                        f"This ensures you understand the current contents before replacing them. "
+                        f"Read the file first, then call write_file again."
+                    )
 
             # Snapshot for undo before writing
             if context._snapshot_callback:
@@ -881,13 +888,15 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file."
 
-            # Enforce read-before-write discipline
+            # Enforce read-before-write discipline (skip for empty files)
             if not context.was_recently_read(path):
-                return (
-                    f"Error: You must read_file('{path}') before editing. "
-                    f"This ensures you understand the file's current contents. "
-                    f"Read the file first, then call edit_file again."
-                )
+                existing = workspace.read_file(path)
+                if existing.strip():
+                    return (
+                        f"Error: You must read_file('{path}') before editing. "
+                        f"This ensures you understand the file's current contents. "
+                        f"Read the file first, then call edit_file again."
+                    )
 
             # Validate position parameter
             if position is not None and position not in ("start", "end"):
