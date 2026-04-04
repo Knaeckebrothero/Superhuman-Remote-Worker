@@ -44,6 +44,8 @@ The only way to influence these is the global "Persistent Agent" section on the 
 
 **Hardcoded models problem:** The session dialog has a hardcoded `<select>` with specific models (GPT-OSS 120B, GPT-5.4, Claude Opus 4.6, MiniMax M2.7) instead of reading from `env.js` like the job creation form does. Adding a new model requires a code change.
 
+**Hardcoded config names problem:** The session dialog also hardcodes the config/expert dropdown options (`interactive`, `defaults`, `developer`, `scholar`) instead of loading them from `GET /api/experts` like the job creation form does. Adding a new expert requires a code change in the session UI.
+
 ### 6. No shared settings component
 
 Job creation and session creation are completely separate implementations with no shared code for model selection, reasoning levels, tool toggles, etc. Any fix to one (e.g., loading models from `env.js`) has to be manually replicated in the other.
@@ -68,6 +70,8 @@ On component init (before any expert is selected), the form loads the full frame
 GET /api/experts/defaults  →  frameworkDefaults
 ```
 
+> **Note:** This works by calling `GET /api/experts/defaults` which loads the expert named "defaults". The current frontend already does this via `api.getExpertDetail('defaults')` (`job-create.component.ts:1749`). No dedicated endpoint is needed — the existing pattern is sufficient.
+
 When an expert is selected, it loads the merged expert config:
 
 ```
@@ -76,10 +80,10 @@ GET /api/experts/{id}  →  expertDetail.config  (already merged with defaults s
 
 When a project is selected, the project's `default_config_override` is layered on top.
 
-The resolution chain for any setting:
+#### UI Resolution Chain (what the form shows)
 
 ```
-user override  >  project override  >  expert config  >  framework defaults
+user override (form)  >  project override  >  expert config  >  framework defaults
 ```
 
 Every form field reads from this chain via a single resolver:
@@ -96,6 +100,72 @@ resolveDefault(path: string): unknown {
 ```
 
 This means the form is **always populated** — even with no expert selected, temperature shows the real `defaults.yaml` value (e.g., 0.7), not 0.
+
+#### Full Runtime Resolution Chain (what the agent actually gets)
+
+The UI chain above is a simplification. After job creation, two additional resolution layers are applied before the agent starts:
+
+```
+AT CREATION (UI → API):
+  form override  >  project.default_config_override  >  expert config  >  framework defaults
+
+AT DISPATCH (orchestrator → agent pod):
+  + datasource-driven tool overrides
+  + workspace config injection (provisioner-dependent):
+    - K8s ContainerProvisioner: dynamic pod creation
+    - DockerProvisioner: static pool assignment (WORKSPACE_HOSTS env var)
+    - VMProvisioner: QEMU VM
+    - SSH key path and port vary by provisioner type
+  + user API keys (user > project > env var)
+  + user preferences as gap-fillers only:
+    - users.settings.default_model         → llm.model (if not set)
+    - users.settings.default_autonomy      → autonomy (if not set)
+    - users.settings.default_reasoning_level → llm.reasoning_level (if not set)
+    - users.settings.default_auxiliary_model → auxiliary.model (if not set)
+    - users.settings.embedding_provider    → env_keys (always)
+
+AT AGENT START (src/agent.py → loader):
+  + safety guard: agent refuses workspace.backend=local unless DEV_MODE=1
+  + settings_matrix.yaml (model-family-specific inference params)
+    - Applies temperature, top_p, top_k per model family
+    - Applies context limits (always from matrix, expert can't override)
+    - Expert explicit llm keys take precedence over matrix
+  + env_keys set as os.environ
+  + phase-specific LLMs created from llm.strategic / llm.tactical overrides
+  + resolved config frozen to DB for resume
+```
+
+**Implication for the UI:** The `resolveDefault()` function shows expert/framework defaults, but the agent may get *different* temperature/top_p values after the settings matrix applies model-family defaults. For most users this is fine — temperature and top_p are Advanced settings. For the "View resolved config" JSON viewer in the Advanced tab, consider fetching the full dispatch-resolved config from a new API endpoint to show the true final config.
+
+#### Settings Matrix Awareness
+
+The settings matrix (`config/settings_matrix.yaml`) maps model families to inference parameters:
+
+```yaml
+gpt-oss:
+  temperature: 1.0
+  top_p: 1.0
+  model_max_context_tokens: 131072
+  limits: { ... }
+
+claude-opus:
+  temperature: 1.0
+  model_max_context_tokens: 200000
+  limits: { ... }
+```
+
+When the user changes the model in the UI, the effective temperature may change (e.g., switching from gpt-oss to claude-opus). The UI cannot fully replicate this without either:
+
+1. A new `GET /api/config/resolve?model={model}&expert={expert}` endpoint that returns the settings-matrix-merged config, or
+2. Shipping the settings matrix to the frontend and replicating `detect_model_family()` + merge logic in TypeScript.
+
+**Decision:** Option 1 is cleaner but adds latency on model change. Option 2 is faster but duplicates logic. Recommend option 1 for the "View resolved config" JSON viewer, and accept the slight inaccuracy in individual form fields (they show expert defaults, which is close enough for the Settings tab; the Advanced tab's JSON viewer shows the real resolved config).
+
+### Schema Sync
+
+The `ConfigEditorComponent` loads its schema from `cockpit/src/assets/schema.json`, which is **137 lines shorter** than the authoritative `config/schema.json`. New config fields (delegation, communication, etc.) may be missing from the UI's schema-driven editor.
+
+**Required:** Add a build step or CI check to sync `config/schema.json` → `cockpit/src/assets/schema.json`. Alternatively, load the schema from the API at runtime (e.g., serve it from `/api/config/schema`).
 
 ### Shared Settings Component
 
@@ -338,10 +408,12 @@ This replaces the current approach where `buildConfigOverride()` silently diffs 
 ## Implementation Plan
 
 ### Phase 1: Resolved Defaults (Foundation)
-- Load `frameworkDefaults` on init (already partially done from the memory toggle fix)
+- Load `frameworkDefaults` on init (already partially done — `job-create.component.ts:1749` loads via `api.getExpertDetail('defaults')`)
 - Replace all `?? 0`, `?? false`, `?? 'review'` fallbacks with `resolveDefault()` calls
 - Temperature sliders, reasoning dropdowns, multimodal toggles, autonomy all show real values immediately
+- Fix temperature slider displaying 0 when null (`strategicTemperature() ?? getExpertPhaseDefault(...) ?? 0` at lines 403/482)
 - No layout changes yet — just fix the data flow in the existing job-create component
+- Sync `cockpit/src/assets/schema.json` with `config/schema.json` (137-line divergence)
 
 ### Phase 2: Shared Settings Component
 - Extract model selection, reasoning, temperature, tools, autonomy, etc. into `AgentSettingsComponent`
@@ -349,6 +421,9 @@ This replaces the current approach where `buildConfigOverride()` silently diffs 
 - Emits `configOverride` whenever settings change
 - Job-create embeds it, delegating all config-related UI
 - Models loaded from `env.js` (single source, not hardcoded)
+- Extract `getReasoningOptions()` logic (currently at `job-create.component.ts:1954-2014`) — this maps model name to available reasoning levels (varies by provider: groq has none, openrouter has 6 levels, claude/gemini have default only, etc.)
+- **Artifact service integration:** The `InstructionsComponent` must expose a signal/output for the host component to wire to `JobArtifactService`. Do NOT move the artifact service dependency into the shared component — it's job-creation-specific (builder AI streaming edits)
+- Follow existing codebase patterns: standalone components, Angular signals (not RxJS), template-driven forms with `[(ngModel)]`, `inject()` for DI, inline styles with Catppuccin Mocha CSS variables, no UI library dependencies
 
 ### Phase 3: Job Creation Layout
 - Reorganize job-create into the tab layout (Settings / Instructions / Advanced)
@@ -357,19 +432,23 @@ This replaces the current approach where `buildConfigOverride()` silently diffs 
 - Add override change indicators (modified dot, per-field reset)
 
 ### Phase 4: Session Creation Settings
-- Replace the minimal session dialog with a full settings page
+- Replace the minimal session dialog with a full settings page (requires new route, currently a dialog overlay)
 - Embed `AgentSettingsComponent` with `mode='session'`
-- Add expert selector (currently sessions have config dropdown but no expert cards)
-- Wire up the resolution chain: per-session > user persistent_agent settings > expert config > framework defaults
+- Add expert selector (currently sessions have a hardcoded config dropdown with 4 options — not expert cards from the API)
+- Replace hardcoded model list (`sessions-page.component.ts:98-113`, 10 models across 4 groups) with `environment.models` from `env.js`
+- Wire up the resolution chain: per-session > user persistent_agent settings > expert config > persistent_defaults.yaml
 - Session-specific fields: permission mode, idle timeout, greeting, command allowlist
 - Backend: pass `config_override` through `threads.metadata.config_override` (already supported)
+- Backend already accepts `temperature` in `ThreadCreateRequest` (line 7773) but the UI doesn't expose it — add it
+- Backend session lifecycle now supports pool mode (Docker Compose): the orchestrator assigns idle agents to threads via `POST /session/attach` on `persistent_app.py`, passing `config_override` and `project_ids`. This is transparent to the UI — the form builds the same `config_override` regardless of provisioner
 
 ### Phase 5: Presets
 - Backend: `agent_presets` table + CRUD endpoints (shared between jobs and sessions)
 - Frontend: Preset selector dropdown, "Save as Preset" button
 - Loading a preset populates all form fields
 - Presets are per-user, stored server-side
-- Preset type field distinguishes job vs. session presets (or presets are type-agnostic and store whatever settings were configured)
+- Presets are type-agnostic with a `scope` field (`job`, `session`, `any`) — see `settings_design.md` for data model
+- **Deferred:** Project-level presets (stored with `project_id`, visible to all project members). Not needed for initial release but the table schema should include an optional `project_id` column to avoid a future migration
 
 ### Phase 6: Cleanup
 - Remove `ConfigEditorComponent` (or keep as read-only JSON viewer in Advanced tab)
@@ -379,29 +458,45 @@ This replaces the current approach where `buildConfigOverride()` silently diffs 
 
 ## Migration Notes
 
-- The `ConfigEditorComponent` (`config-editor.component.ts`) is a schema-driven visual/JSON editor that parses `config/schema.json` to generate form fields. It's currently a separate expandable below "Advanced Options." It can be repurposed as the read-only "View as JSON" in the Advanced tab, but should not be the primary editing surface.
+- The `ConfigEditorComponent` (`config-editor.component.ts`, 928 lines) is a schema-driven visual/JSON editor that parses `cockpit/src/assets/schema.json` to generate form fields. It supports visual mode (expandable sections) and JSON mode. It skips `$schema`, `agent_id`, `display_name`, `description`, `icon`, `color`, `tags`, `tools`, `instruction_files`, `connections`. It can be repurposed as the read-only "View as JSON" in the Advanced tab, but should not be the primary editing surface. Its `setSmartOverride()` logic (only stores if differs from baseline) and `getDisplayValue()` fallback chain (override > expert config > schema default) are good patterns to reuse in the shared component.
 - Existing `env.js` model presets (`window.env.modelPresets`) continue to work as quick model chips. They're orthogonal to the new settings presets which capture the full form state.
-- The `JobArtifactService` integration (builder AI editing instructions/description) is unaffected — it only touches the instructions and description fields, which remain in the same form.
+- The `JobArtifactService` integration (builder AI editing instructions/description) syncs bidirectionally via Angular effects (`job-create.component.ts:1621-1625, 1891-1895`). The shared `InstructionsComponent` must expose signals/outputs that the host component wires to the artifact service — don't move the artifact dependency into the shared component.
 - The global "Persistent Agent" section on the user settings page stays. It fills the same role as `defaults.yaml` does for jobs — user-level defaults that the per-session form shows as initial values.
-- Session `config_override` is already supported in the backend via `threads.metadata.config_override`. The `POST /api/persistent/threads` endpoint already merges user settings into this field. The overhaul just gives the user a UI to set per-session overrides directly instead of relying on the global settings page.
-- The hardcoded model list in `sessions-page.component.ts` (lines 96-111) is replaced by reading from `environment.models` — the same source job creation uses.
+- Session `config_override` is already supported in the backend via `threads.metadata.config_override`. The `POST /api/persistent/threads` endpoint already merges user settings into this field (`orchestrator/main.py:7788-7809`). The overhaul just gives the user a UI to set per-session overrides directly instead of relying on the global settings page.
+- The hardcoded model list in `sessions-page.component.ts` (lines 98-113, 10 models across 4 provider groups) is replaced by reading from `environment.models` — the same source job creation uses.
+- The hardcoded config dropdown in `sessions-page.component.ts` (lines 88-93, 4 options: interactive/defaults/developer/scholar) is replaced by loading experts from `GET /api/experts` — the same source job creation uses.
+- The `config_upload_id` mechanism (uploading a YAML config file at job creation) is a separate feature from presets. It continues to work as-is and is not affected by this overhaul. The config editor's JSON mode will be removed, but config uploads remain available as a power-user feature.
+- User-level preferences (`default_model`, `default_autonomy`, `default_reasoning_level`, `default_auxiliary_model`) from `users.settings` are applied during dispatch as lowest-priority gap-fillers (`orchestrator/main.py:727-794`). The UI does not need to show these in the job creation form — they're invisible fallbacks that only matter when the user sets nothing explicitly. However, the "View resolved config" JSON viewer should reflect them.
 
 ## Files Affected
 
 ### Cockpit (Frontend)
 | File | Change |
 |------|--------|
-| `shared/components/agent-settings/` | **New** — shared settings component |
-| `shared/components/job-create/job-create.component.ts` | Refactor to embed `AgentSettingsComponent`, remove inline settings |
-| `simple/pages/sessions/sessions-page.component.ts` | Replace dialog with full settings page, embed `AgentSettingsComponent` |
-| `shared/components/config-editor/config-editor.component.ts` | Demote to read-only JSON viewer or remove |
-| `core/models/api.model.ts` | Add `SettingsPreset` model |
-| `core/services/api.service.ts` | Add preset CRUD methods |
-| `pages/settings/settings.component.ts` | No change (global persistent agent settings stay) |
+| `shared/components/agent-settings/` | **New** — shared settings component tree (standalone, signals-based) |
+| `shared/components/job-create/job-create.component.ts` | Refactor to embed `AgentSettingsComponent`, remove inline settings (~1000 lines of settings code move out of this 2565-line component) |
+| `simple/pages/sessions/sessions-page.component.ts` | Replace dialog with full settings page, embed `AgentSettingsComponent`, remove hardcoded model list (lines 98-113) and config dropdown (lines 88-93) |
+| `shared/components/config-editor/config-editor.component.ts` | Demote to read-only JSON viewer or remove (928 lines; `setSmartOverride()` and `getDisplayValue()` patterns worth extracting) |
+| `core/models/api.model.ts` | Add `SettingsPreset` model (existing file is 769 lines with `Expert`, `ExpertDetail`, `UserSettings`, `PersistentAgentSettings` already defined) |
+| `core/services/api.service.ts` | Add preset CRUD methods + optional `GET /api/config/resolve` method |
+| `core/services/settings.service.ts` | May need preset-related state signals |
+| `core/environment.ts` | No change — already provides `models` and `modelPresets` from `env.js` (lines 41-42) |
+| `pages/settings/settings.component.ts` | No change (global persistent agent settings stay; communication settings stay) |
+| `app.routes.ts` | Add route for session creation page (currently session creation is a dialog, not routable) |
+| `src/assets/schema.json` | Sync with `config/schema.json` (currently 137 lines shorter) |
 
 ### Orchestrator (Backend)
 | File | Change |
 |------|--------|
-| `orchestrator/main.py` | Add preset CRUD endpoints |
-| `orchestrator/database/schema.sql` | Add `agent_presets` table |
-| `orchestrator/database/postgres.py` | Add preset CRUD queries |
+| `orchestrator/main.py` | Add preset CRUD endpoints (follow existing patterns: user settings at line 9179, project config at line 9536). Optional: add `GET /api/config/resolve` endpoint for settings-matrix-aware config preview. Note: dispatch now handles 3 provisioners (K8s, Docker, VM) with provisioner-specific SSH key paths and variable port |
+| `orchestrator/services/docker_provisioner.py` | **New** — static workspace pool for Docker Compose mode. Assigns/releases workspaces and VMs from `WORKSPACE_HOSTS`/`VM_HOSTS` env vars. Uses same `jobs.context.workspace_container` JSONB field as ContainerProvisioner |
+| `src/api/persistent_app.py` | Now supports pool mode — `POST /session/attach` and `POST /session/detach` endpoints for agent reuse across sessions. `config_override` and `project_ids` flow through attach |
+| `orchestrator/database/schema.sql` | Add `agent_presets` table (include optional `project_id` column for future project-level presets) |
+| `orchestrator/database/postgres.py` | Add preset CRUD queries (follow `update_user_settings()` pattern at line 3188 for JSONB merge) |
+
+### Config
+| File | Change |
+|------|--------|
+| `config/defaults.yaml` | Workspace backend default changed from `local` to `remote`. Agent now refuses `backend=local` without `DEV_MODE=1` (`--dev` flag). In production, orchestrator always injects `backend=remote` with provisioned workspace credentials |
+| `config/schema.json` | Source of truth — ensure cockpit asset stays in sync |
+| `config/settings_matrix.yaml` | No change, but the new `GET /api/config/resolve` endpoint should apply it |

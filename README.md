@@ -104,9 +104,11 @@ python init.py
 python agent.py --description "Research the current state of EU AI regulation and summarize key requirements"
 ```
 
-## Production Deployment
+## Docker Compose Deployment
 
-Deploy the complete system using containers.
+Deploy the complete system using containers. This is the simplest deployment option — no Kubernetes required. The orchestrator auto-detects the environment and uses static workspace pools instead of dynamic pod provisioning. See [`docs/docker_compose_mode.md`](docs/docker_compose_mode.md) for architecture details.
+
+For Kubernetes deployment (recommended for production), see [`docs/deployment.md`](docs/deployment.md) and the `deployment/` or `deployment-local/` directories.
 
 ### 1. Clone and Configure
 
@@ -234,28 +236,35 @@ python init.py --only-agent             # Workspace only
 
 ### 5. Run the Agent
 
+When running outside containers (bare-metal development), use the `--dev` flag to allow the agent to use its local filesystem as the workspace instead of SSH-ing into a workspace container:
+
 ```bash
-# Give it a task
-python agent.py --description "Your task here"
+# Give it a task (--dev enables local workspace)
+python agent.py --dev --description "Your task here"
 
 # With a custom agent config
-python agent.py --config my_agent --description "Your task"
+python agent.py --dev --config my_agent --description "Your task"
 
 # Process a document
-python agent.py --document-path ./data/doc.pdf --description "Extract key findings"
+python agent.py --dev --document-path ./data/doc.pdf --description "Extract key findings"
 
 # Process a directory of documents
-python agent.py --document-dir ./data/reports/ --description "Compare and summarize these reports"
+python agent.py --dev --document-dir ./data/reports/ --description "Compare and summarize these reports"
 
-# Run as an API server
-python agent.py --port 8001
+# Run as an API server (worker mode)
+python agent.py --dev --port 8001
+
+# Run as a persistent interactive agent
+python agent.py --dev --mode persistent --port 8002
 
 # Resume a crashed job
-python agent.py --job-id <id> --resume
+python agent.py --dev --job-id <id> --resume
 
 # Debug mode
-LOG_LEVEL=DEBUG python agent.py --description "Your task"
+LOG_LEVEL=DEBUG python agent.py --dev --description "Your task"
 ```
+
+The `--dev` flag is only needed for bare-metal development. When running inside Docker Compose or Kubernetes, workspace containers are provisioned automatically and the agent receives `backend: remote` from the orchestrator.
 
 ### 6. Backup and Restore
 

@@ -1,5 +1,10 @@
 # Deployment Roadmap — Internal Testing Release
 
+> **Scope:** This document covers the **Kubernetes production deployment** only.
+> For Docker Compose deployment (development and small deployments), see
+> [`docs/docker_compose_mode.md`](docker_compose_mode.md). For the overall
+> deployment strategy, see [`docs/deployment.md`](deployment.md).
+
 **Date:** 2026-03-19 (initial), last updated 2026-03-20
 **Target:** Update the existing K3s deployment to reflect current codebase, then expose to the internet.
 **Domain:** `superhuman-remote-worker.com` (registered on Cloudflare 2026-03-19)

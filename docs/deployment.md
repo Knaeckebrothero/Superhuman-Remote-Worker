@@ -1,39 +1,42 @@
 # Deployment Strategy
 
-**Status:** Planning  
-**Last updated:** 2026-04-03
+**Status:** Active  
+**Last updated:** 2026-04-04
 
 ## Summary
 
-The project currently supports two deployment methods: Docker Compose (podman-compose) for local development and raw Kubernetes manifests managed by Fleet (Rancher GitOps) for production. The long-term goal is to deprecate Docker Compose entirely and standardize on Kubernetes as the only deployment target, offering two profiles:
+The project supports three deployment tiers. All are actively maintained.
 
-1. **Single-cluster** — All services on one K3s node. For development, testing, demos, and small deployments.
-2. **Multi-cluster** — Dedicated nodes with Fleet, Vault, Longhorn, and cross-cluster networking. For production.
+1. **Docker Compose** — Full stack in containers with static workspace/agent pools. For development, small deployments, and environments without Kubernetes. See [`docs/docker_compose_mode.md`](docker_compose_mode.md) for the full design.
+2. **Kubernetes (single-cluster)** — All services on one K3s node via Kustomize overlay (`deployment-local/`). For testing, demos, and small production deployments.
+3. **Kubernetes (multi-cluster)** — Dedicated nodes with Fleet, Vault, Longhorn, and cross-cluster networking (`deployment/`). For production.
 
-## Why Kubernetes is required
+## Why Kubernetes is recommended for production
 
-The system's core architecture depends on capabilities that container runtimes alone (Docker, Podman) cannot provide:
+Kubernetes provides dynamic provisioning capabilities that Docker Compose handles via static pools:
 
-- **Dynamic agent scaling.** The orchestrator provisions workspace pods on demand via `CoreV1Api.create_namespaced_pod()`. Each job gets an isolated container with SSH access, code-server, and a readiness probe. Docker Compose has no equivalent for programmatic container lifecycle management against a scheduler API.
-- **Persistent agent sessions.** Interactive agent pods are created on demand (`persistent_provisioner.py`), health-checked, idle-swept after 30 minutes, and snapshotted to S3. This requires pod creation, deletion, and status watching — all Kubernetes API operations.
-- **Cross-cluster VM lifecycle.** KubeVirt VMs on a separate agent cluster are managed via NATS messages. The orchestrator publishes provisioning requests; a VM controller on the agent cluster handles them. This is a Kubernetes-native pattern (Custom Resources, node scheduling, persistent volumes).
-- **Service discovery and networking.** Agents, workspace pods, and the orchestrator communicate via Kubernetes Services and DNS. Network policies isolate workspace containers from the internet while allowing access to internal databases.
+| Capability | Kubernetes | Docker Compose |
+|------------|-----------|----------------|
+| **Agent scaling** | Dynamic pod creation via `CoreV1Api` | Fixed `deploy.replicas` in compose file |
+| **Workspace isolation** | Per-job pods created/deleted on demand | Static pool of containers, recycled between jobs |
+| **Persistent sessions** | On-demand agent pods per thread | Fixed pool of persistent agents, reassigned between sessions |
+| **VM workspaces** | KubeVirt VMs via NATS or direct API | QEMU-in-Docker containers (requires `/dev/kvm`) |
+| **Cross-cluster VMs** | NATS + KubeVirt + Headscale mesh | Not supported (same-host only) |
+| **Service discovery** | K8s DNS + Services + NetworkPolicies | Docker Compose embedded DNS |
 
-Attempting to replicate these capabilities in Docker Compose would mean reimplementing half of Kubernetes poorly. The existing `docker-compose.dev.yaml` works for running databases while developing the orchestrator/agent on the host, but it cannot test the provisioning paths that define the system's value.
+Docker Compose cannot dynamically scale or provision infrastructure, but it provides a fully functional system for smaller deployments where the fixed pool model is sufficient.
 
 ## Current state
 
-### Docker Compose (being deprecated)
+### Docker Compose (supported)
 
-Three compose files exist:
+The orchestrator auto-detects whether Kubernetes is available. When the k8s API is unreachable, it uses `DockerProvisioner` to assign pre-existing workspace containers from a static pool instead of creating pods on demand. See [`docs/docker_compose_mode.md`](docker_compose_mode.md) for architecture details.
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yaml` | Full stack with GHCR images. Never fully worked as a standalone deployment — missing dynamic provisioning. |
+| `docker-compose.yaml` | Full stack with GHCR images, workspace containers, SSH keygen, static agent pools. |
 | `docker-compose.local.yaml` | Same but builds images locally. |
 | `docker-compose.dev.yaml` | Databases + supporting services only. Orchestrator/agent run on the host for debugging. |
-
-These will not receive new features. They remain functional for running databases during active Python development but are not a supported deployment path.
 
 ### Kubernetes — Multi-cluster (production)
 
@@ -186,19 +189,21 @@ If the project stays internal with two profiles, **Kustomize (Option A)** is suf
 
 The decision doesn't need to be made now. The Kustomize overlay is functional. If it starts feeling painful (too many patches, hard to reason about final state), that's the signal to convert to Helm.
 
-### Phase 3: Deprecate Docker Compose
+### Phase 3: Docker Compose as supported deployment tier
 
-Once the single-cluster Kubernetes deployment is stable and documented:
-1. Add deprecation notice to all `docker-compose*.yaml` files
-2. Update the project README to point to Kubernetes as the primary deployment method
-3. Remove Docker Compose files from the repository after one release cycle
+> **Decision reversed (2026-04-04).** Docker Compose is no longer being deprecated.
+> It remains a supported deployment mode alongside Kubernetes. See
+> [`docs/docker_compose_mode.md`](docker_compose_mode.md) for the full design.
 
-The `docker-compose.dev.yaml` workflow (databases on host, orchestrator running locally) can be replaced by running databases in K3s and port-forwarding:
-```bash
-kubectl port-forward svc/srw-postgres 5432:5432 -n superhuman-remote-worker
-kubectl port-forward svc/srw-mongodb 27017:27017 -n superhuman-remote-worker
-# Then run orchestrator/agent locally as before
-```
+The orchestrator auto-detects whether it's running on Kubernetes (k8s API reachable)
+or Docker Compose (k8s unavailable) and adjusts its provisioning behavior:
+
+- **Kubernetes:** Dynamic workspace/VM/agent pod provisioning (current behavior)
+- **Docker Compose:** Fixed pool of workspace containers and agents defined in the
+  compose file, recycled between jobs via S3 snapshot/restore
+
+This gives smaller deployments a fully functional system without a k8s cluster, while
+production deployments retain dynamic scaling and KubeVirt VM support.
 
 ## Access control
 

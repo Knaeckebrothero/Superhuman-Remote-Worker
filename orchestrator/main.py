@@ -55,7 +55,7 @@ logging.getLogger("uvicorn.access").disabled = True
 
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from typing import Any  # noqa: E402
+from typing import Any, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
@@ -106,6 +106,7 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
+from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
@@ -670,19 +671,26 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
 
         # Inject workspace container config if job has a ready container
         container_ctx = _get_container_context(job)
-        if container_ctx.get("status") == "ready" and container_ctx.get("pod_ip"):
+        container_host = container_ctx.get("pod_ip") or container_ctx.get("host")
+        if container_ctx.get("status") == "ready" and container_host:
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
             ws["backend"] = "remote"
             remote = ws.setdefault("remote", {})
-            remote.setdefault("host", container_ctx["pod_ip"])
-            remote.setdefault("port", 22)
+            remote.setdefault("host", container_host)
+            remote.setdefault("port", container_ctx.get("port", 22))
             remote.setdefault("username", "agent-host")
-            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
+            # Docker Compose mode: SSH key is in /run/secrets/ssh/id_ed25519
+            # Kubernetes mode: SSH key is in /run/secrets/vm-ssh-key
+            if container_ctx.get("provisioner") == "docker":
+                remote.setdefault("key_path", "/run/secrets/ssh/id_ed25519")
+            else:
+                remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
             logger.info(
                 f"Dispatch: injected workspace container config for job {job_id} "
-                f"(host={container_ctx['pod_ip']}:22)"
+                f"(host={container_host}:{container_ctx.get('port', 22)}, "
+                f"provisioner={container_ctx.get('provisioner', 'k8s')})"
             )
 
         # Override workspace_path with worktree_path for subjobs on shared backends
@@ -993,6 +1001,84 @@ async def _initiate_pause(job: dict) -> None:
         _pause_pending_job_ids.discard(job_id)
 
 
+async def _find_idle_persistent_agent() -> Optional[dict]:
+    """Find an idle persistent agent in the pool (Docker Compose mode).
+
+    Returns the agent row dict or None if no idle agents are available.
+    An agent is idle when: agent_mode='persistent', status='available',
+    and it has no thread currently attached.
+    """
+    try:
+        rows = await postgres_db.fetch(
+            """
+            SELECT id, pod_ip, pod_port, hostname, status, config_name
+            FROM agents
+            WHERE agent_mode = 'persistent'
+              AND status = 'available'
+              AND (thread_id IS NULL OR thread_id = '')
+            ORDER BY last_heartbeat DESC
+            LIMIT 1
+            """,
+        )
+        return dict(rows[0]) if rows else None
+    except Exception:
+        logger.exception("Failed to find idle persistent agent")
+        return None
+
+
+async def _send_session_attach(
+    agent: dict,
+    thread_id: str,
+    config_override: Optional[dict] = None,
+    project_ids: Optional[list] = None,
+) -> bool:
+    """Send a session attach request to an idle persistent agent.
+
+    Returns True if the agent accepted the session.
+    """
+    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/session/attach"
+    payload = {
+        "thread_id": thread_id,
+        "config_override": config_override,
+        "project_ids": project_ids,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(agent_url, json=payload)
+        if response.status_code == 200:
+            logger.info(
+                "Assigned thread %s to persistent agent %s (%s:%s)",
+                thread_id,
+                agent["id"],
+                agent["pod_ip"],
+                agent["pod_port"],
+            )
+            # Update the agent's thread_id in DB
+            try:
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE agents SET thread_id = $2 WHERE id = $1",
+                        str(agent["id"]),
+                        thread_id,
+                    )
+            except Exception:
+                logger.warning("Failed to update agent thread_id in DB")
+            return True
+        else:
+            logger.warning(
+                "Persistent agent %s rejected session attach: %s %s",
+                agent["id"],
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+    except Exception:
+        logger.exception(
+            "Failed to send session attach to agent %s", agent["id"]
+        )
+        return False
+
+
 def _job_needs_vm(job: dict) -> bool:
     """Check if a job requires a VM workspace (from config_override or context)."""
     # Explicit VM request in context
@@ -1031,8 +1117,8 @@ def _job_needs_container(job: dict) -> bool:
 
     Returns True if:
     - config_override.workspace.backend == "container", OR
-    - backend is not explicitly set to "local" or "remote" AND container
-      provisioner is available (container is the default for production).
+    - backend is not explicitly set to "local" or "remote" AND a workspace
+      provisioner is available (k8s ContainerProvisioner OR DockerProvisioner).
 
     Returns False if the job already has a ready VM or container inherited
     from a parent job (worktree sharing — no new container needed).
@@ -1060,8 +1146,8 @@ def _job_needs_container(job: dict) -> bool:
         return True
     if backend in ("local", "remote"):
         return False
-    # No explicit backend — default to container if provisioner is available
-    return container_provisioner.is_available
+    # No explicit backend — default to container if any provisioner is available
+    return container_provisioner.is_available or docker_provisioner.is_available
 
 
 def _get_container_context(job: dict) -> dict:
@@ -1204,43 +1290,76 @@ async def _try_dispatch_pending_jobs() -> None:
                     container_status = container_ctx.get("status")
                     if not container_status:
                         # Container needed but not provisioned — provision now
-                        logger.info(
-                            "Dispatcher: job %s provisioning workspace container "
-                            "(VM not available or not requested)",
-                            job_id,
-                        )
-                        config_override = job.get("config_override") or {}
-                        if isinstance(config_override, str):
-                            config_override = json.loads(config_override)
-                        ws_cfg = config_override.get("workspace", {}).get(
-                            "container", {}
-                        )
-                        ok = await container_provisioner.create_workspace(
-                            job_id=job_id,
-                            cpu=ws_cfg.get("cpu", "500m"),
-                            memory=ws_cfg.get("memory", "1Gi"),
-                            cpu_limit=ws_cfg.get("cpu_limit", "2000m"),
-                            memory_limit=ws_cfg.get("memory_limit", "4Gi"),
-                            image=ws_cfg.get("image"),
-                        )
-                        if ok:
+                        if container_provisioner.is_available:
+                            # Kubernetes mode: create pod on demand
                             logger.info(
-                                "Dispatcher: auto-provisioned workspace container for job %s",
+                                "Dispatcher: job %s provisioning workspace container "
+                                "(VM not available or not requested)",
                                 job_id,
                             )
+                            config_override = job.get("config_override") or {}
+                            if isinstance(config_override, str):
+                                config_override = json.loads(config_override)
+                            ws_cfg = config_override.get("workspace", {}).get(
+                                "container", {}
+                            )
+                            ok = await container_provisioner.create_workspace(
+                                job_id=job_id,
+                                cpu=ws_cfg.get("cpu", "500m"),
+                                memory=ws_cfg.get("memory", "1Gi"),
+                                cpu_limit=ws_cfg.get("cpu_limit", "2000m"),
+                                memory_limit=ws_cfg.get("memory_limit", "4Gi"),
+                                image=ws_cfg.get("image"),
+                            )
+                            if ok:
+                                logger.info(
+                                    "Dispatcher: auto-provisioned workspace container for job %s",
+                                    job_id,
+                                )
+                            else:
+                                logger.error(
+                                    "Dispatcher: workspace container provisioning failed "
+                                    "for job %s. Failing job.",
+                                    job_id,
+                                )
+                                await postgres_db.update_job_status(
+                                    job_id,
+                                    status="failed",
+                                    error_message=(
+                                        "Workspace container could not be created. "
+                                        "Check orchestrator logs for details (image pull "
+                                        "failures, insufficient resources, RBAC issues)."
+                                    ),
+                                )
+                        elif docker_provisioner.is_available:
+                            # Docker Compose mode: assign from static pool
+                            logger.info(
+                                "Dispatcher: job %s assigning workspace from "
+                                "Docker Compose pool",
+                                job_id,
+                            )
+                            result = await docker_provisioner.assign_workspace(
+                                job_id
+                            )
+                            if not result:
+                                logger.warning(
+                                    "Dispatcher: no free workspace for job %s "
+                                    "— all containers occupied, will retry",
+                                    job_id,
+                                )
                         else:
                             logger.error(
-                                "Dispatcher: workspace container provisioning failed "
-                                "for job %s. Failing job.",
+                                "Dispatcher: job %s needs workspace but no "
+                                "provisioner available. Failing job.",
                                 job_id,
                             )
                             await postgres_db.update_job_status(
                                 job_id,
                                 status="failed",
                                 error_message=(
-                                    "Workspace container could not be created. "
-                                    "Check orchestrator logs for details (image pull "
-                                    "failures, insufficient resources, RBAC issues)."
+                                    "No workspace provisioner available. "
+                                    "Neither Kubernetes API nor WORKSPACE_HOSTS "
+                                    "configured."
                                 ),
                             )
                         continue  # Skip — wait for container to become ready
@@ -1872,6 +1991,26 @@ async def lifespan(app: FastAPI):
 
     # Initialize S3 snapshot service (graceful if S3 not configured)
     await snapshot_service.connect(db=postgres_db)
+
+    # Initialize Docker Compose provisioner (static workspace pool, used when k8s unavailable)
+    docker_provisioner.connect(db=postgres_db, snapshot_service=snapshot_service)
+
+    # Log deployment mode
+    if container_provisioner.is_available:
+        logger.info(
+            "Deployment mode: KUBERNETES — dynamic provisioning via k8s API"
+        )
+    elif docker_provisioner.is_available:
+        logger.info(
+            "Deployment mode: DOCKER COMPOSE — static workspace pool (%s)",
+            ",".join(docker_provisioner.workspace_hosts),
+        )
+    else:
+        logger.warning(
+            "Deployment mode: NO WORKSPACE PROVISIONER — "
+            "neither k8s API nor WORKSPACE_HOSTS available. "
+            "Jobs requiring workspaces will fail."
+        )
 
     # Initialize IDE session service
     ide_session_service.connect(
@@ -2637,15 +2776,19 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             if vm_ctx.get("status") not in ("deleted", "deleting"):
                 await vm_provisioner.delete_vm(job_id)
 
-        # If job has a workspace container, delete it
+        # If job has a workspace container, delete it (k8s) or release it (docker)
         ws_container_ctx = _get_container_context(job)
         if ws_container_ctx and ws_container_ctx.get("status") not in (
             "deleted",
             "deleting",
+            "released",
             None,
         ):
-            await container_provisioner.delete_workspace(job_id)
-            await container_provisioner.delete_workspace_pvc(job_id)
+            if ws_container_ctx.get("provisioner") == "docker":
+                await docker_provisioner.release_workspace(job_id)
+            else:
+                await container_provisioner.delete_workspace(job_id)
+                await container_provisioner.delete_workspace_pvc(job_id)
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -5394,17 +5537,22 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 await vm_provisioner.delete_vm(job_id)
                 actions.append("vm deletion requested")
 
-        # 9. If job had a workspace container, request teardown
+        # 9. If job had a workspace container, request teardown (k8s) or release (docker)
         if job.get("status") in ("completed", "failed"):
             ws_container_ctx = _get_container_context(job)
             if ws_container_ctx and ws_container_ctx.get("status") not in (
                 "deleted",
                 "deleting",
+                "released",
                 None,
             ):
-                await container_provisioner.delete_workspace(job_id)
-                await container_provisioner.delete_workspace_pvc(job_id)
-                actions.append("workspace container deletion requested")
+                if ws_container_ctx.get("provisioner") == "docker":
+                    await docker_provisioner.release_workspace(job_id)
+                    actions.append("docker workspace released")
+                else:
+                    await container_provisioner.delete_workspace(job_id)
+                    await container_provisioner.delete_workspace_pvc(job_id)
+                    actions.append("workspace container deletion requested")
 
         return {
             "status": "handled",
@@ -7858,9 +8006,9 @@ async def create_thread(
                     {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
-        # Provision workspace container in background if K8s is available
+        # Provision workspace container in background
         if container_provisioner.is_available:
-
+            # Kubernetes mode: create pod on demand
             async def _provision_thread_workspace(tid: str) -> None:
                 ok = await container_provisioner.create_thread_workspace(tid)
                 if not ok:
@@ -7871,18 +8019,31 @@ async def create_thread(
                     )
 
             asyncio.create_task(_provision_thread_workspace(thread_id))
+        elif docker_provisioner.is_available:
+            # Docker Compose mode: assign from static pool
+            async def _assign_thread_workspace(tid: str) -> None:
+                result = await docker_provisioner.assign_thread_workspace(tid)
+                if not result:
+                    logger.warning(
+                        "Thread %s: no free workspace in Docker pool. "
+                        "All containers occupied.",
+                        tid,
+                    )
+
+            asyncio.create_task(_assign_thread_workspace(thread_id))
         else:
             logger.warning(
                 "Thread %s: workspace container not provisioned — "
-                "container provisioner unavailable (no K8s). "
+                "no provisioner available. "
                 "Start the agent manually: python agent.py --mode persistent "
                 "--thread-id %s",
                 thread_id,
                 thread_id,
             )
 
-        # Provision persistent agent pod in background
+        # Provision persistent agent pod / assign from pool
         if persistent_provisioner.is_available:
+            # Kubernetes mode: create agent pod on demand
             effective_config = request_body.config_name or user_settings.get(
                 "config_name", "interactive"
             )
@@ -7897,11 +8058,31 @@ async def create_thread(
                     )
 
             asyncio.create_task(_provision_agent_pod(thread_id, effective_config))
+        elif docker_provisioner.is_available:
+            # Docker Compose mode: find an idle pool agent and attach the thread
+            async def _assign_pool_agent(
+                tid: str, co: dict, pids: list
+            ) -> None:
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    await _send_session_attach(idle_agent, tid, co, pids)
+                else:
+                    logger.warning(
+                        "Thread %s: no idle persistent agents in pool. "
+                        "Increase PERSISTENT_REPLICAS or wait for a session to end.",
+                        tid,
+                    )
+
+            asyncio.create_task(
+                _assign_pool_agent(
+                    thread_id, config_override, effective_project_ids
+                )
+            )
         else:
             logger.warning(
                 "Thread %s: persistent agent pod not provisioned — "
-                "K8s unavailable. Start the agent manually: python agent.py "
-                "--mode persistent --thread-id %s",
+                "no provisioner available. Start the agent manually: "
+                "python agent.py --mode persistent --thread-id %s",
                 thread_id,
                 thread_id,
             )
@@ -7973,18 +8154,20 @@ async def end_thread(
     ws_ctx = metadata.get("workspace_container") or {}
 
     # Capture S3 snapshot before deleting workspace
-    pod_ip = ws_ctx.get("pod_ip")
-    if snapshot_service.is_available and pod_ip and ws_ctx.get("status") == "ready":
+    ws_host = ws_ctx.get("pod_ip") or ws_ctx.get("host")
+    if snapshot_service.is_available and ws_host and ws_ctx.get("status") == "ready":
         await snapshot_service.capture_vm_snapshot(
             job_id=thread_id,
-            ssh_host=pod_ip,
-            ssh_port=22,
+            ssh_host=ws_host,
+            ssh_port=ws_ctx.get("port", 22),
             source_type="pod",
             entity_type="threads",
         )
 
     # Clean up workspace container if one was provisioned
-    if container_provisioner.is_available:
+    if ws_ctx.get("provisioner") == "docker":
+        await docker_provisioner.release_thread_workspace(thread_id)
+    elif container_provisioner.is_available:
         await container_provisioner.delete_thread_workspace(thread_id)
         await container_provisioner.delete_thread_workspace_pvc(thread_id)
 
