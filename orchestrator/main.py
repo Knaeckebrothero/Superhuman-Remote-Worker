@@ -1073,9 +1073,7 @@ async def _send_session_attach(
             )
             return False
     except Exception:
-        logger.exception(
-            "Failed to send session attach to agent %s", agent["id"]
-        )
+        logger.exception("Failed to send session attach to agent %s", agent["id"])
         return False
 
 
@@ -1338,9 +1336,7 @@ async def _try_dispatch_pending_jobs() -> None:
                                 "Docker Compose pool",
                                 job_id,
                             )
-                            result = await docker_provisioner.assign_workspace(
-                                job_id
-                            )
+                            result = await docker_provisioner.assign_workspace(job_id)
                             if not result:
                                 logger.warning(
                                     "Dispatcher: no free workspace for job %s "
@@ -1997,9 +1993,7 @@ async def lifespan(app: FastAPI):
 
     # Log deployment mode
     if container_provisioner.is_available:
-        logger.info(
-            "Deployment mode: KUBERNETES — dynamic provisioning via k8s API"
-        )
+        logger.info("Deployment mode: KUBERNETES — dynamic provisioning via k8s API")
     elif docker_provisioner.is_available:
         logger.info(
             "Deployment mode: DOCKER COMPOSE — static workspace pool (%s)",
@@ -8060,9 +8054,7 @@ async def create_thread(
             asyncio.create_task(_provision_agent_pod(thread_id, effective_config))
         elif docker_provisioner.is_available:
             # Docker Compose mode: find an idle pool agent and attach the thread
-            async def _assign_pool_agent(
-                tid: str, co: dict, pids: list
-            ) -> None:
+            async def _assign_pool_agent(tid: str, co: dict, pids: list) -> None:
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
                     await _send_session_attach(idle_agent, tid, co, pids)
@@ -8074,9 +8066,7 @@ async def create_thread(
                     )
 
             asyncio.create_task(
-                _assign_pool_agent(
-                    thread_id, config_override, effective_project_ids
-                )
+                _assign_pool_agent(thread_id, config_override, effective_project_ids)
             )
         else:
             logger.warning(
