@@ -32,15 +32,23 @@ workspace:
   max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
-  # Workspace backend: "local" (default) or "remote" (SSH/SFTP to VM)
-  backend: local
-  # Remote backend settings (only used when backend: remote)
+  # Workspace backend: "remote" (default) or "local" (bare-metal dev only)
+  #
+  # In production (k8s or Docker Compose), the orchestrator injects
+  # backend=remote with SSH credentials pointing to a workspace container
+  # or VM. The agent refuses backend=local unless DEV_MODE=1 (--dev flag).
+  #
+  # Use "local" only when running `python agent.py --dev` directly on a
+  # developer's machine without containers.
+  backend: remote
+  # Remote backend settings (injected by orchestrator at dispatch time)
   # remote:
-  #   host: ""                                        # VM IP or hostname
+  #   host: ""                                        # VM/container hostname or IP
   #   port: 22
   #   username: agent-host
-  #   key_path: /run/secrets/vm-ssh-key               # Path to SSH private key
-  #   workspace_path: /home/agent-host/workspace    # Workspace root on the VM
+  #   key_path: /run/secrets/vm-ssh-key               # K8s: Secret mount
+  #           # /run/secrets/ssh/id_ed25519            # Docker Compose: shared volume
+  #   workspace_path: /home/agent-host/workspace    # Workspace root on the remote
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)

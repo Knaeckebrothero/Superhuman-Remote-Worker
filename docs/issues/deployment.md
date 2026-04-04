@@ -1,5 +1,9 @@
 # Home Lab Deployment Status (2026-03-16)
 
+> **Scope:** Historical snapshot of the Kubernetes production deployment.
+> For the current deployment strategy (including Docker Compose mode), see
+> [`docs/deployment.md`](../deployment.md).
+
 ## Cluster Status
 
 **Main cluster** (`superhuman-remote-worker` namespace) — all 15 pods running healthy:

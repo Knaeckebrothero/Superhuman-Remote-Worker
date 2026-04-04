@@ -26,6 +26,18 @@ Transform this project from a domain-specific requirement extraction system (cre
 - Be deployed as a complete stack in a single namespace
 - Support multiple LLM backends (self-hosted OSS, Anthropic, Gemini)
 
+## Deployment Modes
+
+Three deployment tiers are supported (see [`docs/deployment.md`](deployment.md)):
+
+| Tier | Target | Provisioning | Config |
+|------|--------|-------------|--------|
+| **Docker Compose** | Dev machines, small servers | Static workspace/agent pools via `DockerProvisioner` | `.env` file |
+| **K8s single-cluster** | Local K3s, demos, small prod | Dynamic pods via `ContainerProvisioner` | `deployment-local/` Kustomize |
+| **K8s multi-cluster** | Production | Dynamic pods + KubeVirt VMs + Fleet GitOps | `deployment/` + Vault/ESO |
+
+See [`docs/docker_compose_mode.md`](docker_compose_mode.md) for the Docker Compose architecture.
+
 ## Current State
 
 ### What Works

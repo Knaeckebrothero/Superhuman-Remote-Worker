@@ -31,14 +31,23 @@ from ..persistent_graph import (
 
 logger = logging.getLogger(__name__)
 
-# --- Module globals (session-scoped, not shared with worker app.py) ---
+# --- Module globals ---
+# Singleton layer (lives for the entire process lifetime):
 _agent: Optional[UniversalAgent] = None
-_session: Optional[PersistentSession] = None
 _config_path: Optional[str] = None
-_thread_id: Optional[str] = None
 _orchestrator_client: Optional[OrchestratorClient] = None
 _heartbeat_task: Optional[asyncio.Task] = None
 _started_at: Optional[datetime] = None
+
+# Session layer (created/destroyed per thread assignment):
+_session: Optional[PersistentSession] = None
+_thread_id: Optional[str] = None
+
+# Pool mode: agent can be reused across sessions (Docker Compose mode)
+_sessions_served: int = 0
+_max_sessions_per_process: int = int(
+    os.environ.get("MAX_SESSIONS_PER_PROCESS", "0")
+)  # 0 = unlimited
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
@@ -67,15 +76,17 @@ async def lifespan(app: FastAPI):
         _thread_id
 
     _started_at = datetime.now()
+    pool_mode = _thread_id is None
     logger.info(
-        f"Starting persistent agent: config={_config_path}, thread={_thread_id}"
+        f"Starting persistent agent: config={_config_path}, "
+        f"thread={_thread_id or '(pool mode — waiting for assignment)'}"
     )
 
-    # 1. Create and initialize UniversalAgent (same as worker)
+    # 1. Create and initialize UniversalAgent (singleton layer)
     _agent = UniversalAgent.from_config(_config_path)
     await _agent.initialize()
 
-    # 2. Connect to orchestrator and auto-create thread if needed
+    # 2. Connect to orchestrator
     orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
     if orchestrator_url:
         try:
@@ -84,34 +95,46 @@ async def lifespan(app: FastAPI):
             )
             await _orchestrator_client.connect()
 
-            # Auto-create thread if none was provided
-            if _thread_id is None:
-                created_id = await _orchestrator_client.create_thread(
-                    config_name=_config_path or "interactive",
-                    permission_mode=_agent.config.interactive.permission_mode,
-                    title=f"Local Session ({_config_path or 'interactive'})",
+            if pool_mode:
+                # Pool mode: register as available, no thread yet.
+                # The orchestrator will assign threads via POST /session/attach.
+                await _orchestrator_client.register(
+                    agent_mode="persistent",
+                    thread_id=None,
                 )
-                if created_id:
-                    _thread_id = created_id
-                    logger.info(f"Auto-created thread: {_thread_id}")
-                else:
-                    logger.warning("Failed to create thread — generating local UUID")
+            else:
+                # Dedicated mode: auto-create thread if needed (backwards compatible)
+                if _thread_id is None:
+                    created_id = await _orchestrator_client.create_thread(
+                        config_name=_config_path or "interactive",
+                        permission_mode=_agent.config.interactive.permission_mode,
+                        title=f"Local Session ({_config_path or 'interactive'})",
+                    )
+                    if created_id:
+                        _thread_id = created_id
+                        logger.info(f"Auto-created thread: {_thread_id}")
+                    else:
+                        logger.warning(
+                            "Failed to create thread — generating local UUID"
+                        )
 
-            # Register with the (now known) thread_id
-            if _thread_id is None:
-                import uuid
+                if _thread_id is None:
+                    import uuid
 
-                _thread_id = str(uuid.uuid4())
+                    _thread_id = str(uuid.uuid4())
 
-            await _orchestrator_client.register(
-                agent_mode="persistent",
-                thread_id=_thread_id,
-            )
+                await _orchestrator_client.register(
+                    agent_mode="persistent",
+                    thread_id=_thread_id,
+                )
 
             # Start heartbeat
+            def _heartbeat_status():
+                return "available" if _session is None else "ready"
+
             _heartbeat_task = asyncio.create_task(
                 _orchestrator_client.run_heartbeat_loop(
-                    get_status=lambda: "ready",
+                    get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
                 )
@@ -123,109 +146,28 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("No ORCHESTRATOR_URL — running standalone")
 
-    # Fallback: generate UUID if still None (standalone mode)
-    if _thread_id is None:
-        import uuid
+    # If we have a thread_id (dedicated mode), set up the session immediately
+    if _thread_id:
+        # Fallback: generate UUID if still None (standalone mode)
+        if _thread_id is None:
+            import uuid
 
-        _thread_id = str(uuid.uuid4())
+            _thread_id = str(uuid.uuid4())
 
-    # 2b. Wait for workspace container (if orchestrator is provisioning one)
-    workspace_override = None
-    if _orchestrator_client and _thread_id:
-        workspace_override = await _poll_workspace_ready(
-            _orchestrator_client, _thread_id, timeout=120
+        await _attach_session(_thread_id)
+    else:
+        logger.info(
+            "Pool mode: waiting for session assignment via POST /session/attach"
         )
-        if workspace_override:
-            logger.info(
-                f"Workspace container ready: {workspace_override['remote']['host']}"
-            )
-        else:
-            logger.info("No workspace container — using local backend")
-
-    # 3. Apply config overrides and project_ids from thread metadata
-    config_override = (workspace_override or {}).get("config_override")
-    project_ids = (workspace_override or {}).get("project_ids") or []
-    if (not config_override or not project_ids) and _orchestrator_client and _thread_id:
-        # No workspace container but might still have config overrides / project_ids
-        try:
-            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
-            if ws_info:
-                if not config_override:
-                    config_override = ws_info.get("config_override")
-                if not project_ids:
-                    project_ids = ws_info.get("project_ids") or []
-        except Exception:
-            pass
-
-    effective_config = _agent.config
-    llm = _agent._tactical_llm or _agent._llm
-    if config_override:
-        import dataclasses
-        from ..core.loader import (
-            deep_merge,
-            load_agent_config_from_dict,
-            create_llm,
-        )
-
-        base_dict = dataclasses.asdict(effective_config)
-        merged = deep_merge(base_dict, config_override)
-        effective_config = load_agent_config_from_dict(
-            merged, deployment_dir=effective_config._deployment_dir
-        )
-        # Recreate LLM if model or temperature changed
-        if config_override.get("llm"):
-            llm = create_llm(effective_config.llm, effective_config.limits)
-            logger.info(
-                f"Config override applied: model={effective_config.llm.model}, "
-                f"temperature={effective_config.llm.temperature}"
-            )
-
-    # 4. Create PersistentSession (thread_id is now guaranteed)
-    _session = PersistentSession(
-        thread_id=_thread_id,
-        config=effective_config,
-        project_ids=project_ids,
-    )
-    if project_ids:
-        logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
-    git_remote_url = (
-        workspace_override.get("git_remote_url") if workspace_override else None
-    )
-    await _session.setup(
-        llm=llm,
-        auxiliary_llm=_agent._auxiliary_llm,
-        postgres_conn=_agent.postgres_conn,
-        vector_conn=getattr(_agent, "vector_conn", None),
-        workspace_override=workspace_override,
-        git_remote_url=git_remote_url,
-    )
-
-    # 5. Restore message history from DB (for pod restart / session resume)
-    await _restore_session_messages()
-
-    logger.info(f"Persistent agent ready: thread={_thread_id}")
-
-    # Mark thread as active now that the agent is fully initialized
-    await _update_thread_status("active")
 
     yield
 
     # --- Shutdown ---
     logger.info("Shutting down persistent agent")
 
-    # Mark thread as idle on graceful shutdown (NOT ended — only /done sets ended)
-    await _update_thread_status("idle")
-
-    # Final git commit + push before cleanup
-    if _session and _session.workspace_manager:
-        git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-        if git_mgr and git_mgr.is_active:
-            try:
-                if git_mgr.has_uncommitted_changes():
-                    git_mgr.commit(f"Session end: thread {_thread_id}")
-                git_mgr.push()
-            except Exception as e:
-                logger.warning(f"Final git push failed (non-fatal): {e}")
+    # Detach any active session
+    if _session:
+        await _detach_session()
 
     if _orchestrator_client:
         try:
@@ -241,13 +183,165 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Orchestrator cleanup error: {e}")
 
-    if _session:
-        await _session.cleanup()
-
     if _agent:
         await _agent.shutdown()
 
     logger.info("Persistent agent shutdown complete")
+
+
+async def _attach_session(
+    thread_id: str,
+    config_override: Optional[Dict[str, Any]] = None,
+    project_ids: Optional[List[str]] = None,
+) -> None:
+    """Create and attach a PersistentSession for the given thread.
+
+    This is the core session setup logic, extracted from the lifespan so it
+    can be reused by both dedicated mode (lifespan startup) and pool mode
+    (POST /session/attach).
+    """
+    global _session, _thread_id
+
+    if _session is not None:
+        raise RuntimeError(
+            f"Cannot attach thread {thread_id}: already attached to {_thread_id}"
+        )
+
+    _thread_id = thread_id
+
+    # Wait for workspace container (if orchestrator is provisioning one)
+    workspace_override = None
+    if _orchestrator_client and _thread_id:
+        workspace_override = await _poll_workspace_ready(
+            _orchestrator_client, _thread_id, timeout=120
+        )
+        if workspace_override:
+            logger.info(
+                f"Workspace container ready: {workspace_override['remote']['host']}"
+            )
+        else:
+            logger.info("No workspace container — using local backend")
+
+    # Apply config overrides and project_ids from thread metadata
+    if not config_override:
+        config_override = (workspace_override or {}).get("config_override")
+    if not project_ids:
+        project_ids = (workspace_override or {}).get("project_ids") or []
+    if (not config_override or not project_ids) and _orchestrator_client and _thread_id:
+        try:
+            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            if ws_info:
+                if not config_override:
+                    config_override = ws_info.get("config_override")
+                if not project_ids:
+                    project_ids = ws_info.get("project_ids") or []
+        except Exception:
+            pass
+
+    effective_config = _agent.config
+    llm = _agent._tactical_llm or _agent._llm
+    if config_override:
+        import dataclasses
+
+        from ..core.loader import (
+            create_llm,
+            deep_merge,
+            load_agent_config_from_dict,
+        )
+
+        base_dict = dataclasses.asdict(effective_config)
+        merged = deep_merge(base_dict, config_override)
+        effective_config = load_agent_config_from_dict(
+            merged, deployment_dir=effective_config._deployment_dir
+        )
+        if config_override.get("llm"):
+            llm = create_llm(effective_config.llm, effective_config.limits)
+            logger.info(
+                f"Config override applied: model={effective_config.llm.model}, "
+                f"temperature={effective_config.llm.temperature}"
+            )
+
+    # Create PersistentSession
+    _session = PersistentSession(
+        thread_id=_thread_id,
+        config=effective_config,
+        project_ids=project_ids or [],
+    )
+    if project_ids:
+        logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
+    git_remote_url = (
+        workspace_override.get("git_remote_url") if workspace_override else None
+    )
+    await _session.setup(
+        llm=llm,
+        auxiliary_llm=_agent._auxiliary_llm,
+        postgres_conn=_agent.postgres_conn,
+        vector_conn=getattr(_agent, "vector_conn", None),
+        workspace_override=workspace_override,
+        git_remote_url=git_remote_url,
+    )
+
+    # Restore message history from DB (for session resume)
+    await _restore_session_messages()
+
+    # Mark thread as active
+    await _update_thread_status("active")
+
+    logger.info(f"Session attached: thread={_thread_id}")
+
+
+async def _detach_session() -> None:
+    """Tear down the current session and return to idle.
+
+    1. Mark thread as idle
+    2. Git commit + push
+    3. Clean up session resources
+    4. Clear session globals
+    5. Increment session counter, exit if max reached
+    """
+    global _session, _thread_id, _sessions_served
+
+    if not _session:
+        return
+
+    thread_id = _thread_id
+    logger.info(f"Detaching session: thread={thread_id}")
+
+    # Mark thread as idle (NOT ended — resumable)
+    await _update_thread_status("idle")
+
+    # Final git commit + push
+    if _session.workspace_manager:
+        git_mgr = getattr(_session.workspace_manager, "git_manager", None)
+        if git_mgr and git_mgr.is_active:
+            try:
+                if git_mgr.has_uncommitted_changes():
+                    git_mgr.commit(f"Session detach: thread {thread_id}")
+                git_mgr.push()
+            except Exception as e:
+                logger.warning(f"Final git push failed (non-fatal): {e}")
+
+    # Clean up session resources
+    await _session.cleanup()
+
+    # Clear session state
+    _session = None
+    _thread_id = None
+
+    # Safety valve: restart after N sessions to guard against state leakage
+    _sessions_served += 1
+    if _max_sessions_per_process > 0 and _sessions_served >= _max_sessions_per_process:
+        logger.info(
+            f"Max sessions per process reached ({_sessions_served}/{_max_sessions_per_process}). "
+            "Exiting — Docker will restart the container."
+        )
+        import sys
+
+        sys.exit(0)
+
+    logger.info(
+        f"Session detached: thread={thread_id} (sessions served: {_sessions_served})"
+    )
 
 
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
@@ -309,6 +403,74 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 else [],
             }
         )
+
+    # --- Session attach/detach (pool mode) ---
+
+    @app.post("/session/attach")
+    async def session_attach(request: dict = {}):
+        """Attach this agent to a thread (Docker Compose pool mode).
+
+        Called by the orchestrator when a user creates a persistent thread
+        and this agent is available.  Creates a new PersistentSession.
+
+        Body:
+            thread_id (str): Thread UUID to attach to
+            config_override (dict, optional): Config overrides from thread metadata
+            project_ids (list[str], optional): Project IDs for scoping
+        """
+        thread_id = request.get("thread_id")
+        if not thread_id:
+            return JSONResponse({"error": "thread_id is required"}, status_code=400)
+
+        if _session is not None:
+            return JSONResponse(
+                {
+                    "error": f"Already attached to thread {_thread_id}",
+                    "current_thread_id": _thread_id,
+                },
+                status_code=409,
+            )
+
+        try:
+            await _attach_session(
+                thread_id=thread_id,
+                config_override=request.get("config_override"),
+                project_ids=request.get("project_ids"),
+            )
+            return JSONResponse(
+                {
+                    "status": "attached",
+                    "thread_id": thread_id,
+                    "sessions_served": _sessions_served,
+                }
+            )
+        except Exception as e:
+            logger.exception(f"Failed to attach session for thread {thread_id}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    @app.post("/session/detach")
+    async def session_detach():
+        """Detach from the current thread and return to idle pool.
+
+        Called by the orchestrator when a thread ends, or by the agent
+        itself on idle timeout.  Tears down the PersistentSession.
+        """
+        if _session is None:
+            return JSONResponse({"status": "already_idle", "thread_id": None})
+
+        thread_id = _thread_id
+        try:
+            await _detach_session()
+            return JSONResponse(
+                {
+                    "status": "detached",
+                    "thread_id": thread_id,
+                    "sessions_served": _sessions_served,
+                }
+            )
+        except Exception as e:
+            logger.exception(f"Failed to detach session for thread {thread_id}")
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     # --- WebSocket endpoint ---
 

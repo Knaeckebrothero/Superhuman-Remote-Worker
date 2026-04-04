@@ -249,6 +249,17 @@ def parse_args():
         help="Git branch to checkout after cloning (default: main)",
     )
 
+    # Development mode
+    parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=(
+            "Enable local development mode. Allows workspace.backend=local "
+            "(agent uses its own filesystem instead of SSH to a workspace "
+            "container). Only for bare-metal development — never in production."
+        ),
+    )
+
     # Phase recovery options
     parser.add_argument(
         "--list-phases",
@@ -528,7 +539,9 @@ def run_server(config_path: str, host: str, port: int):
     )
 
 
-def run_persistent_server(config_path: str, host: str, port: int, thread_id: str | None):
+def run_persistent_server(
+    config_path: str, host: str, port: int, thread_id: str | None
+):
     """Run the persistent-mode FastAPI server.
 
     Starts an interactive agent with WebSocket transport.
@@ -556,6 +569,11 @@ def main():
     setup_logging()
 
     logger = logging.getLogger(__name__)
+
+    # Set dev mode flag as env var so agent core can check it
+    if args.dev:
+        os.environ["DEV_MODE"] = "1"
+        logger.info("Development mode enabled — local workspace backend allowed")
 
     # Determine config path
     config_path = args.config

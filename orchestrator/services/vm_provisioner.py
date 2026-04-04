@@ -65,15 +65,24 @@ class VMProvisioner:
     @property
     def is_available(self) -> bool:
         """True if any VM provisioning backend is available."""
-        return nats_bridge.is_available or self._k8s_available
+        return nats_bridge.is_available or self._k8s_available or self._docker_available
+
+    @property
+    def _docker_available(self) -> bool:
+        """True if QEMU-in-Docker VMs are configured."""
+        from .docker_provisioner import docker_provisioner
+
+        return len(docker_provisioner.vm_hosts) > 0
 
     @property
     def mode(self) -> Optional[str]:
-        """Current provisioning mode: 'nats', 'direct', or None."""
+        """Current provisioning mode: 'nats', 'direct', 'docker', or None."""
         if nats_bridge.is_available:
             return "nats"
         if self._k8s_available:
             return "direct"
+        if self._docker_available:
+            return "docker"
         return None
 
     # =========================================================================
@@ -212,6 +221,13 @@ class VMProvisioner:
                 memory=memory,
                 description=description,
             )
+
+        # Docker Compose mode: assign from QEMU-in-Docker pool
+        if self._docker_available:
+            from .docker_provisioner import docker_provisioner
+
+            result = await docker_provisioner.assign_vm(job_id)
+            return result is not None
 
         return False
 
