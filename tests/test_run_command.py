@@ -193,6 +193,7 @@ class TestToolNameAliasing:
         config.tools.coding = ["shell_execute", "shell_read"]
         config.tools.evaluation = []
         config.tools.knowledge = []
+        config.tools.communication = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "stateless"}}
@@ -218,6 +219,7 @@ class TestToolNameAliasing:
         config.tools.coding = ["run_command", "shell_read"]
         config.tools.evaluation = []
         config.tools.knowledge = []
+        config.tools.communication = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {"shell": {"mode": "persistent"}}
@@ -243,6 +245,7 @@ class TestToolNameAliasing:
         config.tools.coding = ["shell_execute"]
         config.tools.evaluation = []
         config.tools.knowledge = []
+        config.tools.communication = []
         config.tools.delegation = []
         config.tools.orchestrator = []
         config.extra = {}  # No shell config at all
