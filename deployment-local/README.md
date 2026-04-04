@@ -30,10 +30,10 @@ kubectl get nodes   # Should show Ready
 
 ```bash
 # 1. Create K8s secrets from your .env file
-./deployment/local/create-secrets.sh
+./deployment-local/create-secrets.sh
 
 # 2. Build all app images, import into K3s, and deploy the full stack
-./deployment/local/dev-redeploy.sh --apply
+./deployment-local/dev-redeploy.sh --apply
 
 # 3. Watch pods come up
 kubectl get pods -n superhuman-remote-worker -w
@@ -47,14 +47,14 @@ The `dev-redeploy.sh` script rebuilds Docker images, imports them into K3s, and 
 
 ```bash
 # Rebuild everything
-./deployment/local/dev-redeploy.sh
+./deployment-local/dev-redeploy.sh
 
 # Rebuild only specific components
-./deployment/local/dev-redeploy.sh orchestrator
-./deployment/local/dev-redeploy.sh cockpit agent
+./deployment-local/dev-redeploy.sh orchestrator
+./deployment-local/dev-redeploy.sh cockpit agent
 
 # Rebuild + re-apply kustomize (needed if you changed kustomization.yaml or patches)
-./deployment/local/dev-redeploy.sh --apply
+./deployment-local/dev-redeploy.sh --apply
 ```
 
 Components: `orchestrator`, `cockpit`, `agent`, `mcp`. The agent image is the largest (PyTorch + Playwright + Chromium) — expect ~5 min for a cold build, faster on subsequent builds due to Docker layer caching.
@@ -62,7 +62,7 @@ Components: `orchestrator`, `cockpit`, `agent`, `mcp`. The agent image is the la
 ## Tear down
 
 ```bash
-kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment/local/ | kubectl delete -f -
+kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment-local/ | kubectl delete -f -
 ```
 
 This removes all resources but preserves PersistentVolumeClaims (your data). To also delete data:
@@ -104,21 +104,21 @@ kubectl port-forward svc/srw-mongodb 27017:27017 -n superhuman-remote-worker
 The local deployment is a [Kustomize overlay](https://kubectl.docs.kubernetes.io/references/kustomize/glossary/#overlay) that reuses the production base manifests from `deployment/` and applies patches to adapt them for a single-node environment.
 
 ```
-deployment/
-  *.yaml                          # Base manifests (production)
-  local/
-    kustomization.yaml            # Overlay: references base + applies patches
-    configmap.yaml                # Local ConfigMap (replaces 02-configmap.yaml)
-    neo4j.yaml                    # Simplified Neo4j (replaces 14-neo4j.yaml)
-    minio.yaml                    # Local MinIO (not in production base)
-    create-secrets.sh             # Creates K8s secrets from .env
-    dev-redeploy.sh               # Build, import, restart app images
-    patches/
-      agent.yaml                  # Remove Tailscale sidecar, single replica
-      keycloak.yaml               # Local hostname, remove ProtonMail Bridge
-      gitea.yaml                  # Local URLs for OIDC
-      cockpit-env.yaml            # Localhost URLs in env.js
-      orchestrator-schema.yaml    # Temp schema.sql fix (until image rebuild)
+deployment/                         # Base manifests (production, Fleet-managed)
+  *.yaml
+deployment-local/                   # Single-cluster overlay (this directory)
+  kustomization.yaml                # References ../deployment/*.yaml + applies patches
+  configmap.yaml                    # Local ConfigMap (replaces 02-configmap.yaml)
+  neo4j.yaml                        # Simplified Neo4j (replaces 14-neo4j.yaml)
+  minio.yaml                        # Local MinIO (not in production base)
+  create-secrets.sh                 # Creates K8s secrets from .env
+  dev-redeploy.sh                   # Build, import, restart app images
+  patches/
+    agent.yaml                      # Remove Tailscale sidecar, single replica
+    keycloak.yaml                   # Local hostname, remove ProtonMail Bridge
+    gitea.yaml                      # Local URLs for OIDC
+    cockpit-env.yaml                # Localhost URLs in env.js
+    orchestrator-schema.yaml        # Temp schema.sql fix (until image rebuild)
 ```
 
 ### What the overlay changes
@@ -146,7 +146,7 @@ The overlay uses two types of Kustomize patches:
 
 ### Why `--load-restrictor=LoadRestrictionsNone`
 
-By default, Kustomize prevents overlays from referencing files outside their directory (security restriction). Since `deployment/local/` references base manifests in the parent `deployment/` directory via `../`, the load restrictor must be disabled. This is standard practice for overlays that live alongside their base.
+By default, Kustomize prevents overlays from referencing files outside their directory (security restriction). Since `deployment-local/` references base manifests in `../deployment/`, the load restrictor must be disabled. This is standard practice for overlays that reference an external base directory.
 
 ## Updating
 
@@ -154,14 +154,14 @@ After pulling new changes to the base manifests:
 
 ```bash
 # Re-render and apply
-kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment/local/ | kubectl apply -f -
+kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment-local/ | kubectl apply -f -
 ```
 
 After changing `.env` values:
 
 ```bash
 # Re-create secrets, then restart affected pods
-./deployment/local/create-secrets.sh
+./deployment-local/create-secrets.sh
 kubectl rollout restart deployment -n superhuman-remote-worker
 ```
 
