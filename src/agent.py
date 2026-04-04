@@ -1398,9 +1398,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if source_path.exists():
                     # Check if zip - extract instead of copy
                     if source_path.suffix.lower() == ".zip":
-                        extracted = self._extract_zip(
-                            source_path, "documents", logger
-                        )
+                        extracted = self._extract_zip(source_path, "documents", logger)
                         copied_paths.extend(extracted)
                         original_paths.extend([str(source_path)] * len(extracted))
                         logger.info(
@@ -2601,9 +2599,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         backend.write_file(ws_relative, source.read())
 
                     extracted_paths.append(ws_relative)
-                    job_logger.debug(
-                        f"Extracted: {zip_info.filename} -> {ws_relative}"
-                    )
+                    job_logger.debug(f"Extracted: {zip_info.filename} -> {ws_relative}")
 
             job_logger.info(
                 f"Extracted {len(extracted_paths)} files from {zip_path.name}"
