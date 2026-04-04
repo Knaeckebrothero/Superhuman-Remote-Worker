@@ -88,7 +88,12 @@ class ContainerProvisioner:
             )
 
     def _init_k8s(self) -> None:
-        """Try to initialize the Kubernetes client."""
+        """Try to initialize the Kubernetes client.
+
+        Important: ``load_kube_config()`` can succeed even when pointing at a
+        dead cluster (stale kubeconfig).  We follow up with an actual API call
+        (list namespaces) to confirm connectivity.
+        """
         if not K8S_AVAILABLE:
             return
 
@@ -104,7 +109,12 @@ class ContainerProvisioner:
                     )
                     return
 
-            self._core_api = k8s_client.CoreV1Api()
+            api = k8s_client.CoreV1Api()
+
+            # Verify connectivity with a real API call (catches stale kubeconfig)
+            api.list_namespace(limit=1, _request_timeout=5)
+
+            self._core_api = api
             self._k8s_available = True
         except Exception as e:
             logger.debug("Container provisioning not available: %s", e)
@@ -484,6 +494,15 @@ class ContainerProvisioner:
             },
             "spec": {
                 "restartPolicy": "Never",
+                # Explicit ClusterFirst DNS so workspace pods can resolve
+                # in-cluster services (e.g. srw-gitea) even if
+                # WORKSPACE_NAMESPACE differs from the service namespace.
+                "dnsPolicy": "ClusterFirst",
+                "dnsConfig": {
+                    "searches": [
+                        "superhuman-remote-worker.svc.cluster.local",
+                    ],
+                },
                 # Pod-level security: run SSHD as root (required for port 22
                 # and user session management), but restrict everything else.
                 "securityContext": {

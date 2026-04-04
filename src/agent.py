@@ -938,6 +938,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
+        # Safety guard: refuse local backend in production
+        # In production (k8s or Docker Compose), the orchestrator always injects
+        # backend=remote.  If we reach here with backend=local and DEV_MODE is
+        # not set, it means the override failed — refuse the job rather than
+        # running LLM shell commands inside the agent container.
+        dev_mode = os.environ.get("DEV_MODE", "").strip() == "1"
+        if self.config.workspace.backend == "local" and not dev_mode:
+            raise RuntimeError(
+                "Workspace backend is 'local' but DEV_MODE is not enabled. "
+                "In production, the orchestrator must inject "
+                "workspace.backend='remote' with a provisioned workspace "
+                "container or VM.  If you are developing locally without "
+                "containers, restart the agent with --dev."
+            )
+
         # Create workspace backend based on config
         workspace_backend = None
         if self.config.workspace.backend == "remote" and self.config.workspace.remote:
@@ -1296,8 +1311,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             original_paths = []
 
             # Ensure documents directory exists (use backend for remote compat)
-            self._workspace_manager.backend.mkdir("documents")
-            documents_dir = self._workspace_manager.get_path("documents")
+            backend = self._workspace_manager.backend
+            backend.mkdir("documents")
 
             upload_source_dir = None
 
@@ -1333,7 +1348,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         # Check if zip - extract instead of copy
                         if file_path.suffix.lower() == ".zip":
                             extracted = self._extract_zip(
-                                file_path, documents_dir, logger
+                                file_path, "documents", logger
                             )
                             copied_paths.extend(extracted)
                             original_paths.extend([str(file_path)] * len(extracted))
@@ -1341,17 +1356,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                                 f"Processed zip file: {file_path.name} ({len(extracted)} files extracted)"
                             )
                         else:
-                            # Regular file - copy with conflict handling
-                            dest_path = documents_dir / file_path.name
+                            # Regular file - copy via backend with conflict handling
+                            dest_name = file_path.name
                             counter = 1
                             stem = Path(file_path.name).stem
                             suffix = Path(file_path.name).suffix
-                            while dest_path.exists():
-                                dest_path = documents_dir / f"{stem}_{counter}{suffix}"
+                            while backend.exists(f"documents/{dest_name}"):
+                                dest_name = f"{stem}_{counter}{suffix}"
                                 counter += 1
 
-                            shutil.copy2(file_path, dest_path)
-                            dest_relative = f"documents/{dest_path.name}"
+                            dest_relative = f"documents/{dest_name}"
+                            backend.write_file(dest_relative, file_path.read_bytes())
                             logger.info(
                                 f"Copied uploaded file to workspace: {dest_relative}"
                             )
@@ -1375,8 +1390,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             original_paths = []
 
             # Ensure documents directory exists (use backend for remote compat)
-            self._workspace_manager.backend.mkdir("documents")
-            documents_dir = self._workspace_manager.get_path("documents")
+            backend = self._workspace_manager.backend
+            backend.mkdir("documents")
 
             for doc_path in metadata["document_paths"]:
                 source_path = Path(doc_path)
@@ -1384,7 +1399,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     # Check if zip - extract instead of copy
                     if source_path.suffix.lower() == ".zip":
                         extracted = self._extract_zip(
-                            source_path, documents_dir, logger
+                            source_path, "documents", logger
                         )
                         copied_paths.extend(extracted)
                         original_paths.extend([str(source_path)] * len(extracted))
@@ -1392,17 +1407,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                             f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
                         )
                     else:
-                        # Regular file - copy with conflict handling
-                        dest_path = documents_dir / source_path.name
+                        # Regular file - copy via backend with conflict handling
+                        dest_name = source_path.name
                         counter = 1
                         stem = Path(source_path.name).stem
                         suffix = Path(source_path.name).suffix
-                        while dest_path.exists():
-                            dest_path = documents_dir / f"{stem}_{counter}{suffix}"
+                        while backend.exists(f"documents/{dest_name}"):
+                            dest_name = f"{stem}_{counter}{suffix}"
                             counter += 1
 
-                        shutil.copy2(source_path, dest_path)
-                        dest_relative = f"documents/{dest_path.name}"
+                        dest_relative = f"documents/{dest_name}"
+                        backend.write_file(dest_relative, source_path.read_bytes())
                         logger.info(f"Copied document to workspace: {dest_relative}")
 
                         copied_paths.append(dest_relative)
@@ -1422,12 +1437,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             source_path = Path(metadata["document_path"])
             if source_path.exists():
                 # Ensure documents directory exists (use backend for remote compat)
-                self._workspace_manager.backend.mkdir("documents")
-                documents_dir = self._workspace_manager.get_path("documents")
+                backend = self._workspace_manager.backend
+                backend.mkdir("documents")
 
                 # Check if zip - extract instead of copy
                 if source_path.suffix.lower() == ".zip":
-                    extracted = self._extract_zip(source_path, documents_dir, logger)
+                    extracted = self._extract_zip(source_path, "documents", logger)
                     if extracted:
                         updated_metadata["document_paths"] = extracted
                         updated_metadata["original_document_paths"] = [
@@ -1439,12 +1454,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
                     )
                 else:
-                    # Regular file - copy to documents/ folder
-                    dest_filename = source_path.name
-                    dest_relative = f"documents/{dest_filename}"
-                    dest_path = self._workspace_manager.get_path(dest_relative)
-
-                    shutil.copy2(source_path, dest_path)
+                    # Regular file - copy via backend to documents/ folder
+                    dest_relative = f"documents/{source_path.name}"
+                    backend.write_file(dest_relative, source_path.read_bytes())
                     logger.info(f"Copied document to workspace: {dest_relative}")
 
                     # Update metadata to use workspace-relative path
@@ -2540,22 +2552,26 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
     def _extract_zip(
         self,
         zip_path: Path,
-        dest_dir: Path,
+        dest_dir_relative: str,
         job_logger: logging.Logger,
     ) -> List[str]:
         """Extract zip file contents preserving directory structure.
 
-        Skips hidden files and macOS __MACOSX folders.
+        Uses the workspace backend for writes so this works with both
+        local and remote (SSH/SFTP) backends.  Skips hidden files and
+        macOS __MACOSX folders.
 
         Args:
-            zip_path: Path to the zip file
-            dest_dir: Destination directory for extracted files
+            zip_path: Path to the zip file (local to the agent container)
+            dest_dir_relative: Destination directory relative to workspace
+                root (e.g. "documents")
             job_logger: Logger instance
 
         Returns:
             List of relative paths to extracted files (e.g., ["documents/subdir/file.pdf"])
         """
         extracted_paths = []
+        backend = self._workspace_manager.backend
 
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
@@ -2577,19 +2593,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if not relative_path.name:
                         continue
 
-                    # Preserve directory structure
-                    dest_path = dest_dir / relative_path
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Build workspace-relative path (e.g. "documents/subdir/file.pdf")
+                    ws_relative = f"{dest_dir_relative}/{relative_path}"
 
-                    # Extract file
+                    # Extract file content and write via backend
                     with zf.open(zip_info) as source:
-                        dest_path.write_bytes(source.read())
+                        backend.write_file(ws_relative, source.read())
 
-                    # Return path relative to workspace
-                    rel_to_workspace = dest_path.relative_to(dest_dir.parent)
-                    extracted_paths.append(str(rel_to_workspace))
+                    extracted_paths.append(ws_relative)
                     job_logger.debug(
-                        f"Extracted: {zip_info.filename} -> {rel_to_workspace}"
+                        f"Extracted: {zip_info.filename} -> {ws_relative}"
                     )
 
             job_logger.info(

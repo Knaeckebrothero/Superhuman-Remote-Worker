@@ -35,16 +35,24 @@ which slows iteration and makes debugging difficult.
 
 ### What is missing
 
+> **Update (2026-04-04):** Docker Compose mode (`docs/docker_compose_mode.md`)
+> now addresses the first four gaps below. The orchestrator's `DockerProvisioner`
+> assigns workspace containers from a static pool, persistent agents run as a
+> fixed pool with session attach/detach, and QEMU-in-Docker provides VM
+> workspaces without KubeVirt. The remaining gaps (Headscale, Tailscale,
+> Management Daemon, Sudo Gate) are cross-cluster features that don't apply
+> to single-host Docker Compose deployments.
+
 | Component               | Cluster implementation           | Local equivalent |
 |--------------------------|----------------------------------|------------------|
-| ContainerProvisioner     | Creates workspace pods via K8s API | None           |
-| PersistentProvisioner    | Creates persistent agent pods via K8s API | None    |
-| VM Controller            | Listens NATS, calls KubeVirt API | None             |
-| KubeVirt VMs             | Real VMs on agent cluster        | None             |
-| Headscale                | StatefulSet, SQLite, ACLs        | None             |
-| Tailscale sidecar        | Kernel-mode WireGuard in pods    | None             |
-| Management Daemon        | Inside VM, reports via NATS      | None             |
-| Sudo Gate (full flow)    | C plugin + Go daemon + NATS      | None             |
+| ContainerProvisioner     | Creates workspace pods via K8s API | `DockerProvisioner` assigns from static pool |
+| PersistentProvisioner    | Creates persistent agent pods via K8s API | Fixed pool with `POST /session/attach` |
+| VM Controller            | Listens NATS, calls KubeVirt API | Not needed (QEMU containers managed directly) |
+| KubeVirt VMs             | Real VMs on agent cluster        | QEMU-in-Docker (`qemux/qemu` with existing qcow2) |
+| Headscale                | StatefulSet, SQLite, ACLs        | Not needed (same Docker network) |
+| Tailscale sidecar        | Kernel-mode WireGuard in pods    | Not needed (same Docker network) |
+| Management Daemon        | Inside VM, reports via NATS      | Unchanged (runs inside QEMU VM) |
+| Sudo Gate (full flow)    | C plugin + Go daemon + NATS      | Unchanged (runs inside QEMU VM) |
 
 ## Impact
 
