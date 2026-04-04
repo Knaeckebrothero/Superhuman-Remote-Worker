@@ -766,6 +766,7 @@ class ToolsConfig:
     coding: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
+    cloud: List[str] = field(default_factory=list)
     communication: List[str] = field(default_factory=list)
     delegation: List[str] = field(default_factory=list)
     orchestrator: List[str] = field(default_factory=list)
@@ -2633,6 +2634,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         + config.tools.coding
         + config.tools.evaluation
         + config.tools.knowledge
+        + config.tools.cloud
         + config.tools.communication
         + config.tools.delegation
         + config.tools.orchestrator

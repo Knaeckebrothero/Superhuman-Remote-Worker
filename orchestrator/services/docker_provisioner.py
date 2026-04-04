@@ -18,6 +18,7 @@ Selection logic:
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,13 +36,17 @@ class DockerProvisioner:
     .workspace_container`` JSONB field used by ContainerProvisioner) so
     the dispatch logic in ``main.py`` can use either provisioner
     interchangeably.
+
+    Host entries support ``host:port`` format for dev mode where workspace
+    SSH ports are published to the host (e.g. ``localhost:2201``).  Plain
+    hostnames default to port 22 (Docker-internal networking).
     """
 
     def __init__(self) -> None:
         self._db: Optional[Any] = None
         self._snapshot_service: Optional[Any] = None
-        self._workspace_hosts: list[str] = []
-        self._vm_hosts: list[str] = []
+        self._workspace_hosts: list[tuple[str, int]] = []
+        self._vm_hosts: list[tuple[str, int]] = []
 
     # ------------------------------------------------------------------
     # Properties
@@ -54,15 +59,26 @@ class DockerProvisioner:
 
     @property
     def workspace_hosts(self) -> list[str]:
-        return list(self._workspace_hosts)
+        """Human-readable list of workspace host entries."""
+        return [self._host_key(h, p) for h, p in self._workspace_hosts]
 
     @property
     def vm_hosts(self) -> list[str]:
-        return list(self._vm_hosts)
+        """Human-readable list of VM host entries."""
+        return [self._host_key(h, p) for h, p in self._vm_hosts]
+
+    @staticmethod
+    def _host_key(host: str, port: int) -> str:
+        """Canonical key for occupancy tracking (``host:port``)."""
+        return f"{host}:{port}"
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    # Default workspace ports for dev compose (published SSH ports on localhost)
+    _DEV_COMPOSE_DEFAULTS = "localhost:2201,localhost:2202,localhost:2203"
+    _DEV_COMPOSE_SSH_KEY = ".dev/ssh-keys/id_ed25519"
 
     def connect(
         self,
@@ -77,23 +93,57 @@ class DockerProvisioner:
         """
         self._db = db
         self._snapshot_service = snapshot_service
+
+        # Auto-detect dev compose: if WORKSPACE_HOSTS is not set but the
+        # dev compose SSH key exists on disk, apply dev defaults so the
+        # developer doesn't need to export env vars manually.
+        if not os.environ.get("WORKSPACE_HOSTS", "").strip():
+            if Path(self._DEV_COMPOSE_SSH_KEY).exists():
+                logger.info(
+                    "Docker provisioner: detected dev compose "
+                    "(found %s) — applying dev defaults",
+                    self._DEV_COMPOSE_SSH_KEY,
+                )
+                os.environ.setdefault("WORKSPACE_HOSTS", self._DEV_COMPOSE_DEFAULTS)
+                os.environ.setdefault("SSH_KEY_PATH", self._DEV_COMPOSE_SSH_KEY)
+
         self._workspace_hosts = self._parse_hosts("WORKSPACE_HOSTS")
         self._vm_hosts = self._parse_hosts("VM_HOSTS")
 
         if self._workspace_hosts:
             logger.info(
                 "Docker provisioner ready (workspaces=%s, vms=%s)",
-                ",".join(self._workspace_hosts),
-                ",".join(self._vm_hosts) if self._vm_hosts else "none",
+                ",".join(self.workspace_hosts),
+                ",".join(self.vm_hosts) if self._vm_hosts else "none",
             )
         else:
             logger.info("Docker provisioner: not available (WORKSPACE_HOSTS not set)")
 
     @staticmethod
-    def _parse_hosts(env_var: str) -> list[str]:
-        """Parse comma-separated hostnames from an environment variable."""
+    def _parse_hosts(env_var: str) -> list[tuple[str, int]]:
+        """Parse comma-separated ``host[:port]`` entries from an env var.
+
+        Examples::
+
+            workspace-1,workspace-2       → [("workspace-1", 22), ("workspace-2", 22)]
+            localhost:2201,localhost:2202  → [("localhost", 2201), ("localhost", 2202)]
+        """
         raw = os.environ.get(env_var, "")
-        return [h.strip() for h in raw.split(",") if h.strip()]
+        result: list[tuple[str, int]] = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if ":" in entry:
+                host, port_str = entry.rsplit(":", 1)
+                try:
+                    result.append((host.strip(), int(port_str.strip())))
+                except ValueError:
+                    # Not a valid port — treat entire string as hostname
+                    result.append((entry, 22))
+            else:
+                result.append((entry, 22))
+        return result
 
     # ------------------------------------------------------------------
     # Workspace assignment
@@ -103,8 +153,8 @@ class DockerProvisioner:
         """Find a free workspace and assign it to this job.
 
         Checks ``jobs.context.workspace_container`` across all active jobs
-        to determine which hostnames are currently in use.  Returns the
-        first free one.
+        to determine which host:port pairs are currently in use.  Returns
+        the first free one.
 
         Returns:
             ``{"host": "workspace-1", "port": 22, "status": "ready"}``
@@ -113,19 +163,20 @@ class DockerProvisioner:
         if not self._db or not self._workspace_hosts:
             return None
 
-        in_use = await self._get_occupied_hosts()
-        for host in self._workspace_hosts:
-            if host not in in_use:
+        in_use = await self._get_occupied_keys()
+        for host, port in self._workspace_hosts:
+            key = self._host_key(host, port)
+            if key not in in_use:
                 ctx = {
                     "status": "ready",
                     "host": host,
-                    "port": 22,
+                    "port": port,
                     "provisioner": "docker",
                 }
                 await self._db.merge_workspace_container_context(job_id, ctx)
                 logger.info(
                     "Docker provisioner: assigned workspace %s to job %s",
-                    host,
+                    key,
                     job_id,
                 )
                 return ctx
@@ -213,19 +264,20 @@ class DockerProvisioner:
         if not self._db or not self._workspace_hosts:
             return None
 
-        in_use = await self._get_occupied_hosts(include_threads=True)
-        for host in self._workspace_hosts:
-            if host not in in_use:
+        in_use = await self._get_occupied_keys(include_threads=True)
+        for host, port in self._workspace_hosts:
+            key = self._host_key(host, port)
+            if key not in in_use:
                 ctx = {
                     "status": "ready",
                     "host": host,
-                    "port": 22,
+                    "port": port,
                     "provisioner": "docker",
                 }
                 await self._db.merge_thread_workspace_context(thread_id, ctx)
                 logger.info(
                     "Docker provisioner: assigned workspace %s to thread %s",
-                    host,
+                    key,
                     thread_id,
                 )
                 return ctx
@@ -296,25 +348,26 @@ class DockerProvisioner:
         """Assign a free QEMU-in-Docker VM to a job.
 
         Returns:
-            ``{"host": "agent-vm-1", "port": 22, "status": "ready"}``
+            ``{"ssh_host": "agent-vm-1", "ssh_port": 22, "status": "ready"}``
             or ``None`` if no VMs available.
         """
         if not self._db or not self._vm_hosts:
             return None
 
-        in_use = await self._get_occupied_vm_hosts()
-        for host in self._vm_hosts:
-            if host not in in_use:
+        in_use = await self._get_occupied_vm_keys()
+        for host, port in self._vm_hosts:
+            key = self._host_key(host, port)
+            if key not in in_use:
                 ctx = {
                     "status": "ready",
                     "ssh_host": host,
-                    "ssh_port": 22,
+                    "ssh_port": port,
                     "provisioner": "docker",
                 }
                 await self._db.merge_vm_context(job_id, ctx)
                 logger.info(
                     "Docker provisioner: assigned VM %s to job %s",
-                    host,
+                    key,
                     job_id,
                 )
                 return ctx
@@ -329,8 +382,8 @@ class DockerProvisioner:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _get_occupied_hosts(self, include_threads: bool = False) -> set[str]:
-        """Return the set of workspace hostnames currently assigned to
+    async def _get_occupied_keys(self, include_threads: bool = False) -> set[str]:
+        """Return ``host:port`` keys for workspaces currently assigned to
         active jobs (and optionally threads).
         """
         occupied: set[str] = set()
@@ -338,10 +391,12 @@ class DockerProvisioner:
             return occupied
 
         try:
-            # Query active jobs that have a docker workspace assigned
             rows = await self._db.fetch(
                 """
-                SELECT context->'workspace_container'->>'host' AS host
+                SELECT context->'workspace_container'->>'host' AS host,
+                       COALESCE(
+                           (context->'workspace_container'->>'port')::int, 22
+                       ) AS port
                 FROM jobs
                 WHERE status NOT IN ('completed', 'failed', 'cancelled')
                   AND context->'workspace_container'->>'provisioner' = 'docker'
@@ -350,12 +405,15 @@ class DockerProvisioner:
             )
             for row in rows:
                 if row["host"]:
-                    occupied.add(row["host"])
+                    occupied.add(self._host_key(row["host"], row["port"]))
 
             if include_threads:
                 thread_rows = await self._db.fetch(
                     """
-                    SELECT metadata->'workspace_container'->>'host' AS host
+                    SELECT metadata->'workspace_container'->>'host' AS host,
+                           COALESCE(
+                               (metadata->'workspace_container'->>'port')::int, 22
+                           ) AS port
                     FROM threads
                     WHERE status = 'active'
                       AND metadata->'workspace_container'->>'provisioner' = 'docker'
@@ -364,14 +422,14 @@ class DockerProvisioner:
                 )
                 for row in thread_rows:
                     if row["host"]:
-                        occupied.add(row["host"])
+                        occupied.add(self._host_key(row["host"], row["port"]))
         except Exception:
             logger.exception("Docker provisioner: failed to query occupied workspaces")
 
         return occupied
 
-    async def _get_occupied_vm_hosts(self) -> set[str]:
-        """Return the set of VM hostnames currently assigned to active jobs."""
+    async def _get_occupied_vm_keys(self) -> set[str]:
+        """Return ``host:port`` keys for VMs currently assigned to active jobs."""
         occupied: set[str] = set()
         if not self._db:
             return occupied
@@ -379,7 +437,10 @@ class DockerProvisioner:
         try:
             rows = await self._db.fetch(
                 """
-                SELECT context->'vm'->>'ssh_host' AS host
+                SELECT context->'vm'->>'ssh_host' AS host,
+                       COALESCE(
+                           (context->'vm'->>'ssh_port')::int, 22
+                       ) AS port
                 FROM jobs
                 WHERE status NOT IN ('completed', 'failed', 'cancelled')
                   AND context->'vm'->>'provisioner' = 'docker'
@@ -388,7 +449,7 @@ class DockerProvisioner:
             )
             for row in rows:
                 if row["host"]:
-                    occupied.add(row["host"])
+                    occupied.add(self._host_key(row["host"], row["port"]))
         except Exception:
             logger.exception("Docker provisioner: failed to query occupied VMs")
 
