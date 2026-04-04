@@ -680,9 +680,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("host", container_host)
             remote.setdefault("port", container_ctx.get("port", 22))
             remote.setdefault("username", "agent-host")
-            # Docker Compose mode: SSH key is in /run/secrets/ssh/id_ed25519
-            # Kubernetes mode: SSH key is in /run/secrets/vm-ssh-key
-            if container_ctx.get("provisioner") == "docker":
+            # SSH key path resolution:
+            #   SSH_KEY_PATH env var (dev compose: .dev/ssh-keys/id_ed25519)
+            #   Docker Compose mode default: /run/secrets/ssh/id_ed25519
+            #   Kubernetes mode default: /run/secrets/vm-ssh-key
+            ssh_key_override = os.environ.get("SSH_KEY_PATH", "").strip()
+            if ssh_key_override:
+                remote.setdefault("key_path", ssh_key_override)
+            elif container_ctx.get("provisioner") == "docker":
                 remote.setdefault("key_path", "/run/secrets/ssh/id_ed25519")
             else:
                 remote.setdefault("key_path", "/run/secrets/vm-ssh-key")

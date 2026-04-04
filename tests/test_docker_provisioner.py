@@ -12,9 +12,14 @@ class TestDockerProvisionerInit:
 
     def test_not_available_without_hosts(self):
         """Provisioner reports unavailable when WORKSPACE_HOSTS is not set."""
-        with patch.dict(os.environ, {}, clear=False):
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("orchestrator.services.docker_provisioner.Path") as mock_path,
+        ):
             os.environ.pop("WORKSPACE_HOSTS", None)
             os.environ.pop("VM_HOSTS", None)
+            # Prevent dev compose auto-detection
+            mock_path.return_value.exists.return_value = False
 
             from orchestrator.services.docker_provisioner import DockerProvisioner
 
@@ -37,7 +42,10 @@ class TestDockerProvisionerInit:
             db = MagicMock()
             provisioner.connect(db=db)
             assert provisioner.is_available is True
-            assert provisioner.workspace_hosts == ["workspace-1", "workspace-2"]
+            assert provisioner.workspace_hosts == [
+                "workspace-1:22",
+                "workspace-2:22",
+            ]
             assert provisioner.vm_hosts == []
 
     def test_vm_hosts_parsed(self):
@@ -53,7 +61,7 @@ class TestDockerProvisionerInit:
 
             provisioner = DockerProvisioner()
             provisioner.connect(db=MagicMock())
-            assert provisioner.vm_hosts == ["agent-vm-1", "agent-vm-2"]
+            assert provisioner.vm_hosts == ["agent-vm-1:22", "agent-vm-2:22"]
 
     def test_whitespace_in_hosts_stripped(self):
         """Leading/trailing whitespace in hostnames is stripped."""
@@ -65,7 +73,44 @@ class TestDockerProvisionerInit:
 
             provisioner = DockerProvisioner()
             provisioner.connect(db=MagicMock())
-            assert provisioner.workspace_hosts == ["workspace-1", "workspace-2"]
+            assert provisioner.workspace_hosts == [
+                "workspace-1:22",
+                "workspace-2:22",
+            ]
+
+    def test_host_port_format_parsed(self):
+        """Host:port entries are parsed correctly."""
+        with patch.dict(
+            os.environ,
+            {"WORKSPACE_HOSTS": "localhost:2201,localhost:2202"},
+        ):
+            from orchestrator.services.docker_provisioner import DockerProvisioner
+
+            provisioner = DockerProvisioner()
+            provisioner.connect(db=MagicMock())
+            assert provisioner.workspace_hosts == [
+                "localhost:2201",
+                "localhost:2202",
+            ]
+
+    def test_auto_detect_dev_compose(self):
+        """Auto-detects dev compose when .dev/ssh-keys/id_ed25519 exists."""
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("orchestrator.services.docker_provisioner.Path") as mock_path,
+        ):
+            os.environ.pop("WORKSPACE_HOSTS", None)
+            os.environ.pop("SSH_KEY_PATH", None)
+            os.environ.pop("VM_HOSTS", None)
+            mock_path.return_value.exists.return_value = True
+
+            from orchestrator.services.docker_provisioner import DockerProvisioner
+
+            provisioner = DockerProvisioner()
+            provisioner.connect(db=MagicMock())
+            assert provisioner.is_available is True
+            assert len(provisioner.workspace_hosts) == 3
+            assert os.environ.get("SSH_KEY_PATH") == ".dev/ssh-keys/id_ed25519"
 
 
 class TestAssignWorkspace:
@@ -100,7 +145,9 @@ class TestAssignWorkspace:
     @pytest.mark.asyncio
     async def test_assign_skips_occupied(self, provisioner):
         """Skips workspaces already assigned to active jobs."""
-        provisioner._db.fetch = AsyncMock(return_value=[{"host": "workspace-1"}])
+        provisioner._db.fetch = AsyncMock(
+            return_value=[{"host": "workspace-1", "port": 22}]
+        )
         result = await provisioner.assign_workspace("job-2")
         assert result is not None
         assert result["host"] == "workspace-2"
@@ -110,9 +157,9 @@ class TestAssignWorkspace:
         """Returns None when all workspaces are occupied."""
         provisioner._db.fetch = AsyncMock(
             return_value=[
-                {"host": "workspace-1"},
-                {"host": "workspace-2"},
-                {"host": "workspace-3"},
+                {"host": "workspace-1", "port": 22},
+                {"host": "workspace-2", "port": 22},
+                {"host": "workspace-3", "port": 22},
             ]
         )
         result = await provisioner.assign_workspace("job-4")
@@ -142,6 +189,57 @@ class TestAssignWorkspace:
             # Don't call connect — _db is None
             result = await p.assign_workspace("job-1")
             assert result is None
+
+
+class TestAssignWorkspaceWithPorts:
+    """Tests for workspace assignment with host:port format (dev compose)."""
+
+    @pytest.fixture
+    def provisioner(self):
+        """Create a provisioner with localhost:port workspace hosts."""
+        with patch.dict(
+            os.environ,
+            {"WORKSPACE_HOSTS": "localhost:2201,localhost:2202"},
+        ):
+            from orchestrator.services.docker_provisioner import DockerProvisioner
+
+            p = DockerProvisioner()
+            db = AsyncMock()
+            db.fetch = AsyncMock(return_value=[])
+            db.merge_workspace_container_context = AsyncMock(return_value=True)
+            p.connect(db=db)
+            return p
+
+    @pytest.mark.asyncio
+    async def test_assign_uses_correct_port(self, provisioner):
+        """Assignment includes the parsed port, not default 22."""
+        result = await provisioner.assign_workspace("job-1")
+        assert result is not None
+        assert result["host"] == "localhost"
+        assert result["port"] == 2201
+
+    @pytest.mark.asyncio
+    async def test_assign_skips_occupied_by_port(self, provisioner):
+        """Same host with different port is correctly distinguished."""
+        provisioner._db.fetch = AsyncMock(
+            return_value=[{"host": "localhost", "port": 2201}]
+        )
+        result = await provisioner.assign_workspace("job-2")
+        assert result is not None
+        assert result["host"] == "localhost"
+        assert result["port"] == 2202
+
+    @pytest.mark.asyncio
+    async def test_assign_all_occupied(self, provisioner):
+        """All host:port pairs occupied returns None."""
+        provisioner._db.fetch = AsyncMock(
+            return_value=[
+                {"host": "localhost", "port": 2201},
+                {"host": "localhost", "port": 2202},
+            ]
+        )
+        result = await provisioner.assign_workspace("job-3")
+        assert result is None
 
 
 class TestReleaseWorkspace:
