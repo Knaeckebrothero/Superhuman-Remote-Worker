@@ -13,9 +13,9 @@
 #   - VPN sidecars included (require credentials in .env)
 #
 # Usage:
-#   ./deployment/local/create-secrets.sh    # One-time: create K8s secrets from .env
-#   kubectl apply -k deployment/local/      # Deploy everything
-#   kubectl delete -k deployment/local/     # Tear down
+#   ./deployment-local/create-secrets.sh    # One-time: create K8s secrets from .env
+#   kubectl apply -k deployment-local/      # Deploy everything
+#   kubectl delete -k deployment-local/     # Tear down
 #
 # =============================================================================
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -26,7 +26,7 @@ namespace: superhuman-remote-worker
 # =============================================================================
 # Image overrides — use locally built images instead of GHCR SHA tags
 # =============================================================================
-# Run `./deployment/local/dev-redeploy.sh` to build and import these images.
+# Run `./deployment-local/dev-redeploy.sh` to build and import these images.
 # Comment out this section to fall back to pulling from GHCR.
 images:
   - name: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
@@ -42,39 +42,39 @@ images:
 
 resources:
   # --- Namespace ---
-  - ../00-namespace.yaml
+  - ../deployment/00-namespace.yaml
 
   # --- Databases ---
-  - ../10-postgres.yaml
-  - ../10b-postgres-vector.yaml
-  - ../11-mongodb.yaml
+  - ../deployment/10-postgres.yaml
+  - ../deployment/10b-postgres-vector.yaml
+  - ../deployment/11-mongodb.yaml
 
   # --- Supporting services ---
-  - ../12-gitea.yaml
-  - ../13-workspace-pvc.yaml
-  - ../18-keycloak.yaml
-  - ../19-nextcloud.yaml
+  - ../deployment/12-gitea.yaml
+  - ../deployment/13-workspace-pvc.yaml
+  - ../deployment/18-keycloak.yaml
+  - ../deployment/19-nextcloud.yaml
   - minio.yaml
 
   # --- Admin tools ---
-  - ../16-pgadmin.yaml
-  - ../17-mongo-express.yaml
-  - ../24-dozzle.yaml
-  - ../25-codex-proxy.yaml
+  - ../deployment/16-pgadmin.yaml
+  - ../deployment/17-mongo-express.yaml
+  - ../deployment/24-dozzle.yaml
+  - ../deployment/25-codex-proxy.yaml
 
   # --- RBAC & policies ---
-  - ../20b-orchestrator-rbac.yaml
-  - ../21b-agent-pdb.yaml
-  - ../21d-workspace-network-policy.yaml
+  - ../deployment/20b-orchestrator-rbac.yaml
+  - ../deployment/21b-agent-pdb.yaml
+  - ../deployment/21d-workspace-network-policy.yaml
 
   # --- VPN sidecars (cluster, research, workstation) ---
-  - ../15-vpn.yaml
+  - ../deployment/15-vpn.yaml
 
   # --- Application services ---
-  - ../20-orchestrator.yaml
-  - ../21-agent.yaml
-  - ../22-cockpit.yaml
-  - ../23-mcp.yaml
+  - ../deployment/20-orchestrator.yaml
+  - ../deployment/21-agent.yaml
+  - ../deployment/22-cockpit.yaml
+  - ../deployment/23-mcp.yaml
 
   # --- Local replacements (not in base) ---
   - configmap.yaml

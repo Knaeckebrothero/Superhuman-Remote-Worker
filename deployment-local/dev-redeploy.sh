@@ -4,20 +4,20 @@
 # =============================================================================
 #
 # Usage:
-#   ./deployment/local/dev-redeploy.sh                    # Rebuild all 4 app services
-#   ./deployment/local/dev-redeploy.sh orchestrator        # Rebuild one component
-#   ./deployment/local/dev-redeploy.sh cockpit mcp         # Rebuild specific components
-#   ./deployment/local/dev-redeploy.sh --apply             # Rebuild all + re-apply kustomize
-#   ./deployment/local/dev-redeploy.sh orchestrator --apply # Rebuild one + re-apply kustomize
+#   ./deployment-local/dev-redeploy.sh                    # Rebuild all 4 app services
+#   ./deployment-local/dev-redeploy.sh orchestrator        # Rebuild one component
+#   ./deployment-local/dev-redeploy.sh cockpit mcp         # Rebuild specific components
+#   ./deployment-local/dev-redeploy.sh --apply             # Rebuild all + re-apply kustomize
+#   ./deployment-local/dev-redeploy.sh orchestrator --apply # Rebuild one + re-apply kustomize
 #
 # First-time setup:
-#   ./deployment/local/create-secrets.sh
-#   ./deployment/local/dev-redeploy.sh --apply
+#   ./deployment-local/create-secrets.sh
+#   ./deployment-local/dev-redeploy.sh --apply
 #
 # =============================================================================
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NAMESPACE="superhuman-remote-worker"
 REGISTRY="ghcr.io/knaeckebrothero/superhuman-remote-worker"
 TAG="local"
@@ -107,7 +107,7 @@ done
 if [[ "$APPLY" == true ]]; then
   echo ""
   echo "===== Applying kustomize overlay ====="
-  kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment/local/ \
+  kubectl kustomize --load-restrictor=LoadRestrictionsNone deployment-local/ \
     | kubectl apply -f -
 fi
 
