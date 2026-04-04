@@ -56,7 +56,7 @@ Infrastructure dependencies not deployed by SRW:
 
 Recommended minimum: 6 nodes (3 per cluster) for HA.
 
-### Kubernetes — Single-cluster (prototype, `deployment/local/`)
+### Kubernetes — Single-cluster (prototype, `deployment-local/`)
 
 A Kustomize overlay that deploys the full stack to a single K3s node. Created 2026-04-03 as a proof of concept. Works but uses `--load-restrictor=LoadRestrictionsNone` and includes a temporary schema fix workaround.
 
@@ -79,11 +79,11 @@ What it changes from production:
 
 ### Phase 1: Stabilize single-cluster option (current)
 
-The `deployment/local/` Kustomize overlay works. Immediate cleanup:
+The `deployment-local/` Kustomize overlay works. Immediate cleanup:
 - Remove the temporary schema ConfigMap workaround (rebuild images with fixed schema.sql)
 - Add GHCR pull secret setup to `create-secrets.sh` or document image import
 - Test the full job lifecycle (create job → agent picks up → workspace pod → delivery)
-- Write a setup guide in `deployment/local/README.md`
+- Write a setup guide in `deployment-local/README.md`
 
 ### Phase 2: Evaluate packaging format
 
@@ -217,5 +217,5 @@ Admin access for emergency operations should require logging into the Rancher UI
 - `docs/deployment_roadmap.md` — Production deployment log (2026-03-19/20)
 - `docs/deployment_checklist.md` — Original deployment vision
 - `docs/issues/local_e2e_testing.md` — Local testing gaps (workspace/VM provisioning)
-- `deployment/local/` — Single-cluster Kustomize overlay (prototype)
+- `deployment-local/` — Single-cluster Kustomize overlay (prototype)
 - `deployment/deploy.sh` — Image tag update script for Fleet deployments

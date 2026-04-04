@@ -7,15 +7,15 @@
 # Kubernetes secrets that the production manifests expect from Vault/ESO.
 #
 # Usage:
-#   ./deployment/local/create-secrets.sh          # Uses .env in repo root
-#   ./deployment/local/create-secrets.sh /path/.env  # Custom .env path
+#   ./deployment-local/create-secrets.sh          # Uses .env in repo root
+#   ./deployment-local/create-secrets.sh /path/.env  # Custom .env path
 #
 # Re-run to update secrets (uses --dry-run + apply pattern).
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="${1:-$REPO_DIR/.env}"
 NAMESPACE="superhuman-remote-worker"
 
@@ -157,4 +157,4 @@ echo "  vm-ssh-key: ok"
 
 echo ""
 echo "Secrets created. Deploy with:"
-echo "  kubectl apply -k deployment/local/"
+echo "  kubectl apply -k deployment-local/"
