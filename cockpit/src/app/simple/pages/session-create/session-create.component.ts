@@ -30,6 +30,7 @@ interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
   defaults_tools?: Record<string, string[]>;
+  settings_matrix?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -111,9 +112,10 @@ interface ExpertDetail extends Expert {
         <!-- Agent Settings (horizontal tabs: Settings / Advanced) -->
         <app-agent-settings
           mode="session"
-          [config]="expertDetail()?.config ?? {}"
+          [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
           [disabled]="creating()"
           [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
+          [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
           [datasources]="datasources()"
           [loadingDatasources]="loadingDatasources()"
           [loadingExpert]="loadingExpert()"
@@ -358,6 +360,8 @@ export class SessionCreateComponent implements OnInit {
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
   readonly expertDetail = signal<ExpertDetail | null>(null);
+  readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
+  readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
   readonly loadingExperts = signal(false);
   readonly loadingExpert = signal(false);
   readonly datasources = signal<any[]>([]);
@@ -374,6 +378,12 @@ export class SessionCreateComponent implements OnInit {
     this.modelService.load();
     this.loadExperts();
     this.loadDatasourcesList();
+    this.http.get<ExpertDetail>(`${environment.apiUrl}/experts/defaults`).subscribe({
+      next: (d) => {
+        if (d?.config) this.frameworkDefaults.set(d.config);
+        if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
+      },
+    });
   }
 
   private loadProjects(userId: string): void {
