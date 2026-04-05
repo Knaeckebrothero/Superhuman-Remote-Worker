@@ -230,6 +230,21 @@ import {ModelService} from '../../../core/services/model.service';
             <span class="field-hint">Higher priority jobs run first and can preempt lower priority jobs</span>
           </div>
 
+          <!-- Cloud Storage Access Override -->
+          @if (selectedProjectHasCloudStorage()) {
+            <div class="form-group">
+              <label for="cloudStorage" class="form-label">Cloud Storage Access</label>
+              <select id="cloudStorage" name="cloudStorage" class="form-input"
+                [ngModel]="cloudStorageOverride()" (ngModelChange)="cloudStorageOverride.set($event)"
+                [disabled]="isSubmitting()">
+                <option value="inherit">Inherit from project</option>
+                <option value="readonly">Read Only</option>
+                <option value="readwrite">Read & Write</option>
+              </select>
+              <span class="field-hint">Override the project's default cloud storage access mode for this job</span>
+            </div>
+          }
+
           <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
           <app-agent-settings
             mode="job"
@@ -1279,6 +1294,14 @@ export class JobCreateComponent implements OnInit {
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);
 
+  readonly cloudStorageOverride = signal<'inherit' | 'readonly' | 'readwrite'>('inherit');
+  readonly selectedProjectHasCloudStorage = computed(() => {
+    const pid = this.selectedProjectId();
+    if (!pid) return false;
+    const proj = this.projects().find((p) => p.id === pid);
+    return !!proj?.cloud_storage_url;
+  });
+
   readonly availableDatasources = signal<Datasource[]>([]);
   readonly isLoadingDatasources = signal(false);
 
@@ -1476,6 +1499,15 @@ export class JobCreateComponent implements OnInit {
     const priority = this.selectedPriority();
     if (priority !== 5) request.priority = priority;
 
+    // Cloud storage override
+    const csOverride = this.cloudStorageOverride();
+    if (csOverride !== 'inherit') {
+      request.context = {
+        ...(request.context ?? {}),
+        cloud_storage_read_only: csOverride === 'readonly',
+      };
+    }
+
     const currentUserId = this.userService.currentUserId();
     if (currentUserId) request.user_id = currentUserId;
 
@@ -1539,6 +1571,7 @@ export class JobCreateComponent implements OnInit {
     this.selectedExpert.set(null);
     this.expertDetail.set(null);
     this.selectedPriority.set(5);
+    this.cloudStorageOverride.set('inherit');
     this.agentSettings?.resetAll();
     const defaultProject = this.projects().find((p) => p.is_default);
     this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);

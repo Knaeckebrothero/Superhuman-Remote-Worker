@@ -112,6 +112,11 @@ import {environment} from '../../core/environment';
                 <span class="link-icon">&#x1F4E6;</span>MinIO
               </a>
             }
+            @if (nextcloudUrl) {
+              <a class="section-link" [href]="nextcloudUrl" target="_blank" rel="noopener">
+                <span class="link-icon">&#x2601;</span>Nextcloud
+              </a>
+            }
           </div>
 
           <div class="section">
@@ -446,6 +451,7 @@ export class SidebarComponent {
   readonly pgadminUrl = environment.pgadminUrl;
   readonly mongoExpressUrl = environment.mongoExpressUrl;
   readonly minioConsoleUrl = environment.minioConsoleUrl;
+  readonly nextcloudUrl = environment.nextcloudUrl;
 
   readonly isLayoutPickerOpen = signal(false);
   readonly pickerTop = signal(0);

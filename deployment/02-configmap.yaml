@@ -120,6 +120,12 @@ data:
   NTFY_URL: ""
   NTFY_TOPIC: ""
 
+  # Nextcloud — internal + public URLs for NextcloudAdmin service
+  NEXTCLOUD_URL: "http://srw-nextcloud"
+  NEXTCLOUD_PUBLIC_URL: "https://cloud.superhuman-remote-worker.com"
+  NEXTCLOUD_ADMIN_USER: "admin"
+  NEXTCLOUD_AGENT_USER: "agent-service"
+
   # Nextcloud / WebDAV datasource (optional)
   DEFAULT_DS_WEBDAV_URL: "http://srw-nextcloud/remote.php/dav/files/admin/"
   DEFAULT_DS_WEBDAV_NAME: "Nextcloud"

@@ -16,6 +16,7 @@ import {MarkdownComponent} from 'ngx-markdown';
 import {PersistentChatService, ToolCallInfo,} from '../../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../../core/services/api.service';
 import {ModelService} from '../../../core/services/model.service';
+import {environment} from '../../../core/environment';
 
 interface SlashCommand {
     command: string;
@@ -57,6 +58,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
           }
 
           @if (chat.isConnected()) {
+            @if (chat.ncSessionFolder()) {
+              <button class="ide-btn" (click)="openSessionFiles()" title="Open session files in Nextcloud">
+                <span class="ide-icon">cloud</span>
+                Files
+              </button>
+            }
             @if (ideStatus(); as ide) {
               @if (ide.gitea_url) {
                 <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" title="View workspace in Gitea">
@@ -1694,6 +1701,14 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     openIde(url: string): void {
         window.open(url, '_blank');
+    }
+
+    openSessionFiles(): void {
+        const folder = this.chat.ncSessionFolder();
+        if (!folder) return;
+        const ncUrl = environment.nextcloudUrl || 'http://localhost:8800';
+        const folderName = folder.split('/').pop();
+        window.open(`${ncUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     private startIdePolling(threadId: string): void {

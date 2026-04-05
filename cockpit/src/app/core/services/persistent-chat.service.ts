@@ -77,6 +77,7 @@ export class PersistentChatService {
     readonly modelName = signal<string | null>(null);
     readonly temperature = signal<number>(0);
     readonly turnCount = signal<number>(0);
+    readonly ncSessionFolder = signal<string | null>(null);
 
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
@@ -114,6 +115,7 @@ export class PersistentChatService {
         this.modelName.set(null);
         this.temperature.set(0);
         this.turnCount.set(0);
+        this.ncSessionFolder.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
 
@@ -181,6 +183,7 @@ export class PersistentChatService {
             const model = thread.metadata?.config_override?.llm?.model;
             this.modelName.set(model || thread.config_name || null);
             this.turnCount.set(thread.total_turns || 0);
+            this.ncSessionFolder.set(thread.nc_session_folder || null);
         } catch {
             // Non-fatal — UI will show fallback values
         }
@@ -240,6 +243,7 @@ export class PersistentChatService {
         this.modelName.set(null);
         this.temperature.set(0);
         this.turnCount.set(0);
+        this.ncSessionFolder.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
     }
