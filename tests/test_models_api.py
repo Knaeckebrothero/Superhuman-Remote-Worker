@@ -1,9 +1,6 @@
 """Tests for the global models API: catalog loading, provider filtering, dispatch injection."""
 
 import os
-# ---------------------------------------------------------------------------
-# Import orchestrator helpers under test
-# ---------------------------------------------------------------------------
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -11,6 +8,9 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+# ---------------------------------------------------------------------------
+# Import orchestrator helpers under test
+# ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent / "orchestrator"))
 
 # main.py validates VECTOR_DB_URL at module level; set a dummy value so the
