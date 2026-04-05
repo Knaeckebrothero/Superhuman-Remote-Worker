@@ -10,12 +10,13 @@
 # Quick start:
 #   1. cp .env.example .env              # Fill in API keys
 #   2. podman-compose -f docker-compose.dev.yaml up -d
-#   3. Set env vars for the locally-running orchestrator + agent:
-#        export WORKSPACE_HOSTS=localhost:2201,localhost:2202,localhost:2203
-#        export SSH_KEY_PATH=.dev/ssh-keys/id_ed25519
-#   4. cd orchestrator && uvicorn main:app --reload --port 8085
-#   5. python agent.py --port 8001
-#   6. cd cockpit && npm start
+#   3. cd orchestrator && uvicorn main:app --reload --port 8085
+#   4. python agent.py --port 8001
+#   5. cd cockpit && npm start
+#
+# WORKSPACE_HOSTS and SSH_KEY_PATH are auto-detected by the orchestrator
+# when the dev compose SSH key (.dev/ssh-keys/id_ed25519) exists on disk.
+# No manual exports needed — see DockerProvisioner.connect().
 #
 # The orchestrator auto-detects Docker Compose mode (k8s API unreachable)
 # and assigns workspace containers from the pool defined by WORKSPACE_HOSTS.

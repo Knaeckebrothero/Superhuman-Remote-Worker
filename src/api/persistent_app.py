@@ -494,6 +494,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "permission_mode": _session.permission_mode,
                 "turn_count": _session.turn_count,
                 "message_count": len(_session.messages),
+                "model": _session.config.llm.model,
+                "temperature": _session.config.llm.temperature,
             },
         )
 
@@ -765,6 +767,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                             ws,
                             "error",
                             {"message": f"Invalid mode: {new_mode}"},
+                        )
+
+                elif method == "config.update":
+                    config_override = data.get("config", {})
+                    if config_override:
+                        asyncio.create_task(
+                            _handle_config_update(ws, config_override)
                         )
 
                 elif method == "compact":
@@ -1049,6 +1058,84 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
     except Exception as e:
         logger.warning(f"Compaction failed: {e}")
         await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
+
+
+async def _handle_config_update(
+    ws: WebSocket, config_override: Dict[str, Any]
+) -> None:
+    """Apply runtime config changes (model, temperature, permission mode).
+
+    Deep-merges *config_override* into the session config, rebuilds the
+    LLM if the ``llm`` key changed, and persists the update to the
+    orchestrator DB so it survives session resume.
+    """
+    global _session, _orchestrator_client, _thread_id
+
+    if not _session:
+        await _ws_send(ws, "error", {"message": "No active session"})
+        return
+
+    try:
+        import dataclasses
+
+        from ..core.loader import (
+            create_llm,
+            deep_merge,
+            load_agent_config_from_dict,
+        )
+
+        base_dict = dataclasses.asdict(_session.config)
+        merged = deep_merge(base_dict, config_override)
+        new_config = load_agent_config_from_dict(
+            merged, deployment_dir=_session.config._deployment_dir
+        )
+
+        # Rebuild LLM if llm settings changed
+        if config_override.get("llm"):
+            new_llm = create_llm(new_config.llm, new_config.limits)
+            _session._llm = new_llm
+            _session.config = new_config
+            _session._bind_tools()
+            logger.info(
+                "LLM hot-swapped: model=%s, temperature=%s",
+                new_config.llm.model,
+                new_config.llm.temperature,
+            )
+        else:
+            _session.config = new_config
+
+        # Update permission mode if included
+        pm = (config_override.get("interactive") or {}).get("permission_mode")
+        if pm and pm in ("supervised", "auto_accept", "autonomous"):
+            _session.permission_mode = pm
+
+        # Persist to orchestrator DB (fire-and-forget)
+        if _orchestrator_client and _thread_id:
+            try:
+                await _orchestrator_client.update_thread_config(
+                    _thread_id, config_override
+                )
+            except Exception:
+                logger.warning(
+                    "Config persistence to orchestrator failed (non-fatal)"
+                )
+
+        # Acknowledge with resolved values
+        await _ws_send(
+            ws,
+            "config.changed",
+            {
+                "model": new_config.llm.model,
+                "temperature": new_config.llm.temperature,
+                "permission_mode": _session.permission_mode,
+            },
+        )
+
+    except Exception as e:
+        logger.exception("Config update failed: %s", e)
+        await _ws_send(
+            ws, "error", {"message": f"Config update failed: {e}"}
+        )
 
 
 async def _handle_archive(ws: WebSocket) -> None:

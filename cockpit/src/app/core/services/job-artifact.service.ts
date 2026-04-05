@@ -1,7 +1,8 @@
-import { Injectable, inject, signal } from '@angular/core';
-import { environment } from '../environment';
-import { JobContextService } from './job-context.service';
-import type { WorkspaceProposal } from './builder-stream.service';
+import {inject, Injectable, signal} from '@angular/core';
+import {environment} from '../environment';
+import {JobContextService} from './job-context.service';
+import {ModelService} from './model.service';
+import type {WorkspaceProposal} from './builder-stream.service';
 
 /** A pending workspace edit awaiting user approval. */
 export interface PendingWorkspaceEdit {
@@ -46,6 +47,7 @@ const SESSION_STORAGE_KEY = 'builder_session_id';
 @Injectable({ providedIn: 'root' })
 export class JobArtifactService {
   private readonly jobContext = inject(JobContextService);
+  private readonly modelService = inject(ModelService);
 
   /** Current instructions content — single source of truth */
   readonly instructions = signal<string | null>(null);
@@ -146,7 +148,8 @@ export class JobArtifactService {
     this.description.set(null);
     this.persistSessionId(null);
     this.streaming.set(false);
-    this.builderModel.set(environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
+    const models = this.modelService.builderModels();
+    this.builderModel.set(models[0]?.id ?? environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
     this.pendingWorkspaceEdits.set([]);
     this.editCounter = 0;
   }

@@ -789,12 +789,41 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                     )
 
-            # Embedding provider toggle (per-account)
-            embedding_provider = user_settings.get("embedding_provider")
-            if embedding_provider:
+            # Vision model override (injected as env var)
+            vision_model = user_settings.get("default_vision_model")
+            if vision_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
-                env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
+                if "VISION_MODEL" not in env_keys_block:
+                    env_keys_block["VISION_MODEL"] = vision_model
+                    vision_provider = _detect_provider_from_model(vision_model)
+                    if resolved_keys and vision_provider in resolved_keys:
+                        env_keys_block["VISION_API_KEY"] = resolved_keys[vision_provider]
+                    logger.info(
+                        f"Dispatch: injected user vision model: {vision_model}"
+                    )
+
+            # Whisper model override (injected as env var)
+            whisper_model = user_settings.get("default_whisper_model")
+            if whisper_model:
+                config_override = config_override or {}
+                env_keys_block = config_override.setdefault("env_keys", {})
+                if "WHISPER_MODEL" not in env_keys_block:
+                    env_keys_block["WHISPER_MODEL"] = whisper_model
+                    logger.info(
+                        f"Dispatch: injected user whisper model: {whisper_model}"
+                    )
+
+            # Embedding provider and model (per-account)
+            embedding_provider = user_settings.get("embedding_provider")
+            embedding_model = user_settings.get("default_embedding_model")
+            if embedding_provider or embedding_model:
+                config_override = config_override or {}
+                env_keys_block = config_override.setdefault("env_keys", {})
+                if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
+                    env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
+                if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
+                    env_keys_block["EMBEDDING_MODEL"] = embedding_model
                 # When using openrouter, inject the user's OpenRouter key
                 if (
                     embedding_provider == "openrouter"
@@ -803,7 +832,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 ):
                     env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
                 logger.info(
-                    f"Dispatch: injected user embedding_provider: {embedding_provider}"
+                    f"Dispatch: injected user embedding: "
+                    f"provider={embedding_provider}, model={embedding_model}"
                 )
 
         # Build job start request
@@ -1164,12 +1194,31 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+def _detect_provider_from_model(model: str) -> str:
+    """Detect LLM provider from a model name string.
+
+    Must stay in sync with src/core/loader.py:_detect_provider().
+    """
+    model_lower = model.lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if model_lower.startswith("groq/"):
+        return "groq"
+    if model_lower.startswith("codex/"):
+        return "codex"
+    if model_lower.startswith("claude"):
+        return "anthropic"
+    if model_lower.startswith("gemini"):
+        return "google"
+    return "openai"
+
+
 def _detect_llm_provider_for_dispatch(
     job: dict, config_override: dict | None
 ) -> str | None:
     """Detect the LLM provider for a job from its config override or config name.
 
-    Uses the same prefix-matching logic as src/core/loader.py:_detect_provider().
+    Uses _detect_provider_from_model() for consistent prefix matching.
     """
     # Check config_override for explicit provider or model
     if config_override:
@@ -1178,38 +1227,12 @@ def _detect_llm_provider_for_dispatch(
             return llm["provider"].lower()
         model = llm.get("model")
         if model:
-            model_lower = model.lower()
-            if model_lower.startswith("openrouter/"):
-                return "openrouter"
-            if model_lower.startswith("groq/"):
-                return "groq"
-            if model_lower.startswith("claude"):
-                return "anthropic"
-            if model_lower.startswith("gemini"):
-                return "google"
-            return "openai"
+            return _detect_provider_from_model(model)
 
     # Fall back to config_name heuristic (most configs use openai-compatible default)
     config_name = job.get("config_name", "default")
     if config_name and "anthropic" in config_name.lower():
         return "anthropic"
-    return "openai"
-
-
-def _detect_provider_from_model(model: str) -> str:
-    """Detect LLM provider from a model name string.
-
-    Uses the same prefix-matching logic as _detect_llm_provider_for_dispatch().
-    """
-    model_lower = model.lower()
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if model_lower.startswith("groq/"):
-        return "groq"
-    if model_lower.startswith("claude"):
-        return "anthropic"
-    if model_lower.startswith("gemini"):
-        return "google"
     return "openai"
 
 
@@ -1404,10 +1427,21 @@ async def _try_dispatch_pending_jobs() -> None:
                     # else: container is ready, proceed with dispatch
                     logger.info("Dispatcher: job %s using workspace container", job_id)
                 else:
-                    logger.info(
-                        "Dispatcher: job %s using local workspace (no provisioner)",
-                        job_id,
-                    )
+                    # No VM or container provisioning needed — check if a workspace
+                    # was already assigned (e.g. Docker provisioner assigned it on a
+                    # previous cycle and the job is now ready for dispatch).
+                    existing_ctx = _get_container_context(job)
+                    if existing_ctx.get("status") == "ready":
+                        logger.info(
+                            "Dispatcher: job %s using pre-assigned workspace (%s)",
+                            job_id,
+                            existing_ctx.get("host", "unknown"),
+                        )
+                    else:
+                        logger.debug(
+                            "Dispatcher: job %s — no workspace provisioner needed",
+                            job_id,
+                        )
                 dispatchable_jobs.append(job)
 
             if not dispatchable_jobs:
@@ -1787,6 +1821,7 @@ VALID_API_KEY_PROVIDERS = {
     "google",
     "groq",
     "openrouter",
+    "codex",
     "tavily",
     "vision",
 }
@@ -1808,6 +1843,9 @@ class UserSettingsUpdate(BaseModel):
     default_autonomy: str | None = None
     default_reasoning_level: str | None = None
     default_auxiliary_model: str | None = None
+    default_vision_model: str | None = None
+    default_whisper_model: str | None = None
+    default_embedding_model: str | None = None
     embedding_provider: str | None = None
 
 
@@ -3173,6 +3211,113 @@ async def send_agent_message(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _format_freeze_notification(
+    freeze_type: str,
+    freeze_data: dict[str, Any],
+    job_id: str,
+    config_name: str,
+    description: str,
+) -> tuple[str, str]:
+    """Format notification subject and body for a freeze event."""
+    short_id = job_id[:8]
+
+    if freeze_type == "vm_upgrade_required":
+        command = freeze_data.get("command", "unknown")
+        subject = f"Job {short_id} needs VM upgrade (sudo detected)"
+        message_md = (
+            f"**Job `{short_id}`** (`{config_name}`) attempted a sudo command "
+            f"and needs approval to continue.\n\n"
+            f"**Command:** `{command}`\n\n"
+            f"**Description:** {description}\n\n"
+            f"Approve a VM upgrade or reject to keep the job paused."
+        )
+
+    elif freeze_type == "job_complete":
+        summary = freeze_data.get("summary", "No summary provided")
+        confidence = freeze_data.get("confidence", 0)
+        deliverables = freeze_data.get("deliverables", [])
+        confidence_str = (
+            f"{confidence:.0%}" if isinstance(confidence, (int, float)) else str(confidence)
+        )
+        deliverables_str = (
+            "\n".join(f"- `{d}`" for d in deliverables) if deliverables else "*(none listed)*"
+        )
+        subject = f"Job {short_id} completed — review required"
+        message_md = (
+            f"**Job `{short_id}`** (`{config_name}`) has completed and is awaiting review.\n\n"
+            f"**Summary:** {summary}\n\n"
+            f"**Confidence:** {confidence_str}\n\n"
+            f"**Deliverables:**\n{deliverables_str}"
+        )
+
+    elif freeze_type == "budget_exceeded":
+        phase_number = freeze_data.get("phase_number", "?")
+        reason = freeze_data.get("reason", "Tool call budget exceeded")
+        tool_calls = freeze_data.get("tool_calls_this_phase", "?")
+        subject = f"Job {short_id} frozen — budget exceeded (phase {phase_number})"
+        message_md = (
+            f"**Job `{short_id}`** (`{config_name}`) has been frozen because "
+            f"the tool call budget was exceeded.\n\n"
+            f"**Phase:** #{phase_number}\n"
+            f"**Tool calls this phase:** {tool_calls}\n"
+            f"**Reason:** {reason}\n\n"
+            f"**Description:** {description}"
+        )
+
+    else:
+        subject = f"Job {short_id} frozen — {freeze_type}"
+        message_md = (
+            f"**Job `{short_id}`** (`{config_name}`) has frozen with type "
+            f"`{freeze_type}` and requires attention.\n\n"
+            f"**Description:** {description}"
+        )
+
+    return subject, message_md
+
+
+async def _notify_operator_freeze(
+    job: dict[str, Any],
+    job_id: str,
+    freeze_type: str,
+    freeze_data: dict[str, Any],
+) -> None:
+    """Send operator notification when a job freezes for human action."""
+    user_id = str(job["user_id"]) if job.get("user_id") else None
+    if not user_id:
+        logger.debug(f"Job {job_id} has no user_id — skipping freeze notification")
+        return
+
+    user = await postgres_db.get_user(user_id)
+    if not user:
+        logger.debug(f"User {user_id} not found — skipping freeze notification")
+        return
+
+    recipient_email = user.get("email")
+    recipient_name = user.get("display_name", "User")
+    config_name = job.get("config_name", "default")
+    description = (job.get("description") or "")[:100]
+
+    subject, message_md = _format_freeze_notification(
+        freeze_type=freeze_type,
+        freeze_data=freeze_data,
+        job_id=job_id,
+        config_name=config_name,
+        description=description,
+    )
+
+    await notification_service.dispatch(
+        user_id=user_id,
+        job_id=job_id,
+        subject=subject,
+        message_md=message_md,
+        job_description=description,
+        config_name=config_name,
+        recipient_email=recipient_email,
+        recipient_name=recipient_name,
+    )
+    logger.info(f"Freeze notification sent for job {job_id} ({freeze_type})")
+
+
 async def _route_inbound_reply(
     job_id: str,
     thread_id: str,
@@ -4386,7 +4531,7 @@ async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        if job["status"] not in ("pending_review", "reviewing"):
+        if job["status"] not in ("pending_review", "reviewing", "paused"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be upgraded (status: {job['status']}). "
@@ -5430,6 +5575,26 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
             # Update job dict with new status for downstream checks
             job["status"] = new_status
+
+        # 1b. Notify operator for freeze events that require human action
+        _NOTIFIABLE_FREEZE_TYPES = {
+            "vm_upgrade_required",
+            "job_complete",
+            "budget_exceeded",
+        }
+        if new_status in ("pending_review", "paused") and result.get("freeze_data"):
+            fd = result["freeze_data"]
+            if isinstance(fd, str):
+                fd = json.loads(fd)
+            ft = fd.get("freeze_type")
+            if ft in _NOTIFIABLE_FREEZE_TYPES:
+                try:
+                    await _notify_operator_freeze(job, job_id, ft, fd)
+                    actions.append(f"notification sent ({ft})")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to send freeze notification for {job_id}: {e}"
+                    )
 
         # 2. Subjob merge (if this is a subjob with a branch)
         if job.get("parent_job_id"):
@@ -7708,6 +7873,47 @@ async def agent_update_thread_status(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+class AgentThreadConfigUpdateRequest(BaseModel):
+    config_override: dict[str, Any]
+
+
+@app.patch("/api/agents/threads/{thread_id}/config")
+async def agent_update_thread_config(
+    thread_id: str, request: AgentThreadConfigUpdateRequest
+) -> dict[str, str]:
+    """Persist runtime config changes for a thread (no auth, agent-facing).
+
+    Deep-merges the provided config_override into the existing
+    ``threads.metadata.config_override``.  If the override includes
+    ``interactive.permission_mode``, the top-level ``permission_mode``
+    column is updated as well for query consistency.
+    """
+    try:
+        ok = await postgres_db.merge_thread_config_override(
+            thread_id, request.config_override
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        # Keep top-level permission_mode column in sync
+        pm = (request.config_override.get("interactive") or {}).get(
+            "permission_mode"
+        )
+        if pm and pm in ("supervised", "auto_accept", "autonomous"):
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads SET permission_mode = $1 WHERE id = $2",
+                    pm,
+                    thread_id,
+                )
+
+        return {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.post("/api/agents/threads/{thread_id}/upgrade-to-vm")
 async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
     """Request VM provisioning for a persistent thread (no auth, agent-facing).
@@ -9445,6 +9651,146 @@ async def delete_project_api_key(
             status_code=404, detail=f"No API key for provider '{provider}'"
         )
     return {"status": "deleted"}
+
+
+# =============================================================================
+# Global Models API
+# =============================================================================
+
+# Provider → env var mapping for system-level key detection
+_PROVIDER_ENV_KEYS: dict[str, list[str]] = {
+    "openai": ["OPENAI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "google": ["GOOGLE_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "codex": ["CODEX_API_KEY"],
+}
+
+# Cache the loaded catalog (reloaded on expert reload or manually)
+_model_catalog_cache: dict[str, Any] | None = None
+
+
+def _load_model_catalog() -> dict[str, Any]:
+    """Load config/models.yaml (cached after first load)."""
+    global _model_catalog_cache
+    if _model_catalog_cache is not None:
+        return _model_catalog_cache
+
+    catalog_path = _get_config_dir() / "models.yaml"
+    if not catalog_path.exists():
+        logger.warning("models.yaml not found at %s — returning empty catalog", catalog_path)
+        return {"groups": [], "presets": [], "builder_models": []}
+
+    with open(catalog_path) as f:
+        data = yaml.safe_load(f) or {}
+
+    _model_catalog_cache = data
+    logger.info(
+        "Loaded model catalog: %d groups, %d presets, %d builder models",
+        len(data.get("groups", [])),
+        len(data.get("presets", [])),
+        len(data.get("builder_models", [])),
+    )
+    return data
+
+
+def _get_system_providers() -> set[str]:
+    """Detect which providers have API keys set via environment variables."""
+    providers: set[str] = set()
+    for provider, env_vars in _PROVIDER_ENV_KEYS.items():
+        if any(os.getenv(var) for var in env_vars):
+            providers.add(provider)
+    return providers
+
+
+@app.get("/api/models")
+async def list_available_models(
+    request: Request,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """List models available to the current user.
+
+    Filters the global model catalog based on which providers have API keys
+    available at the system level (env vars), user level, or project level.
+
+    Query params:
+        project_id: optional project ID to include project-level API keys
+    """
+    user = await require_approved_user(request, postgres_db)
+    user_id = str(user["id"])
+
+    # Collect available providers: local is always available
+    available_providers: set[str] = {"local"}
+
+    # System-level env vars
+    available_providers |= _get_system_providers()
+
+    # User-level API keys
+    user_keys = await postgres_db.list_user_api_keys(user_id)
+    available_providers |= {k["provider"] for k in user_keys}
+
+    # Project-level API keys (optional)
+    if project_id:
+        try:
+            project_keys = await postgres_db.list_project_api_keys(project_id)
+            available_providers |= {k["provider"] for k in project_keys}
+        except Exception:
+            pass  # Project doesn't exist or no access — ignore
+
+    # Load and filter catalog
+    catalog = _load_model_catalog()
+
+    groups: list[dict[str, Any]] = []
+    available_model_ids: set[str] = set()
+    for group in catalog.get("groups", []):
+        if group["provider"] in available_providers:
+            model_ids = [m["id"] for m in group.get("models", [])]
+            groups.append({"group": group["name"], "models": model_ids})
+            available_model_ids.update(model_ids)
+
+    # Filter presets: both strategic and tactical must be available
+    presets = [
+        {"label": p["label"], "strategic": p["strategic"], "tactical": p["tactical"]}
+        for p in catalog.get("presets", [])
+        if p["strategic"] in available_model_ids and p["tactical"] in available_model_ids
+    ]
+
+    # Filter builder models
+    builder_models = [
+        {"label": m["label"], "id": m["id"]}
+        for m in catalog.get("builder_models", [])
+        if m.get("provider", "local") in available_providers
+    ]
+
+    # Filter helper model lists (auxiliary, vision, whisper, embedding)
+    def _filter_helper(key: str, extra_fields: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        return [
+            {"id": m["id"], "label": m["label"], **{f: m[f] for f in extra_fields if f in m}}
+            for m in catalog.get(key, [])
+            if m.get("provider", "local") in available_providers
+        ]
+
+    return {
+        "groups": groups,
+        "presets": presets,
+        "builder_models": builder_models,
+        "auxiliary_models": _filter_helper("auxiliary_models"),
+        "vision_models": _filter_helper("vision_models"),
+        "whisper_models": _filter_helper("whisper_models"),
+        "embedding_models": _filter_helper("embedding_models", ("dimensions",)),
+        "providers": sorted(available_providers - {"local"}),
+    }
+
+
+@app.post("/api/models/reload")
+async def reload_model_catalog(request: Request) -> dict[str, str]:
+    """Reload the model catalog from disk (admin-only)."""
+    await _require_admin(request)
+    global _model_catalog_cache
+    _model_catalog_cache = None
+    _load_model_catalog()
+    return {"status": "reloaded"}
 
 
 # =============================================================================

@@ -10,12 +10,14 @@ import {InboxPageComponent} from './simple/pages/inbox/inbox-page.component';
 import {MessageRedirectComponent} from './shared/components/message-redirect/message-redirect.component';
 import {ChatPageComponent} from './simple/pages/chat/chat-page.component';
 import {SessionsPageComponent} from './simple/pages/sessions/sessions-page.component';
+import {SessionCreateComponent} from './simple/pages/session-create/session-create.component';
 import {DatasourcesPageComponent} from './simple/pages/datasources/datasources-page.component';
 import {authGuard} from './core/guards/auth.guard';
 
 export const routes: Routes = [
   { path: '', component: ShellPageComponent, canActivate: [authGuard] },
     {path: 'sessions', component: SessionsPageComponent, canActivate: [authGuard]},
+    {path: 'sessions/new', component: SessionCreateComponent, canActivate: [authGuard]},
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
     {path: 'chat', redirectTo: 'sessions'},
   { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },

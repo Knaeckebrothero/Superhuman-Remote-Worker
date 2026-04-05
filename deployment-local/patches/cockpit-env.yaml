@@ -22,7 +22,7 @@ data:
       window['env']['keycloakRealm'] = 'srw';
       window['env']['keycloakClientId'] = 'cockpit';
 
-      // Available models
+      // Available models (fallback — primary source is GET /api/models)
       window['env']['models'] = [
         { group: 'OpenAI', models: ['gpt-4o-mini', 'gpt-4o'] },
         { group: 'Anthropic', models: ['claude-sonnet-4-5-20250929', 'claude-opus-4-6'] },

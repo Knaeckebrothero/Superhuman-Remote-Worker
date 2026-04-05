@@ -21,7 +21,7 @@ data:
       window['env']['keycloakRealm'] = 'srw';
       window['env']['keycloakClientId'] = 'cockpit';
 
-      // Available models for the job creation form
+      // Available models (fallback — primary source is GET /api/models)
       window['env']['models'] = [
         { group: 'Local', models: ['openai/gpt-oss-120b'] },
         { group: 'OpenAI', models: ['gpt-5.4', 'codex/gpt-5.3-codex', 'codex/gpt-5.3-codex-spark'] },

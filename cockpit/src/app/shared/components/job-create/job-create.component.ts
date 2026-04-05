@@ -5,17 +5,11 @@ import {ApiService} from '../../../core/services/api.service';
 import {FileHandlingService} from '../../../core/services/file-handling.service';
 import {JobArtifactService} from '../../../core/services/job-artifact.service';
 import {UserService} from '../../../core/services/user.service';
-import {
-    Datasource,
-    DatasourceType,
-    Expert,
-    ExpertDetail,
-    JobCreateRequest,
-    Project
-} from '../../../core/models/api.model';
+import {Datasource, Expert, ExpertDetail, JobCreateRequest, Project} from '../../../core/models/api.model';
 import {FilePreview, UploadStatus} from '../../../core/models/file.model';
-import {environment} from '../../../core/environment';
-import {ConfigEditorComponent} from '../config-editor/config-editor.component';
+import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
+import {PRIORITY_LEVELS} from '../agent-settings/agent-settings.types';
+import {ModelService} from '../../../core/services/model.service';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -23,7 +17,7 @@ import {ConfigEditorComponent} from '../config-editor/config-editor.component';
 @Component({
   selector: 'app-job-create',
   standalone: true,
-  imports: [FormsModule, ConfigEditorComponent],
+  imports: [FormsModule, AgentSettingsComponent],
   template: `
     <div class="job-create-container">
       <div class="header-bar">
@@ -223,415 +217,32 @@ import {ConfigEditorComponent} from '../config-editor/config-editor.component';
             <span class="field-hint">Optional: Upload documents for the agent to process</span>
           </div>
 
-          <!-- Advanced Section Toggle -->
-          <button
-            type="button"
-            class="toggle-advanced"
-            (click)="showAdvanced.set(!showAdvanced())"
-            [disabled]="isSubmitting()"
-          >
-            <span class="toggle-text">{{ showAdvanced() ? 'Hide' : 'Show' }} Advanced Options</span>
-            <span class="toggle-icon">{{ showAdvanced() ? 'expand_less' : 'expand_more' }}</span>
-          </button>
-
-          @if (showAdvanced()) {
-            <div class="advanced-section">
-              <!-- Priority Level -->
-              <div class="form-group">
-                <label for="priority" class="form-label">Priority</label>
-                <select id="priority" name="priority" class="form-input"
-                  [ngModel]="selectedPriority()" (ngModelChange)="selectedPriority.set($event)"
-                  [disabled]="isSubmitting()">
-                  @for (level of priorityLevels; track level.value) {
-                    <option [ngValue]="level.value">{{ level.label }}</option>
-                  }
-                </select>
-                <span class="field-hint">Higher priority jobs run first and can preempt lower priority jobs</span>
-              </div>
-
-              <!-- Autonomy Level -->
-              <div class="form-group">
-                <label for="autonomy" class="form-label">Autonomy Level</label>
-                <select id="autonomy" name="autonomy" class="form-input"
-                  [ngModel]="selectedAutonomy()" (ngModelChange)="selectedAutonomy.set($event)"
-                  [disabled]="isSubmitting()">
-                  <option [ngValue]="null">Default ({{ getExpertDefault('autonomy') ?? 'review' }})</option>
-                  @for (level of autonomyLevels; track level.value) {
-                    <option [value]="level.value">{{ level.label }}</option>
-                  }
-                </select>
-                <span class="field-hint">{{ autonomyDescription() }}</span>
-              </div>
-
-              <!-- Project Memory Opt-out -->
-              @if (projectHasSharedMemory()) {
-                <div class="form-group">
-                  <label class="memory-toggle">
-                    <input
-                      type="checkbox"
-                      [checked]="useProjectMemory()"
-                      (change)="onUseProjectMemoryChange($event)"
-                      [disabled]="isSubmitting()"
-                    />
-                    <span>Use project memory</span>
-                  </label>
-                  <span class="field-hint">
-                    When enabled, this job shares memories with other jobs in the project.
-                    Uncheck to isolate this job's memories.
-                  </span>
-                </div>
+          <!-- Priority -->
+          <div class="form-group">
+            <label for="priority" class="form-label">Priority</label>
+            <select id="priority" name="priority" class="form-input"
+              [ngModel]="selectedPriority()" (ngModelChange)="selectedPriority.set($event)"
+              [disabled]="isSubmitting()">
+              @for (level of priorityLevels; track level.value) {
+                <option [ngValue]="level.value">{{ level.label }}</option>
               }
+            </select>
+            <span class="field-hint">Higher priority jobs run first and can preempt lower priority jobs</span>
+          </div>
 
-              <!-- Subjob Toggles (Scholar & Critic) -->
-              <div class="form-group">
-                <label class="form-label">Subjobs</label>
-                <label class="memory-toggle">
-                  <input
-                    type="checkbox"
-                    [checked]="enableScholar()"
-                    (change)="onEnableScholarChange($event)"
-                    [disabled]="isSubmitting()"
-                  />
-                  <span>Scholar (research phase)</span>
-                </label>
-                <span class="field-hint">
-                  Spawns a research job before the main job starts to gather information
-                </span>
-                <label class="memory-toggle" style="margin-top: 8px;">
-                  <input
-                    type="checkbox"
-                    [checked]="enableCritic()"
-                    (change)="onEnableCriticChange($event)"
-                    [disabled]="isSubmitting()"
-                  />
-                  <span>Critic (verification phase)</span>
-                </label>
-                @if (enableCritic()) {
-                  <div class="subjob-detail">
-                    <label class="form-label compact-label">Feedback rounds</label>
-                    <select class="form-input compact-select"
-                      [ngModel]="criticMaxRounds()" (ngModelChange)="criticMaxRounds.set($event)"
-                      name="criticMaxRounds" [disabled]="isSubmitting()">
-                      @for (opt of criticRoundOptions; track opt.value) {
-                        <option [ngValue]="opt.value">{{ opt.label }}</option>
-                      }
-                    </select>
-                  </div>
-                }
-                <span class="field-hint">
-                  Spawns a reviewer job after completion to verify deliverables
-                </span>
-              </div>
-
-              <!-- Model Preset -->
-              @if (availablePresets.length > 0) {
-                <div class="form-group">
-                  <label class="form-label">Model Preset</label>
-                  <div class="preset-chips">
-                    @for (preset of availablePresets; track preset.label) {
-                      <button type="button" class="preset-chip"
-                        [class.active]="strategicModel() === preset.strategic && tacticalModel() === preset.tactical"
-                        (click)="applyPreset(preset)" [disabled]="isSubmitting()">
-                        {{ preset.label }}
-                      </button>
-                    }
-                  </div>
-                </div>
-              }
-
-              <!-- Per-Phase LLM Settings -->
-              <div class="phase-cards">
-                <!-- Strategic Phase Card -->
-                <div class="phase-card">
-                  <div class="phase-card-header">
-                    <span class="phase-icon">psychology</span>
-                    Strategic (Planning)
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">Model</label>
-                    <select class="form-input"
-                      [ngModel]="strategicModel()" (ngModelChange)="strategicModel.set($event)"
-                      name="strategicModel" [disabled]="isSubmitting()">
-                      <option [ngValue]="null">Default</option>
-                      @for (group of availableModels; track group.group) {
-                        <optgroup [label]="group.group">
-                          @for (model of group.models; track model) {
-                            <option [value]="model">{{ model }}</option>
-                          }
-                        </optgroup>
-                      }
-                    </select>
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">Reasoning</label>
-                    <select
-                      class="form-input"
-                      [ngModel]="strategicReasoning()"
-                      (ngModelChange)="strategicReasoning.set($event)"
-                      name="strategicReasoning"
-                      [disabled]="isSubmitting()"
-                    >
-                      @for (opt of strategicReasoningOptions(); track opt.value) {
-                        @if (opt.value === null) {
-                          <option [ngValue]="null">{{ opt.label }}</option>
-                        } @else {
-                          <option [value]="opt.value">{{ opt.label }}</option>
-                        }
-                      }
-                    </select>
-                    <span class="field-hint">
-                      @if (getExpertPhaseDefault('strategic', 'reasoning_level'); as defaultLevel) {
-                        Expert default: {{ defaultLevel }}
-                      }
-                    </span>
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">
-                      Temperature: {{ strategicTemperature() !== null ? strategicTemperature() : '(default)' }}
-                    </label>
-                    <div class="slider-row">
-                      <span class="slider-label">0</span>
-                      <input
-                        type="range"
-                        class="form-range"
-                        min="0"
-                        max="2"
-                        step="0.1"
-                        [ngModel]="strategicTemperature() ?? getExpertPhaseDefault('strategic', 'temperature') ?? 0"
-                        (ngModelChange)="onPhaseTemperatureChange('strategic', $event)"
-                        name="strategicTemperature"
-                        [disabled]="isSubmitting()"
-                      >
-                      <span class="slider-label">2</span>
-                    </div>
-                  </div>
-
-                  <label class="multimodal-toggle">
-                    <input
-                      type="checkbox"
-                      [checked]="strategicMultimodal() ?? getExpertPhaseDefault('strategic', 'multimodal') ?? false"
-                      (change)="onMultimodalChange('strategic', $event)"
-                      [disabled]="isSubmitting()"
-                    >
-                    <span>Multimodal (images)</span>
-                  </label>
-                </div>
-
-                <!-- Tactical Phase Card -->
-                <div class="phase-card">
-                  <div class="phase-card-header">
-                    <span class="phase-icon">construction</span>
-                    Tactical (Execution)
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">Model</label>
-                    <select class="form-input"
-                      [ngModel]="tacticalModel()" (ngModelChange)="tacticalModel.set($event)"
-                      name="tacticalModel" [disabled]="isSubmitting()">
-                      <option [ngValue]="null">Default</option>
-                      @for (group of availableModels; track group.group) {
-                        <optgroup [label]="group.group">
-                          @for (model of group.models; track model) {
-                            <option [value]="model">{{ model }}</option>
-                          }
-                        </optgroup>
-                      }
-                    </select>
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">Reasoning</label>
-                    <select
-                      class="form-input"
-                      [ngModel]="tacticalReasoning()"
-                      (ngModelChange)="tacticalReasoning.set($event)"
-                      name="tacticalReasoning"
-                      [disabled]="isSubmitting()"
-                    >
-                      @for (opt of tacticalReasoningOptions(); track opt.value) {
-                        @if (opt.value === null) {
-                          <option [ngValue]="null">{{ opt.label }}</option>
-                        } @else {
-                          <option [value]="opt.value">{{ opt.label }}</option>
-                        }
-                      }
-                    </select>
-                    <span class="field-hint">
-                      @if (getExpertPhaseDefault('tactical', 'reasoning_level'); as defaultLevel) {
-                        Expert default: {{ defaultLevel }}
-                      }
-                    </span>
-                  </div>
-
-                  <div class="form-group compact">
-                    <label class="form-label">
-                      Temperature: {{ tacticalTemperature() !== null ? tacticalTemperature() : '(default)' }}
-                    </label>
-                    <div class="slider-row">
-                      <span class="slider-label">0</span>
-                      <input
-                        type="range"
-                        class="form-range"
-                        min="0"
-                        max="2"
-                        step="0.1"
-                        [ngModel]="tacticalTemperature() ?? getExpertPhaseDefault('tactical', 'temperature') ?? 0"
-                        (ngModelChange)="onPhaseTemperatureChange('tactical', $event)"
-                        name="tacticalTemperature"
-                        [disabled]="isSubmitting()"
-                      >
-                      <span class="slider-label">2</span>
-                    </div>
-                  </div>
-
-                  <label class="multimodal-toggle">
-                    <input
-                      type="checkbox"
-                      [checked]="tacticalMultimodal() ?? getExpertPhaseDefault('tactical', 'multimodal') ?? false"
-                      (change)="onMultimodalChange('tactical', $event)"
-                      [disabled]="isSubmitting()"
-                    >
-                    <span>Multimodal (images)</span>
-                  </label>
-                </div>
-              </div>
-
-              <!-- Tool Category Toggles -->
-              <div class="form-group">
-                <label class="form-label">Tool Categories</label>
-                <div class="tool-toggles">
-                  @for (cat of toolCategories; track cat.key) {
-                    <label class="tool-toggle" [class.disabled]="isSubmitting()">
-                      <input
-                        type="checkbox"
-                        [checked]="isToolCategoryEnabled(cat.key)"
-                        (change)="toggleToolCategory(cat.key)"
-                        [disabled]="isSubmitting()"
-                      >
-                      <span class="tool-toggle-icon">{{ cat.icon }}</span>
-                      <span class="tool-toggle-info">
-                        <span class="tool-toggle-name">{{ cat.label }}</span>
-                        <span class="tool-toggle-desc">{{ cat.description }}</span>
-                      </span>
-                    </label>
-                  }
-                </div>
-                <span class="field-hint">Enable or disable tool categories for this job</span>
-              </div>
-
-              <!-- Instructions Editor -->
-              <div class="form-group">
-                <label class="form-label">
-                  Instructions (Markdown)
-                  @if (isLoadingExpertDetail()) {
-                    <span class="spinner-small inline-spinner"></span>
-                  }
-                </label>
-                <textarea
-                  id="instructions"
-                  name="instructions"
-                  class="form-textarea mono"
-                  [ngModel]="instructionsContent()"
-                  (ngModelChange)="onInstructionsEdit($event)"
-                  rows="12"
-                  placeholder="Select an expert to pre-fill instructions, or type custom instructions..."
-                  [disabled]="isSubmitting() || isLoadingExpertDetail() || artifacts.streaming()"
-                ></textarea>
-                @if (artifacts.streaming()) {
-                  <span class="field-hint" style="color: var(--accent-color, #cba6f7)">
-                    <span class="spinner-small inline-spinner"></span>
-                    AI is editing instructions...
-                  </span>
-                }
-                <div class="instructions-actions">
-                  @if (instructionsContent()) {
-                    <button type="button" class="btn-text" (click)="clearInstructions()" [disabled]="isSubmitting()">
-                      Clear
-                    </button>
-                  }
-                  @if (selectedExpert() && expertDetail()) {
-                    <button type="button" class="btn-text" (click)="resetInstructionsToExpert()" [disabled]="isSubmitting() || isLoadingExpertDetail()">
-                      Reset to expert default
-                    </button>
-                  }
-                </div>
-                <span class="field-hint">Custom task instructions for the agent (replaces default)</span>
-                @if (selectedExpert() && !instructionsContent() && !isLoadingExpertDetail()) {
-                  <span class="field-warning">
-                    No instructions set — the agent will use the expert's default prompt
-                  </span>
-                }
-              </div>
-
-              <!-- Datasource Picker -->
-              <div class="form-group">
-                <label class="form-label">Datasources</label>
-                @if (isLoadingDatasources()) {
-                  <div class="ds-loading">
-                    <span class="spinner-small"></span>
-                    Loading datasources...
-                  </div>
-                } @else if (availableDatasources().length === 0) {
-                  <div class="ds-empty">No global datasources configured</div>
-                } @else {
-                  <div class="ds-picker">
-                    @for (ds of availableDatasources(); track ds.id) {
-                      <label
-                        class="ds-option"
-                        [class.selected]="selectedDatasourceIds().has(ds.id)"
-                      >
-                        <input
-                          type="checkbox"
-                          [checked]="selectedDatasourceIds().has(ds.id)"
-                          (change)="toggleDatasource(ds.id)"
-                          [disabled]="isSubmitting()"
-                        >
-                        <span class="ds-type-icon" [class]="'ds-type-' + ds.type">
-                          {{ getDsTypeIcon(ds.type) }}
-                        </span>
-                        <span class="ds-info">
-                          <span class="ds-name">{{ ds.name }}</span>
-                          @if (ds.description) {
-                            <span class="ds-desc">{{ ds.description }}</span>
-                          }
-                        </span>
-                        <span class="ds-type-badge">{{ ds.type }}</span>
-                      </label>
-                    }
-                  </div>
-                }
-                <span class="field-hint">Select external databases the agent can access during this job</span>
-              </div>
-            </div>
-          }
-
-          <!-- Config Override Editor Toggle -->
-          <button
-            type="button"
-            class="toggle-advanced config-editor-toggle"
-            (click)="showConfigEditor.set(!showConfigEditor())"
-            [disabled]="isSubmitting()"
-          >
-            <span class="toggle-text">{{ showConfigEditor() ? 'Hide' : 'Show' }} Config Override Editor</span>
-            <span class="toggle-icon">{{ showConfigEditor() ? 'expand_less' : 'expand_more' }}</span>
-          </button>
-
-          @if (showConfigEditor()) {
-            <div class="advanced-section">
-              <span class="field-hint" style="display: block; margin-bottom: 8px;">
-                Override any agent config field. Values here take precedence over the Advanced Options above.
-              </span>
-              <app-config-editor
-                [expertConfig]="expertDetail()?.config ?? {}"
-                [value]="configEditorOverrides()"
-                (valueChange)="configEditorOverrides.set($event)"
-              />
-            </div>
-          }
+          <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
+          <app-agent-settings
+            mode="job"
+            [config]="expertDetail()?.config ?? {}"
+            [disabled]="isSubmitting() || artifacts.streaming()"
+            [showProjectMemory]="projectHasSharedMemory()"
+            [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
+            [datasources]="availableDatasources()"
+            [loadingDatasources]="isLoadingDatasources()"
+            [loadingExpert]="isLoadingExpertDetail()"
+            [streaming]="artifacts.streaming()"
+            (instructionsChange)="onInstructionsChange($event)"
+          />
 
           <!-- Submit Button -->
           <div class="form-actions">
@@ -1613,15 +1224,19 @@ export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly route = inject(ActivatedRoute);
   private readonly userService = inject(UserService);
+  private readonly modelService = inject(ModelService);
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
 
+  @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
+  @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;
+
   constructor() {
-    // Sync artifact signals → local form state (builder → form direction)
+    // Sync builder AI → settings component
     effect(() => {
       const instructions = this.artifacts.instructions();
-      if (instructions !== null && instructions !== this.instructionsContent()) {
-        this.instructionsContent.set(instructions);
+      if (instructions !== null) {
+        this.agentSettings?.instructionsTab?.setContent(instructions);
       }
     });
     effect(() => {
@@ -1632,63 +1247,17 @@ export class JobCreateComponent implements OnInit {
     });
     effect(() => {
       const config = this.artifacts.config();
-      if (config === null) return;
-
-      const autonomy = config['autonomy'];
-      if (typeof autonomy === 'string') {
-        this.selectedAutonomy.set(autonomy);
-      }
-
-      const scholar = config['scholar'] as Record<string, unknown> | undefined;
-      if (scholar && typeof scholar['enabled'] === 'boolean') {
-        this.enableScholar.set(scholar['enabled']);
-      }
-
-      const verification = config['verification'] as Record<string, unknown> | undefined;
-      if (verification) {
-        if (typeof verification['enabled'] === 'boolean') {
-          this.enableCritic.set(verification['enabled']);
-        }
-        if (typeof verification['max_rounds'] === 'number') {
-          this.criticMaxRounds.set(verification['max_rounds']);
-        }
-      }
-
-      const memory = config['memory'] as Record<string, unknown> | undefined;
-      if (memory && typeof memory['project_scoped'] === 'boolean') {
-        this.useProjectMemory.set(memory['project_scoped']);
+      if (config && this.agentSettings) {
+        this.agentSettings.prefillFromConfig(config);
       }
     });
-
-    // Load projects reactively — waits for currentUserId to be available.
-    // On F5 refresh, the /api/auth/me call may not have completed by the time
-    // ngOnInit runs, so currentUserId() is null. This effect re-fires once the
-    // user is loaded, ensuring we always pass user_id to the backend.
     effect(() => {
       const userId = this.userService.currentUserId();
       if (userId) {
         this.loadProjects(userId);
       }
     });
-
-    // Reset reasoning level when model changes to one that doesn't support it
-    effect(() => {
-      const options = this.strategicReasoningOptions();
-      const current = this.strategicReasoning();
-      if (current !== null && !options.some(o => o.value === current)) {
-        this.strategicReasoning.set(null);
-      }
-    });
-    effect(() => {
-      const options = this.tacticalReasoningOptions();
-      const current = this.tacticalReasoning();
-      if (current !== null && !options.some(o => o.value === current)) {
-        this.tacticalReasoning.set(null);
-      }
-    });
   }
-
-  @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
 
   readonly isSubmitting = signal(false);
   readonly isUploading = signal(false);
@@ -1697,55 +1266,21 @@ export class JobCreateComponent implements OnInit {
   readonly errorMessage = signal<string | null>(null);
   readonly filePreviews = signal<FilePreview[]>([]);
 
-  // Expert selector state
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
   readonly isLoadingExperts = signal(false);
   readonly expertDetail = signal<ExpertDetail | null>(null);
   readonly isLoadingExpertDetail = signal(false);
 
-  // Instructions editor state
-  readonly instructionsContent = signal<string | null>(null);
-
-  // Per-phase LLM settings
-  readonly strategicModel = signal<string | null>(null);
-  readonly strategicReasoning = signal<string | null>(null);
-  readonly strategicTemperature = signal<number | null>(null);
-  readonly strategicMultimodal = signal<boolean | null>(null);
-
-  readonly tacticalModel = signal<string | null>(null);
-  readonly tacticalReasoning = signal<string | null>(null);
-  readonly tacticalTemperature = signal<number | null>(null);
-  readonly tacticalMultimodal = signal<boolean | null>(null);
-
-  readonly strategicReasoningOptions = computed(() =>
-    this.getReasoningOptions(this.strategicModel())
-  );
-  readonly tacticalReasoningOptions = computed(() =>
-    this.getReasoningOptions(this.tacticalModel())
-  );
-
-  readonly disabledToolCategories = signal<Set<string>>(new Set());
-  /** Categories the expert config originally disabled (empty array in config). */
-  private expertDisabledCategories = new Set<string>();
-  /** Default tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
-  private defaultsTools: Record<string, string[]> = {};
-
-  // Autonomy level override
   readonly selectedPriority = signal<number>(5);
+  readonly priorityLevels = PRIORITY_LEVELS;
 
-  readonly priorityLevels = [
-    { value: 0, label: 'Low (backfill)' },
-    { value: 5, label: 'Normal (default)' },
-    { value: 10, label: 'High (preempts lower)' },
-  ];
+  readonly projects = signal<Project[]>([]);
+  readonly selectedProjectId = signal<string | null>(null);
 
-  readonly selectedAutonomy = signal<string | null>(null);
-  readonly useProjectMemory = signal(true);
-  readonly enableScholar = signal(true);
-  readonly enableCritic = signal(true);
-  readonly criticMaxRounds = signal<number>(5);
-  /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
+  readonly availableDatasources = signal<Datasource[]>([]);
+  readonly isLoadingDatasources = signal(false);
+
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectHasSharedMemory = computed(() => {
     const pid = this.selectedProjectId();
@@ -1755,78 +1290,19 @@ export class JobCreateComponent implements OnInit {
     const override = proj.default_config_override as Record<string, any> | null;
     const val = override?.['memory']?.['project_scoped'];
     if (typeof val === 'boolean') return val;
-    // Fall back to framework default from defaults.yaml
     const defaults = this.frameworkDefaults();
     const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
     return typeof defaultVal === 'boolean' ? defaultVal : true;
   });
 
-  readonly autonomyLevels = [
-    { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
-    { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
-    { value: 'partial', label: 'Partial', description: 'Freezes at phase boundaries and job completion' },
-    { value: 'guided', label: 'Guided', description: 'Freezes after every tactical phase' },
-    { value: 'dependent', label: 'Dependent', description: 'Freezes after every phase (strategic and tactical)' },
-  ] as const;
-
-  readonly autonomyDescription = computed(() => {
-    const selected = this.selectedAutonomy();
-    const effective = selected ?? (this.getExpertDefault('autonomy') as string | null) ?? 'review';
-    return this.autonomyLevels.find(l => l.value === effective)?.description
-      ?? 'Controls when the agent pauses for human review';
-  });
-
-  // Model list for combo-box (loaded from env.js at runtime)
-  readonly availableModels = environment.models;
-  readonly availablePresets = environment.modelPresets;
-
-  // Critic feedback round options
-  readonly criticRoundOptions = [
-    { value: 1, label: '1 round' },
-    { value: 3, label: '3 rounds' },
-    { value: 5, label: '5 rounds (default)' },
-    { value: 10, label: '10 rounds' },
-    { value: 0, label: 'Unlimited' },
-  ];
-
-  // Tool category metadata for toggles
-  readonly toolCategories = [
-    { key: 'research', label: 'Research', icon: 'travel_explore', description: 'Web search, paper search, browsing' },
-    { key: 'citation', label: 'Citation', icon: 'format_quote', description: 'Citation and literature management' },
-    { key: 'document', label: 'Document', icon: 'article', description: 'Document processing and chunking' },
-    { key: 'coding', label: 'Coding', icon: 'code', description: 'Shell command execution' },
-  ];
-
-  // Advanced section state
-  readonly showAdvanced = signal(false);
-
-  // Config editor state
-  readonly showConfigEditor = signal(false);
-  readonly configEditorOverrides = signal<Record<string, unknown>>({});
-
-  // Project selector state
-  readonly projects = signal<Project[]>([]);
-  readonly selectedProjectId = signal<string | null>(null);
-
-  // Datasource picker state
-  readonly availableDatasources = signal<Datasource[]>([]);
-  readonly selectedDatasourceIds = signal<Set<string>>(new Set());
-  readonly isLoadingDatasources = signal(false);
-
-  // Current upload_id after successful upload
   private uploadId: string | null = null;
-
   kickoffMessage = '';
-
-  formData: JobCreateRequest = {
-    description: '',
-  };
+  formData: JobCreateRequest = { description: '' };
 
   ngOnInit(): void {
+    this.modelService.load();
     this.loadExperts();
     this.loadDatasources();
-    // Projects are loaded via effect() in the constructor (waits for currentUserId)
-    // Load framework defaults so toggles reflect the actual base config
     this.api.getExpertDetail('defaults').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
     });
@@ -1835,13 +1311,8 @@ export class JobCreateComponent implements OnInit {
   private loadExperts(): void {
     this.isLoadingExperts.set(true);
     this.api.getExperts().subscribe({
-      next: (experts) => {
-        this.experts.set(experts);
-        this.isLoadingExperts.set(false);
-      },
-      error: () => {
-        this.isLoadingExperts.set(false);
-      },
+      next: (experts) => { this.experts.set(experts); this.isLoadingExperts.set(false); },
+      error: () => { this.isLoadingExperts.set(false); },
     });
   }
 
@@ -1849,20 +1320,8 @@ export class JobCreateComponent implements OnInit {
     if (this.selectedExpert()?.id === expert.id) {
       this.selectedExpert.set(null);
       this.expertDetail.set(null);
-      this.instructionsContent.set(null);
       this.artifacts.instructions.set(null);
-      this.strategicModel.set(null);
-      this.strategicReasoning.set(null);
-      this.strategicTemperature.set(null);
-      this.strategicMultimodal.set(null);
-      this.tacticalModel.set(null);
-      this.tacticalReasoning.set(null);
-      this.tacticalTemperature.set(null);
-      this.tacticalMultimodal.set(null);
-      this.disabledToolCategories.set(new Set());
-      this.expertDisabledCategories = new Set();
-      this.defaultsTools = {};
-      this.selectedAutonomy.set(null);
+      this.agentSettings?.resetAll();
     } else {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);
@@ -1875,421 +1334,61 @@ export class JobCreateComponent implements OnInit {
       next: (detail) => {
         this.expertDetail.set(detail);
         if (detail?.instructions) {
-          this.instructionsContent.set(detail.instructions);
+          this.agentSettings?.instructionsTab?.setFromExpert(detail.instructions);
           this.artifacts.instructions.set(detail.instructions);
         }
-        this.prefillConfigFromExpert();
+        if (detail?.config) {
+          this.agentSettings?.prefillFromConfig(detail.config);
+        }
         this.isLoadingExpertDetail.set(false);
       },
-      error: () => {
-        this.isLoadingExpertDetail.set(false);
-      },
+      error: () => { this.isLoadingExpertDetail.set(false); },
     });
   }
 
-  /** Sync instructions edits to artifact service (form → builder direction). */
-  onInstructionsEdit(value: string): void {
-    this.instructionsContent.set(value);
-    if (!this.artifacts.streaming()) {
-      this.artifacts.instructions.set(value || null);
-    }
-  }
-
-  /** Sync description edits to artifact service (form → builder direction). */
   onDescriptionEdit(value: string): void {
     if (!this.artifacts.streaming()) {
       this.artifacts.description.set(value || null);
     }
   }
 
-  clearInstructions(): void {
-    this.instructionsContent.set(null);
-    this.artifacts.instructions.set(null);
-  }
-
-  resetInstructionsToExpert(): void {
-    const detail = this.expertDetail();
-    if (detail?.instructions) {
-      this.instructionsContent.set(detail.instructions);
-      this.artifacts.instructions.set(detail.instructions);
+  onInstructionsChange(value: string | null): void {
+    if (!this.artifacts.streaming()) {
+      this.artifacts.instructions.set(value);
     }
   }
-
-  // ===== Config Settings Methods =====
-
-  /** Clamp temperature to valid 0-2 range per phase. */
-  onPhaseTemperatureChange(phase: 'strategic' | 'tactical', value: number): void {
-    const clamped = Math.round(Math.min(2, Math.max(0, value)) * 10) / 10;
-    if (phase === 'strategic') this.strategicTemperature.set(clamped);
-    else this.tacticalTemperature.set(clamped);
-  }
-
-  onMultimodalChange(phase: 'strategic' | 'tactical', event: Event): void {
-    const checked = (event.target as HTMLInputElement).checked;
-    if (phase === 'strategic') this.strategicMultimodal.set(checked);
-    else this.tacticalMultimodal.set(checked);
-  }
-
-  applyPreset(preset: { label: string; strategic: string; tactical: string }): void {
-    this.strategicModel.set(preset.strategic);
-    this.tacticalModel.set(preset.tactical);
-  }
-
-  getExpertDefault(path: string): unknown {
-    const detail = this.expertDetail();
-    if (!detail?.config) return null;
-    return path.split('.').reduce((obj: any, key) => obj?.[key], detail.config) ?? null;
-  }
-
-  /** Read phase-specific override, falling back to base llm value. */
-  getExpertPhaseDefault(phase: string, field: string): unknown {
-    return this.getExpertDefault(`llm.${phase}.${field}`)
-      ?? this.getExpertDefault(`llm.${field}`);
-  }
-
-  /**
-   * Determine available reasoning levels based on the model's provider and family.
-   * Mirrors backend logic in src/core/loader.py (detect_model_family + detect_reasoning_method).
-   */
-  getReasoningOptions(model: string | null): { value: string | null; label: string }[] {
-    const base = [{ value: null, label: 'Default' }];
-    if (!model) {
-      // No model selected → show standard set (OpenAI-like: low/medium/high)
-      return [...base,
-        { value: 'none', label: 'None' },
-        { value: 'low', label: 'Low' },
-        { value: 'medium', label: 'Medium' },
-        { value: 'high', label: 'High' },
-      ];
-    }
-
-    const lower = model.toLowerCase();
-
-    // Provider-level: OpenRouter supports all 6 levels natively
-    if (lower.startsWith('openrouter/')) {
-      return [...base,
-        { value: 'none', label: 'None' },
-        { value: 'minimal', label: 'Minimal' },
-        { value: 'low', label: 'Low' },
-        { value: 'medium', label: 'Medium' },
-        { value: 'high', label: 'High' },
-        { value: 'xhigh', label: 'X-High' },
-      ];
-    }
-
-    // Provider-level: Groq doesn't pass reasoning through
-    if (lower.startsWith('groq/')) return base;
-
-    // Strip provider prefix for model family detection
-    let name = lower;
-    for (const prefix of ['openai/']) {
-      if (name.startsWith(prefix)) {
-        name = name.slice(prefix.length);
-        break;
-      }
-    }
-
-    // Model families that don't support reasoning control
-    if (name.startsWith('claude') || name.startsWith('gemini')) return base;
-
-    // gpt-oss (vLLM prompt injection) supports all levels
-    if (name.startsWith('gpt-oss')) {
-      return [...base,
-        { value: 'none', label: 'None' },
-        { value: 'minimal', label: 'Minimal' },
-        { value: 'low', label: 'Low' },
-        { value: 'medium', label: 'Medium' },
-        { value: 'high', label: 'High' },
-        { value: 'xhigh', label: 'X-High' },
-      ];
-    }
-
-    // OpenAI, DeepSeek, Qwen, Llama, default → low/medium/high
-    return [...base,
-      { value: 'none', label: 'None' },
-      { value: 'low', label: 'Low' },
-      { value: 'medium', label: 'Medium' },
-      { value: 'high', label: 'High' },
-    ];
-  }
-
-  isToolCategoryEnabled(category: string): boolean {
-    return !this.disabledToolCategories().has(category);
-  }
-
-  toggleToolCategory(category: string): void {
-    this.disabledToolCategories.update((current) => {
-      const next = new Set(current);
-      if (next.has(category)) {
-        next.delete(category);
-      } else {
-        next.add(category);
-      }
-      return next;
-    });
-  }
-
-  onUseProjectMemoryChange(event: Event): void {
-    this.useProjectMemory.set((event.target as HTMLInputElement).checked);
-  }
-
-  onEnableScholarChange(event: Event): void {
-    this.enableScholar.set((event.target as HTMLInputElement).checked);
-  }
-
-  onEnableCriticChange(event: Event): void {
-    this.enableCritic.set((event.target as HTMLInputElement).checked);
-  }
-
-  /** Build config_override by diffing form values against expert defaults. */
-  private buildConfigOverride(): Record<string, unknown> | undefined {
-    const override: Record<string, unknown> = {};
-    const llm: Record<string, unknown> = {};
-
-    // Build strategic phase override
-    const strategic: Record<string, unknown> = {};
-    const sm = this.strategicModel();
-    if (sm) strategic['model'] = sm;
-    const sr = this.strategicReasoning();
-    if (sr !== null && sr !== this.getExpertPhaseDefault('strategic', 'reasoning_level')) {
-      strategic['reasoning_level'] = sr;
-    }
-    const st = this.strategicTemperature();
-    const stDefault = this.getExpertPhaseDefault('strategic', 'temperature') as number | null;
-    if (st !== null && st !== (stDefault ?? 0)) {
-      strategic['temperature'] = st;
-    }
-    const smm = this.strategicMultimodal();
-    if (smm !== null && smm !== this.getExpertPhaseDefault('strategic', 'multimodal')) {
-      strategic['multimodal'] = smm;
-    }
-    if (Object.keys(strategic).length > 0) llm['strategic'] = strategic;
-
-    // Build tactical phase override
-    const tactical: Record<string, unknown> = {};
-    const tm = this.tacticalModel();
-    if (tm) tactical['model'] = tm;
-    const tr = this.tacticalReasoning();
-    if (tr !== null && tr !== this.getExpertPhaseDefault('tactical', 'reasoning_level')) {
-      tactical['reasoning_level'] = tr;
-    }
-    const tt = this.tacticalTemperature();
-    const ttDefault = this.getExpertPhaseDefault('tactical', 'temperature') as number | null;
-    if (tt !== null && tt !== (ttDefault ?? 0)) {
-      tactical['temperature'] = tt;
-    }
-    const tmm = this.tacticalMultimodal();
-    if (tmm !== null && tmm !== this.getExpertPhaseDefault('tactical', 'multimodal')) {
-      tactical['multimodal'] = tmm;
-    }
-    if (Object.keys(tactical).length > 0) llm['tactical'] = tactical;
-
-    if (Object.keys(llm).length > 0) {
-      override['llm'] = llm;
-    }
-
-    // Tool overrides — disabled categories set to empty array,
-    // re-enabled categories (expert had them disabled, user toggled ON)
-    // get the defaults' tool list so they override the expert's empty array.
-    const disabled = this.disabledToolCategories();
-    const tools: Record<string, unknown> = {};
-    disabled.forEach((cat) => {
-      tools[cat] = [];
-    });
-    // Re-enabled: was disabled in expert config, user toggled ON
-    for (const cat of this.expertDisabledCategories) {
-      if (!disabled.has(cat) && this.defaultsTools[cat]?.length) {
-        tools[cat] = [...this.defaultsTools[cat]];
-      }
-    }
-    if (Object.keys(tools).length > 0) {
-      override['tools'] = tools;
-    }
-
-    // Autonomy level override
-    const autonomy = this.selectedAutonomy();
-    if (autonomy !== null && autonomy !== this.getExpertDefault('autonomy')) {
-      override['autonomy'] = autonomy;
-    }
-
-    // Project memory opt-out
-    if (this.projectHasSharedMemory() && !this.useProjectMemory()) {
-      override['memory'] = { project_scoped: false };
-    }
-
-    // Scholar subjob toggle
-    const scholarDefault = (this.getExpertDefault('scholar.enabled') as boolean) ?? true;
-    if (this.enableScholar() !== scholarDefault) {
-      override['scholar'] = { enabled: this.enableScholar() };
-    }
-
-    // Critic (verification) subjob toggle + max rounds
-    const criticDefault = (this.getExpertDefault('verification.enabled') as boolean) ?? true;
-    const roundsDefault = (this.getExpertDefault('verification.max_rounds') as number) ?? 5;
-    if (this.enableCritic() !== criticDefault || this.criticMaxRounds() !== roundsDefault) {
-      override['verification'] = {
-        enabled: this.enableCritic(),
-        max_rounds: this.criticMaxRounds(),
-      };
-    }
-
-    return Object.keys(override).length > 0 ? override : undefined;
-  }
-
-  /** Deep merge two objects. Source values override target. Objects recurse, arrays replace, null deletes. */
-  private deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
-    const result = { ...target };
-    for (const key of Object.keys(source)) {
-      const sv = source[key];
-      const tv = result[key];
-      if (sv === null || sv === undefined) {
-        delete result[key];
-      } else if (
-        typeof sv === 'object' && !Array.isArray(sv) &&
-        typeof tv === 'object' && !Array.isArray(tv) && tv !== null
-      ) {
-        result[key] = this.deepMerge(tv as Record<string, unknown>, sv as Record<string, unknown>);
-      } else {
-        result[key] = sv;
-      }
-    }
-    return result;
-  }
-
-  private prefillConfigFromExpert(): void {
-    const detail = this.expertDetail();
-    if (!detail?.config) {
-      this.strategicModel.set(null);
-      this.strategicReasoning.set(null);
-      this.strategicTemperature.set(null);
-      this.strategicMultimodal.set(null);
-      this.tacticalModel.set(null);
-      this.tacticalReasoning.set(null);
-      this.tacticalTemperature.set(null);
-      this.tacticalMultimodal.set(null);
-      this.disabledToolCategories.set(new Set());
-      this.expertDisabledCategories = new Set();
-      this.defaultsTools = {};
-      this.selectedAutonomy.set(null);
-      this.enableScholar.set(true);
-      this.enableCritic.set(true);
-      this.criticMaxRounds.set(5);
-      return;
-    }
-
-    // Pre-fill from expert config (user can then change)
-    const llm = detail.config['llm'] as Record<string, unknown> | undefined;
-    const stratOverride = llm?.['strategic'] as Record<string, unknown> | undefined;
-    const tactOverride = llm?.['tactical'] as Record<string, unknown> | undefined;
-    const baseModel = (llm?.['model'] as string) ?? null;
-    const baseReasoning = (llm?.['reasoning_level'] as string) ?? null;
-    const baseTemp = (llm?.['temperature'] as number) ?? null;
-    const baseMultimodal = (llm?.['multimodal'] as boolean) ?? null;
-
-    this.strategicModel.set((stratOverride?.['model'] as string) ?? baseModel);
-    this.strategicReasoning.set((stratOverride?.['reasoning_level'] as string) ?? baseReasoning);
-    this.strategicTemperature.set((stratOverride?.['temperature'] as number) ?? baseTemp);
-    this.strategicMultimodal.set((stratOverride?.['multimodal'] as boolean) ?? baseMultimodal);
-
-    this.tacticalModel.set((tactOverride?.['model'] as string) ?? baseModel);
-    this.tacticalReasoning.set((tactOverride?.['reasoning_level'] as string) ?? baseReasoning);
-    this.tacticalTemperature.set((tactOverride?.['temperature'] as number) ?? baseTemp);
-    this.tacticalMultimodal.set((tactOverride?.['multimodal'] as boolean) ?? baseMultimodal);
-
-    // Detect which tool categories are empty (disabled)
-    const tools = detail.config['tools'] as Record<string, unknown[]> | undefined;
-    const disabled = new Set<string>();
-    if (tools) {
-      for (const cat of this.toolCategories) {
-        const val = tools[cat.key];
-        if (Array.isArray(val) && val.length === 0) {
-          disabled.add(cat.key);
-        }
-      }
-    }
-    this.disabledToolCategories.set(disabled);
-    // Remember expert's original disabled set and defaults' tool lists so
-    // buildConfigOverride() can re-enable categories the user toggles ON.
-    this.expertDisabledCategories = new Set(disabled);
-    this.defaultsTools = detail.defaults_tools ?? {};
-
-    // Pre-fill autonomy level
-    this.selectedAutonomy.set((detail.config['autonomy'] as string) ?? null);
-
-    // Pre-fill subjob toggles
-    const scholar = detail.config['scholar'] as Record<string, unknown> | undefined;
-    this.enableScholar.set((scholar?.['enabled'] as boolean) ?? true);
-    const verification = detail.config['verification'] as Record<string, unknown> | undefined;
-    this.enableCritic.set((verification?.['enabled'] as boolean) ?? true);
-    this.criticMaxRounds.set((verification?.['max_rounds'] as number) ?? 5);
-  }
-
-  // ===== Datasource Methods =====
 
   private loadDatasources(): void {
     this.isLoadingDatasources.set(true);
     this.api.getDatasources('global').subscribe({
-      next: (datasources) => {
-        this.availableDatasources.set(datasources);
-        this.isLoadingDatasources.set(false);
-      },
-      error: () => {
-        this.isLoadingDatasources.set(false);
-      },
+      next: (datasources) => { this.availableDatasources.set(datasources); this.isLoadingDatasources.set(false); },
+      error: () => { this.isLoadingDatasources.set(false); },
     });
   }
 
   private loadProjects(userId: string): void {
     this.api.getProjects(userId).subscribe((projects) => {
       this.projects.set(projects);
-      // Check for ?project= query param (from "New Job" button on project detail)
       const qp = this.route.snapshot.queryParamMap.get('project');
       if (qp && projects.some((p) => p.id === qp)) {
         this.selectedProjectId.set(qp);
       } else {
-        // Default to user's default project
         const defaultProject = projects.find((p) => p.is_default);
         this.selectedProjectId.set(defaultProject?.id ?? projects[0]?.id ?? null);
       }
     });
   }
 
-  toggleDatasource(id: string): void {
-    this.selectedDatasourceIds.update((current) => {
-      const next = new Set(current);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
-  }
-
-  getDsTypeIcon(type: DatasourceType | string): string {
-    const icons: Record<string, string> = {
-      postgresql: 'database',
-      neo4j: 'hub',
-      mongodb: 'eco',
-      webdav: 'cloud',
-    };
-    return icons[type] || 'storage';
-  }
-
   // ===== File Upload Methods =====
 
   triggerFileInput(): void {
-    if (!this.isSubmitting()) {
-      this.fileInput.nativeElement.click();
-    }
+    if (!this.isSubmitting()) this.fileInput.nativeElement.click();
   }
 
   onDragOver(event: DragEvent): void {
     event.preventDefault();
     event.stopPropagation();
-    if (!this.isSubmitting()) {
-      this.isDragOver.set(true);
-    }
+    if (!this.isSubmitting()) this.isDragOver.set(true);
   }
 
   onDragLeave(event: DragEvent): void {
@@ -2302,20 +1401,15 @@ export class JobCreateComponent implements OnInit {
     event.preventDefault();
     event.stopPropagation();
     this.isDragOver.set(false);
-
     if (this.isSubmitting()) return;
-
     const files = event.dataTransfer?.files;
-    if (files && files.length > 0) {
-      await this.addFiles(Array.from(files));
-    }
+    if (files && files.length > 0) await this.addFiles(Array.from(files));
   }
 
   async onFilesSelected(event: Event): Promise<void> {
     const input = event.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
       await this.addFiles(Array.from(input.files));
-      // Clear input so same file can be selected again
       input.value = '';
     }
   }
@@ -2323,109 +1417,64 @@ export class JobCreateComponent implements OnInit {
   private async addFiles(files: File[]): Promise<void> {
     const currentCount = this.filePreviews().length;
     const maxFiles = this.fileService.getMaxFiles();
-
-    // Check file count limit
     if (currentCount + files.length > maxFiles) {
       this.errorMessage.set(`Maximum ${maxFiles} files allowed`);
       files = files.slice(0, maxFiles - currentCount);
     }
-
     if (files.length === 0) return;
-
-    // Create previews
     const newPreviews = await this.fileService.createFilePreviews(files);
     this.filePreviews.update((current) => [...current, ...newPreviews]);
-
-    // Clear any previous upload
     this.uploadId = null;
   }
 
   removeFile(fileId: string, event: Event): void {
     event.stopPropagation();
     this.filePreviews.update((current) => current.filter((f) => f.id !== fileId));
-    // Clear upload_id since file list changed
     this.uploadId = null;
   }
 
   // ===== Form Submission =====
 
   async onSubmit(): Promise<void> {
-    if (!this.formData.description || this.isSubmitting() || this.isUploading()) {
-      return;
-    }
-
+    if (!this.formData.description || this.isSubmitting() || this.isUploading()) return;
     this.clearMessages();
 
-    // Upload document files if any
     const files = this.filePreviews();
     if (files.length > 0 && !this.uploadId) {
-      const uploadSuccess = await this.uploadFiles();
-      if (!uploadSuccess) {
-        return;
-      }
+      if (!(await this.uploadFiles())) return;
     }
 
-    // Create job
     this.isSubmitting.set(true);
+    const request: JobCreateRequest = { description: this.formData.description };
 
-    const request: JobCreateRequest = {
-      description: this.formData.description,
-    };
-
-    // Set expert config if selected (and not the defaults entry)
     const expert = this.selectedExpert();
-    if (expert && expert.id !== 'defaults') {
-      request.config_name = expert.id;
-    }
+    if (expert && expert.id !== 'defaults') request.config_name = expert.id;
+    if (this.uploadId) request.upload_id = this.uploadId;
 
-    if (this.uploadId) {
-      request.upload_id = this.uploadId;
-    }
-    // Build override from UI form, then merge config editor overrides on top
-    let configOverride = this.buildConfigOverride();
-    const editorOverrides = this.configEditorOverrides();
-    if (Object.keys(editorOverrides).length > 0) {
-      configOverride = this.deepMerge(configOverride ?? {}, editorOverrides);
-    }
+    // Collect overrides from the settings component
+    const configOverride = this.agentSettings?.getOverrides();
     if (configOverride && Object.keys(configOverride).length > 0) {
       request.config_override = configOverride;
     }
-    const instructions = this.instructionsContent();
-    if (instructions) {
-      request.instructions = instructions;
-    }
-    if (this.kickoffMessage.trim()) {
-      request.kickoff_message = this.kickoffMessage.trim();
-    }
 
-    const dsIds = this.selectedDatasourceIds();
-    if (dsIds.size > 0) {
-      request.datasource_ids = Array.from(dsIds);
-    }
+    const instructions = this.agentSettings?.getInstructions();
+    if (instructions) request.instructions = instructions;
+    if (this.kickoffMessage.trim()) request.kickoff_message = this.kickoffMessage.trim();
 
-    // Link builder session if one was started
+    const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
+    if (dsIds.length > 0) request.datasource_ids = dsIds;
+
     const builderSessionId = this.artifacts.sessionId();
-    if (builderSessionId) {
-      request.builder_session_id = builderSessionId;
-    }
+    if (builderSessionId) request.builder_session_id = builderSessionId;
 
-    // Attach project
     const projectId = this.selectedProjectId();
-    if (projectId) {
-      request.project_id = projectId;
-    }
+    if (projectId) request.project_id = projectId;
 
-    // Set priority if not default
     const priority = this.selectedPriority();
-    if (priority !== 5) {
-      request.priority = priority;
-    }
+    if (priority !== 5) request.priority = priority;
 
-    // Attach current user
     const currentUserId = this.userService.currentUserId();
-    if (currentUserId) {
-      request.user_id = currentUserId;
-    }
+    if (currentUserId) request.user_id = currentUserId;
 
     this.api.createJob(request).subscribe({
       next: (job) => {
@@ -2447,58 +1496,32 @@ export class JobCreateComponent implements OnInit {
   private async uploadFiles(): Promise<boolean> {
     const previews = this.filePreviews();
     const filesToUpload = previews.filter((p) => p.uploadStatus !== UploadStatus.COMPLETED);
-
-    if (filesToUpload.length === 0) {
-      return true;
-    }
+    if (filesToUpload.length === 0) return true;
 
     this.isUploading.set(true);
-
-    // Mark all as uploading
     this.filePreviews.update((current) =>
-      current.map((f) => ({
-        ...f,
-        uploadStatus: UploadStatus.UPLOADING,
-        uploadProgress: 0,
-      })),
+      current.map((f) => ({ ...f, uploadStatus: UploadStatus.UPLOADING, uploadProgress: 0 })),
     );
 
     try {
       const files = filesToUpload.map((p) => p.file);
       const response = await new Promise<{ upload_id: string } | null>((resolve, reject) => {
-        this.api.uploadFiles(files).subscribe({
-          next: (res) => resolve(res),
-          error: (err) => reject(err),
-        });
+        this.api.uploadFiles(files).subscribe({ next: resolve, error: reject });
       });
-
       if (response) {
         this.uploadId = response.upload_id;
-
-        // Mark all as completed
         this.filePreviews.update((current) =>
-          current.map((f) => ({
-            ...f,
-            uploadStatus: UploadStatus.COMPLETED,
-            uploadProgress: 100,
-          })),
+          current.map((f) => ({ ...f, uploadStatus: UploadStatus.COMPLETED, uploadProgress: 100 })),
         );
-
         this.isUploading.set(false);
         return true;
       } else {
         throw new Error('Upload failed');
       }
-    } catch (err) {
-      // Mark all as failed
+    } catch {
       this.filePreviews.update((current) =>
-        current.map((f) => ({
-          ...f,
-          uploadStatus: UploadStatus.FAILED,
-          error: 'Upload failed',
-        })),
+        current.map((f) => ({ ...f, uploadStatus: UploadStatus.FAILED, error: 'Upload failed' })),
       );
-
       this.isUploading.set(false);
       this.errorMessage.set('Failed to upload files. Please try again.');
       return false;
@@ -2506,59 +1529,20 @@ export class JobCreateComponent implements OnInit {
   }
 
   resetForm(): void {
-    this.formData = {
-      description: '',
-    };
+    this.formData = { description: '' };
     this.kickoffMessage = '';
     this.filePreviews.set([]);
     this.uploadId = null;
-    // Reset expert selection
     this.selectedExpert.set(null);
     this.expertDetail.set(null);
-    // Reset instructions editor
-    this.instructionsContent.set(null);
-    // Reset config settings
-    this.strategicModel.set(null);
-    this.strategicReasoning.set(null);
-    this.strategicTemperature.set(null);
-    this.strategicMultimodal.set(null);
-    this.tacticalModel.set(null);
-    this.tacticalReasoning.set(null);
-    this.tacticalTemperature.set(null);
-    this.tacticalMultimodal.set(null);
-    this.disabledToolCategories.set(new Set());
-    this.expertDisabledCategories = new Set();
-    this.defaultsTools = {};
-    this.selectedAutonomy.set(null);
-    this.useProjectMemory.set(true);
-    this.enableScholar.set(true);
-    this.enableCritic.set(true);
-    this.criticMaxRounds.set(5);
     this.selectedPriority.set(5);
-    // Reset advanced options
-    this.showAdvanced.set(false);
-    // Reset config editor
-    this.showConfigEditor.set(false);
-    this.configEditorOverrides.set({});
-    // Reset datasource selections
-    this.selectedDatasourceIds.set(new Set());
-    // Reset project to default
+    this.agentSettings?.resetAll();
     const defaultProject = this.projects().find((p) => p.is_default);
     this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
-    // Reset artifact service (clears builder session)
     this.artifacts.reset();
   }
 
-  clearSuccess(): void {
-    this.successMessage.set(null);
-  }
-
-  clearError(): void {
-    this.errorMessage.set(null);
-  }
-
-  private clearMessages(): void {
-    this.successMessage.set(null);
-    this.errorMessage.set(null);
-  }
+  clearSuccess(): void { this.successMessage.set(null); }
+  clearError(): void { this.errorMessage.set(null); }
+  private clearMessages(): void { this.successMessage.set(null); this.errorMessage.set(null); }
 }

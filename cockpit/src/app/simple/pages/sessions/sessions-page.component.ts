@@ -39,7 +39,7 @@ interface Project {
       <div class="page-header">
         <h2>Sessions</h2>
         <div class="header-actions">
-          <button class="btn btn-primary" (click)="showCreate = true">
+          <button class="btn btn-primary" (click)="goToCreate()">
             <span class="icon">add</span> New Session
           </button>
           <button class="btn btn-secondary" (click)="connectDirect = !connectDirect">
@@ -724,6 +724,10 @@ export class SessionsPageComponent implements OnInit {
         } catch (e: any) {
             this.toast.error(e?.error?.detail || 'Failed to delete session');
         }
+    }
+
+    goToCreate(): void {
+        this.router.navigate(['/sessions/new']);
     }
 
     returnToActive(): void {
