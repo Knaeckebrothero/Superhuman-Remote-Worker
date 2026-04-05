@@ -299,7 +299,9 @@ async def _attach_session(
             nc_url = os.getenv("NEXTCLOUD_URL", "http://localhost:8800")
             nc_user = os.getenv("NEXTCLOUD_AGENT_USER", "agent-service")
             nc_pass = os.getenv("NEXTCLOUD_AGENT_PASSWORD", "agent-service-dev")
-            webdav_url = f"{nc_url.rstrip('/')}/remote.php/dav/files/{nc_user}/{nc_folder}/"
+            webdav_url = (
+                f"{nc_url.rstrip('/')}/remote.php/dav/files/{nc_user}/{nc_folder}/"
+            )
 
             _session.workspace_sync = WorkspaceSyncService(
                 workspace_path=_session.workspace_manager.workspace_path,
