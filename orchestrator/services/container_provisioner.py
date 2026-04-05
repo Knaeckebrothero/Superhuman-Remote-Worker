@@ -44,6 +44,7 @@ class ContainerProvisioner:
         self._db: Optional[Any] = None
         self._core_api: Optional[Any] = None
         self._k8s_available: bool = False
+        self._in_cluster: bool = False
         self._namespace: str = os.environ.get(
             "WORKSPACE_NAMESPACE", "superhuman-remote-worker"
         )
@@ -63,6 +64,11 @@ class ContainerProvisioner:
         """True if container provisioning is available."""
         return self._k8s_available
 
+    @property
+    def in_cluster(self) -> bool:
+        """True if connected via in-cluster config (running inside K8s)."""
+        return self._in_cluster
+
     # =========================================================================
     # Lifecycle
     # =========================================================================
@@ -78,9 +84,10 @@ class ContainerProvisioner:
 
         if self._k8s_available:
             logger.info(
-                "Container provisioner ready (namespace=%s, image=%s)",
+                "Container provisioner ready (namespace=%s, image=%s, in_cluster=%s)",
                 self._namespace,
                 self._workspace_image,
+                self._in_cluster,
             )
         else:
             logger.info(
@@ -98,8 +105,10 @@ class ContainerProvisioner:
             return
 
         try:
+            in_cluster = False
             try:
                 k8s_config.load_incluster_config()
+                in_cluster = True
             except k8s_config.ConfigException:
                 try:
                     k8s_config.load_kube_config()
@@ -116,6 +125,7 @@ class ContainerProvisioner:
 
             self._core_api = api
             self._k8s_available = True
+            self._in_cluster = in_cluster
         except Exception as e:
             logger.debug("Container provisioning not available: %s", e)
             self._core_api = None

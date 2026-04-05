@@ -64,6 +64,8 @@ export interface ExpertDetail extends Expert {
   instructions: string | null;
   /** Tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
   defaults_tools?: Record<string, string[]>;
+  /** Raw settings_matrix.yaml for client-side model-family resolution. */
+  settings_matrix?: Record<string, Record<string, unknown>>;
 }
 
 // =============================================================================

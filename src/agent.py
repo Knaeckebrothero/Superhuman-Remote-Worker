@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import aiosqlite
+import yaml
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -795,6 +796,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # This must happen before config_upload_id and config_override so those can further override
         if not _config_from_db and metadata.get("config_name"):
             from .core.loader import (
+                _apply_settings_matrix,
                 load_and_merge_config,
                 load_agent_config_from_dict,
                 resolve_config_path,
@@ -805,6 +807,19 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 config_path, deployment_dir = resolve_config_path(expert_name)
                 logger.info(f"Loading expert config '{expert_name}' from {config_path}")
                 merged_config_data = load_and_merge_config(config_path)
+
+                # Apply settings_matrix (model-family defaults) — mirrors load_agent_config()
+                raw_expert_llm_keys: set[str] = set()
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        raw_expert = yaml.safe_load(f) or {}
+                    raw_expert_llm_keys = set((raw_expert.get("llm") or {}).keys())
+                except Exception:
+                    pass
+                _apply_settings_matrix(
+                    merged_config_data, raw_expert_llm_keys, deployment_dir
+                )
+
                 self.config = load_agent_config_from_dict(
                     merged_config_data, deployment_dir=deployment_dir
                 )
@@ -886,7 +901,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Handle inline config override - merge on top of current config
         if not _config_from_db and metadata.get("config_override"):
-            from .core.loader import deep_merge, load_agent_config_from_dict
+            from .core.loader import (
+                _apply_settings_matrix,
+                deep_merge,
+                load_agent_config_from_dict,
+            )
             import dataclasses
 
             config_override = metadata["config_override"]
@@ -899,6 +918,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             prev_deployment_dir = self.config._deployment_dir
             current_config_dict = dataclasses.asdict(self.config)
             merged_config_data = deep_merge(current_config_dict, config_override)
+
+            # If the override changes the model, re-apply settings_matrix for the
+            # new model family. Override LLM keys are treated as "explicitly set"
+            # so the matrix won't overwrite them.
+            if config_override.get("llm"):
+                override_llm_keys = set((config_override.get("llm") or {}).keys())
+                _apply_settings_matrix(
+                    merged_config_data, override_llm_keys, prev_deployment_dir
+                )
+
             self.config = load_agent_config_from_dict(
                 merged_config_data, deployment_dir=prev_deployment_dir
             )
