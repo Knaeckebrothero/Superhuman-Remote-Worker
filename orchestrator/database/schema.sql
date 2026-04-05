@@ -695,6 +695,10 @@ CREATE TABLE IF NOT EXISTS project_datasources (
 
 CREATE INDEX IF NOT EXISTS idx_project_datasources_ds ON project_datasources(datasource_id);
 
+-- Migration: Add read_only and description columns to project_datasources (for existing tables)
+ALTER TABLE project_datasources ADD COLUMN IF NOT EXISTS read_only BOOLEAN;
+ALTER TABLE project_datasources ADD COLUMN IF NOT EXISTS description TEXT;
+
 -- Migrate legacy datasources.project_id rows into junction table
 INSERT INTO project_datasources (project_id, datasource_id)
 SELECT project_id, id FROM datasources WHERE project_id IS NOT NULL

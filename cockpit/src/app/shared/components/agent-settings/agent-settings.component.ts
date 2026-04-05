@@ -120,9 +120,10 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
               [config]="config()"
               [mode]="mode()"
               [disabled]="disabled()"
-              [strategicModelOverride]="modelGroup.strategicModel() ?? null"
-              [tacticalModelOverride]="modelGroup.tacticalModel() ?? null"
-              [sessionModelOverride]="modelGroup.sessionModel() ?? null"
+              [settingsMatrix]="settingsMatrix()"
+              [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
+              [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
+              [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
               (change)="onChange()"
             />
           </div>
@@ -260,6 +261,8 @@ export class AgentSettingsComponent {
   showProjectMemory = input(false);
   /** Default tool lists from defaults.yaml. */
   defaultsTools = input<Record<string, string[]>>({});
+  /** Raw settings_matrix for client-side model-family resolution. */
+  settingsMatrix = input<Record<string, Record<string, unknown>>>({});
   /** Available datasources. */
   datasources = input<Datasource[]>([]);
   loadingDatasources = input(false);
@@ -273,12 +276,12 @@ export class AgentSettingsComponent {
   /** Emitted when instructions content changes. */
   instructionsChange = output<string | null>();
 
-  @ViewChild(ExecutionGroupComponent) executionGroup!: ExecutionGroupComponent;
-  @ViewChild(ModelGroupComponent) modelGroup!: ModelGroupComponent;
-  @ViewChild(ToolsGroupComponent) toolsGroup!: ToolsGroupComponent;
-  @ViewChild(DatasourcesGroupComponent) datasourcesGroup!: DatasourcesGroupComponent;
-  @ViewChild(InstructionsTabComponent) instructionsTab!: InstructionsTabComponent;
-  @ViewChild(AdvancedAccordionComponent) advancedAccordion!: AdvancedAccordionComponent;
+  @ViewChild(ExecutionGroupComponent) executionGroup?: ExecutionGroupComponent;
+  @ViewChild(ModelGroupComponent) modelGroup?: ModelGroupComponent;
+  @ViewChild(ToolsGroupComponent) toolsGroup?: ToolsGroupComponent;
+  @ViewChild(DatasourcesGroupComponent) datasourcesGroup?: DatasourcesGroupComponent;
+  @ViewChild(InstructionsTabComponent) instructionsTab?: InstructionsTabComponent;
+  @ViewChild(AdvancedAccordionComponent) advancedAccordion?: AdvancedAccordionComponent;
 
   readonly activeTab = signal<'settings' | 'instructions' | 'advanced'>('settings');
 
@@ -332,7 +335,7 @@ export class AgentSettingsComponent {
    * Called by parent when expert changes. Propagates to all sub-components.
    */
   prefillFromConfig(config: Record<string, unknown>): void {
-    this.modelGroup.prefillFromConfig(config);
+    this.modelGroup?.prefillFromConfig(config);
     this.toolsGroup?.prefillFromConfig(config);
     this.advancedAccordion?.prefillFromConfig(config);
 
@@ -359,7 +362,7 @@ export class AgentSettingsComponent {
   /** Reset all sub-components to defaults. */
   resetAll(): void {
     this.executionGroup?.resetAll();
-    this.modelGroup.resetAll();
+    this.modelGroup?.resetAll();
     this.toolsGroup?.resetAll();
     this.datasourcesGroup?.resetAll();
     this.instructionsTab?.resetAll();

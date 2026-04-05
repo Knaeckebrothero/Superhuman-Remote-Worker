@@ -999,6 +999,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["config_override"] = request.config_override
         if request.datasources:
             resume_metadata["datasources"] = request.datasources
+        if request.project_id:
+            resume_metadata["project_id"] = request.project_id
 
         # Start processing in background
         async def _resume_job():

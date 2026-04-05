@@ -233,10 +233,11 @@ import {ModelService} from '../../../core/services/model.service';
           <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
           <app-agent-settings
             mode="job"
-            [config]="expertDetail()?.config ?? {}"
+            [config]="expertDetail()?.config ?? frameworkDefaults() ?? {}"
             [disabled]="isSubmitting() || artifacts.streaming()"
             [showProjectMemory]="projectHasSharedMemory()"
             [defaultsTools]="expertDetail()?.defaults_tools ?? {}"
+            [settingsMatrix]="expertDetail()?.settings_matrix ?? frameworkSettingsMatrix()"
             [datasources]="availableDatasources()"
             [loadingDatasources]="isLoadingDatasources()"
             [loadingExpert]="isLoadingExpertDetail()"
@@ -1281,7 +1282,8 @@ export class JobCreateComponent implements OnInit {
   readonly availableDatasources = signal<Datasource[]>([]);
   readonly isLoadingDatasources = signal(false);
 
-  private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
+  readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
+  readonly frameworkSettingsMatrix = signal<Record<string, Record<string, unknown>>>({});
   readonly projectHasSharedMemory = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
@@ -1305,6 +1307,7 @@ export class JobCreateComponent implements OnInit {
     this.loadDatasources();
     this.api.getExpertDetail('defaults').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
+      if (d?.settings_matrix) this.frameworkSettingsMatrix.set(d.settings_matrix);
     });
   }
 

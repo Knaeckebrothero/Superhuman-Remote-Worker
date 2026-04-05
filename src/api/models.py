@@ -359,6 +359,10 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Resolved datasource connection details (set by orchestrator)",
     )
+    project_id: Optional[str] = Field(
+        default=None,
+        description="Project ID for knowledge base and memory scoping (set by orchestrator)",
+    )
     previous_status: Optional[str] = Field(
         default=None,
         description="Job status before resume. Graceful stops (cancelled, paused, pending_review) "

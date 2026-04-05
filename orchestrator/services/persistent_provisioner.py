@@ -32,6 +32,7 @@ class PersistentProvisioner:
         self._db: Optional[Any] = None
         self._core_api: Optional[Any] = None
         self._k8s_available: bool = False
+        self._in_cluster: bool = False
         self._namespace: str = os.environ.get(
             "AGENT_NAMESPACE",
             os.environ.get("WORKSPACE_NAMESPACE", "superhuman-remote-worker"),
@@ -50,6 +51,11 @@ class PersistentProvisioner:
     def is_available(self) -> bool:
         """Whether K8s provisioning is available."""
         return self._k8s_available
+
+    @property
+    def in_cluster(self) -> bool:
+        """True if connected via in-cluster config (running inside K8s)."""
+        return self._in_cluster
 
     @property
     def mode(self) -> Optional[str]:
@@ -85,8 +91,10 @@ class PersistentProvisioner:
             from kubernetes import client as k8s_client
             from kubernetes import config as k8s_config
 
+            in_cluster = False
             try:
                 k8s_config.load_incluster_config()
+                in_cluster = True
             except k8s_config.ConfigException:
                 try:
                     k8s_config.load_kube_config()
@@ -98,6 +106,7 @@ class PersistentProvisioner:
 
             self._core_api = k8s_client.CoreV1Api()
             self._k8s_available = True
+            self._in_cluster = in_cluster
         except ImportError:
             logger.info(
                 "kubernetes package not installed — persistent agents must "

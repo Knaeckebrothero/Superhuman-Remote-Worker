@@ -94,7 +94,10 @@ from services.builder_tools import (  # noqa: E402
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
-from services.builder_config import resolve_builder_settings  # noqa: E402
+from services.builder_config import (  # noqa: E402
+    resolve_builder_settings,
+    detect_model_family as _detect_model_family,
+)
 from langchain_core.messages import (  # noqa: E402
     AIMessage,
     BaseMessage,
@@ -949,6 +952,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "config_name": job.get("config_name", "default"),
             "config_override": config_override,
             "datasources": datasources_payload,
+            "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job.get("status"),
         }
         if queued_feedback:
@@ -1315,8 +1319,15 @@ async def _try_dispatch_pending_jobs() -> None:
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
                     if not container_status:
-                        # Container needed but not provisioned — provision now
-                        if container_provisioner.is_available:
+                        # Container needed but not provisioned — provision now.
+                        # Priority: K8s in-cluster → Docker Compose → K8s via kubeconfig.
+                        # This prevents a local kubeconfig from shadowing Docker Compose
+                        # when running the orchestrator outside the cluster.
+                        use_k8s = container_provisioner.is_available and (
+                            container_provisioner.in_cluster
+                            or not docker_provisioner.is_available
+                        )
+                        if use_k8s:
                             # Kubernetes mode: create pod on demand
                             logger.info(
                                 "Dispatcher: job %s provisioning workspace container "
@@ -2034,14 +2045,23 @@ async def lifespan(app: FastAPI):
     # Initialize Docker Compose provisioner (static workspace pool, used when k8s unavailable)
     docker_provisioner.connect(db=postgres_db, snapshot_service=snapshot_service)
 
-    # Log deployment mode
-    if container_provisioner.is_available:
-        logger.info("Deployment mode: KUBERNETES — dynamic provisioning via k8s API")
+    # Log deployment mode.
+    # Priority: K8s in-cluster → Docker Compose → K8s via kubeconfig.
+    # A local kubeconfig should not shadow Docker Compose when running outside the cluster.
+    if container_provisioner.is_available and container_provisioner.in_cluster:
+        logger.info("Deployment mode: KUBERNETES (in-cluster) — dynamic provisioning via k8s API")
     elif docker_provisioner.is_available:
         logger.info(
             "Deployment mode: DOCKER COMPOSE — static workspace pool (%s)",
             ",".join(docker_provisioner.workspace_hosts),
         )
+        if container_provisioner.is_available:
+            logger.info(
+                "Deployment mode: Kubernetes also reachable via kubeconfig "
+                "but Docker Compose takes priority (not running in-cluster)"
+            )
+    elif container_provisioner.is_available:
+        logger.info("Deployment mode: KUBERNETES (kubeconfig) — dynamic provisioning via k8s API")
     else:
         logger.warning(
             "Deployment mode: NO WORKSPACE PROVISIONER — "
@@ -4272,6 +4292,7 @@ async def resume_job(
             else None,
             "config_override": config_override,
             "datasources": datasources_payload,
+            "project_id": str(job["project_id"]) if job.get("project_id") else None,
             "previous_status": job["status"],
             "snapshot_restored": snapshot_restored,
         }
@@ -7804,8 +7825,8 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
                     {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
-        # Provision workspace container in background if K8s is available
-        if container_provisioner.is_available:
+        # Provision workspace container in background if K8s is available (in-cluster only)
+        if container_provisioner.is_available and container_provisioner.in_cluster:
             asyncio.create_task(
                 container_provisioner.create_thread_workspace(thread_id)
             )
@@ -8214,7 +8235,12 @@ async def create_thread(
                 )
 
         # Provision workspace container in background
-        if container_provisioner.is_available:
+        # Same priority as dispatcher: in-cluster K8s → Docker Compose → kubeconfig K8s
+        use_k8s = container_provisioner.is_available and (
+            container_provisioner.in_cluster
+            or not docker_provisioner.is_available
+        )
+        if use_k8s:
             # Kubernetes mode: create pod on demand
             async def _provision_thread_workspace(tid: str) -> None:
                 ok = await container_provisioner.create_thread_workspace(tid)
@@ -8249,7 +8275,12 @@ async def create_thread(
             )
 
         # Provision persistent agent pod / assign from pool
-        if persistent_provisioner.is_available:
+        # Same priority: in-cluster K8s → Docker Compose → kubeconfig K8s
+        use_k8s_agent = persistent_provisioner.is_available and (
+            persistent_provisioner.in_cluster
+            or not docker_provisioner.is_available
+        )
+        if use_k8s_agent:
             # Kubernetes mode: create agent pod on demand
             effective_config = request_body.config_name or user_settings.get(
                 "config_name", "interactive"
@@ -9072,6 +9103,72 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+_settings_matrix_cache: dict[str, Any] | None = None
+
+
+def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
+    """Load and cache settings_matrix.yaml from the config directory."""
+    global _settings_matrix_cache
+    if _settings_matrix_cache is None:
+        matrix_path = config_dir / "settings_matrix.yaml"
+        if matrix_path.exists():
+            with open(matrix_path) as f:
+                _settings_matrix_cache = yaml.safe_load(f) or {}
+        else:
+            _settings_matrix_cache = {}
+    return _settings_matrix_cache
+
+
+def _apply_settings_matrix_to_config(
+    merged: dict[str, Any],
+    expert_llm_keys: set[str],
+    config_dir: Path,
+    expert_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Apply settings_matrix model-family defaults to a merged config dict.
+
+    Mirrors the agent's _apply_settings_matrix() in src/core/loader.py.
+    Flat keys go to merged["llm"] (skipping expert_llm_keys).
+    Limits go to merged["limits"] (matrix is sole source).
+    """
+    base_matrix = _load_settings_matrix(config_dir)
+
+    # Support per-expert settings_matrix override
+    matrix = dict(base_matrix)
+    if expert_dir and expert_dir != config_dir:
+        expert_matrix_path = expert_dir / "settings_matrix.yaml"
+        if expert_matrix_path.exists():
+            with open(expert_matrix_path) as f:
+                expert_matrix = yaml.safe_load(f) or {}
+            matrix = _deep_merge(matrix, expert_matrix)
+
+    llm_data = merged.get("llm", {})
+    model = llm_data.get("model", "gpt-4o")
+    family = _detect_model_family(model)
+
+    default_settings = matrix.get("default", {})
+    family_settings = matrix.get(family, {}) if family != "default" else {}
+    settings = _deep_merge(default_settings, family_settings)
+
+    if not settings:
+        return base_matrix
+
+    # Apply flat keys -> merged["llm"] (skip keys explicitly set in expert)
+    for key, value in settings.items():
+        if key == "limits":
+            continue
+        if key not in expert_llm_keys:
+            merged.setdefault("llm", {})[key] = value
+
+    # Apply limits -> merged["limits"] (matrix is sole source of truth)
+    limits_settings = settings.get("limits")
+    if isinstance(limits_settings, dict):
+        for key, value in limits_settings.items():
+            merged.setdefault("limits", {})[key] = value
+
+    return base_matrix
+
+
 def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content."""
     config_dir = _get_config_dir()
@@ -9085,6 +9182,7 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         defaults = {}
 
     # Load expert config
+    expert_llm_keys: set[str] = set()
     if expert_id == "defaults":
         merged = dict(defaults)
         expert_config_dir = config_dir
@@ -9095,10 +9193,17 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
             return {}
         with open(config_path) as f:
             expert_data = yaml.safe_load(f) or {}
+        # Track which LLM keys the expert explicitly sets
+        expert_llm_keys = set((expert_data.get("llm") or {}).keys())
         # Remove meta keys before merge
         expert_data.pop("$extends", None)
         merged = _deep_merge(defaults, expert_data)
         expert_config_dir = expert_dir
+
+    # Apply settings_matrix (model-family defaults)
+    raw_matrix = _apply_settings_matrix_to_config(
+        merged, expert_llm_keys, config_dir, expert_config_dir
+    )
 
     # Load instructions content
     instructions_content = None
@@ -9127,6 +9232,7 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         "config": merged,
         "instructions": instructions_content,
         "defaults_tools": defaults_tools,
+        "settings_matrix": raw_matrix,
     }
 
 
@@ -9142,6 +9248,13 @@ async def get_expert(expert_id: str) -> dict[str, Any]:
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
+
+    if expert_id == "defaults":
+        # "defaults" is a virtual expert representing framework defaults
+        detail = _load_expert_detail(expert_id)
+        if not detail:
+            raise HTTPException(status_code=404, detail="Defaults config not found")
+        return detail
 
     expert_info = next((e for e in _experts_cache if e.id == expert_id), None)
     if not expert_info:
@@ -9289,10 +9402,14 @@ async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any
         defaults = {}
 
     expert_data_clean = dict(expert_data)
+    expert_llm_keys = set((expert_data_clean.get("llm") or {}).keys())
     expert_data_clean.pop("$extends", None)
     merged = _deep_merge(defaults, expert_data_clean)
     for key in ("$extends", "connections"):
         merged.pop(key, None)
+
+    # Apply settings_matrix (model-family defaults)
+    raw_matrix = _apply_settings_matrix_to_config(merged, expert_llm_keys, config_dir)
 
     # Read instructions
     instructions_content = await gitea_client.get_file_content(
@@ -9303,6 +9420,7 @@ async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any
         **info.model_dump(),
         "config": merged,
         "instructions": instructions_content,
+        "settings_matrix": raw_matrix,
     }
 
 

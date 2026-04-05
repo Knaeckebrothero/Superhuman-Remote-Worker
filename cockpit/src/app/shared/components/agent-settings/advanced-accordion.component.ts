@@ -1,6 +1,6 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
-import {readConfigPath, SettingsMode} from './agent-settings.types';
+import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
 
 /**
@@ -14,15 +14,15 @@ import {getReasoningOptions} from './reasoning-options';
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'inference'">
-        <button class="accordion-header" (click)="toggleSection('inference')">
-          <span class="accordion-icon">{{ expanded() === 'inference' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('inference')">
+        <button type="button" class="accordion-header" (click)="toggleSection('inference')">
+          <span class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</span>
           Inference Parameters
           @if (inferenceModifiedCount() > 0) {
             <span class="modified-badge">{{ inferenceModifiedCount() }}</span>
           }
         </button>
-        @if (expanded() === 'inference') {
+        @if (expanded().has('inference')) {
           <div class="accordion-body">
             @if (mode() === 'job') {
               <!-- Strategic phase -->
@@ -44,7 +44,7 @@ import {getReasoningOptions} from './reasoning-options';
                       }
                     </select>
                     @if (strategicReasoning() !== null) {
-                      <button class="reset-btn" (click)="strategicReasoning.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="strategicReasoning.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -60,7 +60,7 @@ import {getReasoningOptions} from './reasoning-options';
                       [disabled]="disabled()">
                     <span class="slider-label">2</span>
                     @if (strategicTemperature() !== null) {
-                      <button class="reset-btn" (click)="strategicTemperature.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="strategicTemperature.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -73,7 +73,7 @@ import {getReasoningOptions} from './reasoning-options';
                     <span>Multimodal (images)</span>
                   </label>
                   @if (strategicMultimodal() !== null) {
-                    <button class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -96,7 +96,7 @@ import {getReasoningOptions} from './reasoning-options';
                       }
                     </select>
                     @if (tacticalReasoning() !== null) {
-                      <button class="reset-btn" (click)="tacticalReasoning.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="tacticalReasoning.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -112,7 +112,7 @@ import {getReasoningOptions} from './reasoning-options';
                       [disabled]="disabled()">
                     <span class="slider-label">2</span>
                     @if (tacticalTemperature() !== null) {
-                      <button class="reset-btn" (click)="tacticalTemperature.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="tacticalTemperature.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -125,7 +125,7 @@ import {getReasoningOptions} from './reasoning-options';
                     <span>Multimodal (images)</span>
                   </label>
                   @if (tacticalMultimodal() !== null) {
-                    <button class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -147,7 +147,7 @@ import {getReasoningOptions} from './reasoning-options';
                     }
                   </select>
                   @if (sessionReasoning() !== null) {
-                    <button class="reset-btn" (click)="sessionReasoning.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="sessionReasoning.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -163,7 +163,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()">
                   <span class="slider-label">2</span>
                   @if (sessionTemperature() !== null) {
-                    <button class="reset-btn" (click)="sessionTemperature.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="sessionTemperature.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -176,7 +176,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <span>Multimodal (images)</span>
                 </label>
                 @if (sessionMultimodal() !== null) {
-                  <button class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()">close</button>
                 }
               </div>
             }
@@ -192,7 +192,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()"
                     placeholder="auto">
                   @if (topP() !== null) {
-                    <button class="reset-btn" (click)="topP.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="topP.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -205,7 +205,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()"
                     placeholder="auto">
                   @if (topK() !== null) {
-                    <button class="reset-btn" (click)="topK.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="topK.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -218,7 +218,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()"
                     placeholder="auto">
                   @if (maxOutputTokens() !== null) {
-                    <button class="reset-btn" (click)="maxOutputTokens.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="maxOutputTokens.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -231,7 +231,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <span>Parallel tool calls</span>
                 </label>
                 @if (parallelToolCalls() !== null) {
-                  <button class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -241,12 +241,12 @@ import {getReasoningOptions} from './reasoning-options';
 
       <!-- Delegation (job only) -->
       @if (mode() === 'job') {
-        <div class="accordion-section" [class.expanded]="expanded() === 'delegation'">
-          <button class="accordion-header" (click)="toggleSection('delegation')">
-            <span class="accordion-icon">{{ expanded() === 'delegation' ? 'expand_less' : 'expand_more' }}</span>
+        <div class="accordion-section" [class.expanded]="expanded().has('delegation')">
+          <button type="button" class="accordion-header" (click)="toggleSection('delegation')">
+            <span class="accordion-icon">{{ expanded().has('delegation') ? 'expand_less' : 'expand_more' }}</span>
             Delegation
           </button>
-          @if (expanded() === 'delegation') {
+          @if (expanded().has('delegation')) {
             <div class="accordion-body">
               <div class="field-row toggle-row" [class.modified]="delegationEnabled() !== null">
                 <label class="toggle-label">
@@ -257,7 +257,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <span>Enable delegation</span>
                 </label>
                 @if (delegationEnabled() !== null) {
-                  <button class="reset-btn" (click)="delegationEnabled.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="delegationEnabled.set(null); emitChange()">close</button>
                 }
               </div>
               @if (effectiveDelegationEnabled()) {
@@ -273,7 +273,7 @@ import {getReasoningOptions} from './reasoning-options';
                       <option [ngValue]="3">3</option>
                     </select>
                     @if (delegationMaxDepth() !== null) {
-                      <button class="reset-btn" (click)="delegationMaxDepth.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="delegationMaxDepth.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -285,7 +285,7 @@ import {getReasoningOptions} from './reasoning-options';
                       (ngModelChange)="onDelegationTimeoutChange($event)"
                       [disabled]="disabled()">
                     @if (delegationTimeout() !== null) {
-                      <button class="reset-btn" (click)="delegationTimeout.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="delegationTimeout.set(null); emitChange()">close</button>
                     }
                   </div>
                 </div>
@@ -296,12 +296,12 @@ import {getReasoningOptions} from './reasoning-options';
       }
 
       <!-- Limits & Safety -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'limits'">
-        <button class="accordion-header" (click)="toggleSection('limits')">
-          <span class="accordion-icon">{{ expanded() === 'limits' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('limits')">
+        <button type="button" class="accordion-header" (click)="toggleSection('limits')">
+          <span class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</span>
           Limits &amp; Safety
         </button>
-        @if (expanded() === 'limits') {
+        @if (expanded().has('limits')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="messageCountThreshold() !== null">
               <label class="field-label">Message count threshold</label>
@@ -311,7 +311,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="messageCountThreshold.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (messageCountThreshold() !== null) {
-                  <button class="reset-btn" (click)="messageCountThreshold.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="messageCountThreshold.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -323,7 +323,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="toolRetryCount.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (toolRetryCount() !== null) {
-                  <button class="reset-btn" (click)="toolRetryCount.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="toolRetryCount.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -335,7 +335,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="progressStallThreshold.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (progressStallThreshold() !== null) {
-                  <button class="reset-btn" (click)="progressStallThreshold.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="progressStallThreshold.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -347,7 +347,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="maxToolCallsPerPhase.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxToolCallsPerPhase() !== null) {
-                  <button class="reset-btn" (click)="maxToolCallsPerPhase.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxToolCallsPerPhase.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -356,12 +356,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Memory Tuning -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'memory'">
-        <button class="accordion-header" (click)="toggleSection('memory')">
-          <span class="accordion-icon">{{ expanded() === 'memory' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('memory')">
+        <button type="button" class="accordion-header" (click)="toggleSection('memory')">
+          <span class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</span>
           Memory Tuning
         </button>
-        @if (expanded() === 'memory') {
+        @if (expanded().has('memory')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="memoryEnabled() !== null">
               <label class="toggle-label">
@@ -372,7 +372,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Memory enabled</span>
               </label>
               @if (memoryEnabled() !== null) {
-                <button class="reset-btn" (click)="memoryEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="memoryEnabled.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="memoryBudget() !== null">
@@ -383,7 +383,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="memoryBudget.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (memoryBudget() !== null) {
-                  <button class="reset-btn" (click)="memoryBudget.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="memoryBudget.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -392,12 +392,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Context Management -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'context'">
-        <button class="accordion-header" (click)="toggleSection('context')">
-          <span class="accordion-icon">{{ expanded() === 'context' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('context')">
+        <button type="button" class="accordion-header" (click)="toggleSection('context')">
+          <span class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</span>
           Context Management
         </button>
-        @if (expanded() === 'context') {
+        @if (expanded().has('context')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="compactOnArchive() !== null">
               <label class="toggle-label">
@@ -408,7 +408,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Compact on archive</span>
               </label>
               @if (compactOnArchive() !== null) {
-                <button class="reset-btn" (click)="compactOnArchive.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="keepRecentToolResults() !== null">
@@ -419,7 +419,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="keepRecentToolResults.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (keepRecentToolResults() !== null) {
-                  <button class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -431,7 +431,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="keepRecentMessages.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (keepRecentMessages() !== null) {
-                  <button class="reset-btn" (click)="keepRecentMessages.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="keepRecentMessages.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -440,12 +440,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Workspace -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'workspace'">
-        <button class="accordion-header" (click)="toggleSection('workspace')">
-          <span class="accordion-icon">{{ expanded() === 'workspace' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('workspace')">
+        <button type="button" class="accordion-header" (click)="toggleSection('workspace')">
+          <span class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</span>
           Workspace
         </button>
-        @if (expanded() === 'workspace') {
+        @if (expanded().has('workspace')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="maxReadWords() !== null">
               <label class="field-label">Max read words</label>
@@ -455,7 +455,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="maxReadWords.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxReadWords() !== null) {
-                  <button class="reset-btn" (click)="maxReadWords.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxReadWords.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -467,7 +467,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="maxWriteWords.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxWriteWords() !== null) {
-                  <button class="reset-btn" (click)="maxWriteWords.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxWriteWords.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -480,7 +480,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Git versioning</span>
               </label>
               @if (gitVersioning() !== null) {
-                <button class="reset-btn" (click)="gitVersioning.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="gitVersioning.set(null); emitChange()">close</button>
               }
             </div>
           </div>
@@ -488,12 +488,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Shell -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'shell'">
-        <button class="accordion-header" (click)="toggleSection('shell')">
-          <span class="accordion-icon">{{ expanded() === 'shell' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('shell')">
+        <button type="button" class="accordion-header" (click)="toggleSection('shell')">
+          <span class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</span>
           Shell
         </button>
-        @if (expanded() === 'shell') {
+        @if (expanded().has('shell')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="shellMode() !== null">
               <label class="field-label">Mode</label>
@@ -506,7 +506,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <option value="persistent">Persistent</option>
                 </select>
                 @if (shellMode() !== null) {
-                  <button class="reset-btn" (click)="shellMode.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="shellMode.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -519,7 +519,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Sandbox</span>
               </label>
               @if (shellSandbox() !== null) {
-                <button class="reset-btn" (click)="shellSandbox.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="shellSandbox.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="shellTimeout() !== null">
@@ -530,7 +530,7 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="shellTimeout.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (shellTimeout() !== null) {
-                  <button class="reset-btn" (click)="shellTimeout.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="shellTimeout.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -546,7 +546,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <option value="allow">Allow</option>
                 </select>
                 @if (sudoAction() !== null) {
-                  <button class="reset-btn" (click)="sudoAction.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="sudoAction.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -555,12 +555,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Research & Browser -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'research'">
-        <button class="accordion-header" (click)="toggleSection('research')">
-          <span class="accordion-icon">{{ expanded() === 'research' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('research')">
+        <button type="button" class="accordion-header" (click)="toggleSection('research')">
+          <span class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</span>
           Research &amp; Browser
         </button>
-        @if (expanded() === 'research') {
+        @if (expanded().has('research')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="proxyEnabled() !== null">
               <label class="toggle-label">
@@ -571,7 +571,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Proxy enabled</span>
               </label>
               @if (proxyEnabled() !== null) {
-                <button class="reset-btn" (click)="proxyEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row toggle-row" [class.modified]="browserHeadless() !== null">
@@ -583,7 +583,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Browser headless</span>
               </label>
               @if (browserHeadless() !== null) {
-                <button class="reset-btn" (click)="browserHeadless.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row toggle-row" [class.modified]="browserVision() !== null">
@@ -595,7 +595,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Browser use vision</span>
               </label>
               @if (browserVision() !== null) {
-                <button class="reset-btn" (click)="browserVision.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()">close</button>
               }
             </div>
           </div>
@@ -603,12 +603,12 @@ import {getReasoningOptions} from './reasoning-options';
       </div>
 
       <!-- Auxiliary LLM -->
-      <div class="accordion-section" [class.expanded]="expanded() === 'auxiliary'">
-        <button class="accordion-header" (click)="toggleSection('auxiliary')">
-          <span class="accordion-icon">{{ expanded() === 'auxiliary' ? 'expand_less' : 'expand_more' }}</span>
+      <div class="accordion-section" [class.expanded]="expanded().has('auxiliary')">
+        <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')">
+          <span class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</span>
           Auxiliary LLM
         </button>
-        @if (expanded() === 'auxiliary') {
+        @if (expanded().has('auxiliary')) {
           <div class="accordion-body">
             <div class="field-row toggle-row" [class.modified]="auxEnabled() !== null">
               <label class="toggle-label">
@@ -619,7 +619,7 @@ import {getReasoningOptions} from './reasoning-options';
                 <span>Auxiliary LLM enabled</span>
               </label>
               @if (auxEnabled() !== null) {
-                <button class="reset-btn" (click)="auxEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="auxEnabled.set(null); emitChange()">close</button>
               }
             </div>
             @if (effectiveAuxEnabled()) {
@@ -632,7 +632,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()"
                     placeholder="openai/gpt-oss-120b">
                   @if (auxModel() !== null) {
-                    <button class="reset-btn" (click)="auxModel.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="auxModel.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -648,7 +648,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [disabled]="disabled()">
                   <span class="slider-label">2</span>
                   @if (auxTemperature() !== null) {
-                    <button class="reset-btn" (click)="auxTemperature.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="auxTemperature.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -659,12 +659,12 @@ import {getReasoningOptions} from './reasoning-options';
 
       <!-- Session-specific: idle timeout, greeting, claude code -->
       @if (mode() === 'session') {
-        <div class="accordion-section" [class.expanded]="expanded() === 'session'">
-          <button class="accordion-header" (click)="toggleSection('session')">
-            <span class="accordion-icon">{{ expanded() === 'session' ? 'expand_less' : 'expand_more' }}</span>
+        <div class="accordion-section" [class.expanded]="expanded().has('session')">
+          <button type="button" class="accordion-header" (click)="toggleSection('session')">
+            <span class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</span>
             Session
           </button>
-          @if (expanded() === 'session') {
+          @if (expanded().has('session')) {
             <div class="accordion-body">
               <div class="field-row" [class.modified]="idleTimeout() !== null">
                 <label class="field-label">Idle timeout (minutes)</label>
@@ -674,7 +674,7 @@ import {getReasoningOptions} from './reasoning-options';
                     (ngModelChange)="idleTimeout.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (idleTimeout() !== null) {
-                    <button class="reset-btn" (click)="idleTimeout.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="idleTimeout.set(null); emitChange()">close</button>
                   }
                 </div>
                 <span class="field-hint">0 = disabled</span>
@@ -687,7 +687,7 @@ import {getReasoningOptions} from './reasoning-options';
                     (ngModelChange)="greeting.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (greeting() !== null) {
-                    <button class="reset-btn" (click)="greeting.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="greeting.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
@@ -700,7 +700,7 @@ import {getReasoningOptions} from './reasoning-options';
                   <span>Auto-start Claude Code on session launch</span>
                 </label>
                 @if (claudeCodeAutoStart() !== null) {
-                  <button class="reset-btn" (click)="claudeCodeAutoStart.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="claudeCodeAutoStart.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
@@ -710,7 +710,7 @@ import {getReasoningOptions} from './reasoning-options';
 
       <!-- Resolved Config Viewer -->
       <div class="config-viewer-section">
-        <button class="accordion-header" (click)="showResolvedConfig.set(!showResolvedConfig())">
+        <button type="button" class="accordion-header" (click)="showResolvedConfig.set(!showResolvedConfig())">
           <span class="accordion-icon">{{ showResolvedConfig() ? 'expand_less' : 'expand_more' }}</span>
           View resolved config (JSON)
         </button>
@@ -919,6 +919,8 @@ export class AdvancedAccordionComponent {
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
   disabled = input(false);
+  /** Raw settings_matrix for model-family-aware defaults. */
+  settingsMatrix = input<Record<string, Record<string, unknown>>>({});
   /** The currently selected model(s), used for reasoning options. */
   strategicModelOverride = input<string | null>(null);
   tacticalModelOverride = input<string | null>(null);
@@ -927,7 +929,7 @@ export class AdvancedAccordionComponent {
   change = output<void>();
 
   // Accordion state
-  readonly expanded = signal<string | null>(null);
+  readonly expanded = signal<Set<string>>(new Set());
   readonly showResolvedConfig = signal(false);
 
   // --- Inference params ---
@@ -994,17 +996,38 @@ export class AdvancedAccordionComponent {
   // ===== Resolved defaults =====
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
 
+  /**
+   * Look up a settings_matrix value for a model override.
+   * When a user changes the model in the Settings tab, we re-resolve matrix defaults
+   * for the new model family so the Advanced tab shows correct values.
+   * Returns null if no model is given (meaning config() already has correct values).
+   */
+  private mv(model: string | null, key: string): unknown {
+    if (!model) return null;
+    const resolved = resolveMatrixForModel(this.settingsMatrix(), model);
+    return resolved[key] ?? null;
+  }
+
   readonly resolvedStrategicReasoning = computed(() => (this.r('llm.strategic.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
-  readonly resolvedStrategicTemp = computed(() => (this.r('llm.strategic.temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedStrategicTemp = computed(() =>
+    (this.r('llm.strategic.temperature') ?? this.mv(this.strategicModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedStrategicMultimodal = computed(() => (this.r('llm.strategic.multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
   readonly resolvedTacticalReasoning = computed(() => (this.r('llm.tactical.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
-  readonly resolvedTacticalTemp = computed(() => (this.r('llm.tactical.temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedTacticalTemp = computed(() =>
+    (this.r('llm.tactical.temperature') ?? this.mv(this.tacticalModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedTacticalMultimodal = computed(() => (this.r('llm.tactical.multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
   readonly resolvedSessionReasoning = computed(() => this.r('llm.reasoning_level') as string | null);
-  readonly resolvedSessionTemp = computed(() => (this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedSessionTemp = computed(() =>
+    (this.mv(this.sessionModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
   readonly resolvedSessionMultimodal = computed(() => (this.r('llm.multimodal') ?? false) as boolean);
-  readonly resolvedTopP = computed(() => this.r('llm.top_p') as number | null);
-  readonly resolvedTopK = computed(() => this.r('llm.top_k') as number | null);
+  readonly resolvedTopP = computed(() => {
+    const override = this.mode() === 'session' ? this.sessionModelOverride() : this.strategicModelOverride();
+    return (this.mv(override, 'top_p') ?? this.r('llm.top_p')) as number | null;
+  });
+  readonly resolvedTopK = computed(() => {
+    const override = this.mode() === 'session' ? this.sessionModelOverride() : this.strategicModelOverride();
+    return (this.mv(override, 'top_k') ?? this.r('llm.top_k')) as number | null;
+  });
   readonly resolvedMaxOutputTokens = computed(() => this.r('llm.max_output_tokens') as number | null);
   readonly resolvedParallelToolCalls = computed(() => (this.r('llm.parallel_tool_calls') ?? false) as boolean);
 
@@ -1094,7 +1117,13 @@ export class AdvancedAccordionComponent {
 
   // ===== Event handlers =====
   toggleSection(section: string): void {
-    this.expanded.set(this.expanded() === section ? null : section);
+    const next = new Set(this.expanded());
+    if (next.has(section)) {
+      next.delete(section);
+    } else {
+      next.add(section);
+    }
+    this.expanded.set(next);
   }
 
   emitChange(): void { this.change.emit(); }
@@ -1287,6 +1316,6 @@ export class AdvancedAccordionComponent {
     this.idleTimeout.set(null);
     this.greeting.set(null);
     this.claudeCodeAutoStart.set(null);
-    this.expanded.set(null);
+    this.expanded.set(new Set());
   }
 }
