@@ -208,3 +208,135 @@ These are set on the parent form, not inside the settings component:
 - Title (text)
 - Projects (multi-select chips)
 - Expert selector (card grid)
+
+---
+
+## Research: How Other Applications Organize Settings
+
+### IDE/Editor Patterns
+
+**VS Code** — Sidebar tree: Commonly Used > Text Editor > Workbench > Window > Features > Application > Extensions. "Commonly Used" surfaces ~15 high-impact settings. Full-text search filters the entire tree. Modified settings get a blue left-border indicator. Each setting has a per-field "Reset to Default." Dual view: GUI form or raw JSON.
+
+**JetBrains** — Tree dialog: Appearance & Behavior > Keymap > Editor > Plugins > VCS > Build/Deploy > Languages > Tools > Advanced Settings. "Advanced Settings" is an explicit bottom-level catch-all. Per-setting scope annotations (project vs IDE-global). Search highlights matching text within panels.
+
+**Cursor** — Top-level: General > Models > Features > Rules > MCP > Beta. Model picker is grouped checkboxes. Inference params not in main UI (live in settings files). Privacy toggle prominent. Beta features in a dedicated section with warnings.
+
+**Claude Code CLI** — No GUI. Three-tier config: global > project > user-project. Slash commands for runtime changes (`/model`, `/permissions`). Interactive permission prompts on first use (allow once / always / deny).
+
+### AI Agent Platform Patterns
+
+**OpenAI Playground / Custom GPTs** — Model selector at top, system prompt as main textarea, right sidebar for inference params (temperature, max tokens, top-p, penalties). Tools are toggles in a separate section. "More creative" / "More precise" presets as quick-set shortcuts. Temperature is always visible; top-p/penalties under "Advanced."
+
+**Anthropic Console** — Model dropdown at top, system prompt central, right-side panel: temperature, max tokens, top-k, top-p. Flat layout, almost everything visible at once. Compare mode for A/B testing.
+
+**OpenAI Assistants** — Single-page form: Name, Instructions, Model, Tools (code interpreter/file search/functions), Files, Temperature/Top-P. No tabs. Tools are checkboxes with inline expansion.
+
+**Dify.ai** — Split-panel: prompt editor left, "Model & Parameters" right sidebar, separate tabs for Tools/Knowledge/Variables. Debug mode with live parameter tuning. Emerging standard for LLM app builders.
+
+**GitHub Copilot** — Feature toggles first, model selection second. Zero inference params exposed. Agent "instructions" via file (`.github/copilot-instructions.md`) rather than UI.
+
+**Cross-platform AI pattern**: Model selection is always first. System prompt/instructions gets the most screen real estate. Temperature is the only "always visible" inference param. Tools/capabilities are toggles, separated from inference params.
+
+### CI/CD & DevOps Patterns
+
+**Jenkins** — Single scrollable page: General > SCM > Build Triggers > Build Environment > Build Steps > Post-build. "Advanced..." buttons expand hidden fields per section. Parameters are a first-class top-level concept.
+
+**Kubernetes Dashboards (Lens/Rancher)** — Metadata > Pod Spec > Scheduling > Networking > Scaling. Two-column layout (form left, live YAML preview right). "Show Advanced" toggles per section.
+
+**AWX/Ansible** — Tabbed layout: Details > Launch > Survey > Notifications > Schedules. "Survey" concept: user-facing input form layered over admin-defined config, separating operator inputs from technical structure.
+
+**Cross-platform DevOps pattern**: Universal "What / How / Constraints" split. Advanced options behind toggles, never inline. YAML/code preview alongside forms. Tabbed layouts replacing single-page scroll.
+
+### Chat/Bot Builder Patterns
+
+**Botpress** — Three zones: Flow canvas, Knowledge Base, Agent Settings (model + persona + temperature in one form). Test chat panel always visible alongside settings.
+
+**Intercom/Zendesk AI** — Identity (name, tone) > Knowledge Sources > Behavior Rules > Escalation > Channels. "Tone of voice" as a simple dropdown rather than raw prompt editing.
+
+**Cross-platform bot pattern**: Three-bucket separation is universal: Identity/Persona, Capabilities/Tools, Technical/Inference. Single-page with collapsible sections preferred. Creation and editing use the same UI surface.
+
+### UX Best Practices (NNGroup, Material Design, Apple HIG)
+
+1. **Grouping**: Cluster by user mental model, not technical implementation. Frequency-of-use as secondary organizer.
+2. **Ordering**: Most frequently used first. Required before optional. Critical > Common > Rare > Dangerous.
+3. **Progressive disclosure**: Accordions best for settings pages. "Show advanced" toggle for clear novice/expert split. Avoid separate "simple/advanced" mode toggles — users rarely switch and get confused about what's hidden.
+4. **Layout**: Sidebar nav + content area for 5+ categories. Tabs for 3–7 parallel categories. Single scrollable page for <15 settings.
+5. **Defaults**: Mark modified values with subtle indicator (dot, bold, badge). Per-field/section reset. Show default value as placeholder or helper text.
+6. **Mobile**: Full-width controls, drill-down navigation, toggle switches over checkboxes, sticky save bar.
+
+---
+
+## Proposed Optimal Grouping
+
+Based on the research above, here is a proposed restructuring. The core insight is the universal **three-bucket model**: Identity/Behavior, Capabilities, Technical — ordered by user impact and frequency of change.
+
+### Proposed structure: Job Creation
+
+**Tab 1: Configure** (most-used, visible by default)
+
+| Group | Settings | Rationale |
+|-------|----------|-----------|
+| **Model** | Preset chips, Strategic model, Tactical model | Model is always first (every AI platform does this). Presets serve the 80% case. |
+| **Behavior** | Autonomy, Scholar toggle, Critic toggle + rounds | These define *how* the agent behaves. Renamed from "Execution" — more intuitive. |
+| **Tools** | Tool category toggles (Research, Citation, Document, Coding) | Capabilities the agent has access to. |
+| **Data Sources** | Datasource checkboxes | What data the agent can query. Hidden when empty. |
+
+**Tab 2: Instructions** (unchanged)
+
+| Group | Settings | Rationale |
+|-------|----------|-----------|
+| **Custom Instructions** | Markdown textarea | Dedicated tab is correct — it needs full height. |
+
+**Tab 3: Advanced** (progressive disclosure via accordions)
+
+Reorder sections by likelihood of use, merge related sections:
+
+| Section | Settings | Change from current |
+|---------|----------|---------------------|
+| **Inference** | Reasoning, Temperature, Multimodal (per-phase: Strategic/Tactical), Top-p, Top-k, Max output tokens, Parallel tool calls | Unchanged, already well-structured |
+| **Delegation** | Enable, Max depth, Timeout | Unchanged |
+| **Safety & Limits** | Message count threshold, Tool retry count, Progress stall threshold, Max tool calls per phase, Sudo action | **Merged**: moved `sudo_action` from Shell into here — it's a safety concern, not a shell config |
+| **Memory** | Memory enabled, Budget tokens, Project memory toggle | **Merged**: moved Project memory from Settings tab — it's a tuning knob, not a primary behavior toggle |
+| **Context** | Compact on archive, Keep recent tool results, Keep recent messages | Unchanged |
+| **Shell & Workspace** | Shell mode, Sandbox, Shell timeout, Max read/write words, Git versioning | **Merged**: Shell + Workspace are both about the execution environment |
+| **Research & Browser** | Proxy enabled, Browser headless, Browser use vision | Unchanged |
+| **Auxiliary LLM** | Enabled, Model, Temperature | Unchanged |
+| **Resolved Config** | JSON viewer | Always last |
+
+### Proposed structure: Session Creation
+
+**Tab 1: Configure**
+
+| Group | Settings | Rationale |
+|-------|----------|-----------|
+| **Model** | Model dropdown, Temperature slider | Model first, temperature is the only "always visible" inference param (universal pattern). Promote temperature from Advanced. |
+| **Behavior** | Permission Mode | Primary behavior toggle for sessions. |
+| **Tools** | Tool category toggles (6 categories) | Same as job but with Knowledge + Git. |
+| **Data Sources** | Datasource checkboxes | Same as job. |
+| **Session** | Idle timeout, Greeting, Auto-start Claude Code | **Promoted**: these are session-specific essentials, not "advanced." Move from Advanced accordion to main tab. |
+
+**Tab 2: Advanced**
+
+| Section | Settings | Change from current |
+|---------|----------|---------------------|
+| **Inference** | Reasoning, Multimodal, Top-p, Top-k, Max output tokens, Parallel tool calls | Temperature removed (promoted to Configure tab) |
+| **Safety & Limits** | Same as job minus delegation | Same merge as job |
+| **Memory** | Memory enabled, Budget tokens | Same |
+| **Context** | Same as job | Same |
+| **Shell & Workspace** | Same merge as job | Same |
+| **Research & Browser** | Same | Same |
+| **Auxiliary LLM** | Same | Same |
+| **Resolved Config** | JSON viewer | Always last |
+
+### Summary of key changes
+
+| Change | Why |
+|--------|-----|
+| Rename "Execution" → "Behavior" | Matches user mental model (NNGroup: group by mental model, not implementation) |
+| Model always first in every tab | Universal AI platform pattern |
+| Promote Temperature to Configure tab (session) | Only "always visible" inference param across all platforms |
+| Promote Session section to Configure tab | Idle timeout/greeting are essential, not advanced |
+| Move Project Memory to Advanced > Memory | It's a tuning knob, rarely changed |
+| Move Sudo Action to Safety & Limits | It's a safety policy, not a shell config |
+| Merge Shell + Workspace | Both configure the execution environment; 7 settings total is still manageable as one accordion |
+| Reorder Advanced sections by frequency | Inference (most tweaked) first, Resolved Config (read-only) last |

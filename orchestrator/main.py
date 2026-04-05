@@ -798,10 +798,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     env_keys_block["VISION_MODEL"] = vision_model
                     vision_provider = _detect_provider_from_model(vision_model)
                     if resolved_keys and vision_provider in resolved_keys:
-                        env_keys_block["VISION_API_KEY"] = resolved_keys[vision_provider]
-                    logger.info(
-                        f"Dispatch: injected user vision model: {vision_model}"
-                    )
+                        env_keys_block["VISION_API_KEY"] = resolved_keys[
+                            vision_provider
+                        ]
+                    logger.info(f"Dispatch: injected user vision model: {vision_model}")
 
             # Whisper model override (injected as env var)
             whisper_model = user_settings.get("default_whisper_model")
@@ -3237,10 +3237,14 @@ def _format_freeze_notification(
         confidence = freeze_data.get("confidence", 0)
         deliverables = freeze_data.get("deliverables", [])
         confidence_str = (
-            f"{confidence:.0%}" if isinstance(confidence, (int, float)) else str(confidence)
+            f"{confidence:.0%}"
+            if isinstance(confidence, (int, float))
+            else str(confidence)
         )
         deliverables_str = (
-            "\n".join(f"- `{d}`" for d in deliverables) if deliverables else "*(none listed)*"
+            "\n".join(f"- `{d}`" for d in deliverables)
+            if deliverables
+            else "*(none listed)*"
         )
         subject = f"Job {short_id} completed — review required"
         message_md = (
@@ -7896,9 +7900,7 @@ async def agent_update_thread_config(
             raise HTTPException(status_code=404, detail="Thread not found")
 
         # Keep top-level permission_mode column in sync
-        pm = (request.config_override.get("interactive") or {}).get(
-            "permission_mode"
-        )
+        pm = (request.config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -9679,7 +9681,9 @@ def _load_model_catalog() -> dict[str, Any]:
 
     catalog_path = _get_config_dir() / "models.yaml"
     if not catalog_path.exists():
-        logger.warning("models.yaml not found at %s — returning empty catalog", catalog_path)
+        logger.warning(
+            "models.yaml not found at %s — returning empty catalog", catalog_path
+        )
         return {"groups": [], "presets": [], "builder_models": []}
 
     with open(catalog_path) as f:
@@ -9753,7 +9757,8 @@ async def list_available_models(
     presets = [
         {"label": p["label"], "strategic": p["strategic"], "tactical": p["tactical"]}
         for p in catalog.get("presets", [])
-        if p["strategic"] in available_model_ids and p["tactical"] in available_model_ids
+        if p["strategic"] in available_model_ids
+        and p["tactical"] in available_model_ids
     ]
 
     # Filter builder models
@@ -9764,9 +9769,15 @@ async def list_available_models(
     ]
 
     # Filter helper model lists (auxiliary, vision, whisper, embedding)
-    def _filter_helper(key: str, extra_fields: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    def _filter_helper(
+        key: str, extra_fields: tuple[str, ...] = ()
+    ) -> list[dict[str, Any]]:
         return [
-            {"id": m["id"], "label": m["label"], **{f: m[f] for f in extra_fields if f in m}}
+            {
+                "id": m["id"],
+                "label": m["label"],
+                **{f: m[f] for f in extra_fields if f in m},
+            }
             for m in catalog.get(key, [])
             if m.get("provider", "local") in available_providers
         ]
