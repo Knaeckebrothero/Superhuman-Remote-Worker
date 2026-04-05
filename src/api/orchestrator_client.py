@@ -342,6 +342,34 @@ class OrchestratorClient:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
+    async def update_thread_config(
+        self, thread_id: str, config_override: dict[str, Any]
+    ) -> bool:
+        """Persist runtime config changes for a thread.
+
+        Args:
+            thread_id: Thread UUID
+            config_override: Partial config dict to deep-merge
+                             (e.g. ``{"llm": {"model": "..."}}``)
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        if not self._client:
+            return False
+        url = (
+            f"{self.orchestrator_url}/api/agents/threads/"
+            f"{thread_id}/config"
+        )
+        try:
+            r = await self._client.patch(
+                url, json={"config_override": config_override}
+            )
+            return r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Thread config update failed (non-fatal): {e}")
+            return False
+
     async def heartbeat(
         self,
         status: str,

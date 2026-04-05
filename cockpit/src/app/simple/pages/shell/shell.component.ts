@@ -1,10 +1,12 @@
-import { Component, inject } from '@angular/core';
-import { ViewportService } from '../../../core/services/viewport.service';
-import { JobArtifactService } from '../../../core/services/job-artifact.service';
-import { MobileShellComponent } from '../../layout/mobile-shell/mobile-shell.component';
-import { SidebarToggleComponent } from '../../layout/sidebar-toggle/sidebar-toggle.component';
-import { InstructionBuilderComponent } from '../../../shared/components/instruction-builder/instruction-builder.component';
-import { environment } from '../../../core/environment';
+import {Component, inject, OnInit} from '@angular/core';
+import {ViewportService} from '../../../core/services/viewport.service';
+import {JobArtifactService} from '../../../core/services/job-artifact.service';
+import {ModelService} from '../../../core/services/model.service';
+import {MobileShellComponent} from '../../layout/mobile-shell/mobile-shell.component';
+import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
+import {
+  InstructionBuilderComponent
+} from '../../../shared/components/instruction-builder/instruction-builder.component';
 
 @Component({
   selector: 'app-shell-page',
@@ -23,7 +25,7 @@ import { environment } from '../../../core/environment';
             [value]="artifacts.builderModel()"
             (change)="onModelChange($event)"
           >
-            @for (m of builderModels; track m.id) {
+            @for (m of builderModels(); track m.id) {
               <option [value]="m.id">{{ m.label }}</option>
             }
           </select>
@@ -115,10 +117,15 @@ import { environment } from '../../../core/environment';
     `,
   ],
 })
-export class ShellPageComponent {
+export class ShellPageComponent implements OnInit {
   readonly viewport = inject(ViewportService);
   readonly artifacts = inject(JobArtifactService);
-  readonly builderModels = environment.builderModels;
+  private readonly modelService = inject(ModelService);
+  readonly builderModels = this.modelService.builderModels;
+
+  ngOnInit(): void {
+    this.modelService.load();
+  }
 
   onModelChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;

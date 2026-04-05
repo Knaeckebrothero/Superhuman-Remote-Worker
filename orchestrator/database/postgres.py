@@ -1255,6 +1255,78 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_thread_config_override(
+        self, thread_id: str, config_updates: Dict[str, Any]
+    ) -> bool:
+        """Deep-merge updates into threads.metadata.config_override.
+
+        Unlike the shallow ``||`` merge used by workspace/vm/snapshot helpers,
+        this method reads the current config_override, performs a recursive
+        Python-side merge, and writes the result back.  This allows nested
+        keys (e.g. ``llm.model`` and ``llm.temperature``) to be updated
+        independently without clobbering each other.
+
+        Args:
+            thread_id: Thread UUID as string
+            config_updates: Partial config dict to merge
+                            (e.g. ``{"llm": {"model": "..."}}``).
+
+        Returns:
+            True if updated, False if thread not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(thread_id)
+        except ValueError:
+            return False
+
+        def _deep_merge(base: Dict, override: Dict) -> Dict:
+            merged = dict(base)
+            for key, value in override.items():
+                if (
+                    key in merged
+                    and isinstance(merged[key], dict)
+                    and isinstance(value, dict)
+                ):
+                    merged[key] = _deep_merge(merged[key], value)
+                else:
+                    merged[key] = value
+            return merged
+
+        async with self.acquire() as conn:
+            # Read current config_override
+            row = await conn.fetchrow(
+                "SELECT metadata FROM threads WHERE id = $1", uuid_val
+            )
+            if not row:
+                return False
+
+            metadata = row["metadata"] or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json_module.loads(metadata)
+                except (json_module.JSONDecodeError, TypeError):
+                    metadata = {}
+
+            current = metadata.get("config_override") or {}
+            merged = _deep_merge(current, config_updates)
+
+            result = await conn.execute(
+                "UPDATE threads "
+                "SET metadata = jsonb_set("
+                "    COALESCE(metadata, '{}'::jsonb), "
+                "    '{config_override}', "
+                "    $1::jsonb"
+                "), "
+                "    last_activity = CURRENT_TIMESTAMP "
+                "WHERE id = $2",
+                json_module.dumps(merged),
+                uuid_val,
+            )
+
+        return result == "UPDATE 1"
+
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
 
@@ -1790,6 +1862,7 @@ class PostgresDB:
                 FROM jobs
                 WHERE status IN ('created', 'paused')
                   AND assigned_agent_id IS NULL
+                  AND freeze_data IS NULL
                 ORDER BY priority DESC, created_at ASC
                 LIMIT $1
                 """,

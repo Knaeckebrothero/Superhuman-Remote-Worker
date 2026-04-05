@@ -15,6 +15,7 @@ import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
 import {PersistentChatService, ToolCallInfo,} from '../../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../../core/services/api.service';
+import {ModelService} from '../../../core/services/model.service';
 
 interface SlashCommand {
     command: string;
@@ -48,16 +49,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
           <span class="status-label">{{ connectionLabel() }}</span>
         </div>
         <div class="header-right">
-          <!-- Permission mode selector -->
-          <select
-            class="mode-select"
-            [value]="chat.permissionMode()"
-            (change)="onModeChange($event)"
-          >
-            <option value="supervised">Supervised</option>
-            <option value="auto_accept">Auto-accept</option>
-            <option value="autonomous">Autonomous</option>
-          </select>
+          @if (chat.isConnected()) {
+            <button class="settings-btn" (click)="showSettings.update(v => !v)"
+                    [class.active]="showSettings()" title="Session settings">
+              <span class="settings-icon">tune</span>
+            </button>
+          }
 
           @if (chat.isConnected()) {
             @if (ideStatus(); as ide) {
@@ -92,8 +89,50 @@ const SLASH_COMMANDS: SlashCommand[] = [
           @if (chat.modelName()) {
             <span class="status-chip model-chip">{{ chat.modelName() }}</span>
           }
+          @if (chat.temperature()) {
+            <span class="status-chip">temp {{ chat.temperature() }}</span>
+          }
           <span class="status-chip turn-chip">Turn {{ chat.turnCount() }}</span>
           <span class="status-chip mode-chip">{{ chat.permissionMode() | titlecase }}</span>
+        </div>
+      }
+
+      <!-- Settings panel -->
+      @if (showSettings()) {
+        <div class="settings-panel">
+          <div class="settings-row">
+            <label class="settings-label">Mode</label>
+            <select class="settings-select"
+                    [value]="chat.permissionMode()"
+                    (change)="onModeChange($event)">
+              <option value="supervised">Supervised</option>
+              <option value="auto_accept">Auto-accept</option>
+              <option value="autonomous">Autonomous</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Model</label>
+            <select class="settings-select"
+                    [value]="chat.modelName()"
+                    (change)="onModelChange($event)">
+              @if (chat.modelName() && !hasModelInList(chat.modelName()!)) {
+                <option [value]="chat.modelName()">{{ chat.modelName() }}</option>
+              }
+              @for (group of modelService.models(); track group.group) {
+                <optgroup [label]="group.group">
+                  @for (model of group.models; track model) {
+                    <option [value]="model">{{ model }}</option>
+                  }
+                </optgroup>
+              }
+            </select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Temperature: {{ chat.temperature() }}</label>
+            <input type="range" class="settings-slider" min="0" max="2" step="0.1"
+                   [value]="chat.temperature()"
+                   (input)="onTemperatureChange($event)">
+          </div>
         </div>
       }
 
@@ -488,6 +527,62 @@ const SLASH_COMMANDS: SlashCommand[] = [
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
+      }
+
+      .settings-btn {
+        display: flex;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 4px;
+        border: 1px solid var(--border-color, #313244);
+        background: transparent;
+        color: var(--text-muted, #6c7086);
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      .settings-btn:hover, .settings-btn.active {
+        color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color, #cba6f7);
+      }
+      .settings-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .settings-panel {
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg, #181825);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .settings-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .settings-label {
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+        white-space: nowrap;
+      }
+      .settings-select {
+        padding: 3px 6px;
+        border-radius: 4px;
+        border: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, #313244);
+        color: var(--text-secondary, #a6adc8);
+        font-size: 11px;
+        font-family: inherit;
+        cursor: pointer;
+        max-width: 220px;
+      }
+      .settings-slider {
+        width: 100px;
+        accent-color: var(--accent-color, #cba6f7);
       }
 
       .connect-btn, .disconnect-btn {
@@ -1393,11 +1488,15 @@ const SLASH_COMMANDS: SlashCommand[] = [
 export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly api = inject(ApiService);
+    readonly modelService = inject(ModelService);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
 
     inputText = '';
+
+    // Settings panel
+    readonly showSettings = signal(false);
 
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
@@ -1420,6 +1519,13 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
                 this.startIdePolling(threadId);
             } else {
                 this.stopIdePolling();
+            }
+        });
+
+        // Lazy-load available models when settings panel opens
+        effect(() => {
+            if (this.showSettings()) {
+                this.modelService.load();
             }
         });
 
@@ -1568,6 +1674,22 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     onModeChange(event: Event): void {
         const mode = (event.target as HTMLSelectElement).value as 'supervised' | 'auto_accept' | 'autonomous';
         this.chat.setMode(mode);
+    }
+
+    onModelChange(event: Event): void {
+        const model = (event.target as HTMLSelectElement).value;
+        if (model) {
+            this.chat.updateConfig({llm: {model}});
+        }
+    }
+
+    onTemperatureChange(event: Event): void {
+        const temperature = parseFloat((event.target as HTMLInputElement).value);
+        this.chat.updateConfig({llm: {temperature}});
+    }
+
+    hasModelInList(model: string): boolean {
+        return this.modelService.models().some(g => g.models.includes(model));
     }
 
     openIde(url: string): void {

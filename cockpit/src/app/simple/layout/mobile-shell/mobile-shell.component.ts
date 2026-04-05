@@ -1,11 +1,11 @@
-import {Component, effect, inject, signal, viewChild, ViewContainerRef,} from '@angular/core';
+import {Component, effect, inject, OnInit, signal, viewChild, ViewContainerRef,} from '@angular/core';
 import {ComponentRegistryService} from '../../../core/services/component-registry.service';
 import {DataService} from '../../../core/services/data.service';
 import {JobContextService} from '../../../core/services/job-context.service';
 import {JobArtifactService} from '../../../core/services/job-artifact.service';
+import {ModelService} from '../../../core/services/model.service';
 import {SidebarToggleComponent} from '../sidebar-toggle/sidebar-toggle.component';
 import {ComponentType} from '../../../debug/layout.model';
-import {environment} from '../../../core/environment';
 
 interface MobileTab {
   id: string;
@@ -44,7 +44,7 @@ const TABS: MobileTab[] = [
             [value]="artifacts.builderModel()"
             (change)="onModelChange($event)"
           >
-            @for (m of builderModels; track m.id) {
+            @for (m of builderModels(); track m.id) {
               <option [value]="m.id">{{ m.label }}</option>
             }
           </select>
@@ -241,17 +241,22 @@ const TABS: MobileTab[] = [
     `,
   ],
 })
-export class MobileShellComponent {
+export class MobileShellComponent implements OnInit {
   private readonly registry = inject(ComponentRegistryService);
+  private readonly modelService = inject(ModelService);
   readonly data = inject(DataService);
   readonly jobContext = inject(JobContextService);
   readonly artifacts = inject(JobArtifactService);
-  readonly builderModels = environment.builderModels;
+  readonly builderModels = this.modelService.builderModels;
 
   private readonly outlet = viewChild('outlet', { read: ViewContainerRef });
 
   readonly tabs = TABS;
   readonly activeTab = signal('builder');
+
+  ngOnInit(): void {
+    this.modelService.load();
+  }
 
   constructor() {
     this.jobContext.loadJobs();

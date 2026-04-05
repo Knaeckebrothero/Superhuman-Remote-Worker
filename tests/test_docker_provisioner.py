@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,16 +13,14 @@ class TestDockerProvisionerInit:
 
     def test_not_available_without_hosts(self):
         """Provisioner reports unavailable when WORKSPACE_HOSTS is not set."""
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
         with (
             patch.dict(os.environ, {}, clear=False),
-            patch("orchestrator.services.docker_provisioner.Path") as mock_path,
+            patch.object(DockerProvisioner, "_REPO_ROOT", Path("/nonexistent")),
         ):
             os.environ.pop("WORKSPACE_HOSTS", None)
             os.environ.pop("VM_HOSTS", None)
-            # Prevent dev compose auto-detection
-            mock_path.return_value.exists.return_value = False
-
-            from orchestrator.services.docker_provisioner import DockerProvisioner
 
             provisioner = DockerProvisioner()
             db = MagicMock()
@@ -93,24 +92,29 @@ class TestDockerProvisionerInit:
                 "localhost:2202",
             ]
 
-    def test_auto_detect_dev_compose(self):
+    def test_auto_detect_dev_compose(self, tmp_path):
         """Auto-detects dev compose when .dev/ssh-keys/id_ed25519 exists."""
+        from orchestrator.services.docker_provisioner import DockerProvisioner
+
+        key_dir = tmp_path / ".dev" / "ssh-keys"
+        key_dir.mkdir(parents=True)
+        (key_dir / "id_ed25519").touch()
+
         with (
             patch.dict(os.environ, {}, clear=False),
-            patch("orchestrator.services.docker_provisioner.Path") as mock_path,
+            patch.object(DockerProvisioner, "_REPO_ROOT", tmp_path),
         ):
             os.environ.pop("WORKSPACE_HOSTS", None)
             os.environ.pop("SSH_KEY_PATH", None)
             os.environ.pop("VM_HOSTS", None)
-            mock_path.return_value.exists.return_value = True
-
-            from orchestrator.services.docker_provisioner import DockerProvisioner
 
             provisioner = DockerProvisioner()
             provisioner.connect(db=MagicMock())
             assert provisioner.is_available is True
             assert len(provisioner.workspace_hosts) == 3
-            assert os.environ.get("SSH_KEY_PATH") == ".dev/ssh-keys/id_ed25519"
+            assert os.environ.get("SSH_KEY_PATH") == str(
+                tmp_path / ".dev" / "ssh-keys" / "id_ed25519"
+            )
 
 
 class TestAssignWorkspace:

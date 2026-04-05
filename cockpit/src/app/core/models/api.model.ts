@@ -160,7 +160,7 @@ export interface User {
 /**
  * Supported LLM and tool provider slugs for API key management.
  */
-export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'tavily' | 'vision';
+export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'codex' | 'tavily' | 'vision';
 
 /**
  * An API key entry (as returned by GET endpoints — no full key, prefix only).
@@ -190,9 +190,12 @@ export interface UserSettings {
   default_autonomy?: string | null;
   default_reasoning_level?: string | null;
   default_auxiliary_model?: string | null;
+  default_vision_model?: string | null;
+  default_whisper_model?: string | null;
+  default_embedding_model?: string | null;
   embedding_provider?: string | null;
   communication?: CommunicationSettings | null;
-    persistent_agent?: PersistentAgentSettings | null;
+  persistent_agent?: PersistentAgentSettings | null;
 }
 
 /**

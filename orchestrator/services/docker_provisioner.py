@@ -78,7 +78,10 @@ class DockerProvisioner:
 
     # Default workspace ports for dev compose (published SSH ports on localhost)
     _DEV_COMPOSE_DEFAULTS = "localhost:2201,localhost:2202,localhost:2203"
-    _DEV_COMPOSE_SSH_KEY = ".dev/ssh-keys/id_ed25519"
+    _DEV_COMPOSE_SSH_KEY_REL = ".dev/ssh-keys/id_ed25519"
+
+    # Repo root: orchestrator/services/docker_provisioner.py → ../../
+    _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
     def connect(
         self,
@@ -97,15 +100,16 @@ class DockerProvisioner:
         # Auto-detect dev compose: if WORKSPACE_HOSTS is not set but the
         # dev compose SSH key exists on disk, apply dev defaults so the
         # developer doesn't need to export env vars manually.
+        ssh_key_path = self._REPO_ROOT / self._DEV_COMPOSE_SSH_KEY_REL
         if not os.environ.get("WORKSPACE_HOSTS", "").strip():
-            if Path(self._DEV_COMPOSE_SSH_KEY).exists():
+            if ssh_key_path.exists():
                 logger.info(
                     "Docker provisioner: detected dev compose "
                     "(found %s) — applying dev defaults",
-                    self._DEV_COMPOSE_SSH_KEY,
+                    ssh_key_path,
                 )
                 os.environ.setdefault("WORKSPACE_HOSTS", self._DEV_COMPOSE_DEFAULTS)
-                os.environ.setdefault("SSH_KEY_PATH", self._DEV_COMPOSE_SSH_KEY)
+                os.environ.setdefault("SSH_KEY_PATH", str(ssh_key_path))
 
         self._workspace_hosts = self._parse_hosts("WORKSPACE_HOSTS")
         self._vm_hosts = self._parse_hosts("VM_HOSTS")
