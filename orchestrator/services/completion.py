@@ -318,6 +318,8 @@ def determine_job_status(
             return ("pending_review", None)
 
     # Phase boundary freeze or other non-completion stop
+    if freeze_type == "vm_upgrade_required":
+        return ("paused", None)
     return ("pending_review", None)
 
 

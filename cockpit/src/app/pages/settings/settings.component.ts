@@ -5,12 +5,13 @@ import {McpTokenService} from '../../core/services/mcp-token.service';
 import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
 import {SettingsService} from '../../core/services/settings.service';
+import {ModelService} from '../../core/services/model.service';
 import {
-    ApiKeyProvider,
-    CodexStatus,
-    CommunicationSettings,
-    McpTokenCreateResponse,
-    Project
+  ApiKeyProvider,
+  CodexStatus,
+  CommunicationSettings,
+  McpTokenCreateResponse,
+  Project
 } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
@@ -19,6 +20,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'google', label: 'Google' },
   { value: 'groq', label: 'Groq' },
   { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'codex', label: 'Codex' },
   { value: 'tavily', label: 'Tavily (Web Search)' },
   { value: 'vision', label: 'Vision' },
 ];
@@ -110,23 +112,29 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
           </p>
 
           <div class="create-form" style="border-top: none; padding-top: 0;">
-            <div class="form-row">
-              <label class="field-label">Default Model</label>
-              <input
-                type="text"
-                class="form-input"
-                placeholder="e.g. gpt-4o, claude-sonnet-4-6"
-                [(ngModel)]="prefModel"
-              />
-            </div>
-            <div class="form-row">
-              <label class="field-label">Auxiliary Model</label>
-              <input
-                type="text"
-                class="form-input"
-                placeholder="e.g. groq/llama-3.3-70b-versatile (blank = use default)"
-                [(ngModel)]="prefAuxModel"
-              />
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Default Model</label>
+                <select class="form-input" [(ngModel)]="prefModel">
+                  <option value="">Not set (use expert default)</option>
+                  @for (group of modelService.models(); track group.group) {
+                    <optgroup [label]="group.group">
+                      @for (model of group.models; track model) {
+                        <option [value]="model">{{ model }}</option>
+                      }
+                    </optgroup>
+                  }
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Auxiliary Model</label>
+                <select class="form-input" [(ngModel)]="prefAuxModel">
+                  <option value="">Not set (use default)</option>
+                  @for (m of modelService.auxiliaryModels(); track m.id) {
+                    <option [value]="m.id">{{ m.label }}</option>
+                  }
+                </select>
+              </div>
             </div>
             <div class="form-row two-col">
               <div>
@@ -150,14 +158,52 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 </select>
               </div>
             </div>
-            <div class="form-row">
-              <label class="field-label">Embedding Provider</label>
-              <select class="form-input" [(ngModel)]="prefEmbeddingProvider">
-                <option value="">Server default</option>
-                <option value="local">Local</option>
-                <option value="openrouter">OpenRouter</option>
-              </select>
+
+            <h3 class="subsection-title">Helper Models</h3>
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Vision Model</label>
+                <select class="form-input" [(ngModel)]="prefVisionModel">
+                  <option value="">Server default</option>
+                  @for (m of modelService.visionModels(); track m.id) {
+                    <option [value]="m.id">{{ m.label }}</option>
+                  }
+                </select>
+                <span class="field-hint">Multimodal model for describing images when primary model is text-only</span>
+              </div>
+              <div>
+                <label class="field-label">Whisper Model</label>
+                <select class="form-input" [(ngModel)]="prefWhisperModel">
+                  <option value="">Server default</option>
+                  @for (m of modelService.whisperModels(); track m.id) {
+                    <option [value]="m.id">{{ m.label }}</option>
+                  }
+                </select>
+                <span class="field-hint">Speech-to-text for audio files in workspaces</span>
+              </div>
             </div>
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Embedding Model</label>
+                <select class="form-input" [(ngModel)]="prefEmbeddingModel">
+                  <option value="">Server default</option>
+                  @for (m of modelService.embeddingModels(); track m.id) {
+                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}</option>
+                  }
+                </select>
+                <span class="field-hint">Vector embeddings for memory, knowledge, and citation search</span>
+              </div>
+              <div>
+                <label class="field-label">Embedding Provider</label>
+                <select class="form-input" [(ngModel)]="prefEmbeddingProvider">
+                  <option value="">Server default</option>
+                  <option value="local">Local</option>
+                  <option value="openrouter">OpenRouter</option>
+                </select>
+                <span class="field-hint">Where embedding requests are routed</span>
+              </div>
+            </div>
+
             <button
               class="create-btn"
               (click)="savePreferences()"
@@ -760,6 +806,24 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       gap: 10px;
     }
 
+    .subsection-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted, #6c7086);
+      margin: 16px 0 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-color, #313244);
+    }
+
+    .field-hint {
+      display: block;
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+      margin-top: 4px;
+    }
+
     .form-input {
       width: 100%;
       padding: 10px 14px;
@@ -1050,6 +1114,7 @@ export class SettingsComponent implements OnInit {
   readonly tokenService = inject(McpTokenService);
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
+  readonly modelService = inject(ModelService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
 
@@ -1078,6 +1143,9 @@ export class SettingsComponent implements OnInit {
   prefAuxModel = '';
   prefAutonomy = '';
   prefReasoning = '';
+  prefVisionModel = '';
+  prefWhisperModel = '';
+  prefEmbeddingModel = '';
   prefEmbeddingProvider = '';
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
@@ -1124,6 +1192,9 @@ export class SettingsComponent implements OnInit {
         this.prefAuxModel = prefs.default_auxiliary_model || '';
         this.prefAutonomy = prefs.default_autonomy || '';
         this.prefReasoning = prefs.default_reasoning_level || '';
+        this.prefVisionModel = prefs.default_vision_model || '';
+        this.prefWhisperModel = prefs.default_whisper_model || '';
+        this.prefEmbeddingModel = prefs.default_embedding_model || '';
         this.prefEmbeddingProvider = prefs.embedding_provider || '';
 
         // Sync persistent agent preferences
@@ -1169,6 +1240,7 @@ export class SettingsComponent implements OnInit {
     this.tokenService.tokens().filter((t) => !t.revoked_at);
 
   ngOnInit(): void {
+    this.modelService.load();
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
@@ -1285,6 +1357,9 @@ export class SettingsComponent implements OnInit {
     settings['default_auxiliary_model'] = this.prefAuxModel.trim() || null;
     settings['default_autonomy'] = this.prefAutonomy || null;
     settings['default_reasoning_level'] = this.prefReasoning || null;
+    settings['default_vision_model'] = this.prefVisionModel || null;
+    settings['default_whisper_model'] = this.prefWhisperModel || null;
+    settings['default_embedding_model'] = this.prefEmbeddingModel || null;
     settings['embedding_provider'] = this.prefEmbeddingProvider || null;
 
     this.settingsService.updatePreferences(settings).subscribe({

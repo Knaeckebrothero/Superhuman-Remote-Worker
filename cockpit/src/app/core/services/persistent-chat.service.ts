@@ -75,6 +75,7 @@ export class PersistentChatService {
     // --- Session metadata (loaded from REST on connect) ---
     readonly sessionTitle = signal<string | null>(null);
     readonly modelName = signal<string | null>(null);
+    readonly temperature = signal<number>(0);
     readonly turnCount = signal<number>(0);
 
     // --- Session readiness (agent has finished init and is ready for messages) ---
@@ -111,6 +112,7 @@ export class PersistentChatService {
         this.pendingMessage.set(null);
         this.sessionTitle.set(null);
         this.modelName.set(null);
+        this.temperature.set(0);
         this.turnCount.set(0);
         this.tasks.set([]);
         this.undoAvailable.set(false);
@@ -236,6 +238,7 @@ export class PersistentChatService {
         this.pendingPermission.set(null);
         this.sessionTitle.set(null);
         this.modelName.set(null);
+        this.temperature.set(0);
         this.turnCount.set(0);
         this.tasks.set([]);
         this.undoAvailable.set(false);
@@ -334,6 +337,11 @@ export class PersistentChatService {
         this.send({method: 'mode.set', mode});
     }
 
+    /** Update session config (model, temperature, etc.) at runtime. */
+    updateConfig(config: Record<string, unknown>): void {
+        this.send({method: 'config.update', config});
+    }
+
     /** Clear message history (local only). */
     clearMessages(): void {
         this.messages.set([]);
@@ -358,6 +366,12 @@ export class PersistentChatService {
                 }
                 if (params['turn_count'] != null) {
                     this.turnCount.set(params['turn_count'] as number);
+                }
+                if (params['model']) {
+                    this.modelName.set(params['model'] as string);
+                }
+                if (params['temperature'] != null) {
+                    this.temperature.set(params['temperature'] as number);
                 }
                 break;
 
@@ -432,6 +446,18 @@ export class PersistentChatService {
 
             case 'mode.changed':
                 this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+                break;
+
+            case 'config.changed':
+                if (params['model']) {
+                    this.modelName.set(params['model'] as string);
+                }
+                if (params['temperature'] != null) {
+                    this.temperature.set(params['temperature'] as number);
+                }
+                if (params['permission_mode']) {
+                    this.permissionMode.set(params['permission_mode'] as PermissionMode);
+                }
                 break;
 
             case 'title.updated':
