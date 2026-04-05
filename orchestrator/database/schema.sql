@@ -186,6 +186,18 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
 
+-- Migration: Nextcloud Group Folder ID (NULL for personal/default projects)
+DO $$ BEGIN
+    ALTER TABLE projects ADD COLUMN nextcloud_folder_id INTEGER;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Cloud storage read-only default for the project
+DO $$ BEGIN
+    ALTER TABLE projects ADD COLUMN cloud_storage_read_only BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- ============================================================================
 -- 0d. PROJECT MEMBERS TABLE
 -- Maps users to projects with roles (owner, editor, viewer).
@@ -570,6 +582,17 @@ ALTER TABLE threads
     ADD COLUMN IF NOT EXISTS total_turns INTEGER DEFAULT 0;
 ALTER TABLE threads
     ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0;
+
+-- Nextcloud session folder columns
+DO $$ BEGIN
+    ALTER TABLE threads ADD COLUMN nc_session_folder TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE threads ADD COLUMN nc_share_id INTEGER;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id);
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);

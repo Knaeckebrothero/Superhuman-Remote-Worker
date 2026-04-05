@@ -132,6 +132,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <button class="btn btn-ghost" (click)="cancelEditOverview()">Cancel</button>
                 } @else {
                   <button class="btn btn-ghost" (click)="startEditOverview()">Edit</button>
+                  @if (proj.cloud_storage_url) {
+                    <a class="btn btn-ghost" [href]="proj.cloud_storage_url" target="_blank" rel="noopener">
+                      Open Project Folder
+                    </a>
+                  }
                 }
               </div>
             </div>
@@ -670,6 +675,36 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <p class="text-muted" style="font-size: 12px; margin-top: 4px;">
                   When enabled, automatic memories from any job in this project are visible to all other jobs.
                 </p>
+              </div>
+
+              <!-- Cloud Storage -->
+              <div class="settings-group">
+                <h3 class="settings-heading">Cloud Storage</h3>
+                @if (proj.cloud_storage_url) {
+                  <div class="form-row" style="align-items: center;">
+                    <label class="form-label-sm">Folder</label>
+                    <a [href]="proj.cloud_storage_url" target="_blank" rel="noopener"
+                       style="color: var(--accent); text-decoration: none; display: inline-flex; align-items: center; gap: 4px;">
+                      {{ proj.name }}
+                      <span class="material-symbols-rounded" style="font-size: 14px;">open_in_new</span>
+                    </a>
+                  </div>
+                  <label class="toggle-row">
+                    <input
+                      type="checkbox"
+                      [checked]="settingsCloudReadOnly()"
+                      (change)="toggleCloudReadOnly($event)"
+                    />
+                    <span class="toggle-label">Read-only agent access</span>
+                  </label>
+                  <p class="text-muted" style="font-size: 12px; margin-top: 4px;">
+                    When enabled, agents can browse and download files but cannot upload, modify, or delete.
+                  </p>
+                } @else {
+                  <p class="text-muted" style="font-size: 12px;">
+                    Cloud storage unavailable — Nextcloud not configured.
+                  </p>
+                }
               </div>
 
               <!-- Danger Zone -->
@@ -1505,6 +1540,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   // Settings tab
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
+  readonly settingsCloudReadOnly = signal(false);
   readonly isSavingSettings = signal(false);
   /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
@@ -1577,6 +1613,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       if (p) {
         this.settingsName.set(p.name);
         this.settingsConfigName.set(p.default_config_name ?? '');
+        this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
       }
     });
     this.loadJobs();
@@ -1771,6 +1808,14 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       memory: { ...(existing['memory'] ?? {}), project_scoped: checked },
     };
     this.api.updateProject(this.projectId, { default_config_override: override }).subscribe((res) => {
+      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+    });
+  }
+
+  toggleCloudReadOnly(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    this.settingsCloudReadOnly.set(checked);
+    this.api.updateProject(this.projectId, { cloud_storage_read_only: checked }).subscribe((res) => {
       if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
     });
   }

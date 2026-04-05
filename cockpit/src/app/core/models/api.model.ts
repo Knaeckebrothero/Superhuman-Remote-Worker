@@ -336,6 +336,9 @@ export interface Project {
   is_default: boolean;
   default_config_name?: string | null;
   default_config_override?: Record<string, unknown> | null;
+  nextcloud_folder_id?: number | null;
+  cloud_storage_read_only?: boolean;
+  cloud_storage_url?: string | null;
   created_at: string;
   updated_at: string;
   job_count?: number;
@@ -365,6 +368,7 @@ export interface ProjectUpdateRequest {
   status?: ProjectStatus;
   default_config_name?: string;
   default_config_override?: Record<string, unknown>;
+  cloud_storage_read_only?: boolean;
 }
 
 /**
@@ -446,6 +450,34 @@ export interface PromoteRequest {
   description?: string;
   goal?: string;
   user_id: string;
+}
+
+// =============================================================================
+// Persistent Thread (Session) Models
+// =============================================================================
+
+export type ThreadStatus = 'created' | 'active' | 'idle' | 'ended';
+
+/**
+ * Persistent agent session thread.
+ */
+export interface Thread {
+  id: string;
+  title: string;
+  status: ThreadStatus;
+  config_name: string;
+  permission_mode: string;
+  user_id?: string | null;
+  project_id?: string | null;
+  agent_id?: string | null;
+  created_at: string;
+  last_activity: string;
+  ended_at?: string | null;
+  total_turns: number;
+  total_tokens: number;
+  nc_session_folder?: string | null;
+  nc_share_id?: number | null;
+  metadata?: Record<string, unknown>;
 }
 
 // =============================================================================

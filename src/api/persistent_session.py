@@ -87,6 +87,9 @@ class PersistentSession:
     # File checkpoints for undo (turn_id -> list of snapshots)
     file_checkpoints: Dict[int, List[Dict[str, Any]]] = field(default_factory=dict)
 
+    # Nextcloud workspace sync (initialized if session has nc_session_folder)
+    workspace_sync: Optional[Any] = None
+
     @property
     def project_id(self) -> Optional[str]:
         """Primary project (first in list) for backward compat."""

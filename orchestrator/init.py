@@ -276,6 +276,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
 
+        # Backfill Nextcloud cloud folders for existing projects
+        await _backfill_cloud_folders(db)
+
         # Seed default projects for users without one
         # (handles JIT-provisioned users who lack a default project)
         await _seed_default_projects(db)
@@ -789,6 +792,88 @@ async def _seed_default_datasources(db) -> None:
         logger.info(
             "  No default datasources configured (DEFAULT_DS_* env vars not set)"
         )
+
+
+# =============================================================================
+# Cloud Folder Backfill
+# =============================================================================
+
+
+async def _backfill_cloud_folders(db) -> None:
+    """Create Nextcloud Group Folders for projects that predate the cloud folders feature.
+
+    Idempotent — skips projects that already have nextcloud_folder_id set.
+    Requires NextcloudAdmin to be configured and initialized.
+    """
+    from services.nextcloud_admin import NextcloudAdmin
+
+    nc = NextcloudAdmin()
+    if not await nc.ensure_initialized():
+        logger.info("  Cloud folder backfill skipped — Nextcloud not available")
+        return
+
+    backfilled = 0
+    async with db.acquire() as conn:
+        # Find non-default projects without a Group Folder
+        rows = await conn.fetch(
+            """
+            SELECT id, name FROM projects
+            WHERE nextcloud_folder_id IS NULL
+              AND is_default = FALSE
+              AND status = 'active'
+            """
+        )
+
+    for row in rows:
+        project_id = str(row["id"])
+        project_name = row["name"]
+        group_name = f"project-{project_id}"
+
+        try:
+            await nc.ensure_group(group_name)
+            folder_id = await nc.create_project_folder(
+                project_name=project_name,
+                group_id=group_name,
+            )
+            if folder_id:
+                await db.update_project(project_id, nextcloud_folder_id=folder_id)
+
+                # Create project-scoped WebDAV datasource if none exists
+                existing_ds = await db.list_project_datasources(project_id)
+                has_webdav = any(ds["type"] == "webdav" for ds in existing_ds)
+                if not has_webdav:
+                    webdav_url = nc.get_folder_webdav_url(project_name)
+                    ds = await db.create_datasource(
+                        name=f"Cloud Storage ({project_name})",
+                        ds_type="webdav",
+                        connection_url=webdav_url,
+                        description=f"Shared file storage for project '{project_name}'",
+                        credentials={
+                            "username": nc.agent_user,
+                            "password": nc.agent_password,
+                        },
+                    )
+                    await db.link_datasource_to_project(
+                        project_id=project_id,
+                        datasource_id=str(ds["id"]),
+                        read_only=False,
+                    )
+
+                backfilled += 1
+                logger.info(
+                    f"    Backfilled cloud folder for project '{project_name}' "
+                    f"(folder_id={folder_id})"
+                )
+        except Exception as e:
+            logger.warning(
+                f"    Failed to backfill cloud folder for project "
+                f"'{project_name}': {e}"
+            )
+
+    if backfilled > 0:
+        logger.info(f"  Backfilled {backfilled} project cloud folder(s)")
+    else:
+        logger.info("  No projects need cloud folder backfill")
 
 
 # =============================================================================
