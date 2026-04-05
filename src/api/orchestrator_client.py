@@ -357,14 +357,9 @@ class OrchestratorClient:
         """
         if not self._client:
             return False
-        url = (
-            f"{self.orchestrator_url}/api/agents/threads/"
-            f"{thread_id}/config"
-        )
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/config"
         try:
-            r = await self._client.patch(
-                url, json={"config_override": config_override}
-            )
+            r = await self._client.patch(url, json={"config_override": config_override})
             return r.status_code == 200
         except Exception as e:
             logger.warning(f"Thread config update failed (non-fatal): {e}")

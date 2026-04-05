@@ -772,9 +772,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 elif method == "config.update":
                     config_override = data.get("config", {})
                     if config_override:
-                        asyncio.create_task(
-                            _handle_config_update(ws, config_override)
-                        )
+                        asyncio.create_task(_handle_config_update(ws, config_override))
 
                 elif method == "compact":
                     # Manual compaction trigger (/compact command)
@@ -1060,9 +1058,7 @@ async def _handle_compact(ws: WebSocket, focus: str = "") -> None:
         await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
 
 
-async def _handle_config_update(
-    ws: WebSocket, config_override: Dict[str, Any]
-) -> None:
+async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) -> None:
     """Apply runtime config changes (model, temperature, permission mode).
 
     Deep-merges *config_override* into the session config, rebuilds the
@@ -1116,9 +1112,7 @@ async def _handle_config_update(
                     _thread_id, config_override
                 )
             except Exception:
-                logger.warning(
-                    "Config persistence to orchestrator failed (non-fatal)"
-                )
+                logger.warning("Config persistence to orchestrator failed (non-fatal)")
 
         # Acknowledge with resolved values
         await _ws_send(
@@ -1133,9 +1127,7 @@ async def _handle_config_update(
 
     except Exception as e:
         logger.exception("Config update failed: %s", e)
-        await _ws_send(
-            ws, "error", {"message": f"Config update failed: {e}"}
-        )
+        await _ws_send(ws, "error", {"message": f"Config update failed: {e}"})
 
 
 async def _handle_archive(ws: WebSocket) -> None:
