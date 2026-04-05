@@ -93,6 +93,7 @@ kubectl create secret generic srw-secrets \
     --from-literal="NEXTCLOUD_ADMIN_PASSWORD=${NEXTCLOUD_ADMIN_PASSWORD:-admin}" \
     --from-literal="NEXTCLOUD_DB_PASSWORD=${NEXTCLOUD_DB_PASSWORD:-nextcloud}" \
     --from-literal="NEXTCLOUD_OIDC_CLIENT_SECRET=${NEXTCLOUD_OIDC_CLIENT_SECRET:-nextcloud-local-secret}" \
+    --from-literal="NEXTCLOUD_AGENT_PASSWORD=${NEXTCLOUD_AGENT_PASSWORD:-agent-service-dev}" \
     --from-literal="NEXTCLOUD_S3_ACCESS_KEY=${NEXTCLOUD_S3_ACCESS_KEY:-srw}" \
     --from-literal="NEXTCLOUD_S3_SECRET_KEY=${NEXTCLOUD_S3_SECRET_KEY:-srw_password}" \
     --from-literal="PGADMIN_OIDC_CLIENT_SECRET=${PGADMIN_OIDC_CLIENT_SECRET:-pgadmin-local-secret}" \

@@ -281,6 +281,40 @@ async def _attach_session(
         git_remote_url=git_remote_url,
     )
 
+    # Initialize Nextcloud workspace sync if session has a session folder
+    nc_folder = (
+        workspace_override.get("nc_session_folder") if workspace_override else None
+    )
+    if not nc_folder and _orchestrator_client and _thread_id:
+        try:
+            ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
+            if ws_info:
+                nc_folder = ws_info.get("nc_session_folder")
+        except Exception:
+            pass
+    if nc_folder:
+        try:
+            from src.services.workspace_sync import WorkspaceSyncService
+
+            nc_url = os.getenv("NEXTCLOUD_URL", "http://localhost:8800")
+            nc_user = os.getenv("NEXTCLOUD_AGENT_USER", "agent-service")
+            nc_pass = os.getenv("NEXTCLOUD_AGENT_PASSWORD", "agent-service-dev")
+            webdav_url = f"{nc_url.rstrip('/')}/remote.php/dav/files/{nc_user}/{nc_folder}/"
+
+            _session.workspace_sync = WorkspaceSyncService(
+                workspace_path=_session.workspace_manager.workspace_path,
+                webdav_url=webdav_url,
+                webdav_user=nc_user,
+                webdav_password=nc_pass,
+            )
+            # Initial push of existing workspace files
+            await _session.workspace_sync.push()
+            # Start background pull for user uploads
+            await _session.workspace_sync.start_background_poll()
+            logger.info(f"Nextcloud workspace sync started for folder: {nc_folder}")
+        except Exception as e:
+            logger.warning(f"Failed to start Nextcloud workspace sync: {e}")
+
     # Restore message history from DB (for session resume)
     await _restore_session_messages()
 
@@ -309,6 +343,14 @@ async def _detach_session() -> None:
 
     # Mark thread as idle (NOT ended — resumable)
     await _update_thread_status("idle")
+
+    # Final Nextcloud sync + stop polling
+    if _session.workspace_sync:
+        try:
+            await _session.workspace_sync.full_sync()
+            await _session.workspace_sync.stop()
+        except Exception as e:
+            logger.warning(f"Final Nextcloud sync failed (non-fatal): {e}")
 
     # Final git commit + push
     if _session.workspace_manager:
@@ -679,6 +721,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # Auto-generate title after first turn (fire-and-forget)
             if turn_id == 1 and _session.postgres_conn:
                 asyncio.create_task(_auto_title_after_first_turn(ws))
+
+            # Push workspace changes to Nextcloud (fire-and-forget)
+            if _session.workspace_sync:
+                asyncio.create_task(_session.workspace_sync.push())
 
         async def on_error(message: str) -> None:
             await _ws_send(ws, "error", {"message": message})
@@ -1137,6 +1183,14 @@ async def _handle_archive(ws: WebSocket) -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
+        # 0. Final Nextcloud sync
+        if _session.workspace_sync:
+            try:
+                await _session.workspace_sync.full_sync()
+                await _session.workspace_sync.stop()
+            except Exception as e:
+                logger.warning(f"Final Nextcloud sync failed (non-fatal): {e}")
+
         # 1. Extract final memories
         recall_store = (
             getattr(_session.tool_context, "recall_store", None)
@@ -1314,6 +1368,7 @@ async def _poll_workspace_ready(
                 },
                 "git_remote_url": ws.get("git_remote_url"),
                 "config_override": ws.get("config_override"),
+                "nc_session_folder": ws.get("nc_session_folder"),
             }
 
         # Check container workspace
@@ -1331,6 +1386,7 @@ async def _poll_workspace_ready(
                 },
                 "git_remote_url": ws.get("git_remote_url"),
                 "config_override": ws.get("config_override"),
+                "nc_session_folder": ws.get("nc_session_folder"),
             }
         if status == "failed" and (not vm_status or vm_status == "failed"):
             logger.warning(f"Workspace provisioning failed: {ws}")

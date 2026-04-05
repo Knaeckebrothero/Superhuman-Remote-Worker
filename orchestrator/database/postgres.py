@@ -932,6 +932,50 @@ class PostgresDB:
 
         return int(row["delegation_depth"]) if row else 0
 
+    async def get_descendant_jobs(self, job_id: str) -> List[Dict[str, Any]]:
+        """Get all non-terminal descendant jobs (recursive).
+
+        Walks the parent_job_id tree downward and returns every descendant
+        whose status is not yet terminal (completed/failed/cancelled).
+        Includes all subjob types: scholar, critic, curator, delegation.
+
+        Args:
+            job_id: Root job UUID as string
+
+        Returns:
+            List of job dicts for active descendants (may be empty)
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                WITH RECURSIVE descendants AS (
+                    SELECT id, parent_job_id, status, assigned_agent_id,
+                           config_name, context, 0 AS depth
+                    FROM jobs
+                    WHERE parent_job_id = $1
+
+                    UNION ALL
+
+                    SELECT j.id, j.parent_job_id, j.status, j.assigned_agent_id,
+                           j.config_name, j.context, d.depth + 1
+                    FROM jobs j
+                    JOIN descendants d ON j.parent_job_id = d.id
+                    WHERE d.depth < 20
+                )
+                SELECT *
+                FROM descendants
+                WHERE status NOT IN ('completed', 'failed', 'cancelled')
+                """,
+                uuid_val,
+            )
+
+        return [dict(row) for row in rows]
+
     async def update_job_context(self, job_id: str, context: Dict[str, Any]) -> bool:
         """Update the context JSONB column for a job.
 
@@ -1845,7 +1889,8 @@ class PostgresDB:
         """Get jobs waiting for assignment, ordered by priority then creation time.
 
         Returns jobs in 'created' (new) or 'paused' (preempted) status
-        that have no assigned agent.
+        that have no assigned agent.  Excludes jobs whose ancestor chain
+        contains a paused, cancelled, or failed parent (cascade guard).
 
         Args:
             limit: Maximum jobs to return
@@ -1856,14 +1901,33 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, description, status, config_name, config_override,
-                       assigned_agent_id, user_id, project_id, parent_job_id,
-                       priority, branch_name, context, created_at
-                FROM jobs
-                WHERE status IN ('created', 'paused')
-                  AND assigned_agent_id IS NULL
-                  AND freeze_data IS NULL
-                ORDER BY priority DESC, created_at ASC
+                SELECT j.id, j.description, j.status, j.config_name,
+                       j.config_override, j.assigned_agent_id, j.user_id,
+                       j.project_id, j.parent_job_id, j.priority,
+                       j.branch_name, j.context, j.created_at
+                FROM jobs j
+                WHERE j.status IN ('created', 'paused')
+                  AND j.assigned_agent_id IS NULL
+                  AND j.freeze_data IS NULL
+                  AND NOT EXISTS (
+                      WITH RECURSIVE ancestors AS (
+                          SELECT parent_job_id
+                          FROM jobs
+                          WHERE id = j.id AND parent_job_id IS NOT NULL
+
+                          UNION ALL
+
+                          SELECT p.parent_job_id
+                          FROM jobs p
+                          JOIN ancestors a ON p.id = a.parent_job_id
+                          WHERE a.parent_job_id IS NOT NULL
+                      )
+                      SELECT 1
+                      FROM ancestors a2
+                      JOIN jobs blocked ON blocked.id = a2.parent_job_id
+                      WHERE blocked.status IN ('paused', 'cancelled', 'failed')
+                  )
+                ORDER BY j.priority DESC, j.created_at ASC
                 LIMIT $1
                 """,
                 limit,
@@ -2027,6 +2091,23 @@ class PostgresDB:
                 """,
                 thread_id,
                 status,
+            )
+
+    async def update_thread_nextcloud(
+        self, thread_id: str, nc_session_folder: str, nc_share_id: int | None = None
+    ) -> None:
+        """Store Nextcloud session folder info on a thread."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET nc_session_folder = $2,
+                    nc_share_id       = $3
+                WHERE id = $1
+                """,
+                UUID(thread_id),
+                nc_session_folder,
+                nc_share_id,
             )
 
     async def mark_orphaned_threads_idle(self) -> int:
@@ -3540,6 +3621,7 @@ class PostgresDB:
                     VALUES ($1, $2, TRUE)
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
+                              nextcloud_folder_id, cloud_storage_read_only,
                               created_at, updated_at
                     """,
                     f"{display_name}'s Workspace",
@@ -3774,6 +3856,7 @@ class PostgresDB:
                 VALUES ($1, $2, $3, $4, $5, $6)
                 RETURNING id, name, description, goal, status, is_default,
                           default_config_name, default_config_override,
+                          nextcloud_folder_id, cloud_storage_read_only,
                           created_at, updated_at
                 """,
                 name,
@@ -3807,6 +3890,7 @@ class PostgresDB:
                 """
                 SELECT id, name, description, goal, status, is_default,
                        default_config_name, default_config_override,
+                       nextcloud_folder_id, cloud_storage_read_only,
                        created_at, updated_at
                 FROM projects
                 WHERE id = $1
@@ -3839,6 +3923,7 @@ class PostgresDB:
                 """
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
+                       p.nextcloud_folder_id, p.cloud_storage_read_only,
                        p.created_at, p.updated_at,
                        pm.role AS user_role,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id) AS job_count,
@@ -3862,7 +3947,8 @@ class PostgresDB:
         Args:
             project_id: Project UUID
             **kwargs: Fields to update (name, description, goal, status,
-                      default_config_name, default_config_override)
+                      default_config_name, default_config_override,
+                      nextcloud_folder_id, cloud_storage_read_only)
 
         Returns:
             True if updated, False if not found
@@ -3879,6 +3965,8 @@ class PostgresDB:
             "status",
             "default_config_name",
             "default_config_override",
+            "nextcloud_folder_id",
+            "cloud_storage_read_only",
         }
 
         updates = []
@@ -4312,6 +4400,7 @@ class PostgresDB:
                 VALUES ($1, $2, TRUE)
                 RETURNING id, name, description, goal, status, is_default,
                           default_config_name, default_config_override,
+                          nextcloud_folder_id, cloud_storage_read_only,
                           created_at, updated_at
                 """,
                 f"{display_name}'s Workspace",

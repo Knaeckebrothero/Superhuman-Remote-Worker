@@ -23,7 +23,7 @@ Automatically provision Nextcloud folders at two scopes:
 1. **Project folders** — a Group Folder (Team Folder) per project. Users upload reference material; agents get `cloud_*` tool access. Personal projects map to the user's Nextcloud home directory.
 2. **Session folders** — a per-session folder shared between the user and the persistent agent. Workspace files sync bidirectionally so user and AI can exchange files in real time.
 
-**Status:** Design phase.
+**Status:** All phases complete (1-7). Nextcloud init, NextcloudAdmin service, DB migration, lifecycle wiring, settings + override, cockpit UI, session cloud folders, session UI, backfill script.
 
 **Depends on:** [[sso_and_cloud_storage]] (Keycloak SSO + Nextcloud deployment + WebDAV datasource type).
 

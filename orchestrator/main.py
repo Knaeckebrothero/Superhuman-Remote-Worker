@@ -83,6 +83,7 @@ from security.auth import (  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
+from services.nextcloud_admin import NextcloudAdmin  # noqa: E402
 from services.builder_tools import (  # noqa: E402
     BUILDER_TOOLS,
     SERVER_SIDE_TOOLS,
@@ -132,6 +133,7 @@ postgres_db = PostgresDB()
 mongodb = MongoDB()
 gitea_client = GiteaClient()
 keycloak_groups = KeycloakGroupSync()
+nextcloud_admin = NextcloudAdmin()
 
 # Vector DB — separate pgvector instance for citations, memories + knowledge_index.
 _vector_url = os.getenv("VECTOR_DB_URL")
@@ -647,6 +649,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         resolved_ds = await postgres_db.resolve_datasources_for_job(
             job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
         )
+        _apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = _build_datasources_payload(resolved_ds)
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
@@ -914,6 +917,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         resolved_ds = await postgres_db.resolve_datasources_for_job(
             job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
         )
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            job_context = json.loads(job_context)
+        _apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = _build_datasources_payload(resolved_ds)
 
         config_override = job.get("config_override")
@@ -1884,6 +1891,7 @@ class ProjectUpdate(BaseModel):
     status: str | None = None
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
+    cloud_storage_read_only: bool | None = None
 
 
 class ProjectMemberAdd(BaseModel):
@@ -2029,6 +2037,7 @@ async def lifespan(app: FastAPI):
 
     # Initialize Keycloak group sync (graceful if unavailable)
     await keycloak_groups.ensure_initialized()
+    await nextcloud_admin.ensure_initialized()
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -2049,7 +2058,9 @@ async def lifespan(app: FastAPI):
     # Priority: K8s in-cluster → Docker Compose → K8s via kubeconfig.
     # A local kubeconfig should not shadow Docker Compose when running outside the cluster.
     if container_provisioner.is_available and container_provisioner.in_cluster:
-        logger.info("Deployment mode: KUBERNETES (in-cluster) — dynamic provisioning via k8s API")
+        logger.info(
+            "Deployment mode: KUBERNETES (in-cluster) — dynamic provisioning via k8s API"
+        )
     elif docker_provisioner.is_available:
         logger.info(
             "Deployment mode: DOCKER COMPOSE — static workspace pool (%s)",
@@ -2061,7 +2072,9 @@ async def lifespan(app: FastAPI):
                 "but Docker Compose takes priority (not running in-cluster)"
             )
     elif container_provisioner.is_available:
-        logger.info("Deployment mode: KUBERNETES (kubeconfig) — dynamic provisioning via k8s API")
+        logger.info(
+            "Deployment mode: KUBERNETES (kubeconfig) — dynamic provisioning via k8s API"
+        )
     else:
         logger.warning(
             "Deployment mode: NO WORKSPACE PROVISIONER — "
@@ -2772,6 +2785,131 @@ async def subjob_merge(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _cascade_cancel_to_children(job_id: str) -> None:
+    """Cancel all non-terminal descendant jobs of a parent.
+
+    Fetches the full descendant tree (recursive), signals processing agents
+    to stop, cleans up VMs/containers, and bulk-updates DB status.
+    """
+    children = await postgres_db.get_descendant_jobs(job_id)
+    if not children:
+        return
+
+    # Signal processing agents concurrently
+    async def _signal_cancel(child: dict) -> None:
+        child_id = str(child["id"])
+        agent_id = child.get("assigned_agent_id")
+        if child["status"] != "processing" or not agent_id:
+            return
+        agent = await postgres_db.get_agent(str(agent_id))
+        if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
+            return
+        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
+        try:
+            async with httpx.AsyncClient(timeout=130.0) as client:
+                await client.post(
+                    agent_url,
+                    json={"reason": f"Parent job {job_id} cancelled"},
+                )
+        except Exception as e:
+            logger.warning(f"Could not reach agent to cancel child {child_id}: {e}")
+
+    async def _cleanup_child(child: dict) -> None:
+        child_id = str(child["id"])
+        vm_ctx = _get_vm_context(child)
+        if vm_ctx:
+            try:
+                await vm_provisioner.send_control(child_id, "terminate")
+                if vm_ctx.get("status") not in ("deleted", "deleting"):
+                    await vm_provisioner.delete_vm(child_id)
+            except Exception as e:
+                logger.warning(f"VM cleanup failed for child {child_id}: {e}")
+        ws_ctx = _get_container_context(child)
+        if ws_ctx and ws_ctx.get("status") not in (
+            "deleted",
+            "deleting",
+            "released",
+            None,
+        ):
+            try:
+                if ws_ctx.get("provisioner") == "docker":
+                    await docker_provisioner.release_workspace(child_id)
+                else:
+                    await container_provisioner.delete_workspace(child_id)
+                    await container_provisioner.delete_workspace_pvc(child_id)
+            except Exception as e:
+                logger.warning(f"Container cleanup failed for child {child_id}: {e}")
+
+    await asyncio.gather(
+        *[_signal_cancel(c) for c in children],
+        *[_cleanup_child(c) for c in children],
+        return_exceptions=True,
+    )
+
+    # Bulk cancel in DB
+    child_ids = [str(c["id"]) for c in children]
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'cancelled',
+                assigned_agent_id = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ANY($1::uuid[])
+              AND status NOT IN ('completed', 'cancelled')
+            """,
+            child_ids,
+        )
+
+    logger.info(f"Cascade-cancelled {len(child_ids)} descendant(s) of job {job_id}")
+
+
+async def _cascade_pause_to_children(job_id: str) -> None:
+    """Pause all processing descendant jobs of a parent.
+
+    Only actively-processing children are signaled and paused in DB.
+    Non-processing children (created, waiting) are implicitly held by
+    the dispatcher's ancestor guard.
+    """
+    children = await postgres_db.get_descendant_jobs(job_id)
+    processing = [c for c in children if c["status"] == "processing"]
+    if not processing:
+        return
+
+    async def _signal_pause(child: dict) -> None:
+        child_id = str(child["id"])
+        agent_id = child.get("assigned_agent_id")
+        if not agent_id:
+            return
+        agent = await postgres_db.get_agent(str(agent_id))
+        if not agent or not agent.get("pod_ip") or agent["status"] == "offline":
+            return
+        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+        try:
+            async with httpx.AsyncClient(timeout=130.0) as client:
+                await client.post(agent_url)
+        except Exception as e:
+            logger.warning(f"Could not reach agent to pause child {child_id}: {e}")
+
+        vm_ctx = _get_vm_context(child)
+        if vm_ctx:
+            try:
+                await vm_provisioner.send_control(child_id, "freeze")
+            except Exception as e:
+                logger.warning(f"VM freeze failed for child {child_id}: {e}")
+
+        await postgres_db.pause_job(child_id)
+
+    await asyncio.gather(
+        *[_signal_pause(c) for c in processing],
+        return_exceptions=True,
+    )
+
+    logger.info(
+        f"Cascade-paused {len(processing)} processing descendant(s) of job {job_id}"
+    )
+
+
 @app.put("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str) -> dict[str, str]:
     """Cancel a running job.
@@ -2859,6 +2997,9 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                     detail="Job cannot be cancelled (already completed or cancelled)",
                 )
 
+        # Cascade cancel to all child/subjobs
+        await _cascade_cancel_to_children(job_id)
+
         # If this was a scholar, unblock the parent job
         job["status"] = "cancelled"
         try:
@@ -2940,6 +3081,10 @@ async def pause_job(job_id: str) -> dict[str, str]:
                 status_code=400,
                 detail="Job cannot be paused (status may have changed)",
             )
+
+        # Cascade pause to processing child/subjobs
+        await _cascade_pause_to_children(job_id)
+
         return {"status": "paused", "job_id": job_id}
     except HTTPException:
         raise
@@ -4254,6 +4399,7 @@ async def resume_job(
 
         # Resolve datasources for this job (job-specific > global fallback)
         resolved_ds = await postgres_db.resolve_datasources_for_job(job_id)
+        _apply_cloud_storage_override(resolved_ds, job_context)
         datasources_payload = _build_datasources_payload(resolved_ds)
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
@@ -4327,6 +4473,9 @@ async def resume_job(
             status="working",
             current_job_id=job_id,
         )
+
+        # Parent resumed — trigger dispatch so paused children become dispatchable
+        _trigger_dispatch()
 
         return {"status": "resumed", "job_id": job_id, "agent_id": str(agent_id)}
 
@@ -6781,6 +6930,23 @@ def _build_datasource_tool_override(
     return override
 
 
+def _apply_cloud_storage_override(
+    resolved_ds: list[dict[str, Any]], job_context: dict[str, Any]
+) -> None:
+    """Apply job-level cloud_storage_read_only override to WebDAV datasources.
+
+    If the job's context contains cloud_storage_read_only, it overrides the
+    project-level read_only setting on any webdav datasource in the resolved list.
+    Mutates resolved_ds in place.
+    """
+    override = job_context.get("cloud_storage_read_only")
+    if override is None:
+        return
+    for ds in resolved_ds:
+        if ds["type"] == "webdav":
+            ds["project_read_only"] = bool(override)
+
+
 def _build_datasources_payload(
     resolved_ds: list[dict[str, Any]],
 ) -> list[dict[str, Any]] | None:
@@ -7869,6 +8035,8 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
         "config_override": metadata.get("config_override"),
         # Project scoping
         "project_ids": metadata.get("project_ids"),
+        # Nextcloud session folder (for workspace sync)
+        "nc_session_folder": thread.get("nc_session_folder"),
     }
 
 
@@ -8234,11 +8402,36 @@ async def create_thread(
                     {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
 
+        # Provision Nextcloud session folder + share with user
+        if nextcloud_admin.is_initialized:
+            try:
+                nc_folder = f"sessions/{thread_id[:8]}"
+                folder_ok = await nextcloud_admin.create_session_folder(nc_folder)
+                nc_username = (
+                    await nextcloud_admin.resolve_nc_username(
+                        user.get("email"),
+                        user.get("display_name", "").lower(),
+                    )
+                    if folder_ok
+                    else None
+                )
+                if nc_username:
+                    share_id = await nextcloud_admin.share_folder_with_user(
+                        nc_folder, nc_username
+                    )
+                    await postgres_db.update_thread_nextcloud(
+                        thread_id, nc_folder, share_id
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to provision Nextcloud session folder for "
+                    f"thread {thread_id}: {e}"
+                )
+
         # Provision workspace container in background
         # Same priority as dispatcher: in-cluster K8s → Docker Compose → kubeconfig K8s
         use_k8s = container_provisioner.is_available and (
-            container_provisioner.in_cluster
-            or not docker_provisioner.is_available
+            container_provisioner.in_cluster or not docker_provisioner.is_available
         )
         if use_k8s:
             # Kubernetes mode: create pod on demand
@@ -8277,8 +8470,7 @@ async def create_thread(
         # Provision persistent agent pod / assign from pool
         # Same priority: in-cluster K8s → Docker Compose → kubeconfig K8s
         use_k8s_agent = persistent_provisioner.is_available and (
-            persistent_provisioner.in_cluster
-            or not docker_provisioner.is_available
+            persistent_provisioner.in_cluster or not docker_provisioner.is_available
         )
         if use_k8s_agent:
             # Kubernetes mode: create agent pod on demand
@@ -8420,6 +8612,17 @@ async def end_thread(
     repo_name = ws_ctx.get("repo_name")
     if repo_name and gitea_client.is_initialized:
         await gitea_client.delete_repo(repo_name)
+
+    # Clean up Nextcloud session folder
+    nc_folder = thread.get("nc_session_folder")
+    if nc_folder and nextcloud_admin.is_initialized:
+        try:
+            await nextcloud_admin.delete_folder(nc_folder)
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete Nextcloud session folder for thread "
+                f"{thread_id}: {e}"
+            )
 
     if permanent:
         await postgres_db.delete_thread(thread_id)
@@ -10149,6 +10352,32 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
             email=body.email,
         )
         await _create_gitea_repo_for_project(user, project)
+
+        # Create personal WebDAV datasource for the default project
+        if nextcloud_admin.is_initialized and body.email:
+            try:
+                webdav_url = nextcloud_admin.get_user_home_webdav_url(body.email)
+                ds = await postgres_db.create_datasource(
+                    name="Cloud Storage (Personal)",
+                    ds_type="webdav",
+                    connection_url=webdav_url,
+                    description="Personal Nextcloud file storage",
+                    credentials={
+                        "username": nextcloud_admin.agent_user,
+                        "password": nextcloud_admin.agent_password,
+                    },
+                )
+                await postgres_db.link_datasource_to_project(
+                    project_id=str(project["id"]),
+                    datasource_id=str(ds["id"]),
+                    read_only=False,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create personal cloud storage for user "
+                    f"{user['id']}: {e}"
+                )
+
         return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -10243,6 +10472,47 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                         user["keycloak_sub"], project_id_str
                     )
 
+        # Provision Nextcloud Group Folder + WebDAV datasource
+        if nextcloud_admin.is_initialized:
+            project_id_str = str(project["id"])
+            group_name = f"project-{project_id_str}"
+            try:
+                # Pre-create Nextcloud group (so it exists before folder assignment)
+                await nextcloud_admin.ensure_group(group_name)
+
+                # Create Group Folder and grant access
+                folder_id = await nextcloud_admin.create_project_folder(
+                    project_name=body.name,
+                    group_id=group_name,
+                )
+                if folder_id:
+                    await postgres_db.update_project(
+                        project_id_str, nextcloud_folder_id=folder_id
+                    )
+
+                    # Create project-scoped WebDAV datasource + link to project
+                    webdav_url = nextcloud_admin.get_folder_webdav_url(body.name)
+                    ds = await postgres_db.create_datasource(
+                        name=f"Cloud Storage ({body.name})",
+                        ds_type="webdav",
+                        connection_url=webdav_url,
+                        description=f"Shared file storage for project '{body.name}'",
+                        credentials={
+                            "username": nextcloud_admin.agent_user,
+                            "password": nextcloud_admin.agent_password,
+                        },
+                    )
+                    await postgres_db.link_datasource_to_project(
+                        project_id=project_id_str,
+                        datasource_id=str(ds["id"]),
+                        read_only=False,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to provision Nextcloud folder for project "
+                    f"{project_id_str}: {e}"
+                )
+
         return project
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -10272,6 +10542,17 @@ async def get_project(project_id: str) -> dict[str, Any]:
     project = await postgres_db.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    # Compute cloud_storage_url for cockpit deep-links
+    if nextcloud_admin.is_initialized and project.get("nextcloud_folder_id"):
+        project["cloud_storage_url"] = nextcloud_admin.get_folder_browser_url(
+            project["name"]
+        )
+    elif nextcloud_admin.is_initialized and project.get("is_default"):
+        project["cloud_storage_url"] = nextcloud_admin.get_user_home_browser_url()
+    else:
+        project["cloud_storage_url"] = None
+
     return project
 
 
@@ -10284,6 +10565,25 @@ async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]
     success = await postgres_db.update_project(project_id, **kwargs)
     if not success:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    # Sync cloud_storage_read_only to the project-scoped WebDAV datasource
+    if body.cloud_storage_read_only is not None:
+        try:
+            project_ds = await postgres_db.list_project_datasources(project_id)
+            for ds in project_ds:
+                if ds["type"] == "webdav":
+                    await postgres_db.link_datasource_to_project(
+                        project_id=project_id,
+                        datasource_id=str(ds["id"]),
+                        read_only=body.cloud_storage_read_only,
+                    )
+                    break
+        except Exception as e:
+            logger.warning(
+                f"Failed to sync cloud_storage_read_only to datasource "
+                f"for project {project_id}: {e}"
+            )
+
     return {"status": "updated"}
 
 
@@ -10330,6 +10630,17 @@ async def delete_project(project_id: str) -> dict[str, str]:
     # Clean up Keycloak group
     if keycloak_groups.is_initialized:
         await keycloak_groups.delete_project_group(project_id)
+
+    # Clean up Nextcloud Group Folder
+    if nextcloud_admin.is_initialized and project.get("nextcloud_folder_id"):
+        try:
+            await nextcloud_admin.delete_project_folder(
+                project["nextcloud_folder_id"]
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to delete Nextcloud folder for project {project_id}: {e}"
+            )
 
     return {"status": "deleted"}
 
@@ -10378,6 +10689,31 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
             except Exception as e:
                 logger.warning(
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"
+                )
+
+        # Sync to Nextcloud group (immediate access, don't wait for OIDC login)
+        if nextcloud_admin.is_initialized:
+            try:
+                nc_user = await postgres_db.get_user(body.user_id)
+                nc_username = (
+                    await nextcloud_admin.resolve_nc_username(
+                        nc_user.get("email"),
+                        nc_user.get("display_name", "").lower(),
+                    )
+                    if nc_user
+                    else None
+                )
+                if nc_username:
+                    group_name = f"project-{project_id}"
+                    await nextcloud_admin.add_user_to_group(nc_username, group_name)
+                    # Workaround for NC server#57445: re-grant group access
+                    if project.get("nextcloud_folder_id"):
+                        await nextcloud_admin.refresh_group_folder_access(
+                            project["nextcloud_folder_id"], group_name
+                        )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to sync Nextcloud group for member {body.user_id}: {e}"
                 )
 
         return result
@@ -10438,6 +10774,27 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
                         )
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
+
+    # Remove from Nextcloud group
+    if nextcloud_admin.is_initialized:
+        try:
+            nc_user = await postgres_db.get_user(user_id)
+            nc_username = (
+                await nextcloud_admin.resolve_nc_username(
+                    nc_user.get("email"),
+                    nc_user.get("display_name", "").lower(),
+                )
+                if nc_user
+                else None
+            )
+            if nc_username:
+                await nextcloud_admin.remove_user_from_group(
+                    nc_username, f"project-{project_id}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Failed to remove Nextcloud group membership for {user_id}: {e}"
+            )
 
     return {"status": "removed"}
 

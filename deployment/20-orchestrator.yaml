@@ -180,6 +180,37 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: DEFAULT_DS_NEO4J_READ_ONLY
+            # Nextcloud — NextcloudAdmin service (Group Folders, session folders)
+            - name: NEXTCLOUD_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NEXTCLOUD_URL
+            - name: NEXTCLOUD_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NEXTCLOUD_PUBLIC_URL
+            - name: NEXTCLOUD_ADMIN_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NEXTCLOUD_ADMIN_USER
+            - name: NEXTCLOUD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEXTCLOUD_ADMIN_PASSWORD
+            - name: NEXTCLOUD_AGENT_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NEXTCLOUD_AGENT_USER
+            - name: NEXTCLOUD_AGENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEXTCLOUD_AGENT_PASSWORD
             # Default WebDAV datasource (Nextcloud)
             - name: DEFAULT_DS_WEBDAV_URL
               valueFrom:

@@ -239,8 +239,13 @@ services:
       POSTGRES_DB: nextcloud
       POSTGRES_USER: nextcloud
       POSTGRES_PASSWORD: nextcloud
+      # OIDC + init hook configuration
+      NEXTCLOUD_OIDC_CLIENT_SECRET: "${NEXTCLOUD_OIDC_CLIENT_SECRET:-nextcloud-client-secret}"
+      NEXTCLOUD_OIDC_DISCOVERY_URI: "http://keycloak:8080/realms/srw/.well-known/openid-configuration"
+      NEXTCLOUD_AGENT_PASSWORD: "${NEXTCLOUD_AGENT_PASSWORD:-agent-service-dev}"
     volumes:
       - nextcloud_dev_data:/var/www/html
+      - ./docker/nextcloud/setup-nextcloud.sh:/docker-entrypoint-hooks.d/before-starting/setup-nextcloud.sh:ro
     ports:
       - "${NEXTCLOUD_PORT:-8800}:80"
     depends_on:

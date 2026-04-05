@@ -3,10 +3,11 @@
 # Configure Nextcloud to use Keycloak for OIDC login
 # =============================================================================
 #
-# DEPRECATED: OIDC registration is now automated.
-#   A before-starting hook script (ConfigMap srw-nextcloud-hooks) configures
-#   Nextcloud OIDC on every container start when NEXTCLOUD_OIDC_CLIENT_SECRET
-#   is set. This script is retained for manual troubleshooting only.
+# DEPRECATED: Use docker/nextcloud/setup-nextcloud.sh instead.
+#   That script is mounted as a before-starting hook in all docker-compose files
+#   and inlined in the K8s ConfigMap (deployment/19-nextcloud.yaml). It handles
+#   OIDC, groupfolders, srw-agents group, and agent-service user creation.
+#   This script is retained for manual OIDC-only troubleshooting.
 #
 # Run this ONCE after both Keycloak and Nextcloud containers are up and healthy.
 # Requires: podman (or docker) with the srw-nextcloud container running.

@@ -8,20 +8,7 @@ import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {UserService} from '../../../core/services/user.service';
-
-interface Thread {
-    id: string;
-    title: string;
-    status: string;
-    config_name: string;
-    permission_mode: string;
-    created_at: string;
-    last_activity: string;
-    ended_at: string | null;
-    total_turns: number;
-    project_id: string | null;
-    project_ids?: string[];
-}
+import {Thread} from '../../../core/models/api.model';
 
 interface Project {
     id: string;
@@ -203,6 +190,11 @@ interface Project {
                 </div>
               </div>
               <div class="session-actions">
+                @if (thread.nc_session_folder) {
+                  <button class="icon-btn" title="Session Files" (click)="openSessionFiles(thread)">
+                    <span class="icon">cloud</span>
+                  </button>
+                }
                 <button class="icon-btn" title="Resume" (click)="resumeSession(thread)">
                   <span class="icon">play_arrow</span>
                 </button>
@@ -700,6 +692,13 @@ export class SessionsPageComponent implements OnInit {
             }
         }
         this.router.navigate(['/sessions', thread.id]);
+    }
+
+    openSessionFiles(thread: Thread): void {
+        if (!thread.nc_session_folder) return;
+        const ncUrl = environment.nextcloudUrl || 'http://localhost:8800';
+        const folderName = thread.nc_session_folder.split('/').pop();
+        window.open(`${ncUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     async endSession(thread: Thread): Promise<void> {
