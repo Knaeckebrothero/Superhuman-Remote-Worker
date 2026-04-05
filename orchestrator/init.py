@@ -723,14 +723,10 @@ async def _seed_default_datasources(db) -> None:
     pg_url = os.getenv("DEFAULT_DS_POSTGRESQL_URL")
     if pg_url:
         name = os.getenv("DEFAULT_DS_POSTGRESQL_NAME", "Default PostgreSQL")
-        read_only = (
-            os.getenv("DEFAULT_DS_POSTGRESQL_READ_ONLY", "true").lower() == "true"
-        )
         await db.upsert_default_datasource(
             name=name,
             ds_type="postgresql",
             connection_url=pg_url,
-            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: postgresql ({name})")
         seeded += 1
@@ -739,7 +735,6 @@ async def _seed_default_datasources(db) -> None:
     neo4j_url = os.getenv("DEFAULT_DS_NEO4J_URL")
     if neo4j_url:
         name = os.getenv("DEFAULT_DS_NEO4J_NAME", "Default Neo4j")
-        read_only = os.getenv("DEFAULT_DS_NEO4J_READ_ONLY", "true").lower() == "true"
         credentials = {}
         username = os.getenv("DEFAULT_DS_NEO4J_USERNAME")
         password = os.getenv("DEFAULT_DS_NEO4J_PASSWORD")
@@ -752,7 +747,6 @@ async def _seed_default_datasources(db) -> None:
             ds_type="neo4j",
             connection_url=neo4j_url,
             credentials=credentials if credentials else None,
-            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: neo4j ({name})")
         seeded += 1
@@ -761,12 +755,10 @@ async def _seed_default_datasources(db) -> None:
     mongo_url = os.getenv("DEFAULT_DS_MONGODB_URL")
     if mongo_url:
         name = os.getenv("DEFAULT_DS_MONGODB_NAME", "Default MongoDB")
-        read_only = os.getenv("DEFAULT_DS_MONGODB_READ_ONLY", "true").lower() == "true"
         await db.upsert_default_datasource(
             name=name,
             ds_type="mongodb",
             connection_url=mongo_url,
-            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: mongodb ({name})")
         seeded += 1
@@ -775,7 +767,6 @@ async def _seed_default_datasources(db) -> None:
     webdav_url = os.getenv("DEFAULT_DS_WEBDAV_URL")
     if webdav_url:
         name = os.getenv("DEFAULT_DS_WEBDAV_NAME", "Default WebDAV")
-        read_only = os.getenv("DEFAULT_DS_WEBDAV_READ_ONLY", "true").lower() == "true"
         credentials = {}
         username = os.getenv("DEFAULT_DS_WEBDAV_USERNAME")
         password = os.getenv("DEFAULT_DS_WEBDAV_PASSWORD")
@@ -788,7 +779,6 @@ async def _seed_default_datasources(db) -> None:
             ds_type="webdav",
             connection_url=webdav_url,
             credentials=credentials if credentials else None,
-            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: webdav ({name})")
         seeded += 1
