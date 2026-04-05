@@ -8620,8 +8620,7 @@ async def end_thread(
             await nextcloud_admin.delete_folder(nc_folder)
         except Exception as e:
             logger.warning(
-                f"Failed to delete Nextcloud session folder for thread "
-                f"{thread_id}: {e}"
+                f"Failed to delete Nextcloud session folder for thread {thread_id}: {e}"
             )
 
     if permanent:
@@ -10634,9 +10633,7 @@ async def delete_project(project_id: str) -> dict[str, str]:
     # Clean up Nextcloud Group Folder
     if nextcloud_admin.is_initialized and project.get("nextcloud_folder_id"):
         try:
-            await nextcloud_admin.delete_project_folder(
-                project["nextcloud_folder_id"]
-            )
+            await nextcloud_admin.delete_project_folder(project["nextcloud_folder_id"])
         except Exception as e:
             logger.warning(
                 f"Failed to delete Nextcloud folder for project {project_id}: {e}"

@@ -866,8 +866,7 @@ async def _backfill_cloud_folders(db) -> None:
                 )
         except Exception as e:
             logger.warning(
-                f"    Failed to backfill cloud folder for project "
-                f"'{project_name}': {e}"
+                f"    Failed to backfill cloud folder for project '{project_name}': {e}"
             )
 
     if backfilled > 0:
