@@ -13,6 +13,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "orchestrator"))
 
+# main.py validates VECTOR_DB_URL at module level; set a dummy value so the
+# import succeeds — tests here only exercise pure utility functions.
+os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
+
 from main import (
     _detect_provider_from_model,
     _get_system_providers,
@@ -25,10 +29,12 @@ from main import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def clear_catalog_cache():
     """Reset catalog cache between tests."""
     import main as orchestrator_main
+
     orchestrator_main._model_catalog_cache = None
     yield
     orchestrator_main._model_catalog_cache = None
@@ -51,10 +57,16 @@ class TestDetectProviderFromModel:
     """Provider detection must match src/core/loader.py:_detect_provider()."""
 
     def test_openrouter_prefix(self):
-        assert _detect_provider_from_model("openrouter/minimax/minimax-m2.7") == "openrouter"
+        assert (
+            _detect_provider_from_model("openrouter/minimax/minimax-m2.7")
+            == "openrouter"
+        )
 
     def test_groq_prefix(self):
-        assert _detect_provider_from_model("groq/moonshotai/kimi-k2-instruct-0905") == "groq"
+        assert (
+            _detect_provider_from_model("groq/moonshotai/kimi-k2-instruct-0905")
+            == "groq"
+        )
 
     def test_codex_prefix(self):
         assert _detect_provider_from_model("codex/gpt-5.3-codex") == "codex"
@@ -137,7 +149,9 @@ class TestGetSystemProviders:
 
 class TestLoadModelCatalog:
     def test_loads_real_file(self):
-        with patch.dict(os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}):
+        with patch.dict(
+            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
+        ):
             catalog = _load_model_catalog()
             assert "groups" in catalog
             assert "presets" in catalog
@@ -148,7 +162,9 @@ class TestLoadModelCatalog:
             assert "embedding_models" in catalog
 
     def test_groups_have_required_fields(self):
-        with patch.dict(os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}):
+        with patch.dict(
+            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
+        ):
             catalog = _load_model_catalog()
             for group in catalog["groups"]:
                 assert "name" in group
@@ -159,8 +175,18 @@ class TestLoadModelCatalog:
                     assert "display_name" in model
 
     def test_all_providers_are_known(self):
-        known_providers = {"local", "openai", "codex", "anthropic", "google", "groq", "openrouter"}
-        with patch.dict(os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}):
+        known_providers = {
+            "local",
+            "openai",
+            "codex",
+            "anthropic",
+            "google",
+            "groq",
+            "openrouter",
+        }
+        with patch.dict(
+            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
+        ):
             catalog = _load_model_catalog()
             for group in catalog["groups"]:
                 assert group["provider"] in known_providers, (
@@ -168,14 +194,20 @@ class TestLoadModelCatalog:
                 )
 
     def test_embedding_models_have_dimensions(self):
-        with patch.dict(os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}):
+        with patch.dict(
+            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
+        ):
             catalog = _load_model_catalog()
             for m in catalog["embedding_models"]:
-                assert "dimensions" in m, f"Embedding model {m['id']} missing dimensions"
+                assert "dimensions" in m, (
+                    f"Embedding model {m['id']} missing dimensions"
+                )
                 assert isinstance(m["dimensions"], int)
 
     def test_caching(self):
-        with patch.dict(os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}):
+        with patch.dict(
+            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
+        ):
             cat1 = _load_model_catalog()
             cat2 = _load_model_catalog()
             assert cat1 is cat2  # Same object — cached
@@ -205,8 +237,10 @@ class TestProviderFiltering:
                 available_model_ids.update(model_ids)
 
         presets = [
-            p for p in catalog.get("presets", [])
-            if p["strategic"] in available_model_ids and p["tactical"] in available_model_ids
+            p
+            for p in catalog.get("presets", [])
+            if p["strategic"] in available_model_ids
+            and p["tactical"] in available_model_ids
         ]
 
         builder_models = [
@@ -217,7 +251,8 @@ class TestProviderFiltering:
 
         def _filter_helper(key):
             return [
-                m for m in catalog.get(key, [])
+                m
+                for m in catalog.get(key, [])
                 if m.get("provider", "local") in available_providers
             ]
 
@@ -257,7 +292,15 @@ class TestProviderFiltering:
         assert "Codex" in group_names
 
     def test_all_providers_shows_everything(self, catalog):
-        all_providers = {"local", "openai", "codex", "anthropic", "google", "groq", "openrouter"}
+        all_providers = {
+            "local",
+            "openai",
+            "codex",
+            "anthropic",
+            "google",
+            "groq",
+            "openrouter",
+        }
         result = self._filter(catalog, all_providers)
         assert len(result["groups"]) == len(catalog["groups"])
         assert len(result["presets"]) == len(catalog["presets"])
