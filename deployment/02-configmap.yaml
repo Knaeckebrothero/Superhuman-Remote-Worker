@@ -150,7 +150,7 @@ data:
   WORKSPACE_NAMESPACE: "superhuman-remote-worker"
 
   # Persistent agent pods (on-demand, same image as worker agents)
-  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-9594c31"
+  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-0cb1d85"
 
   # Logging
   LOG_LEVEL: "DEBUG"
