@@ -8,16 +8,16 @@ function createService(mockHttp?: any) {
   const http = mockHttp ?? {
     get: vi.fn().mockReturnValue(of({
       groups: [
-        {group: 'Local', models: ['openai/gpt-oss-120b']},
-        {group: 'OpenAI', models: ['gpt-5.4', 'gpt-4o']},
+        {group: 'Local', provider: 'local', configured: true, models: ['openai/gpt-oss-120b']},
+        {group: 'OpenAI', provider: 'openai', configured: true, models: ['gpt-5.4', 'gpt-4o']},
       ],
-      presets: [{label: 'OSS Local', strategic: 'openai/gpt-oss-120b', tactical: 'openai/gpt-oss-120b'}],
-      builder_models: [{label: 'GPT OSS 120B', id: 'openai/gpt-oss-120b'}],
-      auxiliary_models: [{id: 'gpt-4o-mini', label: 'GPT-4o Mini'}],
-      vision_models: [{id: 'gpt-4o', label: 'GPT-4o'}],
-      whisper_models: [{id: 'whisper-1', label: 'Whisper v1'}],
-      embedding_models: [{id: 'text-embedding-3-small', label: 'TE3 Small', dimensions: 1536}],
-      providers: ['openai'],
+      presets: [{label: 'OSS Local', strategic: 'openai/gpt-oss-120b', tactical: 'openai/gpt-oss-120b', configured: true}],
+      builder_models: [{label: 'GPT OSS 120B', id: 'openai/gpt-oss-120b', configured: true}],
+      auxiliary_models: [{id: 'gpt-4o-mini', label: 'GPT-4o Mini', configured: true}],
+      vision_models: [{id: 'gpt-4o', label: 'GPT-4o', configured: true}],
+      whisper_models: [{id: 'whisper-1', label: 'Whisper v1', configured: true}],
+      embedding_models: [{id: 'text-embedding-3-small', label: 'TE3 Small', dimensions: 1536, configured: true}],
+      configured_providers: ['openai'],
     })),
   };
 
@@ -125,14 +125,14 @@ describe('ModelService', () => {
         get: vi.fn()
           .mockReturnValueOnce(throwError(() => new Error('fail')))
           .mockReturnValueOnce(of({
-            groups: [{group: 'Test', models: ['test-model']}],
+            groups: [{group: 'Test', provider: 'local', configured: true, models: ['test-model']}],
             presets: [],
             builder_models: [],
             auxiliary_models: [],
             vision_models: [],
             whisper_models: [],
             embedding_models: [],
-            providers: ['openai'],
+            configured_providers: ['openai'],
           })),
       };
       const {service} = createService(http);
@@ -154,7 +154,7 @@ describe('ModelService', () => {
           presets: [],
           builder_models: [],
           // helper fields omitted (old backend)
-          providers: [],
+          configured_providers: [],
         })),
       };
       const {service} = createService(http);

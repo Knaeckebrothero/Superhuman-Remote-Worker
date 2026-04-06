@@ -45,6 +45,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "run_persistent_loop": (".persistent_graph", "run_persistent_loop"),
     "PersistentLoopCallbacks": (".persistent_graph", "PersistentLoopCallbacks"),
     "create_persistent_app": (".api.persistent_app", "create_persistent_app"),
+    "create_dual_app": (".api.dual_app", "create_dual_app"),
     "PersistentSession": (".api.persistent_session", "PersistentSession"),
     # Loader exports
     "load_summarization_prompt": (".core.loader", "load_summarization_prompt"),

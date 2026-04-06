@@ -26,8 +26,10 @@ import {getReasoningOptions} from './reasoning-options';
                 type="button"
                 class="preset-chip"
                 [class.active]="strategicModel() === preset.strategic && tacticalModel() === preset.tactical"
+                [class.unconfigured]="!preset.configured"
                 (click)="applyPreset(preset)"
                 [disabled]="disabled()"
+                [title]="preset.configured ? '' : 'One or both models lack an API key'"
               >{{ preset.label }}</button>
             }
           </div>
@@ -47,7 +49,7 @@ import {getReasoningOptions} from './reasoning-options';
             >
               <option [ngValue]="null">Default</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.group">
+                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -72,7 +74,7 @@ import {getReasoningOptions} from './reasoning-options';
             >
               <option [ngValue]="null">Default</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.group">
+                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -97,7 +99,7 @@ import {getReasoningOptions} from './reasoning-options';
             >
               <option [ngValue]="null">Default</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.group">
+                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -195,6 +197,10 @@ import {getReasoningOptions} from './reasoning-options';
     .preset-chip:disabled {
       opacity: 0.5;
       cursor: not-allowed;
+    }
+    .preset-chip.unconfigured {
+      opacity: 0.5;
+      border-style: dashed;
     }
     .reset-btn {
       display: inline-flex;

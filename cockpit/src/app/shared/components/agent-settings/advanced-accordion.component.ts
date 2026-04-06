@@ -635,18 +635,6 @@ import {getReasoningOptions} from './reasoning-options';
                   }
                 </div>
               </div>
-              <div class="field-row toggle-row" [class.modified]="claudeCodeAutoStart() !== null">
-                <label class="toggle-label">
-                  <input type="checkbox"
-                    [checked]="claudeCodeAutoStart() ?? resolvedClaudeCodeAutoStart()"
-                    (change)="onClaudeCodeAutoStartChange($event)"
-                    [disabled]="disabled()">
-                  <span>Auto-start Claude Code on session launch</span>
-                </label>
-                @if (claudeCodeAutoStart() !== null) {
-                  <button type="button" class="reset-btn" (click)="claudeCodeAutoStart.set(null); emitChange()">close</button>
-                }
-              </div>
             </div>
           }
         </div>
@@ -930,8 +918,6 @@ export class AdvancedAccordionComponent {
   // --- Session-specific ---
   readonly idleTimeout = signal<number | null>(null);
   readonly greeting = signal<string | null>(null);
-  readonly claudeCodeAutoStart = signal<boolean | null>(null);
-
   // ===== Resolved defaults =====
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
 
@@ -1004,8 +990,6 @@ export class AdvancedAccordionComponent {
 
   readonly resolvedIdleTimeout = computed(() => (this.r('interactive.idle_timeout_minutes') ?? 30) as number);
   readonly resolvedGreeting = computed(() => (this.r('interactive.greeting') ?? '') as string);
-  readonly resolvedClaudeCodeAutoStart = computed(() => (this.r('shell.auto_start_claude_code') ?? false) as boolean);
-
   // ===== Computed helpers =====
   readonly effectiveAuxEnabled = computed(() => this.auxEnabled() ?? this.resolvedAuxEnabled());
   readonly effectiveStrategicTemp = computed(() => this.strategicTemperature() ?? this.resolvedStrategicTemp());
@@ -1087,8 +1071,6 @@ export class AdvancedAccordionComponent {
   onBrowserHeadlessChange(e: Event): void { this.browserHeadless.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onBrowserVisionChange(e: Event): void { this.browserVision.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onAuxEnabledChange(e: Event): void { this.auxEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onClaudeCodeAutoStartChange(e: Event): void { this.claudeCodeAutoStart.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-
   /** Build the advanced settings config_override fragment. */
   getOverrides(): Record<string, unknown> {
     const o: Record<string, unknown> = {};
@@ -1174,9 +1156,6 @@ export class AdvancedAccordionComponent {
       if (this.idleTimeout() !== null) inter['idle_timeout_minutes'] = this.idleTimeout();
       if (this.greeting() !== null) inter['greeting'] = this.greeting();
       if (Object.keys(inter).length) o['interactive'] = { ...(o['interactive'] as any ?? {}), ...inter };
-      if (this.claudeCodeAutoStart() !== null) {
-        o['shell'] = { ...(o['shell'] as any ?? {}), auto_start_claude_code: this.claudeCodeAutoStart() };
-      }
     }
 
     return o;
@@ -1234,7 +1213,6 @@ export class AdvancedAccordionComponent {
     this.auxTemperature.set(null);
     this.idleTimeout.set(null);
     this.greeting.set(null);
-    this.claudeCodeAutoStart.set(null);
     this.expanded.set(new Set());
   }
 }

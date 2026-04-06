@@ -1048,20 +1048,20 @@ async def _initiate_pause(job: dict) -> None:
 
 
 async def _find_idle_persistent_agent() -> Optional[dict]:
-    """Find an idle persistent agent in the pool (Docker Compose mode).
+    """Find an idle persistent or dual-mode agent in the pool.
 
     Returns the agent row dict or None if no idle agents are available.
-    An agent is idle when: agent_mode='persistent', status='available',
-    and it has no thread currently attached.
+    An agent is idle when: agent_mode in ('persistent', 'dual'),
+    status in ('available', 'ready'), and no thread currently attached.
     """
     try:
         rows = await postgres_db.fetch(
             """
             SELECT id, pod_ip, pod_port, hostname, status, config_name
             FROM agents
-            WHERE agent_mode = 'persistent'
-              AND status = 'available'
-              AND (thread_id IS NULL OR thread_id = '')
+            WHERE agent_mode IN ('persistent', 'dual')
+              AND status IN ('available', 'ready')
+              AND thread_id IS NULL
             ORDER BY last_heartbeat DESC
             LIMIT 1
             """,
@@ -1099,7 +1099,7 @@ async def _send_session_attach(
                 agent["pod_ip"],
                 agent["pod_port"],
             )
-            # Update the agent's thread_id in DB
+            # Update both sides of the agent↔thread binding
             try:
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
@@ -1107,8 +1107,13 @@ async def _send_session_attach(
                         str(agent["id"]),
                         thread_id,
                     )
+                    await conn.execute(
+                        "UPDATE threads SET agent_id = $2 WHERE id = $1",
+                        thread_id,
+                        str(agent["id"]),
+                    )
             except Exception:
-                logger.warning("Failed to update agent thread_id in DB")
+                logger.warning("Failed to update agent/thread binding in DB")
             return True
         else:
             logger.warning(
@@ -1650,7 +1655,7 @@ class AgentHeartbeat(BaseModel):
     status: str = Field(
         ...,
         description="Agent status",
-        pattern="^(booting|ready|working|draining|completed|failed)$",
+        pattern="^(booting|ready|working|session|draining|completed|failed)$",
     )
     current_job_id: str | None = Field(None, description="Current job UUID if working")
     metrics: dict[str, Any] | None = Field(
@@ -8933,8 +8938,13 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
             async with httpx.AsyncClient(timeout=2) as client:
                 resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
                 if resp.status_code == 200:
-                    agent_ready = True
-                    break
+                    try:
+                        body = resp.json()
+                        if body.get("ready", False):
+                            agent_ready = True
+                            break
+                    except Exception:
+                        pass
         except Exception:
             pass
         await asyncio.sleep(2)
@@ -10028,15 +10038,39 @@ def _get_system_providers() -> set[str]:
     return providers
 
 
+async def _get_codex_subscription_models() -> set[str]:
+    """Fetch model IDs available through the Codex proxy subscription.
+
+    Returns an empty set if the proxy is unreachable or has no active account.
+    Uses a short timeout to avoid slowing down /api/models.
+    """
+    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{proxy_url}/v1/models")
+        if resp.status_code == 200:
+            data = resp.json()
+            return {
+                m["id"] if isinstance(m, dict) else m
+                for m in data.get("data", [])
+            }
+    except Exception:
+        pass
+    return set()
+
+
 @app.get("/api/models")
 async def list_available_models(
     request: Request,
     project_id: str | None = None,
 ) -> dict[str, Any]:
-    """List models available to the current user.
+    """List all models from the catalog with provider availability annotations.
 
-    Filters the global model catalog based on which providers have API keys
-    available at the system level (env vars), user level, or project level.
+    Returns the full model catalog. Each group, preset, builder model, and
+    helper model includes a ``configured`` boolean indicating whether the
+    provider has an API key available (system env vars, user keys, or
+    project keys). Unconfigured models are still returned so users can
+    discover them and add their own keys.
 
     Query params:
         project_id: optional project ID to include project-level API keys
@@ -10044,73 +10078,164 @@ async def list_available_models(
     user = await require_approved_user(request, postgres_db)
     user_id = str(user["id"])
 
-    # Collect available providers: local is always available
-    available_providers: set[str] = {"local"}
+    # Collect configured providers: local is always available
+    configured_providers: set[str] = {"local"}
 
     # System-level env vars
-    available_providers |= _get_system_providers()
+    configured_providers |= _get_system_providers()
 
     # User-level API keys
     user_keys = await postgres_db.list_user_api_keys(user_id)
-    available_providers |= {k["provider"] for k in user_keys}
+    configured_providers |= {k["provider"] for k in user_keys}
 
     # Project-level API keys (optional)
     if project_id:
         try:
             project_keys = await postgres_db.list_project_api_keys(project_id)
-            available_providers |= {k["provider"] for k in project_keys}
+            configured_providers |= {k["provider"] for k in project_keys}
         except Exception:
             pass  # Project doesn't exist or no access — ignore
 
-    # Load and filter catalog
+    # Load full catalog (no filtering — all models returned)
     catalog = _load_model_catalog()
 
-    groups: list[dict[str, Any]] = []
-    available_model_ids: set[str] = set()
+    # Build model_id -> provider lookup for preset annotation
+    model_provider: dict[str, str] = {}
     for group in catalog.get("groups", []):
-        if group["provider"] in available_providers:
-            model_ids = [m["id"] for m in group.get("models", [])]
-            groups.append({"group": group["name"], "models": model_ids})
-            available_model_ids.update(model_ids)
+        for m in group.get("models", []):
+            model_provider[m["id"]] = group["provider"]
 
-    # Filter presets: both strategic and tactical must be available
+    groups = [
+        {
+            "group": group["name"],
+            "provider": group["provider"],
+            "configured": group["provider"] in configured_providers,
+            "models": [m["id"] for m in group.get("models", [])],
+        }
+        for group in catalog.get("groups", [])
+    ]
+
     presets = [
-        {"label": p["label"], "strategic": p["strategic"], "tactical": p["tactical"]}
+        {
+            "label": p["label"],
+            "strategic": p["strategic"],
+            "tactical": p["tactical"],
+            "configured": (
+                model_provider.get(p["strategic"], "local") in configured_providers
+                and model_provider.get(p["tactical"], "local") in configured_providers
+            ),
+        }
         for p in catalog.get("presets", [])
-        if p["strategic"] in available_model_ids
-        and p["tactical"] in available_model_ids
     ]
 
-    # Filter builder models
     builder_models = [
-        {"label": m["label"], "id": m["id"]}
+        {
+            "label": m["label"],
+            "id": m["id"],
+            "configured": m.get("provider", "local") in configured_providers,
+        }
         for m in catalog.get("builder_models", [])
-        if m.get("provider", "local") in available_providers
     ]
 
-    # Filter helper model lists (auxiliary, vision, whisper, embedding)
-    def _filter_helper(
+    def _annotate_helper(
         key: str, extra_fields: tuple[str, ...] = ()
     ) -> list[dict[str, Any]]:
         return [
             {
                 "id": m["id"],
                 "label": m["label"],
+                "configured": m.get("provider", "local") in configured_providers,
                 **{f: m[f] for f in extra_fields if f in m},
             }
             for m in catalog.get(key, [])
-            if m.get("provider", "local") in available_providers
         ]
+
+    auxiliary = _annotate_helper("auxiliary_models")
+    vision = _annotate_helper("vision_models")
+    whisper = _annotate_helper("whisper_models")
+    embedding = _annotate_helper("embedding_models", ("dimensions",))
+
+    # Codex subscription override: if the Codex proxy is connected and
+    # offers a model that also exists in the OpenAI API catalog, prefer the
+    # subscription-backed codex/ variant so the user isn't double-billed.
+    codex_sub_models = await _get_codex_subscription_models()
+    if codex_sub_models:
+        configured_providers.add("codex")
+
+        # Collect OpenAI model IDs that the subscription also offers
+        overrides: dict[str, str] = {}  # "gpt-5.4" -> "codex/gpt-5.4"
+        for group in groups:
+            if group["provider"] != "openai":
+                continue
+            kept = []
+            for mid in group["models"]:
+                if mid in codex_sub_models:
+                    overrides[mid] = f"codex/{mid}"
+                else:
+                    kept.append(mid)
+            group["models"] = kept
+
+        if overrides:
+            # Add overridden models to the Codex group
+            codex_group = next(
+                (g for g in groups if g["provider"] == "codex"), None
+            )
+            new_codex_models = list(overrides.values())
+            if codex_group:
+                new_set = set(new_codex_models)
+                codex_group["models"] = new_codex_models + [
+                    m for m in codex_group["models"] if m not in new_set
+                ]
+                codex_group["configured"] = True
+            else:
+                groups.append(
+                    {
+                        "group": "Codex",
+                        "provider": "codex",
+                        "configured": True,
+                        "models": new_codex_models,
+                    }
+                )
+
+            # Update model_provider map so preset configured checks work
+            for old_id, new_id in overrides.items():
+                model_provider[new_id] = "codex"
+
+            # Update presets
+            for p in presets:
+                if p["strategic"] in overrides:
+                    p["strategic"] = overrides[p["strategic"]]
+                if p["tactical"] in overrides:
+                    p["tactical"] = overrides[p["tactical"]]
+                p["configured"] = (
+                    model_provider.get(p["strategic"], "local")
+                    in configured_providers
+                    and model_provider.get(p["tactical"], "local")
+                    in configured_providers
+                )
+
+            # Update builder models
+            for bm in builder_models:
+                if bm["id"] in overrides:
+                    bm["id"] = overrides[bm["id"]]
+                    bm["configured"] = True
+
+            # Update helper model lists
+            for helper_list in (auxiliary, vision, whisper, embedding):
+                for hm in helper_list:
+                    if hm["id"] in overrides:
+                        hm["id"] = overrides[hm["id"]]
+                        hm["configured"] = True
 
     return {
         "groups": groups,
         "presets": presets,
         "builder_models": builder_models,
-        "auxiliary_models": _filter_helper("auxiliary_models"),
-        "vision_models": _filter_helper("vision_models"),
-        "whisper_models": _filter_helper("whisper_models"),
-        "embedding_models": _filter_helper("embedding_models", ("dimensions",)),
-        "providers": sorted(available_providers - {"local"}),
+        "auxiliary_models": auxiliary,
+        "vision_models": vision,
+        "whisper_models": whisper,
+        "embedding_models": embedding,
+        "configured_providers": sorted(configured_providers - {"local"}),
     }
 
 

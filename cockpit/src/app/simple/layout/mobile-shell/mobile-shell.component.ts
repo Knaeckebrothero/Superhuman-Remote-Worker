@@ -45,7 +45,7 @@ const TABS: MobileTab[] = [
             (change)="onModelChange($event)"
           >
             @for (m of builderModels(); track m.id) {
-              <option [value]="m.id">{{ m.label }}</option>
+              <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
             }
           </select>
           @if (artifacts.streaming()) {
