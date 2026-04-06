@@ -10050,10 +10050,7 @@ async def _get_codex_subscription_models() -> set[str]:
             resp = await client.get(f"{proxy_url}/v1/models")
         if resp.status_code == 200:
             data = resp.json()
-            return {
-                m["id"] if isinstance(m, dict) else m
-                for m in data.get("data", [])
-            }
+            return {m["id"] if isinstance(m, dict) else m for m in data.get("data", [])}
     except Exception:
         pass
     return set()
@@ -10177,9 +10174,7 @@ async def list_available_models(
 
         if overrides:
             # Add overridden models to the Codex group
-            codex_group = next(
-                (g for g in groups if g["provider"] == "codex"), None
-            )
+            codex_group = next((g for g in groups if g["provider"] == "codex"), None)
             new_codex_models = list(overrides.values())
             if codex_group:
                 new_set = set(new_codex_models)
@@ -10208,8 +10203,7 @@ async def list_available_models(
                 if p["tactical"] in overrides:
                     p["tactical"] = overrides[p["tactical"]]
                 p["configured"] = (
-                    model_provider.get(p["strategic"], "local")
-                    in configured_providers
+                    model_provider.get(p["strategic"], "local") in configured_providers
                     and model_provider.get(p["tactical"], "local")
                     in configured_providers
                 )
