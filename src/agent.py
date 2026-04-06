@@ -1603,7 +1603,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 from src.tools.shell.shell_manager import ShellManager
 
                 shell_config = self.config.extra.get("shell", {})
-                cc_config = self.config.extra.get("claude_code", {})
                 # VM-backed agents get sudo_action=allow (sudo goes through
                 # the VM's approval gate, not the container intercept)
                 sudo_action = shell_config.get("sudo_action", "freeze")
@@ -1619,12 +1618,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     sandbox_cwd=str(self._workspace_manager.path)
                     if shell_config.get("sandbox", True)
                     else None,
-                    auto_start_claude_code=shell_config.get(
-                        "auto_start_claude_code", False
-                    )
-                    if not use_remote_shell
-                    else False,
-                    claude_code_model=cc_config.get("model", "claude-opus-4-6"),
                     backend=ws_backend if use_remote_shell else None,
                     sudo_action=sudo_action,
                 )

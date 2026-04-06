@@ -140,8 +140,6 @@ class ShellManager:
         default_timeout: int = 120,
         blocked_commands: Optional[List[str]] = None,
         sandbox_cwd: Optional[str] = None,
-        auto_start_claude_code: bool = False,
-        claude_code_model: str = "claude-opus-4-6",
         backend: Optional[Any] = None,
         sudo_action: str = "freeze",
     ):
@@ -154,8 +152,6 @@ class ShellManager:
             default_timeout: Default timeout for run_sync in seconds
             blocked_commands: Commands to block (None = use defaults)
             sandbox_cwd: Working directory to restrict commands to (None = no restriction)
-            auto_start_claude_code: Whether to auto-open a claude-code tab
-            claude_code_model: Model for Claude Code session
             backend: Optional workspace backend with shell support. When provided
                      and backend.supports_shell is True, all shell operations delegate
                      to the backend (for remote execution). When None, local libtmux
@@ -169,7 +165,6 @@ class ShellManager:
         self.scrollback_limit = scrollback_limit
         self.default_timeout = default_timeout
         self.sandbox_cwd = sandbox_cwd
-        self._claude_code_model = claude_code_model
         self._backend = backend
         self.sudo_action = sudo_action
 
@@ -238,27 +233,6 @@ class ShellManager:
         if self.sandbox_cwd:
             default_pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
             time.sleep(0.1)
-
-        # Auto-start Claude Code tab if configured
-        if auto_start_claude_code:
-            try:
-                import shutil as _shutil
-
-                if _shutil.which("claude") is not None:
-                    cmd = (
-                        "env -u ANTHROPIC_API_KEY -u CLAUDECODE "
-                        f"claude --model {claude_code_model} --dangerously-skip-permissions"
-                    )
-                    self.open_tab(
-                        name="claude-code",
-                        command=cmd,
-                        tab_type="claude-code",
-                    )
-                    self._handle_claude_code_startup()
-                else:
-                    logger.debug("Claude CLI not found — skipping auto-start")
-            except Exception as e:
-                logger.warning(f"Failed to auto-start Claude Code tab: {e}")
 
         logger.info(
             f"ShellManager initialized: session={session_name}, "
@@ -1000,102 +974,6 @@ class ShellManager:
         except Exception as e:
             logger.debug(f"Failed to capture terminal state: {e}")
             return "(failed to capture terminal state)"
-
-    def _handle_claude_code_startup(self, timeout: int = 30) -> None:
-        """Handle Claude Code interactive startup prompts automatically.
-
-        Waits for Claude Code to start and auto-dismisses setup prompts
-        (bypass permissions, API key, trust folder).
-        """
-        tab = self._tabs.get("claude-code")
-        if tab is None:
-            return
-
-        start = time.monotonic()
-        handled = set()
-
-        while time.monotonic() - start < timeout:
-            time.sleep(1.0)
-            try:
-                captured = tab.pane.capture_pane(start="-200")
-                text = (
-                    "\n".join(captured) if not isinstance(captured, str) else captured
-                )
-            except Exception:
-                continue
-
-            text_lower = text.lower()
-
-            if (
-                "bypass permissions" in text_lower
-                and "yes, i accept" in text_lower
-                and "bypass" not in handled
-            ):
-                tab.pane.send_keys("Down", enter=False)
-                time.sleep(0.3)
-                tab.pane.send_keys("", enter=True)
-                handled.add("bypass")
-                logger.info("Claude Code startup: accepted Bypass Permissions prompt")
-                time.sleep(2.0)
-                continue
-
-            if (
-                "do you want to use this api key" in text_lower
-                and "api_key" not in handled
-            ):
-                tab.pane.send_keys("", enter=True)
-                handled.add("api_key")
-                logger.info("Claude Code startup: dismissed API key prompt")
-                time.sleep(2.0)
-                continue
-
-            if (
-                "trust" in text_lower
-                and "folder" in text_lower
-                and "trust" not in handled
-            ):
-                tab.pane.send_keys("y", enter=True)
-                handled.add("trust")
-                logger.info("Claude Code startup: accepted trust prompt")
-                time.sleep(2.0)
-                continue
-
-            if (
-                "\u276f" in text
-                and "enter to confirm" in text_lower
-                and "generic_menu" not in handled
-            ):
-                tab.pane.send_keys("", enter=True)
-                handled.add("generic_menu")
-                logger.info("Claude Code startup: confirmed default menu selection")
-                time.sleep(2.0)
-                continue
-
-            if any(
-                indicator in text
-                for indicator in [
-                    "Welcome to Claude Code",
-                    "/help",
-                    "What can I help you with",
-                    "Type your prompt",
-                ]
-            ):
-                logger.info(
-                    f"Claude Code startup complete (handled: {handled or 'no prompts'})"
-                )
-                return
-
-            if "(.venv) $" in text and (
-                "bypass" in handled or time.monotonic() - start > 10
-            ):
-                logger.warning(
-                    f"Claude Code may have exited during startup (handled: {handled or 'no prompts'})"
-                )
-                return
-
-        logger.info(
-            f"Claude Code startup handler timed out after {timeout}s (handled: {handled or 'no prompts'})"
-        )
 
     def _check_blocked(self, command: str) -> str | None:
         """Return error message if command's first word is blocked, else None.

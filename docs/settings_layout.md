@@ -163,7 +163,6 @@ Per-phase in job mode (Strategic + Tactical), single set in session mode.
 |---------|-------------|------|-------|-----|---------|---------|-------|
 | Idle timeout (min) | `interactive.idle_timeout` | int | 0+ (0 = disabled) | - | Y | - | Auto-disconnect after inactivity |
 | Greeting | `interactive.greeting` | text | Free-form | - | Y | - | Initial message shown to user |
-| Auto-start Claude Code | `interactive.claude_code_auto_start` | bool | on/off | - | Y | - | Launch Claude Code IDE on session start |
 
 ### Resolved Config Viewer (read-only)
 
@@ -259,10 +258,6 @@ Removing these cripples the agent. They should never appear in the UI.
 |----------|-------|--------------|
 | **orchestrator** | 8 | Job lifecycle management (create, list, get, approve, resume, cancel, pause, get_file). Force-injected in persistent sessions, ignores config. |
 
-#### Dead code
-
-- `claude_code` tool: defined in `src/tools/shell/claude_code.py` but never imported into registry. Should be removed.
-
 ---
 
 ### Datasource Lifecycle
@@ -298,7 +293,7 @@ workspace.md gets datasource index + KB gets retrieval-optimized notes
 | **Critic** | Orchestrator, post-job | Git worktree on same VM | Parent waits | Working |
 | **delegate_work** | Agent tool call | Git worktrees, squash-merge back | Parent suspends | **PLACEHOLDER** |
 | **Orchestrator tools** (8) | Persistent agent | Independent workspace | Fire-and-forget | Working |
-| **claude_code** | Agent tool call | Same workspace (subprocess) | No | **DEAD CODE** |
+| ~~claude_code~~ | *(removed — dead code, Anthropic bans this pattern)* | — | — | **DELETED** |
 
 Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Orchestrator tools = independent dispatch. These should stay separate.
 
@@ -331,7 +326,7 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 | 4 | Communication has no toggle | **Added as a tool category** called "Communication" with its own toggle in the Tools group. Added to `JOB_TOOL_CATEGORIES` + `SESSION_TOOL_CATEGORIES`, agent-activity color mapping. | DONE |
 | 5 | CLI clients not in agent Docker image | **Should be auto-installed.** The assumption was CLI clients would be installed automatically when needed. Needs investigation — may need Dockerfile changes or dynamic installation logic. | TODO (infrastructure) |
 | 6 | Developer expert uses `null` not `[]` | **Fixed.** Changed `config/experts/developer/config.yaml` to use `[]` for disabled categories. | DONE |
-| 7 | claude_code is dead code | **Delete it.** Anthropic bans this usage pattern and it never worked well. | TODO |
+| 7 | claude_code is dead code | **Deleted.** Removed `claude_code.py`, `auto_start_claude_code` from shell_manager/agent/configs/schemas/cockpit UI. Developer expert prompts still reference it (separate rewrite). | DONE |
 | 8 | delegate_work is placeholder | **Moved to tool toggle** in the Tools group. Removed delegation accordion from Advanced. Delegation toggle with inline params (max_depth, timeout) shown when enabled. Tool toggle syncs `delegation.enabled` + `tools.delegation` together. | DONE |
 | 9 | Critic/Scholar enable delegation | Review when delegate_work is implemented. Currently harmless (placeholder guard). | Deferred |
 | 10 | Interactive disables knowledge entirely | Noted. May want to revisit — limits session usefulness. | Deferred |
@@ -463,7 +458,7 @@ Based on research + design decisions above. Core insight: **Identity/Behavior �
 | **Behavior** | Permission Mode | Primary behavior toggle for sessions. |
 | **Tools** | Research, Citation, Shell, Communication, Knowledge, Git | Session adds Knowledge + Git toggles. No Delegation (sessions use orchestrator tools instead). |
 | **Data Sources** | Datasource checkboxes | Same as job. |
-| **Session** | Idle timeout, Greeting, Auto-start Claude Code | **Promoted from Advanced** — these are session essentials. |
+| **Session** | Idle timeout, Greeting | **Promoted from Advanced** — these are session essentials. |
 
 **Tab 2: Advanced**
 

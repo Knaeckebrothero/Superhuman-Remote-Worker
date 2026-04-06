@@ -9,16 +9,16 @@ import {ModelService} from '../../../core/services/model.service';
  * Create a ModelGroupComponent in a minimal injection context with a mock ModelService.
  */
 function createComponent(overrides?: {
-  models?: { group: string; models: string[] }[];
-  presets?: { label: string; strategic: string; tactical: string }[];
+  models?: { group: string; provider: string; configured: boolean; models: string[] }[];
+  presets?: { label: string; strategic: string; tactical: string; configured: boolean }[];
 }) {
   const mockModels = signal(overrides?.models ?? [
-    {group: 'Local', models: ['openai/gpt-oss-120b']},
-    {group: 'OpenAI', models: ['gpt-5.4', 'gpt-4o']},
-    {group: 'Anthropic', models: ['claude-opus-4-6', 'claude-sonnet-4-5-20250929']},
+    {group: 'Local', provider: 'local', configured: true, models: ['openai/gpt-oss-120b']},
+    {group: 'OpenAI', provider: 'openai', configured: true, models: ['gpt-5.4', 'gpt-4o']},
+    {group: 'Anthropic', provider: 'anthropic', configured: false, models: ['claude-opus-4-6', 'claude-sonnet-4-5-20250929']},
   ]);
   const mockPresets = signal(overrides?.presets ?? [
-    {label: 'Opus + Sonnet', strategic: 'claude-opus-4-6', tactical: 'claude-sonnet-4-5-20250929'},
+    {label: 'Opus + Sonnet', strategic: 'claude-opus-4-6', tactical: 'claude-sonnet-4-5-20250929', configured: false},
   ]);
 
   const mockModelService = {
@@ -67,7 +67,7 @@ describe('ModelGroupComponent', () => {
       const {component, mockModels} = createComponent();
       expect(component.availableModels()).toHaveLength(3);
 
-      mockModels.set([{group: 'Test', models: ['test-model']}]);
+      mockModels.set([{group: 'Test', provider: 'local', configured: true, models: ['test-model']}]);
       expect(component.availableModels()).toHaveLength(1);
       expect(component.availableModels()[0].group).toBe('Test');
     });

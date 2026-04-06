@@ -457,7 +457,7 @@ CREATE TABLE IF NOT EXISTS agents (
 DO $$ BEGIN
     ALTER TABLE agents DROP CONSTRAINT valid_agent_status;
     ALTER TABLE agents ADD CONSTRAINT valid_agent_status
-        CHECK (status IN ('booting', 'ready', 'working', 'draining', 'completed', 'failed', 'offline'));
+        CHECK (status IN ('booting', 'ready', 'working', 'session', 'draining', 'completed', 'failed', 'offline'));
 EXCEPTION WHEN undefined_object THEN null;
 END $$;
 

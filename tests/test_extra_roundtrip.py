@@ -1,6 +1,6 @@
 """Tests for config.extra serialization round-trip.
 
-Verifies that extra fields (shell, claude_code, verification, browser, etc.)
+Verifies that extra fields (shell, verification, browser, proxy, etc.)
 survive serialize_resolved_config → load_config_from_resolved without
 double-nesting into extra["extra"].
 """
@@ -35,7 +35,7 @@ class TestExtraSerializationRoundTrip:
             extra={
                 "verification": {"enabled": True, "agent_config": "critic"},
                 "shell": {"max_tabs": 5},
-                "claude_code": {"model": "claude-opus-4-6"},
+                "proxy": {"enabled": True},
                 "browser": {"headless": True},
             },
         )
@@ -49,7 +49,7 @@ class TestExtraSerializationRoundTrip:
             "agent_config": "critic",
         }
         assert restored.extra.get("shell") == {"max_tabs": 5}
-        assert restored.extra.get("claude_code") == {"model": "claude-opus-4-6"}
+        assert restored.extra.get("proxy") == {"enabled": True}
         assert restored.extra.get("browser") == {"headless": True}
 
         # Must NOT be double-nested
@@ -92,7 +92,7 @@ class TestExtraSerializationRoundTrip:
                 "extra": {
                     "shell": {"max_tabs": 5},
                     "verification": {"enabled": True},
-                    "claude_code": {"model": "claude-opus-4-6"},
+                    "proxy": {"enabled": True},
                 },
             },
             "prompts": {},
@@ -104,7 +104,7 @@ class TestExtraSerializationRoundTrip:
         # Should be flattened, not double-nested
         assert restored.extra.get("shell") == {"max_tabs": 5}
         assert restored.extra.get("verification") == {"enabled": True}
-        assert restored.extra.get("claude_code") == {"model": "claude-opus-4-6"}
+        assert restored.extra.get("proxy") == {"enabled": True}
         assert "extra" not in restored.extra
 
     def test_extra_fields_dont_overwrite_standard_fields(self):

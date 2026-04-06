@@ -1959,7 +1959,7 @@ class PostgresDB:
                        last_completed_at, metadata
                 FROM agents
                 WHERE status = 'ready'
-                  AND COALESCE(agent_mode, 'worker') = 'worker'
+                  AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')
                   AND (last_completed_at IS NULL
                        OR NOW() - last_completed_at >= make_interval(secs => $1))
                 ORDER BY last_heartbeat DESC

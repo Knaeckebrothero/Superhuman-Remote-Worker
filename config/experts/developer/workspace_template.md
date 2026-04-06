@@ -32,14 +32,6 @@ Track expected outputs and their verification status:
 |---|---|---|
 | (from plan.md) | pending | (test command or git evidence) |
 
-## Session IDs
-
-Active claude_code sessions for potential follow-ups:
-
-(Format: "todo_N: session_abc123 — brief description")
-
-(Clear completed sessions during strategic phases. Keep only active/resumable ones.)
-
 ## Key Decisions
 
 Architectural decisions AND their reasoning. Without the WHY, you may revisit unnecessarily.
