@@ -39,7 +39,7 @@ tools:
     - todo_rewind
     - mark_complete
     - job_complete
-  coding:
+  shell:
     - run_command
   # evaluation: injected via config_override for verification subjobs only
   git:
@@ -53,7 +53,6 @@ tools:
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed
-  document: []
   research: []
   citation: []
   graph: []

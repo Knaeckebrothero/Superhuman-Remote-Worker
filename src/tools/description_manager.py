@@ -123,7 +123,6 @@ class DescriptionManager:
         category_order = [
             "workspace",
             "core",
-            "document",
             "research",
             "citation",
             "graph",
@@ -131,7 +130,7 @@ class DescriptionManager:
             "mongodb",
             "knowledge",
             "git",
-            "coding",
+            "shell",
             "evaluation",
             "communication",
             "other",

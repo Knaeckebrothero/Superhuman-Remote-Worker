@@ -99,26 +99,26 @@ TMUX_SPECIAL_KEYS = frozenset(
 # Tool metadata for registry
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "run_command": {
-        "module": "coding.shell_tools",
+        "module": "shell.shell_tools",
         "function": "run_command",
         "description": "Execute a shell command and return its output",
-        "category": "coding",
+        "category": "shell",
         "short_description": "Run a shell command and get output.",
         "phases": ["strategic", "tactical"],
     },
     "shell_execute": {
-        "module": "coding.shell_tools",
+        "module": "shell.shell_tools",
         "function": "shell_execute",
         "description": "Execute a command or send keystrokes in an independent persistent terminal tab",
-        "category": "coding",
+        "category": "shell",
         "short_description": "Run commands in a persistent terminal tab.",
         "phases": ["strategic", "tactical"],
     },
     "shell_read": {
-        "module": "coding.shell_tools",
+        "module": "shell.shell_tools",
         "function": "shell_read",
         "description": "Read scrollback output from a persistent terminal tab",
-        "category": "coding",
+        "category": "shell",
         "short_description": "Read output from a terminal tab.",
         "phases": ["strategic", "tactical"],
     },

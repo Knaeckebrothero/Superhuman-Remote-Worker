@@ -14,17 +14,18 @@ export interface ToolCategoryMeta {
 
 /** Standard tool categories shown in job creation. */
 export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
-  { key: 'research', label: 'Research', icon: 'travel_explore', description: 'Web search, paper search, browsing' },
-  { key: 'citation', label: 'Citation', icon: 'format_quote', description: 'Citation and literature management' },
-  { key: 'document', label: 'Document', icon: 'article', description: 'Document processing and chunking' },
-  { key: 'coding', label: 'Coding', icon: 'code', description: 'Shell command execution' },
+  { key: 'research', label: 'Research', icon: 'travel_explore', description: 'Ability to search the web, find academic papers, and browse websites' },
+  { key: 'citation', label: 'Citation', icon: 'format_quote', description: 'Ability to track sources, manage citations, and generate bibliographies' },
+  { key: 'shell', label: 'Shell', icon: 'terminal', description: 'Ability to run shell commands in a sandboxed terminal' },
+  { key: 'communication', label: 'Communication', icon: 'mail', description: 'Ability to send email messages to you or your team' },
+  { key: 'delegation', label: 'Delegation', icon: 'account_tree', description: 'Ability to spawn subagents that work in parallel' },
 ];
 
 /** Session creation also shows knowledge and git categories. */
 export const SESSION_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   ...JOB_TOOL_CATEGORIES,
-  { key: 'knowledge', label: 'Knowledge', icon: 'psychology', description: 'Knowledge graph and memory tools' },
-  { key: 'git', label: 'Git', icon: 'commit', description: 'Git repository operations' },
+  { key: 'knowledge', label: 'Knowledge', icon: 'psychology', description: 'Ability to read and write to the project knowledge base' },
+  { key: 'git', label: 'Git', icon: 'commit', description: 'Ability to inspect workspace version history' },
 ];
 
 /** Autonomy level options. */

@@ -74,9 +74,6 @@ tools:
     - todo_rewind
     - mark_complete
     - job_complete
-  # Document tools - document processing (src/tools/document/)
-  document:
-    - chunk_document
   # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
   research:
     - web_search
@@ -113,8 +110,8 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
-  # Coding tools - shell command execution (src/tools/coding/)
-  coding:
+  # Shell tools - shell command execution (src/tools/shell/)
+  shell:
     - run_command     # Execute commands, get output (stateless mode, default)
     - shell_read      # Read more output from scrollback when needed
   # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)

@@ -25,34 +25,32 @@ Usage:
     tools = load_tools(["read_file", "write_file", "add_todo", "complete_todo"], context)
 
     # Or load all domain tools
-    tools = load_tools(["chunk_document", "execute_cypher_query"], context)
+    tools = load_tools(["execute_cypher_query"], context)
 
     # Or create tool sets directly
     workspace_tools = create_workspace_tools(context)
     todo_tools = create_todo_tools(context)
 """
 
-from .context import ToolContext
-
-# Workspace toolkit (new package structure)
-from .workspace import create_workspace_tools, get_workspace_metadata
-
-# Domain tools
-from .document import create_document_tools, get_document_metadata
-from .research import create_research_tools, get_research_metadata
-
 from .citation import create_citation_tools, get_citation_metadata
-
-# Note: cache_tools removed (deprecated, not used in configs)
-from .graph import create_graph_tools, get_graph_metadata
-from .sql import create_sql_tools, get_sql_metadata
-from .mongodb import create_mongodb_tools, get_mongodb_metadata
-from .knowledge import create_knowledge_tools, get_knowledge_metadata
-
+from .context import ToolContext
 # Core toolkit exports (todo + job tools)
 from .core import create_core_tools, get_core_metadata
-from .core.todo import create_todo_tools
 from .core.job import create_job_tools, get_final_phase_data, clear_final_phase_data
+from .core.todo import create_todo_tools
+from .description_manager import (
+    DescriptionManager,
+    generate_workspace_tool_docs,
+    generate_tool_description,
+    generate_tool_index,
+    apply_description_overrides,
+    get_deferred_tools,
+    get_core_tools,
+)
+# Note: cache_tools removed (deprecated, not used in configs)
+from .graph import create_graph_tools, get_graph_metadata
+from .knowledge import create_knowledge_tools, get_knowledge_metadata
+from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .registry import (
     TOOL_REGISTRY,
     load_tools,
@@ -65,15 +63,11 @@ from .registry import (
     get_phase_tool_summary,
     apply_instruction_enforcement,
 )
-from .description_manager import (
-    DescriptionManager,
-    generate_workspace_tool_docs,
-    generate_tool_description,
-    generate_tool_index,
-    apply_description_overrides,
-    get_deferred_tools,
-    get_core_tools,
-)
+# Domain tools
+from .research import create_research_tools, get_research_metadata
+from .sql import create_sql_tools, get_sql_metadata
+# Workspace toolkit (new package structure)
+from .workspace import create_workspace_tools, get_workspace_metadata
 
 # Backward compatibility alias
 create_search_tools = create_research_tools
@@ -92,8 +86,6 @@ __all__ = [
     "get_final_phase_data",
     "clear_final_phase_data",
     # Domain tools
-    "create_document_tools",
-    "get_document_metadata",
     "create_search_tools",
     "create_research_tools",
     "get_research_metadata",

@@ -15,8 +15,8 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None, reason="tmux not installed"
 )
 
-from src.tools.coding.shell_manager import ShellManager  # noqa: E402
-from src.tools.coding.shell_tools import create_shell_tools  # noqa: E402
+from src.tools.shell.shell_manager import ShellManager  # noqa: E402
+from src.tools.shell.shell_tools import create_shell_tools  # noqa: E402
 
 
 @pytest.fixture
@@ -190,7 +190,7 @@ class TestToolNameAliasing:
         config.tools.sql = []
         config.tools.mongodb = []
         config.tools.git = []
-        config.tools.coding = ["shell_execute", "shell_read"]
+        config.tools.shell =["shell_execute", "shell_read"]
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []
@@ -217,7 +217,7 @@ class TestToolNameAliasing:
         config.tools.sql = []
         config.tools.mongodb = []
         config.tools.git = []
-        config.tools.coding = ["run_command", "shell_read"]
+        config.tools.shell =["run_command", "shell_read"]
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []
@@ -244,7 +244,7 @@ class TestToolNameAliasing:
         config.tools.sql = []
         config.tools.mongodb = []
         config.tools.git = []
-        config.tools.coding = ["shell_execute"]
+        config.tools.shell =["shell_execute"]
         config.tools.evaluation = []
         config.tools.knowledge = []
         config.tools.communication = []

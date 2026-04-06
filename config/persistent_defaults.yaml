@@ -72,9 +72,7 @@ tools:
     - tag_source
     - search_library
     - generate_bibliography
-  document:
-    - chunk_document
-  coding:
+  shell:
     - run_command
     - shell_read
   git:

@@ -70,7 +70,7 @@ tools:
     - get_paper_info
     - browse_website
     - research_topic
-  coding:
+  shell:
     - run_command
   git:
     - git_log
@@ -83,7 +83,6 @@ tools:
   # SQL injected when system datasource attached (for reading job data, test results)
   sql: []
   # Not needed
-  document: []
   citation: []
   graph: []
   mongodb: []
