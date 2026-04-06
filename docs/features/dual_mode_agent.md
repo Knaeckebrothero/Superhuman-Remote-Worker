@@ -218,75 +218,125 @@ WHERE status = 'ready' AND agent_mode IN ('persistent', 'dual') AND thread_id IS
 
 When both a job and a session are waiting, the orchestrator needs a decision rule.
 
-**Approach:** FIFO — first request to arrive gets the next idle pod. The dispatcher runs on a 30s cycle; session attachment is immediate (via REST call to the pod). No reservation logic, no priority tiers. If all pods are busy, new work waits for a pod to restart after completing its task. The HPA scales up if idle pods drop below the target ratio.
+**Approach:** FIFO — first request to arrive gets the next idle pod. If no idle pod exists and we're under `MAX_AGENT_PODS`, a new pod is created on demand. No reservation logic, no priority tiers. If all pods are busy and the cap is reached, new work queues until a pod frees up.
 
-#### 4. Thread Provisioning Changes
+#### 4. Unified Agent Provisioner
 
-Currently, thread creation provisions a *new* persistent agent pod (K8s) or finds an idle one from the persistent pool (Docker Compose). With dual mode:
+Replace both the static Deployment (`21-agent.yaml`) and `persistent_provisioner.py` with a single on-demand provisioner that creates dual-mode Pods.
 
-**K8s mode:** No change to provisioning — dual pods already exist in the deployment. The orchestrator just needs to find an idle dual pod and call `/session/attach` instead of spinning up a dedicated persistent pod. If no idle dual pod is available, the HPA (Horizontal Pod Autoscaler) scales up the single dual-mode deployment.
+**Why not a static Deployment?** With pod-per-task, pods exit after every job/session. A Deployment with `restartPolicy: Always` would just keep restarting pods that have nothing to do — wasting startup time and resources. On-demand creation means pods only exist when there's work.
 
-**Docker Compose mode:** The `_find_idle_persistent_agent()` function becomes `_find_idle_agent()` and queries for any idle dual/persistent pod.
+**Unified provisioner** (`orchestrator/services/agent_provisioner.py`):
+
+Merges logic from `persistent_provisioner.py` (which already creates on-demand agent Pods) with job dispatch needs:
+
+```python
+class AgentProvisioner:
+    """Creates dual-mode agent pods on demand for jobs or sessions."""
+
+    async def create_agent_pod(
+        self,
+        task_id: str,           # job_id or thread_id
+        task_type: str,         # "job" or "session"
+        config_name: str = "default",
+    ) -> dict:
+        """Create a dual-mode agent pod. Returns {pod_name, pod_ip}."""
+        # Pod runs: python agent.py --mode dual --port 8001
+        # Pod registers with orchestrator on startup
+        # Orchestrator then sends /job/start or /session/attach
+        ...
+
+    async def delete_agent_pod(self, task_id: str, task_type: str) -> None:
+        """Clean up agent pod after task completion."""
+        ...
+```
+
+**Pod lifecycle:**
+1. Orchestrator has a job to dispatch or session to attach
+2. Checks if any registered idle dual agents exist (Docker Compose pool or previously created pods)
+3. If none available and under `MAX_AGENT_PODS` cap → `create_agent_pod()`
+4. Waits for pod readiness (health check, registration)
+5. Sends `/job/start` or `/session/attach`
+6. Pod processes task, exits
+7. Orchestrator detects pod exit (heartbeat timeout or pod phase=Succeeded) → cleans up
+
+**Max agents cap:**
+
+```python
+MAX_AGENT_PODS = int(os.environ.get("MAX_AGENT_PODS", "8"))
+```
+
+Before creating a new pod, the provisioner checks:
+```python
+active_count = await self._count_active_agent_pods()
+if active_count >= MAX_AGENT_PODS:
+    logger.warning(f"Agent pod limit reached ({active_count}/{MAX_AGENT_PODS})")
+    return None  # Job/session queues until a pod frees up
+```
+
+This prevents runaway pod creation from overwhelming the cluster. The limit is configurable per deployment via environment variable.
 
 ### Deployment Changes
 
-#### Single Deployment Manifest
+#### Kubernetes: On-Demand Pods (No Static Deployment)
 
-Replace the two separate deployments with one:
-
-```yaml
-# Before: deployment/21-agent.yaml (worker) + deployment/22-persistent-agent.yaml
-# After:  deployment/21-agent.yaml (dual)
-
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: srw-agent
-spec:
-  replicas: 4  # Single pool serves both workloads
-  template:
-    spec:
-      containers:
-        - name: agent
-          command: ["python", "agent.py", "--mode", "dual", "--port", "8001"]
-          env:
-            - name: AGENT_CONFIG
-              value: "default"
-          ports:
-            - containerPort: 8001
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8001
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 8001
-```
-
-**HPA (Horizontal Pod Autoscaler):**
+The static `deployment/21-agent.yaml` (2-replica Deployment) is **removed**. Agent pods are created on demand by the orchestrator's `AgentProvisioner`, similar to how `persistent_provisioner.py` already works.
 
 ```yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
+# deployment/21-agent.yaml is replaced by orchestrator-managed Pods
+# The Pod template is defined in agent_provisioner.py, not a static manifest
+
+# Only configuration needed:
+apiVersion: v1
+kind: ConfigMap
 metadata:
-  name: srw-agent
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: srw-agent
-  minReplicas: 2
-  maxReplicas: 16
-  metrics:
-    - type: Pods
-      pods:
-        metric:
-          name: agent_idle_ratio  # Custom metric: idle_pods / total_pods
-        target:
-          type: AverageValue
-          averageValue: "0.25"  # Keep ~25% of pods idle for responsiveness
+  name: srw-agent-config
+data:
+  MAX_AGENT_PODS: "8"          # Max concurrent agent pods
+  AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest"
 ```
+
+Pod manifest (generated by provisioner):
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-<task_id[:12]>    # e.g., agent-a1b2c3d4e5f6
+  labels:
+    app: srw-agent
+    task-type: job              # or "session"
+    task-id: <task_id>
+spec:
+  restartPolicy: Never          # Pod exits after task, no restart
+  containers:
+    - name: agent
+      image: ${AGENT_IMAGE}
+      command: ["python", "agent.py", "--mode", "dual", "--port", "8001"]
+      # Same env, volumes, security context, probes as current 21-agent.yaml
+  terminationGracePeriodSeconds: 180
+```
+
+**Advantages over static Deployment:**
+- No idle pods burning resources when there's no work
+- Scales to zero naturally (no work = no pods)
+- `MAX_AGENT_PODS` is a simple, predictable cap — no HPA tuning needed
+- Pod names include task IDs for easy debugging (`kubectl logs agent-a1b2c3d4`)
+
+#### Docker Compose: Static Pool with Restart
+
+Docker Compose can't dynamically create containers via API. Keep a static pool:
+
+```yaml
+agent:
+  image: ${AGENT_IMAGE}
+  command: python agent.py --mode dual --port 8001
+  deploy:
+    replicas: ${AGENT_REPLICAS:-2}    # Single pool, both workloads
+  restart: unless-stopped              # Restart after task exit
+  # ... same env, volumes as current
+```
+
+The `agent-persistent` service is **removed** — the dual-mode pool handles both jobs and sessions. Pods exit after each task, Docker restarts them, they register as idle.
 
 ## Implementation Plan
 
@@ -304,7 +354,7 @@ spec:
 | State transition logic (IDLE -> WORKING/SESSION -> exit) | `src/api/dual_app.py` | M |
 | Tests: state guards, concurrent request rejection | `tests/test_dual_app.py` | M |
 
-**Validation:** Start pod in dual mode, manually POST `/job/start` — verify it processes. POST `/session/attach` — verify it serves. Confirm mutual exclusion.
+**Validation:** Start pod in dual mode, manually POST `/job/start` — verify it processes and exits on completion. Restart, POST `/session/attach` — verify it serves the session and exits on detach. Confirm mutual exclusion (second request gets 409 while first is active).
 
 ### Phase 2: Orchestrator Dispatch (Orchestrator-Side)
 
@@ -320,18 +370,22 @@ spec:
 | Update heartbeat to handle `status='session'` | `orchestrator/database/postgres.py` | S |
 | Tests: dispatch prefers idle dual pod, mutual exclusion | `tests/test_dispatch_dual.py` | M |
 
-**Validation:** Deploy 2 dual pods. Create a job — verify one pod picks it up. Create a session — verify the other pod serves it. Complete both — verify both return to idle.
+**Validation:** Deploy 2 dual pods. Create a job — verify one pod picks it up. Create a session — verify the other pod serves it. Complete both — verify both pods exit and restart fresh.
 
-### Phase 3: Deployment Unification
+### Phase 3: Unified Agent Provisioner (Orchestrator-Side)
 
-**Scope:** Merge K8s manifests. Configure HPA. Remove dedicated persistent deployment.
+**Scope:** Replace static Deployment + `persistent_provisioner.py` with a single on-demand `AgentProvisioner`. Add `MAX_AGENT_PODS` cap.
 
 | Task | File | Effort |
 |------|------|--------|
-| Update agent deployment to use `--mode dual` | `deployment/21-agent.yaml` | S |
-| Remove dedicated persistent deployment (if exists) | `deployment/22-persistent-agent.yaml` | S |
-| Configure HPA with idle-ratio metric | `deployment/21-agent-hpa.yaml` | M |
-| Update Docker Compose for dual mode | `docker-compose*.yaml` | S |
+| Create `AgentProvisioner` (merge from `persistent_provisioner.py`) | `orchestrator/services/agent_provisioner.py` | M |
+| Add `MAX_AGENT_PODS` env var and cap check | `orchestrator/services/agent_provisioner.py` | S |
+| Update job dispatcher to create pod on demand if no idle agent | `orchestrator/main.py` | M |
+| Update thread creation to use `AgentProvisioner` | `orchestrator/main.py` | M |
+| Add pod cleanup on task completion (heartbeat timeout / exit) | `orchestrator/services/agent_provisioner.py` | S |
+| Remove static `deployment/21-agent.yaml` (K8s on-demand only) | `deployment/` | S |
+| Remove `deployment/21b-agent-pdb.yaml` (no static pool to protect) | `deployment/` | S |
+| Update Docker Compose: single `agent` service, remove `agent-persistent` | `docker-compose*.yaml` | S |
 | Update Fleet/Kustomize overlays | `deployment-local/` | S |
 
 ### Phase 4: Cleanup and Documentation
@@ -368,9 +422,10 @@ async def _enter_worker_mode(request):
 **Scenario:** All dual pods are in `SESSION` state; jobs queue up indefinitely.
 
 **Mitigation:**
-- HPA scales up based on idle ratio metric (target 25% idle).
-- Idle timeout on sessions (15 minutes) exits the pod and returns capacity to the pool.
+- `MAX_AGENT_PODS` still allows new pods for jobs as long as the cap isn't hit.
+- Idle timeout on sessions (15 minutes) exits the pod and frees a slot.
 - Active sessions (user sending messages) are not affected by the timeout — only idle ones.
+- If cap is hit, jobs queue until a pod frees up (session ends or job completes).
 - Orchestrator dashboard shows pool utilization breakdown (idle/working/session).
 
 ### Session Resume After Pod Replacement
