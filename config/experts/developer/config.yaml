@@ -55,7 +55,7 @@ tools:
     - git_status
     - git_tags
   # Disable unused tool categories
-  document: null
-  research: null
-  citation: null
-  graph: null
+  document: []
+  research: []
+  citation: []
+  graph: []

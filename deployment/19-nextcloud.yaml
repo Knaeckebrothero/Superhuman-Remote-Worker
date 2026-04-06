@@ -58,6 +58,12 @@ data:
     fi
 
     # =========================================================================
+    # 0. Allow connections to cluster-internal services (SSRF protection override)
+    #    Required because Keycloak runs as an internal K8s service.
+    # =========================================================================
+    occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
+
+    # =========================================================================
     # 1. OIDC provider registration
     # =========================================================================
     if [ -z "$CLIENT_SECRET" ] || [ -z "$DISCOVERY_URI" ]; then

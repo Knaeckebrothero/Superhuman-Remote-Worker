@@ -43,6 +43,12 @@ if ! occ status --output=json 2>/dev/null | grep -q '"installed":true'; then
 fi
 
 # =============================================================================
+# 0. Allow connections to local/internal services (SSRF protection override)
+#    Required when Keycloak runs as a local Docker/K8s service.
+# =============================================================================
+occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
+
+# =============================================================================
 # 1. OIDC provider registration
 # =============================================================================
 if [ -z "$CLIENT_SECRET" ] || [ -z "$DISCOVERY_URI" ]; then

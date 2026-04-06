@@ -44,10 +44,13 @@ Tool categories are toggle-able on/off. Categories differ by mode:
 |----------|-----|-------------|-----|---------|---------|
 | Research | `tools.research` | Web search, paper search, browsing | Y | Y | - |
 | Citation | `tools.citation` | Citation and literature management | Y | Y | - |
-| Document | `tools.document` | Document processing and chunking | Y | Y | - |
-| Coding | `tools.coding` | Shell command execution | Y | Y | - |
+| Shell | `tools.shell` | Terminal execution (run_command, shell_execute, shell_read) | Y | Y | - |
+| Communication | `tools.communication` | Email to job owner (send_message) | Y | Y | - |
+| Delegation | `tools.delegation` | Spawn sub-jobs (delegate_work) — with inline depth/timeout params | Y | - | - |
 | Knowledge | `tools.knowledge` | Knowledge graph and memory tools | - | Y | - |
 | Git | `tools.git` | Git repository operations | - | Y | - |
+
+**Removed**: ~~Document~~ (`chunk_document` — obsolete with 1M context models)
 
 ### Group: Data Sources
 
@@ -305,10 +308,10 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 
 | Category | defaults | critic | curator | developer | scholar | interactive |
 |----------|----------|--------|---------|-----------|---------|-------------|
-| research | 10 | `[]` | `[]` | `null` | 9 | 1 (web_search) |
-| citation | 11 | `[]` | `[]` | `null` | `[]` | `[]` |
-| document | 1 | `[]` | `[]` | `null` | `[]` | `[]` |
-| coding | 2 | 1 | `[]` | 2 | 1 | 2 |
+| research | 10 | `[]` | `[]` | `[]` (fixed) | 9 | 1 (web_search) |
+| citation | 11 | `[]` | `[]` | `[]` (fixed) | `[]` | `[]` |
+| ~~document~~ | ~~1~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | **DELETE CATEGORY** |
+| shell (was coding) | 2 | 1 | `[]` | 2 | 1 | 2 |
 | knowledge | 10 | inherited (10) | 9 | inherited (10) | inherited (10) | `[]` |
 | git | 5 | 5 | 5 | 4 | 5 | 4 |
 | communication | 1 | inherited | inherited | inherited | inherited | `[]` |
@@ -318,23 +321,28 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 
 ---
 
-### Issues Found
+### Design Decisions
 
-| # | Issue | Severity | Type |
-|---|-------|----------|------|
-| 1 | **"coding" is misnamed** — tools are general shell execution | Medium | Naming |
-| 2 | **"document" has 1 tool** — chunk_document alone | Medium | Category structure |
-| 3 | **Knowledge + Git have no Job UI toggle** | Medium | UI gap |
-| 4 | **Communication has no toggle** | Low | UI gap |
-| 5 | **CLI clients not in agent Docker image** — read-write datasource mode broken | High | Infrastructure |
-| 6 | **Developer expert uses `null` not `[]`** — cockpit `prefillFromConfig()` checks `Array.isArray()`, `null` removes the key → shows as "not disabled" | Medium | Bug |
-| 7 | **claude_code is dead code** | Low | Cleanup |
-| 8 | **delegate_work is placeholder** — Advanced UI exists but tool not implemented | Medium | Feature gap |
-| 9 | **Critic/Scholar enable delegation** — will break when placeholder is replaced | Low | Config |
-| 10 | **Interactive disables knowledge entirely** | Low | Design choice |
-| 11 | **Re-enabling a category restores defaults, not expert's list** | Low | UI logic |
-| 12 | **`cloud:` key missing from defaults.yaml** | Low | Config |
-| 13 | **Neo4j has no separate write tool** — read/write modes get same tools | Low | Feature gap |
+| # | Issue | Decision | Status |
+|---|-------|----------|--------|
+| 1 | "coding" is misnamed | **Rename to "shell"** — tools are general terminal execution, not coding-specific | TODO |
+| 2 | "document" has 1 tool (chunk_document) | **Delete the tool and the category.** Models have 1M context windows now; chunking adds no value. | TODO |
+| 3 | Knowledge has no Job UI toggle | **Not needed as a tool toggle.** Knowledge graph access is already controlled by the "Project memory" toggle (per-project setting in project detail + override in ExecutionGroup). Git is part of the strategic/tactical loop and should not be toggleable for jobs. | Resolved (already works) |
+| 4 | Communication has no toggle | **Add as a tool category** called "Communication" with its own toggle in the Tools group. | TODO |
+| 5 | CLI clients not in agent Docker image | **Should be auto-installed.** The assumption was CLI clients would be installed automatically when needed. Needs investigation — may need Dockerfile changes or dynamic installation logic. | TODO (infrastructure) |
+| 6 | Developer expert uses `null` not `[]` | **Fixed.** Changed `config/experts/developer/config.yaml` to use `[]` for disabled categories. | DONE |
+| 7 | claude_code is dead code | **Delete it.** Anthropic bans this usage pattern and it never worked well. | TODO |
+| 8 | delegate_work is placeholder | **Should become a tool toggle** in the Tools group (not a separate Advanced accordion section). When implemented, delegation appears as a tool category alongside Shell, Research, etc. The Advanced delegation params (max_depth, timeout) show inline when the toggle is on. | TODO (design) |
+| 9 | Critic/Scholar enable delegation | Review when delegate_work is implemented. Currently harmless (placeholder guard). | Deferred |
+| 10 | Interactive disables knowledge entirely | Noted. May want to revisit — limits session usefulness. | Deferred |
+| 11 | Re-enabling category restores defaults, not expert's list | Noted. Low priority — edge case. | Deferred |
+| 12 | `cloud:` key missing from defaults.yaml | Add for consistency. | TODO (minor) |
+| 13 | Neo4j has no separate write tool | Noted. Low priority — read/write modes get same tools. | Deferred |
+
+### Remaining Issues (not yet decided)
+
+- **Datasource tools in the UI**: When a datasource is attached, should the injected tools appear as read-only indicators in the Tools section? Currently invisible to the user.
+- **Session knowledge toggle**: Sessions don't show the project memory toggle. Should they?
 
 ---
 
@@ -395,7 +403,25 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 
 ## Proposed Optimal Grouping
 
-Based on the research above, here is a proposed restructuring. The core insight is the universal **three-bucket model**: Identity/Behavior, Capabilities, Technical — ordered by user impact and frequency of change.
+Based on research + design decisions above. Core insight: **Identity/Behavior → Capabilities → Technical**, ordered by user impact and frequency of change.
+
+### Proposed Tool Categories (after cleanup)
+
+| Category key | UI label | Tools | Job | Session | Notes |
+|-------------|----------|-------|-----|---------|-------|
+| `research` | Research | web_search, extract_webpage, crawl_website, map_website, browse_website, download_from_website, search_papers, download_paper, get_paper_info, research_topic | Y | Y | Web + academic paper research |
+| `citation` | Citation | cite_document, cite_web, list_sources, get_citation, list_citations, edit_citation, annotate_source, get_annotations, tag_source, search_library, generate_bibliography | Y | Y | Source tracking + bibliography |
+| `shell` | Shell | run_command, shell_execute, shell_read | Y | Y | **Renamed from "coding"** — general terminal execution |
+| `communication` | Communication | send_message | Y | Y | **NEW toggle** — email to job owner |
+| `delegation` | Delegation | delegate_work | Y | - | **Moved from Advanced** — tool toggle + inline params (depth, timeout) |
+| `knowledge` | Knowledge | kb_write, kb_read, kb_list, kb_search, ... (10 tools) | - | Y | Session-only toggle. Job access controlled by Project Memory setting. |
+| `git` | Git | git_log, git_show, git_diff, git_status, git_tags | - | Y | Session-only toggle. Always-on for jobs (part of strategic/tactical loop). |
+
+**Removed**: `document` category (delete chunk_document tool — obsolete with 1M context models)
+
+**Not toggleable** (by design): workspace, core, session_task, evaluation, orchestrator — system tools
+
+**Datasource-injected** (controlled by datasource attachment + read_only flag, not toggles): sql, graph, mongodb, cloud
 
 ### Proposed structure: Job Creation
 
@@ -403,29 +429,26 @@ Based on the research above, here is a proposed restructuring. The core insight 
 
 | Group | Settings | Rationale |
 |-------|----------|-----------|
-| **Model** | Preset chips, Strategic model, Tactical model | Model is always first (every AI platform does this). Presets serve the 80% case. |
-| **Behavior** | Autonomy, Scholar toggle, Critic toggle + rounds | These define *how* the agent behaves. Renamed from "Execution" — more intuitive. |
-| **Tools** | Tool category toggles (Research, Citation, Document, Coding) | Capabilities the agent has access to. |
-| **Data Sources** | Datasource checkboxes | What data the agent can query. Hidden when empty. |
+| **Model** | Preset chips, Strategic model, Tactical model | Model is always first (universal AI platform pattern). Presets serve the 80% case. |
+| **Behavior** | Autonomy, Scholar toggle, Critic toggle + rounds | Renamed from "Execution" — defines *how* the agent behaves. Project Memory stays here (per-project, shows conditionally). |
+| **Tools** | Research, Citation, Shell, Communication, Delegation (with inline depth/timeout when on) | Capabilities the agent has. Delegation moved here from Advanced. |
+| **Data Sources** | Datasource checkboxes | What external data the agent can query. Hidden when none exist. |
 
 **Tab 2: Instructions** (unchanged)
 
 | Group | Settings | Rationale |
 |-------|----------|-----------|
-| **Custom Instructions** | Markdown textarea | Dedicated tab is correct — it needs full height. |
+| **Custom Instructions** | Markdown textarea | Dedicated tab — needs full height. Builder AI can edit via streaming. |
 
 **Tab 3: Advanced** (progressive disclosure via accordions)
 
-Reorder sections by likelihood of use, merge related sections:
-
 | Section | Settings | Change from current |
 |---------|----------|---------------------|
-| **Inference** | Reasoning, Temperature, Multimodal (per-phase: Strategic/Tactical), Top-p, Top-k, Max output tokens, Parallel tool calls | Unchanged, already well-structured |
-| **Delegation** | Enable, Max depth, Timeout | Unchanged |
-| **Safety & Limits** | Message count threshold, Tool retry count, Progress stall threshold, Max tool calls per phase, Sudo action | **Merged**: moved `sudo_action` from Shell into here — it's a safety concern, not a shell config |
-| **Memory** | Memory enabled, Budget tokens, Project memory toggle | **Merged**: moved Project memory from Settings tab — it's a tuning knob, not a primary behavior toggle |
+| **Inference** | Reasoning, Temperature, Multimodal (per-phase: Strategic/Tactical), Top-p, Top-k, Max output tokens, Parallel tool calls | Unchanged |
+| **Safety & Limits** | Message count threshold, Tool retry count, Progress stall threshold, Max tool calls per phase, Sudo action | **Merged**: sudo_action moved from Shell (it's a safety policy) |
+| **Memory** | Memory enabled, Budget tokens | Project Memory stays in Behavior group above |
 | **Context** | Compact on archive, Keep recent tool results, Keep recent messages | Unchanged |
-| **Shell & Workspace** | Shell mode, Sandbox, Shell timeout, Max read/write words, Git versioning | **Merged**: Shell + Workspace are both about the execution environment |
+| **Shell & Workspace** | Shell mode, Sandbox, Shell timeout, Max read/write words, Git versioning | **Merged**: Shell + Workspace both configure execution environment |
 | **Research & Browser** | Proxy enabled, Browser headless, Browser use vision | Unchanged |
 | **Auxiliary LLM** | Enabled, Model, Temperature | Unchanged |
 | **Resolved Config** | JSON viewer | Always last |
@@ -436,34 +459,38 @@ Reorder sections by likelihood of use, merge related sections:
 
 | Group | Settings | Rationale |
 |-------|----------|-----------|
-| **Model** | Model dropdown, Temperature slider | Model first, temperature is the only "always visible" inference param (universal pattern). Promote temperature from Advanced. |
+| **Model** | Model dropdown, Temperature slider | Model first. Temperature promoted from Advanced (only "always visible" inference param). |
 | **Behavior** | Permission Mode | Primary behavior toggle for sessions. |
-| **Tools** | Tool category toggles (6 categories) | Same as job but with Knowledge + Git. |
+| **Tools** | Research, Citation, Shell, Communication, Knowledge, Git | Session adds Knowledge + Git toggles. No Delegation (sessions use orchestrator tools instead). |
 | **Data Sources** | Datasource checkboxes | Same as job. |
-| **Session** | Idle timeout, Greeting, Auto-start Claude Code | **Promoted**: these are session-specific essentials, not "advanced." Move from Advanced accordion to main tab. |
+| **Session** | Idle timeout, Greeting, Auto-start Claude Code | **Promoted from Advanced** — these are session essentials. |
 
 **Tab 2: Advanced**
 
 | Section | Settings | Change from current |
 |---------|----------|---------------------|
-| **Inference** | Reasoning, Multimodal, Top-p, Top-k, Max output tokens, Parallel tool calls | Temperature removed (promoted to Configure tab) |
-| **Safety & Limits** | Same as job minus delegation | Same merge as job |
+| **Inference** | Reasoning, Multimodal, Top-p, Top-k, Max output tokens, Parallel tool calls | Temperature promoted to Configure tab |
+| **Safety & Limits** | Same as job minus delegation | Same |
 | **Memory** | Memory enabled, Budget tokens | Same |
 | **Context** | Same as job | Same |
-| **Shell & Workspace** | Same merge as job | Same |
+| **Shell & Workspace** | Same as job | Same |
 | **Research & Browser** | Same | Same |
 | **Auxiliary LLM** | Same | Same |
 | **Resolved Config** | JSON viewer | Always last |
 
-### Summary of key changes
+### Summary of all changes
 
 | Change | Why |
 |--------|-----|
-| Rename "Execution" → "Behavior" | Matches user mental model (NNGroup: group by mental model, not implementation) |
-| Model always first in every tab | Universal AI platform pattern |
-| Promote Temperature to Configure tab (session) | Only "always visible" inference param across all platforms |
-| Promote Session section to Configure tab | Idle timeout/greeting are essential, not advanced |
-| Move Project Memory to Advanced > Memory | It's a tuning knob, rarely changed |
-| Move Sudo Action to Safety & Limits | It's a safety policy, not a shell config |
-| Merge Shell + Workspace | Both configure the execution environment; 7 settings total is still manageable as one accordion |
-| Reorder Advanced sections by frequency | Inference (most tweaked) first, Resolved Config (read-only) last |
+| Rename "coding" → "shell" | Accurate — tools are general terminal execution |
+| Delete "document" category + chunk_document tool | Obsolete — 1M context models don't need chunking |
+| Add "communication" toggle | send_message was hidden, should be user-controllable |
+| Move delegation from Advanced accordion to Tools group | It's a capability (tool toggle), not a tuning knob |
+| Rename "Execution" → "Behavior" | Matches user mental model |
+| Model always first | Universal AI platform pattern |
+| Promote Temperature to Configure (session) | Only "always visible" inference param |
+| Promote Session settings to Configure | Idle timeout/greeting are essentials |
+| Move Sudo Action to Safety & Limits | Safety policy, not shell config |
+| Merge Shell + Workspace accordions | Both configure execution environment |
+| Knowledge: no change for jobs | Already controlled by Project Memory toggle (project-level + per-job override in Behavior group) |
+| Git: no change for jobs | Always-on — part of strategic/tactical loop design |
