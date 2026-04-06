@@ -150,6 +150,7 @@ metadata:
   namespace: superhuman-remote-worker
 spec:
   replicas: 1
+  progressDeadlineSeconds: 900
   selector:
     matchLabels:
       app: srw-nextcloud
@@ -238,6 +239,15 @@ spec:
               mountPath: /docker-entrypoint-hooks.d/before-starting/setup-nextcloud.sh
               subPath: setup-nextcloud.sh
               readOnly: true
+          startupProbe:
+            httpGet:
+              path: /status.php
+              port: 80
+              httpHeaders:
+                - name: Host
+                  value: "localhost"
+            failureThreshold: 30
+            periodSeconds: 10
           livenessProbe:
             httpGet:
               path: /status.php
@@ -245,7 +255,6 @@ spec:
               httpHeaders:
                 - name: Host
                   value: "localhost"
-            initialDelaySeconds: 60
             periodSeconds: 15
           readinessProbe:
             httpGet:
@@ -254,7 +263,6 @@ spec:
               httpHeaders:
                 - name: Host
                   value: "localhost"
-            initialDelaySeconds: 30
             periodSeconds: 10
           resources:
             requests:
