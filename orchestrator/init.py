@@ -105,10 +105,11 @@ def _parse_connection_string(connection_string: str) -> dict:
 
 
 async def ensure_sso_databases() -> bool:
-    """Create Keycloak and Nextcloud databases on the shared PostgreSQL instance.
+    """Create Keycloak database on the shared PostgreSQL instance.
 
     For fresh deployments, the compose init script (init_sso_dbs.sh) handles this.
     This function covers existing deployments where the postgres volume already exists.
+    Nextcloud uses SQLite (self-contained in its own PVC).
 
     Connects to the maintenance 'postgres' database to create the SSO databases
     and roles. Idempotent — safe to run repeatedly.
@@ -124,7 +125,6 @@ async def ensure_sso_databases() -> bool:
 
     sso_databases = [
         {"name": "keycloak", "user": "keycloak", "password": "keycloak"},
-        {"name": "nextcloud", "user": "nextcloud", "password": "nextcloud"},
     ]
 
     try:
@@ -173,7 +173,7 @@ async def ensure_sso_databases() -> bool:
 
 
 async def reset_sso_databases() -> bool:
-    """Drop Keycloak and Nextcloud databases so they re-initialize from config.
+    """Drop Keycloak database so it re-initializes from config.
 
     Keycloak imports realm-export.json only on first startup (empty DB).
     Dropping the database forces a clean re-import on next container restart.
@@ -185,7 +185,7 @@ async def reset_sso_databases() -> bool:
     parsed = _parse_connection_string(connection_string)
     maint_url = f"postgresql://{parsed['user']}:{parsed['password']}@{parsed['host']}:{parsed['port']}/postgres"
 
-    sso_databases = ["keycloak", "nextcloud"]
+    sso_databases = ["keycloak"]
 
     try:
         conn = await psycopg.AsyncConnection.connect(maint_url, autocommit=True)
