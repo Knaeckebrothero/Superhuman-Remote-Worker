@@ -175,6 +175,8 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: NEXTCLOUD_ADMIN_PASSWORD
+            - name: SQLITE_DATABASE
+              value: "nextcloud"
             - name: NEXTCLOUD_TRUSTED_DOMAINS
               value: "srw-nextcloud cloud.superhuman-remote-worker.com"
             # S3 primary storage (existing cluster MinIO)
