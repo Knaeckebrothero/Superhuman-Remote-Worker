@@ -179,6 +179,10 @@ spec:
               value: "nextcloud"
             - name: NEXTCLOUD_TRUSTED_DOMAINS
               value: "srw-nextcloud cloud.superhuman-remote-worker.com"
+            - name: NEXTCLOUD_TRUSTED_PROXIES
+              value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+            - name: OVERWRITEPROTOCOL
+              value: "https"
             # S3 primary storage (existing cluster MinIO)
             - name: OBJECTSTORE_S3_BUCKET
               value: "srw-nextcloud"
