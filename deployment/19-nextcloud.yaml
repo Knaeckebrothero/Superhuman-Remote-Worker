@@ -4,7 +4,7 @@
 #   The 'nextcloud' database must exist on srw-postgres. Handled automatically
 #   by ensure_sso_databases() in orchestrator/init.py.
 #
-# Auto-configuration:
+# Autoconfiguration:
 #   A before-starting hook (setup-nextcloud.sh from ConfigMap srw-nextcloud-hooks)
 #   runs on every container start. It configures OIDC, installs the groupfolders
 #   app, creates the srw-agents group, and provisions the agent-service user.
