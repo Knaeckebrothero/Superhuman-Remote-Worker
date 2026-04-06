@@ -32,10 +32,10 @@ MAX_OUTPUT_CHARS = 50000
 # Tool metadata for registry
 CLAUDE_CODE_METADATA: Dict[str, Dict[str, Any]] = {
     "claude_code": {
-        "module": "coding.claude_code",
+        "module": "shell.claude_code",
         "function": "claude_code",
         "description": "Delegate a task to a Claude Code session for heavy work (writing, research, file ops)",
-        "category": "coding",
+        "category": "shell",
         "short_description": "Spawn Claude Code to do heavy work (writing, research, file ops).",
         "phases": ["strategic", "tactical"],
     },

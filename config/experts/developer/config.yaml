@@ -40,7 +40,7 @@ tools:
     - search_files
     - file_exists
     - get_document_info
-  coding:
+  shell:
     - run_command
     - shell_read
   core:
@@ -55,7 +55,6 @@ tools:
     - git_status
     - git_tags
   # Disable unused tool categories
-  document: []
   research: []
   citation: []
   graph: []

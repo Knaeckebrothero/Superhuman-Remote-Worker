@@ -756,14 +756,13 @@ class ToolsConfig:
 
     workspace: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
-    document: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
     sql: List[str] = field(default_factory=list)
     mongodb: List[str] = field(default_factory=list)
     git: List[str] = field(default_factory=list)
-    coding: List[str] = field(default_factory=list)
+    shell: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
     cloud: List[str] = field(default_factory=list)
@@ -1201,14 +1200,13 @@ def load_agent_config(
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
-        document=tools_data.get("document", []),
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
-        coding=tools_data.get("coding", []),
+        shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         delegation=tools_data.get("delegation", []),
@@ -1390,14 +1388,13 @@ def load_agent_config_from_dict(
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
-        document=tools_data.get("document", []),
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         sql=tools_data.get("sql", []),
         mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
-        coding=tools_data.get("coding", []),
+        shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
         delegation=tools_data.get("delegation", []),
@@ -2484,14 +2481,13 @@ def load_instructions(config: AgentConfig, model: str = "") -> str:
         all_tools = []
         all_tools.extend(config.tools.workspace)
         all_tools.extend(config.tools.core)
-        all_tools.extend(config.tools.document)
         all_tools.extend(config.tools.research)
         all_tools.extend(config.tools.citation)
         all_tools.extend(config.tools.graph)
         all_tools.extend(config.tools.sql)
         all_tools.extend(config.tools.mongodb)
         all_tools.extend(config.tools.git)
-        all_tools.extend(config.tools.coding)
+        all_tools.extend(config.tools.shell)
         all_tools.extend(config.tools.evaluation)
         tools_str = ", ".join(all_tools) if all_tools else "(none configured)"
 
@@ -2624,14 +2620,13 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     names = (
         config.tools.workspace
         + config.tools.core
-        + config.tools.document
         + config.tools.research
         + config.tools.citation
         + config.tools.graph
         + config.tools.sql
         + config.tools.mongodb
         + config.tools.git
-        + config.tools.coding
+        + config.tools.shell
         + config.tools.evaluation
         + config.tools.knowledge
         + config.tools.cloud

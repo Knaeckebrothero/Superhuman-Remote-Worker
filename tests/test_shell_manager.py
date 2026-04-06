@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None, reason="tmux not installed"
 )
 
-from src.tools.coding.shell_manager import ShellManager, TAB_NAME_PATTERN  # noqa: E402
+from src.tools.shell.shell_manager import ShellManager, TAB_NAME_PATTERN  # noqa: E402
 
 
 @pytest.fixture
@@ -465,7 +465,7 @@ class TestBlockedCommandSend:
 
     def test_send_freezes_sudo_by_default(self, manager):
         """send() returns freeze sentinel for sudo (default sudo_action=freeze)."""
-        from src.tools.coding.shell_manager import SUDO_FREEZE_SENTINEL
+        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
 
         result = manager.send("default", "sudo ls", enter=True)
         assert result == SUDO_FREEZE_SENTINEL
@@ -492,7 +492,7 @@ class TestBlockedCommandSend:
 
     def test_all_default_blocked_commands_in_send(self, manager):
         """All default blocked commands are caught by send()."""
-        from src.tools.coding.shell_manager import DEFAULT_BLOCKED_COMMANDS
+        from src.tools.shell.shell_manager import DEFAULT_BLOCKED_COMMANDS
 
         for cmd in DEFAULT_BLOCKED_COMMANDS:
             result = manager.send("default", f"{cmd} something", enter=True)
@@ -503,7 +503,7 @@ class TestApplyTailTerminalState:
     """Tests for _apply_tail handling terminal state format."""
 
     def test_terminal_state_preserved_when_short(self):
-        from src.tools.coding.shell_tools import _apply_tail
+        from src.tools.shell.shell_tools import _apply_tail
 
         output = (
             "Command timed out after 120s: ssh admin@host\n"
@@ -514,7 +514,7 @@ class TestApplyTailTerminalState:
         assert result == output  # Should not truncate
 
     def test_terminal_state_truncated_when_long(self):
-        from src.tools.coding.shell_tools import _apply_tail
+        from src.tools.shell.shell_tools import _apply_tail
 
         body_lines = [f"line {i}" for i in range(50)]
         output = (
@@ -528,7 +528,7 @@ class TestApplyTailTerminalState:
         assert "line 49" in result  # Last line preserved
 
     def test_stdout_format_still_works(self):
-        from src.tools.coding.shell_tools import _apply_tail
+        from src.tools.shell.shell_tools import _apply_tail
 
         body_lines = [f"line {i}" for i in range(50)]
         output = "Exit code: 0\n--- stdout ---\n" + "\n".join(body_lines)

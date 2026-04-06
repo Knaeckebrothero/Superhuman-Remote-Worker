@@ -20,19 +20,15 @@ from typing import Any, Dict, List
 
 from .citation import create_citation_tools, get_citation_metadata
 from .cloud import create_cloud_tools, get_cloud_metadata
-from .coding import create_coding_tools, get_coding_metadata
 from .communication import create_communication_tools, get_communication_metadata
 from .context import ToolContext
-
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
 from .core.session_task_tools import (
     create_session_task_tools,
     get_session_task_metadata,
 )
-
 # Import domain tools
-from .document import create_document_tools, get_document_metadata
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .git import create_git_tools, get_git_metadata
 from .graph import create_graph_tools, get_graph_metadata
@@ -40,8 +36,8 @@ from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 from .research import create_research_tools, get_research_metadata
+from .shell import create_shell_tools, get_shell_metadata
 from .sql import create_sql_tools, get_sql_metadata
-
 # Import workspace tools from new package
 from .workspace import create_workspace_tools, get_workspace_metadata
 
@@ -59,7 +55,6 @@ TOOL_REGISTRY.update(get_workspace_metadata())
 TOOL_REGISTRY.update(get_core_metadata())
 
 # Register domain tools
-TOOL_REGISTRY.update(get_document_metadata())
 TOOL_REGISTRY.update(get_research_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
@@ -67,7 +62,7 @@ TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_cloud_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
-TOOL_REGISTRY.update(get_coding_metadata())
+TOOL_REGISTRY.update(get_shell_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
@@ -100,7 +95,7 @@ def get_tools_by_category(category: str) -> List[str]:
     """Get tool names in a specific category.
 
     Args:
-        category: Category name (workspace, core, document, research, citation, graph)
+        category: Category name (workspace, core, research, citation, graph)
 
     Returns:
         List of tool names in the category
@@ -166,7 +161,7 @@ def get_phase_tool_summary() -> Dict[str, Dict[str, List[str]]]:
         Dictionary with structure:
         {
             "strategic": {"workspace": [...], "core": [...], ...},
-            "tactical": {"workspace": [...], "document": [...], ...}
+            "tactical": {"workspace": [...], "research": [...], ...}
         }
     """
     summary = {
@@ -212,11 +207,11 @@ def load_tools_for_phase(
         ```python
         # Load all configured tools, but only those available in strategic phase
         tools = load_tools_for_phase(
-            ["read_file", "write_file", "next_phase_todos", "chunk_document"],
+            ["read_file", "write_file", "next_phase_todos", "web_search"],
             phase="strategic",
             context=ctx
         )
-        # Result: Only read_file, write_file, next_phase_todos (chunk_document is tactical-only)
+        # Result: Only tools available in the strategic phase
         ```
     """
     filtered_names = filter_tools_by_phase(tool_names, phase)
@@ -313,18 +308,6 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded session task tool: {tool.name}")
         except Exception as e:
             logger.debug(f"Session task tools not available: {e}")
-
-    # Document tools
-    if "document" in tools_by_category:
-        try:
-            doc_tools = create_document_tools(context)
-            requested = set(tools_by_category["document"])
-            for tool in doc_tools:
-                if tool.name in requested:
-                    all_tools.append(tool)
-                    logger.debug(f"Loaded document tool: {tool.name}")
-        except Exception as e:
-            logger.warning(f"Could not load document tools: {e}")
 
     # Research tools
     if "research" in tools_by_category:
@@ -427,20 +410,20 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             except Exception as e:
                 logger.warning(f"Could not load git tools: {e}")
 
-    # Coding tools
-    if "coding" in tools_by_category:
+    # Shell tools
+    if "shell" in tools_by_category:
         if not context.has_workspace():
-            logger.warning("Coding tools require workspace_manager in ToolContext")
+            logger.warning("Shell tools require workspace_manager in ToolContext")
         else:
             try:
-                coding_tools = create_coding_tools(context)
-                requested = set(tools_by_category["coding"])
-                for tool in coding_tools:
+                shell_tools = create_shell_tools(context)
+                requested = set(tools_by_category["shell"])
+                for tool in shell_tools:
                     if tool.name in requested:
                         all_tools.append(tool)
-                        logger.debug(f"Loaded coding tool: {tool.name}")
+                        logger.debug(f"Loaded shell tool: {tool.name}")
             except Exception as e:
-                logger.warning(f"Could not load coding tools: {e}")
+                logger.warning(f"Could not load shell tools: {e}")
 
     # Evaluation tools
     if "evaluation" in tools_by_category:
@@ -519,7 +502,7 @@ def load_tools_by_category(category: str, context: ToolContext) -> List[Any]:
     """Load all tools in a specific category.
 
     Args:
-        category: Category name (workspace, core, document, research, citation, graph)
+        category: Category name (workspace, core, research, citation, graph)
         context: ToolContext with dependencies
 
     Returns:

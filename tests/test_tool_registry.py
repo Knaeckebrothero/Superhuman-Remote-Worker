@@ -4,10 +4,12 @@ Tests the centralized tool registry, phase-aware filtering, dynamic tool
 registration, and instruction enforcement wrappers.
 """
 
-import pytest
-from unittest.mock import MagicMock
 from dataclasses import dataclass
+from unittest.mock import MagicMock
 
+import pytest
+
+from src.tools.context import ToolContext
 from src.tools.registry import (
     TOOL_REGISTRY,
     get_available_tools,
@@ -22,7 +24,6 @@ from src.tools.registry import (
     unregister_tool,
     apply_instruction_enforcement,
 )
-from src.tools.context import ToolContext
 
 
 # =============================================================================
@@ -93,14 +94,13 @@ class TestRegistryMetadata:
         expected = {
             "workspace",
             "core",
-            "document",
             "research",
             "citation",
             "graph",
             "sql",
             "mongodb",
             "git",
-            "coding",
+            "shell",
         }
         for cat in expected:
             assert cat in categories, f"Missing category: {cat}"

@@ -477,7 +477,7 @@ export class SessionCreateComponent implements OnInit {
 
     try {
       const resp = await firstValueFrom(
-        this.http.post<{ thread_id: string }>(`${environment.apiUrl}/threads`, body)
+        this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
       );
       if (resp?.thread_id) {
         this.router.navigate(['/sessions', resp.thread_id]);

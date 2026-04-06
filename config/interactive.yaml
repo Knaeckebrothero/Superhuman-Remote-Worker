@@ -18,7 +18,7 @@ tools:
     - search_files
   research:
     - web_search
-  coding:
+  shell:
     - run_command
     - shell_read
   git:
@@ -27,7 +27,6 @@ tools:
     - git_diff
   orchestrator: [ ]
   core: [ ]
-  document: [ ]
   citation: [ ]
   graph: [ ]
   sql: [ ]

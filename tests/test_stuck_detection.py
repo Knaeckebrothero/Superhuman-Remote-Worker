@@ -9,12 +9,12 @@ See docs/features/stuck_agent_recovery.md for the full design.
 """
 
 import json
-import pytest
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
 
 # Add project root to path
@@ -43,7 +43,7 @@ class FakeToolsConfig:
     sql: list = field(default_factory=list)
     mongodb: list = field(default_factory=list)
     git: list = field(default_factory=list)
-    coding: list = field(default_factory=list)
+    shell: list = field(default_factory=list)
     evaluation: list = field(default_factory=list)
     knowledge: list = field(default_factory=list)
     cloud: list = field(default_factory=list)

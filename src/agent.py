@@ -1600,7 +1600,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         if use_remote_shell or shutil.which("tmux"):
             try:
-                from src.tools.coding.shell_manager import ShellManager
+                from src.tools.shell.shell_manager import ShellManager
 
                 shell_config = self.config.extra.get("shell", {})
                 cc_config = self.config.extra.get("claude_code", {})

@@ -130,7 +130,7 @@ class PersistentSession:
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
 
-        # 2. Set up shell manager BEFORE tools so coding tools can detect it
+        # 2. Set up shell manager BEFORE tools so shell tools can detect it
         self._setup_shell_manager()
 
         # 3. Create tool context and load tools
@@ -374,7 +374,7 @@ class PersistentSession:
             return
 
         try:
-            from src.tools.coding.shell_manager import ShellManager
+            from src.tools.shell.shell_manager import ShellManager
 
             shell_config = self.config.extra.get("shell", {})
             self.shell_manager = ShellManager(
