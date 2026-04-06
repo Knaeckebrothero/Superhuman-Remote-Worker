@@ -75,14 +75,11 @@ Instead of `--mode worker` vs `--mode persistent` at container start, the pod st
                     └──────────┬──────────┘
                                │
                         ┌──────▼──────┐
-                        │  COOLDOWN   │
-                        │  (30s idle) │
-                        └──────┬──────┘
-                               │
-                        ┌──────▼──────┐
-                        │    IDLE     │ ← Ready for next task
+                        │  POD EXIT   │ ← Process exits, K8s/Docker restarts fresh
                         └─────────────┘
 ```
+
+**Pod-per-task model:** Each pod handles exactly one task (job or session), then exits. K8s `restartPolicy: Always` or Docker Compose `restart: unless-stopped` brings up a fresh container. This eliminates memory leaks, workspace artifacts, and state contamination between tasks. Pod restart time (~10-15s) replaces the old 30s cooldown.
 
 ### Agent-Side Changes
 
@@ -105,7 +102,6 @@ class PodState(str, Enum):
     IDLE = "idle"           # Ready for any work
     WORKING = "working"     # Processing a job
     SESSION = "session"     # Serving a persistent session
-    COOLDOWN = "cooldown"   # Post-task cooldown before accepting new work
 
 _pod_state: PodState = PodState.IDLE
 ```
@@ -155,7 +151,7 @@ Heartbeat reports the current state:
 ```python
 def get_status() -> str:
     match _pod_state:
-        case PodState.IDLE | PodState.COOLDOWN:
+        case PodState.IDLE:
             return "ready"
         case PodState.WORKING:
             return "working"
@@ -220,19 +216,9 @@ WHERE status = 'ready' AND agent_mode IN ('persistent', 'dual') AND thread_id IS
 
 #### 3. Priority and Fairness
 
-When both a job and a session are waiting, the orchestrator needs a decision rule. Options:
+When both a job and a session are waiting, the orchestrator needs a decision rule.
 
-| Strategy | Behavior | Trade-off |
-|----------|----------|-----------|
-| **FIFO** (recommended) | First request to arrive gets the next idle pod | Simple, fair, predictable |
-| **Session-priority** | Sessions always win (interactive users are waiting) | Workers starve under session load |
-| **Job-priority** | Jobs always win (batch throughput matters) | Interactive latency suffers |
-| **Split pool** | Reserve N pods for sessions, rest for jobs | Partial resource sharing, configurable |
-
-**Recommended approach:** FIFO with optional reservation. The dispatcher runs on a 30s cycle; session attachment is immediate (via REST call). To prevent starvation:
-
-- The job dispatcher skips dual pods that had a session within the last `session_cooldown` seconds (e.g., 10s) — gives session assignment a brief priority window.
-- Configurable `min_session_reserve` (default: 0): if fewer than N dual pods are idle, skip them for job dispatch, reserving them for potential sessions.
+**Approach:** FIFO — first request to arrive gets the next idle pod. The dispatcher runs on a 30s cycle; session attachment is immediate (via REST call to the pod). No reservation logic, no priority tiers. If all pods are busy, new work waits for a pod to restart after completing its task. The HPA scales up if idle pods drop below the target ratio.
 
 #### 4. Thread Provisioning Changes
 
@@ -315,7 +301,7 @@ spec:
 | Mount persistent routes from `persistent_app.py` | `src/api/dual_app.py` | M |
 | Unified lifespan (create agent once, support both paths) | `src/api/dual_app.py` | M |
 | Add `--mode dual` to entry point | `agent.py` | S |
-| State transition logic (IDLE -> WORKING/SESSION -> COOLDOWN -> IDLE) | `src/api/dual_app.py` | M |
+| State transition logic (IDLE -> WORKING/SESSION -> exit) | `src/api/dual_app.py` | M |
 | Tests: state guards, concurrent request rejection | `tests/test_dual_app.py` | M |
 
 **Validation:** Start pod in dual mode, manually POST `/job/start` — verify it processes. POST `/session/attach` — verify it serves. Confirm mutual exclusion.
@@ -329,7 +315,7 @@ spec:
 | Add `'session'` to valid agent statuses | `orchestrator/database/schema.sql` | S |
 | Update `get_available_agents()` to include dual-mode | `orchestrator/database/postgres.py` | S |
 | Update `_find_idle_persistent_agent()` to include dual-mode | `orchestrator/main.py` | S |
-| Add `session_cooldown` and `min_session_reserve` config | `orchestrator/main.py` | S |
+| Reduce default session idle timeout to 15 minutes | `config/persistent_defaults.yaml` | S |
 | Update registration to accept `agent_mode='dual'` | `orchestrator/main.py` | S |
 | Update heartbeat to handle `status='session'` | `orchestrator/database/postgres.py` | S |
 | Tests: dispatch prefers idle dual pod, mutual exclusion | `tests/test_dispatch_dual.py` | M |
@@ -348,15 +334,16 @@ spec:
 | Update Docker Compose for dual mode | `docker-compose*.yaml` | S |
 | Update Fleet/Kustomize overlays | `deployment-local/` | S |
 
-### Phase 4: Backward Compatibility Cleanup
+### Phase 4: Cleanup and Documentation
 
-**Scope:** Deprecate `--mode worker` and `--mode persistent` flags. Keep them functional but make `dual` the default.
+**Scope:** `--mode dual` is already the default. Clean up references to old modes and update docs.
 
 | Task | File | Effort |
 |------|------|--------|
-| Deprecation warning on `--mode worker/persistent` | `agent.py` | S |
-| Update CLAUDE.md and docs | Various | S |
-| Migration guide for existing deployments | `docs/` | S |
+| Update CLAUDE.md command examples to use dual mode | `CLAUDE.md` | S |
+| Add pod-exit-after-task logic (process exits after job/session completes) | `src/api/dual_app.py` | S |
+| Update Docker Compose files for dual mode and restart policy | `docker-compose*.yaml` | S |
+| Update CI/CD pipeline if it references `--mode` | `.github/workflows/` | S |
 
 ## Edge Cases and Risks
 
@@ -382,8 +369,8 @@ async def _enter_worker_mode(request):
 
 **Mitigation:**
 - HPA scales up based on idle ratio metric (target 25% idle).
-- `min_session_reserve` is *bidirectional* — can also be configured as `min_worker_reserve` to prevent all pods from being claimed by sessions.
-- Idle timeout on sessions (default 30min) returns pods to the pool.
+- Idle timeout on sessions (15 minutes) exits the pod and returns capacity to the pool.
+- Active sessions (user sending messages) are not affected by the timeout — only idle ones.
 - Orchestrator dashboard shows pool utilization breakdown (idle/working/session).
 
 ### Session Resume After Pod Replacement
@@ -400,23 +387,13 @@ async def _enter_worker_mode(request):
 
 **Scenario:** A pod serves a persistent session with custom config (e.g., `temperature=0.3`), then picks up a worker job that expects default config.
 
-**Mitigation:** Each mode transition creates fresh state:
-- Worker mode: `process_job()` loads config from scratch per job (already true today).
-- Session mode: `_attach_session()` creates a new `PersistentSession` with its own config (already true today).
-- `_detach_session()` cleans up all session state before returning to IDLE.
-
-The `UniversalAgent` instance persists across transitions (expensive to recreate — LLM clients, DB pools), but its mutable state (messages, tools, config overrides) is reset per task.
+**Mitigation:** Not an issue — pods exit after every task. Each new pod starts with a clean `UniversalAgent` instance. No state, config, or workspace artifacts carry over.
 
 ### Workspace Isolation
 
 **Scenario:** A job writes files to the workspace, then a session starts and sees leftover files.
 
-**Mitigation:** Workspaces are already task-scoped:
-- Worker jobs get a dedicated workspace directory (`workspace/job_<uuid>/`).
-- Sessions get a dedicated workspace (`workspace/thread_<uuid>/`).
-- The `UniversalAgent`'s workspace manager is re-initialized on each mode entry.
-
-No cross-contamination is possible as long as each task uses its own workspace path (already enforced).
+**Mitigation:** Not an issue — pods exit after every task, so no workspace artifacts persist. Additionally, workspaces are already task-scoped (job gets `workspace/job_<uuid>/`, session gets `workspace/thread_<uuid>/`).
 
 ## Metrics and Observability
 
@@ -424,12 +401,10 @@ New metrics to expose from dual-mode pods:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `agent_pod_state` | Gauge (enum) | Current state: idle, working, session, cooldown |
-| `agent_jobs_served` | Counter | Total jobs processed since pod start |
-| `agent_sessions_served` | Counter | Total sessions served since pod start |
-| `agent_mode_transitions` | Counter (by from/to) | State transition counts |
-| `agent_idle_seconds` | Histogram | Time spent in IDLE before next task |
-| `agent_task_seconds` | Histogram (by mode) | Time spent in WORKING or SESSION per task |
+| `agent_pod_state` | Gauge (enum) | Current state: idle, working, session |
+| `agent_task_type` | Label | Whether this pod served a job or session (reported at exit) |
+| `agent_task_seconds` | Histogram (by type) | Time from task start to pod exit |
+| `agent_idle_seconds` | Histogram | Time spent in IDLE before receiving a task |
 
 Orchestrator-level:
 
@@ -444,16 +419,17 @@ Orchestrator-level:
 ## Non-Goals
 
 - **Concurrent job + session on the same pod**: Out of scope. Both modes are CPU/memory intensive and share the same LLM client. Running both simultaneously would degrade quality and complicate state management. The one-task-at-a-time model is retained.
+- **Multi-task pod lifecycle**: Pods exit after every task. No reuse, no task counters, no cooldown. Fresh container on every restart eliminates an entire class of state management bugs.
+- **Sticky sessions**: No mechanism to pin a session to a specific pod. The 15-minute idle timeout and checkpoint/resume handle all lifecycle needs. If a session is interrupted (pod crash, timeout), the user reconnects and a new pod restores from DB state.
 - **Live migration**: Moving an active job or session from one pod to another mid-execution. Checkpoint/resume already handles pod failures; live migration adds complexity without clear benefit.
-- **Automatic mode preference learning**: The orchestrator won't track which pods "perform better" at jobs vs sessions. All dual pods are fungible.
+- **Demand-aware eviction**: The orchestrator won't force-detach idle sessions when jobs are queuing. The 15-minute idle timeout is sufficient. HPA handles capacity scaling.
 
-## Open Questions
+## Decisions
 
-1. **Should `--mode dual` be the default immediately, or opt-in first?**
-   Making it the default is cleaner but requires all existing deployments to update. A phased rollout (opt-in in v1, default in v2) is safer.
+1. **`--mode dual` is the default immediately.** We're still in development — no backward-compatibility ceremony needed. The old `--mode worker` and `--mode persistent` flags remain functional but are no longer the default.
 
-2. **Session idle timeout vs. job dispatch pressure**: Should the orchestrator force-detach idle sessions when job demand is high? Currently, idle timeout is purely time-based (30min). Adding demand-aware eviction adds complexity but improves utilization.
+2. **Session idle timeout reduced to 15 minutes (from 30).** No demand-aware eviction logic. The shorter timeout is a simple way to return pods to the pool faster without adding orchestrator complexity. If 15 minutes proves too aggressive, we adjust the number.
 
-3. **Max sessions per pod lifecycle**: Current persistent pods have `PERSISTENT_MAX_SESSIONS` (default varies). Should dual pods track total tasks (jobs + sessions) served and restart after N to prevent memory leaks? Or rely on K8s pod lifecycle management?
+3. **Pod restarts after every job or session.** No task counter, no `PERSISTENT_MAX_SESSIONS`. After a job completes or a session detaches, the pod exits and K8s/Docker restarts a fresh one. This eliminates memory leak concerns entirely — no LLM client state, tool caches, or workspace artifacts can accumulate across tasks. The 30s cooldown before accepting new work is replaced by pod restart time (~10-15s for a fresh container).
 
-4. **Dedicated persistent pods for premium/long sessions**: Some use cases (multi-hour interactive sessions, sessions with large VM workspaces) may benefit from a dedicated pod that doesn't return to the pool. Keep `--mode persistent` for these, or add a "sticky" flag to the session attach request?
+4. **No sticky sessions.** The 15-minute idle timeout is sufficient. Active sessions (user is sending messages) never time out. If sticky sessions become a real issue later, we revisit — but don't build it now.
