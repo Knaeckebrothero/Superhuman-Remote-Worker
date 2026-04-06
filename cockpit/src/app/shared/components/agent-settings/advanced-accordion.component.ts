@@ -239,62 +239,6 @@ import {getReasoningOptions} from './reasoning-options';
         }
       </div>
 
-      <!-- Delegation (job only) -->
-      @if (mode() === 'job') {
-        <div class="accordion-section" [class.expanded]="expanded().has('delegation')">
-          <button type="button" class="accordion-header" (click)="toggleSection('delegation')">
-            <span class="accordion-icon">{{ expanded().has('delegation') ? 'expand_less' : 'expand_more' }}</span>
-            Delegation
-          </button>
-          @if (expanded().has('delegation')) {
-            <div class="accordion-body">
-              <div class="field-row toggle-row" [class.modified]="delegationEnabled() !== null">
-                <label class="toggle-label">
-                  <input type="checkbox"
-                    [checked]="delegationEnabled() ?? resolvedDelegationEnabled()"
-                    (change)="onDelegationEnabledChange($event)"
-                    [disabled]="disabled()">
-                  <span>Enable delegation</span>
-                </label>
-                @if (delegationEnabled() !== null) {
-                  <button type="button" class="reset-btn" (click)="delegationEnabled.set(null); emitChange()">close</button>
-                }
-              </div>
-              @if (effectiveDelegationEnabled()) {
-                <div class="field-row" [class.modified]="delegationMaxDepth() !== null">
-                  <label class="field-label">Max depth</label>
-                  <div class="field-control">
-                    <select class="form-input"
-                      [ngModel]="delegationMaxDepth() ?? resolvedDelegationMaxDepth()"
-                      (ngModelChange)="onDelegationMaxDepthChange($event)"
-                      [disabled]="disabled()">
-                      <option [ngValue]="1">1</option>
-                      <option [ngValue]="2">2</option>
-                      <option [ngValue]="3">3</option>
-                    </select>
-                    @if (delegationMaxDepth() !== null) {
-                      <button type="button" class="reset-btn" (click)="delegationMaxDepth.set(null); emitChange()">close</button>
-                    }
-                  </div>
-                </div>
-                <div class="field-row" [class.modified]="delegationTimeout() !== null">
-                  <label class="field-label">Default timeout (seconds)</label>
-                  <div class="field-control">
-                    <input type="number" class="form-input compact-input" min="60" step="60"
-                      [ngModel]="delegationTimeout() ?? resolvedDelegationTimeout()"
-                      (ngModelChange)="onDelegationTimeoutChange($event)"
-                      [disabled]="disabled()">
-                    @if (delegationTimeout() !== null) {
-                      <button type="button" class="reset-btn" (click)="delegationTimeout.set(null); emitChange()">close</button>
-                    }
-                  </div>
-                </div>
-              }
-            </div>
-          }
-        </div>
-      }
-
       <!-- Limits & Safety -->
       <div class="accordion-section" [class.expanded]="expanded().has('limits')">
         <button type="button" class="accordion-header" (click)="toggleSection('limits')">
@@ -947,11 +891,6 @@ export class AdvancedAccordionComponent {
   readonly maxOutputTokens = signal<number | null>(null);
   readonly parallelToolCalls = signal<boolean | null>(null);
 
-  // --- Delegation ---
-  readonly delegationEnabled = signal<boolean | null>(null);
-  readonly delegationMaxDepth = signal<number | null>(null);
-  readonly delegationTimeout = signal<number | null>(null);
-
   // --- Limits ---
   readonly messageCountThreshold = signal<number | null>(null);
   readonly toolRetryCount = signal<number | null>(null);
@@ -1031,10 +970,6 @@ export class AdvancedAccordionComponent {
   readonly resolvedMaxOutputTokens = computed(() => this.r('llm.max_output_tokens') as number | null);
   readonly resolvedParallelToolCalls = computed(() => (this.r('llm.parallel_tool_calls') ?? false) as boolean);
 
-  readonly resolvedDelegationEnabled = computed(() => (this.r('delegation.enabled') ?? false) as boolean);
-  readonly resolvedDelegationMaxDepth = computed(() => (this.r('delegation.max_depth') ?? 1) as number);
-  readonly resolvedDelegationTimeout = computed(() => (this.r('delegation.default_timeout') ?? 7200) as number);
-
   readonly resolvedMessageCountThreshold = computed(() => (this.r('limits.message_count_threshold') ?? 300) as number);
   readonly resolvedToolRetryCount = computed(() => (this.r('limits.tool_retry_count') ?? 3) as number);
   readonly resolvedProgressStallThreshold = computed(() => (this.r('limits.progress_stall_threshold') ?? 30) as number);
@@ -1072,7 +1007,6 @@ export class AdvancedAccordionComponent {
   readonly resolvedClaudeCodeAutoStart = computed(() => (this.r('shell.auto_start_claude_code') ?? false) as boolean);
 
   // ===== Computed helpers =====
-  readonly effectiveDelegationEnabled = computed(() => this.delegationEnabled() ?? this.resolvedDelegationEnabled());
   readonly effectiveAuxEnabled = computed(() => this.auxEnabled() ?? this.resolvedAuxEnabled());
   readonly effectiveStrategicTemp = computed(() => this.strategicTemperature() ?? this.resolvedStrategicTemp());
   readonly effectiveTacticalTemp = computed(() => this.tacticalTemperature() ?? this.resolvedTacticalTemp());
@@ -1145,9 +1079,6 @@ export class AdvancedAccordionComponent {
   onTopKChange(v: number | null): void { this.topK.set(v); this.emitChange(); }
   onMaxOutputTokensChange(v: number | null): void { this.maxOutputTokens.set(v); this.emitChange(); }
   onParallelToolCallsChange(e: Event): void { this.parallelToolCalls.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onDelegationEnabledChange(e: Event): void { this.delegationEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
-  onDelegationMaxDepthChange(v: number): void { this.delegationMaxDepth.set(v); this.emitChange(); }
-  onDelegationTimeoutChange(v: number): void { this.delegationTimeout.set(v); this.emitChange(); }
   onMemoryEnabledChange(e: Event): void { this.memoryEnabled.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onCompactOnArchiveChange(e: Event): void { this.compactOnArchive.set((e.target as HTMLInputElement).checked); this.emitChange(); }
   onGitVersioningChange(e: Event): void { this.gitVersioning.set((e.target as HTMLInputElement).checked); this.emitChange(); }
@@ -1186,15 +1117,6 @@ export class AdvancedAccordionComponent {
     if (this.maxOutputTokens() !== null) llm['max_output_tokens'] = this.maxOutputTokens();
     if (this.parallelToolCalls() !== null) llm['parallel_tool_calls'] = this.parallelToolCalls();
     if (Object.keys(llm).length) o['llm'] = llm;
-
-    // Delegation
-    if (this.delegationEnabled() !== null || this.delegationMaxDepth() !== null || this.delegationTimeout() !== null) {
-      const d: Record<string, unknown> = {};
-      if (this.delegationEnabled() !== null) d['enabled'] = this.delegationEnabled();
-      if (this.delegationMaxDepth() !== null) d['max_depth'] = this.delegationMaxDepth();
-      if (this.delegationTimeout() !== null) d['default_timeout'] = this.delegationTimeout();
-      o['delegation'] = d;
-    }
 
     // Limits
     const lim: Record<string, unknown> = {};
@@ -1288,9 +1210,6 @@ export class AdvancedAccordionComponent {
     this.topK.set(null);
     this.maxOutputTokens.set(null);
     this.parallelToolCalls.set(null);
-    this.delegationEnabled.set(null);
-    this.delegationMaxDepth.set(null);
-    this.delegationTimeout.set(null);
     this.messageCountThreshold.set(null);
     this.toolRetryCount.set(null);
     this.progressStallThreshold.set(null);

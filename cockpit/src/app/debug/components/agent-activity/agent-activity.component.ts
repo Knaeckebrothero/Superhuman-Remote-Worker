@@ -1,16 +1,7 @@
-import {
-  Component,
-  inject,
-  ElementRef,
-  viewChildren,
-  viewChild,
-  signal,
-  computed,
-  effect,
-} from '@angular/core';
-import { DataService } from '../../../core/services/data.service';
-import { RequestService } from '../../services/request.service';
-import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../../core/models/audit.model';
+import {Component, computed, effect, ElementRef, inject, signal, viewChild, viewChildren,} from '@angular/core';
+import {DataService} from '../../../core/services/data.service';
+import {RequestService} from '../../services/request.service';
+import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/models/audit.model';
 
 /**
  * Agent Activity component that displays MongoDB audit trail.
@@ -750,10 +741,11 @@ export class AgentActivityComponent {
   private readonly toolCategoryColors: Record<string, string> = {
     workspace: '#89b4fa',     // Blue - file operations
     core: '#cba6f7',          // Purple - todo/job management
-    document: '#fab387',      // Peach - document processing
     research: '#94e2d5',      // Teal - web search
     citation: '#f9e2af',      // Yellow - citations
     graph: '#f5c2e7',         // Pink - Neo4j graph
+    communication: '#a6e3a1', // Green - messaging
+    delegation: '#fab387',    // Peach - child jobs
   };
 
   // Map tool names to their categories
@@ -777,8 +769,6 @@ export class AgentActivityComponent {
     todo_rewind: 'core',
     mark_complete: 'core',
     job_complete: 'core',
-    // Document tools
-    chunk_document: 'document',
     // Research tools
     web_search: 'research',
     // Citation tools
@@ -801,6 +791,10 @@ export class AgentActivityComponent {
     mongo_schema: 'mongodb',
     mongo_insert: 'mongodb',
     mongo_update: 'mongodb',
+    // Communication tools
+    send_message: 'communication',
+    // Delegation tools
+    delegate_work: 'delegation',
   };
 
   // Step type badge labels

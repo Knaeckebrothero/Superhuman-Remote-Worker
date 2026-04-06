@@ -1,14 +1,22 @@
 import {Component, computed, input, output, signal} from '@angular/core';
-import {JOB_TOOL_CATEGORIES, SESSION_TOOL_CATEGORIES, SettingsMode, ToolCategoryMeta,} from './agent-settings.types';
+import {FormsModule} from '@angular/forms';
+import {
+    JOB_TOOL_CATEGORIES,
+    readConfigPath,
+    SESSION_TOOL_CATEGORIES,
+    SettingsMode,
+    ToolCategoryMeta,
+} from './agent-settings.types';
 
 /**
  * Tool category toggles.
  * Session mode shows additional categories (knowledge, git).
+ * Delegation shows inline params (max_depth, timeout) when enabled.
  */
 @Component({
   selector: 'app-tools-group',
   standalone: true,
-  imports: [],
+  imports: [FormsModule],
   template: `
     <div class="settings-group">
       <div class="group-label">Tools</div>
@@ -38,6 +46,34 @@ import {JOB_TOOL_CATEGORIES, SESSION_TOOL_CATEGORIES, SettingsMode, ToolCategory
               >close</button>
             }
           </label>
+          @if (cat.key === 'delegation' && isCategoryEnabled('delegation')) {
+            <div class="inline-params">
+              <div class="inline-field" [class.modified]="delegationMaxDepth() !== null">
+                <label class="inline-label">Max depth</label>
+                <select class="inline-input"
+                  [ngModel]="delegationMaxDepth() ?? resolvedDelegationMaxDepth()"
+                  (ngModelChange)="onDelegationMaxDepthChange($event)"
+                  [disabled]="disabled()">
+                  <option [ngValue]="1">1</option>
+                  <option [ngValue]="2">2</option>
+                  <option [ngValue]="3">3</option>
+                </select>
+                @if (delegationMaxDepth() !== null) {
+                  <button class="reset-btn" (click)="delegationMaxDepth.set(null); change.emit()">close</button>
+                }
+              </div>
+              <div class="inline-field" [class.modified]="delegationTimeout() !== null">
+                <label class="inline-label">Timeout (sec)</label>
+                <input type="number" class="inline-input number-input" min="60" step="60"
+                  [ngModel]="delegationTimeout() ?? resolvedDelegationTimeout()"
+                  (ngModelChange)="onDelegationTimeoutChange($event)"
+                  [disabled]="disabled()">
+                @if (delegationTimeout() !== null) {
+                  <button class="reset-btn" (click)="delegationTimeout.set(null); change.emit()">close</button>
+                }
+              </div>
+            </div>
+          }
         }
       </div>
     </div>
@@ -126,6 +162,42 @@ import {JOB_TOOL_CATEGORIES, SESSION_TOOL_CATEGORIES, SettingsMode, ToolCategory
       background: rgba(243, 139, 168, 0.2);
       color: #f38ba8;
     }
+    .inline-params {
+      display: flex;
+      gap: 12px;
+      padding: 6px 10px 6px 42px;
+    }
+    .inline-field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding-left: 4px;
+      border-left: 2px solid transparent;
+    }
+    .inline-field.modified {
+      border-left-color: var(--accent-color, #cba6f7);
+    }
+    .inline-label {
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+      white-space: nowrap;
+    }
+    .inline-input {
+      padding: 4px 8px;
+      border: 1px solid var(--border-color, #45475a);
+      border-radius: 4px;
+      background: var(--surface-0, #313244);
+      color: var(--text-primary, #cdd6f4);
+      font-family: inherit;
+      font-size: 12px;
+    }
+    .inline-input:focus {
+      outline: none;
+      border-color: var(--accent-color, #cba6f7);
+    }
+    .number-input {
+      max-width: 80px;
+    }
   `],
 })
 export class ToolsGroupComponent {
@@ -142,6 +214,10 @@ export class ToolsGroupComponent {
   /** Categories the expert config originally disabled. */
   private expertDisabledCategories = new Set<string>();
 
+  /** Delegation inline params. */
+  readonly delegationMaxDepth = signal<number | null>(null);
+  readonly delegationTimeout = signal<number | null>(null);
+
   readonly categories = computed<ToolCategoryMeta[]>(() =>
     this.mode() === 'session' ? SESSION_TOOL_CATEGORIES : JOB_TOOL_CATEGORIES
   );
@@ -151,8 +227,16 @@ export class ToolsGroupComponent {
     for (const cat of this.categories()) {
       if (this.isModified(cat.key)) count++;
     }
+    if (this.delegationMaxDepth() !== null) count++;
+    if (this.delegationTimeout() !== null) count++;
     return count;
   });
+
+  // --- Resolved defaults ---
+  private r(path: string): unknown { return readConfigPath(this.config(), path); }
+
+  readonly resolvedDelegationMaxDepth = computed(() => (this.r('delegation.max_depth') ?? 1) as number);
+  readonly resolvedDelegationTimeout = computed(() => (this.r('delegation.default_timeout') ?? 7200) as number);
 
   isCategoryEnabled(key: string): boolean {
     return !this.disabledCategories().has(key);
@@ -190,10 +274,17 @@ export class ToolsGroupComponent {
       }
       return next;
     });
+    if (key === 'delegation') {
+      this.delegationMaxDepth.set(null);
+      this.delegationTimeout.set(null);
+    }
     this.change.emit();
   }
 
-  /** Build the tools config_override fragment. */
+  onDelegationMaxDepthChange(v: number): void { this.delegationMaxDepth.set(v); this.change.emit(); }
+  onDelegationTimeoutChange(v: number): void { this.delegationTimeout.set(v); this.change.emit(); }
+
+  /** Build the tools + delegation config_override fragment. */
   getOverrides(): Record<string, unknown> {
     const tools: Record<string, unknown> = {};
     const disabled = this.disabledCategories();
@@ -212,7 +303,24 @@ export class ToolsGroupComponent {
       }
     }
 
-    return Object.keys(tools).length > 0 ? { tools } : {};
+    const result: Record<string, unknown> = {};
+    if (Object.keys(tools).length > 0) result['tools'] = tools;
+
+    // Delegation config: sync delegation.enabled with the tool toggle,
+    // and include inline param overrides
+    const delegationEnabled = this.isCategoryEnabled('delegation');
+    const wasEnabledByExpert = !this.expertDisabledCategories.has('delegation');
+    const hasParamOverrides = this.delegationMaxDepth() !== null || this.delegationTimeout() !== null;
+
+    if (delegationEnabled !== wasEnabledByExpert || hasParamOverrides) {
+      const d: Record<string, unknown> = {};
+      if (delegationEnabled !== wasEnabledByExpert) d['enabled'] = delegationEnabled;
+      if (this.delegationMaxDepth() !== null) d['max_depth'] = this.delegationMaxDepth();
+      if (this.delegationTimeout() !== null) d['default_timeout'] = this.delegationTimeout();
+      result['delegation'] = d;
+    }
+
+    return result;
   }
 
   /** Called by parent when expert changes to sync disabled state. */
@@ -229,9 +337,15 @@ export class ToolsGroupComponent {
     }
     this.disabledCategories.set(disabled);
     this.expertDisabledCategories = new Set(disabled);
+
+    // Reset delegation inline params on expert change
+    this.delegationMaxDepth.set(null);
+    this.delegationTimeout.set(null);
   }
 
   resetAll(): void {
     this.disabledCategories.set(new Set(this.expertDisabledCategories));
+    this.delegationMaxDepth.set(null);
+    this.delegationTimeout.set(null);
   }
 }

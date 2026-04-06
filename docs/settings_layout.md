@@ -235,10 +235,12 @@ Removing these cripples the agent. They should never appear in the UI.
 |----------|-------|-----------------------|--------|------------|
 | **research** | 10 | Web search (Tavily), academic papers (arXiv, Semantic Scholar), browser automation (Playwright+OpenAI). All tactical-only. | Y | Y |
 | **citation** | 11 | Citation/source management via CitationEngine: create, edit, annotate, tag, search, bibliography. Both phases. | Y | Y |
-| **document** | 1 | Just `chunk_document` — splits PDF/DOCX/TXT into chunks. **Thin category.** | Y | Y |
-| **coding** | 3 | `run_command`, `shell_execute`, `shell_read`. General-purpose terminal via tmux. **Misnamed — not coding-specific.** | Y | Y |
+| ~~document~~ | — | **Deleted.** Was just `chunk_document` — obsolete with 1M context models. | — | — |
+| **shell** | 3 | `run_command`, `shell_execute`, `shell_read`. General-purpose terminal via tmux. | Y | Y |
 | **knowledge** | 10 | Project knowledge base (system Neo4j + pgvector): write, read, search, relationships, export. Both phases. | **NO** | Y |
 | **git** | 5 | Read-only git inspection (log, show, diff, status, tags). Git writes go through shell. | **NO** | Y |
+| **communication** | 1 | `send_message` — emails job owner/team. Async (continue) or blocking (freeze until reply). | Y | Y |
+| **delegation** | 1 | `delegate_work` — **PLACEHOLDER.** Registry entry has `placeholder: True`. Toggle in UI, inline params (max_depth, timeout). | Y | Y |
 
 #### Datasource-injected categories (dual-mode system)
 
@@ -255,13 +257,11 @@ Removing these cripples the agent. They should never appear in the UI.
 
 | Category | Count | How it works |
 |----------|-------|--------------|
-| **communication** | 1 | `send_message` — emails job owner. Controlled by `communication.enabled` config flag. Always on by default. |
 | **orchestrator** | 8 | Job lifecycle management (create, list, get, approve, resume, cancel, pause, get_file). Force-injected in persistent sessions, ignores config. |
-| **delegation** | 1 | `delegate_work` — **PLACEHOLDER, not implemented.** Registry entry has `placeholder: True`. No source code exists. |
 
 #### Dead code
 
-- `claude_code` tool: defined in `src/tools/coding/claude_code.py` but never imported into registry. Should be removed.
+- `claude_code` tool: defined in `src/tools/shell/claude_code.py` but never imported into registry. Should be removed.
 
 ---
 
@@ -310,7 +310,7 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 |----------|----------|--------|---------|-----------|---------|-------------|
 | research | 10 | `[]` | `[]` | `[]` (fixed) | 9 | 1 (web_search) |
 | citation | 11 | `[]` | `[]` | `[]` (fixed) | `[]` | `[]` |
-| ~~document~~ | ~~1~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | **DELETE CATEGORY** |
+| ~~document~~ | ~~1~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | ~~`[]`~~ | **DELETED** |
 | shell (was coding) | 2 | 1 | `[]` | 2 | 1 | 2 |
 | knowledge | 10 | inherited (10) | 9 | inherited (10) | inherited (10) | `[]` |
 | git | 5 | 5 | 5 | 4 | 5 | 4 |
@@ -325,14 +325,14 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 
 | # | Issue | Decision | Status |
 |---|-------|----------|--------|
-| 1 | "coding" is misnamed | **Rename to "shell"** — tools are general terminal execution, not coding-specific | TODO |
-| 2 | "document" has 1 tool (chunk_document) | **Delete the tool and the category.** Models have 1M context windows now; chunking adds no value. | TODO |
+| 1 | "coding" is misnamed | **Renamed to "shell"** — tools are general terminal execution, not coding-specific. Directory `src/tools/coding/` → `src/tools/shell/`, all configs, registry, loader, UI, tests updated. Backward-compat fallback in loader.py for old YAML. | DONE |
+| 2 | "document" has 1 tool (chunk_document) | **Deleted** — tool, directory (`src/tools/document/`), registry, loader field, all YAML configs, JSON schemas, builder prompts, agent-activity mapping, tests, README all removed. | DONE |
 | 3 | Knowledge has no Job UI toggle | **Not needed as a tool toggle.** Knowledge graph access is already controlled by the "Project memory" toggle (per-project setting in project detail + override in ExecutionGroup). Git is part of the strategic/tactical loop and should not be toggleable for jobs. | Resolved (already works) |
-| 4 | Communication has no toggle | **Add as a tool category** called "Communication" with its own toggle in the Tools group. | TODO |
+| 4 | Communication has no toggle | **Added as a tool category** called "Communication" with its own toggle in the Tools group. Added to `JOB_TOOL_CATEGORIES` + `SESSION_TOOL_CATEGORIES`, agent-activity color mapping. | DONE |
 | 5 | CLI clients not in agent Docker image | **Should be auto-installed.** The assumption was CLI clients would be installed automatically when needed. Needs investigation — may need Dockerfile changes or dynamic installation logic. | TODO (infrastructure) |
 | 6 | Developer expert uses `null` not `[]` | **Fixed.** Changed `config/experts/developer/config.yaml` to use `[]` for disabled categories. | DONE |
 | 7 | claude_code is dead code | **Delete it.** Anthropic bans this usage pattern and it never worked well. | TODO |
-| 8 | delegate_work is placeholder | **Should become a tool toggle** in the Tools group (not a separate Advanced accordion section). When implemented, delegation appears as a tool category alongside Shell, Research, etc. The Advanced delegation params (max_depth, timeout) show inline when the toggle is on. | TODO (design) |
+| 8 | delegate_work is placeholder | **Moved to tool toggle** in the Tools group. Removed delegation accordion from Advanced. Delegation toggle with inline params (max_depth, timeout) shown when enabled. Tool toggle syncs `delegation.enabled` + `tools.delegation` together. | DONE |
 | 9 | Critic/Scholar enable delegation | Review when delegate_work is implemented. Currently harmless (placeholder guard). | Deferred |
 | 10 | Interactive disables knowledge entirely | Noted. May want to revisit — limits session usefulness. | Deferred |
 | 11 | Re-enabling category restores defaults, not expert's list | Noted. Low priority — edge case. | Deferred |

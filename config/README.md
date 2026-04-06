@@ -194,10 +194,6 @@ tools:
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
 
-  # Document processing (src/tools/document/)
-  document:
-    - chunk_document
-
   # Research: web, papers, browser, workflows (src/tools/research/)
   research:
     - web_search             # Tavily web search
@@ -233,9 +229,9 @@ tools:
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
 
-  # Shell command execution (src/tools/coding/)
+  # Shell command execution (src/tools/shell/)
   # Mode controlled by shell.mode: "stateless" (default) or "persistent"
-  coding:
+  shell:
     - run_command     # Execute commands, get output (stateless mode, default)
     - shell_read      # Read more output from scrollback
     # Alternative (persistent mode): shell_execute + shell_read

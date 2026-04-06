@@ -1,4 +1,4 @@
-"""Coding toolkit - shell command execution.
+"""Shell toolkit - shell command execution.
 
 This toolkit provides tools in two modes (configured via shell.mode):
 
@@ -18,8 +18,8 @@ from typing import Any, Dict, List
 from ..context import ToolContext
 
 
-def create_coding_tools(context: ToolContext) -> List[Any]:
-    """Create all coding tools with injected context.
+def create_shell_tools(context: ToolContext) -> List[Any]:
+    """Create all shell tools with injected context.
 
     Args:
         context: ToolContext with workspace_manager
@@ -43,8 +43,8 @@ def create_coding_tools(context: ToolContext) -> List[Any]:
     return tools
 
 
-def get_coding_metadata() -> Dict[str, Dict[str, Any]]:
-    """Get metadata for all coding tools."""
+def get_shell_metadata() -> Dict[str, Dict[str, Any]]:
+    """Get metadata for all shell tools."""
     from .coding_tools import CODING_TOOLS_METADATA
     from .shell_tools import SHELL_TOOLS_METADATA
 

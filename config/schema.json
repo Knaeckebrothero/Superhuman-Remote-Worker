@@ -276,14 +276,6 @@
           "description": "Core tools: todo management + job completion (src/tools/core/)",
           "examples": [["next_phase_todos", "todo_complete", "mark_complete", "job_complete"]]
         },
-        "document": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "description": "Document processing tools (src/tools/document/)",
-          "examples": [["chunk_document"]]
-        },
         "research": {
           "type": "array",
           "items": {
@@ -332,12 +324,12 @@
           "description": "Git version control tools for workspace history (src/tools/git/)",
           "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
         },
-        "coding": {
+        "shell": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Coding/execution tools: shell commands (src/tools/coding/)",
+          "description": "Shell tools: command execution (src/tools/shell/)",
           "examples": [["run_command", "shell_read"], ["shell_execute", "shell_read"]]
         },
         "evaluation": {
@@ -355,6 +347,14 @@
           },
           "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
           "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
+        },
+        "communication": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Communication tools: agent-initiated messaging to humans via email (src/tools/communication/)",
+          "examples": [["send_message"]]
         },
         "delegation": {
           "type": "array",

@@ -194,7 +194,7 @@ class TestSetup:
     async def test_setup_calls_submethods_in_order(self):
         """Verifies setup calls sub-methods: workspace → shell → tools → bind → context → prompt → memory.
 
-        Shell must come before tools so that create_coding_tools() sees a
+        Shell must come before tools so that create_shell_tools() sees a
         non-None shell_manager and includes run_command/shell_read.
         """
         cfg = _make_config()
@@ -271,12 +271,12 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
     appear in the final tool list when shell_manager is initialised before
     tool loading.
 
-    These tests exercise the real create_coding_tools() gate
+    These tests exercise the real create_shell_tools() gate
     (``if context.shell_manager is not None``) rather than mocking it away.
     """
 
-    def test_coding_tools_include_shell_when_shell_manager_set(self):
-        """create_coding_tools returns shell tools when context.shell_manager is set."""
+    def test_shell_tools_include_shell_when_shell_manager_set(self):
+        """create_shell_tools returns shell tools when context.shell_manager is set."""
         from src.tools.context import ToolContext
 
         mock_wm = MagicMock()
@@ -288,15 +288,15 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
             shell_manager=mock_sm,
         )
 
-        from src.tools.coding import create_coding_tools
+        from src.tools.shell import create_shell_tools
 
-        tools = create_coding_tools(ctx)
+        tools = create_shell_tools(ctx)
         tool_names = [t.name for t in tools]
         assert "run_command" in tool_names
         assert "shell_read" in tool_names
 
-    def test_coding_tools_exclude_shell_when_shell_manager_none(self):
-        """create_coding_tools omits shell tools when context.shell_manager is None."""
+    def test_shell_tools_exclude_shell_when_shell_manager_none(self):
+        """create_shell_tools omits shell tools when context.shell_manager is None."""
         from src.tools.context import ToolContext
 
         mock_wm = MagicMock()
@@ -307,16 +307,16 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
             shell_manager=None,
         )
 
-        from src.tools.coding import create_coding_tools
+        from src.tools.shell import create_shell_tools
 
-        tools = create_coding_tools(ctx)
+        tools = create_shell_tools(ctx)
         tool_names = [t.name for t in tools]
         assert "run_command" not in tool_names
         assert "shell_read" not in tool_names
 
     def test_setup_tools_passes_shell_manager_to_load_tools(self):
         """_setup_tools creates ToolContext with session.shell_manager so that
-        the coding tool gate sees a non-None value."""
+        the shell tool gate sees a non-None value."""
         cfg = _make_config()
         session = _make_session(config=cfg)
         session.workspace_manager = MagicMock()
@@ -877,7 +877,7 @@ class TestSetupShellManager:
             mock_module = MagicMock()
             mock_module.ShellManager = MockSM
             with patch.dict(
-                sys.modules, {"src.tools.coding.shell_manager": mock_module}
+                sys.modules, {"src.tools.shell.shell_manager": mock_module}
             ):
                 session._setup_shell_manager()
 
@@ -916,7 +916,7 @@ class TestSetupShellManager:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.tools.coding.shell_manager": MagicMock(
+                    "src.tools.shell.shell_manager": MagicMock(
                         ShellManager=MagicMock(return_value=mock_sm)
                     )
                 },
@@ -942,7 +942,7 @@ class TestSetupShellManager:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.tools.coding.shell_manager": MagicMock(
+                    "src.tools.shell.shell_manager": MagicMock(
                         ShellManager=MagicMock(side_effect=RuntimeError("tmux broken")),
                     )
                 },
@@ -970,7 +970,7 @@ class TestSetupShellManager:
             patch.dict(
                 "sys.modules",
                 {
-                    "src.tools.coding.shell_manager": MagicMock(
+                    "src.tools.shell.shell_manager": MagicMock(
                         ShellManager=MagicMock(return_value=mock_sm)
                     )
                 },

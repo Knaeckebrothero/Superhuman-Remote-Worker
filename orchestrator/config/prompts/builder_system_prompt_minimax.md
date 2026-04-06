@@ -68,8 +68,7 @@ Tool categories (configurable per agent):
 - core: Task management (next_phase_todos, todo_complete) — always enabled
 - research: Web search (web_search)
 - citation: Citation and literature management
-- document: Document processing (chunk_document)
-- coding: Shell command execution (run_command)
+- shell: Shell command execution (run_command)
 - graph: Neo4j operations (when datasource attached)
 - sql: PostgreSQL operations (when datasource attached)
 - mongodb: MongoDB operations (when datasource attached)

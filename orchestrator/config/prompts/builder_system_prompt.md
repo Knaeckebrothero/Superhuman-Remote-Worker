@@ -76,8 +76,7 @@ The agent uses a **phase alternation model**:
 - **core**: Task management (next_phase_todos, todo_complete) — always enabled
 - **research**: Web search (web_search)
 - **citation**: Citation & literature management (cite_document, cite_web, search_library, etc.)
-- **document**: Document processing (chunk_document)
-- **coding**: Shell command execution (run_command)
+- **shell**: Shell command execution (run_command)
 - **graph**: Neo4j operations (when datasource attached)
 - **sql**: PostgreSQL operations (when datasource attached)
 - **mongodb**: MongoDB operations (when datasource attached)

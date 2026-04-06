@@ -1042,7 +1042,7 @@ class RemoteBackend(WorkspaceBackend):
         if tab_type is None:
             tab_type = "shell"
             if command:
-                from src.tools.coding.shell_manager import COMMAND_TYPE_MAP
+                from src.tools.shell.shell_manager import COMMAND_TYPE_MAP
 
                 first_word = command.strip().split()[0]
                 base_cmd = first_word.rsplit("/", 1)[-1]
