@@ -5,7 +5,7 @@ import {ModelService} from '../../../core/services/model.service';
 import {MobileShellComponent} from '../../layout/mobile-shell/mobile-shell.component';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {
-  InstructionBuilderComponent
+    InstructionBuilderComponent
 } from '../../../shared/components/instruction-builder/instruction-builder.component';
 
 @Component({
@@ -26,7 +26,7 @@ import {
             (change)="onModelChange($event)"
           >
             @for (m of builderModels(); track m.id) {
-              <option [value]="m.id">{{ m.label }}</option>
+              <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
             }
           </select>
           @if (artifacts.streaming()) {

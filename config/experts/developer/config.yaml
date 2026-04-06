@@ -18,12 +18,6 @@ tags:
 llm:
   reasoning_level: high
 
-claude_code:
-  model: openai/gpt-oss-120b
-
-shell:
-  auto_start_claude_code: true
-
 workspace:
   structure:
     - archive/

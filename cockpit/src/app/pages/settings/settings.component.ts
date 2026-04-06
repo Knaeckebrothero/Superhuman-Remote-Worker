@@ -7,11 +7,11 @@ import {ApiService} from '../../core/services/api.service';
 import {SettingsService} from '../../core/services/settings.service';
 import {ModelService} from '../../core/services/model.service';
 import {
-  ApiKeyProvider,
-  CodexStatus,
-  CommunicationSettings,
-  McpTokenCreateResponse,
-  Project
+    ApiKeyProvider,
+    CodexStatus,
+    CommunicationSettings,
+    McpTokenCreateResponse,
+    Project
 } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
@@ -118,7 +118,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <select class="form-input" [(ngModel)]="prefModel">
                   <option value="">Not set (use expert default)</option>
                   @for (group of modelService.models(); track group.group) {
-                    <optgroup [label]="group.group">
+                    <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
                       @for (model of group.models; track model) {
                         <option [value]="model">{{ model }}</option>
                       }
@@ -131,7 +131,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <select class="form-input" [(ngModel)]="prefAuxModel">
                   <option value="">Not set (use default)</option>
                   @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
               </div>
@@ -166,7 +166,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <select class="form-input" [(ngModel)]="prefVisionModel">
                   <option value="">Server default</option>
                   @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Multimodal model for describing images when primary model is text-only</span>
@@ -176,7 +176,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <select class="form-input" [(ngModel)]="prefWhisperModel">
                   <option value="">Server default</option>
                   @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Speech-to-text for audio files in workspaces</span>
@@ -188,7 +188,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <select class="form-input" [(ngModel)]="prefEmbeddingModel">
                   <option value="">Server default</option>
                   @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Vector embeddings for memory, knowledge, and citation search</span>

@@ -4,6 +4,8 @@ import {environment} from '../environment';
 
 export interface ModelGroup {
   group: string;
+  provider: string;
+  configured: boolean;
   models: string[];
 }
 
@@ -11,16 +13,19 @@ export interface ModelPreset {
   label: string;
   strategic: string;
   tactical: string;
+  configured: boolean;
 }
 
 export interface BuilderModel {
   label: string;
   id: string;
+  configured: boolean;
 }
 
 export interface HelperModel {
   id: string;
   label: string;
+  configured: boolean;
 }
 
 export interface EmbeddingModel extends HelperModel {
@@ -35,7 +40,7 @@ interface ModelsResponse {
   vision_models: HelperModel[];
   whisper_models: HelperModel[];
   embedding_models: EmbeddingModel[];
-  providers: string[];
+  configured_providers: string[];
 }
 
 /**
@@ -80,16 +85,17 @@ export class ModelService {
         this.visionModels.set(resp.vision_models ?? []);
         this.whisperModels.set(resp.whisper_models ?? []);
         this.embeddingModels.set(resp.embedding_models ?? []);
-        this.providers.set(resp.providers);
+        this.providers.set(resp.configured_providers);
         this.loading.set(false);
         this.loaded.set(true);
         this.fetchInFlight = false;
       },
       error: () => {
         // Fallback: use env.js static config if API fails
-        this.models.set(environment.models);
-        this.presets.set(environment.modelPresets);
-        this.builderModels.set(environment.builderModels);
+        // Static config lacks API-only fields (configured, provider) — cast to match
+        this.models.set(environment.models as ModelGroup[]);
+        this.presets.set(environment.modelPresets as ModelPreset[]);
+        this.builderModels.set(environment.builderModels as BuilderModel[]);
         this.providers.set([]);
         this.loading.set(false);
         this.loaded.set(true);

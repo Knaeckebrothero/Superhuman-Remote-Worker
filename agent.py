@@ -185,9 +185,9 @@ def parse_args():
     # Agent mode
     parser.add_argument(
         "--mode",
-        choices=["worker", "persistent"],
-        default="worker",
-        help="Agent mode: 'worker' (job dispatch, default) or 'persistent' (interactive session)",
+        choices=["worker", "persistent", "dual"],
+        default="dual",
+        help="Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' (jobs only), or 'persistent' (sessions only)",
     )
     parser.add_argument(
         "--thread-id",
@@ -563,6 +563,28 @@ def run_persistent_server(
     )
 
 
+def run_dual_server(config_path: str, host: str, port: int):
+    """Run the dual-mode FastAPI server.
+
+    Accepts both job dispatch (/job/start) and session attachment
+    (/session/attach). Each pod handles one task then exits.
+    """
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"Starting Dual-Mode Agent on {host}:{port}")
+    logger.info(f"Config: {config_path}")
+
+    from src.api.dual_app import create_dual_app
+
+    app = create_dual_app(config_path)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+    )
+
+
 def main():
     """Main entry point."""
     args = parse_args()
@@ -678,12 +700,20 @@ def main():
         run_persistent_server(config_path, args.host, args.port, thread_id)
         return
 
-    # API server mode (default — worker)
+    # Worker-only mode
+    if args.mode == "worker":
+        if args.no_server:
+            logger.error("Specify --job-id or --description with --no-server")
+            sys.exit(1)
+        run_server(config_path, args.host, args.port)
+        return
+
+    # Dual mode (default) — accepts both jobs and sessions
     if args.no_server:
         logger.error("Specify --job-id or --description with --no-server")
         sys.exit(1)
 
-    run_server(config_path, args.host, args.port)
+    run_dual_server(config_path, args.host, args.port)
 
 
 if __name__ == "__main__":

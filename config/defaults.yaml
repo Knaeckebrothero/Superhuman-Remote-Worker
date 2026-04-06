@@ -279,10 +279,6 @@ browser:
   use_vision: false  # DOM-based by default (works with any LLM)
   remote: auto  # "auto" (use remote Chromium when workspace is remote), "local" (always local)
 
-# Claude Code delegation settings (model for auto-started claude-code shell tab)
-claude_code:
-  model: claude-opus-4-6
-
 # Shell command execution (tmux-backed terminal multiplexer)
 # Requires tmux installed.
 shell:
@@ -294,7 +290,6 @@ shell:
   blocked_commands: [reboot, shutdown, poweroff, halt, init]
   sudo_action: freeze          # "freeze" (intercept sudo, offer VM upgrade) or "block" (hard reject)
   sandbox: true                # Restrict working directory to workspace
-  auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)
 
 # Interactive persistent agent settings
 # Only used when agent is started with --mode persistent

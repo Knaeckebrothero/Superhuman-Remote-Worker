@@ -582,18 +582,6 @@
         }
       }
     },
-    "claude_code": {
-      "type": "object",
-      "description": "Claude Code settings (model for auto-started claude-code shell tab)",
-      "properties": {
-        "model": {
-          "type": "string",
-          "default": "claude-opus-4-6",
-          "description": "Model for Claude Code sessions (--model flag)"
-        }
-      },
-      "additionalProperties": false
-    },
     "shell": {
       "type": "object",
       "description": "Shell command execution settings (tmux-backed terminal multiplexer). Requires tmux installed.",
@@ -648,11 +636,6 @@
           "default": true,
           "description": "Restrict working directory to workspace root"
         },
-        "auto_start_claude_code": {
-          "type": "boolean",
-          "default": false,
-          "description": "Auto-open a Claude Code tab on job start (requires claude CLI in PATH)"
-        }
       },
       "additionalProperties": false
     },
