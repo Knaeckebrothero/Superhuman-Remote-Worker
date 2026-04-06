@@ -172,10 +172,10 @@ async def init_all(
             if force_reset:
                 from orchestrator.init import reset_sso_databases
 
-                logger.info("  Resetting SSO databases (Keycloak, Nextcloud)...")
+                logger.info("  Resetting SSO databases (Keycloak)...")
                 await reset_sso_databases()
 
-            # Create Keycloak/Nextcloud databases on the same PostgreSQL instance
+            # Create Keycloak database on the same PostgreSQL instance
             from orchestrator.init import ensure_sso_databases
 
             logger.info("  Creating SSO databases (Keycloak, Nextcloud)...")

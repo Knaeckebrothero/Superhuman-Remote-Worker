@@ -211,6 +211,133 @@ These are set on the parent form, not inside the settings component:
 
 ---
 
+## Deep Audit: Tools, Datasources, Delegation, Experts
+
+### Tool Inventory (83 tools, 17 registry categories)
+
+#### System tools (always-on, not toggleable — by design)
+
+Removing these cripples the agent. They should never appear in the UI.
+
+| Category | Count | Purpose |
+|----------|-------|---------|
+| **workspace** | 13 | File I/O (read, write, edit, list, search, copy, move, delete, etc.) |
+| **core** | 6 | Phase/todo lifecycle (next_phase_todos, todo_complete, job_complete, etc.) — excluded in persistent mode |
+| **session_task** | 3 | task_add, task_complete, task_list — force-injected in persistent sessions |
+| **evaluation** | 2 | approve_job, return_job_with_feedback — injected for critic sub-jobs only |
+
+#### User-facing tool categories (currently in UI)
+
+| Category | Count | What they actually do | Job UI | Session UI |
+|----------|-------|-----------------------|--------|------------|
+| **research** | 10 | Web search (Tavily), academic papers (arXiv, Semantic Scholar), browser automation (Playwright+OpenAI). All tactical-only. | Y | Y |
+| **citation** | 11 | Citation/source management via CitationEngine: create, edit, annotate, tag, search, bibliography. Both phases. | Y | Y |
+| **document** | 1 | Just `chunk_document` — splits PDF/DOCX/TXT into chunks. **Thin category.** | Y | Y |
+| **coding** | 3 | `run_command`, `shell_execute`, `shell_read`. General-purpose terminal via tmux. **Misnamed — not coding-specific.** | Y | Y |
+| **knowledge** | 10 | Project knowledge base (system Neo4j + pgvector): write, read, search, relationships, export. Both phases. | **NO** | Y |
+| **git** | 5 | Read-only git inspection (log, show, diff, status, tags). Git writes go through shell. | **NO** | Y |
+
+#### Datasource-injected categories (dual-mode system)
+
+**Key design**: `read_only` is a project-level setting (on `project_datasources` junction table). One datasource can be read-only in project A and read-write in project B.
+
+| Category | Read-only mode (tools) | Read-write mode (CLI) | Issue |
+|----------|------------------------|-----------------------|-------|
+| **sql** (PostgreSQL) | sql_query, sql_schema | No tools — injects PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE, expects `psql` | **psql not in agent Docker image** |
+| **graph** (Neo4j) | execute_cypher_query, get_database_schema | No tools — injects NEO4J_URI/USERNAME/PASSWORD, expects `cypher-shell` | **cypher-shell not in agent Docker image** |
+| **mongodb** | mongo_query, mongo_aggregate, mongo_schema | No tools — injects MONGOSH_URI, expects `mongosh` | **mongosh not in agent Docker image** |
+| **cloud** (WebDAV) | cloud_list, cloud_read, cloud_info | Always uses tools (adds cloud_write, cloud_delete). No CLI equivalent. | `cloud:` key missing from defaults.yaml |
+
+#### Hidden categories (no UI toggle)
+
+| Category | Count | How it works |
+|----------|-------|--------------|
+| **communication** | 1 | `send_message` — emails job owner. Controlled by `communication.enabled` config flag. Always on by default. |
+| **orchestrator** | 8 | Job lifecycle management (create, list, get, approve, resume, cancel, pause, get_file). Force-injected in persistent sessions, ignores config. |
+| **delegation** | 1 | `delegate_work` — **PLACEHOLDER, not implemented.** Registry entry has `placeholder: True`. No source code exists. |
+
+#### Dead code
+
+- `claude_code` tool: defined in `src/tools/coding/claude_code.py` but never imported into registry. Should be removed.
+
+---
+
+### Datasource Lifecycle
+
+```
+Cockpit: user selects datasources → datasource_ids[]
+  ↓
+Orchestrator: clones global ds as job-scoped → resolve one per type (job > project > global)
+  ↓
+_build_datasource_tool_override():
+  ├─ read_only=true  → tools_override[category] = read-only tool list
+  ├─ read_only=false + webdav → tools_override[category] = full tool list
+  └─ read_only=false + managed → tools_override[category] = [] (CLI mode)
+  ↓
+Agent: _setup_job_tools()
+  ├─ read-write managed → inject typed env vars, skip tool connection
+  ├─ read-only managed → create driver connection, store in ToolContext
+  ├─ generic → inject env vars from credentials
+  └─ repository → git clone into ./repos/{slug}/
+  ↓
+workspace.md gets datasource index + KB gets retrieval-optimized notes
+```
+
+**Critical gap**: CLI clients (psql, cypher-shell, mongosh) are NOT in `Dockerfile.agent`. Read-write mode only works when workspace is a remote VM with these preinstalled. No dynamic install logic exists and agent runs as non-root.
+
+---
+
+### Delegation / Sub-Agent System (5 mechanisms)
+
+| Mechanism | Trigger | Workspace | Suspends? | Status |
+|-----------|---------|-----------|-----------|--------|
+| **Scholar** | Orchestrator, pre-job | Git worktree on same VM | Parent waits | Working |
+| **Critic** | Orchestrator, post-job | Git worktree on same VM | Parent waits | Working |
+| **delegate_work** | Agent tool call | Git worktrees, squash-merge back | Parent suspends | **PLACEHOLDER** |
+| **Orchestrator tools** (8) | Persistent agent | Independent workspace | Fire-and-forget | Working |
+| **claude_code** | Agent tool call | Same workspace (subprocess) | No | **DEAD CODE** |
+
+Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Orchestrator tools = independent dispatch. These should stay separate.
+
+---
+
+### Expert × Tool Category Matrix
+
+| Category | defaults | critic | curator | developer | scholar | interactive |
+|----------|----------|--------|---------|-----------|---------|-------------|
+| research | 10 | `[]` | `[]` | `null` | 9 | 1 (web_search) |
+| citation | 11 | `[]` | `[]` | `null` | `[]` | `[]` |
+| document | 1 | `[]` | `[]` | `null` | `[]` | `[]` |
+| coding | 2 | 1 | `[]` | 2 | 1 | 2 |
+| knowledge | 10 | inherited (10) | 9 | inherited (10) | inherited (10) | `[]` |
+| git | 5 | 5 | 5 | 4 | 5 | 4 |
+| communication | 1 | inherited | inherited | inherited | inherited | `[]` |
+| delegation | `[]` | **enabled** | `[]` | `[]` | **enabled** | `[]` |
+
+**Merge rules**: Dicts merge recursively. Arrays replace entirely. `null` removes the key.
+
+---
+
+### Issues Found
+
+| # | Issue | Severity | Type |
+|---|-------|----------|------|
+| 1 | **"coding" is misnamed** — tools are general shell execution | Medium | Naming |
+| 2 | **"document" has 1 tool** — chunk_document alone | Medium | Category structure |
+| 3 | **Knowledge + Git have no Job UI toggle** | Medium | UI gap |
+| 4 | **Communication has no toggle** | Low | UI gap |
+| 5 | **CLI clients not in agent Docker image** — read-write datasource mode broken | High | Infrastructure |
+| 6 | **Developer expert uses `null` not `[]`** — cockpit `prefillFromConfig()` checks `Array.isArray()`, `null` removes the key → shows as "not disabled" | Medium | Bug |
+| 7 | **claude_code is dead code** | Low | Cleanup |
+| 8 | **delegate_work is placeholder** — Advanced UI exists but tool not implemented | Medium | Feature gap |
+| 9 | **Critic/Scholar enable delegation** — will break when placeholder is replaced | Low | Config |
+| 10 | **Interactive disables knowledge entirely** | Low | Design choice |
+| 11 | **Re-enabling a category restores defaults, not expert's list** | Low | UI logic |
+| 12 | **`cloud:` key missing from defaults.yaml** | Low | Config |
+| 13 | **Neo4j has no separate write tool** — read/write modes get same tools | Low | Feature gap |
+
+---
+
 ## Research: How Other Applications Organize Settings
 
 ### IDE/Editor Patterns
