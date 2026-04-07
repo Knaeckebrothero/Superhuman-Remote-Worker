@@ -123,7 +123,8 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
             "- `sql_schema` — inspect tables, columns, types, constraints",
         ],
         "neo4j": [
-            "- `execute_cypher_query` — execute read-only Cypher queries",
+            "- `cypher_query` — execute read-only Cypher queries",
+            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
             "- `get_database_schema` — inspect labels, relationships, properties",
         ],
         "mongodb": [
@@ -339,7 +340,7 @@ class TestManagedReadOnlyNote:
 
     def test_neo4j_readonly(self):
         content = _build_managed_readonly_note("Graph", "", "neo4j")
-        assert "`execute_cypher_query`" in content
+        assert "`cypher_query`" in content
 
     def test_mongodb_readonly(self):
         content = _build_managed_readonly_note("Docs", "", "mongodb")

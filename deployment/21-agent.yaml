@@ -6,7 +6,9 @@ metadata:
   annotations:
     reloader.stakater.com/auto: "true"
 spec:
-  replicas: 2
+  # Dynamic provisioning: AgentProvisioner creates on-demand pods per task.
+  # Set replicas > 0 only as a rollback if dynamic provisioning is disabled.
+  replicas: 0
   strategy:
     type: RollingUpdate
     rollingUpdate:

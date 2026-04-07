@@ -328,11 +328,11 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 | 6 | Developer expert uses `null` not `[]` | **Fixed.** Changed `config/experts/developer/config.yaml` to use `[]` for disabled categories. | DONE |
 | 7 | claude_code is dead code | **Deleted.** Removed `claude_code.py`, `auto_start_claude_code` from shell_manager/agent/configs/schemas/cockpit UI. Developer expert prompts still reference it (separate rewrite). | DONE |
 | 8 | delegate_work is placeholder | **Moved to tool toggle** in the Tools group. Removed delegation accordion from Advanced. Delegation toggle with inline params (max_depth, timeout) shown when enabled. Tool toggle syncs `delegation.enabled` + `tools.delegation` together. | DONE |
-| 9 | Critic/Scholar enable delegation | Review when delegate_work is implemented. Currently harmless (placeholder guard). | Deferred |
-| 10 | Interactive disables knowledge entirely | Noted. May want to revisit — limits session usefulness. | Deferred |
-| 11 | Re-enabling category restores defaults, not expert's list | Noted. Low priority — edge case. | Deferred |
+| 9 | Critic/Scholar enable delegation | **Resolved.** `delegate_work` and `resume_delegation_child` are fully implemented. Both critic and scholar configs already list both tools. No changes needed. | DONE |
+| 10 | Interactive disables knowledge entirely | **Enabled.** Replaced `knowledge: []` with full kb_* tool list (10 tools) in `config/experts/interactive/config.yaml`. Infrastructure was already wired (KnowledgeStore, Neo4j, project scoping). | DONE |
+| 11 | Re-enabling category restores defaults, not expert's list | **Not a bug.** Re-enabling an expert-disabled category correctly restores from defaults. Edge case: toggling off/on a custom subset loses the subset — low priority, revisit if needed. | Resolved |
 | 12 | `cloud:` key missing from defaults.yaml | Added `cloud: []` with datasource-injected comment, consistent with graph/sql/mongodb. | DONE |
-| 13 | Neo4j has no separate write tool | Noted. Low priority — read/write modes get same tools. | Deferred |
+| 13 | Neo4j has no separate write tool | **Split.** `execute_cypher_query` → `cypher_query` (read-only, blocks writes) + `cypher_execute` (write). `DS_TOOL_MAP` now gives read-only datasources only `cypher_query`. Audit queries match both new and legacy tool names. | DONE |
 
 ### Remaining Issues (not yet decided)
 

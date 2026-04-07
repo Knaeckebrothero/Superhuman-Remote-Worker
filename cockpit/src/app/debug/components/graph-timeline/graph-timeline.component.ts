@@ -1,21 +1,20 @@
 import {
-  Component,
-  OnDestroy,
-  inject,
-  signal,
-  effect,
-  ElementRef,
-  viewChild,
-  ChangeDetectionStrategy,
-  NgZone,
-  DestroyRef,
-  computed,
+    ChangeDetectionStrategy,
+    Component,
+    DestroyRef,
+    effect,
+    ElementRef,
+    inject,
+    NgZone,
+    OnDestroy,
+    signal,
+    viewChild,
 } from '@angular/core';
-import { GraphService } from '../../services/graph.service';
-import { DataService } from '../../../core/services/data.service';
-import { cytoscapeStyles } from './graph-styles';
-import { TimelineRenderer } from './timeline-renderer';
-import type { Core } from 'cytoscape';
+import {GraphService} from '../../services/graph.service';
+import {DataService} from '../../../core/services/data.service';
+import {cytoscapeStyles} from './graph-styles';
+import {TimelineRenderer} from './timeline-renderer';
+import type {Core} from 'cytoscape';
 
 // Dynamic import for Cytoscape (loaded at runtime)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -159,7 +158,7 @@ let cytoscape: any;
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C8;</span>
           <span>No graph operations found</span>
-          <span class="empty-hint">This job has no execute_cypher_query calls</span>
+          <span class="empty-hint">This job has no Cypher query calls</span>
         </div>
       }
 
