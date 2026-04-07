@@ -1541,6 +1541,11 @@ async def _poll_vm_ready(
 async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[str]:
     """Generate a short title from conversation using AuxiliaryLLM."""
     if not auxiliary_llm or not messages:
+        logger.debug(
+            "Title generation skipped: auxiliary_llm=%s, messages=%d",
+            bool(auxiliary_llm),
+            len(messages) if messages else 0,
+        )
         return None
     try:
         from langchain_core.messages import HumanMessage as HM
@@ -1549,9 +1554,23 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         # Grab first few exchanges for title generation
         sample = []
         for m in messages[:10]:
-            if hasattr(m, "content") and isinstance(m.content, str) and m.content:
-                sample.append(m.content[:200])
+            content = getattr(m, "content", None)
+            if isinstance(content, str) and content:
+                sample.append(content[:200])
+            elif isinstance(content, list):
+                # Handle list-of-blocks content (e.g. responses API)
+                text_parts = [
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content
+                ]
+                joined = " ".join(t for t in text_parts if t)
+                if joined:
+                    sample.append(joined[:200])
         if not sample:
+            logger.debug(
+                "Title generation skipped: no text content in %d messages",
+                len(messages),
+            )
             return None
 
         response = await auxiliary_llm.llm.ainvoke(
@@ -1564,7 +1583,10 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
             ]
         )
         text = getattr(response, "content", None) or ""
-        return text.strip()[:100] if text.strip() else None
+        title = text.strip()[:100] if text.strip() else None
+        if not title:
+            logger.debug("Title generation returned empty response")
+        return title
     except Exception as e:
         logger.warning(f"Title generation error: {e}")
         return None

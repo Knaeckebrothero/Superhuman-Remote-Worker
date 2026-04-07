@@ -194,6 +194,7 @@ export interface UserSettings {
   default_auxiliary_model?: string | null;
   default_vision_model?: string | null;
   default_whisper_model?: string | null;
+  default_builder_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
   communication?: CommunicationSettings | null;
