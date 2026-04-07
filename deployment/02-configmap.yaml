@@ -146,11 +146,11 @@ data:
   HEADSCALE_URL: "https://headscale.superhuman-remote-worker.com"
 
   # Workspace containers (per-job sandboxed execution environments)
-  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-ba0aecf"
+  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-96e317d"
   WORKSPACE_NAMESPACE: "superhuman-remote-worker"
 
   # Persistent agent pods (on-demand, same image as worker agents)
-  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-4a6e003"
+  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-96e317d"
 
   # Logging
   LOG_LEVEL: "DEBUG"
