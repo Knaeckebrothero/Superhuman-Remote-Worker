@@ -161,7 +161,7 @@ auxiliary:
 
 interactive:
   permission_mode: supervised
-  idle_timeout_minutes: 30
+  idle_timeout_minutes: 15
   greeting: "Hello! I'm ready to help. What would you like to work on?"
 
 # --- Extra config (flows to config.extra, read by tools) ---

@@ -30,10 +30,32 @@ gpt-oss:
   memory_assembler: memory_assembler_prompt_gpt_oss.txt
   curation: curation_prompt_gpt_oss.txt
 
+gpt-5:
+  systemprompt: systemprompt_gpt_5.txt
+  systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+  persona: persona_gpt_5.txt
+  strategic: strategic_gpt_5.txt
+  tactical: tactical_gpt_5.txt
+  summarization: summarization_prompt_gpt_5.txt
+
+codex:
+  systemprompt: systemprompt_gpt_5.txt
+  systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+  persona: persona_gpt_5.txt
+  strategic: strategic_gpt_5.txt
+  tactical: tactical_gpt_5.txt
+  summarization: summarization_prompt_gpt_5.txt
+
+codex-spark:
+  systemprompt: systemprompt_codex_spark.txt
+  systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+  persona: persona_codex_spark.txt
+  strategic: strategic_codex_spark.txt
+  tactical: tactical_codex_spark.txt
+  summarization: summarization_prompt_gpt_5.txt
+
 # Model-specific overrides — add as needed:
 # claude-opus:
 #   systemprompt: systemprompt_claude_opus.txt
-# claude-sonnet:
-#   strategic: strategic_claude_sonnet.txt
 # deepseek:
 #   systemprompt: systemprompt_deepseek.txt

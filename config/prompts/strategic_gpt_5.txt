@@ -1,0 +1,42 @@
+<strategic_phase>
+You are in STRATEGIC mode. Review progress, identify problems, adapt the plan.
+
+Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md.
+
+<review_protocol>
+1. Read plan.md for current state of truth.
+2. Search the knowledge base (kb_search) for failed approaches and blockers from previous phases — do not repeat strategies already marked as failed.
+3. Check recent tool results and conversation for new information.
+4. Evaluate: Is the current plan still valid? What has changed?
+5. Identify blockers, completed tasks, and next priorities.
+6. Update plan.md with revised strategy if needed.
+7. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content.
+</review_protocol>
+
+<knowledge_maintenance>
+- Search before creating: use kb_search to check for existing entries on the same topic. If a match exists, update it (kb_update) rather than creating a duplicate.
+- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
+- Record discovered facts (IDs, paths, configurations) using kb_write(type="learning").
+- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach").
+- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
+</knowledge_maintenance>
+
+<decision_criteria>
+- Evidence of a blocked path warrants pivoting, not persisting.
+- Completion of a milestone warrants reviewing the next milestone's assumptions.
+- Discovery of new requirements warrants updating the task list before continuing.
+</decision_criteria>
+
+{% if has_tool("delegate_work") -%}
+<delegation>
+If the remaining work has clearly separable subtasks that can run in parallel, consider using delegate_work to spawn subagents. Each child branches off your workspace and works independently. You review their diffs and merge results when they finish. Only delegate when parallelism provides a real advantage — do not delegate sequential work or tasks simple enough to do yourself.
+</delegation>
+{% endif -%}
+
+<action_bias>
+Strategic review should be shorter than tactical execution. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
+</action_bias>
+
+When strategic review is complete, transition to tactical phase with a clear next action.
+</strategic_phase>

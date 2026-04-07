@@ -281,7 +281,7 @@ Agent: _setup_job_tools()
 workspace.md gets datasource index + KB gets retrieval-optimized notes
 ```
 
-**Critical gap**: CLI clients (psql, cypher-shell, mongosh) are NOT in `Dockerfile.agent`. Read-write mode only works when workspace is a remote VM with these preinstalled. No dynamic install logic exists and agent runs as non-root.
+**Resolved**: CLI clients (psql, cypher-shell, mongosh) are installed in `Dockerfile.workspace` and `provision.sh`. Agent CLI commands are proxied to workspaces via SSH.
 
 ---
 
@@ -324,14 +324,14 @@ Scholar/Critic/delegate_work = parent-child (shared workspace via worktrees). Or
 | 2 | "document" has 1 tool (chunk_document) | **Deleted** — tool, directory (`src/tools/document/`), registry, loader field, all YAML configs, JSON schemas, builder prompts, agent-activity mapping, tests, README all removed. | DONE |
 | 3 | Knowledge has no Job UI toggle | **Not needed as a tool toggle.** Knowledge graph access is already controlled by the "Project memory" toggle (per-project setting in project detail + override in ExecutionGroup). Git is part of the strategic/tactical loop and should not be toggleable for jobs. | Resolved (already works) |
 | 4 | Communication has no toggle | **Added as a tool category** called "Communication" with its own toggle in the Tools group. Added to `JOB_TOOL_CATEGORIES` + `SESSION_TOOL_CATEGORIES`, agent-activity color mapping. | DONE |
-| 5 | CLI clients not in agent Docker image | **Should be auto-installed.** The assumption was CLI clients would be installed automatically when needed. Needs investigation — may need Dockerfile changes or dynamic installation logic. | TODO (infrastructure) |
+| 5 | CLI clients not in agent Docker image | **Installed in workspace images.** Added `psql`, `mongosh`, `cypher-shell` to `Dockerfile.workspace` and VM base (`provision.sh`). Agent CLI commands are proxied to workspaces via SSH. | DONE |
 | 6 | Developer expert uses `null` not `[]` | **Fixed.** Changed `config/experts/developer/config.yaml` to use `[]` for disabled categories. | DONE |
 | 7 | claude_code is dead code | **Deleted.** Removed `claude_code.py`, `auto_start_claude_code` from shell_manager/agent/configs/schemas/cockpit UI. Developer expert prompts still reference it (separate rewrite). | DONE |
 | 8 | delegate_work is placeholder | **Moved to tool toggle** in the Tools group. Removed delegation accordion from Advanced. Delegation toggle with inline params (max_depth, timeout) shown when enabled. Tool toggle syncs `delegation.enabled` + `tools.delegation` together. | DONE |
 | 9 | Critic/Scholar enable delegation | Review when delegate_work is implemented. Currently harmless (placeholder guard). | Deferred |
 | 10 | Interactive disables knowledge entirely | Noted. May want to revisit — limits session usefulness. | Deferred |
 | 11 | Re-enabling category restores defaults, not expert's list | Noted. Low priority — edge case. | Deferred |
-| 12 | `cloud:` key missing from defaults.yaml | Add for consistency. | TODO (minor) |
+| 12 | `cloud:` key missing from defaults.yaml | Added `cloud: []` with datasource-injected comment, consistent with graph/sql/mongodb. | DONE |
 | 13 | Neo4j has no separate write tool | Noted. Low priority — read/write modes get same tools. | Deferred |
 
 ### Remaining Issues (not yet decided)

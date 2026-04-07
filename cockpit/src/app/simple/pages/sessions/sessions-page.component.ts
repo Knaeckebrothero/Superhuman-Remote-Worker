@@ -9,6 +9,7 @@ import {PersistentChatService} from '../../../core/services/persistent-chat.serv
 import {ToastService} from '../../../core/services/toast.service';
 import {UserService} from '../../../core/services/user.service';
 import {Thread} from '../../../core/models/api.model';
+import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 
 interface Project {
     id: string;
@@ -20,8 +21,11 @@ interface Project {
 @Component({
     selector: 'app-sessions-page',
     standalone: true,
-    imports: [FormsModule, DatePipe, TitleCasePipe],
+    imports: [FormsModule, DatePipe, TitleCasePipe, SidebarToggleComponent],
     template: `
+    <div class="page-toggle">
+      <app-sidebar-toggle />
+    </div>
     <div class="sessions-page">
       <div class="page-header">
         <h2>Sessions</h2>
@@ -219,6 +223,15 @@ interface Project {
       height: 100%;
       overflow-y: auto;
       background: var(--app-bg, #1e1e2e);
+    }
+
+    .page-toggle {
+      padding: 8px 12px;
+      flex-shrink: 0;
+    }
+
+    .page-toggle:empty {
+      display: none;
     }
 
     .sessions-page {

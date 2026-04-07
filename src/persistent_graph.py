@@ -542,8 +542,8 @@ async def _execute_turn(
                     )
                     response = await llm_with_tools.ainvoke(prepared)
                     # Stream the complete response as a single chunk
-                    if hasattr(response, "content") and response.content:
-                        content = response.content
+                    content = getattr(response, "content", None)
+                    if content:
                         if isinstance(content, list):
                             for block in content:
                                 if (
@@ -560,6 +560,28 @@ async def _execute_turn(
                         elif isinstance(content, str) and content:
                             response_content = content
                             await callbacks.on_token(content)
+                    else:
+                        extra = getattr(response, "additional_kwargs", None) or {}
+                        refusal = extra.get("refusal")
+                        logger.warning(
+                            "ainvoke fallback returned empty content "
+                            "(type=%s, has_tool_calls=%s, additional_kwargs=%s)",
+                            type(content).__name__,
+                            bool(getattr(response, "tool_calls", None)),
+                            list(extra.keys()),
+                        )
+                        if refusal:
+                            logger.warning("Model refusal: %s", refusal)
+                            response_content = (
+                                f"⚠ The model declined to respond: {refusal}"
+                            )
+                            await callbacks.on_token(response_content)
+                        else:
+                            response_content = (
+                                "⚠ The model returned an empty response. "
+                                "Please try again or switch models."
+                            )
+                            await callbacks.on_token(response_content)
                 else:
                     raise
 

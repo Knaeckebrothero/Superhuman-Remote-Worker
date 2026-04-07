@@ -8,7 +8,7 @@
 # Usage:
 #   podman-compose -f docker-compose.local.yaml build          # Build all images
 #   podman-compose -f docker-compose.local.yaml up -d          # Start all services
-#   podman-compose -f docker-compose.local.yaml up -d --scale agent=3
+#   podman-compose -f docker-compose.local.yaml up -d --scale agent=5
 #   podman-compose -f docker-compose.local.yaml down           # Stop services
 #   podman-compose -f docker-compose.local.yaml down -v        # Stop and remove all data
 #   podman-compose -f docker-compose.local.yaml logs -f agent  # Follow agent logs
@@ -377,7 +377,7 @@ services:
       # VM lifecycle (optional)
       NATS_URL: ${NATS_URL:-nats://nats:4222}
       # Docker Compose mode — workspace/VM pool (ignored when k8s is available)
-      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3}
+      WORKSPACE_HOSTS: ${WORKSPACE_HOSTS:-workspace-1,workspace-2,workspace-3,workspace-4,workspace-5}
       VM_HOSTS: ${VM_HOSTS:-}
       # Orchestrator settings
       AUTO_ASSIGN_ENABLED: ${AUTO_ASSIGN_ENABLED:-true}
@@ -482,7 +482,7 @@ services:
       - agent_home:/home/srw
       - ssh_keys:/run/secrets/ssh:ro
     deploy:
-      replicas: ${AGENT_REPLICAS:-2}
+      replicas: ${AGENT_REPLICAS:-5}
       resources:
         limits:
           pids: 256
@@ -499,110 +499,6 @@ services:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 10s
-      start_period: 60s
-      retries: 3
-    restart: unless-stopped
-
-  agent-persistent:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.agent
-      args:
-        CITATION_ENGINE_PATH: CitationEngine
-    image: srw-agent:local
-    container_name: srw-agent-persistent
-    command: [ "sh", "-c", "python agent.py --mode persistent --config interactive --port 8001 --host 0.0.0.0" ]
-    environment:
-      AGENT_CONFIG: interactive
-      AGENT_PORT: 8001
-      # Core databases
-      DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
-      VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      MONGODB_URL: mongodb://mongodb:27017/srw_logs
-      ORCHESTRATOR_URL: http://orchestrator:8085
-      WORKSPACE_PATH: /workspace
-      # LLM routing (via VPN sidecar)
-      LLM_BASE_URL: http://vpn-cluster:8080/v1
-      KEY_COOLDOWN_SECONDS: ${KEY_COOLDOWN_SECONDS:-3600}
-      # LLM provider keys — set in .env
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      GROQ_API_KEY: ${GROQ_API_KEY:-}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-      SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
-      # Vision model (for text-only agents)
-      VISION_API_KEY: ${VISION_API_KEY:-}
-      VISION_BASE_URL: ${VISION_BASE_URL:-}
-      VISION_MODEL: ${VISION_MODEL:-gpt-4o-mini}
-      # Audio transcription (Whisper)
-      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
-      # Browser automation (via VPN sidecar)
-      BROWSER_LLM_MODEL: ${BROWSER_LLM_MODEL:-gpt-4o-mini}
-      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
-      # Research proxy (via VPN sidecar SOCKS5)
-      RESEARCH_PROXY_TYPE: socks5
-      RESEARCH_PROXY_HOST: vpn-research
-      RESEARCH_PROXY_PORT: 1080
-      # Citation Engine (via VPN sidecar)
-      CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      CITATION_LLM_URL: http://vpn-cluster:8080/v1
-      CITATION_LLM_MODEL: ${CITATION_LLM_MODEL:-gpt-4o}
-      CITATION_REASONING_LEVEL: ${CITATION_REASONING_LEVEL:-high}
-      CITATION_EMBEDDING_MODEL: ${CITATION_EMBEDDING_MODEL:-qwen3-embedding-8b}
-      CITATION_EMBEDDING_URL: http://vpn-workstation:8080/v1
-      CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
-      # Embedding routing — workstation VPN hosts embedding models
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_BASE_URL: http://vpn-workstation:8080/v1
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
-      # Research
-      UNPAYWALL_EMAIL: ${UNPAYWALL_EMAIL:-}
-      # Neo4j (local instance)
-      NEO4J_URL: bolt://neo4j:7687
-      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
-      # Workstation API (embeddings, vision, whisper, TTS)
-      WORKSTATION_BASE_URL: http://vpn-workstation:8080/v1
-      # Gitea
-      GITEA_URL: http://gitea:3000
-      # Claude Code CLI auth (for coder-cc expert, uses Max/Pro plan)
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
-      # Logging
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=256m
-      - /run:rw,noexec,nosuid,size=16m
-    volumes:
-      - workspace_data:/workspace:z
-      - agent_persistent_home:/home/srw
-      - ssh_keys:/run/secrets/ssh:ro
-    deploy:
-      replicas: ${PERSISTENT_REPLICAS:-0}  # 0 for k8s (on-demand pods); set to 1+ for Docker Compose mode
-      resources:
-        limits:
-          pids: 256
-    depends_on:
-      postgres:
-        condition: service_healthy
-      orchestrator:
-        condition: service_healthy
-      vpn-cluster:
-        condition: service_healthy
-      vpn-workstation:
-        condition: service_healthy
-      ssh-keygen:
-        condition: service_completed_successfully
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8001/health" ]
       interval: 30s
       timeout: 10s
       start_period: 60s
@@ -673,6 +569,42 @@ services:
     container_name: srw-workspace-3
     environment:
       WORKSPACE_ID: "3"
+    volumes:
+      - ssh_keys:/home/agent-host/.ssh:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      ssh-keygen:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  workspace-4:
+    image: srw-workspace:local
+    container_name: srw-workspace-4
+    environment:
+      WORKSPACE_ID: "4"
+    volumes:
+      - ssh_keys:/home/agent-host/.ssh:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    depends_on:
+      ssh-keygen:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  workspace-5:
+    image: srw-workspace:local
+    container_name: srw-workspace-5
+    environment:
+      WORKSPACE_ID: "5"
     volumes:
       - ssh_keys:/home/agent-host/.ssh:ro
     healthcheck:
@@ -874,8 +806,6 @@ volumes:
     name: srw_workspace_data
   agent_home:
     name: srw_agent_home
-  agent_persistent_home:
-    name: srw_agent_persistent_home
   ssh_keys:
     name: srw_ssh_keys
   codex_proxy_auths:

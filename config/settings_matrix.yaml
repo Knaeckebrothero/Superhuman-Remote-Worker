@@ -77,6 +77,26 @@ gpt-5:
     summarization_chunk_size: 120000
     message_count_min_tokens: 100000
 
+codex:
+  temperature: 1.0  # Reasoning model: temperature effectively disabled
+  model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
+  limits:
+    model_max_context_tokens: 350000
+    context_threshold_tokens: 270000  # Stay under 272K to avoid accuracy degradation
+    summarization_safe_limit: 300000
+    summarization_chunk_size: 200000
+    message_count_min_tokens: 150000
+
+codex-spark:
+  temperature: 1.0  # Reasoning model: temperature effectively disabled
+  model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
+  limits:
+    model_max_context_tokens: 110000
+    context_threshold_tokens: 85000
+    summarization_safe_limit: 100000
+    summarization_chunk_size: 75000
+    message_count_min_tokens: 60000
+
 gpt-oss:
   temperature: 1.0  # OpenAI official: use 1.0 for full reasoning capability
   top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution

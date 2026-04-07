@@ -19,9 +19,6 @@ groups:
   - name: "OpenAI"
     provider: openai
     models:
-      - id: "gpt-5.4"
-        display_name: "GPT-5.4"
-        family: gpt-5
       - id: "gpt-4o"
         display_name: "GPT-4o"
         family: default
@@ -32,6 +29,9 @@ groups:
   - name: "Codex"
     provider: codex
     models:
+      - id: "codex/gpt-5.4"
+        display_name: "GPT-5.4"
+        family: gpt-5
       - id: "codex/gpt-5.3-codex"
         display_name: "Codex"
         family: gpt-5
@@ -105,8 +105,8 @@ builder_models:
     id: "openrouter/minimax/minimax-m2.7"
     provider: openrouter
   - label: "GPT-5.4"
-    id: "gpt-5.4"
-    provider: openai
+    id: "codex/gpt-5.4"
+    provider: codex
   - label: "Codex (coding)"
     id: "codex/gpt-5.3-codex"
     provider: codex

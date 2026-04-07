@@ -3,11 +3,13 @@
 Merges worker (job dispatch) and persistent (interactive session) routes
 into a single application with a state machine:
 
+Pod-per-task mode (default, for K8s):
     IDLE  ──/job/start──>  WORKING  ──job done──>  EXIT
     IDLE  ──/session/attach──>  SESSION  ──detach──>  EXIT
 
-Each pod handles exactly one task (job or session), then exits.
-K8s/Docker restarts a fresh container for the next task.
+Loop mode (AGENT_LOOP=1, default in --dev):
+    IDLE  ──/job/start──>  WORKING  ──job done──>  IDLE
+    IDLE  ──/session/attach──>  SESSION  ──detach──>  IDLE
 
 Start with: python agent.py --mode dual --port 8001
 """
@@ -251,6 +253,52 @@ def _schedule_exit(delay: float = 1.0) -> None:
     asyncio.create_task(_exit())
 
 
+def _should_loop() -> bool:
+    """Check if agent should loop back to IDLE instead of exiting."""
+    return os.environ.get("AGENT_LOOP", "").strip() == "1"
+
+
+async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> None:
+    """Clean up current task state and return to IDLE for next task."""
+    global _pod_state, _current_job_id, _current_job_task
+
+    logger.info(f"Resetting to IDLE after: {source}")
+
+    _current_job_id = None
+    _current_job_task = None
+    _clear_stop()
+
+    if _pod_state == PodState.SESSION and not skip_session_cleanup:
+        try:
+            from .persistent_app import _detach_session
+
+            await _detach_session()
+        except Exception as e:
+            logger.warning(f"Session cleanup during reset failed: {e}")
+
+    # Remove per-job file handlers from root logger
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        if isinstance(handler, logging.FileHandler) and "job_" in getattr(
+            handler, "baseFilename", ""
+        ):
+            handler.close()
+            root_logger.removeHandler(handler)
+
+    async with _state_lock:
+        _pod_state = PodState.IDLE
+
+    if _orchestrator_client and _orchestrator_client.agent_id:
+        try:
+            await _orchestrator_client.heartbeat(
+                status="ready", job_id=None, metrics=_get_agent_metrics()
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send ready heartbeat after reset: {e}")
+
+    logger.info("Agent returned to IDLE — ready for next task")
+
+
 # ---------------------------------------------------------------------------
 # Job processing (adapted from app.py)
 # ---------------------------------------------------------------------------
@@ -376,8 +424,10 @@ async def _process_orchestrator_job(
             except Exception as e:
                 logger.error(f"Failed to report completion for job {job_id}: {e}")
 
-        # Pod-per-task: exit after job completion
-        _schedule_exit(delay=2.0)
+        if _should_loop():
+            await _reset_to_idle("job completion")
+        else:
+            _schedule_exit(delay=2.0)
 
     except asyncio.CancelledError:
         logger.info(f"Job {job_id} was cancelled")
@@ -391,7 +441,10 @@ async def _process_orchestrator_job(
                 )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
-        _schedule_exit(delay=2.0)
+        if _should_loop():
+            await _reset_to_idle("job error")
+        else:
+            _schedule_exit(delay=2.0)
     finally:
         if _current_job_id == job_id:
             _current_job_id = None
@@ -488,6 +541,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         return {
             "mode": "dual",
             "pod_state": _pod_state.value,
+            "loop_mode": _should_loop(),
             "current_job_id": _current_job_id,
             "config": _config_path,
             "uptime_seconds": (datetime.now() - _started_at).total_seconds()
@@ -754,7 +808,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     except Exception as e:
                         logger.error(f"Failed to report completion: {e}")
 
-                _schedule_exit(delay=2.0)
+                if _should_loop():
+                    await _reset_to_idle("job resume completion")
+                else:
+                    _schedule_exit(delay=2.0)
 
             except asyncio.CancelledError:
                 raise
@@ -767,7 +824,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                         )
                     except Exception:
                         pass
-                _schedule_exit(delay=2.0)
+                if _should_loop():
+                    await _reset_to_idle("job resume error")
+                else:
+                    _schedule_exit(delay=2.0)
             finally:
                 if _current_job_id == request.job_id:
                     _current_job_id = None
@@ -868,8 +928,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             thread_id = pa._thread_id
             await pa._detach_session()
 
-            # Pod-per-task: exit after session
-            _schedule_exit(delay=2.0)
+            if _should_loop():
+                await _reset_to_idle("session detach", skip_session_cleanup=True)
+            else:
+                _schedule_exit(delay=2.0)
 
             return JSONResponse(
                 {
@@ -1219,7 +1281,12 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
 
         if idle_timed_out:
             await pa._handle_idle_archive()
-            # Pod-per-task: exit after idle timeout
+
+        if _should_loop():
+            await _reset_to_idle(
+                "idle timeout" if idle_timed_out else "WebSocket disconnect"
+            )
+        else:
             _schedule_exit(delay=2.0)
 
         logger.info(f"WebSocket session ended: thread={_thread_id}")

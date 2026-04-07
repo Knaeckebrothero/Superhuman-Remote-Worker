@@ -1,7 +1,7 @@
-import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
-import { ApiService } from '../../../core/services/api.service';
-import { Agent, AgentStatus } from '../../../core/models/api.model';
-import { JobSummary } from '../../../core/models/audit.model';
+import {Component, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {ApiService} from '../../../core/services/api.service';
+import {Agent, AgentStatus} from '../../../core/models/api.model';
+import {JobSummary} from '../../../core/models/audit.model';
 
 /**
  * Agent List component that displays registered agents.
@@ -492,6 +492,16 @@ import { JobSummary } from '../../../core/models/audit.model';
         color: #6c7086;
       }
 
+      .status-badge.status-session {
+        background: rgba(116, 199, 236, 0.2);
+        color: #74c7ec;
+      }
+
+      .status-badge.status-draining {
+        background: rgba(250, 179, 135, 0.2);
+        color: #fab387;
+      }
+
       .config-name {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
@@ -740,6 +750,8 @@ export class AgentListComponent implements OnInit, OnDestroy {
       booting: '\u23F3',
       ready: '\u2705',
       working: '\u26A1',
+      session: '\uD83D\uDCAC',
+      draining: '\u23F3',
       completed: '\u2714',
       failed: '\u274C',
       offline: '\u26AA',

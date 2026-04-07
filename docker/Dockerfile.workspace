@@ -65,6 +65,36 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
 
 # ---------------------------------------------------------------------------
+# 1b. Datasource CLI clients (psql, mongosh, cypher-shell)
+#     Needed for read-write datasource mode — agent runs queries via shell.
+#     Mirrors agent-vm-base/scripts/provision.sh section 1b.
+# ---------------------------------------------------------------------------
+
+# PostgreSQL client (psql) — available in default Ubuntu repos
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# MongoDB Shell (mongosh) — from MongoDB's official APT repo
+RUN curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
+        | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
+        > /etc/apt/sources.list.d/mongodb-org-8.0.list \
+    && apt-get update -y && apt-get install -y --no-install-recommends \
+        mongodb-mongosh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Neo4j Cypher Shell — requires JRE, from Neo4j's official APT repo
+RUN curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/neo4j-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/neo4j-archive-keyring.gpg] https://debian.neo4j.com stable latest" \
+        > /etc/apt/sources.list.d/neo4j.list \
+    && apt-get update -y && apt-get install -y --no-install-recommends \
+        openjdk-17-jre-headless \
+        cypher-shell \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
 # 2. Node.js 22 + global packages
 # ---------------------------------------------------------------------------
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \

@@ -696,6 +696,95 @@ class TestDatasourceIndex:
         # Should not raise
         agent._inject_datasource_index([{"type": "generic", "name": "X"}])
 
+    def test_rw_postgresql_expanded_block(self):
+        agent, ws = self._make_agent()
+        configs = [
+            {"type": "postgresql", "name": "Main DB", "project_read_only": False},
+        ]
+        agent._inject_datasource_index(configs)
+        written = ws.write_file.call_args[0][1]
+
+        assert "**Main DB** (postgresql, read-write)" in written
+        assert "run_command" in written
+        assert "psql -c" in written
+        assert "Credentials are pre-configured" in written
+        assert "do NOT pass connection flags" in written
+
+    def test_rw_neo4j_expanded_block(self):
+        agent, ws = self._make_agent()
+        configs = [
+            {"type": "neo4j", "name": "Graph", "project_read_only": False},
+        ]
+        agent._inject_datasource_index(configs)
+        written = ws.write_file.call_args[0][1]
+
+        assert "cypher-shell --format plain" in written
+        assert "run_command" in written
+        assert "Credentials are pre-configured" in written
+
+    def test_rw_mongodb_expanded_block(self):
+        agent, ws = self._make_agent()
+        configs = [
+            {"type": "mongodb", "name": "Docs", "project_read_only": False},
+        ]
+        agent._inject_datasource_index(configs)
+        written = ws.write_file.call_args[0][1]
+
+        assert "mongosh --quiet --eval" in written
+        assert "run_command" in written
+        assert "Credentials are pre-configured" in written
+
+    def test_readonly_not_expanded(self):
+        agent, ws = self._make_agent()
+        configs = [
+            {"type": "postgresql", "name": "ReadOnly DB", "project_read_only": True},
+        ]
+        agent._inject_datasource_index(configs)
+        written = ws.write_file.call_args[0][1]
+
+        assert "query tools" in written
+        assert "run_command" not in written
+
+
+class TestRenderInstructionContentCLI:
+    """Tests for cli_datasources support in render_instruction_content."""
+
+    def test_cli_datasources_conditional(self):
+        from src.core.loader import render_instruction_content
+
+        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
+        result = render_instruction_content(
+            template, [], cli_datasources=["postgresql"]
+        )
+        assert "HAS_CLI" in result
+
+    def test_no_cli_datasources_omits_block(self):
+        from src.core.loader import render_instruction_content
+
+        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
+        result = render_instruction_content(template, [], cli_datasources=[])
+        assert "HAS_CLI" not in result
+
+    def test_has_cli_datasource_check(self):
+        from src.core.loader import render_instruction_content
+
+        template = (
+            '{% if has_cli_datasource("postgresql") %}PG{% endif %}'
+            '{% if has_cli_datasource("neo4j") %}NEO{% endif %}'
+        )
+        result = render_instruction_content(
+            template, [], cli_datasources=["postgresql"]
+        )
+        assert "PG" in result
+        assert "NEO" not in result
+
+    def test_default_none_cli_datasources(self):
+        from src.core.loader import render_instruction_content
+
+        template = "{% if cli_datasources %}HAS_CLI{% endif %}"
+        result = render_instruction_content(template, [])
+        assert "HAS_CLI" not in result
+
 
 # =============================================================================
 # Credential Structure Validation

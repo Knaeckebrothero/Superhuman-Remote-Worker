@@ -1217,6 +1217,41 @@ def format_experts(experts: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_models(data: dict[str, Any]) -> str:
+    """Format model catalog for AI-friendly display."""
+    lines: list[str] = []
+
+    groups = data.get("groups", [])
+    if groups:
+        lines.append("Models by Provider:")
+        for group in groups:
+            provider = group.get("group", group.get("provider", "unknown"))
+            status = "ready" if group.get("configured") else "needs API key"
+            models = group.get("models", [])
+            lines.append(f"\n  {provider} ({status}):")
+            for model_id in models:
+                lines.append(f"    - {model_id}")
+
+    presets = data.get("presets", [])
+    if presets:
+        lines.append("\nPresets (strategic + tactical pairs):")
+        for preset in presets:
+            label = preset.get("label", "unnamed")
+            status = "ready" if preset.get("configured") else "needs API key"
+            lines.append(f"  {label} ({status}):")
+            lines.append(f"    strategic: {preset.get('strategic', '?')}")
+            lines.append(f"    tactical:  {preset.get('tactical', '?')}")
+
+    if not lines:
+        return "No models found in catalog."
+
+    lines.append(
+        '\nUsage: create_job(..., config_override={"llm": {"model": "<model_id>"}})'
+    )
+
+    return "\n".join(lines)
+
+
 def format_expert_detail(expert_id: str, data: dict[str, Any]) -> str:
     """Format expert config detail."""
     lines = [f"Expert: {expert_id}\n"]
