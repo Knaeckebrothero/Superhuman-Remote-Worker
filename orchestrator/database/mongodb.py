@@ -606,7 +606,9 @@ class MongoDB:
         query = {
             "job_id": job_id,
             "step_type": "tool",
-            "tool.name": {"$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]},
+            "tool.name": {
+                "$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]
+            },
         }
 
         # Get total count
@@ -678,7 +680,9 @@ class MongoDB:
             {
                 "job_id": job_id,
                 "step_type": "tool",
-                "tool.name": {"$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]},
+                "tool.name": {
+                    "$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]
+                },
             }
         )
 
