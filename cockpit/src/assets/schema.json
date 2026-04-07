@@ -268,7 +268,7 @@
             "type": "string"
           },
           "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
-          "examples": [["execute_cypher_query", "get_database_schema"]]
+          "examples": [["cypher_query", "cypher_execute", "get_database_schema"]]
         },
         "sql": {
           "type": "array",

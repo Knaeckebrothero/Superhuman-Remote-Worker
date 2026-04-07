@@ -60,11 +60,12 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
         # Get all audit entries for this job
         all_entries = await _get_all_tool_calls(job_id)
 
-        # Filter to graph operations (execute_cypher_query)
+        # Filter to graph operations (cypher_query, cypher_execute, and legacy execute_cypher_query)
+        _graph_tool_names = {"cypher_query", "cypher_execute", "execute_cypher_query"}
         graph_calls = [
             entry
             for entry in all_entries
-            if entry.get("tool", {}).get("name") == "execute_cypher_query"
+            if entry.get("tool", {}).get("name") in _graph_tool_names
         ]
 
         if not graph_calls:

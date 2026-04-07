@@ -11,9 +11,9 @@ MongoDB is optional - the system gracefully degrades if unavailable.
 This is the canonical database layer for the orchestrator.
 """
 
+import logging
 import math
 import os
-import logging
 from datetime import datetime as dt, timezone
 from typing import Optional, List, Dict, Any, Literal
 
@@ -602,11 +602,11 @@ class MongoDB:
 
         collection = self._db["agent_audit"]
 
-        # Query for execute_cypher_query tool calls
+        # Query for cypher tool calls (current + legacy name)
         query = {
             "job_id": job_id,
             "step_type": "tool",
-            "tool.name": "execute_cypher_query",
+            "tool.name": {"$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]},
         }
 
         # Get total count
@@ -673,12 +673,12 @@ class MongoDB:
 
         chat_count = await chat_collection.count_documents({"job_id": job_id})
 
-        # Count graph deltas (execute_cypher_query tool calls)
+        # Count graph deltas (cypher tool calls, current + legacy name)
         graph_count = await audit_collection.count_documents(
             {
                 "job_id": job_id,
                 "step_type": "tool",
-                "tool.name": "execute_cypher_query",
+                "tool.name": {"$in": ["cypher_query", "cypher_execute", "execute_cypher_query"]},
             }
         )
 

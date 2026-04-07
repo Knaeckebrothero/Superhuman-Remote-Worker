@@ -25,7 +25,7 @@ Usage:
     tools = load_tools(["read_file", "write_file", "add_todo", "complete_todo"], context)
 
     # Or load all domain tools
-    tools = load_tools(["execute_cypher_query"], context)
+    tools = load_tools(["cypher_query"], context)
 
     # Or create tool sets directly
     workspace_tools = create_workspace_tools(context)

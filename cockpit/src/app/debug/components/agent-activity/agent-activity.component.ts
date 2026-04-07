@@ -779,7 +779,8 @@ export class AgentActivityComponent {
     list_citations: 'citation',
     edit_citation: 'citation',
     // Graph tools (Neo4j datasource)
-    execute_cypher_query: 'graph',
+    cypher_query: 'graph',
+    cypher_execute: 'graph',
     get_database_schema: 'graph',
     // SQL tools (PostgreSQL datasource)
     sql_query: 'sql',
