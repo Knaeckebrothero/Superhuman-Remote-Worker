@@ -750,6 +750,12 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_builder_sessions_user_id ON builder_sessions(user_id);
 
+-- Migration: Add title column to builder_sessions table
+DO $$ BEGIN
+    ALTER TABLE builder_sessions ADD COLUMN title VARCHAR(120);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Chat messages within a builder session
 CREATE TABLE IF NOT EXISTS builder_messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

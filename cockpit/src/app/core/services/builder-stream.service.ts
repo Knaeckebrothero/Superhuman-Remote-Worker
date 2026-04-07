@@ -1,9 +1,9 @@
-import { Injectable, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { Observable, catchError, of } from 'rxjs';
-import { environment } from '../environment';
-import { JobArtifactService } from './job-artifact.service';
-import { UserService } from './user.service';
+import {inject, Injectable} from '@angular/core';
+import {HttpClient} from '@angular/common/http';
+import {catchError, Observable, of} from 'rxjs';
+import {environment} from '../environment';
+import {JobArtifactService} from './job-artifact.service';
+import {UserService} from './user.service';
 
 /** A builder chat message (stored in builder_messages table). */
 export interface BuilderMessage {
@@ -24,6 +24,7 @@ export interface BuilderSession {
   created_at: string;
   updated_at: string;
   summary: string | null;
+  title: string | null;
 }
 
 /** A workspace edit proposal from the builder that needs user approval. */
@@ -46,7 +47,7 @@ export interface StreamCallbacks {
   onToolResult?: (tool: string, summary: string, content?: string) => void;
   onWorkspaceProposal?: (proposal: WorkspaceProposal) => void;
   onStep?: (type: string, title: string) => void;
-  onDone?: () => void;
+  onDone?: (title?: string) => void;
   onError?: (message: string) => void;
 }
 
@@ -87,6 +88,15 @@ export class BuilderStreamService {
   getMessages(sessionId: string): Observable<BuilderMessage[]> {
     return this.http
       .get<BuilderMessage[]>(`${this.baseUrl}/builder/sessions/${sessionId}/messages`)
+      .pipe(catchError(() => of([])));
+  }
+
+  /** List sessions for a user (most recent first). */
+  listSessions(userId: string): Observable<BuilderSession[]> {
+    return this.http
+      .get<BuilderSession[]>(`${this.baseUrl}/builder/sessions`, {
+        params: { user_id: userId },
+      })
       .pipe(catchError(() => of([])));
   }
 
@@ -238,7 +248,7 @@ export class BuilderStreamService {
         break;
 
       case 'done':
-        callbacks.onDone?.();
+        callbacks.onDone?.(data['title'] as string | undefined);
         break;
 
       case 'error':

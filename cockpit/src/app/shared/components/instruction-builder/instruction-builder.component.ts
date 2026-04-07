@@ -1,10 +1,12 @@
 import {AfterViewChecked, Component, computed, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {DatePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
 import {AgentStepsComponent, AgentStepType, IAgentStep} from '../agent-steps/agent-steps.component';
 import {JobArtifactService, PendingWorkspaceEdit} from '../../../core/services/job-artifact.service';
-import {BuilderStreamService} from '../../../core/services/builder-stream.service';
+import {BuilderSession, BuilderStreamService} from '../../../core/services/builder-stream.service';
 import {ApiService} from '../../../core/services/api.service';
+import {UserService} from '../../../core/services/user.service';
 
 type BuilderStepStatus = 'active' | 'complete';
 
@@ -23,9 +25,38 @@ interface ChatMessage {
 @Component({
   selector: 'app-instruction-builder',
   standalone: true,
-  imports: [FormsModule, MarkdownComponent, AgentStepsComponent],
+  imports: [FormsModule, MarkdownComponent, AgentStepsComponent, DatePipe],
   template: `
     <div class="builder-container">
+      @if (artifacts.sessionId()) {
+        <div class="session-header">
+          <button class="session-title-btn" (click)="toggleSessionDropdown()">
+            <span class="session-title-text">{{ artifacts.sessionTitle() || 'Untitled session' }}</span>
+            <span class="dropdown-arrow">expand_more</span>
+          </button>
+          <button class="new-session-btn" (click)="startNewSession()" title="New session">
+            add
+          </button>
+
+          @if (showSessionDropdown()) {
+            <div class="session-dropdown">
+              @for (s of sessions(); track s.id) {
+                <button
+                  class="session-option"
+                  [class.active]="s.id === artifacts.sessionId()"
+                  (click)="switchSession(s.id, s.title)"
+                >
+                  <span class="session-option-title">{{ s.title || 'Untitled' }}</span>
+                  <span class="session-option-date">{{ s.updated_at | date:'short' }}</span>
+                </button>
+              }
+              @if (sessions().length === 0) {
+                <div class="session-option-empty">No previous sessions</div>
+              }
+            </div>
+          }
+        </div>
+      }
       @if (!artifacts.sessionId()) {
         <div class="empty-state">
           <span class="empty-icon">smart_toy</span>
@@ -558,6 +589,128 @@ interface ChatMessage {
         to { transform: rotate(360deg); }
       }
 
+      /* Session header */
+      .session-header {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 12px;
+        border-bottom: 1px solid var(--border-color, #313244);
+        position: relative;
+        flex-shrink: 0;
+      }
+
+      .session-title-btn {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 8px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        min-width: 0;
+      }
+
+      .session-title-btn:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .session-title-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .dropdown-arrow {
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+        color: var(--text-muted, #6c7086);
+        flex-shrink: 0;
+      }
+
+      .new-session-btn {
+        width: 28px;
+        height: 28px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-muted, #6c7086);
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+      }
+
+      .new-session-btn:hover {
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .session-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 8px;
+        right: 8px;
+        max-height: 240px;
+        overflow-y: auto;
+        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        z-index: 100;
+      }
+
+      .session-option {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        width: 100%;
+        padding: 8px 12px;
+        border: none;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .session-option:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .session-option.active {
+        background: rgba(203, 166, 247, 0.12);
+      }
+
+      .session-option-title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .session-option-date {
+        font-size: 10px;
+        color: var(--text-muted, #6c7086);
+        flex-shrink: 0;
+      }
+
+      .session-option-empty {
+        padding: 12px;
+        text-align: center;
+        font-size: 12px;
+        color: var(--text-muted, #6c7086);
+      }
+
       /* Markdown content styling */
       :host ::ng-deep .markdown-body {
         font-size: 13px;
@@ -990,6 +1143,10 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
   readonly artifacts = inject(JobArtifactService);
   private readonly stream = inject(BuilderStreamService);
   private readonly api = inject(ApiService);
+  private readonly userService = inject(UserService);
+
+  readonly sessions = signal<BuilderSession[]>([]);
+  readonly showSessionDropdown = signal(false);
 
   @ViewChild('messagesContainer') messagesContainer?: ElementRef<HTMLDivElement>;
   @ViewChild('inputArea') inputArea?: ElementRef<HTMLTextAreaElement>;
@@ -1068,6 +1225,13 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
       error: () => {
         this.isRestoringSession.set(false);
       },
+    });
+
+    // Also load session title
+    this.stream.getSession(sessionId).subscribe((session) => {
+      if (session?.title) {
+        this.artifacts.sessionTitle.set(session.title);
+      }
     });
   }
 
@@ -1158,7 +1322,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
         this.artifacts.addWorkspaceProposal(proposal);
         this.shouldScrollToBottom = true;
       },
-      onDone: () => {
+      onDone: (title?: string) => {
         const content = this.streamingText();
         const steps = this.streamingSteps();
         // Mark remaining active steps as complete
@@ -1174,6 +1338,9 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
             steps: finalSteps.length > 0 ? finalSteps : undefined,
           },
         ]);
+        if (title) {
+          this.artifacts.sessionTitle.set(title);
+        }
         this.shouldScrollToBottom = true;
       },
       onError: (message) => {
@@ -1248,6 +1415,56 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
 
   dismissWorkspaceEdit(edit: PendingWorkspaceEdit): void {
     this.artifacts.resolveWorkspaceEdit(edit.id, 'dismissed');
+  }
+
+  /** Toggle the session dropdown (lazy-loads sessions on first open). */
+  toggleSessionDropdown(): void {
+    const next = !this.showSessionDropdown();
+    if (next) {
+      this.loadSessions();
+    }
+    this.showSessionDropdown.set(next);
+  }
+
+  /** Start a brand new session. */
+  startNewSession(): void {
+    this.stream.abort();
+    this.artifacts.reset();
+    this.messages.set([]);
+    this.streamingText.set('');
+    this.streamingSteps.set([]);
+    this.error.set(null);
+    this.lastFailedMessage.set(null);
+    this.showSessionDropdown.set(false);
+  }
+
+  /** Switch to an existing session. */
+  switchSession(sessionId: string, title: string | null): void {
+    this.stream.abort();
+    this.artifacts.instructions.set(null);
+    this.artifacts.config.set(null);
+    this.artifacts.description.set(null);
+    this.artifacts.streaming.set(false);
+    this.artifacts.pendingWorkspaceEdits.set([]);
+    this.messages.set([]);
+    this.streamingText.set('');
+    this.streamingSteps.set([]);
+    this.error.set(null);
+    this.lastFailedMessage.set(null);
+
+    this.artifacts.persistSessionId(sessionId);
+    this.artifacts.sessionTitle.set(title);
+    this.showSessionDropdown.set(false);
+
+    this.restoreMessages(sessionId);
+  }
+
+  private loadSessions(): void {
+    const userId = this.userService.currentUserId();
+    if (!userId) return;
+    this.stream.listSessions(userId).subscribe((sessions) => {
+      this.sessions.set(sessions);
+    });
   }
 
   autoResizeTextarea(): void {
