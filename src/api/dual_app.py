@@ -383,6 +383,9 @@ async def _process_orchestrator_job(
 
         _clear_stop()
 
+        # Inject orchestrator client so delegation tools can reach the API
+        _agent._orchestrator_client = _orchestrator_client
+
         # Process with streaming
         final_state = None
         last_iteration = "?"
@@ -770,6 +773,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 if request.project_id:
                     resume_metadata["project_id"] = request.project_id
 
+                _agent._orchestrator_client = _orchestrator_client
                 final_state = None
                 streaming_gen = await _agent.process_job(
                     request.job_id,

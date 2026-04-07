@@ -1,0 +1,77 @@
+# yaml-language-server: $schema=../../schema.json
+# Designer - UI/UX design and prototyping
+$extends: defaults
+
+agent_id: designer
+display_name: Designer
+description: |
+  UI/UX design specialist. Analyzes existing interface patterns, creates
+  self-contained HTML/CSS mockups using the project's design system, and
+  outputs structured design specifications for developers to implement.
+  Focuses on visual consistency, usability, and component reuse.
+icon: palette
+color: "#f5c2e7"
+tags:
+  - design
+  - ui
+  - prototyping
+  - mockups
+
+llm:
+  reasoning_level: high
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - mockups/
+    - design_spec/
+    - reference/
+    - output/
+    - repo/
+  git_versioning: true
+
+instruction_files:
+  - file: design_guide.md
+    trigger: phase:tactical
+    enforce: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - copy_file
+    - get_document_info
+    - create_directory
+  shell:
+    - run_command
+    - shell_read
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  research:
+    - web_search
+    - extract_webpage
+    - browse_website
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Not needed
+  delegation: []
+  citation: []
+  graph: []
+  sql: []
+  mongodb: []

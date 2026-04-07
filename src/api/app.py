@@ -477,6 +477,9 @@ async def _process_orchestrator_job(
         # Reset stop flags for this job
         _clear_stop()
 
+        # Inject orchestrator client so delegation tools can reach the API
+        _agent._orchestrator_client = _orchestrator_client
+
         # Process the job with streaming for iteration logging
         final_state = None
         last_iteration = "?"
@@ -1010,6 +1013,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             global _current_job_id
             _setup_job_file_logging(request.job_id)
             _clear_stop()
+            _agent._orchestrator_client = _orchestrator_client
             try:
                 # Use streaming for cooperative stop support (pause/cancel)
                 final_state = None

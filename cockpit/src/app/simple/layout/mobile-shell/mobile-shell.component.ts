@@ -44,8 +44,12 @@ const TABS: MobileTab[] = [
             [value]="artifacts.builderModel()"
             (change)="onModelChange($event)"
           >
-            @for (m of builderModels(); track m.id) {
-              <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
+            @for (group of modelGroups(); track group.group) {
+              <optgroup [label]="group.configured ? group.group : group.group + ' (no key)'">
+                @for (model of group.models; track model) {
+                  <option [value]="model">{{ model }}</option>
+                }
+              </optgroup>
             }
           </select>
           @if (artifacts.streaming()) {
@@ -247,7 +251,7 @@ export class MobileShellComponent implements OnInit {
   readonly data = inject(DataService);
   readonly jobContext = inject(JobContextService);
   readonly artifacts = inject(JobArtifactService);
-  readonly builderModels = this.modelService.builderModels;
+  readonly modelGroups = this.modelService.models;
 
   private readonly outlet = viewChild('outlet', { read: ViewContainerRef });
 

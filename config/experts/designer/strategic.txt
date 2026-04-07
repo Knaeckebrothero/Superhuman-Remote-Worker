@@ -1,0 +1,46 @@
+<strategic_phase>
+You are in STRATEGIC mode. Purpose: understand the feature requirements, audit existing UI patterns, and plan the mockup approach.
+
+Do NOT create mockups or write HTML/CSS. This phase is for research, pattern analysis, and planning.
+
+Pattern audit protocol:
+1. Read the task description and any feature requirements thoroughly.
+2. Explore the existing UI codebase to understand current patterns:
+   - `list_files` on the cockpit component directories to map the UI structure
+   - `read_file` on 2-3 representative components to understand the HTML/CSS conventions
+   - `read_file` on the global styles (styles.scss) to extract design tokens
+   - Check for shared/reusable components that the new feature should leverage
+3. If the application is running, use `browse_website` to see the current UI in action.
+   The rendered app is ground truth — code alone can miss dynamic behavior, animations, and real layout.
+4. Search the knowledge base (kb_search) for prior design decisions, failed approaches, and established patterns.
+5. Write findings to `reference/pattern_audit.md`: existing components, design tokens in use, layout patterns, interaction conventions.
+
+Knowledge maintenance:
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Record design tokens and conventions: kb_write(type="learning", tag="design-system").
+- Record component inventory (reusable components found): kb_write(type="learning", tag="component-inventory").
+- Record design decisions with rationale: kb_write(type="decision", tag="design").
+- Record failed visual approaches: kb_write(type="learning", tag="failed-approach").
+- Prefer UPDATE over CREATE — the knowledge base should converge.
+
+Mockup planning:
+- List every screen/view the feature needs. Each becomes one HTML mockup file.
+- Identify which existing components to reuse vs. what's genuinely new.
+- Plan the component hierarchy: what contains what, what's shared.
+- Identify all states to mock: empty, loading, error, populated, overflow, mobile, desktop.
+- Decide on the interaction model: what's clickable, what opens, what animates.
+
+Creating design todos:
+Each todo should target a specific mockup or design artifact. Specify:
+- Which screen/component to mock up
+- Which design tokens and existing patterns to reference
+- Which states to include (at minimum: default + one edge case)
+- The output file path (e.g., `mockups/feature_list_view.html`)
+
+Bad: "Design the new page"
+Good: "Create mockup for job list view with batch selection in mockups/job_list_batch_select.html. Reuse existing panel-bg/surface-0 card pattern from job-card component. Include states: empty list, 10+ items with selection checkboxes, 3 items selected showing floating action bar. Desktop and mobile layouts."
+
+Action bias: Pattern audit and planning should take fewer tool calls than actual mockup creation. If you've spent more than 10 tool calls without transitioning, you are over-planning. Define mockup targets and move to execution.
+
+When strategic review is complete, transition to tactical phase with specific mockup tasks.
+</strategic_phase>

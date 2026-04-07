@@ -47,6 +47,8 @@ class DockerProvisioner:
         self._snapshot_service: Optional[Any] = None
         self._workspace_hosts: list[tuple[str, int]] = []
         self._vm_hosts: list[tuple[str, int]] = []
+        # Maps SSH "host:port" → IDE "host:port" for code-server access
+        self._ide_hosts: dict[str, tuple[str, int]] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -78,6 +80,7 @@ class DockerProvisioner:
 
     # Default workspace ports for dev compose (published SSH ports on localhost)
     _DEV_COMPOSE_DEFAULTS = "localhost:2201,localhost:2202,localhost:2203"
+    _DEV_COMPOSE_IDE_DEFAULTS = "localhost:18081,localhost:18082,localhost:18083"
     _DEV_COMPOSE_SSH_KEY_REL = ".dev/ssh-keys/id_ed25519"
 
     # Repo root: orchestrator/services/docker_provisioner.py → ../../
@@ -109,10 +112,20 @@ class DockerProvisioner:
                     ssh_key_path,
                 )
                 os.environ.setdefault("WORKSPACE_HOSTS", self._DEV_COMPOSE_DEFAULTS)
+                os.environ.setdefault(
+                    "WORKSPACE_IDE_HOSTS", self._DEV_COMPOSE_IDE_DEFAULTS
+                )
                 os.environ.setdefault("SSH_KEY_PATH", str(ssh_key_path))
 
         self._workspace_hosts = self._parse_hosts("WORKSPACE_HOSTS")
         self._vm_hosts = self._parse_hosts("VM_HOSTS")
+
+        # Build SSH→IDE host mapping (positional: 1st SSH ↔ 1st IDE, etc.)
+        ide_hosts = self._parse_hosts("WORKSPACE_IDE_HOSTS")
+        for i, (ws_host, ws_port) in enumerate(self._workspace_hosts):
+            ws_key = self._host_key(ws_host, ws_port)
+            if i < len(ide_hosts):
+                self._ide_hosts[ws_key] = ide_hosts[i]
 
         if self._workspace_hosts:
             logger.info(
@@ -171,12 +184,17 @@ class DockerProvisioner:
         for host, port in self._workspace_hosts:
             key = self._host_key(host, port)
             if key not in in_use:
-                ctx = {
+                ctx: dict[str, Any] = {
                     "status": "ready",
                     "host": host,
                     "port": port,
                     "provisioner": "docker",
                 }
+                ide_entry = self._ide_hosts.get(key)
+                if ide_entry:
+                    ide_host, ide_port = ide_entry
+                    ctx["ide_host"] = ide_host
+                    ctx["ide_port"] = ide_port
                 await self._db.merge_workspace_container_context(job_id, ctx)
                 logger.info(
                     "Docker provisioner: assigned workspace %s to job %s",
@@ -272,12 +290,18 @@ class DockerProvisioner:
         for host, port in self._workspace_hosts:
             key = self._host_key(host, port)
             if key not in in_use:
-                ctx = {
+                ctx: dict[str, Any] = {
                     "status": "ready",
                     "host": host,
                     "port": port,
                     "provisioner": "docker",
                 }
+                # Include IDE (code-server) address if mapped
+                ide_entry = self._ide_hosts.get(key)
+                if ide_entry:
+                    ide_host, ide_port = ide_entry
+                    ctx["ide_host"] = ide_host
+                    ctx["ide_port"] = ide_port
                 await self._db.merge_thread_workspace_context(thread_id, ctx)
                 logger.info(
                     "Docker provisioner: assigned workspace %s to thread %s",

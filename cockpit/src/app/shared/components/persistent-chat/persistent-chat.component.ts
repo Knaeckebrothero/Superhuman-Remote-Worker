@@ -1522,19 +1522,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         effect(() => {
             const connected = this.chat.isConnected();
             const threadId = this.chat.threadId();
-            if (connected && threadId && threadId !== 'local') {
+            if (connected && threadId) {
                 this.startIdePolling(threadId);
             } else {
                 this.stopIdePolling();
             }
         });
 
-        // Lazy-load available models when settings panel opens
-        effect(() => {
-            if (this.showSettings()) {
-                this.modelService.load();
-            }
-        });
+        // Load available models eagerly so the dropdown is ready
+        this.modelService.load();
 
         // Auto-scroll when messages, streaming, or tool calls change
         effect(() => {

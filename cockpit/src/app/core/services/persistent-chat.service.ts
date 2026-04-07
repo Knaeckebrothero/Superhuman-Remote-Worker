@@ -100,10 +100,9 @@ export class PersistentChatService {
     /**
      * Connect to a persistent agent session.
      *
-     * For orchestrator-proxied sessions: loads history via REST first, then opens WS.
-     * For direct local dev: opens WS directly (no history).
+     * Loads history via REST first, then opens the orchestrator's WS proxy.
      */
-    async connect(target: { threadId: string } | { directUrl: string }): Promise<void> {
+    async connect(threadId: string): Promise<void> {
         this.disconnect();
         this.messages.set([]);
         this.connectionState.set('connecting');
@@ -119,23 +118,15 @@ export class PersistentChatService {
         this.tasks.set([]);
         this.undoAvailable.set(false);
 
-        let url: string;
-        if ('directUrl' in target) {
-            url = target.directUrl;
-            this.threadId.set('local');
-        } else {
-            // Load history and metadata via REST before opening WS
-            this.threadId.set(target.threadId);
-            await this.loadHistory(target.threadId);
-            await this.loadThreadMeta(target.threadId);
+        this.threadId.set(threadId);
+        await this.loadHistory(threadId);
+        await this.loadThreadMeta(threadId);
 
-            // Derive WS URL from API URL
-            const apiUrl = environment.apiUrl;
-            const wsBase = apiUrl
-                .replace(/\/api\/?$/, '')
-                .replace(/^http/, 'ws');
-            url = `${wsBase}/ws/persistent/${target.threadId}`;
-        }
+        const apiUrl = environment.apiUrl;
+        const wsBase = apiUrl
+            .replace(/\/api\/?$/, '')
+            .replace(/^http/, 'ws');
+        const url = `${wsBase}/ws/persistent/${threadId}`;
 
         this._connectWs(url);
     }
