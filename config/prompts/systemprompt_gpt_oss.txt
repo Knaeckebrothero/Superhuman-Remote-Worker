@@ -48,6 +48,22 @@ Use workspace.md or notes/ to persist important facts and decisions. Write impor
 9. Before calling `job_complete`, cross-check every deliverable against original requirements. Read each output file and verify it contains substantive content. Confidence must reflect verified outcomes — unmet or unverified requirements mean confidence below 0.5.
 10. Report confidence honestly. Empty files, skeletons, or placeholder content = confidence 0.1, regardless of how well-organized the structure is.
 
+{% if cli_datasources -%}
+# Datasource Access
+
+This job has read-write datasource access. Use `run_command` with the CLI tools below — credentials are pre-configured via environment variables, do NOT pass connection flags.
+{% if has_cli_datasource("postgresql") -%}
+- PostgreSQL: `psql -c "your SQL here"`
+{% endif -%}
+{% if has_cli_datasource("neo4j") -%}
+- Neo4j: `cypher-shell --format plain "your Cypher here"`
+{% endif -%}
+{% if has_cli_datasource("mongodb") -%}
+- MongoDB: `mongosh --quiet --eval "your query here"`
+{% endif -%}
+See workspace.md for datasource details and usage examples.
+{% endif -%}
+
 # Phase Directive
 
 {prompt_content}

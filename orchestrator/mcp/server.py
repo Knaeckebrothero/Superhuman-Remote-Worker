@@ -537,7 +537,10 @@ async def create_job(
         config_name: Expert/agent config to use (default: "default")
         datasource_ids: List of global datasource UUIDs to clone as job-scoped
         instructions: Additional inline markdown instructions
-        config_override: Per-job config overrides as JSON
+        config_override: Per-job config overrides as JSON. To set the model,
+            use {"llm": {"model": "<model_id>"}} — e.g.
+            {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
+            Use the list_models tool to discover available model IDs.
         context: Additional context dictionary
 
     Returns:
@@ -985,6 +988,25 @@ async def get_expert(expert_id: str) -> str:
         return fmt.format_expert_detail(expert_id, data)
     except Exception as e:
         return fmt.format_monitoring_error(f"get expert '{expert_id}'", e)
+
+
+@mcp.tool
+async def list_models() -> str:
+    """List available AI models grouped by provider.
+
+    Returns model IDs for use in create_job's config_override parameter,
+    e.g. config_override={"llm": {"model": "<model_id>"}}.
+    Also includes preset pairs (strategic + tactical models).
+
+    Returns:
+        Models grouped by provider with availability status, plus presets
+    """
+    client = _get_client()
+    try:
+        data = await client.list_models()
+        return fmt.format_models(data)
+    except Exception as e:
+        return fmt.format_monitoring_error("list models", e)
 
 
 @mcp.tool
@@ -1827,7 +1849,10 @@ async def create_project_job(
         description: Task description
         config_name: Expert/agent config (default: uses project default)
         instructions: Additional inline instructions (optional)
-        config_override: Per-job config overrides (optional)
+        config_override: Per-job config overrides as JSON (optional). To set
+            the model, use {"llm": {"model": "<model_id>"}} — e.g.
+            {"llm": {"model": "codex/gpt-5.3-codex-spark"}}.
+            Use the list_models tool to discover available model IDs.
         datasource_ids: Global datasource IDs to clone (optional)
 
     Returns:

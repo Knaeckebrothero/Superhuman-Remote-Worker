@@ -71,6 +71,33 @@ sudo apt-get install -y \
     fonts-noto-core
 
 # -----------------------------------------------------------------------------
+# 1b. Datasource CLI clients (psql, mongosh, cypher-shell)
+#     Needed for read-write datasource mode — agent runs queries via shell.
+#     Mirrors docker/Dockerfile.workspace section 1b.
+# -----------------------------------------------------------------------------
+
+echo "--- Installing datasource CLI clients ---"
+
+# PostgreSQL client (psql) — available in default Ubuntu repos
+sudo apt-get install -y postgresql-client
+
+# MongoDB Shell (mongosh) — from MongoDB's official APT repo
+curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
+    | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
+echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
+    | sudo tee /etc/apt/sources.list.d/mongodb-org-8.0.list
+sudo apt-get update -y
+sudo apt-get install -y mongodb-mongosh
+
+# Neo4j Cypher Shell — requires JRE, from Neo4j's official APT repo
+curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key \
+    | sudo gpg --dearmor -o /usr/share/keyrings/neo4j-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/neo4j-archive-keyring.gpg] https://debian.neo4j.com stable latest" \
+    | sudo tee /etc/apt/sources.list.d/neo4j.list
+sudo apt-get update -y
+sudo apt-get install -y openjdk-17-jre-headless cypher-shell
+
+# -----------------------------------------------------------------------------
 # 2. Tailscale (mesh VPN — joins Headscale tailnet at VM boot via cloud-init)
 # -----------------------------------------------------------------------------
 

@@ -632,7 +632,7 @@ export type MemorySortField = 'created_at' | 'importance' | 'access_count' | 'to
 /**
  * Agent status types.
  */
-export type AgentStatus = 'booting' | 'ready' | 'working' | 'completed' | 'failed' | 'offline';
+export type AgentStatus = 'booting' | 'ready' | 'working' | 'session' | 'draining' | 'completed' | 'failed' | 'offline';
 
 /**
  * Registered agent from the orchestrator.

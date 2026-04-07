@@ -278,6 +278,41 @@ class PostgresDB:
         """Check if connected to database."""
         return self._pool is not None
 
+    async def get_thread(self, thread_id: str) -> Optional[Dict[str, Any]]:
+        """Get thread by ID."""
+        row = await self.fetchrow(
+            "SELECT * FROM threads WHERE id = $1",
+            thread_id,
+        )
+        return self._row_to_dict(row)
+
+    async def end_thread(self, thread_id: str) -> None:
+        """End a persistent thread."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET status   = 'ended',
+                    ended_at = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                thread_id,
+            )
+
+    async def update_thread_status(self, thread_id: str, status: str) -> None:
+        """Update thread status."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE threads
+                SET status        = $2,
+                    last_activity = CURRENT_TIMESTAMP
+                WHERE id = $1
+                """,
+                thread_id,
+                status,
+            )
+
     async def get_thread_messages_history(
         self,
         thread_id: str,

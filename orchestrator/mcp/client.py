@@ -1107,6 +1107,13 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
+    async def list_models(self) -> dict[str, Any]:
+        """List available models from the model catalog."""
+        resp = await self._client.get("/api/models")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
     async def list_datasources(
         self, ds_type: str | None = None
     ) -> list[dict[str, Any]]:

@@ -8027,10 +8027,14 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
     vm = metadata.get("vm") or {}
     return {
         "status": ws.get("status", "none"),
-        "pod_ip": ws.get("pod_ip"),
+        # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
+        "pod_ip": ws.get("pod_ip") or ws.get("host"),
         "pod_name": ws.get("pod_name"),
+        "pod_port": ws.get("pod_port") or ws.get("port"),
         "namespace": ws.get("namespace"),
         "git_remote_url": ws.get("git_remote_url"),
+        # SSH key path (set by Docker provisioner in dev mode)
+        "ssh_key_path": os.environ.get("SSH_KEY_PATH"),
         # VM fields (take precedence when present)
         "vm_status": vm.get("status"),
         "vm_ssh_host": vm.get("ssh_host"),

@@ -1575,6 +1575,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if ds_configs:
             self._inject_datasource_index(ds_configs)
 
+        # Store CLI datasource types for system prompt conditionals
+        cli_ds_types = [
+            ds.get("type")
+            for ds in ds_configs
+            if not ds.get("project_read_only", False)
+            and ds.get("type") in ("postgresql", "neo4j", "mongodb")
+        ]
+        if cli_ds_types:
+            self.config.extra["_cli_datasources"] = cli_ds_types
+
         # Create tool context with dependencies
         # Merge agent_id and LLM settings into config for tools
         tool_config = {
@@ -2038,14 +2048,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if is_ro:
                     lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
                 else:
-                    cli_map = {
-                        "postgresql": "psql",
-                        "neo4j": "cypher-shell",
-                        "mongodb": "mongosh",
-                    }
-                    lines.append(
-                        f"- **{name}** ({ds_type}, read-write) — `{cli_map.get(ds_type)}` via env vars"
-                    )
+                    lines.append(self._format_rw_cli_block(name, ds_type))
             else:
                 lines.append(f"- **{name}** ({ds_type})")
 
@@ -2059,6 +2062,40 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             )
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
+
+    @staticmethod
+    def _format_rw_cli_block(name: str, ds_type: str) -> str:
+        """Format an expanded CLI usage block for a read-write managed datasource."""
+        blocks = {
+            "postgresql": (
+                f"- **{name}** (postgresql, read-write):\n"
+                f"  Use `run_command` with `psql`. Credentials are pre-configured — do NOT pass connection flags.\n"
+                f"  ```\n"
+                f"  psql -c \"SELECT table_name FROM information_schema.tables WHERE table_schema='public'\"\n"
+                f'  psql -c "\\dt"\n'
+                f"  ```"
+            ),
+            "neo4j": (
+                f"- **{name}** (neo4j, read-write):\n"
+                f"  Use `run_command` with `cypher-shell`. Credentials are pre-configured — do NOT pass connection flags.\n"
+                f"  ```\n"
+                f'  cypher-shell --format plain "MATCH (n) RETURN labels(n), count(*)"\n'
+                f"  cypher-shell --format plain \"CREATE (n:Note {{text: 'hello'}}) RETURN n\"\n"
+                f"  ```"
+            ),
+            "mongodb": (
+                f"- **{name}** (mongodb, read-write):\n"
+                f"  Use `run_command` with `mongosh`. Credentials are pre-configured — do NOT pass connection flags.\n"
+                f"  ```\n"
+                f'  mongosh --quiet --eval "db.getCollectionNames()"\n'
+                f'  mongosh --quiet --eval "db.users.find().limit(5)"\n'
+                f"  ```"
+            ),
+        }
+        return blocks.get(
+            ds_type,
+            f"- **{name}** ({ds_type}, read-write) — CLI via env vars",
+        )
 
     def _setup_repository_datasource(self, ds: Dict[str, Any]) -> None:
         """Clone a repository into the workspace and configure git credentials.
