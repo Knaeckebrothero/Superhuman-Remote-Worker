@@ -190,6 +190,12 @@ def parse_args():
         help="Agent mode: 'dual' (accepts jobs or sessions, default), 'worker' (jobs only), or 'persistent' (sessions only)",
     )
     parser.add_argument(
+        "--loop",
+        action="store_true",
+        default=None,
+        help="After completing a job or session, return to IDLE instead of exiting. Enabled by default in dev mode.",
+    )
+    parser.add_argument(
         "--thread-id",
         help="Thread UUID for persistent mode (auto-generated if omitted)",
     )
@@ -596,6 +602,13 @@ def main():
     if args.dev:
         os.environ["DEV_MODE"] = "1"
         logger.info("Development mode enabled — local workspace backend allowed")
+
+    # Loop mode: return to IDLE after task instead of exiting
+    if args.loop or (args.loop is None and args.dev):
+        os.environ["AGENT_LOOP"] = "1"
+        logger.info(
+            "Loop mode enabled — agent will return to IDLE after task completion"
+        )
 
     # Determine config path
     config_path = args.config

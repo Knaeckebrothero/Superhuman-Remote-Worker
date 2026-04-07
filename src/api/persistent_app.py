@@ -244,6 +244,7 @@ async def _attach_session(
         import dataclasses
 
         from ..core.loader import (
+            _apply_settings_matrix,
             create_llm,
             deep_merge,
             load_agent_config_from_dict,
@@ -251,6 +252,17 @@ async def _attach_session(
 
         base_dict = dataclasses.asdict(effective_config)
         merged = deep_merge(base_dict, config_override)
+
+        # If the override changes the model, re-apply settings_matrix for the
+        # new model family so temperature/top_p/limits get correct defaults.
+        # Override LLM keys are treated as "explicitly set" so the matrix
+        # won't overwrite them.
+        if config_override.get("llm"):
+            override_llm_keys = set(config_override["llm"].keys())
+            _apply_settings_matrix(
+                merged, override_llm_keys, effective_config._deployment_dir
+            )
+
         effective_config = load_agent_config_from_dict(
             merged, deployment_dir=effective_config._deployment_dir
         )
@@ -1123,6 +1135,7 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         import dataclasses
 
         from ..core.loader import (
+            _apply_settings_matrix,
             create_llm,
             deep_merge,
             load_agent_config_from_dict,
@@ -1130,6 +1143,15 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
 
         base_dict = dataclasses.asdict(_session.config)
         merged = deep_merge(base_dict, config_override)
+
+        # Re-apply settings_matrix when LLM config changes so model-family
+        # defaults (temperature, top_p, limits) are resolved correctly.
+        if config_override.get("llm"):
+            override_llm_keys = set(config_override["llm"].keys())
+            _apply_settings_matrix(
+                merged, override_llm_keys, _session.config._deployment_dir
+            )
+
         new_config = load_agent_config_from_dict(
             merged, deployment_dir=_session.config._deployment_dir
         )
@@ -1356,6 +1378,10 @@ async def _poll_workspace_ready(
         if not ws:
             return None
 
+        # SSH key: orchestrator sends the path it resolved (dev compose
+        # key or K8s secret mount); fall back to the K8s default.
+        ssh_key = ws.get("ssh_key_path") or "/run/secrets/vm-ssh-key"
+
         # Check VM workspace first (takes precedence over container)
         vm_status = ws.get("vm_status")
         if vm_status == "ready" and ws.get("vm_ssh_host"):
@@ -1365,7 +1391,7 @@ async def _poll_workspace_ready(
                     "host": ws["vm_ssh_host"],
                     "port": ws.get("vm_ssh_port", 22),
                     "username": "agent-host",
-                    "key_path": "/run/secrets/vm-ssh-key",
+                    "key_path": ssh_key,
                     "workspace_path": "/home/agent-host/workspace",
                 },
                 "git_remote_url": ws.get("git_remote_url"),
@@ -1381,9 +1407,9 @@ async def _poll_workspace_ready(
                 "backend": "remote",
                 "remote": {
                     "host": ws["pod_ip"],
-                    "port": 22,
+                    "port": ws.get("pod_port") or 22,
                     "username": "agent-host",
-                    "key_path": "/run/secrets/vm-ssh-key",
+                    "key_path": ssh_key,
                     "workspace_path": "/home/agent-host/workspace",
                 },
                 "git_remote_url": ws.get("git_remote_url"),
@@ -1440,11 +1466,12 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
         from ..core.backends.remote import RemoteBackend
 
         shell_config = _session.config.extra.get("shell", {})
+        ssh_key = os.environ.get("SSH_KEY_PATH", "/run/secrets/vm-ssh-key")
         new_backend = RemoteBackend(
             host=vm_config["ssh_host"],
             port=vm_config.get("ssh_port", 22),
             username="agent-host",
-            key_path="/run/secrets/vm-ssh-key",
+            key_path=ssh_key,
             workspace_path="/home/agent-host/workspace",
             job_id=_thread_id,
             default_timeout=shell_config.get("default_timeout", 120),
@@ -1516,7 +1543,8 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
     if not auxiliary_llm or not messages:
         return None
     try:
-        from ..services.auxiliary import SummarizeTask
+        from langchain_core.messages import HumanMessage as HM
+        from langchain_core.messages import SystemMessage as SM
 
         # Grab first few exchanges for title generation
         sample = []
@@ -1526,13 +1554,17 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         if not sample:
             return None
 
-        result = await auxiliary_llm.run_task(
-            SummarizeTask,
-            text="\n".join(sample),
-            instructions="Generate a short title (5-8 words) for this conversation. Return ONLY the title, no quotes or punctuation.",
-            mode="chain",
+        response = await auxiliary_llm.llm.ainvoke(
+            [
+                SM(
+                    content="Generate a short title (5-8 words) for this conversation. "
+                    "Return ONLY the title, no quotes or punctuation."
+                ),
+                HM(content="\n".join(sample)),
+            ]
         )
-        return result.strip()[:100] if result else None
+        text = getattr(response, "content", None) or ""
+        return text.strip()[:100] if text.strip() else None
     except Exception as e:
         logger.warning(f"Title generation error: {e}")
         return None

@@ -110,6 +110,9 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
+  # Cloud tools - WebDAV file operations (src/tools/cloud/)
+  # Injected automatically via datasource system
+  cloud: []
   # Shell tools - shell command execution (src/tools/shell/)
   shell:
     - run_command     # Execute commands, get output (stateless mode, default)
@@ -295,6 +298,6 @@ shell:
 # Only used when agent is started with --mode persistent
 interactive:
   permission_mode: supervised   # supervised | auto_accept | autonomous
-  idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)
+  idle_timeout_minutes: 15      # Auto-pause session after idle period (0 = disabled)
   greeting: "Hello! I'm ready to help. What would you like to work on?"
 

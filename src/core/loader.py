@@ -371,16 +371,25 @@ class FileResolver:
 PromptResolver = FileResolver
 
 
-def render_instruction_content(content: str, tool_names: List[str]) -> str:
+def render_instruction_content(
+    content: str,
+    tool_names: List[str],
+    cli_datasources: Optional[List[str]] = None,
+) -> str:
     """Render Jinja2 template markers in instruction file content.
 
-    Supports ``{% if has_tool("kb_write") %}`` conditionals and
+    Supports ``{% if has_tool("kb_write") %}`` conditionals,
+    ``{% if cli_datasources %}`` for read-write datasource access, and
     ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
     or ``{{`` markers) passes through unchanged with zero overhead.
 
     Args:
         content: Raw instruction file content (may contain Jinja2 markers).
         tool_names: List of actually-loaded tool names for this job.
+        cli_datasources: List of datasource types with read-write CLI access
+            (e.g. ``["postgresql", "neo4j"]``).  Enables
+            ``{% if cli_datasources %}`` and ``has_cli_datasource("postgresql")``
+            conditionals in templates.
 
     Returns:
         Rendered content with conditionals resolved.
@@ -393,9 +402,12 @@ def render_instruction_content(content: str, tool_names: List[str]) -> str:
     env = Environment(keep_trailing_newline=True)
     template = env.from_string(content)
     tool_set = set(tool_names)
+    ds_set = set(cli_datasources or [])
     return template.render(
         tools=tool_names,
         has_tool=lambda name: name in tool_set,
+        cli_datasources=list(ds_set),
+        has_cli_datasource=lambda ds_type: ds_type in ds_set,
     )
 
 
@@ -1648,6 +1660,10 @@ def detect_model_family(model: str) -> str:
         return "claude-sonnet"
     if name.startswith("claude-haiku"):
         return "claude-haiku"
+    if "codex-spark" in name:
+        return "codex-spark"
+    if "codex" in name and name.startswith("gpt-5"):
+        return "codex"
     if name.startswith("gpt-5"):
         return "gpt-5"
     if name.startswith("gpt-4o"):
@@ -2245,13 +2261,21 @@ def _create_codex_llm(
         llm_kwargs["top_p"] = config.top_p
 
     # Add reasoning parameters — proxy forwards to real OpenAI which supports them.
-    # Use Chat Completions API path (reasoning_effort in model_kwargs) since the
-    # proxy is an intermediary.
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
         level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
-        model_kwargs["reasoning_effort"] = level
-        reasoning_mode = f"chat_completions(effort={level})"
+        if _should_use_reasoning_summary(model):
+            # Native OpenAI reasoning models (gpt-5.x, o3, o4, etc.):
+            # use Responses API with readable summaries.
+            llm_kwargs["reasoning"] = {
+                "effort": level,
+                "summary": "auto",
+            }
+            reasoning_mode = f"responses_api(effort={level})"
+        else:
+            # Other models: use Chat Completions API.
+            model_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"chat_completions(effort={level})"
 
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
@@ -2390,8 +2414,11 @@ def get_phase_system_prompt(
                 expert_identity = ""
 
         # Render Jinja2 conditionals
+        cli_ds_interactive = config.extra.get("_cli_datasources", [])
         if tool_names is not None:
-            template = render_instruction_content(template, tool_names)
+            template = render_instruction_content(
+                template, tool_names, cli_datasources=cli_ds_interactive
+            )
 
         rendered = template.format(
             agent_display_name=config.display_name,
@@ -2429,9 +2456,14 @@ def get_phase_system_prompt(
 
     # Render Jinja2 conditionals BEFORE .format() — Python's str.format()
     # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
+    cli_ds = config.extra.get("_cli_datasources", [])
     if tool_names is not None:
-        phase_component = render_instruction_content(phase_component, tool_names)
-        base_template = render_instruction_content(base_template, tool_names)
+        phase_component = render_instruction_content(
+            phase_component, tool_names, cli_datasources=cli_ds
+        )
+        base_template = render_instruction_content(
+            base_template, tool_names, cli_datasources=cli_ds
+        )
 
     # Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)

@@ -265,41 +265,49 @@ class TestGenerateTitle:
     async def test_samples_first_10_messages(self):
         """Only first 10 messages sampled."""
         messages = [HumanMessage(content=f"msg {i}") for i in range(20)]
-        mock_llm = AsyncMock()
-        mock_llm.run_task.return_value = "Test Title"
+        mock_response = MagicMock()
+        mock_response.content = "Test Title"
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
+        mock_llm.llm.ainvoke.return_value = mock_response
 
-        with patch("src.api.persistent_app.SummarizeTask", create=True):
-            await _generate_title(messages, mock_llm)
+        await _generate_title(messages, mock_llm)
 
-        # The text passed should only contain messages 0-9
-        call_kwargs = mock_llm.run_task.call_args[1]
-        assert "msg 9" in call_kwargs["text"]
-        assert "msg 10" not in call_kwargs["text"]
+        # The HumanMessage passed should only contain messages 0-9
+        call_args = mock_llm.llm.ainvoke.call_args[0][0]
+        human_text = call_args[1].content  # second message is HumanMessage
+        assert "msg 9" in human_text
+        assert "msg 10" not in human_text
 
     @pytest.mark.asyncio
     async def test_truncates_content_to_200_chars(self):
         """Each message content truncated to 200 chars."""
         long_msg = HumanMessage(content="x" * 500)
-        mock_llm = AsyncMock()
-        mock_llm.run_task.return_value = "Title"
+        mock_response = MagicMock()
+        mock_response.content = "Title"
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
+        mock_llm.llm.ainvoke.return_value = mock_response
 
-        with patch("src.api.persistent_app.SummarizeTask", create=True):
-            await _generate_title([long_msg], mock_llm)
+        await _generate_title([long_msg], mock_llm)
 
-        call_text = mock_llm.run_task.call_args[1]["text"]
-        assert len(call_text) <= 200
+        call_args = mock_llm.llm.ainvoke.call_args[0][0]
+        human_text = call_args[1].content
+        assert len(human_text) <= 200
 
     @pytest.mark.asyncio
     async def test_result_stripped_and_truncated_to_100(self):
         """Result is stripped and truncated to 100 chars."""
-        mock_llm = AsyncMock()
-        mock_llm.run_task.return_value = "  " + "A" * 150 + "  "
+        mock_response = MagicMock()
+        mock_response.content = "  " + "A" * 150 + "  "
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
+        mock_llm.llm.ainvoke.return_value = mock_response
 
-        with patch("src.api.persistent_app.SummarizeTask", create=True):
-            result = await _generate_title(
-                [HumanMessage(content="hi")],
-                mock_llm,
-            )
+        result = await _generate_title(
+            [HumanMessage(content="hi")],
+            mock_llm,
+        )
 
         assert len(result) <= 100
         assert not result.startswith(" ")
@@ -307,28 +315,30 @@ class TestGenerateTitle:
     @pytest.mark.asyncio
     async def test_returns_none_on_empty_result(self):
         """Returns None when LLM returns empty string."""
-        mock_llm = AsyncMock()
-        mock_llm.run_task.return_value = ""
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
+        mock_llm.llm.ainvoke.return_value = mock_response
 
-        with patch("src.api.persistent_app.SummarizeTask", create=True):
-            result = await _generate_title(
-                [HumanMessage(content="hi")],
-                mock_llm,
-            )
+        result = await _generate_title(
+            [HumanMessage(content="hi")],
+            mock_llm,
+        )
 
         assert result is None
 
     @pytest.mark.asyncio
     async def test_exception_returns_none(self):
         """Exception during title generation returns None."""
-        mock_llm = AsyncMock()
-        mock_llm.run_task.side_effect = RuntimeError("LLM error")
+        mock_llm = MagicMock()
+        mock_llm.llm = AsyncMock()
+        mock_llm.llm.ainvoke.side_effect = RuntimeError("LLM error")
 
-        with patch("src.api.persistent_app.SummarizeTask", create=True):
-            result = await _generate_title(
-                [HumanMessage(content="hi")],
-                mock_llm,
-            )
+        result = await _generate_title(
+            [HumanMessage(content="hi")],
+            mock_llm,
+        )
 
         assert result is None
 
