@@ -129,6 +129,16 @@ interface JobRow {
                       <span class="status-badge" [class]="'status-' + row.job.status">
                         {{ formatStatus(row.job.status) }}
                       </span>
+                      @if (row.job.status === 'waiting' && row.hasChildren) {
+                        <span class="delegation-badge" title="Waiting for delegation children to complete">
+                          {{ getChildCount(row.job.id) }} children
+                        </span>
+                      }
+                      @if (row.isChild && row.job.creation_order != null) {
+                        <span class="delegation-badge" title="Delegation child (creation order {{ row.job.creation_order }})">
+                          #{{ row.job.creation_order }}
+                        </span>
+                      }
                       @if (row.job.snapshot_status === 'available') {
                         <span class="snapshot-badge" title="Environment snapshot available">S</span>
                       }
@@ -653,6 +663,20 @@ interface JobRow {
         color: #cba6f7;
         margin-left: 2px;
         flex-shrink: 0;
+      }
+
+      .delegation-badge {
+        display: inline-block;
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 9px;
+        font-weight: 500;
+        letter-spacing: 0.3px;
+        background: rgba(116, 199, 236, 0.15);
+        color: #74c7ec;
+        margin-left: 4px;
+        flex-shrink: 0;
+        cursor: help;
       }
 
       .snapshot-badge {
@@ -1389,6 +1413,11 @@ export class JobListComponent implements OnInit, OnDestroy {
       return prompt;
     }
     return prompt.slice(0, maxLength) + '...';
+  }
+
+  getChildCount(parentId: string): number {
+    const jobs = this.filteredJobs();
+    return jobs.filter((j) => j.parent_job_id === parentId).length;
   }
 
   formatStatus(status: string): string {

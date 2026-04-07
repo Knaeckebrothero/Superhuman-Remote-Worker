@@ -365,6 +365,11 @@ class JobResumeRequest(BaseModel):
     )
     previous_status: Optional[str] = Field(
         default=None,
-        description="Job status before resume. Graceful stops (cancelled, paused, pending_review) "
+        description="Job status before resume. Graceful stops (cancelled, paused, pending_review, waiting) "
         "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
+    )
+    delegation_results: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Results from completed delegation children (set by orchestrator when "
+        "resuming a parent from 'waiting' status).",
     )

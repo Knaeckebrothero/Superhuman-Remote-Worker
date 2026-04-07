@@ -673,6 +673,9 @@ export interface Job {
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
+  creation_order?: number | null;
+  delegation_context?: string | null;
+  worktree_path?: string | null;
   repo_name?: string | null;
   branch_name?: string | null;
   merge_status?: string | null;

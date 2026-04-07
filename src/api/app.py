@@ -990,6 +990,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         feedback = request.feedback
         config_name = request.config_name
         previous_status = request.previous_status
+        delegation_results = request.delegation_results
 
         # Build metadata with config info for resume
         resume_metadata = {}
@@ -1001,6 +1002,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["datasources"] = request.datasources
         if request.project_id:
             resume_metadata["project_id"] = request.project_id
+        if delegation_results:
+            resume_metadata["delegation_results"] = delegation_results
 
         # Start processing in background
         async def _resume_job():

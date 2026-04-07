@@ -3,11 +3,12 @@
 Tests the git tools that wrap GitManager for LLM access.
 """
 
-import pytest
 import shutil
-import tempfile
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -134,7 +135,15 @@ class TestCreateGitTools:
     def test_creates_all_tools(self, tools):
         """Test that all expected tools are created."""
         tool_names = {t.name for t in tools}
-        expected = {"git_log", "git_show", "git_diff", "git_status", "git_tags"}
+        expected = {
+            "git_log",
+            "git_show",
+            "git_diff",
+            "git_status",
+            "git_tags",
+            "git_merge_squash",
+            "git_worktree_cleanup",
+        }
         assert tool_names == expected
 
     def test_raises_without_workspace(self):
@@ -364,8 +373,14 @@ class TestGitToolsInactive:
         ctx = MockToolContext(ws)
         tools = create_git_tools(ctx)
 
+        # Tools with required params need minimal valid input
+        required_args = {
+            "git_merge_squash": {"branch": "test"},
+            "git_worktree_cleanup": {"branch": "test"},
+        }
         for tool in tools:
-            result = tool.invoke({})
+            args = required_args.get(tool.name, {})
+            result = tool.invoke(args)
             assert "not available" in result.lower(), (
                 f"{tool.name} didn't handle inactive"
             )
