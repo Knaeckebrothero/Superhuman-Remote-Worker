@@ -756,6 +756,70 @@ class OrchestratorClient:
             )
             return False
 
+    async def create_delegation_job(
+        self,
+        description: str,
+        config_name: str,
+        parent_job_id: str,
+        creation_order: int,
+        delegation_context: str = "",
+        config_override: dict[str, Any] | None = None,
+        project_id: str | None = None,
+        priority: int = 5,
+    ) -> dict[str, Any] | None:
+        """Create a delegation child job via the orchestrator.
+
+        Args:
+            description: Task description for the child job
+            config_name: Agent config to use (e.g., "scholar", "developer")
+            parent_job_id: UUID of the parent job
+            creation_order: 0-based index in the sibling group
+            delegation_context: Shared context string (with port range info)
+            config_override: Config overrides (autonomy, delegation settings)
+            project_id: Project UUID (inherited from parent)
+            priority: Job priority (inherited from parent)
+
+        Returns:
+            Created job dict with id, or None on failure.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs"
+        payload: dict[str, Any] = {
+            "description": description,
+            "config_name": config_name,
+            "parent_job_id": parent_job_id,
+            "creation_order": creation_order,
+            "delegation_context": delegation_context,
+            "priority": priority,
+        }
+        if config_override:
+            payload["config_override"] = config_override
+        if project_id:
+            payload["project_id"] = project_id
+
+        try:
+            response = await self._client.post(url, json=payload, timeout=30.0)
+            if response.status_code in (200, 201):
+                data = response.json()
+                logger.info(
+                    f"Created delegation child job {data.get('id')} "
+                    f"(order={creation_order}) for parent {parent_job_id}"
+                )
+                return data
+            else:
+                logger.warning(
+                    f"Failed to create delegation job for parent {parent_job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return None
+        except Exception as e:
+            logger.warning(
+                f"Error creating delegation job for parent {parent_job_id}: {e}"
+            )
+            return None
+
     async def approve_job(
         self,
         job_id: str,

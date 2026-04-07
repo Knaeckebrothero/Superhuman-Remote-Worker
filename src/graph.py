@@ -57,19 +57,11 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from .core.state import UniversalAgentState
-from .core.loader import (
-    AgentConfig,
-    load_summarization_prompt,
-    load_auxiliary_prompt,
-    get_phase_system_prompt,
-)
-from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
 from .core.context import (
     ContextManager,
@@ -77,17 +69,25 @@ from .core.context import (
     ToolRetryManager,
     sanitize_message_history,
 )
-from .core.phase_snapshot import PhaseSnapshotManager
+from .core.loader import (
+    AgentConfig,
+    load_summarization_prompt,
+    load_auxiliary_prompt,
+    get_phase_system_prompt,
+)
 from .core.phase import (
     handle_phase_transition,
     get_initial_strategic_todos,
     get_transition_strategic_todos,
     get_resume_strategic_todos,
 )
-from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
-from .llm.exceptions import ContextOverflowError
-from .tools.context import ToolContext
+from .core.phase_snapshot import PhaseSnapshotManager
 from .core.response_validator import validate_response
+from .core.state import UniversalAgentState
+from .core.workspace import WorkspaceManager
+from .llm.exceptions import ContextOverflowError
+from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
+from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -2952,6 +2952,7 @@ def create_audited_tool_node(
                     if ws.git_manager and ws.git_manager.is_active:
                         ws.git_manager.commit("Job frozen: waiting for reply")
                     result["should_stop"] = True
+                    result["freeze_data"] = freeze_req
                     logger.info(
                         f"[{job_id}] Freeze requested by tool: "
                         f"{freeze_req.get('freeze_type')}"

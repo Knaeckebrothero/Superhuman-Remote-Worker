@@ -50,6 +50,7 @@ tools:
     - git_tags
   delegation:
     - delegate_work
+    - resume_delegation_child
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed
@@ -57,6 +58,3 @@ tools:
   citation: []
   graph: []
   mongodb: []
-
-delegation:
-  enabled: true

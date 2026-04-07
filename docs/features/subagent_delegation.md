@@ -21,7 +21,7 @@ related:
 
 Design document for letting agents delegate work to subagents (child jobs). Subagents are **branches** of the parent — they share the same VM, inherit the parent's workspace as a git branch, and work in parallel via git worktrees. The parent suspends while children run, then resumes to review diffs, resolve merge conflicts, and squash-merge results in creation order.
 
-**Status:** Concept.
+**Status:** Implemented. All four phases complete — tool, review/merge, cockpit UI, hardening. 46 tests in `tests/test_delegation.py`.
 
 ## Industry Research
 
@@ -703,47 +703,339 @@ delegation:
 - New "Children" tab on parent jobs showing child status, progress, results
 - New "Parent" link on child jobs
 
-## Implementation Phases
+## Implementation Plan
 
-### Phase 1: Core Plumbing
-- `parent_job_id`, `creation_order`, `branch_name`, `worktree_path` columns in DB
-- `waiting` job status
-- Orchestrator: create child jobs with parent reference
-- Orchestrator: completion hook to detect all-children-done
-- Orchestrator: resume parent job
+### Already Implemented (no changes needed)
 
-### Phase 2: Agent Tool + Git Integration
-- `delegate_work` tool: validation, branch creation, worktree setup
-- Port range allocation + kickoff context injection
-- Sibling manifest file (`.subagents.json`)
-- Graph suspension logic (detect `awaiting_children`, checkpoint, exit)
-- Resume injection (child results + branch stats as tool response)
-- Child `WorkspaceManager` pointed at worktree path
-- Config keys + validation
+The following infrastructure already exists in the codebase:
 
-### Phase 3: Review + Merge Loop
-- Parent review flow: `git diff`, read completion.json, approve/resume decision
-- Surviving process tracking at child completion
-- Parent process review (kill/keep decision)
-- Squash merge implementation with conflict detection
-- Resume-with-feedback flow (child goes back to working)
-- Worktree + branch + process + tmux cleanup after merge
-- Merge conflict resolution by parent agent
+**Database schema** (`orchestrator/database/schema.sql:284-422`):
+- Jobs table has all delegation columns: `parent_job_id UUID`, `creation_order SMALLINT`, `worktree_path VARCHAR(500)`, `delegation_context TEXT`, `branch_name VARCHAR(200)`, `merge_status VARCHAR(50)`
+- Status enum includes `'waiting'`
+- `get_delegation_children()` returns children ordered by `creation_order` (`postgres.py:823`)
+- `all_delegation_children_terminal()` checks if all siblings are in terminal state (`postgres.py:853`)
+- `get_delegation_depth()` recursive CTE counting delegation links only (`postgres.py:889`)
 
-### Phase 4: Cockpit UI
-- Job tree visualization (parent → children with branches)
-- Parent/child navigation
-- Waiting status display
-- Branch diff viewer
+**Orchestrator completion flow** (`orchestrator/main.py`):
+- `_handle_delegation_child_completion()` (line 5119): checks if all siblings done → builds child_results summary → stores in parent context as `delegation_results` → transitions parent `waiting` → `paused` → triggers dispatch
+- `_squash_merge_subjob()` (line 215): merges subjob branch into parent via Gitea PR, pre-merge cleanup of job-scoped files
+- `complete_job()` calls both (lines 5778-5807)
 
-### Phase 5: Hardening
-- Timeout enforcement
-- Cascade cancellation
-- Nesting depth enforcement
-- Orphaned worktree cleanup
-- Resource limit tracking (total token spend across parent + children)
-- Optional network namespace isolation (`delegation.network_isolation`)
-- Port range enforcement in shell tools (warn/block out-of-range binds)
+**Job creation** (`orchestrator/main.py:2408`):
+- `JobCreate` model accepts `parent_job_id`, `creation_order`, `worktree_path`, `delegation_context`
+- Gitea branching creates `subjob/{short_id}/{config_name}` branches for subjobs
+
+**Agent workspace** (`src/agent.py:1020-1052`):
+- Worktree creation for subjobs on remote backends (SSH `git worktree add`)
+- Fallback to standard workspace init on failure
+- `GitManager.from_worktree()` (`src/managers/git_manager.py:795`) initializes GitManager on existing worktrees
+
+**Config** (`src/core/loader.py:927-945`, `config/defaults.yaml:259-264`):
+- `DelegationConfig` dataclass: `enabled`, `max_depth`, `default_timeout`, `max_timeout`, `allowed_configs`
+- `config.tools.delegation: []` in defaults (opt-in per expert)
+- Critic and scholar configs enable delegation (`config/experts/{critic,scholar}/config.yaml`)
+
+**Prompts and guides**:
+- Critic strategic prompts have `{% if has_tool("delegate_work") %}` blocks with detailed delegation guidance
+- Scholar strategic prompts and todo_guide.md have delegation phase templates
+- Tool registry has placeholder entry (`src/tools/registry.py:78-85`)
+
+---
+
+### Phase 1: `delegate_work` Tool Implementation
+
+**Goal**: Working tool that creates child jobs, suspends parent, resumes with results.
+
+#### 1.1 Tool module: `src/tools/delegation/delegate_work.py`
+
+New file. The tool function:
+
+```python
+async def delegate_work(
+    tasks: list[dict],       # 1-5 dicts: {"description": str, "config": str (optional)}
+    context: str = "",       # Shared context for all children
+    timeout: int = 7200,     # Max wait in seconds (default 2h)
+    *,
+    # Injected by tool loader (not user-facing):
+    tool_context: ToolContext,
+) -> str:
+```
+
+**Validation** (return error string, don't raise):
+- 1-5 tasks, each with non-empty `description`
+- `config` values (if provided) in `delegation.allowed_configs` or allow-list empty
+- `timeout` ≤ `delegation.max_timeout`
+- `delegation.enabled == True` (should be guaranteed by tool loading, but defense-in-depth)
+- `git_versioning == True` (worktrees require git)
+- Depth check: call orchestrator `GET /api/jobs/{job_id}/delegation-depth` or use cached job metadata. Must be < `max_depth`
+
+**Execution steps:**
+1. Commit current workspace state: `git_manager.commit("Delegation snapshot before spawning N subagents")`
+2. Push to Gitea: `git_manager.push()` (so children can branch from this commit)
+3. Build port range context per child (Layer 2 awareness injection)
+4. Write `.subagents.json` manifest to workspace root
+5. For each task (index `i`):
+   - Build child job payload:
+     - `description`: task description (with subagent environment block prepended to `delegation_context`)
+     - `config_name`: task `config` or parent's config_name
+     - `parent_job_id`: current job_id
+     - `creation_order`: `i`
+     - `delegation_context`: shared `context` + port range + sibling info
+     - `config_override`: `{"autonomy": "full", "delegation": {"enabled": false}}` (no nesting v1)
+     - `project_id`: parent's project_id
+     - `priority`: parent's priority (inherit)
+   - POST to orchestrator `POST /api/jobs` via `tool_context.orchestrator_client`
+   - Record child job_id
+6. Return formatted message: `"Created {N} subagent jobs. Suspending to wait for results.\n\nChildren:\n- subagent/0: {desc} ({config})\n..."`
+7. Set delegation state on tool_context for graph suspension detection
+
+**Files to create:**
+- `src/tools/delegation/__init__.py`
+- `src/tools/delegation/delegate_work.py`
+
+**Files to modify:**
+- `src/tools/registry.py`: Remove `placeholder: True` from `delegate_work` entry, update module path to `delegation.delegate_work`
+
+#### 1.2 Orchestrator client: `create_delegation_job()` method
+
+Add to `src/api/orchestrator_client.py`:
+
+```python
+async def create_delegation_job(
+    self,
+    description: str,
+    config_name: str,
+    parent_job_id: str,
+    creation_order: int,
+    delegation_context: str = "",
+    config_override: dict | None = None,
+    project_id: str | None = None,
+    priority: int = 5,
+) -> dict[str, Any] | None:
+```
+
+Simple wrapper around `POST /api/jobs` with delegation-specific fields. Returns the created job dict or None on failure.
+
+#### 1.3 Tool context: expose orchestrator client and job metadata
+
+**`src/tools/context.py`** (ToolContext dataclass):
+- Add `orchestrator_client: Optional[Any] = None` attribute
+- Add `_job_metadata: Dict[str, Any] = field(default_factory=dict)` for job_id, project_id, priority, config_name, repo_name
+
+No new freeze mechanism needed — ToolContext already has `request_freeze()` / `consume_freeze_request()` (lines 433-455), used by `send_message` for blocking freezes. The delegation tool reuses this.
+
+**`src/agent.py:_setup_job_tools()`**:
+- Pass orchestrator client reference to ToolContext
+- Pass job metadata to ToolContext
+
+#### 1.4 Graph suspension: reuse existing freeze mechanism
+
+The `request_freeze()` → `consume_freeze_request()` pattern already exists in ToolContext (line 433) and is consumed in `audited_tools` (graph.py:2942-2960). When a tool calls `request_freeze()`, the audited_tools node:
+1. Writes `output/job_frozen.json`
+2. Commits to git
+3. Sets `result["should_stop"] = True`
+
+The delegation tool calls:
+```python
+tool_context.request_freeze({
+    "freeze_type": "delegation",
+    "child_job_ids": child_ids,
+    "child_count": len(tasks),
+})
+```
+
+**Required fix in audited_tools** (graph.py:2954): The existing freeze handling sets `result["should_stop"] = True` but does NOT propagate `freeze_data` through graph state. For delegation, the orchestrator's `determine_job_status()` needs `freeze_type` to return `"waiting"`. Add:
+
+```python
+result["should_stop"] = True
+result["freeze_data"] = freeze_req  # NEW: propagate to report_completion()
+```
+
+This also benefits the existing `blocking_message` freeze flow (currently falls through to `pending_review` because freeze_data never reaches the orchestrator — not a bug, but now it's explicit).
+
+The graph then flows: `tools` → `check_todos` → (sees `should_stop`) → `check_goal` → END. The `freeze_data` propagates through graph state → `report_completion()` → orchestrator.
+
+#### 1.5 Orchestrator: handle delegation freeze in `determine_job_status()`
+
+**`orchestrator/services/completion.py:determine_job_status()`** (line 250):
+
+Add delegation handling before the phase boundary fallback (before line 320):
+
+```python
+if freeze_type == "delegation":
+    return ("waiting", None)
+```
+
+This ensures the parent is set to `waiting` when it reports completion with a delegation freeze.
+
+#### 1.6 Orchestrator: skip cleanup for delegation-waiting jobs
+
+**`orchestrator/main.py:complete_job()`** — the snapshot/cleanup section (lines 5835-5898) should skip when the new status is `"waiting"`:
+
+```python
+if new_status not in ("waiting", "reviewing"):
+    # Snapshot and cleanup VM/workspace
+    ...
+```
+
+This preserves the VM/workspace while children are running on it.
+
+#### 1.7 Resume injection: delegation results as tool response
+
+When the parent resumes after all children complete, `delegation_results` is already in the job context (stored by `_handle_delegation_child_completion()`). The resume path needs to inject this.
+
+**`src/graph.py:restore_todo_state()`** (line 2209):
+
+After restoring todos, check for delegation results in metadata:
+```python
+delegation_results = metadata.get("delegation_results")
+if delegation_results:
+    # Inject as a HumanMessage summarizing child results
+    results_msg = _format_delegation_results(delegation_results)
+    return {
+        ...existing returns...,
+        "messages": [HumanMessage(content=results_msg)],
+    }
+```
+
+The results message includes per-child: job_id, status, config, summary, confidence, branch_name. The parent agent then uses `git_diff` and `read_file` tools to review each child's changes and decide on merging.
+
+**Merge flow**: The existing `_squash_merge_subjob()` auto-merges via Gitea PR when each child completes. This is the right behavior for critic/scholar subjobs but NOT for delegation children, where the parent should review before merging.
+
+**Change**: In `complete_job()` (line 5778-5782), skip auto-merge for delegation children:
+
+```python
+# Skip auto-merge for delegation children — parent reviews and merges
+if job.get("parent_job_id") and job.get("creation_order") is None:
+    merge_result = await _squash_merge_subjob(job_id)
+```
+
+Delegation children (have `creation_order`) keep their branches until the parent explicitly merges them. The parent agent uses `git_diff`, `git_merge_squash` (Phase 2) tools to review and merge each child's branch in creation order during the review phase.
+
+#### 1.8 GitManager: add worktree management methods
+
+**`src/managers/git_manager.py`** — add methods for delegation:
+
+```python
+def worktree_add(self, path: str, branch: str, create_branch: bool = True) -> bool:
+    """Create a git worktree at the given path on the specified branch."""
+
+def worktree_remove(self, path: str, force: bool = False) -> bool:
+    """Remove a git worktree."""
+
+def worktree_list(self) -> list[dict]:
+    """List all worktrees."""
+
+def merge_squash(self, branch: str) -> tuple[bool, str]:
+    """Squash-merge the given branch into current HEAD. Returns (success, message)."""
+```
+
+These work on both local (subprocess) and remote (backend.shell_run) paths, following the existing `_use_backend` pattern.
+
+#### 1.9 Port range allocation
+
+In `delegate_work`, generate the environment block per child:
+
+```python
+def _build_subagent_env_block(creation_order: int, total: int, tasks: list) -> str:
+    base_port = 8000 + (creation_order + 1) * 100
+    # Returns the "=== SUBAGENT ENVIRONMENT ===" block from the design doc
+```
+
+This is prepended to each child's `delegation_context`.
+
+---
+
+### Phase 2: Review & Merge Tools
+
+**Goal**: Parent agent can review child diffs and merge them after resume.
+
+#### 2.1 Git tools for delegation review
+
+The parent already has `git_diff`, `git_status`, `git_tags` tools. Add or enhance:
+
+**`src/tools/git/git_tools.py`** — add:
+- `git_merge_squash(branch: str)`: Squash-merge a branch into current HEAD, commit with descriptive message
+- `git_worktree_cleanup(branch: str)`: Remove worktree and delete branch after merge
+
+These are available in both phases (strategic and tactical).
+
+#### 2.2 Worktree cleanup after review
+
+After the parent merges all children, it should clean up:
+1. For each child branch: `git worktree remove .worktrees/subagent_{i}` + `git branch -d subagent/{i}`
+2. Remove `.subagents.json`
+3. Commit cleanup
+
+This can be done by the parent agent using the git tools, or automated in the merge tool.
+
+#### 2.3 Resume-with-feedback for children
+
+If the parent rejects a child's work, it can resume the child with feedback. Use existing `OrchestratorClient.resume_job()` method (line 590).
+
+Add a tool: `resume_delegation_child(job_id: str, feedback: str)`:
+- Calls `POST /api/jobs/{job_id}/resume` with feedback
+- Sets parent back to `waiting` (call orchestrator)
+- Re-suspends the graph (same delegation freeze pattern)
+
+---
+
+### Phase 3: Cockpit UI
+
+**Goal**: Visualize delegation relationships in the web UI.
+
+#### 3.1 Job list enhancements
+
+**`cockpit/src/app/simple/pages/sessions/sessions-page.component.ts`** (or equivalent job list):
+- Show "parent" badge with link for child jobs
+- Show "waiting for N children" indicator for parent jobs in `waiting` status
+- Expandable tree view for parent → children hierarchy
+
+#### 3.2 Job detail enhancements
+
+- New "Children" tab on parent job detail: shows child jobs with status, progress, config, branch
+- "Parent" link on child job detail pages
+- Branch diff viewer: show `git diff main..subagent/N` for each child
+
+#### 3.3 Real-time status updates
+
+- SSE/WebSocket updates for child job progress (already exists for regular jobs)
+- Parent job detail auto-refreshes when children complete
+
+---
+
+### Phase 4: Hardening
+
+**Goal**: Production safety and edge case handling.
+
+#### 4.1 Timeout enforcement
+
+In `_handle_delegation_child_completion()` or a separate periodic task:
+- Check delegation timeout from parent's config
+- If elapsed > timeout: cancel remaining children, resume parent with partial results
+
+#### 4.2 Cascade cancellation
+
+When a parent job is cancelled:
+- Find all delegation children via `get_descendant_jobs()` (already exists, postgres.py:935)
+- Cancel each non-terminal child
+- Clean up worktrees
+
+#### 4.3 Orphaned worktree cleanup
+
+Add to `init.py` or a periodic maintenance task:
+- Scan for `.worktrees/` directories without corresponding running jobs
+- Remove orphaned worktrees and branches
+- Log warnings for manual review
+
+#### 4.4 Resource limit tracking
+
+- Total token spend queryable via existing MongoDB audit trail (per-job `llm_requests`)
+- Add optional `delegation.max_total_tokens` config to cap aggregate spend across parent + children
+
+#### 4.5 Port range awareness (deferred)
+
+Network namespace isolation (Layer 3) is deferred. Port range allocation and awareness injection (Layer 2) are implemented in Phase 1. Port range *enforcement* in shell tools (warn/block out-of-range binds) is deferred to this phase.
 
 ## Inheritance Defaults
 
@@ -769,3 +1061,98 @@ Subagents are branches, so they naturally inherit everything up to the branch po
 3. **Shared knowledge base**: Children get full read/write access to Neo4j. Neo4j handles concurrent writes natively. Subagents work on different tasks so conflicts are unlikely; minor duplicates can be noticed and cleaned up later. Don't overengineer.
 4. **Worktree disk space**: Not a concern. Git worktrees share the object store — only working tree files are duplicated. Typical workspaces (documents, markdown, configs) are small.
 5. **Child checkpoints**: Already solved. Children are separate jobs with their own `job_id`, so checkpoints go to `workspace/checkpoints/job_<child_id>.db` — no conflict with the parent.
+
+## Integration Tests
+
+Test file: `tests/test_delegation.py`
+
+### Phase 1 Tests
+
+**TestDelegateWorkTool:**
+- `test_validate_empty_tasks`: Rejects empty task list
+- `test_validate_too_many_tasks`: Rejects >5 tasks
+- `test_validate_empty_description`: Rejects task with empty description
+- `test_validate_timeout_exceeds_max`: Rejects timeout > max_timeout
+- `test_validate_disallowed_config`: Rejects config not in allowed_configs
+- `test_validate_git_versioning_required`: Rejects when git_versioning=False
+- `test_validate_depth_exceeded`: Rejects when delegation depth >= max_depth
+- `test_creates_child_jobs`: Verify orchestrator API called with correct payloads
+- `test_port_range_allocation`: Verify port range blocks in delegation_context
+- `test_subagent_manifest`: Verify `.subagents.json` written correctly
+- `test_sets_delegation_result`: Verify tool_context.delegation_result set for graph suspension
+
+**TestGraphDelegationSuspension:**
+- `test_audited_tools_detects_delegation`: Verify `should_stop=True` and `freeze_data` set after delegation tool
+- `test_graph_exits_after_delegation`: Verify graph reaches END after delegation suspension
+- `test_freeze_data_contains_child_ids`: Verify freeze_data has correct structure
+
+**TestDetermineJobStatusDelegation:**
+- `test_delegation_freeze_returns_waiting`: `freeze_type="delegation"` → status "waiting"
+- `test_delegation_children_skip_auto_merge`: Children with creation_order skip `_squash_merge_subjob()`
+- `test_cleanup_skipped_for_waiting`: VM/workspace cleanup skipped when status="waiting"
+
+**TestDelegationResume:**
+- `test_resume_injects_delegation_results`: Verify HumanMessage with child results injected on resume
+- `test_delegation_results_format`: Verify message includes per-child status, summary, branch info
+- `test_resume_clears_stop_flags`: Verify should_stop/goal_achieved cleared on delegation resume
+
+**TestGitManagerWorktree:**
+- `test_worktree_add_local`: Create worktree on local filesystem
+- `test_worktree_remove_local`: Remove worktree on local filesystem
+- `test_worktree_list`: List worktrees
+- `test_merge_squash`: Squash-merge branch into current HEAD
+
+**TestPortRangeAllocation:**
+- `test_port_range_single_child`: Verify port range for 1 child
+- `test_port_range_five_children`: Verify port ranges for max children
+- `test_env_block_format`: Verify subagent environment block format
+
+### Phase 2 Tests
+
+**TestDelegationReview:**
+- `test_git_merge_squash_tool`: Verify squash merge via git tool
+- `test_worktree_cleanup_tool`: Verify worktree and branch cleanup
+- `test_resume_child_with_feedback`: Verify child resume + parent re-suspension
+
+### Verification Commands
+
+```bash
+# Phase 1: Core delegation
+pytest tests/test_delegation.py -v -x
+
+# Phase 1: Specific test class
+pytest tests/test_delegation.py::TestDelegateWorkTool -v
+pytest tests/test_delegation.py::TestGraphDelegationSuspension -v
+pytest tests/test_delegation.py::TestDetermineJobStatusDelegation -v
+pytest tests/test_delegation.py::TestDelegationResume -v
+pytest tests/test_delegation.py::TestGitManagerWorktree -v
+
+# Full suite (ensure no regressions)
+pytest tests/ -x -q --tb=short
+
+# Lint
+ruff check src/tools/delegation/ tests/test_delegation.py
+ruff format src/tools/delegation/ tests/test_delegation.py
+```
+
+## File Change Summary
+
+### New Files
+| File | Phase | Purpose |
+|------|-------|---------|
+| `src/tools/delegation/__init__.py` | 1 | Package init, exports metadata |
+| `src/tools/delegation/delegate_work.py` | 1 | Tool implementation |
+| `tests/test_delegation.py` | 1 | Integration tests |
+
+### Modified Files
+| File | Phase | Changes |
+|------|-------|---------|
+| `src/tools/registry.py` | 1 | Remove placeholder, update module path |
+| `src/api/orchestrator_client.py` | 1 | Add `create_delegation_job()` method |
+| `src/tools/tool_context.py` | 1 | Add orchestrator_client, job_metadata, delegation_result |
+| `src/agent.py` | 1 | Pass orchestrator client + metadata to ToolContext |
+| `src/graph.py` | 1 | Delegation suspension in audited_tools, resume injection in restore_todo_state |
+| `orchestrator/services/completion.py` | 1 | Handle `freeze_type="delegation"` → "waiting" |
+| `orchestrator/main.py` | 1 | Skip auto-merge for delegation children, skip cleanup for waiting |
+| `src/managers/git_manager.py` | 1 | Add worktree_add, worktree_remove, worktree_list, merge_squash |
+| `src/tools/git/git_tools.py` | 2 | Add git_merge_squash, git_worktree_cleanup tools |

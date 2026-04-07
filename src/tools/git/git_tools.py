@@ -63,6 +63,22 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "List git tags for this job (use all_jobs=True for all).",
         "phases": ["strategic", "tactical"],
     },
+    "git_merge_squash": {
+        "module": "git.git_tools",
+        "function": "git_merge_squash",
+        "description": "Squash-merge a branch into the current HEAD (for delegation review)",
+        "category": "git",
+        "short_description": "Squash-merge a branch into HEAD. Used to merge subagent results.",
+        "phases": ["strategic", "tactical"],
+    },
+    "git_worktree_cleanup": {
+        "module": "git.git_tools",
+        "function": "git_worktree_cleanup",
+        "description": "Remove a worktree directory and delete its branch (for delegation cleanup)",
+        "category": "git",
+        "short_description": "Remove a worktree and delete its branch after merge.",
+        "phases": ["strategic", "tactical"],
+    },
 }
 
 
@@ -261,10 +277,106 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         return ", ".join(tags)
 
+    @tool
+    def git_merge_squash(
+        branch: str,
+        commit_message: Optional[str] = None,
+    ) -> str:
+        """Squash-merge a branch into the current HEAD.
+
+        Used during delegation review to merge a subagent's branch. Creates a
+        single squash commit containing all changes from the branch. Does NOT
+        delete the branch — use git_worktree_cleanup for that.
+
+        Merge in creation order (subagent/0 first, then subagent/1, etc.) to
+        handle conflicts incrementally.
+
+        Args:
+            branch: Branch name to squash-merge (e.g., "subagent/0")
+            commit_message: Optional custom commit message. If not provided,
+                           uses "Squash merge {branch}".
+
+        Returns:
+            Success message with commit info, or error details if merge failed.
+            If merge conflicts occur, the message describes which files conflict.
+
+        Example:
+            git_merge_squash(branch="subagent/0")
+            git_merge_squash(branch="subagent/1", commit_message="Merge research results")
+        """
+        if not git_mgr.is_active:
+            return "Git versioning not available for this workspace"
+
+        success, msg = git_mgr.merge_squash(branch)
+
+        if not success and "conflict" in msg.lower():
+            return (
+                f"Merge conflicts when merging {branch}:\n{msg}\n\n"
+                "Resolve conflicts manually using read_file/write_file, "
+                "then run_command('git add .') and run_command('git commit')."
+            )
+        if not success:
+            return f"Failed to merge {branch}: {msg}"
+
+        # If custom commit message and the merge created a commit, amend it
+        if commit_message and "No changes" not in msg:
+            git_mgr._run_git(["commit", "--amend", "-m", commit_message])
+
+        return f"Successfully squash-merged {branch}: {msg}"
+
+    @tool
+    def git_worktree_cleanup(
+        branch: str,
+        force: bool = False,
+    ) -> str:
+        """Remove a worktree and delete its branch after merge.
+
+        Call this after squash-merging a subagent's branch to clean up. Removes
+        the worktree directory and deletes the local branch.
+
+        The worktree path is derived from the branch name:
+        - branch "subagent/0" → worktree ".worktrees/subagent_0"
+
+        Args:
+            branch: Branch name to clean up (e.g., "subagent/0")
+            force: Force removal even if worktree has uncommitted changes
+
+        Returns:
+            Status message about what was cleaned up.
+
+        Example:
+            git_worktree_cleanup(branch="subagent/0")
+            git_worktree_cleanup(branch="subagent/2", force=True)
+        """
+        if not git_mgr.is_active:
+            return "Git versioning not available for this workspace"
+
+        # Derive worktree path from branch name: subagent/N → .worktrees/subagent_N
+        wt_dir = branch.replace("/", "_")
+        wt_path = f".worktrees/{wt_dir}"
+
+        results = []
+
+        # Remove worktree
+        if git_mgr.worktree_remove(wt_path, force=force):
+            results.append(f"Removed worktree {wt_path}")
+        else:
+            results.append(f"Failed to remove worktree {wt_path} (may not exist)")
+
+        # Delete branch
+        if git_mgr.delete_branch(branch, force=force):
+            results.append(f"Deleted branch {branch}")
+        else:
+            results.append(f"Failed to delete branch {branch}")
+
+        return ". ".join(results) + "."
+
     return [
         git_log,
         git_show,
         git_diff,
         git_status,
         git_tags,
+        git_merge_squash,
+        git_worktree_cleanup,
     ]

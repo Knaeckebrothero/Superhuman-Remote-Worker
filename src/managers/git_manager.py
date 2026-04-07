@@ -997,6 +997,215 @@ class GitManager:
 
         return result
 
+    # --- Worktree management (for subagent delegation) ---
+
+    def worktree_add(self, path: str, branch: str, create_branch: bool = True) -> bool:
+        """Create a git worktree at the given path on the specified branch.
+
+        Args:
+            path: Relative path for the worktree (e.g., '.worktrees/subagent_0')
+            branch: Branch name (e.g., 'subagent/0')
+            create_branch: If True, create a new branch; if False, use existing
+
+        Returns:
+            True if worktree was created successfully
+        """
+        if not self.is_active:
+            return False
+
+        args = ["worktree", "add"]
+        if create_branch:
+            args.extend(["-b", branch, path])
+        else:
+            args.extend([path, branch])
+
+        result = self._run_git(args)
+        if result.returncode == 0:
+            logger.info(f"Created worktree at {path} on branch {branch}")
+            return True
+        else:
+            logger.error(f"Failed to create worktree at {path}: {result.stderr}")
+            return False
+
+    def worktree_remove(self, path: str, force: bool = False) -> bool:
+        """Remove a git worktree.
+
+        Args:
+            path: Path to the worktree to remove
+            force: If True, force removal even with uncommitted changes
+
+        Returns:
+            True if worktree was removed successfully
+        """
+        if not self.is_active:
+            return False
+
+        args = ["worktree", "remove"]
+        if force:
+            args.append("--force")
+        args.append(path)
+
+        result = self._run_git(args)
+        if result.returncode == 0:
+            logger.info(f"Removed worktree at {path}")
+            return True
+        else:
+            logger.error(f"Failed to remove worktree at {path}: {result.stderr}")
+            return False
+
+    def worktree_list(self) -> list[dict]:
+        """List all worktrees.
+
+        Returns:
+            List of dicts with 'path', 'head', and 'branch' keys
+        """
+        if not self.is_active:
+            return []
+
+        result = self._run_git(["worktree", "list", "--porcelain"])
+        if result.returncode != 0:
+            logger.warning(f"Failed to list worktrees: {result.stderr}")
+            return []
+
+        worktrees = []
+        current: dict = {}
+        for line in result.stdout.strip().splitlines():
+            if line.startswith("worktree "):
+                if current:
+                    worktrees.append(current)
+                current = {"path": line[len("worktree ") :].strip()}
+            elif line.startswith("HEAD "):
+                current["head"] = line[len("HEAD ") :].strip()
+            elif line.startswith("branch "):
+                current["branch"] = line[len("branch ") :].strip()
+            elif line == "bare":
+                current["bare"] = True
+            elif line == "detached":
+                current["detached"] = True
+        if current:
+            worktrees.append(current)
+
+        return worktrees
+
+    def merge_squash(self, branch: str) -> tuple[bool, str]:
+        """Squash-merge the given branch into current HEAD.
+
+        Performs `git merge --squash <branch>` then commits with a descriptive
+        message. Does NOT delete the source branch — caller handles cleanup.
+
+        Args:
+            branch: Branch name to squash-merge
+
+        Returns:
+            Tuple of (success, message). Message contains the commit info on
+            success, or the error/conflict details on failure.
+        """
+        if not self.is_active:
+            return False, "Git not active"
+
+        # Perform squash merge
+        result = self._run_git(["merge", "--squash", branch])
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "CONFLICT" in result.stdout or "CONFLICT" in stderr:
+                return False, f"Merge conflicts detected:\n{result.stdout}\n{stderr}"
+            return False, f"Squash merge failed: {stderr}"
+
+        # Check if merge reported no changes
+        if "Already up to date" in result.stdout:
+            return True, f"No changes from {branch} (already up to date)"
+
+        # Commit the squash merge
+        commit_msg = f"Squash merge {branch}"
+        commit_result = self._run_git(["commit", "-m", commit_msg, "--no-edit"])
+        if commit_result.returncode != 0:
+            # Check if there's nothing to commit (no changes from branch)
+            combined = commit_result.stdout + commit_result.stderr
+            if "nothing to commit" in combined or "nothing added" in combined:
+                return True, f"No changes from {branch} (already merged or empty)"
+            return False, f"Commit after squash merge failed: {commit_result.stderr}"
+
+        logger.info(f"Squash-merged branch {branch}")
+        return True, f"Squash-merged {branch}: {commit_result.stdout.strip()}"
+
+    def delete_branch(self, branch: str, force: bool = False) -> bool:
+        """Delete a local branch.
+
+        Args:
+            branch: Branch name to delete
+            force: If True, use -D (force delete); otherwise -d (safe delete)
+
+        Returns:
+            True if branch was deleted
+        """
+        if not self.is_active:
+            return False
+
+        flag = "-D" if force else "-d"
+        result = self._run_git(["branch", flag, branch])
+        if result.returncode == 0:
+            logger.info(f"Deleted branch {branch}")
+            return True
+        else:
+            logger.warning(f"Failed to delete branch {branch}: {result.stderr}")
+            return False
+
+    def cleanup_orphaned_worktrees(self) -> list[str]:
+        """Remove worktrees in .worktrees/ that have no corresponding active branch.
+
+        Scans git worktree list for entries under .worktrees/ and removes any
+        that are no longer needed (branch deleted, or worktree in broken state).
+
+        Returns:
+            List of cleaned-up worktree paths
+        """
+        if not self.is_active:
+            return []
+
+        worktrees = self.worktree_list()
+        cleaned = []
+
+        for wt in worktrees:
+            path = wt.get("path", "")
+            if "/.worktrees/" not in path and "\\.worktrees\\" not in path:
+                continue  # Not a delegation worktree
+
+            # Check if worktree is in broken state (branch deleted, etc.)
+            # git worktree list --porcelain shows "prunable" for stale entries
+            # For simplicity, we use git worktree prune to clean up stale refs
+            pass
+
+        # Use git worktree prune to remove stale worktree refs
+        prune_result = self._run_git(["worktree", "prune"])
+        if prune_result.returncode == 0 and prune_result.stdout.strip():
+            logger.info(f"Pruned stale worktree refs: {prune_result.stdout.strip()}")
+
+        # Check for .worktrees/ directory entries that git no longer tracks
+        worktrees_dir = self._workspace_path / ".worktrees"
+        if worktrees_dir.exists() and worktrees_dir.is_dir():
+            tracked_paths = {wt.get("path", "") for wt in self.worktree_list()}
+            for child in worktrees_dir.iterdir():
+                if child.is_dir() and str(child) not in tracked_paths:
+                    # Orphaned directory — git doesn't know about it
+                    try:
+                        shutil.rmtree(child)
+                        cleaned.append(str(child))
+                        logger.info(f"Removed orphaned worktree directory: {child}")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to remove orphaned worktree {child}: {e}"
+                        )
+
+            # Remove .worktrees/ if empty
+            if worktrees_dir.exists() and not any(worktrees_dir.iterdir()):
+                try:
+                    worktrees_dir.rmdir()
+                    logger.info("Removed empty .worktrees/ directory")
+                except Exception:
+                    pass
+
+        return cleaned
+
     def _check_git_available(self) -> bool:
         """Check if git is installed and available.
 
