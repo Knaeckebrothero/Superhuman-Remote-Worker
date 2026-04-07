@@ -91,10 +91,15 @@ class IdeProxyService:
         if ide_ctx.get("status") in ("active", "idle") and ide_ctx.get("pod_ip"):
             return ide_ctx["pod_ip"]
 
-        # 2. Live workspace container
+        # 2. Live workspace container (K8s pod or Docker Compose)
         ws_ctx = ctx.get("workspace_container", {})
-        if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
-            return ws_ctx["pod_ip"]
+        if ws_ctx.get("status") == "ready":
+            if ws_ctx.get("pod_ip"):
+                return ws_ctx["pod_ip"]
+            # Docker Compose: code-server exposed on host via mapped port
+            if ws_ctx.get("ide_host"):
+                ide_port = ws_ctx.get("ide_port", 8080)
+                return f"{ws_ctx['ide_host']}:{ide_port}"
 
         # 3. Live VM — prefer pod_ip (cluster-internal, reachable from orchestrator)
         #    over ssh_host (Tailscale IP, only reachable from mesh nodes)

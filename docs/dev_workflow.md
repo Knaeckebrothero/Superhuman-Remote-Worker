@@ -105,14 +105,18 @@ Today:     Scholar ------> Main Job ------> Critic
 ### Proposed Pipeline
 
 ```
+Stage 0 (optional):   Designer ←→ User (interactive, produces design_spec/)
+                              |
 Stage 1 (parallel):   Requirements Engineer + Scholar
                               |
-Stage 2:              Developer (receives research + requirements)
+Stage 2:              Developer (receives research + requirements + design_spec/)
                               |
 Stage 3:              Tester (receives diff, criteria, runs tests)
                               |
-Stage 4:              Critic (reviews ALL agents' work)
+Stage 4:              Critic (reviews ALL agents' work, including design fidelity)
 ```
+
+The Designer stage is optional and interactive — it runs before the automated pipeline as a collaborative session between the designer agent and the user. When a design_spec/ exists, it's injected into the developer's workspace alongside requirements and research. The critic also checks whether the implementation matches the design.
 
 ### Stage Details
 
@@ -197,6 +201,11 @@ New top-level config key for jobs:
 pipeline:
   enabled: true
   stages:
+    - name: design
+      optional: true
+      agents:
+        - config: designer
+          interactive: true   # Runs as persistent session with user
     - name: research
       parallel: true
       agents:
@@ -248,7 +257,29 @@ Create `config/experts/tester/` with all config, prompts, and instruction templa
 - Orchestrator support: `is_testing_enabled()`, `format_test_instructions()`, `_spawn_tester_subjob()` in completion service
 - Completion handler wiring: spawn tester after developer completes (before critic)
 
-### Phase 2: Requirements Expert
+### Phase 2: Designer Expert
+
+Create `config/experts/designer/` with all config, prompts, and instruction templates. Can be used immediately in two modes: (a) interactive persistent session for collaborative design with the user, (b) worker-mode subjob that produces design_spec/ artifacts for the pipeline.
+
+**Deliverables** (DONE):
+- `config/experts/designer/config.yaml`
+- `config/experts/designer/prompt_matrix.yaml`
+- `config/experts/designer/instruction_matrix.yaml`
+- `config/experts/designer/persona.txt`
+- `config/experts/designer/strategic.txt`
+- `config/experts/designer/tactical.txt`
+- `config/experts/designer/instructions.md`
+- `config/experts/designer/design_guide.md` (Catppuccin design system reference)
+- `config/experts/designer/workspace_template.md`
+- `config/experts/designer/strategic_todos_initial.yaml`
+
+**Future work**:
+- Persistent/interactive variant config (`$extends: persistent_defaults`)
+- Orchestrator support: inject design_spec/ into developer workspace
+- Completion handler: optional designer stage before pipeline begins
+- Cockpit UI: mockup preview panel (render HTML mockups inline)
+
+### Phase 3: Requirements Expert
 
 Create `config/experts/requirements/` for structured requirements capture. Can run as a parallel subjob alongside scholar.
 
@@ -261,7 +292,7 @@ Create `config/experts/requirements/` for structured requirements capture. Can r
 - `config/experts/requirements/requirements_instructions.md`
 - Output schema: `requirements.yaml` format definition
 
-### Phase 3: Pipeline Orchestration
+### Phase 4: Pipeline Orchestration
 
 Wire the stages together in the orchestrator. Extend the completion handler to support multi-stage pipelines with parallel agents per stage.
 
@@ -273,7 +304,7 @@ Wire the stages together in the orchestrator. Extend the completion handler to s
 - Feedback routing to specific stages
 - Cockpit UI: pipeline progress visualization
 
-### Phase 4: Iteration
+### Phase 5: Iteration
 
 - Tune tester prompts based on real job results (are tests actually comprehensive?)
 - Tune requirements prompts (are criteria actually testable?)

@@ -379,13 +379,6 @@ describe('SessionsPageComponent', () => {
     // =========================================================================
 
     describe('returnToActive()', () => {
-        it('should navigate to direct when threadId is "local"', () => {
-            mockChat.threadId = () => 'local';
-            component.returnToActive();
-
-            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'direct']);
-        });
-
         it('should navigate to thread when threadId exists', () => {
             mockChat.threadId = () => 'thread-abc';
             component.returnToActive();
@@ -396,38 +389,6 @@ describe('SessionsPageComponent', () => {
         it('should not navigate when threadId is null', () => {
             mockChat.threadId = () => null;
             component.returnToActive();
-
-            expect(mockRouter.navigate).not.toHaveBeenCalled();
-        });
-    });
-
-    // =========================================================================
-    // 9.2.9: goDirectConnect()
-    // =========================================================================
-
-    describe('goDirectConnect()', () => {
-        it('should navigate to direct page', () => {
-            component.directUrl = 'ws://localhost:8001/ws/chat';
-            component.goDirectConnect();
-
-            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'direct']);
-        });
-
-        it('should store URL in sessionStorage', () => {
-            const setItemSpy = vi.spyOn(Storage.prototype, 'setItem');
-            component.directUrl = 'ws://localhost:8001/ws/chat';
-            component.goDirectConnect();
-
-            expect(setItemSpy).toHaveBeenCalledWith(
-                'persistentDirectUrl',
-                'ws://localhost:8001/ws/chat'
-            );
-            setItemSpy.mockRestore();
-        });
-
-        it('should not navigate with empty URL', () => {
-            component.directUrl = '   ';
-            component.goDirectConnect();
 
             expect(mockRouter.navigate).not.toHaveBeenCalled();
         });

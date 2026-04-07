@@ -8,6 +8,7 @@
   window['env']['pgadminUrl'] = 'http://localhost:5050';
   window['env']['mongoExpressUrl'] = 'http://localhost:8081';
   window['env']['mcpUrl'] = 'http://localhost:8055/mcp';
+  window['env']['nextcloudUrl'] = 'http://localhost:8800';
 
   // Keycloak SSO
   window['env']['keycloakUrl'] = 'http://localhost:8180';
