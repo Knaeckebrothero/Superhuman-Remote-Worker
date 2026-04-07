@@ -1,7 +1,8 @@
-import {inject, Injectable, signal} from '@angular/core';
+import {effect, inject, Injectable, signal} from '@angular/core';
 import {environment} from '../environment';
 import {JobContextService} from './job-context.service';
 import {ModelService} from './model.service';
+import {SettingsService} from './settings.service';
 import type {WorkspaceProposal} from './builder-stream.service';
 
 /** A pending workspace edit awaiting user approval. */
@@ -35,6 +36,7 @@ function deepMerge(base: Record<string, unknown>, override: Record<string, unkno
 }
 
 const SESSION_STORAGE_KEY = 'builder_session_id';
+const BUILDER_MODEL_KEY = 'builder_model';
 
 /**
  * Shared signal service for bidirectional artifact state between the
@@ -48,6 +50,7 @@ const SESSION_STORAGE_KEY = 'builder_session_id';
 export class JobArtifactService {
   private readonly jobContext = inject(JobContextService);
   private readonly modelService = inject(ModelService);
+  private readonly settingsService = inject(SettingsService);
 
   /** Current instructions content — single source of truth */
   readonly instructions = signal<string | null>(null);
@@ -70,13 +73,28 @@ export class JobArtifactService {
   /** Whether AI is currently streaming (locks editor to prevent conflicts) */
   readonly streaming = signal<boolean>(false);
 
-  /** Selected builder model */
-  readonly builderModel = signal<string>(environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
+  /** Selected builder model (persisted to localStorage + server settings) */
+  readonly builderModel = signal<string>(this.loadBuilderModel());
 
   /** Pending workspace edit proposals awaiting user approval */
   readonly pendingWorkspaceEdits = signal<PendingWorkspaceEdit[]>([]);
 
   private editCounter = 0;
+  private serverSynced = false;
+
+  constructor() {
+    // Hydrate builder model from server preferences when they load (if no local override)
+    effect(() => {
+      const prefs = this.settingsService.preferences();
+      if (this.serverSynced || !prefs || Object.keys(prefs).length === 0) return;
+      this.serverSynced = true;
+      const serverModel = prefs.default_builder_model;
+      if (serverModel && !this.loadBuilderModelFromStorage()) {
+        this.builderModel.set(serverModel);
+        this.saveBuilderModelToStorage(serverModel);
+      }
+    });
+  }
 
   /**
    * Apply an artifact mutation from a builder tool call.
@@ -147,15 +165,20 @@ export class JobArtifactService {
     }
   }
 
-  /** Reset all state for a new job creation session (preserves job selection) */
+  /** Persist builder model to localStorage and server settings. */
+  persistBuilderModel(modelId: string): void {
+    this.builderModel.set(modelId);
+    this.saveBuilderModelToStorage(modelId);
+    this.settingsService.updatePreferences({ default_builder_model: modelId }).subscribe();
+  }
+
+  /** Reset all state for a new job creation session (preserves builder model + job selection) */
   reset(): void {
     this.instructions.set(null);
     this.config.set(null);
     this.description.set(null);
     this.persistSessionId(null);
     this.streaming.set(false);
-    const models = this.modelService.builderModels();
-    this.builderModel.set(models[0]?.id ?? environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
     this.pendingWorkspaceEdits.set([]);
     this.editCounter = 0;
   }
@@ -166,6 +189,26 @@ export class JobArtifactService {
       return localStorage.getItem(SESSION_STORAGE_KEY);
     } catch {
       return null;
+    }
+  }
+
+  private loadBuilderModel(): string {
+    return this.loadBuilderModelFromStorage() ?? environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b';
+  }
+
+  private loadBuilderModelFromStorage(): string | null {
+    try {
+      return localStorage.getItem(BUILDER_MODEL_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  private saveBuilderModelToStorage(modelId: string): void {
+    try {
+      localStorage.setItem(BUILDER_MODEL_KEY, modelId);
+    } catch {
+      // localStorage may be unavailable
     }
   }
 }

@@ -450,7 +450,7 @@ CREATE TABLE IF NOT EXISTS agents (
     -- Extensible metadata
     metadata JSONB DEFAULT '{}',
 
-    CONSTRAINT valid_agent_status CHECK (status IN ('booting', 'ready', 'working', 'draining', 'completed', 'failed', 'offline'))
+    CONSTRAINT valid_agent_status CHECK (status IN ('booting', 'available', 'ready', 'working', 'draining', 'completed', 'failed', 'offline'))
 );
 
 -- Migration: Add 'draining' to valid_agent_status constraint (graceful shutdown)

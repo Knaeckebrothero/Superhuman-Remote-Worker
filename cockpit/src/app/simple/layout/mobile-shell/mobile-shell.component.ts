@@ -280,7 +280,7 @@ export class MobileShellComponent implements OnInit {
 
   onModelChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
-    this.artifacts.builderModel.set(value);
+    this.artifacts.persistBuilderModel(value);
   }
 
   onJobChange(event: Event): void {

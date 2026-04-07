@@ -1922,6 +1922,7 @@ class UserSettingsUpdate(BaseModel):
     default_auxiliary_model: str | None = None
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
+    default_builder_model: str | None = None
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
 
