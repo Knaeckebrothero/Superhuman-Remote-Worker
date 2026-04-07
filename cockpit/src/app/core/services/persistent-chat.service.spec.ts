@@ -42,7 +42,7 @@ function createService() {
  * Helper: connect a service and return the mock WS.
  * Patches globalThis.WebSocket to intercept construction.
  */
-async function connectService(service: PersistentChatService, opts?: { directUrl?: string }) {
+async function connectService(service: PersistentChatService) {
     const ws = createMockWs();
     // Must use a regular function (not arrow) — arrow functions can't be called with `new`.
     const WsSpy = vi.fn();
@@ -53,11 +53,7 @@ async function connectService(service: PersistentChatService, opts?: { directUrl
     // Add OPEN constant so `send()` guard works
     (globalThis as any).WebSocket.OPEN = 1;
 
-    if (opts?.directUrl) {
-        await service.connect({directUrl: opts.directUrl});
-    } else {
-        await service.connect({threadId: 'test-thread-123'});
-    }
+    await service.connect('test-thread-123');
 
     // Trigger onopen
     if (ws.onopen) ws.onopen({});
@@ -148,7 +144,7 @@ describe('PersistentChatService', () => {
             } as any;
             (globalThis as any).WebSocket.OPEN = 1;
 
-            const promise = service.connect({threadId: 'tid-1'});
+            const promise = service.connect('tid-1');
             await promise;
 
             // Before onopen fires, state should be connecting
@@ -164,11 +160,6 @@ describe('PersistentChatService', () => {
         it('should set threadId for proxied connection', async () => {
             await connectService(service);
             expect(service.threadId()).toBe('test-thread-123');
-        });
-
-        it('should set threadId to "local" for direct connection', async () => {
-            await connectService(service, {directUrl: 'ws://localhost:8001/ws/chat'});
-            expect(service.threadId()).toBe('local');
         });
 
         it('should load history for proxied connection', async () => {
@@ -201,11 +192,6 @@ describe('PersistentChatService', () => {
             expect(msgs[0].role).toBe('user');
             expect(msgs[1].role).toBe('assistant');
             expect(msgs[0].historical).toBe(true);
-        });
-
-        it('should NOT load history for direct connection', async () => {
-            await connectService(service, {directUrl: 'ws://localhost:8001/ws/chat'});
-            expect(mockHttp.get).not.toHaveBeenCalled();
         });
 
         it('should derive WS URL from API URL', async () => {
@@ -1036,7 +1022,7 @@ describe('PersistentChatService', () => {
             } as any;
             (globalThis as any).WebSocket.OPEN = 1;
 
-            const promise = service.connect({threadId: 'tid'});
+            const promise = service.connect('tid');
             await promise;
 
             expect(service.connectionState()).toBe('connecting');

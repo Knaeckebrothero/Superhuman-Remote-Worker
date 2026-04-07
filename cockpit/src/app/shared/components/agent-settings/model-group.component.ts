@@ -1,8 +1,15 @@
 import {Component, computed, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {ModelService} from '../../../core/services/model.service';
+import {SettingsService} from '../../../core/services/settings.service';
 import {readConfigPath, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
+
+const STORAGE_KEYS = {
+  strategic: 'default_strategic_model',
+  tactical: 'default_tactical_model',
+  session: 'default_session_model',
+} as const;
 
 /**
  * Model settings group: preset chips, strategic/tactical model dropdowns.
@@ -57,7 +64,7 @@ import {getReasoningOptions} from './reasoning-options';
               }
             </select>
             @if (strategicModel() !== null) {
-              <button class="reset-btn" (click)="strategicModel.set(null); change.emit()" title="Reset to default">close</button>
+              <button class="reset-btn" (click)="onStrategicModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
@@ -82,7 +89,7 @@ import {getReasoningOptions} from './reasoning-options';
               }
             </select>
             @if (tacticalModel() !== null) {
-              <button class="reset-btn" (click)="tacticalModel.set(null); change.emit()" title="Reset to default">close</button>
+              <button class="reset-btn" (click)="onTacticalModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
@@ -107,7 +114,7 @@ import {getReasoningOptions} from './reasoning-options';
               }
             </select>
             @if (sessionModel() !== null) {
-              <button class="reset-btn" (click)="sessionModel.set(null); change.emit()" title="Reset to default">close</button>
+              <button class="reset-btn" (click)="onSessionModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
@@ -225,6 +232,7 @@ import {getReasoningOptions} from './reasoning-options';
 })
 export class ModelGroupComponent {
   private readonly modelService = inject(ModelService);
+  private readonly settingsService = inject(SettingsService);
 
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
@@ -284,21 +292,29 @@ export class ModelGroupComponent {
   applyPreset(preset: { label: string; strategic: string; tactical: string }): void {
     this.strategicModel.set(preset.strategic);
     this.tacticalModel.set(preset.tactical);
+    this.persistModel('strategic', preset.strategic);
+    this.persistModel('tactical', preset.tactical);
     this.change.emit();
   }
 
   onStrategicModelChange(value: string | null): void {
-    this.strategicModel.set(value === this.resolvedStrategicModel() ? null : value);
+    const resolved = value === this.resolvedStrategicModel() ? null : value;
+    this.strategicModel.set(resolved);
+    this.persistModel('strategic', resolved);
     this.change.emit();
   }
 
   onTacticalModelChange(value: string | null): void {
-    this.tacticalModel.set(value === this.resolvedTacticalModel() ? null : value);
+    const resolved = value === this.resolvedTacticalModel() ? null : value;
+    this.tacticalModel.set(resolved);
+    this.persistModel('tactical', resolved);
     this.change.emit();
   }
 
   onSessionModelChange(value: string | null): void {
-    this.sessionModel.set(value === this.resolvedSessionModel() ? null : value);
+    const resolved = value === this.resolvedSessionModel() ? null : value;
+    this.sessionModel.set(resolved);
+    this.persistModel('session', resolved);
     this.change.emit();
   }
 
@@ -325,15 +341,43 @@ export class ModelGroupComponent {
     this.sessionModel.set(null);
   }
 
-  /** Prefill from expert config (called by parent when expert changes). */
+  /** Prefill from expert config (called by parent when expert changes).
+   *  Falls back to saved user preferences when config doesn't specify a model. */
   prefillFromConfig(config: Record<string, unknown>): void {
     const llm = config['llm'] as Record<string, unknown> | undefined;
     const strat = llm?.['strategic'] as Record<string, unknown> | undefined;
     const tact = llm?.['tactical'] as Record<string, unknown> | undefined;
     const baseModel = (llm?.['model'] as string) ?? null;
 
-    this.strategicModel.set((strat?.['model'] as string) ?? baseModel);
-    this.tacticalModel.set((tact?.['model'] as string) ?? baseModel);
-    this.sessionModel.set(baseModel);
+    this.strategicModel.set(
+      (strat?.['model'] as string) ?? baseModel ?? this.loadSavedModel('strategic'),
+    );
+    this.tacticalModel.set(
+      (tact?.['model'] as string) ?? baseModel ?? this.loadSavedModel('tactical'),
+    );
+    this.sessionModel.set(baseModel ?? this.loadSavedModel('session'));
+  }
+
+  private loadSavedModel(key: keyof typeof STORAGE_KEYS): string | null {
+    try {
+      return localStorage.getItem(STORAGE_KEYS[key]) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private persistModel(key: keyof typeof STORAGE_KEYS, value: string | null): void {
+    const storageKey = STORAGE_KEYS[key];
+    const settingsKey = `default_${key}_model` as const;
+    try {
+      if (value) {
+        localStorage.setItem(storageKey, value);
+      } else {
+        localStorage.removeItem(storageKey);
+      }
+    } catch {
+      // localStorage may be unavailable
+    }
+    this.settingsService.updatePreferences({ [settingsKey]: value ?? null }).subscribe();
   }
 }

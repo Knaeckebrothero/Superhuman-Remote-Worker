@@ -6,6 +6,7 @@ import {DatePipe, TitleCasePipe} from '@angular/common';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {UserService} from '../../../core/services/user.service';
 import {Thread} from '../../../core/models/api.model';
@@ -33,9 +34,6 @@ interface Project {
           <button class="btn btn-primary" (click)="goToCreate()">
             <span class="icon">add</span> New Session
           </button>
-          <button class="btn btn-secondary" (click)="connectDirect = !connectDirect">
-            <span class="icon">link</span> Direct Connect
-          </button>
         </div>
       </div>
 
@@ -45,23 +43,6 @@ interface Project {
           <span class="active-dot"></span>
           <span>Active session in progress</span>
           <span class="active-action">Return to chat</span>
-        </div>
-      }
-
-      <!-- Direct connect (local dev) -->
-      @if (connectDirect) {
-        <div class="direct-connect">
-          <div class="direct-hint">Connects directly to a running agent, bypassing the orchestrator. For local dev with <code>python agent.py --mode persistent</code>.</div>
-          <div class="direct-row">
-            <input
-              type="text"
-              [(ngModel)]="directUrl"
-              placeholder="ws://localhost:8001/ws/chat"
-              (keydown.enter)="goDirectConnect()"
-            />
-            <button class="btn btn-primary btn-sm" (click)="goDirectConnect()">Connect</button>
-            <button class="btn btn-secondary btn-sm" (click)="connectDirect = false">Cancel</button>
-          </div>
         </div>
       }
 
@@ -326,15 +307,7 @@ interface Project {
       text-decoration: underline;
     }
 
-    /* Direct connect */
-    .direct-connect {
-      padding: 12px;
-      background: var(--panel-bg, #181825);
-      border-radius: 8px;
-      margin-bottom: 16px;
-    }
-
-    .direct-hint, .dialog-hint {
+    .dialog-hint {
       font-size: 11px;
       color: var(--text-muted, #6c7086);
       line-height: 1.5;
@@ -342,30 +315,6 @@ interface Project {
     }
 
     .dialog-hint { margin-top: -4px; }
-
-    .direct-hint code {
-      padding: 1px 4px;
-      border-radius: 3px;
-      background: var(--surface-0, #313244);
-      font-size: 11px;
-    }
-
-    .direct-row {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-    }
-
-    .direct-connect input {
-      flex: 1;
-      padding: 6px 10px;
-      border-radius: 4px;
-      border: 1px solid var(--border-color, #313244);
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      font-family: inherit;
-    }
 
     /* Create dialog */
     .create-dialog {
@@ -594,6 +543,7 @@ export class SessionsPageComponent implements OnInit {
     private readonly router = inject(Router);
     private readonly toast = inject(ToastService);
     private readonly userService = inject(UserService);
+    private readonly settingsService = inject(SettingsService);
     readonly chat = inject(PersistentChatService);
 
     threads = signal<Thread[]>([]);
@@ -604,11 +554,9 @@ export class SessionsPageComponent implements OnInit {
     selectedProjectIds = signal<string[]>([]);
 
     showCreate = false;
-    connectDirect = false;
-    directUrl = 'ws://localhost:8001/ws/chat';
     newTitle = '';
     newConfig = 'interactive';
-    newModel = '';
+    newModel = this.loadSavedSessionModel();
     newPermission = 'supervised';
 
     filteredThreads = () => {
@@ -673,7 +621,10 @@ export class SessionsPageComponent implements OnInit {
                 config_name: this.newConfig,
                 permission_mode: this.newPermission,
             };
-            if (this.newModel) body['model'] = this.newModel;
+            if (this.newModel) {
+                body['model'] = this.newModel;
+                this.persistSessionModel(this.newModel);
+            }
             if (this.selectedProjectIds().length > 0) {
                 body['project_ids'] = this.selectedProjectIds();
             }
@@ -682,7 +633,6 @@ export class SessionsPageComponent implements OnInit {
             );
             this.showCreate = false;
             this.newTitle = '';
-            this.newModel = '';
             this.selectedProjectIds.set([]);
             this.router.navigate(['/sessions', data.thread_id]);
         } catch (e: any) {
@@ -744,18 +694,23 @@ export class SessionsPageComponent implements OnInit {
 
     returnToActive(): void {
         const threadId = this.chat.threadId();
-        if (threadId === 'local') {
-            this.router.navigate(['/sessions', 'direct']);
-        } else if (threadId) {
+        if (threadId) {
             this.router.navigate(['/sessions', threadId]);
         }
     }
 
-    goDirectConnect(): void {
-        if (this.directUrl.trim()) {
-            // Store URL and navigate to chat page with direct flag
-            sessionStorage.setItem('persistentDirectUrl', this.directUrl.trim());
-            this.router.navigate(['/sessions', 'direct']);
+    private loadSavedSessionModel(): string {
+        try {
+            return localStorage.getItem('default_session_model') ?? '';
+        } catch {
+            return '';
         }
+    }
+
+    private persistSessionModel(model: string): void {
+        try {
+            localStorage.setItem('default_session_model', model);
+        } catch { /* localStorage may be unavailable */ }
+        this.settingsService.updatePreferences({ default_session_model: model }).subscribe();
     }
 }

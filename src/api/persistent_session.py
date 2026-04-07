@@ -90,6 +90,11 @@ class PersistentSession:
     # Nextcloud workspace sync (initialized if session has nc_session_folder)
     workspace_sync: Optional[Any] = None
 
+    # Datasource connections keyed by type (for ToolContext)
+    datasources: Dict[str, Any] = field(default_factory=dict)
+    # Parent clients for cleanup (e.g. MongoClient)
+    _datasource_clients: Dict[str, Any] = field(default_factory=dict)
+
     @property
     def project_id(self) -> Optional[str]:
         """Primary project (first in list) for backward compat."""
@@ -242,6 +247,7 @@ class PersistentSession:
             workspace_manager=self.workspace_manager,
             todo_manager=None,  # No TodoManager in persistent mode
             postgres_db=postgres_conn,
+            datasources=self.datasources,
             config=tool_config,
             _job_id=self.thread_id,
             _llm_config=self.config.llm,
@@ -505,6 +511,14 @@ class PersistentSession:
                 self.shell_manager.cleanup()
             except Exception as e:
                 logger.warning(f"Shell cleanup error: {e}")
+
+        # Close datasource connections
+        if self.datasources or self._datasource_clients:
+            from ..core.datasource_setup import close_datasource_connections
+
+            close_datasource_connections(self.datasources, self._datasource_clients)
+            self.datasources = {}
+            self._datasource_clients = {}
 
         # Disconnect remote backend if connected
         if self.workspace_manager:

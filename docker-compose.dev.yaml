@@ -236,7 +236,7 @@ services:
       NEXTCLOUD_ADMIN_USER: admin
       NEXTCLOUD_ADMIN_PASSWORD: admin
       SQLITE_DATABASE: nextcloud
-      OVERWRITEPROTOCOL: https
+      OVERWRITEPROTOCOL: http
       # OIDC + init hook configuration
       NEXTCLOUD_OIDC_CLIENT_SECRET: "${NEXTCLOUD_OIDC_CLIENT_SECRET:-nextcloud-client-secret}"
       NEXTCLOUD_OIDC_DISCOVERY_URI: "http://keycloak:8080/realms/srw/.well-known/openid-configuration"
@@ -424,6 +424,7 @@ services:
       - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
     ports:
       - "${WORKSPACE_1_SSH_PORT:-2201}:22"
+      - "${WORKSPACE_1_IDE_PORT:-18081}:8080"
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -447,6 +448,7 @@ services:
       - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
     ports:
       - "${WORKSPACE_2_SSH_PORT:-2202}:22"
+      - "${WORKSPACE_2_IDE_PORT:-18082}:8080"
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -470,6 +472,7 @@ services:
       - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
     ports:
       - "${WORKSPACE_3_SSH_PORT:-2203}:22"
+      - "${WORKSPACE_3_IDE_PORT:-18083}:8080"
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s

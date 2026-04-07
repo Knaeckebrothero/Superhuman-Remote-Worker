@@ -2577,6 +2577,67 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
+    async def resolve_datasources_for_thread(
+        self,
+        datasource_ids: list[str] | None = None,
+        project_ids: list[str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        """Resolve datasources for a persistent thread.
+
+        Returns all applicable datasources: explicitly attached to the thread,
+        then any linked to the thread's projects via the project_datasources
+        junction table, then global ones.  For each datasource type, explicit
+        IDs take priority over project-linked which take priority over global.
+
+        Args:
+            datasource_ids: Explicit datasource UUIDs attached to the thread
+            project_ids: Project UUIDs scoped to the thread
+
+        Returns:
+            List of resolved datasource dicts (one per type)
+        """
+        ds_uuids = []
+        for ds_id in datasource_ids or []:
+            try:
+                ds_uuids.append(UUID(ds_id))
+            except ValueError:
+                pass
+
+        proj_uuids = []
+        for pid in project_ids or []:
+            try:
+                proj_uuids.append(UUID(pid))
+            except ValueError:
+                pass
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (d.type)
+                    d.id, d.name, d.description, d.type, d.connection_url,
+                    d.credentials, d.job_id, d.project_id,
+                    d.cli_hint, d.default_branch,
+                    d.created_at, d.updated_at,
+                    pd.read_only AS project_read_only
+                FROM datasources d
+                LEFT JOIN project_datasources pd
+                    ON pd.datasource_id = d.id
+                   AND pd.project_id = ANY($2::uuid[])
+                WHERE d.id = ANY($1::uuid[])
+                   OR pd.project_id IS NOT NULL
+                   OR (d.job_id IS NULL AND d.project_id IS NULL)
+                ORDER BY d.type,
+                         CASE WHEN d.id = ANY($1::uuid[]) THEN 0
+                              WHEN pd.project_id IS NOT NULL THEN 1
+                              ELSE 2
+                         END
+                """,
+                ds_uuids,
+                proj_uuids,
+            )
+
+        return [dict(row) for row in rows]
+
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 
     async def link_datasource_to_project(

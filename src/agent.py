@@ -178,6 +178,9 @@ class UniversalAgent:
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
 
+        # Orchestrator client (injected by app layer for delegation/reporting)
+        self._orchestrator_client = None
+
         # Persistent shell sessions (tmux-backed)
         self._shell_manager = None
 
@@ -1586,66 +1589,27 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         and injects them into the ToolContext.
         """
         # Process datasources from job metadata (sent by orchestrator)
-        datasources_dict: Dict[str, Any] = {}
+        from src.core.datasource_setup import (
+            inject_datasource_index,
+            process_datasources,
+        )
+
         ds_configs = (
             self._job_metadata.get("datasources", []) if self._job_metadata else []
         )
-        for ds in ds_configs:
-            ds_type = ds.get("type")
-            if not ds_type:
-                continue
+        ws = self._workspace_manager
+        workspace_dir = getattr(ws, "workspace_dir", None) or os.getcwd()
 
-            # Generic datasources: inject env vars into process environment
-            if ds_type == "generic":
-                creds = ds.get("credentials") or {}
-                env_vars = creds.get("env_vars", {})
-                for key, value in env_vars.items():
-                    os.environ[key] = str(value)
-                logger.info(
-                    f"Injected {len(env_vars)} env vars for generic datasource: {ds.get('name', 'unnamed')}"
-                )
-                continue
+        datasources_dict, client_registry, cli_ds_types = process_datasources(
+            ds_configs, workspace_dir=workspace_dir
+        )
+        # Track connections for cleanup
+        self._datasource_connections.update(datasources_dict)
+        self._datasource_clients.update(client_registry)
 
-            # Repository datasources: clone repo and configure git credentials
-            if ds_type == "repository":
-                try:
-                    self._setup_repository_datasource(ds)
-                except Exception as e:
-                    logger.warning(f"Failed to setup repository datasource: {e}")
-                continue
-
-            # Managed connectors: connect via typed drivers (for read-only tools)
-            # In read-write mode, inject env vars instead (no tool connection needed)
-            is_read_only = ds.get("project_read_only", False)
-            if not is_read_only and ds_type in ("postgresql", "neo4j", "mongodb"):
-                # Read-write: inject env vars for CLI access, skip tool connection
-                self._inject_typed_env_vars(ds_type, ds)
-                logger.info(
-                    f"Injected env vars for {ds_type} CLI access: {ds.get('name', 'unnamed')}"
-                )
-                continue
-
-            try:
-                conn = self._create_datasource_connection(ds)
-                datasources_dict[ds_type] = conn
-                self._datasource_connections[ds_type] = conn
-                logger.info(
-                    f"Connected to {ds_type} datasource: {ds.get('name', 'unnamed')}"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to connect to {ds_type} datasource: {e}")
-
-        # Inject datasource index into workspace.md for agent discovery
         if ds_configs:
-            self._inject_datasource_index(ds_configs)
+            inject_datasource_index(ds_configs, ws)
 
-        # Store CLI datasource types for system prompt conditionals
-        cli_ds_types = [
-            ds.get("type")
-            for ds in ds_configs
-            if not ds.get("project_read_only", False)
-            and ds.get("type") in ("postgresql", "neo4j", "mongodb")
-        ]
         if cli_ds_types:
             self.config.extra["_cli_datasources"] = cli_ds_types
 
@@ -1661,7 +1625,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "job_id": self._current_job_id,
             "project_id": (self._job_metadata or {}).get("project_id"),
             "priority": (self._job_metadata or {}).get("priority", 5),
-            "config_name": self.config.name,
+            "config_name": (self._job_metadata or {}).get(
+                "config_name", self.config.agent_id
+            ),
             "repo_name": (self._job_metadata or {}).get("repo_name"),
         }
 

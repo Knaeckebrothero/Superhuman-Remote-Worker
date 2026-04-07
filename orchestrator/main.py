@@ -1107,6 +1107,7 @@ async def _send_session_attach(
     thread_id: str,
     config_override: Optional[dict] = None,
     project_ids: Optional[list] = None,
+    datasources: Optional[list] = None,
 ) -> bool:
     """Send a session attach request to an idle persistent agent.
 
@@ -1117,6 +1118,7 @@ async def _send_session_attach(
         "thread_id": thread_id,
         "config_override": config_override,
         "project_ids": project_ids,
+        "datasources": datasources,
     }
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1923,6 +1925,9 @@ class UserSettingsUpdate(BaseModel):
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
     default_builder_model: str | None = None
+    default_session_model: str | None = None
+    default_strategic_model: str | None = None
+    default_tactical_model: str | None = None
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
 
@@ -6339,8 +6344,9 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
 
-    # Build upstream URL
-    upstream_url = f"http://{pod_ip}:8080/{path}"
+    # Build upstream URL (pod_ip may include port for Docker Compose, e.g. "localhost:8081")
+    host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    upstream_url = f"http://{host}/{path}"
     if request.url.query:
         # Strip 'token' param (reserved for future auth) but forward the rest
         query = str(request.url.query)
@@ -6351,7 +6357,7 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     for key, value in request.headers.items():
         if key.lower() not in _PROXY_HOP_HEADERS:
             upstream_headers[key] = value
-    upstream_headers["host"] = f"{pod_ip}:8080"
+    upstream_headers["host"] = host
     upstream_headers["x-forwarded-for"] = request.client.host if request.client else ""
     upstream_headers["x-forwarded-proto"] = "https"
 
@@ -6400,8 +6406,9 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
 
     await ws.accept()
 
-    # Build upstream WS URL
-    upstream_url = f"ws://{pod_ip}:8080/{path}"
+    # Build upstream WS URL (pod_ip may include port for Docker Compose)
+    ws_host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    upstream_url = f"ws://{ws_host}/{path}"
     if ws.url.query:
         upstream_url += f"?{ws.url.query}"
 
@@ -7475,6 +7482,28 @@ async def test_datasource(datasource_id: str) -> dict[str, Any]:
             except Exception as e:
                 return {"status": "error", "message": str(e)}
 
+        elif ds_type == "webdav":
+            try:
+                from webdav3.client import Client as WebDAVClient
+
+                client = WebDAVClient(
+                    {
+                        "webdav_hostname": url,
+                        "webdav_login": creds.get("username"),
+                        "webdav_password": creds.get("password"),
+                    }
+                )
+                client.list("/")
+                return {"status": "ok", "message": "Connected to WebDAV"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif ds_type in ("generic", "repository"):
+            return {
+                "status": "ok",
+                "message": f"No connectivity test for {ds_type} datasources",
+            }
+
         else:
             return {"status": "error", "message": f"Unknown datasource type: {ds_type}"}
 
@@ -8227,6 +8256,20 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _resolve_thread_datasources(
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Resolve and build datasource payload from thread metadata."""
+    ds_ids = metadata.get("datasource_ids")
+    p_ids = metadata.get("project_ids")
+    if not ds_ids and not p_ids:
+        return None
+    resolved = await postgres_db.resolve_datasources_for_thread(
+        datasource_ids=ds_ids, project_ids=p_ids
+    )
+    return _build_datasources_payload(resolved)
+
+
 @app.get("/api/agents/threads/{thread_id}/workspace")
 async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
     """Agent polls workspace container status for a thread (no auth).
@@ -8264,6 +8307,8 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
         "config_override": metadata.get("config_override"),
         # Project scoping
         "project_ids": metadata.get("project_ids"),
+        # Resolved datasources for the thread
+        "datasources": await _resolve_thread_datasources(metadata),
         # Nextcloud session folder (for workspace sync)
         "nc_session_folder": thread.get("nc_session_folder"),
     }
@@ -8538,6 +8583,9 @@ class ThreadCreateRequest(BaseModel):
     project_ids: list[str] | None = Field(
         None, description="List of project UUIDs to scope"
     )
+    datasource_ids: list[str] | None = Field(
+        None, description="Explicit datasource IDs to attach to this thread"
+    )
     permission_mode: str = Field("supervised", description="Initial permission mode")
     title: str = Field("Untitled Session", description="Session title")
     model: str | None = Field(
@@ -8609,6 +8657,8 @@ async def create_thread(
             metadata_patch["config_override"] = config_override
         if effective_project_ids:
             metadata_patch["project_ids"] = effective_project_ids
+        if request_body.datasource_ids:
+            metadata_patch["datasource_ids"] = request_body.datasource_ids
         if metadata_patch:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -8632,22 +8682,22 @@ async def create_thread(
                 )
 
         # Provision Nextcloud session folder + share with user
+        if not nextcloud_admin.is_initialized and nextcloud_admin.is_configured:
+            await nextcloud_admin.ensure_initialized()
         if nextcloud_admin.is_initialized:
             try:
                 nc_folder = f"sessions/{thread_id[:8]}"
                 folder_ok = await nextcloud_admin.create_session_folder(nc_folder)
-                nc_username = (
-                    await nextcloud_admin.resolve_nc_username(
+                if folder_ok:
+                    share_id = None
+                    nc_username = await nextcloud_admin.resolve_nc_username(
                         user.get("email"),
                         user.get("display_name", "").lower(),
                     )
-                    if folder_ok
-                    else None
-                )
-                if nc_username:
-                    share_id = await nextcloud_admin.share_folder_with_user(
-                        nc_folder, nc_username
-                    )
+                    if nc_username:
+                        share_id = await nextcloud_admin.share_folder_with_user(
+                            nc_folder, nc_username
+                        )
                     await postgres_db.update_thread_nextcloud(
                         thread_id, nc_folder, share_id
                     )
@@ -8731,10 +8781,25 @@ async def create_thread(
             asyncio.create_task(_provision_agent_pod(thread_id, effective_config))
         elif docker_provisioner.is_available:
             # Docker Compose mode: find an idle pool agent and attach the thread
-            async def _assign_pool_agent(tid: str, co: dict, pids: list) -> None:
+            async def _assign_pool_agent(
+                tid: str,
+                co: dict,
+                pids: list,
+                ds_ids: list[str] | None,
+            ) -> None:
+                # Resolve datasources for the thread (explicit + project + global)
+                resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                    datasource_ids=ds_ids, project_ids=pids
+                )
+                ds_payload = _build_datasources_payload(resolved_ds)
+                if resolved_ds:
+                    co = _build_datasource_tool_override(resolved_ds, co)
+
                 idle_agent = await _find_idle_persistent_agent()
                 if idle_agent:
-                    await _send_session_attach(idle_agent, tid, co, pids)
+                    await _send_session_attach(
+                        idle_agent, tid, co, pids, datasources=ds_payload
+                    )
                 else:
                     logger.warning(
                         "Thread %s: no idle agents in pool. "
@@ -8743,7 +8808,12 @@ async def create_thread(
                     )
 
             asyncio.create_task(
-                _assign_pool_agent(thread_id, config_override, effective_project_ids)
+                _assign_pool_agent(
+                    thread_id,
+                    config_override,
+                    effective_project_ids,
+                    request_body.datasource_ids,
+                )
             )
         else:
             logger.warning(
@@ -9008,8 +9078,10 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
                 "gitea_url": gitea_url,
             }
 
-    # Check workspace container
-    if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
+    # Check workspace container (K8s pod_ip or Docker Compose ide_host)
+    if ws_ctx.get("status") == "ready" and (
+        ws_ctx.get("pod_ip") or ws_ctx.get("ide_host")
+    ):
         proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
         return {
             "status": "active",
@@ -9018,8 +9090,11 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
             "gitea_url": gitea_url,
         }
 
-    # Workspace is provisioning
-    if ws_ctx.get("status") == "provisioning" or vm_ctx.get("status") == "provisioning":
+    # Workspace is provisioning (includes "pending" from pre-provision signal)
+    if ws_ctx.get("status") in ("provisioning", "pending") or vm_ctx.get("status") in (
+        "provisioning",
+        "pending",
+    ):
         return {"status": "restoring", "code_server_url": None, "gitea_url": gitea_url}
 
     return {"status": "unavailable", "code_server_url": None, "gitea_url": gitea_url}

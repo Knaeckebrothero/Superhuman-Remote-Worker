@@ -193,6 +193,7 @@ async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
     project_ids: Optional[List[str]] = None,
+    datasources: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     """Create and attach a PersistentSession for the given thread.
 
@@ -222,12 +223,16 @@ async def _attach_session(
         else:
             logger.info("No workspace container — using local backend")
 
-    # Apply config overrides and project_ids from thread metadata
+    # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:
         config_override = (workspace_override or {}).get("config_override")
     if not project_ids:
         project_ids = (workspace_override or {}).get("project_ids") or []
-    if (not config_override or not project_ids) and _orchestrator_client and _thread_id:
+    if (
+        (not config_override or not project_ids or not datasources)
+        and _orchestrator_client
+        and _thread_id
+    ):
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
@@ -235,8 +240,84 @@ async def _attach_session(
                     config_override = ws_info.get("config_override")
                 if not project_ids:
                     project_ids = ws_info.get("project_ids") or []
+                if not datasources:
+                    datasources = ws_info.get("datasources")
         except Exception:
             pass
+
+    # Process datasources: create connections, inject env vars, apply tool overrides
+    datasources_dict: Dict[str, Any] = {}
+    datasource_clients: Dict[str, Any] = {}
+    if datasources:
+        from ..core.datasource_setup import (
+            inject_datasource_index as _inject_ds_index,
+            process_datasources,
+        )
+
+        workspace_dir = os.getcwd()
+        datasources_dict, datasource_clients, cli_ds_types = process_datasources(
+            datasources, workspace_dir=workspace_dir
+        )
+
+        # Inject datasource tool categories into config_override so the
+        # correct tools are loaded when config is resolved below
+        _ds_tool_map = {
+            "neo4j": {
+                "category": "graph",
+                "read": ["cypher_query", "get_database_schema"],
+                "write": ["cypher_query", "cypher_execute", "get_database_schema"],
+            },
+            "postgresql": {
+                "category": "sql",
+                "read": ["sql_query", "sql_schema"],
+                "write": ["sql_query", "sql_schema", "sql_execute"],
+            },
+            "mongodb": {
+                "category": "mongodb",
+                "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
+                "write": [
+                    "mongo_query",
+                    "mongo_aggregate",
+                    "mongo_schema",
+                    "mongo_insert",
+                    "mongo_update",
+                ],
+            },
+            "webdav": {
+                "category": "cloud",
+                "read": ["cloud_list", "cloud_read", "cloud_info"],
+                "write": [
+                    "cloud_list",
+                    "cloud_read",
+                    "cloud_info",
+                    "cloud_write",
+                    "cloud_delete",
+                ],
+            },
+        }
+        config_override = dict(config_override or {})
+        tools_override = dict(config_override.get("tools", {}))
+        attached_types = {ds["type"] for ds in datasources}
+        for ds_type, tool_info in _ds_tool_map.items():
+            cat = tool_info["category"]
+            if ds_type in attached_types:
+                ds_entry = next(d for d in datasources if d["type"] == ds_type)
+                is_ro = ds_entry.get("project_read_only", False)
+                tools_override[cat] = tool_info["read"] if is_ro else tool_info["write"]
+            else:
+                tools_override.setdefault(cat, [])
+        if tools_override:
+            config_override["tools"] = tools_override
+
+        if cli_ds_types:
+            config_override.setdefault("extra", {})["_cli_datasources"] = cli_ds_types
+
+        logger.info(
+            "Processed %d datasource(s) for session: %d connections, %d CLI",
+            len(datasources),
+            len(datasources_dict),
+            len(cli_ds_types),
+        )
 
     effective_config = _agent.config
     llm = _agent._tactical_llm or _agent._llm
@@ -278,6 +359,8 @@ async def _attach_session(
         thread_id=_thread_id,
         config=effective_config,
         project_ids=project_ids or [],
+        datasources=datasources_dict,
+        _datasource_clients=datasource_clients,
     )
     if project_ids:
         logger.info(f"Session scoped to {len(project_ids)} project(s): {project_ids}")
@@ -292,6 +375,13 @@ async def _attach_session(
         workspace_override=workspace_override,
         git_remote_url=git_remote_url,
     )
+
+    # Inject datasource index into workspace.md (after workspace is initialized)
+    if datasources and _session.workspace_manager:
+        try:
+            _inject_ds_index(datasources, _session.workspace_manager)
+        except Exception as e:
+            logger.warning(f"Failed to inject datasource index: {e}")
 
     # Initialize Nextcloud workspace sync if session has a session folder
     nc_folder = (
@@ -492,6 +582,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 thread_id=thread_id,
                 config_override=request.get("config_override"),
                 project_ids=request.get("project_ids"),
+                datasources=request.get("datasources"),
             )
             return JSONResponse(
                 {

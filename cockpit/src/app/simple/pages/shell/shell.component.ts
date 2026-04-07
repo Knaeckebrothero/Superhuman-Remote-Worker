@@ -1,7 +1,10 @@
-import {Component, inject, OnInit} from '@angular/core';
+import {Component, ElementRef, HostListener, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {DatePipe} from '@angular/common';
 import {ViewportService} from '../../../core/services/viewport.service';
 import {JobArtifactService} from '../../../core/services/job-artifact.service';
 import {ModelService} from '../../../core/services/model.service';
+import {UserService} from '../../../core/services/user.service';
+import {BuilderSession, BuilderStreamService} from '../../../core/services/builder-stream.service';
 import {MobileShellComponent} from '../../layout/mobile-shell/mobile-shell.component';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {
@@ -11,7 +14,7 @@ import {
 @Component({
   selector: 'app-shell-page',
   standalone: true,
-  imports: [MobileShellComponent, SidebarToggleComponent, InstructionBuilderComponent],
+  imports: [MobileShellComponent, SidebarToggleComponent, InstructionBuilderComponent, DatePipe],
   template: `
     @if (viewport.isMobile()) {
       <app-mobile-shell />
@@ -19,16 +22,60 @@ import {
       <div class="page">
         <header class="page-header">
           <app-sidebar-toggle />
-          <div class="header-spacer"></div>
-          <select
-            class="model-select"
-            [value]="artifacts.builderModel()"
-            (change)="onModelChange($event)"
-          >
-            @for (m of builderModels(); track m.id) {
-              <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
+
+          <div class="session-controls">
+            <button class="session-title-btn" (click)="toggleSessionDropdown()">
+              <span class="session-title-text">{{ artifacts.sessionTitle() || 'New session' }}</span>
+              <span class="dropdown-arrow">expand_more</span>
+            </button>
+
+            @if (showSessionDropdown()) {
+              <div class="session-dropdown">
+                <button class="session-option new-option" (click)="startNewSession()">
+                  <span class="new-icon">add</span>
+                  <span>New session</span>
+                </button>
+                @for (s of sessions(); track s.id) {
+                  <button
+                    class="session-option"
+                    [class.active]="s.id === artifacts.sessionId()"
+                    (click)="switchSession(s.id, s.title)"
+                  >
+                    <span class="session-option-title">{{ s.title || 'Untitled' }}</span>
+                    <span class="session-option-date">{{ s.updated_at | date:'short' }}</span>
+                  </button>
+                }
+              </div>
             }
-          </select>
+          </div>
+
+          <div class="header-spacer"></div>
+
+          <div class="model-controls">
+            <button class="model-title-btn" (click)="toggleModelDropdown()">
+              <span class="model-title-text">{{ artifacts.builderModel() || 'Select model' }}</span>
+              <span class="dropdown-arrow">expand_more</span>
+            </button>
+
+            @if (showModelDropdown()) {
+              <div class="model-dropdown">
+                @for (group of modelGroups(); track group.group) {
+                  <div class="model-group-header" [class.unconfigured]="!group.configured">
+                    {{ group.configured ? group.group : group.group + ' (no key)' }}
+                  </div>
+                  @for (model of group.models; track model) {
+                    <button
+                      class="model-option"
+                      [class.active]="model === artifacts.builderModel()"
+                      [class.unconfigured]="!group.configured"
+                      (click)="selectModel(model)"
+                    >{{ model }}</button>
+                  }
+                }
+              </div>
+            }
+          </div>
+
           @if (artifacts.streaming()) {
             <span class="streaming-badge">
               <span class="pulse-dot"></span>
@@ -69,21 +116,195 @@ import {
         flex: 1;
       }
 
-      .model-select {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 6px;
-        padding: 6px 8px;
-        font-size: 12px;
-        max-width: 200px;
-        min-height: 36px;
-        cursor: pointer;
-        outline: none;
+      /* Session controls */
+      .session-controls {
+        position: relative;
       }
 
-      .model-select:focus-visible {
+      .session-title-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 10px;
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        max-width: 240px;
+        min-height: 36px;
+      }
+
+      .session-title-btn:hover {
+        background: rgba(255, 255, 255, 0.04);
         border-color: var(--accent-color, #cba6f7);
+      }
+
+      .session-title-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .dropdown-arrow {
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+        color: var(--text-muted, #6c7086);
+        flex-shrink: 0;
+      }
+
+      .session-dropdown {
+        position: absolute;
+        top: calc(100% + 4px);
+        left: 0;
+        min-width: 280px;
+        max-height: 300px;
+        overflow-y: auto;
+        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        z-index: 100;
+      }
+
+      .session-option {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        width: 100%;
+        padding: 8px 12px;
+        border: none;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .session-option:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .session-option.active {
+        background: rgba(203, 166, 247, 0.12);
+      }
+
+      .new-option {
+        border-bottom: 1px solid var(--border-color, #45475a);
+        color: var(--accent-color, #cba6f7);
+        font-weight: 500;
+        gap: 6px;
+        justify-content: flex-start;
+      }
+
+      .new-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .session-option-title {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .session-option-date {
+        font-size: 10px;
+        color: var(--text-muted, #6c7086);
+        flex-shrink: 0;
+      }
+
+      /* Model controls */
+      .model-controls {
+        position: relative;
+      }
+
+      .model-title-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 10px;
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 6px;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        max-width: 260px;
+        min-height: 36px;
+      }
+
+      .model-title-btn:hover {
+        background: rgba(255, 255, 255, 0.04);
+        border-color: var(--accent-color, #cba6f7);
+      }
+
+      .model-title-text {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .model-dropdown {
+        position: absolute;
+        top: calc(100% + 4px);
+        right: 0;
+        min-width: 280px;
+        max-height: 360px;
+        overflow-y: auto;
+        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        z-index: 100;
+      }
+
+      .model-group-header {
+        padding: 6px 12px 4px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--text-muted, #6c7086);
+        border-top: 1px solid var(--border-color, #45475a);
+      }
+
+      .model-group-header:first-child {
+        border-top: none;
+      }
+
+      .model-group-header.unconfigured {
+        opacity: 0.5;
+      }
+
+      .model-option {
+        display: block;
+        width: 100%;
+        padding: 7px 12px 7px 20px;
+        border: none;
+        background: transparent;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        cursor: pointer;
+        text-align: left;
+      }
+
+      .model-option:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .model-option.active {
+        background: rgba(203, 166, 247, 0.12);
+        color: var(--accent-color, #cba6f7);
+      }
+
+      .model-option.unconfigured {
+        opacity: 0.5;
       }
 
       .streaming-badge {
@@ -118,17 +339,73 @@ import {
   ],
 })
 export class ShellPageComponent implements OnInit {
+  private readonly el = inject(ElementRef);
   readonly viewport = inject(ViewportService);
   readonly artifacts = inject(JobArtifactService);
   private readonly modelService = inject(ModelService);
-  readonly builderModels = this.modelService.builderModels;
+  private readonly userService = inject(UserService);
+  private readonly stream = inject(BuilderStreamService);
+  readonly modelGroups = this.modelService.models;
+
+  readonly sessions = signal<BuilderSession[]>([]);
+  readonly showSessionDropdown = signal(false);
+  readonly showModelDropdown = signal(false);
+
+  @ViewChild(InstructionBuilderComponent) builder?: InstructionBuilderComponent;
+
+  @HostListener('document:click', ['$event'])
+  onDocumentClick(event: MouseEvent): void {
+    const target = event.target as Node;
+    if (this.showSessionDropdown()) {
+      const controls = this.el.nativeElement.querySelector('.session-controls');
+      if (controls && !controls.contains(target)) {
+        this.showSessionDropdown.set(false);
+      }
+    }
+    if (this.showModelDropdown()) {
+      const modelControls = this.el.nativeElement.querySelector('.model-controls');
+      if (modelControls && !modelControls.contains(target)) {
+        this.showModelDropdown.set(false);
+      }
+    }
+  }
 
   ngOnInit(): void {
     this.modelService.load();
   }
 
-  onModelChange(event: Event): void {
-    const value = (event.target as HTMLSelectElement).value;
-    this.artifacts.persistBuilderModel(value);
+  toggleModelDropdown(): void {
+    this.showModelDropdown.update((v) => !v);
+  }
+
+  selectModel(model: string): void {
+    this.showModelDropdown.set(false);
+    this.artifacts.persistBuilderModel(model);
+  }
+
+  toggleSessionDropdown(): void {
+    const next = !this.showSessionDropdown();
+    if (next) {
+      this.loadSessions();
+    }
+    this.showSessionDropdown.set(next);
+  }
+
+  startNewSession(): void {
+    this.showSessionDropdown.set(false);
+    this.builder?.startNewSession();
+  }
+
+  switchSession(sessionId: string, title: string | null): void {
+    this.showSessionDropdown.set(false);
+    this.builder?.switchSession(sessionId, title);
+  }
+
+  private loadSessions(): void {
+    const userId = this.userService.currentUserId();
+    if (!userId) return;
+    this.stream.listSessions(userId).subscribe((sessions) => {
+      this.sessions.set(sessions);
+    });
   }
 }

@@ -1,0 +1,141 @@
+# Strategic todos for designer job initialization (first strategic phase)
+# These todos guide the designer agent through feature understanding,
+# pattern auditing, design planning, and first phase mockup todo generation.
+todos:
+  - id: 1
+    content: >-
+      UNDERSTAND: Read the task description and feature requirements.
+
+      Steps:
+      (1) Use read_file to read task_brief.md — this is the feature description.
+      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
+          Pay attention to: target screens/views, user flows, states to handle,
+          existing patterns to match, and any design constraints.
+      (3) Use list_files on documents/ to inventory all input materials
+          (wireframes, screenshots, requirement docs, reference images).
+      (4) Read any provided reference documents or mockups.
+
+      Then persist critical rules as knowledge notes:
+      - Feature requirements and acceptance criteria → kb_write with type="goal", tag="feature"
+      - Design constraints (must match existing patterns, specific colors, etc.) → kb_write with type="decision", tag="constraint"
+      - User flows to design for → kb_write with type="goal", tag="user-flow"
+      - States to handle (empty, error, loading, etc.) → kb_write with type="decision", tag="states"
+
+      COMPLETION CRITERIA: Knowledge notes created for feature requirements,
+      constraints, and user flows. task_brief.md and instructions.md read in full.
+
+      INSTEAD OF: Starting to create mockups — this phase is research only.
+
+  - id: 2
+    content: >-
+      AUDIT EXISTING UI: Map the cockpit's current design patterns and components.
+
+      Steps:
+      (1) Read the design_guide.md file — this is the design system reference with all tokens.
+      (2) Use list_files on repo/cockpit/src/app/ to understand the component structure.
+      (3) Read 3-5 components that are most relevant to the feature you're designing.
+          Focus on their HTML templates (.component.html or inline template) and styles
+          (.component.scss or inline styles).
+      (4) Read repo/cockpit/src/styles.scss for global design tokens.
+      (5) If relevant, explore the simple/ (mobile) layout to understand mobile patterns.
+      (6) If the app is running, use browse_website to see the current UI rendered.
+
+      Write findings to reference/pattern_audit.md:
+      - Existing components that can be reused (with file paths)
+      - Layout patterns in use (split panels, tab bars, card grids)
+      - Interaction patterns (how forms work, how lists handle selection, how modals open)
+      - Gaps: patterns the new feature needs that don't exist yet
+
+      Record as knowledge notes:
+      - Component inventory → kb_write(type="learning", tag="component-inventory")
+      - Design patterns observed → kb_write(type="learning", tag="design-patterns")
+
+      COMPLETION CRITERIA: reference/pattern_audit.md exists with component inventory,
+      patterns observed, and gaps identified. Knowledge notes created.
+
+      INSTEAD OF: Reading every component — focus on the ones relevant to your feature.
+      Instead of memorizing patterns — write them to files, context gets compacted.
+
+  - id: 3
+    content: >-
+      PLAN: Create plan.md with mockup targets and design strategy.
+
+      Start with a "## Feature Overview" section:
+      - What the feature does (one paragraph)
+      - Primary user flow (step by step)
+      - Edge cases and states to handle
+
+      Then a "## Mockup Inventory" section listing every screen/component to mock:
+      - Screen/component name
+      - Output file path (e.g., mockups/feature_screen.html)
+      - States to include (default, empty, error, etc.)
+      - Existing components to reuse
+      - What's new (needs to be designed from scratch)
+
+      Then a "## Reuse Map" showing which existing components map to the new feature.
+
+      Then structure phases:
+      - Phase 1: Core screens (the primary user flow, default states)
+      - Phase 2: Edge cases (empty states, error states, overflow)
+      - Phase 3: Polish (responsive refinements, interaction details, design spec)
+
+      PHASE SIZING: Target 3-5 mockup files per tactical phase. Each mockup
+      should be completable in one focused effort.
+
+      COMPLETION CRITERIA: plan.md exists with mockup inventory, reuse map,
+      and at least 2 phases defined.
+
+      INSTEAD OF: Planning production implementation — you design, the developer builds.
+      Instead of over-planning — start with the core screens and iterate.
+
+  - id: 4
+    content: >-
+      REVIEW PROJECT KNOWLEDGE: Check for prior design decisions and context.
+
+      Search the knowledge base for existing notes from prior jobs:
+      (1) Use kb_list to see all existing notes.
+      (2) Use kb_search with key terms from the feature to find relevant context.
+      (3) Check for existing design decisions that constrain your approach.
+      (4) Check for prior mockups or design work in the project.
+
+      If this is the first design job in the project, the knowledge base may be empty.
+
+      Create initial state notes if they don't exist:
+      - Job objective summary → kb_write with type="goal"
+      - Design approach chosen → kb_write with type="decision", tag="design"
+
+      COMPLETION CRITERIA: kb_list or kb_search called. Prior context reviewed.
+      Initial state notes created.
+
+      INSTEAD OF: Skipping this — prior jobs may have design context that saves work.
+
+  - id: 5
+    content: >-
+      CREATE first phase mockup todos using the next_phase_todos tool.
+
+      IMPORTANT: You MUST read_file('design_guide.md') BEFORE calling next_phase_todos.
+      This file contains the design system tokens and component patterns you MUST use
+      in every mockup.
+
+      After reading the guide, create 3-5 todos for the first tactical phase.
+      Each todo must specify:
+      - Which screen/component to mock up
+      - The output file path (e.g., mockups/feature_main_view.html)
+      - Which design tokens and existing patterns to use
+      - Which states to include
+      - The responsive behavior (mobile + desktop)
+
+      For the FIRST tactical phase, focus on:
+      - The primary screen (the default/populated state of the main view)
+      - One supporting screen (a detail view, modal, or secondary panel)
+      - One edge case mockup (empty state or error state)
+
+      Bad: "Design the job list page"
+      Good: "Create mockup for job list with batch selection in mockups/batch_export_list.html.
+      Use panel layout (panel-bg, panel-header pattern). List items use surface-0 cards with
+      hover to surface-1. Include checkbox column. States: populated (8 items, 3 selected with
+      floating action bar), empty list. Desktop: side panel layout. Mobile: full-width stacked."
+
+      COMPLETION CRITERIA: next_phase_todos called successfully with 3-5 mockup todos.
+
+      INSTEAD OF: Vague todos — name exact files, tokens, patterns, and states.
