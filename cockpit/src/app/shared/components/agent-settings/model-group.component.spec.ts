@@ -1,9 +1,10 @@
-import {describe, expect, it, vi} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
 import {ModelGroupComponent} from './model-group.component';
 import {ModelService} from '../../../core/services/model.service';
+import {SettingsService} from '../../../core/services/settings.service';
 
 /**
  * Create a ModelGroupComponent in a minimal injection context with a mock ModelService.
@@ -37,10 +38,17 @@ function createComponent(overrides?: {
 
   const mockHttp = {get: vi.fn().mockReturnValue(of({}))};
 
+  const mockSettings = {
+    apiKeys: signal([]),
+    preferences: signal({}),
+    updatePreferences: vi.fn().mockReturnValue(of({status: 'ok'})),
+  };
+
   const injector = Injector.create({
     providers: [
       {provide: ModelService, useValue: mockModelService},
       {provide: HttpClient, useValue: mockHttp},
+      {provide: SettingsService, useValue: mockSettings},
     ],
   });
 
@@ -50,6 +58,8 @@ function createComponent(overrides?: {
 
 
 describe('ModelGroupComponent', () => {
+  afterEach(() => localStorage.clear());
+
   describe('signal wiring', () => {
     it('should read models from ModelService', () => {
       const {component} = createComponent();

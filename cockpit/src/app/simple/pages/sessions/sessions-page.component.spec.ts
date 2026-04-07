@@ -1,10 +1,11 @@
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {Injector, runInInjectionContext} from '@angular/core';
+import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {Router} from '@angular/router';
 import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {UserService} from '../../../core/services/user.service';
 
@@ -43,6 +44,12 @@ function createComponent() {
         sessionReady: () => true,
     };
 
+    const mockSettings: any = {
+        apiKeys: signal([]),
+        preferences: signal({}),
+        updatePreferences: vi.fn().mockReturnValue(of({status: 'ok'})),
+    };
+
     const injector = Injector.create({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
@@ -50,6 +57,7 @@ function createComponent() {
             {provide: PersistentChatService, useValue: mockChat},
             {provide: ToastService, useValue: mockToast},
             {provide: UserService, useValue: mockUserService},
+            {provide: SettingsService, useValue: mockSettings},
         ],
     });
 
@@ -284,7 +292,7 @@ describe('SessionsPageComponent', () => {
             await component.createSession();
 
             expect(component.newTitle).toBe('');
-            expect(component.newModel).toBe('');
+            expect(component.newModel).toBe('gpt-5.4');
             expect(component.selectedProjectIds()).toEqual([]);
             expect(component.showCreate).toBe(false);
         });
