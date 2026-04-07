@@ -13,10 +13,14 @@ metadata:
   name: srw-orchestrator-workspace
   namespace: superhuman-remote-worker
 rules:
-  # Workspace container lifecycle (create, delete, get status)
+  # Workspace container + agent pod lifecycle (create, delete, get status)
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch"]
+  # PVC lifecycle for workspace persistence
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "delete", "get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -30,19 +30,19 @@ class WorkspaceSuspensionService:
         self._db: Optional[Any] = None
         self._snapshot_service: Optional[Any] = None
         self._container_provisioner: Optional[Any] = None
-        self._persistent_provisioner: Optional[Any] = None
+        self._agent_provisioner: Optional[Any] = None
 
     def connect(
         self,
         db: Any,
         snapshot_service: Any,
         container_provisioner: Any,
-        persistent_provisioner: Any = None,
+        agent_provisioner: Any = None,
     ) -> None:
         self._db = db
         self._snapshot_service = snapshot_service
         self._container_provisioner = container_provisioner
-        self._persistent_provisioner = persistent_provisioner
+        self._agent_provisioner = agent_provisioner
 
         if self.is_enabled:
             logger.info(
@@ -313,12 +313,9 @@ class WorkspaceSuspensionService:
 
             await self._container_provisioner.delete_thread_workspace(thread_id)
 
-            # Also delete the persistent agent pod (it's stateless, state is in the workspace)
-            if (
-                self._persistent_provisioner
-                and self._persistent_provisioner.is_available
-            ):
-                await self._persistent_provisioner.delete_agent_pod(thread_id)
+            # Also delete the agent pod (it's stateless, state is in the workspace)
+            if self._agent_provisioner and self._agent_provisioner.is_available:
+                await self._agent_provisioner.delete_agent_pod_by_thread(thread_id)
 
             await self._db.merge_thread_workspace_context(
                 thread_id,

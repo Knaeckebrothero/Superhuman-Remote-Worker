@@ -43,7 +43,7 @@ tools:
   sql: [ ]
   mongodb: [ ]
   evaluation: [ ]
-  knowledge: [ ]
+  # knowledge: inherited from persistent_defaults
   delegation: [ ]
 
 interactive:

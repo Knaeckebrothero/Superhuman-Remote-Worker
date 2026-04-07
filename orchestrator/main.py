@@ -112,6 +112,7 @@ from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
+from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
@@ -372,6 +373,31 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             pass  # Continue loop
 
     logger.info("Stale agent detector stopped")
+
+
+async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
+    """Background task that maintains the dynamic agent pool.
+
+    Runs every 60 seconds:
+    - Ensures MIN_AGENTS warm pods exist (instant dispatch)
+    - Cleans up Succeeded/Failed pods from completed tasks
+    """
+    logger.info("Agent pool reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            if agent_provisioner.is_available:
+                await agent_provisioner.ensure_warm_pool()
+                await agent_provisioner.cleanup_completed_pods()
+        except Exception as e:
+            logger.error("Error in agent pool reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Agent pool reconciler stopped")
 
 
 async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -1497,6 +1523,30 @@ async def _try_dispatch_pending_jobs() -> None:
                     matched_job_ids.add(job_id)
                     matched_agent_ids.add(str(agent["id"]))
 
+            # Phase 1.5: Provision agent pods for unmatched jobs (K8s only)
+            remaining = [
+                j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids
+            ]
+            if remaining and agent_provisioner.is_available:
+                for job in remaining:
+                    if (
+                        await agent_provisioner.active_count()
+                        >= agent_provisioner.max_agents
+                    ):
+                        break
+                    pod_name = await agent_provisioner.provision_agent(purpose="job")
+                    if pod_name:
+                        logger.info(
+                            "Provisioned agent %s for pending job %s",
+                            pod_name,
+                            str(job["id"]),
+                        )
+                    else:
+                        break  # At capacity or error
+                    # Don't assign yet — pod needs to register first.
+                    # Agent heartbeats "ready" → _trigger_dispatch() → next
+                    # cycle matches it.
+
             # Phase 2: Preemption (non-blocking)
             remaining = [j for j in pending_jobs if str(j["id"]) not in matched_job_ids]
             if not remaining:
@@ -2100,15 +2150,18 @@ async def lifespan(app: FastAPI):
         container_provisioner=container_provisioner,
     )
 
-    # Initialize persistent agent provisioner (on-demand pods per thread)
+    # Initialize persistent agent provisioner (legacy, kept for backward compat)
     persistent_provisioner.connect(db=postgres_db)
+
+    # Initialize unified agent provisioner (on-demand pods for jobs + sessions)
+    agent_provisioner.connect(db=postgres_db)
 
     # Initialize workspace suspension service (idle timeout → S3 snapshot → pod deletion)
     workspace_suspension_service.connect(
         db=postgres_db,
         snapshot_service=snapshot_service,
         container_provisioner=container_provisioner,
-        persistent_provisioner=persistent_provisioner,
+        agent_provisioner=agent_provisioner,
     )
 
     # Initialize IDE proxy service (pod IP resolution + cache)
@@ -2160,6 +2213,7 @@ async def lifespan(app: FastAPI):
     delegation_timeout_task = asyncio.create_task(
         delegation_timeout_sweeper(_shutdown_event)
     )
+    pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
 
     yield
 
@@ -2175,6 +2229,7 @@ async def lifespan(app: FastAPI):
     await imap_task
     await digest_task
     await delegation_timeout_task
+    await pool_reconciler_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -7039,8 +7094,8 @@ def _build_datasource_tool_override(
     DS_TOOL_MAP = {
         "neo4j": {
             "category": "graph",
-            "read": ["execute_cypher_query", "get_database_schema"],
-            "write": ["execute_cypher_query", "get_database_schema"],
+            "read": ["cypher_query", "get_database_schema"],
+            "write": ["cypher_query", "cypher_execute", "get_database_schema"],
         },
         "postgresql": {
             "category": "sql",
@@ -8637,10 +8692,10 @@ async def create_thread(
                 thread_id,
             )
 
-        # Provision persistent agent pod / assign from pool
-        # Same priority: in-cluster K8s → Docker Compose → kubeconfig K8s
-        use_k8s_agent = persistent_provisioner.is_available and (
-            persistent_provisioner.in_cluster or not docker_provisioner.is_available
+        # Provision agent pod / assign from pool
+        # Priority: unified provisioner (K8s) → Docker Compose pool → manual
+        use_k8s_agent = agent_provisioner.is_available and (
+            agent_provisioner.in_cluster or not docker_provisioner.is_available
         )
         if use_k8s_agent:
             # Kubernetes mode: create agent pod on demand
@@ -8649,10 +8704,12 @@ async def create_thread(
             )
 
             async def _provision_agent_pod(tid: str, cfg: str) -> None:
-                ok = await persistent_provisioner.create_agent_pod(tid, config_name=cfg)
-                if not ok:
+                pod_name = await agent_provisioner.provision_agent(
+                    purpose="session", thread_id=tid, config_name=cfg
+                )
+                if not pod_name:
                     logger.error(
-                        "Thread %s: persistent agent pod provisioning failed. "
+                        "Thread %s: agent pod provisioning failed. "
                         "Check image availability, RBAC, and node resources.",
                         tid,
                     )
@@ -8666,8 +8723,8 @@ async def create_thread(
                     await _send_session_attach(idle_agent, tid, co, pids)
                 else:
                     logger.warning(
-                        "Thread %s: no idle persistent agents in pool. "
-                        "Increase PERSISTENT_REPLICAS or wait for a session to end.",
+                        "Thread %s: no idle agents in pool. "
+                        "Increase AGENT_REPLICAS or wait for a session to end.",
                         tid,
                     )
 
@@ -8676,7 +8733,7 @@ async def create_thread(
             )
         else:
             logger.warning(
-                "Thread %s: persistent agent pod not provisioned — "
+                "Thread %s: agent pod not provisioned — "
                 "no provisioner available. Start the agent manually: "
                 "python agent.py --mode persistent --thread-id %s",
                 thread_id,
@@ -8767,8 +8824,10 @@ async def end_thread(
         await container_provisioner.delete_thread_workspace(thread_id)
         await container_provisioner.delete_thread_workspace_pvc(thread_id)
 
-    # Clean up persistent agent pod
-    if persistent_provisioner.is_available:
+    # Clean up agent pod (unified provisioner, then legacy fallback)
+    if agent_provisioner.is_available:
+        await agent_provisioner.delete_agent_pod_by_thread(thread_id)
+    elif persistent_provisioner.is_available:
         await persistent_provisioner.delete_agent_pod(thread_id)
         await persistent_provisioner.delete_agent_pvc(thread_id)
 
@@ -8826,7 +8885,16 @@ async def resume_thread(
     await postgres_db.resume_thread(thread_id)
 
     # Re-provision agent pod and restore workspace if suspended
-    if persistent_provisioner.is_available:
+    if agent_provisioner.is_available:
+        config_name = thread.get("config_name", "interactive")
+
+        async def _reprovision(tid: str, cfg: str) -> None:
+            await agent_provisioner.provision_agent(
+                purpose="session", thread_id=tid, config_name=cfg
+            )
+
+        asyncio.create_task(_reprovision(thread_id, config_name))
+    elif persistent_provisioner.is_available:
         config_name = thread.get("config_name", "interactive")
         asyncio.create_task(
             persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
@@ -9062,7 +9130,18 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
 
     if not thread.get("agent_id"):
         # On-demand: provision agent pod if needed, then wait for registration
-        if persistent_provisioner.is_available:
+        if agent_provisioner.is_available:
+            pod_status = await agent_provisioner.get_pod_status(thread_id)
+            if not pod_status:
+                config_name = thread.get("config_name", "interactive")
+
+                async def _ws_provision(tid: str, cfg: str) -> None:
+                    await agent_provisioner.provision_agent(
+                        purpose="session", thread_id=tid, config_name=cfg
+                    )
+
+                asyncio.create_task(_ws_provision(thread_id, config_name))
+        elif persistent_provisioner.is_available:
             pod_status = await persistent_provisioner.get_pod_status(thread_id)
             if not pod_status:
                 config_name = thread.get("config_name", "interactive")
@@ -11676,7 +11755,8 @@ def _build_managed_readonly_note(name: str, desc: str, ds_type: str) -> str:
             "- `sql_schema` — inspect tables, columns, types, constraints",
         ],
         "neo4j": [
-            "- `execute_cypher_query` — execute read-only Cypher queries",
+            "- `cypher_query` — execute read-only Cypher queries",
+            "- `cypher_execute` — execute write Cypher statements (CREATE, MERGE, DELETE, SET)",
             "- `get_database_schema` — inspect labels, relationships, properties",
         ],
         "mongodb": [

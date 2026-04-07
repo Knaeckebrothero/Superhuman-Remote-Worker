@@ -610,7 +610,7 @@ class TestLoadToolsDatasourceWarnings:
         """Graph tools should warn (not raise) when no neo4j datasource."""
         ctx = ToolContext()  # no datasources
         # This should not raise — just warn and skip
-        result = load_tools(["execute_cypher_query"], ctx)
+        result = load_tools(["cypher_query"], ctx)
         assert result == []
 
     def test_sql_tools_warn_without_postgresql(self):
