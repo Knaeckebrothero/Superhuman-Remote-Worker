@@ -4593,9 +4593,7 @@ class PostgresDB:
 
         return [dict(r) for r in rows]
 
-    async def update_builder_session_title(
-        self, session_id: str, title: str
-    ) -> bool:
+    async def update_builder_session_title(self, session_id: str, title: str) -> bool:
         """Set the auto-generated title for a builder session."""
         try:
             uuid_val = UUID(session_id)
