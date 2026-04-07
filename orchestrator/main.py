@@ -12682,7 +12682,9 @@ async def send_builder_message(
             if not session.get("title") and len(messages) <= 1:
                 try:
                     title = await _generate_builder_title(
-                        session_id, body.message, final_text,
+                        session_id,
+                        body.message,
+                        final_text,
                         user_id=_session_user_id,
                     )
                     if title:
@@ -12915,14 +12917,17 @@ async def _generate_builder_title(
     llm = _create_builder_llm(model)
 
     prompt_messages = [
-        SystemMessage(content=(
-            "Generate a short title (max 6 words) for this chat session. "
-            "Return ONLY the title text, no quotes, no punctuation at the end."
-        )),
-        HumanMessage(content=(
-            f"User: {user_message[:500]}\n\n"
-            f"Assistant: {assistant_response[:500]}"
-        )),
+        SystemMessage(
+            content=(
+                "Generate a short title (max 6 words) for this chat session. "
+                "Return ONLY the title text, no quotes, no punctuation at the end."
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"User: {user_message[:500]}\n\nAssistant: {assistant_response[:500]}"
+            )
+        ),
     ]
 
     response = await llm.ainvoke(prompt_messages)
