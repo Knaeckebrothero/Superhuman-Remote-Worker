@@ -77,6 +77,45 @@ class _AiosqliteConnectionWrapper:
 logger = logging.getLogger(__name__)
 
 
+def _format_delegation_results(delegation_results: list) -> str:
+    """Format delegation child results as a human-readable message.
+
+    Injected into the parent's graph state as a HumanMessage on delegation
+    resume so the agent can review each child's outcome.
+    """
+    lines = [
+        "## Delegation Results",
+        "",
+        f"All {len(delegation_results)} subagent(s) have completed. "
+        "Review each child's changes below, then merge or resume with feedback.",
+        "",
+    ]
+    for child in delegation_results:
+        status = child.get("status", "unknown")
+        emoji = "completed" if status == "completed" else status
+        lines.append(f"### Child {child.get('creation_order', '?')}: {emoji}")
+        lines.append(f"- **Job ID**: {child.get('job_id', 'unknown')}")
+        lines.append(f"- **Config**: {child.get('config', 'unknown')}")
+        lines.append(f"- **Status**: {status}")
+        if child.get("confidence") is not None:
+            lines.append(f"- **Confidence**: {child['confidence']}")
+        if child.get("branch_name"):
+            lines.append(f"- **Branch**: {child['branch_name']}")
+        if child.get("summary"):
+            lines.append(f"- **Summary**: {child['summary']}")
+        lines.append("")
+        lines.append(
+            f"To review: `git diff main..{child.get('branch_name', 'subagent/?')}`"
+        )
+        lines.append("")
+
+    lines.append(
+        "Use `git_diff` to review each branch. Approve by squash-merging "
+        "in creation order, or resume a child with feedback if changes need revision."
+    )
+    return "\n".join(lines)
+
+
 class UniversalAgent:
     """
     Configurable autonomous agent using workspace-centric architecture.
@@ -496,7 +535,12 @@ class UniversalAgent:
             # Graceful stops (cancel/pause/review) have a valid checkpoint.db with current todos,
             # so we skip snapshot recovery. Crash states need snapshot recovery because the
             # checkpoint may be corrupted or incomplete.
-            GRACEFUL_STOP_STATUSES = {"cancelled", "paused", "pending_review"}
+            GRACEFUL_STOP_STATUSES = {
+                "cancelled",
+                "paused",
+                "pending_review",
+                "waiting",
+            }
             graph_input = None
             if resume:
                 is_graceful = previous_status in GRACEFUL_STOP_STATUSES
@@ -575,6 +619,26 @@ class UniversalAgent:
                     as_node="__start__",
                 )
                 logger.info("Injected feedback into graph state via aupdate_state")
+
+            # Inject delegation results into graph state when resuming from waiting
+            delegation_results = (updated_metadata or {}).get("delegation_results")
+            if resume and delegation_results and graph_input is None:
+                from langchain_core.messages import HumanMessage
+
+                results_msg = _format_delegation_results(delegation_results)
+                await self._graph.aupdate_state(
+                    thread_config,
+                    {
+                        "messages": [HumanMessage(content=results_msg)],
+                        "should_stop": False,
+                        "goal_achieved": False,
+                    },
+                    as_node="restore_todo_state",
+                )
+                logger.info(
+                    f"Injected delegation results into graph state "
+                    f"({len(delegation_results)} children)"
+                )
 
             if stream:
                 # For streaming, cleanup happens inside the generator
@@ -1592,6 +1656,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "agent_id": self.config.agent_id,
             "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
         }
+        # Build job metadata for delegation tool access
+        job_metadata = {
+            "job_id": self._current_job_id,
+            "project_id": (self._job_metadata or {}).get("project_id"),
+            "priority": (self._job_metadata or {}).get("priority", 5),
+            "config_name": self.config.name,
+            "repo_name": (self._job_metadata or {}).get("repo_name"),
+        }
+
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
@@ -1601,6 +1674,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _job_id=self._current_job_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
+            orchestrator_client=self._orchestrator_client,
+            _job_metadata=job_metadata,
         )
         self._tool_context = context
 

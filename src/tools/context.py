@@ -100,6 +100,10 @@ class ToolContext:
     _snapshot_callback: Optional[Any] = (
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
+    orchestrator_client: Optional[Any] = None  # OrchestratorClient for delegation
+    _job_metadata: Dict[str, Any] = field(
+        default_factory=dict
+    )  # job_id, project_id, priority, config_name, repo_name
 
     def __post_init__(self):
         """Validate context after initialization."""

@@ -137,8 +137,9 @@ tools:
   communication:
     - send_message
   # Delegation tools - spawn child jobs as workspace branches (src/tools/delegation/)
-  # Not in defaults — opt-in per expert config (e.g. tools.delegation: [delegate_work])
-  delegation: []
+  delegation:
+    - delegate_work
+    - resume_delegation_child
   # Orchestrator tools - job delegation for persistent agents (src/tools/orchestrator/)
   # Empty by default; persistent agents auto-load these via PersistentSession
   orchestrator: [ ]
@@ -257,7 +258,7 @@ scholar:
 
 # Subagent delegation — let agents spawn child jobs that branch off the workspace
 delegation:
-  enabled: false             # Opt-in: agent gets delegate_work tool
+  enabled: true              # Agents can spawn child jobs via delegate_work
   max_depth: 1               # Nesting depth (1 = no grandchildren)
   default_timeout: 7200      # Default timeout per delegation in seconds (2h)
   max_timeout: 14400          # Maximum allowed timeout (4h)

@@ -953,6 +953,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
         queued_feedback = job_context.pop("queued_feedback", None)
+        delegation_results = job_context.pop("delegation_results", None)
 
         resume_payload = {
             "job_id": job_id,
@@ -964,7 +965,10 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         }
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
-            # Clean up queued_feedback from context so it's not re-injected
+        if delegation_results:
+            resume_payload["delegation_results"] = delegation_results
+        # Clean up consumed context keys so they're not re-injected on retry
+        if queued_feedback or delegation_results:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
@@ -2153,6 +2157,9 @@ async def lifespan(app: FastAPI):
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
     digest_task = asyncio.create_task(quiet_hours_digest_loop(_shutdown_event))
+    delegation_timeout_task = asyncio.create_task(
+        delegation_timeout_sweeper(_shutdown_event)
+    )
 
     yield
 
@@ -2167,6 +2174,7 @@ async def lifespan(app: FastAPI):
     await gc_sweeper_task
     await imap_task
     await digest_task
+    await delegation_timeout_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -5223,6 +5231,158 @@ async def _handle_delegation_child_completion(
     )
 
 
+async def _check_delegation_timeouts() -> int:
+    """Check for timed-out delegation parents and cancel their remaining children.
+
+    Scans jobs in 'waiting' status with freeze_type='delegation'. If the
+    delegation timeout has elapsed, cancels remaining non-terminal children
+    and resumes the parent with partial results.
+
+    Returns the number of timed-out delegations handled.
+    """
+    handled = 0
+    try:
+        async with postgres_db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, freeze_data, config_override, context
+                FROM jobs
+                WHERE status = 'waiting'
+                  AND freeze_data IS NOT NULL
+                """,
+            )
+
+        for row in rows:
+            job_id = str(row["id"])
+            freeze = row["freeze_data"]
+            if isinstance(freeze, str):
+                try:
+                    freeze = json.loads(freeze)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            if not freeze or freeze.get("freeze_type") != "delegation":
+                continue
+
+            timestamp_str = freeze.get("timestamp")
+            timeout = freeze.get("timeout", 7200)
+            if not timestamp_str:
+                continue
+
+            from datetime import datetime, timezone
+
+            try:
+                delegation_start = datetime.fromisoformat(timestamp_str)
+                if delegation_start.tzinfo is None:
+                    delegation_start = delegation_start.replace(tzinfo=timezone.utc)
+                elapsed = (
+                    datetime.now(timezone.utc) - delegation_start
+                ).total_seconds()
+            except (ValueError, TypeError):
+                continue
+
+            if elapsed < timeout:
+                continue
+
+            # Timeout reached — cancel remaining children and resume parent
+            logger.warning(
+                f"Delegation timeout for job {job_id}: "
+                f"{elapsed:.0f}s elapsed > {timeout}s limit"
+            )
+
+            # Cancel non-terminal children
+            children = await postgres_db.get_delegation_children(job_id)
+            cancelled_count = 0
+            for child in children:
+                child_status = child.get("status", "")
+                if child_status not in ("completed", "failed", "cancelled"):
+                    child_id = str(child["id"])
+                    try:
+                        await postgres_db.cancel_job(child_id)
+                        cancelled_count += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to cancel timed-out child {child_id}: {e}"
+                        )
+
+            # Build partial results and resume parent
+            # Re-trigger the completion handler by faking an "all done" state
+            # The simplest approach: just unblock the parent directly
+            child_results = []
+            refreshed_children = await postgres_db.get_delegation_children(job_id)
+            for child in refreshed_children:
+                child_id = str(child["id"])
+                freeze_child = child.get("freeze_data")
+                if isinstance(freeze_child, str):
+                    try:
+                        freeze_child = json.loads(freeze_child)
+                    except (json.JSONDecodeError, ValueError):
+                        freeze_child = {}
+                freeze_child = freeze_child or {}
+
+                child_results.append(
+                    {
+                        "job_id": child_id,
+                        "description": child.get("description", ""),
+                        "status": child.get("status", "unknown"),
+                        "config_name": child.get("config_name", "default"),
+                        "creation_order": child.get("creation_order"),
+                        "branch_name": child.get("branch_name"),
+                        "summary": freeze_child.get("summary", ""),
+                        "confidence": freeze_child.get("confidence", 0.0),
+                        "timed_out": child.get("status") == "cancelled",
+                    }
+                )
+
+            parent_ctx = {}
+            raw_ctx = row.get("context")
+            if raw_ctx:
+                if isinstance(raw_ctx, str):
+                    try:
+                        parent_ctx = json.loads(raw_ctx)
+                    except (json.JSONDecodeError, ValueError):
+                        parent_ctx = {}
+                else:
+                    parent_ctx = dict(raw_ctx)
+
+            parent_ctx["delegation_results"] = child_results
+            parent_ctx["delegation_timed_out"] = True
+            await postgres_db.update_job_context(job_id, parent_ctx)
+
+            await postgres_db.update_job_status(
+                job_id, status="paused", assigned_agent_id=""
+            )
+            _trigger_dispatch()
+
+            logger.info(
+                f"Delegation timeout handled for {job_id}: "
+                f"cancelled {cancelled_count} children, parent re-queued"
+            )
+            handled += 1
+
+    except Exception as e:
+        logger.error(f"Error checking delegation timeouts: {e}", exc_info=True)
+
+    return handled
+
+
+async def delegation_timeout_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that checks for timed-out delegations every 60 seconds."""
+    logger.info("Delegation timeout sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break  # shutdown requested
+        except asyncio.TimeoutError:
+            pass  # 60s elapsed — run the check
+        try:
+            handled = await _check_delegation_timeouts()
+            if handled:
+                logger.info(f"Delegation timeout sweeper: handled {handled} timeouts")
+        except Exception as e:
+            logger.error(f"Delegation timeout sweeper error: {e}", exc_info=True)
+    logger.info("Delegation timeout sweeper stopped")
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
@@ -5776,7 +5936,8 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                     )
 
         # 2. Subjob merge (if this is a subjob with a branch)
-        if job.get("parent_job_id"):
+        # Skip auto-merge for delegation children — parent reviews and merges
+        if job.get("parent_job_id") and job.get("creation_order") is None:
             merge_result = await _squash_merge_subjob(job_id)
             if merge_result:
                 actions.append("subjob branch merged")

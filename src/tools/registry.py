@@ -22,14 +22,13 @@ from .citation import create_citation_tools, get_citation_metadata
 from .cloud import create_cloud_tools, get_cloud_metadata
 from .communication import create_communication_tools, get_communication_metadata
 from .context import ToolContext
-
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
 from .core.session_task_tools import (
     create_session_task_tools,
     get_session_task_metadata,
 )
-
+from .delegation import create_delegation_tools, get_delegation_metadata
 # Import domain tools
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .git import create_git_tools, get_git_metadata
@@ -40,7 +39,6 @@ from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
 from .research import create_research_tools, get_research_metadata
 from .shell import create_shell_tools, get_shell_metadata
 from .sql import create_sql_tools, get_sql_metadata
-
 # Import workspace tools from new package
 from .workspace import create_workspace_tools, get_workspace_metadata
 
@@ -74,15 +72,8 @@ TOOL_REGISTRY.update(get_orchestrator_metadata())
 # Register session task tools (lightweight todos for persistent sessions)
 TOOL_REGISTRY.update(get_session_task_metadata())
 
-# Register delegation tool (placeholder — implementation in Phase 2)
-TOOL_REGISTRY["delegate_work"] = {
-    "module": "core.delegation",
-    "function": "delegate_work",
-    "description": "Delegate work to 1-5 subagent jobs that branch off your workspace",
-    "category": "delegation",
-    "phases": ["strategic", "tactical"],
-    "placeholder": True,  # Removed in Phase 2 when tool is implemented
-}
+# Register delegation tools (subagent spawning)
+TOOL_REGISTRY.update(get_delegation_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -472,16 +463,12 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Delegation tools (subagent spawning)
     if "delegation" in tools_by_category:
         try:
-            from .delegation import create_delegation_tools, get_delegation_metadata  # noqa: F401
-
             delegation_tools = create_delegation_tools(context)
             requested = set(tools_by_category["delegation"])
             for tool in delegation_tools:
                 if tool.name in requested:
                     all_tools.append(tool)
                     logger.debug(f"Loaded delegation tool: {tool.name}")
-        except ImportError:
-            logger.debug("Delegation tools not yet implemented (Phase 2)")
         except Exception as e:
             logger.warning(f"Could not load delegation tools: {e}")
 
