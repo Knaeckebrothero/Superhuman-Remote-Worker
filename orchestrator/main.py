@@ -1709,7 +1709,7 @@ class AgentHeartbeat(BaseModel):
     status: str = Field(
         ...,
         description="Agent status",
-        pattern="^(booting|ready|working|session|draining|completed|failed)$",
+        pattern="^(booting|available|ready|working|session|draining|completed|failed)$",
     )
     current_job_id: str | None = Field(None, description="Current job UUID if working")
     metrics: dict[str, Any] | None = Field(
@@ -8214,6 +8214,9 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
 
         # Provision workspace container in background if K8s is available (in-cluster only)
         if container_provisioner.is_available and container_provisioner.in_cluster:
+            await postgres_db.merge_thread_workspace_context(
+                thread_id, {"status": "pending"}
+            )
             asyncio.create_task(
                 container_provisioner.create_thread_workspace(thread_id)
             )
@@ -8659,6 +8662,12 @@ async def create_thread(
             container_provisioner.in_cluster or not docker_provisioner.is_available
         )
         if use_k8s:
+            # Signal that workspace provisioning is starting so the agent
+            # keeps polling instead of falling back to local mode immediately.
+            await postgres_db.merge_thread_workspace_context(
+                thread_id, {"status": "pending"}
+            )
+
             # Kubernetes mode: create pod on demand
             async def _provision_thread_workspace(tid: str) -> None:
                 ok = await container_provisioner.create_thread_workspace(tid)
@@ -8671,6 +8680,10 @@ async def create_thread(
 
             asyncio.create_task(_provision_thread_workspace(thread_id))
         elif docker_provisioner.is_available:
+            await postgres_db.merge_thread_workspace_context(
+                thread_id, {"status": "pending"}
+            )
+
             # Docker Compose mode: assign from static pool
             async def _assign_thread_workspace(tid: str) -> None:
                 result = await docker_provisioner.assign_thread_workspace(tid)
@@ -12356,6 +12369,14 @@ async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/builder/sessions")
+async def list_builder_sessions(user_id: str | None = None) -> list[dict[str, Any]]:
+    """List builder sessions for a user."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id query parameter required")
+    return await postgres_db.list_builder_sessions(user_id)
+
+
 @app.get("/api/builder/sessions/{session_id}")
 async def get_builder_session(session_id: str) -> dict[str, Any]:
     """Get builder session details."""
@@ -12656,8 +12677,21 @@ async def send_builder_message(
                 except Exception as e:
                     logger.warning(f"Builder auto-summarization failed: {e}")
 
+            # Auto-generate title after first exchange
+            done_data: dict[str, Any] = {"usage": {}}
+            if not session.get("title") and len(messages) <= 1:
+                try:
+                    title = await _generate_builder_title(
+                        session_id, body.message, final_text,
+                        user_id=_session_user_id,
+                    )
+                    if title:
+                        done_data["title"] = title
+                except Exception as e:
+                    logger.warning(f"Builder auto-title failed: {e}")
+
             # Send done event
-            yield f"event: done\ndata: {json.dumps({'usage': {}})}\n\n"
+            yield f"event: done\ndata: {json.dumps(done_data)}\n\n"
 
         except Exception as e:
             logger.error(f"Builder stream error: {e}", exc_info=True)
@@ -12855,3 +12889,47 @@ async def _summarize_builder_session(
 
     if summary_text:
         await postgres_db.update_builder_session_summary(session_id, summary_text)
+
+
+async def _generate_builder_title(
+    session_id: str,
+    user_message: str,
+    assistant_response: str,
+    *,
+    user_id: str | None = None,
+) -> str | None:
+    """Auto-generate a short title for a builder session from the first exchange.
+
+    Uses the user's auxiliary model if configured, otherwise the builder model.
+    """
+    model = get_builder_model()
+    if user_id:
+        try:
+            user_settings = await postgres_db.get_user_settings(user_id)
+            aux = user_settings.get("default_auxiliary_model")
+            if aux:
+                model = aux
+        except Exception:
+            pass
+
+    llm = _create_builder_llm(model)
+
+    prompt_messages = [
+        SystemMessage(content=(
+            "Generate a short title (max 6 words) for this chat session. "
+            "Return ONLY the title text, no quotes, no punctuation at the end."
+        )),
+        HumanMessage(content=(
+            f"User: {user_message[:500]}\n\n"
+            f"Assistant: {assistant_response[:500]}"
+        )),
+    ]
+
+    response = await llm.ainvoke(prompt_messages)
+    title = response.content if isinstance(response.content, str) else ""
+    title = title.strip().strip('"').strip("'")[:120]
+
+    if title:
+        await postgres_db.update_builder_session_title(session_id, title)
+        return title
+    return None

@@ -61,6 +61,9 @@ export class JobArtifactService {
   /** Builder session ID (null if no builder session started) */
   readonly sessionId = signal<string | null>(this.loadSessionId());
 
+  /** Current session title (auto-generated after first exchange) */
+  readonly sessionTitle = signal<string | null>(null);
+
   /** Active job context — delegates to JobContextService */
   readonly activeJobId = this.jobContext.activeJobId;
 
@@ -130,6 +133,9 @@ export class JobArtifactService {
   /** Persist sessionId to localStorage so it survives page refresh. */
   persistSessionId(id: string | null): void {
     this.sessionId.set(id);
+    if (!id) {
+      this.sessionTitle.set(null);
+    }
     try {
       if (id) {
         localStorage.setItem(SESSION_STORAGE_KEY, id);

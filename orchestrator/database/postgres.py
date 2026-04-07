@@ -4482,7 +4482,7 @@ class PostgresDB:
                 """
                 INSERT INTO builder_sessions (expert_id, user_id)
                 VALUES ($1, $2)
-                RETURNING id, job_id, expert_id, user_id, created_at, updated_at, summary
+                RETURNING id, job_id, expert_id, user_id, created_at, updated_at, summary, title
                 """,
                 expert_id,
                 user_uuid,
@@ -4507,7 +4507,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, job_id, expert_id, created_at, updated_at, summary
+                SELECT id, job_id, expert_id, created_at, updated_at, summary, title
                 FROM builder_sessions
                 WHERE id = $1
                 """,
@@ -4562,6 +4562,50 @@ class PostgresDB:
             result = await conn.execute(
                 "UPDATE builder_sessions SET summary = $1 WHERE id = $2",
                 summary,
+                uuid_val,
+            )
+
+        return result == "UPDATE 1"
+
+    async def list_builder_sessions(
+        self,
+        user_id: str,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List builder sessions for a user, most recent first."""
+        try:
+            user_uuid = UUID(user_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, title, expert_id, created_at, updated_at
+                FROM builder_sessions
+                WHERE user_id = $1
+                ORDER BY updated_at DESC
+                LIMIT $2
+                """,
+                user_uuid,
+                limit,
+            )
+
+        return [dict(r) for r in rows]
+
+    async def update_builder_session_title(
+        self, session_id: str, title: str
+    ) -> bool:
+        """Set the auto-generated title for a builder session."""
+        try:
+            uuid_val = UUID(session_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE builder_sessions SET title = $1 WHERE id = $2",
+                title,
                 uuid_val,
             )
 
