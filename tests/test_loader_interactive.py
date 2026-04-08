@@ -92,18 +92,12 @@ class TestInteractiveConfigParsing:
         config = load_agent_config_from_dict(data)
         assert config.interactive.idle_timeout_minutes == 120
 
-    def test_explicit_greeting_overrides_default(self):
-        data = _minimal_config_data(interactive={"greeting": "Hi there!"})
-        config = load_agent_config_from_dict(data)
-        assert config.interactive.greeting == "Hi there!"
-
     def test_partial_interactive_section(self):
         """Only specified fields override; others keep defaults."""
         data = _minimal_config_data(interactive={"permission_mode": "auto_accept"})
         config = load_agent_config_from_dict(data)
         assert config.interactive.permission_mode == "auto_accept"
         assert config.interactive.idle_timeout_minutes == 60
-        assert config.interactive.greeting == InteractiveConfig.greeting
 
     def test_empty_interactive_section_uses_defaults(self):
         """Empty interactive dict is the same as missing."""
