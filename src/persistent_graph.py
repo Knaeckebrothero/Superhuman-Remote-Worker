@@ -519,8 +519,10 @@ async def _execute_turn(
                 # don't send function_call_arguments.delta events, so
                 # streamed tool calls end up with empty args {}.  Detect
                 # this and retry with ainvoke to get correct args.
+                # Only applies to Responses API models (reasoning attr).
                 if (
                     response
+                    and getattr(llm_with_tools, "reasoning", None)
                     and getattr(response, "tool_calls", None)
                     and any(not tc.get("args") for tc in response.tool_calls)
                 ):
