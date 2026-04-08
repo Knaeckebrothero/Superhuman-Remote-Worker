@@ -66,7 +66,9 @@ else
             --clientid="$CLIENT_ID" \
             --clientsecret="$CLIENT_SECRET" \
             --discoveryuri="$DISCOVERY_URI" \
-            --unique-uid=0 \
+            --unique-uid=1 \
+            --mapping-uid=preferred_username \
+            --mapping-displayName=name \
             --check-bearer=1 \
             --group-provisioning=1 2>&1; then
             echo "[nc-setup] OIDC provider registered successfully"

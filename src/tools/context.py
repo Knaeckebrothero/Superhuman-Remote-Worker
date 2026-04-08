@@ -6,6 +6,7 @@ such as workspace managers, database connections, and configuration.
 
 import hashlib
 import logging
+import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -104,6 +105,9 @@ class ToolContext:
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
+    _browser_session: Optional[Any] = None  # browser_use.BrowserSession
+    _browser_cdp_url: Optional[str] = None  # CDP WebSocket URL for remote
+    _browser_started: bool = False  # Whether Chromium has been started
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -589,3 +593,137 @@ class ToolContext:
             phase_config = self._llm_config.get_phase_config(self._current_phase)
             return phase_config.multimodal
         return self.get_config("multimodal", False)
+
+    # ── Browser session lifecycle ────────────────────────────────────
+
+    def should_include_screenshots(self) -> bool:
+        """Whether browser tools should include screenshots in results.
+
+        Resolves the 'auto' setting: true if the current model is multimodal.
+        """
+        browser_cfg = self.config.get("browser", {})
+        snapshot_cfg = browser_cfg.get("snapshot", {})
+        setting = snapshot_cfg.get("include_screenshot", "auto")
+        if setting == "auto":
+            return self.get_phase_multimodal()
+        return bool(setting)
+
+    def get_max_dom_chars(self) -> int:
+        """Max DOM text characters to return from browser tools."""
+        browser_cfg = self.config.get("browser", {})
+        snapshot_cfg = browser_cfg.get("snapshot", {})
+        return snapshot_cfg.get("max_dom_chars", 40000)
+
+    async def get_browser_session(self) -> Any:
+        """Lazy-start Chromium and return a persistent BrowserSession.
+
+        On first call, starts a local or remote Chromium instance.
+        On subsequent calls, health-checks the existing session and
+        reconnects if needed. The user_data_dir preserves state across
+        restarts.
+
+        Returns:
+            browser_use.BrowserSession instance
+        """
+        from browser_use import BrowserSession
+
+        # Return existing healthy session
+        if self._browser_session is not None:
+            try:
+                # Quick health check — get current page URL
+                await self._browser_session.get_current_page_url()
+                return self._browser_session
+            except Exception:
+                logger.warning("Browser session unhealthy, restarting")
+                await self._close_browser_session()
+
+        browser_cfg = self.config.get("browser", {})
+        persistence_cfg = browser_cfg.get("persistence", {})
+
+        # Resolve user_data_dir
+        user_data_dir = persistence_cfg.get("user_data_dir", ".browser-profile")
+        if self.has_workspace():
+            from pathlib import Path
+
+            ws_root = self.workspace_manager.get_path("")
+            user_data_dir = str(Path(ws_root) / user_data_dir)
+
+        headless_env = os.getenv("BROWSER_HEADLESS", "").lower()
+        if headless_env in ("true", "1", "yes"):
+            headless = True
+        elif headless_env in ("false", "0", "no"):
+            headless = False
+        else:
+            headless = browser_cfg.get("headless", True)
+
+        kwargs = {
+            "headless": headless,
+            "user_data_dir": user_data_dir,
+        }
+
+        # Remote browser via CDP
+        from .research.browser import _is_remote_browser, _start_remote_chromium
+
+        if _is_remote_browser(self):
+            backend = self.workspace_manager.backend
+            backend.mkdir("documents")
+            cdp_url = _start_remote_chromium(backend, backend.resolve_path("documents"))
+            self._browser_cdp_url = cdp_url
+            kwargs = {"cdp_url": cdp_url}
+
+        session = BrowserSession(**kwargs)
+        await session.start()
+        self._browser_session = session
+        self._browser_started = True
+        logger.info("Browser session started")
+        return session
+
+    async def _close_browser_session(self) -> None:
+        """Close the browser session without stopping remote Chromium."""
+        if self._browser_session is not None:
+            try:
+                await self._browser_session.stop()
+            except Exception:
+                pass
+            self._browser_session = None
+
+    async def close_browser(self) -> None:
+        """Kill Chromium and cleanup. Called on job/session end."""
+        await self._close_browser_session()
+
+        # Stop remote Chromium if we started it
+        if self._browser_cdp_url is not None and self.has_workspace():
+            from .research.browser import _is_remote_browser, _stop_remote_chromium
+
+            if _is_remote_browser(self):
+                _stop_remote_chromium(self.workspace_manager.backend)
+            self._browser_cdp_url = None
+
+        self._browser_started = False
+        logger.info("Browser cleaned up")
+
+    async def export_browser_state(self) -> None:
+        """Export browser storage state for crash recovery.
+
+        Called at phase boundaries when persistence.export_state_on_phase
+        is true. Saves cookies/localStorage to the workspace.
+        """
+        browser_cfg = self.config.get("browser", {})
+        persistence_cfg = browser_cfg.get("persistence", {})
+        if not persistence_cfg.get("export_state_on_phase", True):
+            return
+        if self._browser_session is None:
+            return
+
+        try:
+            if self.has_workspace():
+                from pathlib import Path
+
+                ws_root = self.workspace_manager.get_path("")
+                state_path = str(
+                    Path(ws_root) / ".browser-profile" / "storage_state.json"
+                )
+                await self._browser_session.export_storage_state(output_path=state_path)
+                logger.debug(f"Exported browser state to {state_path}")
+        except Exception as e:
+            logger.debug(f"Could not export browser state: {e}")

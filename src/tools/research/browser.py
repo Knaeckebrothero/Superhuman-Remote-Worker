@@ -173,20 +173,33 @@ def _find_new_files_remote(
 # ── LLM + config helpers ─────────────────────────────────────────────
 
 
-def _get_browser_llm():
-    """Create an LLM instance for browser-use agent.
+def _get_browser_llm(context: Optional[ToolContext] = None):
+    """Create an LLM instance for browser-use sub-agent.
 
-    Uses BROWSER_LLM_MODEL env var (default: gpt-4o-mini).
-    Falls back to OPENAI_API_KEY for authentication.
+    Resolution order:
+    1. browser.model in YAML config (via ToolContext)
+    2. BROWSER_LLM_MODEL env var
+    3. Fall back to gpt-4o (capable multimodal default)
+
+    Similarly for api_key and base_url.
+
+    Args:
+        context: Optional ToolContext with browser config.
 
     Returns:
         A LangChain chat model instance
     """
     from langchain_openai import ChatOpenAI
 
-    model = os.getenv("BROWSER_LLM_MODEL", "gpt-4o-mini")
-    api_key = os.getenv("BROWSER_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("BROWSER_LLM_BASE_URL")
+    browser_cfg = context.config.get("browser", {}) if context else {}
+
+    model = browser_cfg.get("model") or os.getenv("BROWSER_LLM_MODEL") or "gpt-4o"
+    api_key = (
+        browser_cfg.get("api_key")
+        or os.getenv("BROWSER_LLM_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+    base_url = browser_cfg.get("base_url") or os.getenv("BROWSER_LLM_BASE_URL")
     if not base_url and model.lower().startswith("openai/"):
         base_url = os.getenv("LLM_BASE_URL")
 
@@ -301,11 +314,11 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
         task: str,
         use_vision: bool = False,
     ) -> str:
-        """Navigate a website and complete a task using browser automation.
+        """Delegate a browsing task to an autonomous browser agent.
 
-        Uses an AI agent to interact with the page via DOM/accessibility tree
-        (default) or screenshots (vision mode). Works with dynamic JavaScript
-        pages, cookie banners, and complex navigation.
+        Best for simple extraction, multi-page research, or bulk URL processing.
+        The browser agent runs independently and returns a text summary.
+        For step-by-step interaction or visual verification, use browser_navigate instead.
 
         Args:
             url: Starting URL to navigate to
@@ -326,7 +339,7 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
         remote = _is_remote_browser(context)
         browser = None
         try:
-            llm = _get_browser_llm()
+            llm = _get_browser_llm(context)
             browser_kwargs = _get_browser_config(context)
             browser = Browser(**browser_kwargs)
 
@@ -387,7 +400,7 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
         remote = _is_remote_browser(context)
         browser = None
         try:
-            llm = _get_browser_llm()
+            llm = _get_browser_llm(context)
 
             if remote:
                 browser_kwargs = _get_browser_config(context)

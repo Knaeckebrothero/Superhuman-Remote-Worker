@@ -88,7 +88,9 @@ ${CONTAINER_RUNTIME} exec -u www-data "${NEXTCLOUD_CONTAINER}" php occ user_oidc
     --clientid="${CLIENT_ID}" \
     --clientsecret="${CLIENT_SECRET}" \
     --discoveryuri="${DISCOVERY_URI}" \
-    --unique-uid=0 \
+    --unique-uid=1 \
+    --mapping-uid=preferred_username \
+    --mapping-displayName=name \
     --check-bearer=1
 
 echo ""
