@@ -15,6 +15,7 @@ export interface ToolCategoryMeta {
 /** Standard tool categories shown in job creation. */
 export const JOB_TOOL_CATEGORIES: ToolCategoryMeta[] = [
   { key: 'research', label: 'Research', icon: 'travel_explore', description: 'Ability to search the web, find academic papers, and browse websites' },
+  { key: 'browser_direct', label: 'Browser', icon: 'web', description: 'Direct browser control — navigate, click, type, screenshot, and visually verify pages' },
   { key: 'citation', label: 'Citation', icon: 'format_quote', description: 'Ability to track sources, manage citations, and generate bibliographies' },
   { key: 'shell', label: 'Shell', icon: 'terminal', description: 'Ability to run shell commands in a sandboxed terminal' },
   { key: 'communication', label: 'Communication', icon: 'mail', description: 'Ability to send email messages to you or your team' },

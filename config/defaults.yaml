@@ -85,6 +85,17 @@ tools:
     - browse_website
     - download_from_website
     - research_topic
+  # Direct browser control - step-by-step page interaction (src/tools/research/browser_direct.py)
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
   # Citation tools - citation management (src/tools/citation/)
   citation:
     - cite_document
@@ -276,11 +287,27 @@ communication:
   allowed_recipients: project      # "owner" (job owner only) or "project" (all project members)
 
 # Browser automation settings (browser-use + CDP)
+# Direct browser tools (browser_navigate, browser_click, etc.) give the agent
+# step-by-step control. Vision mode auto-selects based on model's multimodal flag.
 browser:
   headless: true
   timeout: 60000  # Milliseconds
-  use_vision: false  # DOM-based by default (works with any LLM)
+  use_vision: auto  # "auto" (true if model is multimodal) | true | false
   remote: auto  # "auto" (use remote Chromium when workspace is remote), "local" (always local)
+  model: null  # Sub-agent model for browse_website (null = gpt-4o)
+  api_key: null  # Sub-agent API key (null = OPENAI_API_KEY)
+  base_url: null  # Sub-agent base URL
+  chromium_max_memory_mb: 512  # Restart Chromium if RSS exceeds this
+  snapshot:
+    include_screenshot: auto  # "auto" (if multimodal) | true | false
+    max_dom_chars: 40000  # Truncate DOM text beyond this
+  security:
+    allowed_domains: []  # Empty = allow all public domains
+    blocked_domains: ["localhost", "127.0.0.1", "169.254.169.254"]
+    blocked_schemes: ["file", "javascript", "data"]
+  persistence:
+    user_data_dir: .browser-profile  # Relative to workspace root
+    export_state_on_phase: true  # storageState backup at phase boundaries
 
 # Shell command execution (tmux-backed terminal multiplexer)
 # Requires tmux installed.
