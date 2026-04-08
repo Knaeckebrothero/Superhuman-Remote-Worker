@@ -450,6 +450,7 @@ class TestRunPersistentLoopErrorHandling:
 
         # LLM that raises a runtime error on first call
         llm = AsyncMock()
+        llm.reasoning = None  # ensure astream path is used, not ainvoke
         invocation = 0
 
         async def _astream(messages, **kw):
