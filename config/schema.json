@@ -641,7 +641,7 @@
     },
     "interactive": {
       "type": "object",
-      "description": "Settings for persistent interactive mode (--mode persistent). Controls permission defaults, idle behavior, and the initial greeting.",
+      "description": "Settings for persistent interactive mode (--mode persistent). Controls permission defaults and idle behavior.",
       "properties": {
         "permission_mode": {
           "type": "string",
@@ -658,11 +658,6 @@
           "default": 60,
           "minimum": 0,
           "description": "Auto-end session after idle period in minutes (0 = disabled)"
-        },
-        "greeting": {
-          "type": "string",
-          "default": "Hello! I'm ready to help. What would you like to work on?",
-          "description": "Initial greeting message sent to user on session start"
         }
       },
       "additionalProperties": false

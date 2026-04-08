@@ -1661,6 +1661,9 @@ class DatasourceCreate(BaseModel):
     default_branch: str | None = Field(
         None, description="Branch to clone (repository type)"
     )
+    is_global: bool = Field(
+        False, description="Whether this datasource is visible to all users"
+    )
 
 
 class DatasourceUpdate(BaseModel):
@@ -7134,25 +7137,30 @@ def _build_datasource_tool_override(
         },
     }
 
-    attached_types = {ds["type"] for ds in datasources}
+    # Group datasources by type
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for ds in datasources:
+        by_type.setdefault(ds["type"], []).append(ds)
 
     for ds_type, tool_info in DS_TOOL_MAP.items():
         category = tool_info["category"]
-        if ds_type in attached_types:
-            ds = next(d for d in datasources if d["type"] == ds_type)
-            is_read_only = ds.get("project_read_only", False)
-
-            if is_read_only:
-                # Read-only: register read-only tools, no CLI/env vars
-                tools_override[category] = tool_info["read"]
-            elif ds_type == "webdav":
-                # WebDAV always uses tools (no good CLI)
-                tools_override[category] = tool_info["write"]
-            else:
-                # Read-write managed connectors: CLI mode, no custom tools
-                tools_override[category] = []
-        else:
+        ds_list = by_type.get(ds_type, [])
+        if not ds_list:
             # No datasource attached — strip the category
+            tools_override[category] = []
+            continue
+
+        # If ANY datasource of this type is read-write, use CLI mode
+        # (tools stripped). If ALL are read-only, register read-only tools.
+        all_read_only = all(ds.get("project_read_only", False) for ds in ds_list)
+
+        if all_read_only:
+            tools_override[category] = tool_info["read"]
+        elif ds_type == "webdav":
+            # WebDAV always uses tools (no good CLI)
+            tools_override[category] = tool_info["write"]
+        else:
+            # Read-write managed connectors: CLI mode, no custom tools
             tools_override[category] = []
 
     override["tools"] = tools_override
@@ -7326,17 +7334,17 @@ async def get_datasource(datasource_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/datasources")
-async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
-    """Create a new datasource.
-
-    Use job_id=null for global datasources (available to all jobs).
-    """
+async def create_datasource(body: DatasourceCreate, request: Request) -> dict[str, Any]:
+    """Create a new datasource owned by the current user."""
     valid_types = {"generic", "repository", "postgresql", "neo4j", "mongodb", "webdav"}
     if body.type not in valid_types:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
+
+    user = await get_current_user(request, postgres_db)
+    user_id = str(user["id"]) if user else None
 
     try:
         return await postgres_db.create_datasource(
@@ -7348,14 +7356,15 @@ async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
             job_id=body.job_id,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
+            created_by=user_id,
+            is_global=body.is_global,
         )
     except Exception as e:
         error_msg = str(e)
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
-            scope = f"job '{body.job_id}'" if body.job_id else "global scope"
             raise HTTPException(
                 status_code=409,
-                detail=f"A '{body.type}' datasource already exists for {scope}",
+                detail=f"A datasource named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
 
@@ -8233,6 +8242,8 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
         )
 
         # Create Gitea repo for workspace versioning
+        if not gitea_client.is_initialized and gitea_client.is_configured:
+            await gitea_client.ensure_initialized()
         if gitea_client.is_initialized:
             repo_name = f"thread-{thread_id[:8]}"
             git_remote_url = await gitea_client.create_repo(repo_name)
@@ -8672,6 +8683,8 @@ async def create_thread(
                 )
 
         # Create Gitea repo for workspace versioning
+        if not gitea_client.is_initialized and gitea_client.is_configured:
+            await gitea_client.ensure_initialized()
         if gitea_client.is_initialized:
             repo_name = f"thread-{thread_id[:8]}"
             git_remote_url = await gitea_client.create_repo(repo_name)
@@ -9745,10 +9758,15 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         merged = _deep_merge(defaults, expert_data)
         expert_config_dir = expert_dir
 
-    # Apply settings_matrix (model-family defaults)
-    raw_matrix = _apply_settings_matrix_to_config(
-        merged, expert_llm_keys, config_dir, expert_config_dir
-    )
+    # Load the raw settings_matrix for the client to resolve per-model defaults.
+    # Do NOT apply it to merged — the client resolves based on the user's model selection.
+    raw_matrix = _load_settings_matrix(config_dir)
+    if expert_config_dir and expert_config_dir != config_dir:
+        expert_matrix_path = expert_config_dir / "settings_matrix.yaml"
+        if expert_matrix_path.exists():
+            with open(expert_matrix_path) as f:
+                expert_matrix = yaml.safe_load(f) or {}
+            raw_matrix = _deep_merge(raw_matrix, expert_matrix)
 
     # Load instructions content
     instructions_content = None
@@ -9953,8 +9971,9 @@ async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any
     for key in ("$extends", "connections"):
         merged.pop(key, None)
 
-    # Apply settings_matrix (model-family defaults)
-    raw_matrix = _apply_settings_matrix_to_config(merged, expert_llm_keys, config_dir)
+    # Load the raw settings_matrix for the client to resolve per-model defaults.
+    # Do NOT apply it to merged — the client resolves based on the user's model selection.
+    raw_matrix = _load_settings_matrix(config_dir)
 
     # Read instructions
     instructions_content = await gitea_client.get_file_content(

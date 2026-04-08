@@ -5,19 +5,28 @@ Nextcloud after each turn. Pull syncs user uploads from Nextcloud to the
 workspace on a configurable polling interval.
 
 Uses webdav3.client.Client for WebDAV operations.
+
+Supports both local and remote workspace backends:
+- Local backend: uses os.walk() for file discovery
+- Remote backend: uses workspace backend's list_dir()/read_file()/write_file()
 """
 
 import asyncio
 import logging
 import os
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from ..core.workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
 
 # Internal workspace files excluded from sync
 SYNC_IGNORE_PATTERNS = [
     ".git/",
+    "repos/",
     "tools/",
     "todos.yaml",
     "archive/",
@@ -48,6 +57,9 @@ class WorkspaceSyncService:
     - After each agent turn (push): upload new/modified workspace files
     - On a polling interval (pull): download new/modified user uploads
     - On explicit call: full_sync()
+
+    When a workspace_backend is provided (remote workspace), file operations
+    go through the backend instead of direct local filesystem access.
     """
 
     def __init__(
@@ -57,17 +69,23 @@ class WorkspaceSyncService:
         webdav_user: str,
         webdav_password: str,
         poll_interval: int = 15,
+        workspace_backend: Optional["WorkspaceBackend"] = None,
     ):
         self._workspace_path = Path(workspace_path)
         self._webdav_url = webdav_url
         self._webdav_user = webdav_user
         self._webdav_password = webdav_password
         self._poll_interval = poll_interval
+        self._backend = workspace_backend
 
-        # Track local file mtimes for push
+        # Track local file mtimes for push (local backend only)
         self._local_state: dict[str, float] = {}
         # Track remote file etags for pull
         self._remote_state: dict[str, str] = {}
+        # Track remote dirs confirmed to exist (avoids redundant mkdir calls)
+        self._remote_dirs: set[str] = set()
+        # Track pushed files for remote backend (by content length)
+        self._pushed_sizes: dict[str, int] = {}
 
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
@@ -87,11 +105,45 @@ class WorkspaceSyncService:
             )
         return self._client
 
+    async def _ensure_remote_dirs(self, client, remote_dir: str) -> None:
+        """Recursively create remote directories, caching known dirs."""
+        if not remote_dir or remote_dir == "." or remote_dir in self._remote_dirs:
+            return
+        # Create parents first
+        parent = str(Path(remote_dir).parent)
+        if parent != remote_dir:
+            await self._ensure_remote_dirs(client, parent)
+        try:
+            await asyncio.to_thread(client.mkdir, remote_dir)
+        except Exception:
+            pass  # Already exists or created by parent call
+        self._remote_dirs.add(remote_dir)
+
+    def _walk_backend_files(self) -> list[str]:
+        """Recursively list all files from the workspace backend.
+
+        Returns list of relative paths.
+        """
+        results = []
+        stack = [""]
+        while stack:
+            dir_path = stack.pop()
+            try:
+                entries = self._backend.list_dir(dir_path)
+            except Exception:
+                continue
+            for entry in entries:
+                if entry.endswith("/"):
+                    stack.append(entry.rstrip("/"))
+                else:
+                    results.append(entry)
+        return results
+
     async def push(self) -> list[str]:
         """Push locally modified/new files to Nextcloud.
 
-        Compares workspace mtimes against last-known state. Uploads
-        new/modified files, skipping ignored patterns.
+        For local backends: compares workspace mtimes against last-known state.
+        For remote backends: pushes all non-ignored files each time.
 
         Returns:
             List of pushed file paths (relative to workspace).
@@ -99,41 +151,93 @@ class WorkspaceSyncService:
         pushed = []
         try:
             client = self._get_client()
-            for root, _dirs, files in os.walk(self._workspace_path):
-                for filename in files:
-                    local_path = Path(root) / filename
-                    rel_path = str(local_path.relative_to(self._workspace_path))
 
-                    if _should_ignore(rel_path):
-                        continue
-
-                    mtime = local_path.stat().st_mtime
-                    prev_mtime = self._local_state.get(rel_path)
-                    if prev_mtime is not None and mtime <= prev_mtime:
-                        continue
-
-                    # Upload
-                    remote_path = rel_path
-                    try:
-                        # Ensure remote parent dirs exist
-                        remote_dir = str(Path(remote_path).parent)
-                        if remote_dir and remote_dir != ".":
-                            await asyncio.to_thread(client.mkdir, remote_dir)
-
-                        await asyncio.to_thread(
-                            client.upload_sync,
-                            remote_path=remote_path,
-                            local_path=str(local_path),
-                        )
-                        self._local_state[rel_path] = mtime
-                        pushed.append(rel_path)
-                    except Exception as e:
-                        logger.debug(f"Push failed for {rel_path}: {e}")
+            if self._backend:
+                pushed = await self._push_via_backend(client)
+            else:
+                pushed = await self._push_local(client)
 
             if pushed:
                 logger.info(f"Synced {len(pushed)} file(s) to Nextcloud")
         except Exception as e:
             logger.warning(f"Push sync failed: {e}")
+        return pushed
+
+    async def _push_via_backend(self, client) -> list[str]:
+        """Push files from a remote workspace backend to Nextcloud."""
+        pushed = []
+        files = await asyncio.to_thread(self._walk_backend_files)
+
+        for rel_path in files:
+            if _should_ignore(rel_path):
+                continue
+            try:
+                content = await asyncio.to_thread(
+                    self._backend.read_file, rel_path, True
+                )
+                if isinstance(content, str):
+                    content = content.encode("utf-8")
+
+                # Skip if size unchanged since last push
+                prev_size = self._pushed_sizes.get(rel_path)
+                if prev_size is not None and len(content) == prev_size:
+                    continue
+
+                # Write to temp file for webdav upload
+                fd, tmp_path = tempfile.mkstemp()
+                try:
+                    os.write(fd, content)
+                    os.close(fd)
+
+                    remote_dir = str(Path(rel_path).parent)
+                    await self._ensure_remote_dirs(client, remote_dir)
+                    await asyncio.to_thread(
+                        client.upload_sync,
+                        remote_path=rel_path,
+                        local_path=tmp_path,
+                    )
+                    self._pushed_sizes[rel_path] = len(content)
+                    pushed.append(rel_path)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.debug(f"Push failed for {rel_path}: {e}")
+        return pushed
+
+    async def _push_local(self, client) -> list[str]:
+        """Push files from local filesystem to Nextcloud (original logic)."""
+        pushed = []
+        for root, _dirs, files in os.walk(self._workspace_path):
+            for filename in files:
+                local_path = Path(root) / filename
+                rel_path = str(local_path.relative_to(self._workspace_path))
+
+                if _should_ignore(rel_path):
+                    continue
+
+                mtime = local_path.stat().st_mtime
+                prev_mtime = self._local_state.get(rel_path)
+                if prev_mtime is not None and mtime <= prev_mtime:
+                    continue
+
+                # Upload
+                remote_path = rel_path
+                try:
+                    remote_dir = str(Path(remote_path).parent)
+                    await self._ensure_remote_dirs(client, remote_dir)
+
+                    await asyncio.to_thread(
+                        client.upload_sync,
+                        remote_path=remote_path,
+                        local_path=str(local_path),
+                    )
+                    self._local_state[rel_path] = mtime
+                    pushed.append(rel_path)
+                except Exception as e:
+                    logger.debug(f"Push failed for {rel_path}: {e}")
         return pushed
 
     async def pull(self) -> list[str]:
@@ -149,8 +253,12 @@ class WorkspaceSyncService:
         try:
             client = self._get_client()
 
-            # List remote files recursively
-            remote_files = await asyncio.to_thread(client.list, "/", get_info=True)
+            # List remote files (may fail if folder is empty / not yet created)
+            try:
+                remote_files = await asyncio.to_thread(client.list, "/", get_info=True)
+            except Exception:
+                # Folder doesn't exist yet — nothing to pull
+                return pulled
 
             for item in remote_files:
                 if not isinstance(item, dict):
@@ -167,17 +275,11 @@ class WorkspaceSyncService:
                     continue
 
                 # Download
-                local_path = self._workspace_path / path
                 try:
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    await asyncio.to_thread(
-                        client.download_sync,
-                        remote_path=path,
-                        local_path=str(local_path),
-                    )
-                    self._remote_state[path] = etag
-                    # Update local state so push doesn't re-upload
-                    self._local_state[path] = local_path.stat().st_mtime
+                    if self._backend:
+                        await self._pull_file_to_backend(client, path, etag)
+                    else:
+                        await self._pull_file_local(client, path, etag)
                     pulled.append(path)
                 except Exception as e:
                     logger.debug(f"Pull failed for {path}: {e}")
@@ -187,6 +289,44 @@ class WorkspaceSyncService:
         except Exception as e:
             logger.warning(f"Pull sync failed: {e}")
         return pulled
+
+    async def _pull_file_to_backend(
+        self, client, path: str, etag: str
+    ) -> None:
+        """Download a file from Nextcloud and write to remote backend."""
+        fd, tmp_path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            await asyncio.to_thread(
+                client.download_sync,
+                remote_path=path,
+                local_path=tmp_path,
+            )
+            with open(tmp_path, "rb") as f:
+                content = f.read()
+
+            await asyncio.to_thread(self._backend.write_file, path, content)
+            self._remote_state[path] = etag
+            # Track size so push doesn't re-upload
+            self._pushed_sizes[path] = len(content)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    async def _pull_file_local(self, client, path: str, etag: str) -> None:
+        """Download a file from Nextcloud to local filesystem."""
+        local_path = self._workspace_path / path
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            client.download_sync,
+            remote_path=path,
+            local_path=str(local_path),
+        )
+        self._remote_state[path] = etag
+        # Update local state so push doesn't re-upload
+        self._local_state[path] = local_path.stat().st_mtime
 
     async def full_sync(self) -> tuple[list[str], list[str]]:
         """Bidirectional sync. Push first, then pull.

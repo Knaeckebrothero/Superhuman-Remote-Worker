@@ -37,4 +37,3 @@ tools:
 
 interactive:
   permission_mode: autonomous
-  greeting: "Hello! I'm your interactive assistant. How can I help?"

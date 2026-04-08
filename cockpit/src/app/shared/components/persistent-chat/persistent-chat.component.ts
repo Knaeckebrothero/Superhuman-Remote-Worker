@@ -120,15 +120,15 @@ const SLASH_COMMANDS: SlashCommand[] = [
           <div class="settings-row">
             <label class="settings-label">Model</label>
             <select class="settings-select"
-                    [value]="chat.modelName()"
-                    (change)="onModelChange($event)">
+                    [ngModel]="chat.modelName()"
+                    (ngModelChange)="onModelChange($event)">
               @if (chat.modelName() && !hasModelInList(chat.modelName()!)) {
-                <option [value]="chat.modelName()">{{ chat.modelName() }}</option>
+                <option [ngValue]="chat.modelName()">{{ chat.modelName() }}</option>
               }
               @for (group of modelService.models(); track group.group) {
                 <optgroup [label]="group.group">
                   @for (model of group.models; track model) {
-                    <option [value]="model">{{ model }}</option>
+                    <option [ngValue]="model">{{ model }}</option>
                   }
                 </optgroup>
               }
@@ -137,8 +137,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
           <div class="settings-row">
             <label class="settings-label">Temperature: {{ chat.temperature() }}</label>
             <input type="range" class="settings-slider" min="0" max="2" step="0.1"
-                   [value]="chat.temperature()"
-                   (input)="onTemperatureChange($event)">
+                   [ngModel]="chat.temperature()"
+                   (ngModelChange)="onTemperatureChange($event)">
           </div>
         </div>
       }
@@ -229,6 +229,20 @@ const SLASH_COMMANDS: SlashCommand[] = [
               <span class="divider-line"></span>
               <span class="divider-text">Session resumed</span>
               <span class="divider-line"></span>
+            </div>
+          }
+        } @empty {
+          @if (!chat.isStreaming()) {
+            <div class="empty-state">
+              <span class="empty-state-text">
+                @if (chat.sessionReady()) {
+                  Start a conversation...
+                } @else if (chat.isConnected()) {
+                  Session starting...
+                } @else {
+                  Connecting...
+                }
+              </span>
             </div>
           }
         }
@@ -726,6 +740,18 @@ const SLASH_COMMANDS: SlashCommand[] = [
         flex-direction: column;
         gap: 16px;
         scrollbar-width: thin;
+      }
+
+      .empty-state {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .empty-state-text {
+        color: var(--text-muted, #6c7086);
+        font-size: 14px;
         scrollbar-color: var(--border-color, #313244) transparent;
       }
 
@@ -1679,15 +1705,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.chat.setMode(mode);
     }
 
-    onModelChange(event: Event): void {
-        const model = (event.target as HTMLSelectElement).value;
+    onModelChange(model: string): void {
         if (model) {
+            this.chat.modelName.set(model);
             this.chat.updateConfig({llm: {model}});
         }
     }
 
-    onTemperatureChange(event: Event): void {
-        const temperature = parseFloat((event.target as HTMLInputElement).value);
+    onTemperatureChange(temperature: number): void {
+        this.chat.temperature.set(temperature);
         this.chat.updateConfig({llm: {temperature}});
     }
 

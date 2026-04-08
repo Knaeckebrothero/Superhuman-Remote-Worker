@@ -7,6 +7,9 @@
 # Flat keys → data["llm"], nested "limits:" → data["limits"].
 
 default:
+  temperature: 0.0
+  multimodal: false
+  parallel_tool_calls: false
   model_max_context_tokens: 128000
   limits:
     model_max_context_tokens: 100000
@@ -18,6 +21,8 @@ default:
 minimax:
   temperature: 1.0  # M2.7 is a reasoning model; use default
   top_p: 0.95
+  multimodal: false
+  parallel_tool_calls: true
   model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
   limits:
     model_max_context_tokens: 170000
@@ -28,6 +33,8 @@ minimax:
 
 o-series:
   temperature: 1.0
+  multimodal: true  # o3/o4-mini support image inputs
+  parallel_tool_calls: true
   model_max_context_tokens: 200000
   limits:
     model_max_context_tokens: 170000
@@ -38,6 +45,8 @@ o-series:
 
 deepseek:
   top_p: 0.95
+  multimodal: false
+  parallel_tool_calls: false  # DeepSeek parallel calls are unreliable
   model_max_context_tokens: 64000
   limits:
     model_max_context_tokens: 55000
@@ -49,6 +58,8 @@ deepseek:
 gemini:
   top_p: 0.95
   top_k: 40
+  multimodal: true  # Gemini models are natively multimodal
+  parallel_tool_calls: true
   model_max_context_tokens: 1000000
   limits:
     model_max_context_tokens: 200000
@@ -59,6 +70,8 @@ gemini:
 
 claude-opus:
   temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
+  multimodal: true  # Claude Opus 4.6 supports vision
+  parallel_tool_calls: true
   model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
   limits:
     model_max_context_tokens: 200000
@@ -69,6 +82,8 @@ claude-opus:
 
 gpt-5:
   temperature: 1.0  # Reasoning model: only default 1.0 is supported
+  multimodal: true  # GPT-5 supports image inputs
+  parallel_tool_calls: true
   model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
   limits:
     model_max_context_tokens: 200000
@@ -79,6 +94,8 @@ gpt-5:
 
 codex:
   temperature: 1.0  # Reasoning model: temperature effectively disabled
+  multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
+  parallel_tool_calls: true
   model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
   limits:
     model_max_context_tokens: 350000
@@ -89,6 +106,8 @@ codex:
 
 codex-spark:
   temperature: 1.0  # Reasoning model: temperature effectively disabled
+  multimodal: false  # Codex Spark is code-focused, no vision
+  parallel_tool_calls: true
   model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
   limits:
     model_max_context_tokens: 110000
@@ -102,6 +121,8 @@ gpt-oss:
   top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution
   # top_k: DO NOT SET — HuggingFace defaults to 50 if present; must stay disabled
   # repetition_penalty: DO NOT SET — some clients enable by default; OpenAI says disable
+  multimodal: false  # gpt-oss-120b is text-only (MoE architecture)
+  parallel_tool_calls: false  # Served via vLLM; parallel calls need provider support
   model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
   limits:
     model_max_context_tokens: 110000

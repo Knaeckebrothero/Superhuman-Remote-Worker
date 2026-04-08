@@ -52,15 +52,15 @@ Persist important facts to workspace.md early — context can be compacted at an
 {% if cli_datasources -%}
 # Datasource Access
 
-Use `run_command` with the CLI tools below — credentials are pre-configured:
+Use `run_command` with named connections — credentials are pre-configured. Check workspace.md for connection names.
 {% if has_cli_datasource("postgresql") -%}
-- PostgreSQL: `psql -c "your SQL here"`
+- PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"`
 {% endif -%}
 {% if has_cli_datasource("neo4j") -%}
-- Neo4j: `cypher-shell --format plain "your Cypher here"`
+- Neo4j: `cypher-shell --address "$NEO4J_<NAME>_URI" --username "$NEO4J_<NAME>_USERNAME" --password "$NEO4J_<NAME>_PASSWORD" --format plain "your Cypher here"`
 {% endif -%}
 {% if has_cli_datasource("mongodb") -%}
-- MongoDB: `mongosh --quiet --eval "your query here"`
+- MongoDB: `mongosh "$MONGO_<NAME>_URI" --quiet --eval "your query here"`
 {% endif -%}
 {% endif -%}
 

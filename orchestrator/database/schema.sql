@@ -656,7 +656,11 @@ CREATE TABLE IF NOT EXISTS datasources (
     cli_hint TEXT,                         -- Suggested CLI command (e.g. "psql $DATABASE_URL")
     default_branch TEXT,                   -- Default branch to clone (repository type only)
 
-    -- Scope: NULL = global (available to all jobs), UUID = job-specific
+    -- Ownership & visibility
+    created_by UUID REFERENCES users(id),   -- Owner (NULL for system-seeded datasources)
+    is_global BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE = visible to all users
+
+    -- Legacy scope column (kept for backward compat, will be removed)
     job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
 
     -- Timestamps
@@ -687,14 +691,24 @@ ALTER TABLE datasources ALTER COLUMN connection_url DROP NOT NULL;
 -- Migration: Drop read_only from datasources (now project-level only via project_datasources)
 ALTER TABLE datasources DROP COLUMN IF EXISTS read_only;
 
--- Job-scoped uniqueness: one datasource of each type per job (or one global per type).
--- Project scoping is handled via the project_datasources junction table (N:M).
+-- Migration: Add ownership and visibility columns
+DO $$ BEGIN
+    ALTER TABLE datasources ADD COLUMN created_by UUID REFERENCES users(id);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE datasources ADD COLUMN is_global BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_datasources_created_by ON datasources(created_by);
+
+-- Migration: Remove one-per-type constraint, allow multiple datasources of the same type.
+-- Per-owner uniqueness prevents accidental exact duplicates (same name+type per owner).
 DROP INDEX IF EXISTS uq_datasource_type_scope;
 DROP INDEX IF EXISTS uq_datasource_type_job;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_job ON datasources (
-    type,
-    COALESCE(job_id, '00000000-0000-0000-0000-000000000000')
-) WHERE project_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_name_type_owner ON datasources (
+    name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000')
+);
 
 CREATE INDEX IF NOT EXISTS idx_datasources_type ON datasources(type);
 CREATE INDEX IF NOT EXISTS idx_datasources_job_id ON datasources(job_id);

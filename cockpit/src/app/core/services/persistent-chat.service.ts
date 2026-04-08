@@ -173,6 +173,10 @@ export class PersistentChatService {
             this.sessionTitle.set(thread.title || null);
             const model = thread.metadata?.config_override?.llm?.model;
             this.modelName.set(model || thread.config_name || null);
+            const temperature = thread.metadata?.config_override?.llm?.temperature;
+            if (temperature != null) {
+                this.temperature.set(temperature);
+            }
             this.turnCount.set(thread.total_turns || 0);
             this.ncSessionFolder.set(thread.nc_session_folder || null);
         } catch {
@@ -368,19 +372,6 @@ export class PersistentChatService {
                 if (params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
                 }
-                break;
-
-            case 'greeting':
-                this.messages.update((msgs) => [
-                    ...msgs,
-                    {
-                        role: 'assistant',
-                        content: (params['content'] as string) || '',
-                        timestamp: new Date(),
-                    },
-                ]);
-                this.isWaitingForInput.set(true);
-                this.markSessionReady();
                 break;
 
             case 'ready':

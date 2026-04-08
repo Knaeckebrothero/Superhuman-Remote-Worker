@@ -65,46 +65,44 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
 
       <!-- Tab content -->
       <div class="tab-content">
-        @if (activeTab() === 'settings') {
-          <div class="tab-panel settings-panel">
-            <app-execution-group
-              [config]="config()"
-              [mode]="mode()"
-              [disabled]="disabled()"
-              [showProjectMemory]="showProjectMemory()"
-              (change)="onChange()"
-            />
-            <app-model-group
-              [config]="config()"
-              [mode]="mode()"
-              [disabled]="disabled()"
-              (change)="onChange()"
-            />
-            <app-tools-group
-              [config]="config()"
-              [mode]="mode()"
-              [disabled]="disabled()"
-              [defaultsTools]="defaultsTools()"
-              (change)="onChange()"
-            />
-            <app-datasources-group
-              [datasources]="datasources()"
-              [loading]="loadingDatasources()"
-              [disabled]="disabled()"
-              (change)="onChange()"
-            />
+        <div class="tab-panel settings-panel" [class.tab-hidden]="activeTab() !== 'settings'">
+          <app-execution-group
+            [config]="config()"
+            [mode]="mode()"
+            [disabled]="disabled()"
+            [showProjectMemory]="showProjectMemory()"
+            (change)="onChange()"
+          />
+          <app-model-group
+            [config]="config()"
+            [mode]="mode()"
+            [disabled]="disabled()"
+            (change)="onChange()"
+          />
+          <app-tools-group
+            [config]="config()"
+            [mode]="mode()"
+            [disabled]="disabled()"
+            [defaultsTools]="defaultsTools()"
+            (change)="onChange()"
+          />
+          <app-datasources-group
+            [datasources]="datasources()"
+            [loading]="loadingDatasources()"
+            [disabled]="disabled()"
+            (change)="onChange()"
+          />
 
-            <!-- Modified count summary -->
-            @if (settingsModifiedCount() > 0) {
-              <div class="modified-summary">
-                {{ settingsModifiedCount() }} setting{{ settingsModifiedCount() > 1 ? 's' : '' }} modified
-              </div>
-            }
-          </div>
-        }
+          <!-- Modified count summary -->
+          @if (settingsModifiedCount() > 0) {
+            <div class="modified-summary">
+              {{ settingsModifiedCount() }} setting{{ settingsModifiedCount() > 1 ? 's' : '' }} modified
+            </div>
+          }
+        </div>
 
-        @if (activeTab() === 'instructions') {
-          <div class="tab-panel instructions-panel">
+        @if (mode() === 'job') {
+          <div class="tab-panel instructions-panel" [class.tab-hidden]="activeTab() !== 'instructions'">
             <app-instructions-tab
               [disabled]="disabled()"
               [loadingExpert]="loadingExpert()"
@@ -114,20 +112,18 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
           </div>
         }
 
-        @if (activeTab() === 'advanced') {
-          <div class="tab-panel advanced-panel">
-            <app-advanced-accordion
-              [config]="config()"
-              [mode]="mode()"
-              [disabled]="disabled()"
-              [settingsMatrix]="settingsMatrix()"
-              [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
-              [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
-              [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
-              (change)="onChange()"
-            />
-          </div>
-        }
+        <div class="tab-panel advanced-panel" [class.tab-hidden]="activeTab() !== 'advanced'">
+          <app-advanced-accordion
+            [config]="config()"
+            [mode]="mode()"
+            [disabled]="disabled()"
+            [settingsMatrix]="settingsMatrix()"
+            [strategicModelOverride]="modelGroup?.strategicModel() ?? null"
+            [tacticalModelOverride]="modelGroup?.tacticalModel() ?? null"
+            [sessionModelOverride]="modelGroup?.sessionModel() ?? null"
+            (change)="onChange()"
+          />
+        </div>
       </div>
     </div>
   `,
@@ -236,6 +232,9 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
     }
     .tab-panel {
       padding: 16px;
+    }
+    .tab-hidden {
+      display: none;
     }
     .instructions-panel {
       display: flex;

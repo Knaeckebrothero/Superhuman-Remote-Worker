@@ -546,13 +546,8 @@ export class ApiService {
   /**
    * Create a new datasource.
    */
-  createDatasource(ds: DatasourceCreateRequest): Observable<Datasource | null> {
-    return this.http.post<Datasource>(`${this.baseUrl}/datasources`, ds).pipe(
-      catchError((error) => {
-        console.error('Failed to create datasource:', error);
-        return of(null);
-      }),
-    );
+  createDatasource(ds: DatasourceCreateRequest): Observable<Datasource> {
+    return this.http.post<Datasource>(`${this.baseUrl}/datasources`, ds);
   }
 
   /**

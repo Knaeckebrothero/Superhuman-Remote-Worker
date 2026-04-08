@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=../../schema.json
+# Design Studio - Interactive persistent design sessions
+$extends: persistent_defaults
+
+agent_id: designer-interactive
+display_name: Design Studio
+description: |
+  Interactive design collaborator for persistent sessions. Works with the user
+  to create HTML/CSS mockups, iterate on designs, and produce structured design
+  specifications. Uses the project's Catppuccin Mocha design system for all
+  visual output. Outputs self-contained HTML prototypes that developers implement.
+icon: palette
+color: "#f5c2e7"
+tags:
+  - design
+  - ui
+  - prototyping
+  - interactive
+  - persistent
+
+llm:
+  reasoning_level: high
+
+workspace:
+  structure:
+    - mockups/
+    - design_spec/
+    - reference/
+    - documents/
+    - notes/
+  git_versioning: true
+
+instruction_files:
+  - file: design_guide.md
+    trigger: on_setup
+    enforce: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - copy_file
+    - get_document_info
+    - create_directory
+  research:
+    - web_search
+    - extract_webpage
+    - browse_website
+  shell:
+    - run_command
+    - shell_read
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Knowledge tools inherited from persistent_defaults
+  # Unused categories
+  orchestrator: []
+  core: []
+  citation: []
+  graph: []
+  sql: []
+  mongodb: []
+  evaluation: []
+  delegation: []
+  communication: []
+
+interactive:
+  permission_mode: supervised
+  idle_timeout_minutes: 120
+
+memory:
+  enabled: true
