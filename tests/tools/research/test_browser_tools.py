@@ -464,7 +464,7 @@ class TestStartRemoteChromium:
 
         url = _start_remote_chromium(
             mock_remote_backend,
-            "/home/agent-host/workspace/job_abc123/documents",
+            "/home/agent-host/workspace/documents",
         )
 
         assert url.startswith("ws://10.42.0.50:9222/")
@@ -533,8 +533,8 @@ class TestFindNewFilesRemote:
         from src.tools.research.browser import _find_new_files_remote
 
         mock_remote_backend.exec_command.return_value = (
-            "1712000000.0 /home/agent-host/workspace/job_abc123/documents/paper.pdf\n"
-            "1711999000.0 /home/agent-host/workspace/job_abc123/documents/data.csv\n"
+            "1712000000.0 /home/agent-host/workspace/documents/paper.pdf\n"
+            "1711999000.0 /home/agent-host/workspace/documents/data.csv\n"
         )
 
         files = _find_new_files_remote(mock_remote_backend, "documents")

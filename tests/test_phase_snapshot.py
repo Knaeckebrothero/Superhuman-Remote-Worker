@@ -91,19 +91,17 @@ class TestSnapshotCreation:
         mgr.job_id = job_id
         mgr._base_path = tmp_path
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
-        mgr._workspace_path = tmp_path / f"job_{job_id}"
+        mgr._workspace_path = tmp_path
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
         mgr._backend = None
         return mgr
 
     def _setup_workspace(self, tmp_path, job_id="test-job"):
-        """Create minimal workspace files."""
-        ws_path = tmp_path / f"job_{job_id}"
-        ws_path.mkdir(parents=True)
-        (ws_path / "workspace.md").write_text("# Workspace")
-        (ws_path / "plan.md").write_text("# Plan")
-        (ws_path / "todos.yaml").write_text("todos: []")
-        return ws_path
+        """Create minimal workspace files at base path (tmp_path)."""
+        (tmp_path / "workspace.md").write_text("# Workspace")
+        (tmp_path / "plan.md").write_text("# Plan")
+        (tmp_path / "todos.yaml").write_text("todos: []")
+        return tmp_path
 
     def _setup_checkpoint(self, tmp_path, job_id="test-job"):
         """Create a fake checkpoint.db."""
@@ -221,7 +219,7 @@ class TestGetSnapshot:
         mgr.job_id = job_id
         mgr._base_path = tmp_path
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
-        mgr._workspace_path = tmp_path / f"job_{job_id}"
+        mgr._workspace_path = tmp_path
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
         mgr._backend = None
         return mgr
@@ -229,9 +227,7 @@ class TestGetSnapshot:
     def test_get_existing_snapshot(self, tmp_path):
         """Should return snapshot for existing phase."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
         mgr.create_snapshot(phase_number=1, iteration=50)
 
         snap = mgr.get_snapshot(1)
@@ -257,7 +253,7 @@ class TestRecoverToPhase:
         mgr.job_id = job_id
         mgr._base_path = tmp_path
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
-        mgr._workspace_path = tmp_path / f"job_{job_id}"
+        mgr._workspace_path = tmp_path
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
         mgr._backend = None
         return mgr
@@ -268,8 +264,7 @@ class TestRecoverToPhase:
         mgr = self._make_manager(tmp_path, job_id)
 
         # Setup workspace with initial state
-        ws_path = tmp_path / f"job_{job_id}"
-        ws_path.mkdir(parents=True)
+        ws_path = tmp_path
         (ws_path / "workspace.md").write_text("Phase 1 workspace")
         (ws_path / "plan.md").write_text("Phase 1 plan")
         (ws_path / "todos.yaml").write_text("phase: 1")
@@ -302,8 +297,7 @@ class TestRecoverToPhase:
         job_id = "test-job"
         mgr = self._make_manager(tmp_path, job_id)
 
-        ws_path = tmp_path / f"job_{job_id}"
-        ws_path.mkdir(parents=True)
+        ws_path = tmp_path
         (ws_path / "workspace.md").write_text("initial")
 
         cp_dir = tmp_path / "checkpoints"
@@ -333,8 +327,7 @@ class TestRecoverToPhase:
         job_id = "test-job"
         mgr = self._make_manager(tmp_path, job_id)
 
-        ws_path = tmp_path / f"job_{job_id}"
-        ws_path.mkdir(parents=True)
+        ws_path = tmp_path
         (ws_path / "workspace.md").write_text("")
         archive = ws_path / "archive"
         archive.mkdir()
@@ -367,7 +360,7 @@ class TestDeletionAndCleanup:
         mgr.job_id = job_id
         mgr._base_path = tmp_path
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
-        mgr._workspace_path = tmp_path / f"job_{job_id}"
+        mgr._workspace_path = tmp_path
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
         mgr._backend = None
         return mgr
@@ -375,9 +368,7 @@ class TestDeletionAndCleanup:
     def test_delete_after_removes_later_phases(self, tmp_path):
         """delete_snapshots_after should remove phases > N."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
 
         mgr.create_snapshot(phase_number=1, iteration=10)
         mgr.create_snapshot(phase_number=2, iteration=20)
@@ -393,9 +384,7 @@ class TestDeletionAndCleanup:
     def test_delete_after_returns_zero_when_nothing(self, tmp_path):
         """Should return 0 when no snapshots to delete."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
 
         mgr.create_snapshot(phase_number=1, iteration=10)
         deleted = mgr.delete_snapshots_after(5)
@@ -404,9 +393,7 @@ class TestDeletionAndCleanup:
     def test_delete_after_preserves_given_phase(self, tmp_path):
         """delete_snapshots_after(N) should NOT delete phase N itself."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
 
         mgr.create_snapshot(phase_number=2, iteration=20)
         mgr.create_snapshot(phase_number=3, iteration=30)
@@ -418,9 +405,7 @@ class TestDeletionAndCleanup:
     def test_cleanup_removes_everything(self, tmp_path):
         """cleanup should remove entire snapshots directory."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
 
         mgr.create_snapshot(phase_number=1, iteration=10)
         assert mgr._snapshots_dir.exists()
@@ -448,7 +433,7 @@ class TestGetLatestSnapshot:
         mgr.job_id = job_id
         mgr._base_path = tmp_path
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
-        mgr._workspace_path = tmp_path / f"job_{job_id}"
+        mgr._workspace_path = tmp_path
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
         mgr._backend = None
         return mgr
@@ -456,9 +441,7 @@ class TestGetLatestSnapshot:
     def test_returns_last_snapshot(self, tmp_path):
         """Should return the highest phase number snapshot."""
         mgr = self._make_manager(tmp_path)
-        ws = tmp_path / "job_test-job"
-        ws.mkdir(parents=True)
-        (ws / "workspace.md").write_text("")
+        (tmp_path / "workspace.md").write_text("")
 
         mgr.create_snapshot(phase_number=1, iteration=10)
         mgr.create_snapshot(phase_number=3, iteration=30)

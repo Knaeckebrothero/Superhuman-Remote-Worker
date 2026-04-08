@@ -62,7 +62,7 @@ without `--dev`, the agent refuses the job with a clear error.
 modes). When set:
 
 - `workspace.backend: local` is allowed — the agent uses the local filesystem
-  via `LocalBackend` (workspace at `./workspace/job_<uuid>/`).
+  via `LocalBackend` (workspace at `./workspace/`).
 - Shell commands run in local tmux (no container isolation).
 - The orchestrator's `config_override.workspace` is ignored — the agent forces
   `backend: local` regardless of what the orchestrator sends.

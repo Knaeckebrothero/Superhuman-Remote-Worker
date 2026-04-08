@@ -33,7 +33,7 @@ def send_request(sock_path: str, command: str, argv: list[str] | None = None) ->
         "user": "agent-host",
         "host": "agent-vm-test",
         "tty": "",
-        "cwd": "/home/agent-host/workspace",
+        "cwd": "/home/agent-host",
         "argv": argv,
     }
 

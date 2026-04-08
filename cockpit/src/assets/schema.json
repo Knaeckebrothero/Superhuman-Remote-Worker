@@ -217,8 +217,8 @@
             },
             "workspace_path": {
               "type": "string",
-              "default": "/home/agent-host/workspace",
-              "description": "Workspace root path on the remote VM"
+              "default": "/home/agent-host",
+              "description": "Workspace root path on remote (= agent home dir)"
             }
           },
           "required": ["host"]

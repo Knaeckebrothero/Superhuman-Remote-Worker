@@ -398,7 +398,7 @@ Based on this comparison, here are additional approaches beyond the original opt
 Keep workspace.md for working memory but add a **separate CLAUDE.md-style file** for project configuration:
 
 ```
-workspace/job_{id}/
+~/                     # Workspace root (= agent home dir)
 ├── instructions.md    # Already exists - task instructions
 ├── workspace.md       # Working memory (current use)
 └── context.md         # NEW: Project context (CLAUDE.md-style)

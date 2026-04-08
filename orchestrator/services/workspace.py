@@ -65,15 +65,18 @@ class WorkspaceService:
     def _get_job_path(self, job_id: str) -> Path | None:
         """Get the workspace path for a job.
 
+        In the simplified workspace model, the base path IS the workspace
+        (no job_{id} subdirectories). This is dev-only — in production the
+        orchestrator reads workspace files via API, not local filesystem.
+
         Args:
-            job_id: Job UUID
+            job_id: Job UUID (unused — kept for interface compatibility)
 
         Returns:
-            Path to job workspace or None if not found
+            Base path if it exists, None otherwise
         """
-        job_path = self._base / f"job_{job_id}"
-        if job_path.exists() and job_path.is_dir():
-            return job_path
+        if self._base.exists() and self._base.is_dir():
+            return self._base
         return None
 
     def get_current_todos(self, job_id: str) -> dict[str, Any] | None:

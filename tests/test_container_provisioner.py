@@ -180,6 +180,25 @@ class TestPodManifest:
 
         assert manifest["spec"]["restartPolicy"] == "Never"
 
+    def test_manifest_termination_grace_period(self):
+        """Pod has terminationGracePeriodSeconds for graceful artifact upload."""
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="workspace-abc123",
+            job_id="abc123",
+            image="test:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
+
+        assert manifest["spec"]["terminationGracePeriodSeconds"] == 120
+
     def test_manifest_volume_mounts(self):
         """Container has correct volume mounts for workspace and SSH key."""
         from orchestrator.services.container_provisioner import (
@@ -200,7 +219,7 @@ class TestPodManifest:
         container = manifest["spec"]["containers"][0]
         mounts = {m["name"]: m for m in container["volumeMounts"]}
 
-        assert mounts["workspace-data"]["mountPath"] == "/home/agent-host/workspace"
+        assert mounts["workspace-data"]["mountPath"] == "/home/agent-host"
         # SSH pubkey mounted to staging path — entrypoint copies to authorized_keys
         assert mounts["ssh-pubkey"]["mountPath"] == "/tmp/ssh-pubkey"
         assert mounts["ssh-pubkey"]["readOnly"] is True
@@ -448,11 +467,10 @@ class TestDockerfileHardening:
         assert ".cache" in content
 
     def test_entrypoint_copies_ssh_key(self):
-        """Entrypoint must copy SSH key from staging path with correct ownership."""
+        """Entrypoint must copy SSH key from staging path to /etc/ssh/authorized_keys/."""
         content = self._read_file("docker/workspace-entrypoint.sh")
         assert "/tmp/ssh-pubkey" in content
-        assert "chown agent-host:agent-host" in content
-        assert "authorized_keys" in content
+        assert "/etc/ssh/authorized_keys/agent-host" in content
 
     def test_entrypoint_does_not_run_as_user(self):
         """Entrypoint must run SSHD as root (required for port 22 + sessions).

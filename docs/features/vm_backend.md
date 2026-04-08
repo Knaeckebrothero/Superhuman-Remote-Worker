@@ -247,7 +247,7 @@ class RemoteBackend(WorkspaceBackend):
         port: int = 22,
         username: str = "agent-host",
         key_path: Optional[str] = None,
-        workspace_path: str = "/home/agent-host/workspace",
+        workspace_path: str = "/home/agent-host",
         job_id: str = "",
         scrollback_limit: int = 5000,
         default_timeout: int = 120,
@@ -484,7 +484,7 @@ workspace:
   #   port: 22
   #   username: agent-host
   #   key_path: /run/secrets/vm-ssh-key               # Path to SSH private key
-  #   workspace_path: /home/agent-host/workspace    # Workspace root on the VM
+  #   workspace_path: /home/agent-host    # Workspace root on the VM
 ```
 
 **Config schema** (`config/schema.json`): Added `backend` enum property (`"local"|"remote"`) and `remote` object schema with `host`, `port`, `username`, `key_path`, `workspace_path` properties.

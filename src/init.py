@@ -193,9 +193,11 @@ def verify_workspace() -> dict:
         dir_path = base_path / subdir
         result["directories"][subdir] = dir_path.exists()
 
-    # Count jobs
-    job_dirs = list(base_path.glob("job_*"))
-    result["job_count"] = len(job_dirs)
+    # Count top-level entries (flat workspace, no job_* subdirectories)
+    try:
+        result["entry_count"] = len(list(base_path.iterdir()))
+    except OSError:
+        result["entry_count"] = 0
 
     # Count checkpoints
     checkpoints_dir = base_path / "checkpoints"
@@ -251,14 +253,11 @@ def backup_workspace(backup_dir: Path) -> bool:
         shutil.copytree(base_path, dest_workspace)
 
         # Count what was backed up
-        job_count = len(list(dest_workspace.glob("job_*")))
         checkpoint_count = 0
         if (dest_workspace / "checkpoints").exists():
             checkpoint_count = len(list((dest_workspace / "checkpoints").glob("*.db")))
 
-        logger.info(
-            f"  Backed up workspace: {job_count} jobs, {checkpoint_count} checkpoints"
-        )
+        logger.info(f"  Backed up workspace ({checkpoint_count} checkpoints)")
         return True
 
     except Exception as e:
@@ -301,9 +300,7 @@ def restore_workspace(backup_dir: Path) -> bool:
             else:
                 shutil.copy2(item, dest_item)
 
-        # Count what was restored
-        job_count = len(list(base_path.glob("job_*")))
-        logger.info(f"  Restored workspace: {job_count} jobs")
+        logger.info("  Restored workspace from backup")
         return True
 
     except Exception as e:

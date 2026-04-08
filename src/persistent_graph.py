@@ -492,10 +492,7 @@ async def _execute_turn(
                 if content:
                     if isinstance(content, list):
                         for block in content:
-                            if (
-                                isinstance(block, dict)
-                                and block.get("type") == "text"
-                            ):
+                            if isinstance(block, dict) and block.get("type") == "text":
                                 text = block.get("text", "")
                                 if text:
                                     response_content += text
@@ -507,114 +504,117 @@ async def _execute_turn(
                         response_content = content
                         await callbacks.on_token(content)
             else:
-              try:
-                # Try astream for token-by-token streaming
-                chunks = []
-                streaming_interrupted = False
-                async for chunk in llm_with_tools.astream(prepared):
-                    chunks.append(chunk)
-                    # Extract and stream text content
-                    if hasattr(chunk, "content") and chunk.content:
-                        content = chunk.content
-                        # Anthropic returns content as list of dicts
-                        if isinstance(content, list):
-                            for block in content:
-                                if (
-                                    isinstance(block, dict)
-                                    and block.get("type") == "text"
-                                ):
-                                    text = block.get("text", "")
-                                    if text:
-                                        response_content += text
-                                        await callbacks.on_token(text)
-                                elif isinstance(block, str) and block:
-                                    response_content += block
-                                    await callbacks.on_token(block)
-                        elif isinstance(content, str) and content:
-                            response_content += content
-                            await callbacks.on_token(content)
+                try:
+                    # Try astream for token-by-token streaming
+                    chunks = []
+                    streaming_interrupted = False
+                    async for chunk in llm_with_tools.astream(prepared):
+                        chunks.append(chunk)
+                        # Extract and stream text content
+                        if hasattr(chunk, "content") and chunk.content:
+                            content = chunk.content
+                            # Anthropic returns content as list of dicts
+                            if isinstance(content, list):
+                                for block in content:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                    ):
+                                        text = block.get("text", "")
+                                        if text:
+                                            response_content += text
+                                            await callbacks.on_token(text)
+                                    elif isinstance(block, str) and block:
+                                        response_content += block
+                                        await callbacks.on_token(block)
+                            elif isinstance(content, str) and content:
+                                response_content += content
+                                await callbacks.on_token(content)
 
-                    # Check for mid-stream interrupt
-                    if callbacks.check_interrupt():
-                        logger.info("Interrupt received during LLM streaming")
-                        streaming_interrupted = True
-                        break
+                        # Check for mid-stream interrupt
+                        if callbacks.check_interrupt():
+                            logger.info("Interrupt received during LLM streaming")
+                            streaming_interrupted = True
+                            break
 
-                # Concatenate all chunks into final response
-                if chunks:
-                    response = chunks[0]
-                    for chunk in chunks[1:]:
-                        response = response + chunk
+                    # Concatenate all chunks into final response
+                    if chunks:
+                        response = chunks[0]
+                        for chunk in chunks[1:]:
+                            response = response + chunk
 
-                # Handle mid-stream interruption
-                if streaming_interrupted:
-                    if response:
-                        # Strip incomplete tool calls from partial response
-                        if hasattr(response, "tool_calls"):
-                            response.tool_calls = []
-                        if hasattr(response, "invalid_tool_calls"):
-                            response.invalid_tool_calls = []
-                        messages.append(response)
-                        messages_added += 1
-                    return TurnResult(
-                        turn_id=0,
-                        messages_added=messages_added,
-                        tool_calls_made=tool_calls_made,
-                        interrupted=True,
-                    )
-
-              except Exception as stream_err:
-                # Fallback to ainvoke when streaming fails
-                # (e.g. ReasoningCapturingClient can't handle stream=True)
-                err_name = type(stream_err).__name__
-                if "ResponseNotRead" in err_name or "APIConnectionError" in err_name:
-                    logger.info(
-                        f"Streaming not supported ({err_name}), falling back to ainvoke"
-                    )
-                    response = await llm_with_tools.ainvoke(prepared)
-                    # Stream the complete response as a single chunk
-                    content = getattr(response, "content", None)
-                    if content:
-                        if isinstance(content, list):
-                            for block in content:
-                                if (
-                                    isinstance(block, dict)
-                                    and block.get("type") == "text"
-                                ):
-                                    text = block.get("text", "")
-                                    if text:
-                                        response_content += text
-                                        await callbacks.on_token(text)
-                                elif isinstance(block, str) and block:
-                                    response_content += block
-                                    await callbacks.on_token(block)
-                        elif isinstance(content, str) and content:
-                            response_content = content
-                            await callbacks.on_token(content)
-                    else:
-                        extra = getattr(response, "additional_kwargs", None) or {}
-                        refusal = extra.get("refusal")
-                        logger.warning(
-                            "ainvoke fallback returned empty content "
-                            "(type=%s, has_tool_calls=%s, additional_kwargs=%s)",
-                            type(content).__name__,
-                            bool(getattr(response, "tool_calls", None)),
-                            list(extra.keys()),
+                    # Handle mid-stream interruption
+                    if streaming_interrupted:
+                        if response:
+                            # Strip incomplete tool calls from partial response
+                            if hasattr(response, "tool_calls"):
+                                response.tool_calls = []
+                            if hasattr(response, "invalid_tool_calls"):
+                                response.invalid_tool_calls = []
+                            messages.append(response)
+                            messages_added += 1
+                        return TurnResult(
+                            turn_id=0,
+                            messages_added=messages_added,
+                            tool_calls_made=tool_calls_made,
+                            interrupted=True,
                         )
-                        if refusal:
-                            logger.warning("Model refusal: %s", refusal)
-                            response_content = (
-                                f"⚠ The model declined to respond: {refusal}"
-                            )
-                            await callbacks.on_token(response_content)
+
+                except Exception as stream_err:
+                    # Fallback to ainvoke when streaming fails
+                    # (e.g. ReasoningCapturingClient can't handle stream=True)
+                    err_name = type(stream_err).__name__
+                    if (
+                        "ResponseNotRead" in err_name
+                        or "APIConnectionError" in err_name
+                    ):
+                        logger.info(
+                            f"Streaming not supported ({err_name}), falling back to ainvoke"
+                        )
+                        response = await llm_with_tools.ainvoke(prepared)
+                        # Stream the complete response as a single chunk
+                        content = getattr(response, "content", None)
+                        if content:
+                            if isinstance(content, list):
+                                for block in content:
+                                    if (
+                                        isinstance(block, dict)
+                                        and block.get("type") == "text"
+                                    ):
+                                        text = block.get("text", "")
+                                        if text:
+                                            response_content += text
+                                            await callbacks.on_token(text)
+                                    elif isinstance(block, str) and block:
+                                        response_content += block
+                                        await callbacks.on_token(block)
+                            elif isinstance(content, str) and content:
+                                response_content = content
+                                await callbacks.on_token(content)
                         else:
-                            response_content = (
-                                "⚠ The model returned an empty response. "
-                                "Please try again or switch models."
+                            extra = getattr(response, "additional_kwargs", None) or {}
+                            refusal = extra.get("refusal")
+                            logger.warning(
+                                "ainvoke fallback returned empty content "
+                                "(type=%s, has_tool_calls=%s, additional_kwargs=%s)",
+                                type(content).__name__,
+                                bool(getattr(response, "tool_calls", None)),
+                                list(extra.keys()),
                             )
-                            await callbacks.on_token(response_content)
-                else:
-                    raise
+                            if refusal:
+                                logger.warning("Model refusal: %s", refusal)
+                                response_content = (
+                                    f"⚠ The model declined to respond: {refusal}"
+                                )
+                                await callbacks.on_token(response_content)
+                            else:
+                                response_content = (
+                                    "⚠ The model returned an empty response. "
+                                    "Please try again or switch models."
+                                )
+                                await callbacks.on_token(response_content)
+                    else:
+                        raise
 
         except asyncio.TimeoutError:
             error_msg = f"LLM call timed out after {llm_timeout}s"

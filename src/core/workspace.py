@@ -1,12 +1,16 @@
 """Workspace management for agent file-based storage.
 
 This module provides a filesystem-based workspace abstraction for agents.
-Each job gets an isolated workspace directory where agents can store plans,
-documents, notes, and intermediate work products.
+Each job gets an isolated workspace (container or VM) where agents can
+store plans, documents, notes, and intermediate work products.
+
+The workspace IS the base path — no per-job subdirectories. Isolation is
+provided by the container/VM boundary, not directory structure.
 
 Environment-aware path resolution:
-- Container mode: /workspace/job_{uuid}/
-- Dev mode: ./workspace/job_{uuid}/
+- Remote workspace container: /home/agent-host (= home dir)
+- VM workspace: /home/agent-host (= home dir)
+- Dev mode (local): ./workspace
 
 Git versioning:
 - Optional git repository per workspace for automatic change tracking
@@ -16,7 +20,7 @@ Git versioning:
 Backend abstraction:
 - File I/O is delegated to a WorkspaceBackend implementation
 - LocalBackend (default): pathlib-based, current behavior
-- RemoteBackend (Phase 2): SSH/SFTP to a remote VM
+- RemoteBackend: SSH/SFTP to a remote VM or workspace container
 - See docs/features/vm_backend.md for the full design
 """
 
@@ -199,8 +203,9 @@ class WorkspaceManager:
         else:
             self._base_path = get_workspace_base_path()
 
-        # Job-specific workspace path
-        self._workspace_path = self._base_path / f"job_{job_id}"
+        # Workspace path — the base path IS the workspace.
+        # Isolation is provided by the container/VM, not subdirectories.
+        self._workspace_path = self._base_path
         self._initialized = False
 
         # Create or accept backend
@@ -273,6 +278,15 @@ class WorkspaceManager:
         if self.config.git_versioning and self.config.git_remote_url:
             if not self._backend_has_shell:
                 self._workspace_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                # Remote backend: workspace dir may have leftover files from a
+                # previous session (static container pool reuse). Clear it so
+                # git clone has an empty target directory.
+                self._backend.shell_run(
+                    f"rm -rf {self._backend.root}/* {self._backend.root}/.[!.]* 2>/dev/null || true",
+                    timeout=30,
+                    tab_name="git",
+                )
             self._initialize_git()
             # Create any subdirectories the clone didn't provide
             for subdir in self.config.structure:

@@ -535,7 +535,7 @@ context = await browser.new_context(storage_state="auth_state.json")
    browser tool call (lazy), kill on job completion/archive. Store CDP URL
    in ToolContext.
 2. **Move `user_data_dir` into workspace directory** (e.g.,
-   `/home/agent-host/workspace/.browser-profile/`). Scoped to job, destroyed
+   `/home/agent-host/.browser-profile/`). Scoped to job, destroyed
    with workspace. Survives Chromium crashes.
 3. **Add health-check reconnection**: Before each browser tool call, check if
    Chromium is alive. If yes, reconnect. If no, restart with same `user_data_dir`.
@@ -876,7 +876,7 @@ Job/session starts
             └── Kill Chromium, cleanup
 ```
 
-- **`user_data_dir`** moved into workspace: `/home/agent-host/workspace/.browser-profile/`
+- **`user_data_dir`** moved into workspace: `/home/agent-host/.browser-profile/`
   Scoped to job, survives Chromium crashes, destroyed with workspace.
 - **Tab management**: Close stale tabs after each tool call. Direct-control
   tools work on the active tab; snapshot includes tab list.
