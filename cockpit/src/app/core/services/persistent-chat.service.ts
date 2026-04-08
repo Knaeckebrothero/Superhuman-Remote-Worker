@@ -374,6 +374,15 @@ export class PersistentChatService {
                 }
                 break;
 
+            case 'greeting':
+                this.messages.update(msgs => [...msgs, {
+                    role: 'assistant',
+                    content: (params['content'] as string) || '',
+                    timestamp: new Date(),
+                }]);
+                this.isWaitingForInput.set(true);
+                break;
+
             case 'ready':
                 this.isWaitingForInput.set(true);
                 this.isStreaming.set(false);

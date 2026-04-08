@@ -9721,7 +9721,6 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         defaults = {}
 
     # Load expert config
-    expert_llm_keys: set[str] = set()
     if expert_id == "defaults":
         merged = dict(defaults)
         expert_config_dir = config_dir
@@ -9732,8 +9731,6 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
             return {}
         with open(config_path) as f:
             expert_data = yaml.safe_load(f) or {}
-        # Track which LLM keys the expert explicitly sets
-        expert_llm_keys = set((expert_data.get("llm") or {}).keys())
         # Remove meta keys before merge
         expert_data.pop("$extends", None)
         merged = _deep_merge(defaults, expert_data)
@@ -9946,7 +9943,6 @@ async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any
         defaults = {}
 
     expert_data_clean = dict(expert_data)
-    expert_llm_keys = set((expert_data_clean.get("llm") or {}).keys())
     expert_data_clean.pop("$extends", None)
     merged = _deep_merge(defaults, expert_data_clean)
     for key in ("$extends", "connections"):
