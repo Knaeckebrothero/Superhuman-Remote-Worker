@@ -221,7 +221,10 @@ async def _attach_session(
                 f"Workspace container ready: {workspace_override['remote']['host']}"
             )
         else:
-            logger.info("No workspace container — using local backend")
+            raise RuntimeError(
+                "No workspace container provisioned for thread. "
+                "Cannot attach session without an isolated workspace."
+            )
 
     # Apply config overrides, project_ids, and datasources from thread metadata
     if not config_override:

@@ -404,8 +404,9 @@ services:
           apk add --no-cache openssh-keygen &&
           ssh-keygen -t ed25519 -f /keys/id_ed25519 -N "" -C "agent@srw" &&
           cat /keys/id_ed25519.pub > /keys/authorized_keys &&
+          cp /keys/id_ed25519.pub /keys/ssh-publickey &&
           chmod 600 /keys/id_ed25519 &&
-          chmod 644 /keys/authorized_keys;
+          chmod 644 /keys/authorized_keys /keys/ssh-publickey;
         fi
       '
     volumes:
@@ -421,7 +422,7 @@ services:
     environment:
       WORKSPACE_ID: "1"
     volumes:
-      - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
+      - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
       - "${WORKSPACE_1_SSH_PORT:-2201}:22"
       - "${WORKSPACE_1_IDE_PORT:-18081}:8080"
@@ -445,7 +446,7 @@ services:
     environment:
       WORKSPACE_ID: "2"
     volumes:
-      - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
+      - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
       - "${WORKSPACE_2_SSH_PORT:-2202}:22"
       - "${WORKSPACE_2_IDE_PORT:-18082}:8080"
@@ -469,7 +470,7 @@ services:
     environment:
       WORKSPACE_ID: "3"
     volumes:
-      - ./.dev/ssh-keys:/home/agent-host/.ssh:ro
+      - ./.dev/ssh-keys:/tmp/ssh-pubkey:ro
     ports:
       - "${WORKSPACE_3_SSH_PORT:-2203}:22"
       - "${WORKSPACE_3_IDE_PORT:-18083}:8080"

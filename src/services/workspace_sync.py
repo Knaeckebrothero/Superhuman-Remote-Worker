@@ -17,6 +17,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from ..core.workspace_backend import WorkspaceBackend
@@ -90,6 +91,10 @@ class WorkspaceSyncService:
         self._poll_task: Optional[asyncio.Task] = None
         self._running = False
         self._client = None
+
+        # Base path on the WebDAV server — used to convert absolute server
+        # paths returned by client.list(get_info=True) into relative paths.
+        self._webdav_base_path = urlparse(webdav_url).path.rstrip("/") + "/"
 
     def _get_client(self):
         """Lazy-init the WebDAV client."""
@@ -263,7 +268,14 @@ class WorkspaceSyncService:
             for item in remote_files:
                 if not isinstance(item, dict):
                     continue
-                path = item.get("path", "").strip("/")
+                raw_path = item.get("path", "")
+                # client.list(get_info=True) returns full server paths like
+                # /remote.php/dav/files/user/folder/file.txt — strip the
+                # base prefix to get a path relative to the session folder.
+                if raw_path.startswith(self._webdav_base_path):
+                    path = raw_path[len(self._webdav_base_path) :]
+                else:
+                    path = raw_path.strip("/")
                 if not path or item.get("isdir"):
                     continue
                 if _should_ignore(path):
@@ -290,9 +302,7 @@ class WorkspaceSyncService:
             logger.warning(f"Pull sync failed: {e}")
         return pulled
 
-    async def _pull_file_to_backend(
-        self, client, path: str, etag: str
-    ) -> None:
+    async def _pull_file_to_backend(self, client, path: str, etag: str) -> None:
         """Download a file from Nextcloud and write to remote backend."""
         fd, tmp_path = tempfile.mkstemp()
         os.close(fd)

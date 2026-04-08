@@ -6,9 +6,8 @@ _setup_context_manager(), _setup_shell_manager(), _setup_memory(),
 swap_backend(), get_workspace_content(), cleanup().
 """
 
-import os
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -16,6 +15,7 @@ from src.api.persistent_session import (
     PersistentSession,
     _EXCLUDED_TOOLS,
 )
+from src.core.workspace_backend import WorkspaceUnavailableError
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +145,7 @@ class TestSetup:
         session = _make_session(config=cfg)
 
         with (
-            patch.object(session, "_setup_workspace"),
+            patch.object(session, "_setup_workspace", new_callable=AsyncMock),
             patch.object(session, "_setup_tools"),
             patch.object(session, "_bind_tools"),
             patch.object(session, "_setup_context_manager"),
@@ -167,7 +167,7 @@ class TestSetup:
         mock_llm = MagicMock()
 
         with (
-            patch.object(session, "_setup_workspace"),
+            patch.object(session, "_setup_workspace", new_callable=AsyncMock),
             patch.object(session, "_setup_tools"),
             patch.object(session, "_bind_tools"),
             patch.object(session, "_setup_context_manager"),
@@ -208,7 +208,12 @@ class TestSetup:
             return fn
 
         with (
-            patch.object(session, "_setup_workspace", side_effect=track("workspace")),
+            patch.object(
+                session,
+                "_setup_workspace",
+                new_callable=AsyncMock,
+                side_effect=track("workspace"),
+            ),
             patch.object(session, "_setup_tools", side_effect=track("tools")),
             patch.object(session, "_bind_tools", side_effect=track("bind")),
             patch.object(
@@ -238,7 +243,7 @@ class TestSetup:
         session = _make_session(config=cfg)
 
         with (
-            patch.object(session, "_setup_workspace"),
+            patch.object(session, "_setup_workspace", new_callable=AsyncMock),
             patch.object(session, "_setup_tools"),
             patch.object(session, "_bind_tools"),
             patch.object(session, "_setup_context_manager"),
@@ -355,42 +360,18 @@ class TestShellToolsIncludedWhenShellManagerAvailable:
 
 
 class TestSetupWorkspace:
-    def test_local_workspace_created_by_default(self):
-        """Default config (no remote) creates local workspace."""
+    @pytest.mark.asyncio
+    async def test_no_remote_config_raises(self):
+        """Default config (no remote) raises RuntimeError — local backend not allowed."""
         cfg = _make_config()
         session = _make_session(config=cfg)
 
-        with (
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
-        ):
-            MockWM.return_value.path = "/tmp/test"
-            MockWM.return_value.initialize = MagicMock()
-            session._setup_workspace()
+        with pytest.raises(RuntimeError, match="No remote workspace configured"):
+            await session._setup_workspace()
 
-        assert session.workspace_manager is not None
-        MockWM.return_value.initialize.assert_called_once()
-
-    def test_workspace_path_from_env(self):
-        """WORKSPACE_PATH env var is used as base path."""
-        cfg = _make_config()
-        session = _make_session(config=cfg)
-
-        with (
-            patch.dict(os.environ, {"WORKSPACE_PATH": "/custom/path"}),
-            patch("src.api.persistent_session.WorkspaceManager") as MockWM,
-            patch("src.api.persistent_session.WorkspaceManagerConfig"),
-        ):
-            MockWM.return_value.path = "/custom/path/job_xxx"
-            MockWM.return_value.initialize = MagicMock()
-            session._setup_workspace()
-
-        # The base_path should be /custom/path
-        call_kwargs = MockWM.call_args
-        assert "/custom/path" in str(call_kwargs)
-
-    def test_remote_backend_creation(self):
-        """Remote backend created when config says 'remote'."""
+    @pytest.mark.asyncio
+    async def test_remote_backend_creation(self):
+        """Remote backend created and connected when config says 'remote'."""
         cfg = _make_config(
             ws_backend="remote",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
@@ -404,52 +385,87 @@ class TestSetupWorkspace:
         with (
             patch("src.api.persistent_session.WorkspaceManager") as MockWM,
             patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch(
-                "src.api.persistent_session.RemoteBackend",
-                return_value=mock_remote,
-                create=True,
-            ),
-        ):
-            # Patch the import inside the method
-            with patch.dict(
+            patch.dict(
                 "sys.modules",
                 {
                     "src.core.backends.remote": MagicMock(
                         RemoteBackend=MagicMock(return_value=mock_remote)
                     )
                 },
-            ):
-                MockWM.return_value.path = "/tmp/test"
-                MockWM.return_value.initialize = MagicMock()
-                session._setup_workspace()
+            ),
+        ):
+            MockWM.return_value.path = "/tmp/test"
+            MockWM.return_value.initialize = MagicMock()
+            await session._setup_workspace()
 
-    def test_remote_backend_failure_falls_back_to_local(self):
-        """Remote backend creation failure falls back to local."""
+        mock_remote.connect.assert_called_once()
+        assert session.workspace_manager is not None
+
+    @pytest.mark.asyncio
+    async def test_remote_retry_succeeds_after_failures(self):
+        """Retry loop recovers when connect fails then succeeds."""
         cfg = _make_config(
             ws_backend="remote",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
 
-        failing_module = MagicMock()
-        failing_module.RemoteBackend.side_effect = RuntimeError("connect failed")
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock(
+            side_effect=[RuntimeError("fail 1"), RuntimeError("fail 2"), None]
+        )
+        mock_module = MagicMock()
+        mock_module.RemoteBackend = MagicMock(return_value=mock_remote)
 
         with (
             patch("src.api.persistent_session.WorkspaceManager") as MockWM,
             patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch.dict(
-                "sys.modules",
-                {"src.core.backends.remote": failing_module},
-            ),
+            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
+            patch("asyncio.sleep", new_callable=AsyncMock),
         ):
             MockWM.return_value.path = "/tmp/test"
             MockWM.return_value.initialize = MagicMock()
-            session._setup_workspace()
+            await session._setup_workspace()
 
-        # Should still have a workspace manager (local fallback)
+        assert mock_remote.connect.call_count == 3
         assert session.workspace_manager is not None
 
-    def test_workspace_override_takes_priority(self):
+    @pytest.mark.asyncio
+    async def test_remote_retry_raises_after_timeout(self):
+        """Retry loop raises WorkspaceUnavailableError after max duration."""
+        cfg = _make_config(
+            ws_backend="remote",
+            ws_remote={"host": "10.0.0.1"},
+        )
+        session = _make_session(config=cfg)
+
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock(side_effect=RuntimeError("always fails"))
+        mock_module = MagicMock()
+        mock_module.RemoteBackend = MagicMock(return_value=mock_remote)
+
+        # Simulate time passing beyond max_duration (300s)
+        clock = [0.0]
+
+        def fake_monotonic():
+            val = clock[0]
+            clock[0] += 301.0  # Jump past deadline on first failure
+            return val
+
+        with (
+            patch("src.api.persistent_session.WorkspaceManager"),
+            patch("src.api.persistent_session.WorkspaceManagerConfig"),
+            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
+            patch(
+                "src.api.persistent_session.time.monotonic", side_effect=fake_monotonic
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="after 1 attempts"):
+                await session._setup_workspace()
+
+    @pytest.mark.asyncio
+    async def test_workspace_override_takes_priority(self):
         """workspace_override overrides config values."""
         cfg = _make_config(ws_backend=None)
         session = _make_session(config=cfg)
@@ -459,23 +475,23 @@ class TestSetupWorkspace:
             "remote": {"host": "override-host"},
         }
 
-        failing_module = MagicMock()
-        failing_module.RemoteBackend.side_effect = RuntimeError("expected")
+        mock_remote = MagicMock()
+        mock_remote.connect = MagicMock()
+        mock_module = MagicMock()
+        mock_module.RemoteBackend = MagicMock(return_value=mock_remote)
 
         with (
             patch("src.api.persistent_session.WorkspaceManager") as MockWM,
             patch("src.api.persistent_session.WorkspaceManagerConfig"),
-            patch.dict(
-                "sys.modules",
-                {"src.core.backends.remote": failing_module},
-            ),
+            patch.dict("sys.modules", {"src.core.backends.remote": mock_module}),
         ):
             MockWM.return_value.path = "/tmp/test"
             MockWM.return_value.initialize = MagicMock()
-            session._setup_workspace(workspace_override=override)
+            await session._setup_workspace(workspace_override=override)
 
-        # RemoteBackend should have been attempted (the override provides "remote" backend)
-        failing_module.RemoteBackend.assert_called_once()
+        # RemoteBackend should have been created with the override host
+        call_kwargs = mock_module.RemoteBackend.call_args
+        assert call_kwargs[1]["host"] == "override-host"
 
 
 # ---------------------------------------------------------------------------

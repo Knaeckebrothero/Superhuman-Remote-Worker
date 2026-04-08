@@ -3,7 +3,7 @@
 This module provides snapshot creation and recovery at phase boundaries,
 allowing agents to roll back to a previous phase if corruption occurs.
 
-Snapshots are stored in: workspace/phase_snapshots/job_<id>/
+Snapshots are stored on the agent pod: workspace/phase_snapshots/job_<id>/
 Each snapshot includes:
 - phase_<n>/checkpoint.db: Copy of the LangGraph checkpoint at phase end
 - phase_<n>/metadata.json: Snapshot metadata (iteration, timestamp, etc.)
@@ -184,7 +184,9 @@ class PhaseSnapshotManager:
 
         self._base_path = base_path
         self._snapshots_dir = get_phase_snapshots_path() / f"job_{job_id}"
-        self._workspace_path = base_path / f"job_{job_id}"
+        # Workspace path IS the base path — no job_{id} subdirectory.
+        # Isolation is provided by the container/VM boundary.
+        self._workspace_path = base_path
         self._checkpoint_path = base_path / "checkpoints" / f"job_{job_id}.db"
         self._backend = workspace_backend
 

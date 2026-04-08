@@ -147,14 +147,15 @@ sudo chmod 0440 /etc/sudoers.d/agent-host
 # Allow agent-host to read systemd journal (for debugging daemon issues)
 sudo usermod -aG systemd-journal agent-host
 
-# Workspace directory (where the agent operates)
+# Workspace lives in a dedicated subdirectory of home — keeps dotfiles
+# separate and provides a clean target for git clone.
 sudo mkdir -p /home/agent-host/workspace
 sudo chown agent-host:agent-host /home/agent-host/workspace
 
-# SSH key directory (keys injected at runtime by orchestrator or cloud-init)
-sudo mkdir -p /home/agent-host/.ssh
-sudo chmod 700 /home/agent-host/.ssh
-sudo chown agent-host:agent-host /home/agent-host/.ssh
+# SSH authorized_keys outside home dir — keeps ~ clean for workspace use.
+# Keys are injected at runtime by cloud-init.
+sudo mkdir -p /etc/ssh/authorized_keys
+sudo chmod 755 /etc/ssh/authorized_keys
 
 # Agent runtime directory
 sudo mkdir -p /run/agent
@@ -173,7 +174,7 @@ sudo tee /etc/ssh/sshd_config.d/agent.conf > /dev/null <<'SSHEOF'
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
 X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*

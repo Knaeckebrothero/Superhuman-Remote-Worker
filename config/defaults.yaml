@@ -47,7 +47,7 @@ workspace:
   #   username: agent-host
   #   key_path: /run/secrets/vm-ssh-key               # K8s: Secret mount
   #           # /run/secrets/ssh/id_ed25519            # Docker Compose: shared volume
-  #   workspace_path: /home/agent-host/workspace    # Workspace root on the remote
+  #   workspace_path: /home/agent-host/workspace     # Workspace root (subdirectory of home)
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)
