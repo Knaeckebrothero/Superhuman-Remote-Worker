@@ -522,9 +522,7 @@ async def _execute_turn(
                 if (
                     response
                     and getattr(response, "tool_calls", None)
-                    and any(
-                        not tc.get("args") for tc in response.tool_calls
-                    )
+                    and any(not tc.get("args") for tc in response.tool_calls)
                 ):
                     logger.info(
                         "Streaming produced tool calls with empty args — "
@@ -575,10 +573,7 @@ async def _execute_turn(
                 # Fallback to ainvoke when streaming fails
                 # (e.g. ReasoningCapturingClient can't handle stream=True)
                 err_name = type(stream_err).__name__
-                if (
-                    "ResponseNotRead" in err_name
-                    or "APIConnectionError" in err_name
-                ):
+                if "ResponseNotRead" in err_name or "APIConnectionError" in err_name:
                     logger.info(
                         f"Streaming not supported ({err_name}), falling back to ainvoke"
                     )
