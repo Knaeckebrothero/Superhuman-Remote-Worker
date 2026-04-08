@@ -33,6 +33,13 @@ def create_research_tools(context: ToolContext) -> List[Any]:
     return tools
 
 
+def create_browser_direct_tools(context: ToolContext) -> List[Any]:
+    """Create direct browser control tools with injected context."""
+    from .browser_direct import create_browser_direct_tools as _create
+
+    return _create(context)
+
+
 def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     """Get metadata for all research tools."""
     from .browser import BROWSER_TOOLS_METADATA
@@ -46,3 +53,10 @@ def get_research_metadata() -> Dict[str, Dict[str, Any]]:
     metadata.update(BROWSER_TOOLS_METADATA)
     metadata.update(WORKFLOW_TOOLS_METADATA)
     return metadata
+
+
+def get_browser_direct_metadata() -> Dict[str, Dict[str, Any]]:
+    """Get metadata for direct browser control tools."""
+    from .browser_direct import BROWSER_DIRECT_TOOLS_METADATA
+
+    return BROWSER_DIRECT_TOOLS_METADATA

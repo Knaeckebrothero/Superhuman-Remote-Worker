@@ -388,6 +388,8 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
             if agent_provisioner.is_available:
                 await agent_provisioner.ensure_warm_pool()
                 await agent_provisioner.cleanup_completed_pods()
+                await agent_provisioner.reap_stale_pods()
+                await agent_provisioner.scale_down_idle()
         except Exception as e:
             logger.error("Error in agent pool reconciler: %s", e)
 
@@ -8756,23 +8758,59 @@ async def create_thread(
             agent_provisioner.in_cluster or not docker_provisioner.is_available
         )
         if use_k8s_agent:
-            # Kubernetes mode: create agent pod on demand
+            # Kubernetes mode: create agent pod on demand, with pool fallback
             effective_config = request_body.config_name or user_settings.get(
                 "config_name", "interactive"
             )
 
-            async def _provision_agent_pod(tid: str, cfg: str) -> None:
+            async def _provision_or_assign(
+                tid: str,
+                cfg: str,
+                co: dict,
+                pids: list,
+                ds_ids: list[str] | None,
+            ) -> None:
                 pod_name = await agent_provisioner.provision_agent(
                     purpose="session", thread_id=tid, config_name=cfg
                 )
-                if not pod_name:
+                if pod_name:
+                    return
+
+                # K8s provisioning failed (capacity, error, etc.) — try
+                # attaching an existing idle agent from the pool as fallback.
+                logger.warning(
+                    "Thread %s: K8s provisioning failed, trying pool fallback",
+                    tid,
+                )
+                resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                    datasource_ids=ds_ids, project_ids=pids
+                )
+                ds_payload = _build_datasources_payload(resolved_ds)
+                if resolved_ds:
+                    co = _build_datasource_tool_override(resolved_ds, co)
+
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    await _send_session_attach(
+                        idle_agent, tid, co, pids, datasources=ds_payload
+                    )
+                else:
                     logger.error(
-                        "Thread %s: agent pod provisioning failed. "
-                        "Check image availability, RBAC, and node resources.",
+                        "Thread %s: agent pod provisioning failed and "
+                        "no idle agents available. Check image availability, "
+                        "RBAC, node resources, or increase MAX_AGENTS.",
                         tid,
                     )
 
-            asyncio.create_task(_provision_agent_pod(thread_id, effective_config))
+            asyncio.create_task(
+                _provision_or_assign(
+                    thread_id,
+                    effective_config,
+                    config_override,
+                    effective_project_ids,
+                    request_body.datasource_ids,
+                )
+            )
         elif docker_provisioner.is_available:
             # Docker Compose mode: find an idle pool agent and attach the thread
             async def _assign_pool_agent(
@@ -8967,9 +9005,40 @@ async def resume_thread(
         config_name = thread.get("config_name", "interactive")
 
         async def _reprovision(tid: str, cfg: str) -> None:
-            await agent_provisioner.provision_agent(
+            pod_name = await agent_provisioner.provision_agent(
                 purpose="session", thread_id=tid, config_name=cfg
             )
+            if pod_name:
+                return
+            # K8s provisioning failed — try attaching an idle pool agent
+            logger.warning(
+                "Thread %s: resume provisioning failed, trying pool fallback",
+                tid,
+            )
+            idle_agent = await _find_idle_persistent_agent()
+            if idle_agent:
+                co = thread.get("config_override") or {}
+                if isinstance(co, str):
+                    try:
+                        co = json.loads(co)
+                    except (json.JSONDecodeError, TypeError):
+                        co = {}
+                pids = thread.get("project_ids") or []
+                resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                    project_ids=pids
+                )
+                ds_payload = _build_datasources_payload(resolved_ds)
+                if resolved_ds:
+                    co = _build_datasource_tool_override(resolved_ds, co)
+                await _send_session_attach(
+                    idle_agent, tid, co, pids, datasources=ds_payload
+                )
+            else:
+                logger.error(
+                    "Thread %s: resume failed — no capacity and "
+                    "no idle agents available",
+                    tid,
+                )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:

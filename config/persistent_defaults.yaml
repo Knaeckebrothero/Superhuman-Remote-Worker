@@ -60,6 +60,16 @@ tools:
     - browse_website
     - download_from_website
     - research_topic
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
   citation:
     - cite_document
     - cite_web
@@ -175,7 +185,22 @@ research:
 browser:
   headless: true
   timeout: 60000
-  use_vision: false
+  use_vision: auto
+  remote: auto
+  model: null
+  api_key: null
+  base_url: null
+  chromium_max_memory_mb: 512
+  snapshot:
+    include_screenshot: auto
+    max_dom_chars: 40000
+  security:
+    allowed_domains: []
+    blocked_domains: ["localhost", "127.0.0.1", "169.254.169.254"]
+    blocked_schemes: ["file", "javascript", "data"]
+  persistence:
+    user_data_dir: .browser-profile
+    export_state_on_phase: true
 
 shell:
   mode: stateless

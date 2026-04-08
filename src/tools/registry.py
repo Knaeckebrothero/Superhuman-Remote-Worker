@@ -22,7 +22,6 @@ from .citation import create_citation_tools, get_citation_metadata
 from .cloud import create_cloud_tools, get_cloud_metadata
 from .communication import create_communication_tools, get_communication_metadata
 from .context import ToolContext
-
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
 from .core.session_task_tools import (
@@ -30,7 +29,6 @@ from .core.session_task_tools import (
     get_session_task_metadata,
 )
 from .delegation import create_delegation_tools, get_delegation_metadata
-
 # Import domain tools
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .git import create_git_tools, get_git_metadata
@@ -38,10 +36,14 @@ from .graph import create_graph_tools, get_graph_metadata
 from .knowledge import create_knowledge_tools, get_knowledge_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .orchestrator import create_orchestrator_tools, get_orchestrator_metadata
-from .research import create_research_tools, get_research_metadata
+from .research import (
+    create_browser_direct_tools,
+    create_research_tools,
+    get_browser_direct_metadata,
+    get_research_metadata,
+)
 from .shell import create_shell_tools, get_shell_metadata
 from .sql import create_sql_tools, get_sql_metadata
-
 # Import workspace tools from new package
 from .workspace import create_workspace_tools, get_workspace_metadata
 
@@ -60,6 +62,7 @@ TOOL_REGISTRY.update(get_core_metadata())
 
 # Register domain tools
 TOOL_REGISTRY.update(get_research_metadata())
+TOOL_REGISTRY.update(get_browser_direct_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_sql_metadata())
@@ -317,6 +320,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded research tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load research tools: {e}")
+
+    # Direct browser control tools
+    if "browser_direct" in tools_by_category:
+        try:
+            bd_tools = create_browser_direct_tools(context)
+            requested = set(tools_by_category["browser_direct"])
+            for tool in bd_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded browser_direct tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load browser_direct tools: {e}")
 
     # Citation tools
     if "citation" in tools_by_category:

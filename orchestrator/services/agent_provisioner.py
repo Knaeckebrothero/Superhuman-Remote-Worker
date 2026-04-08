@@ -165,17 +165,22 @@ class AgentProvisioner:
             )
             return None
 
-        # Capacity check with reservation awareness
+        # Capacity check with reservation-aware eviction
         counts = await self.active_counts_by_purpose()
         total = counts["total"]
         if total >= self._max_agents:
-            logger.warning(
-                "Agent pool at capacity (%d/%d) — cannot provision new %s agent",
-                total,
-                self._max_agents,
-                purpose,
-            )
-            return None
+            # At capacity — try to evict an idle agent of the OTHER purpose
+            # if this purpose has reserved slots configured.
+            evicted = await self._try_evict_for_reservation(purpose, counts)
+            if not evicted:
+                logger.warning(
+                    "Agent pool at capacity (%d/%d) — cannot provision new %s agent",
+                    total,
+                    self._max_agents,
+                    purpose,
+                )
+                return None
+            # One slot freed via eviction — fall through to create pod
 
         # Reservation check: ensure this purpose doesn't starve the other
         if purpose == "job" and self._reserved_session_slots > 0:
@@ -490,6 +495,204 @@ class AgentProvisioner:
         if cleaned > 0:
             logger.info("Cleaned up %d completed agent pod(s)", cleaned)
         return cleaned
+
+    async def reap_stale_pods(self, offline_threshold_minutes: int = 10) -> int:
+        """Delete Running pods whose agents have been offline beyond threshold.
+
+        The stale-agent detector marks agents offline in the DB after 3 minutes
+        without a heartbeat, but leaves the K8s pod running.  This method
+        cross-references Running pods with offline DB records and terminates
+        the zombie pods so they stop consuming capacity.
+
+        Returns:
+            Number of pods reaped.
+        """
+        if not self._k8s_available or not self._db:
+            return 0
+
+        reaped = 0
+        try:
+            # 1. Collect hostnames of long-offline agents
+            offline_hostnames: set[str] = set()
+            try:
+                async with self._db.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT hostname FROM agents
+                        WHERE status = 'offline'
+                          AND hostname IS NOT NULL
+                          AND last_heartbeat < NOW() - make_interval(mins => $1)
+                        """,
+                        offline_threshold_minutes,
+                    )
+                offline_hostnames = {r["hostname"] for r in rows}
+            except Exception:
+                logger.exception("Failed to query offline agents for stale reaping")
+                return 0
+
+            if not offline_hostnames:
+                return 0
+
+            # 2. List managed Running pods and delete matches
+            pods = await asyncio.to_thread(
+                self._core_api.list_namespaced_pod,
+                namespace=self._namespace,
+                label_selector=self._label_selector,
+            )
+            for pod in pods.items:
+                if pod.status.phase in ("Succeeded", "Failed"):
+                    continue
+                if pod.metadata.name in offline_hostnames:
+                    if await self.delete_agent_pod(pod.metadata.name):
+                        reaped += 1
+        except Exception:
+            logger.exception("Error during stale pod reaping")
+
+        if reaped:
+            logger.info("Reaped %d stale agent pod(s)", reaped)
+        return reaped
+
+    async def scale_down_idle(self, max_terminate: int = 2) -> int:
+        """Terminate excess idle agent pods above MIN_AGENTS floor.
+
+        Runs each reconciler cycle but only removes up to *max_terminate* pods
+        per invocation for gradual scale-down (avoids thundering herd).
+
+        Returns:
+            Number of pods terminated.
+        """
+        if not self._k8s_available or not self._db:
+            return 0
+        if self._min_agents <= 0:
+            return 0  # No floor configured — nothing to scale down to
+
+        active = await self.active_count()
+        if active <= self._min_agents:
+            return 0
+
+        # Find truly idle agents (no job, no thread, not session-bound)
+        try:
+            async with self._db.acquire() as conn:
+                idle_rows = await conn.fetch(
+                    """
+                    SELECT id, hostname FROM agents
+                    WHERE status = 'ready'
+                      AND current_job_id IS NULL
+                      AND thread_id IS NULL
+                      AND hostname IS NOT NULL
+                    ORDER BY last_heartbeat ASC
+                    LIMIT $1
+                    """,
+                    max_terminate + 5,  # fetch a few extra for filtering
+                )
+        except Exception:
+            logger.exception("Failed to query idle agents for scale-down")
+            return 0
+
+        if not idle_rows:
+            return 0
+
+        excess = active - self._min_agents
+        to_terminate = min(excess, len(idle_rows), max_terminate)
+        terminated = 0
+
+        for row in idle_rows[:to_terminate]:
+            hostname = row["hostname"]
+            agent_id = str(row["id"])
+            if await self.delete_agent_pod(hostname):
+                # Mark agent offline so it doesn't get re-counted as idle
+                try:
+                    async with self._db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE agents SET status = 'offline' WHERE id = $1",
+                            agent_id,
+                        )
+                except Exception:
+                    pass  # Heartbeat timeout will handle it
+                terminated += 1
+
+        if terminated:
+            logger.info(
+                "Scale-down: terminated %d idle agent pod(s) (active=%d, min=%d)",
+                terminated,
+                active - terminated,
+                self._min_agents,
+            )
+        return terminated
+
+    async def _try_evict_for_reservation(self, purpose: str, counts: dict) -> bool:
+        """Evict an idle agent of the OTHER purpose to honour reserved slots.
+
+        Called when the pool is at capacity. If the requesting *purpose* has
+        reserved slots configured, finds an idle agent pod of the opposing type
+        and deletes it to free one slot.
+
+        Returns:
+            True if a pod was successfully evicted.
+        """
+        # Determine which reservation applies
+        if purpose == "session" and self._reserved_session_slots > 0:
+            other_purpose = "job"
+        elif purpose == "job" and self._reserved_job_slots > 0:
+            other_purpose = "session"
+        else:
+            return False  # No reservation configured for this purpose
+
+        if not self._db:
+            return False
+
+        try:
+            # Find idle agents (no job, no thread) whose hostname matches a
+            # Running pod of the OTHER purpose.
+            async with self._db.acquire() as conn:
+                idle_rows = await conn.fetch(
+                    """
+                    SELECT id, hostname FROM agents
+                    WHERE status = 'ready'
+                      AND current_job_id IS NULL
+                      AND thread_id IS NULL
+                      AND hostname IS NOT NULL
+                    ORDER BY last_heartbeat ASC
+                    """,
+                )
+            if not idle_rows:
+                return False
+
+            idle_hostnames = {r["hostname"]: r for r in idle_rows}
+
+            # List pods of the other purpose
+            pods = await asyncio.to_thread(
+                self._core_api.list_namespaced_pod,
+                namespace=self._namespace,
+                label_selector=(f"{self._label_selector},srw/purpose={other_purpose}"),
+            )
+            for pod in pods.items:
+                if pod.status.phase in ("Succeeded", "Failed"):
+                    continue
+                if pod.metadata.name in idle_hostnames:
+                    agent_id = str(idle_hostnames[pod.metadata.name]["id"])
+                    if await self.delete_agent_pod(pod.metadata.name):
+                        # Mark evicted agent offline
+                        try:
+                            async with self._db.acquire() as conn:
+                                await conn.execute(
+                                    "UPDATE agents SET status = 'offline' "
+                                    "WHERE id = $1",
+                                    agent_id,
+                                )
+                        except Exception:
+                            pass
+                        logger.info(
+                            "Evicted idle %s agent %s to free slot for %s",
+                            other_purpose,
+                            pod.metadata.name,
+                            purpose,
+                        )
+                        return True
+        except Exception:
+            logger.exception("Failed to evict agent for reservation")
+
+        return False
 
     # =========================================================================
     # Pod manifest
