@@ -105,7 +105,7 @@ def _simulate_approve(job: dict, workspace_base: Path) -> tuple[dict, str | None
 
     if freeze_type in ("phase_boundary", "vm_upgrade_required"):
         # Remove local freeze file
-        local_frozen = workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
+        local_frozen = workspace_base / "output" / "job_frozen.json"
         if local_frozen.exists():
             local_frozen.unlink()
 
@@ -165,7 +165,7 @@ def _simulate_upgrade(
     vm_ctx["upgrade_command"] = frozen_data.get("command", "")
 
     # Remove local freeze file
-    local_frozen = workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
+    local_frozen = workspace_base / "output" / "job_frozen.json"
     if local_frozen.exists():
         local_frozen.unlink()
 
@@ -217,7 +217,7 @@ class TestUpgradeToVm:
         job = make_job(job_id=job_id, freeze_data=freeze_data, context={})
 
         # Create the freeze file
-        output_dir = tmp_path / f"job_{job_id}" / "output"
+        output_dir = tmp_path / "output"
         output_dir.mkdir(parents=True)
         frozen_path = output_dir / "job_frozen.json"
         frozen_path.write_text(json.dumps(freeze_data))
@@ -327,7 +327,7 @@ class TestApproveVmUpgradeWithoutVm:
         job = make_job(job_id=job_id, freeze_data=freeze_data)
 
         # Create the freeze file
-        output_dir = tmp_path / f"job_{job_id}" / "output"
+        output_dir = tmp_path / "output"
         output_dir.mkdir(parents=True)
         frozen_path = output_dir / "job_frozen.json"
         frozen_path.write_text(json.dumps(freeze_data))

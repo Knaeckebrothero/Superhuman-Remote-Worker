@@ -354,7 +354,7 @@ Idempotent: if a session is already active, returns it. If restoring, returns cu
 ```json
 {
   "status": "active",
-  "code_server_url": "http://10.0.50.12:8080/?folder=/home/agent-host/workspace",
+  "code_server_url": "http://10.0.50.12:8080/?folder=/home/agent-host",
   "expires_at": "2026-03-17T19:00:00Z"
 }
 ```

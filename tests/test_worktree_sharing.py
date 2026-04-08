@@ -217,12 +217,12 @@ class TestWorktreePathComputation:
     """Tests for worktree_path generation."""
 
     def test_worktree_path_format(self):
-        """worktree_path follows /home/agent-host/worktrees/{short_id}-{config} pattern."""
+        """worktree_path follows /home/agent-host/workspace/worktrees/{short_id}-{config} pattern."""
         short_id = "abc12345"
         config_name = "critic"
-        path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
+        path = f"/home/agent-host/workspace/worktrees/{short_id}-{config_name}"
 
-        assert path == "/home/agent-host/worktrees/abc12345-critic"
+        assert path == "/home/agent-host/workspace/worktrees/abc12345-critic"
 
     def test_worktree_path_only_when_backend_inherited(self):
         """worktree_path is set only when parent has a workspace backend."""
@@ -237,7 +237,9 @@ class TestWorktreePathComputation:
         if parent_ctx_with_vm.get("vm") or parent_ctx_with_vm.get(
             "workspace_container"
         ):
-            worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
+            worktree_path = (
+                f"/home/agent-host/workspace/worktrees/{short_id}-{config_name}"
+            )
         assert worktree_path is not None
 
         # Without backend
@@ -245,7 +247,9 @@ class TestWorktreePathComputation:
         if parent_ctx_without.get("vm") or parent_ctx_without.get(
             "workspace_container"
         ):
-            worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
+            worktree_path = (
+                f"/home/agent-host/workspace/worktrees/{short_id}-{config_name}"
+            )
         assert worktree_path is None
 
 
@@ -274,7 +278,7 @@ class TestDispatchWorktreePath:
             k: v for k, v in job_context.items() if k not in extracted_keys
         }
 
-        worktree_path = "/home/agent-host/worktrees/1111222-critic"
+        worktree_path = "/home/agent-host/workspace/worktrees/1111222-critic"
         job = {"worktree_path": worktree_path}
         if job.get("worktree_path"):
             remaining_context["worktree_path"] = job["worktree_path"]
@@ -303,7 +307,7 @@ class TestDispatchWorktreePath:
                 },
             }
         }
-        worktree_path = "/home/agent-host/worktrees/abc12345-critic"
+        worktree_path = "/home/agent-host/workspace/worktrees/abc12345-critic"
 
         # Simulate the override logic from _dispatch_job_to_agent
         if worktree_path and config_override:
@@ -317,7 +321,7 @@ class TestDispatchWorktreePath:
     def test_no_override_without_remote_config(self):
         """No crash when config_override has no remote section."""
         config_override = {"workspace": {"backend": "local"}}
-        worktree_path = "/home/agent-host/worktrees/abc12345-critic"
+        worktree_path = "/home/agent-host/workspace/worktrees/abc12345-critic"
 
         if worktree_path and config_override:
             ws = config_override.get("workspace", {})
@@ -449,7 +453,7 @@ class TestAgentWorktreeCreation:
         backend.supports_shell = True
         backend._exec = MagicMock(return_value="")
 
-        worktree_path = "/home/agent-host/worktrees/abc12345-critic"
+        worktree_path = "/home/agent-host/workspace/worktrees/abc12345-critic"
         branch_name = "subjob/abc12345/critic"
         parent_workspace = "/home/agent-host/workspace"
 
@@ -495,7 +499,7 @@ class TestAgentWorktreeCreation:
 
     def test_no_worktree_when_no_backend(self):
         """No worktree commands when workspace_backend is None."""
-        metadata = {"worktree_path": "/home/agent-host/worktrees/abc-critic"}
+        metadata = {"worktree_path": "/home/agent-host/workspace/worktrees/abc-critic"}
 
         workspace_backend = None
         worktree_path = metadata.get("worktree_path")
@@ -513,7 +517,7 @@ class TestAgentWorktreeCreation:
         backend = MagicMock()
         backend.supports_shell = False
 
-        metadata = {"worktree_path": "/home/agent-host/worktrees/abc-critic"}
+        metadata = {"worktree_path": "/home/agent-host/workspace/worktrees/abc-critic"}
         worktree_path = metadata.get("worktree_path")
 
         should_create = worktree_path and backend and backend.supports_shell
@@ -526,7 +530,7 @@ class TestAgentWorktreeCreation:
         backend._exec = MagicMock(side_effect=Exception("SSH connection lost"))
 
         metadata = {
-            "worktree_path": "/home/agent-host/worktrees/abc-critic",
+            "worktree_path": "/home/agent-host/workspace/worktrees/abc-critic",
             "branch_name": "subjob/abc12345/critic",
         }
         worktree_path = metadata.get("worktree_path")
@@ -658,9 +662,11 @@ class TestWorktreePathContainer:
 
         worktree_path = None
         if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-            worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
+            worktree_path = (
+                f"/home/agent-host/workspace/worktrees/{short_id}-{config_name}"
+            )
 
-        assert worktree_path == "/home/agent-host/worktrees/def67890-scholar"
+        assert worktree_path == "/home/agent-host/workspace/worktrees/def67890-scholar"
 
     def test_worktree_path_not_set_for_deleted_container(self):
         """No worktree_path when parent container is deleted."""
@@ -672,7 +678,9 @@ class TestWorktreePathContainer:
         # The code checks presence of the key, not the status —
         # status filtering happens at dispatch time via _job_needs_container
         if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-            worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
+            worktree_path = (
+                f"/home/agent-host/workspace/worktrees/{short_id}-{config_name}"
+            )
 
         # worktree_path IS set because the key exists (status is checked elsewhere)
         assert worktree_path is not None

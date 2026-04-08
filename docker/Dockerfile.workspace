@@ -129,12 +129,13 @@ RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_S
 # 4. User setup (mirrors provision.sh lines 111-131)
 # ---------------------------------------------------------------------------
 RUN userdel -r $(getent passwd 1000 | cut -d: -f1) 2>/dev/null || true \
-    && useradd -m -s /bin/bash -u 1000 agent-host \
-    && mkdir -p /home/agent-host/workspace \
-    && chown agent-host:agent-host /home/agent-host/workspace \
-    && mkdir -p /home/agent-host/.ssh \
-    && chmod 700 /home/agent-host/.ssh \
-    && chown agent-host:agent-host /home/agent-host/.ssh
+    && useradd -m -s /bin/bash -u 1000 agent-host
+
+# SSH authorized_keys outside home dir — keeps ~ clean for workspace use.
+# sshd StrictModes requires root ownership on this path, which the entrypoint
+# (running as root) satisfies trivially.
+RUN mkdir -p /etc/ssh/authorized_keys \
+    && chmod 755 /etc/ssh/authorized_keys
 
 # User-writable package directories (pip/npm without sudo)
 RUN mkdir -p /home/agent-host/.local/bin \
@@ -156,7 +157,7 @@ RUN mkdir -p /run/sshd \
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
-AuthorizedKeysFile .ssh/authorized_keys
+AuthorizedKeysFile /etc/ssh/authorized_keys/%u
 X11Forwarding no
 PrintMotd no
 AcceptEnv LANG LC_*
@@ -192,7 +193,7 @@ RUN su -c 'git config --global init.defaultBranch main' agent-host \
     && su -c 'git config --global core.editor vim' agent-host
 
 # ---------------------------------------------------------------------------
-# 8. code-server config
+# 8. code-server config (state outside home so it doesn't clutter workspace)
 # ---------------------------------------------------------------------------
 RUN mkdir -p /home/agent-host/.config/code-server \
     && tee /home/agent-host/.config/code-server/config.yaml > /dev/null <<'CSEOF'
@@ -203,8 +204,37 @@ disable-telemetry: true
 CSEOF
 RUN chown -R agent-host:agent-host /home/agent-host/.config
 
+# code-server user-data and extensions live outside home — survives volume
+# mounts and keeps the IDE file explorer clean.
+RUN mkdir -p /var/lib/code-server/User \
+             /var/lib/code-server/extensions \
+    && tee /var/lib/code-server/User/settings.json > /dev/null <<'VSEOF'
+{
+    "files.exclude": {
+        "**/.bashrc": true,
+        "**/.bash_logout": true,
+        "**/.bash_history": true,
+        "**/.profile": true,
+        "**/.gitconfig": true,
+        "**/.tmux.conf": true,
+        "**/.config": true,
+        "**/.local": true,
+        "**/.cache": true,
+        "**/.npm-global": true,
+        "**/.workspace-initialized": true
+    }
+}
+VSEOF
+RUN chown -R agent-host:agent-host /var/lib/code-server
+
 # ---------------------------------------------------------------------------
-# 9. Entrypoint — SSHD (foreground) + code-server (background)
+# 9. Dotfile skeleton — volume mounts shadow baked-in files, so stage a copy
+#    that the entrypoint seeds on first boot.
+# ---------------------------------------------------------------------------
+RUN cp -a /home/agent-host /etc/skel.agent-host
+
+# ---------------------------------------------------------------------------
+# 10. Entrypoint — SSHD (foreground) + code-server (background)
 # ---------------------------------------------------------------------------
 COPY docker/workspace-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

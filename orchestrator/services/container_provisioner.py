@@ -161,19 +161,10 @@ class ContainerProvisioner:
             return False
 
         pod_name = f"workspace-{job_id[:12]}"
-        pvc_name = f"pvc-workspace-{job_id[:12]}"
         workspace_image = image or self._workspace_image
 
-        # Create PVC for workspace data (idempotent — reuses existing on restore)
-        pvc_ok = await self._create_pvc(
-            pvc_name, size="10Gi", labels={"srw/job-id": job_id}
-        )
-        if not pvc_ok:
-            await self._set_context(
-                job_id, {"status": "failed", "error": "PVC creation failed"}
-            )
-            return False
-
+        # emptyDir by default — storage dies with the pod, no cleanup needed.
+        # Each job gets a fresh container; isolation is the pod boundary.
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
             job_id=job_id,
@@ -182,7 +173,6 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
-            pvc_name=pvc_name,
         )
 
         try:
@@ -269,9 +259,11 @@ class ContainerProvisioner:
             return False
 
     async def delete_workspace_pvc(self, job_id: str) -> bool:
-        """Delete the PVC for a job workspace (final cleanup only).
+        """Delete the PVC for a job workspace if one exists.
 
-        Called on job completion/cancellation — NOT during suspension.
+        With emptyDir (default), there is no PVC — storage dies with the pod.
+        This method is kept for backward compatibility: it cleans up PVCs
+        from workspaces created before the emptyDir switch.
         """
         pvc_name = f"pvc-workspace-{job_id[:12]}"
         return await self._delete_pvc(pvc_name)
@@ -504,6 +496,9 @@ class ContainerProvisioner:
             },
             "spec": {
                 "restartPolicy": "Never",
+                # Grace period for agent to checkpoint and push artifacts
+                # before the pod is killed on deletion.
+                "terminationGracePeriodSeconds": 120,
                 # Explicit ClusterFirst DNS so workspace pods can resolve
                 # in-cluster services (e.g. srw-gitea) even if
                 # WORKSPACE_NAMESPACE differs from the service namespace.
@@ -564,7 +559,7 @@ class ContainerProvisioner:
                         "volumeMounts": [
                             {
                                 "name": "workspace-data",
-                                "mountPath": "/home/agent-host/workspace",
+                                "mountPath": "/home/agent-host",
                             },
                             {
                                 "name": "ssh-pubkey",
@@ -686,19 +681,10 @@ class ContainerProvisioner:
             return False
 
         pod_name = f"ws-thread-{thread_id[:12]}"
-        pvc_name = f"pvc-ws-thread-{thread_id[:12]}"
         workspace_image = image or self._workspace_image
 
-        # Create PVC for workspace data (idempotent — reuses existing on restore)
-        pvc_ok = await self._create_pvc(
-            pvc_name, size="10Gi", labels={"srw/thread-id": thread_id}
-        )
-        if not pvc_ok:
-            await self._set_thread_context(
-                thread_id, {"status": "failed", "error": "PVC creation failed"}
-            )
-            return False
-
+        # emptyDir by default — storage dies with the pod, no cleanup needed.
+        # Each session gets a fresh container; isolation is the pod boundary.
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
             job_id=thread_id,  # Reuse job_id label slot for thread_id
@@ -707,7 +693,6 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
-            pvc_name=pvc_name,
         )
 
         # Override labels for thread identification
@@ -792,9 +777,10 @@ class ContainerProvisioner:
             return False
 
     async def delete_thread_workspace_pvc(self, thread_id: str) -> bool:
-        """Delete the PVC for a thread workspace (final cleanup only).
+        """Delete the PVC for a thread workspace if one exists.
 
-        Called on thread end/deletion — NOT during suspension.
+        With emptyDir (default), there is no PVC — storage dies with the pod.
+        Kept for backward compatibility with existing PVCs.
         """
         pvc_name = f"pvc-ws-thread-{thread_id[:12]}"
         return await self._delete_pvc(pvc_name)

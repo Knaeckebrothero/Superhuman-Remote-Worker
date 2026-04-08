@@ -149,13 +149,15 @@ class NextcloudAdmin:
     async def resolve_nc_username(self, *candidates: str) -> str | None:
         """Find the first candidate that exists as a Nextcloud user.
 
-        In production, OIDC provisions NC users with their email as username.
-        In local dev (no SSO), only ``admin`` and ``agent-service`` exist, so
-        the email won't match.  Callers pass multiple candidates (email,
-        display_name, …) and we return the first one that Nextcloud recognises.
+        Tries two strategies:
+        1. Exact user-ID lookup for each candidate (fast, covers the common
+           case where the NC username *is* the email or display name).
+        2. Search API with each candidate as query — catches OIDC setups
+           where NC stores a UUID as user-ID but the email is searchable.
         """
         if not self._initialized:
             return None
+        # Pass 1: exact user-ID match
         for name in candidates:
             if not name:
                 continue
@@ -166,6 +168,22 @@ class NextcloudAdmin:
                 )
                 if resp.status_code == 200:
                     return name
+            except Exception:
+                continue
+        # Pass 2: search (matches email, display name, etc.)
+        for name in candidates:
+            if not name:
+                continue
+            try:
+                resp = await self._client.get(
+                    "/ocs/v2.php/cloud/users",
+                    params={"format": "json", "search": name},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    users = data.get("ocs", {}).get("data", {}).get("users", [])
+                    if len(users) == 1:
+                        return users[0]
             except Exception:
                 continue
         return None

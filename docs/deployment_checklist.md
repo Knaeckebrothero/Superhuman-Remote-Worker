@@ -322,7 +322,7 @@ services:
       WORKSPACE_ROOT: /app/workspace
 ```
 
-Each job gets: `/app/workspace/job_<uuid>/`
+Each job gets a dedicated workspace container. The agent's home directory (`/home/agent-host`) IS the workspace.
 
 Checkpoints: `/app/workspace/checkpoints/job_<uuid>.db`
 

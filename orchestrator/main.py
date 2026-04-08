@@ -2364,15 +2364,11 @@ async def workspace_status() -> dict[str, Any]:
     base_path = workspace_service.base_path
     is_available = workspace_service.is_available
 
-    # List job directories if available
-    job_dirs = []
+    # List top-level entries (workspace is a flat directory now, no job_* subdirs)
+    entries = []
     if is_available:
         try:
-            job_dirs = [
-                d.name
-                for d in base_path.iterdir()
-                if d.is_dir() and d.name.startswith("job_")
-            ][:10]  # Limit to 10 for display
+            entries = [d.name for d in base_path.iterdir()][:20]
         except Exception:
             pass
 
@@ -2381,8 +2377,7 @@ async def workspace_status() -> dict[str, Any]:
         "resolved_path": str(base_path.resolve()) if base_path.exists() else None,
         "is_available": is_available,
         "env_workspace_path": os.environ.get("WORKSPACE_PATH"),
-        "job_directories": job_dirs,
-        "job_count": len(job_dirs) if is_available else 0,
+        "entries": entries,
     }
 
 
@@ -4624,12 +4619,7 @@ async def approve_job(
 
         # Fallback: local workspace
         if frozen_data is None:
-            workspace_path = (
-                workspace_service.base_path
-                / f"job_{job_id}"
-                / "output"
-                / "job_frozen.json"
-            )
+            workspace_path = workspace_service.base_path / "output" / "job_frozen.json"
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
             else:
@@ -4647,12 +4637,7 @@ async def approve_job(
             # (not complete). For vm_upgrade_required, this is the "resume without
             # VM" path — the agent continues in the container and adapts.
             # Remove job_frozen.json from local workspace
-            local_frozen = (
-                workspace_service.base_path
-                / f"job_{job_id}"
-                / "output"
-                / "job_frozen.json"
-            )
+            local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
             if local_frozen.exists():
                 local_frozen.unlink()
 
@@ -4710,7 +4695,7 @@ async def approve_job(
                 wrote_to_gitea = True
 
         # Also write to local workspace if it exists
-        local_output = workspace_service.base_path / f"job_{job_id}" / "output"
+        local_output = workspace_service.base_path / "output"
         if local_output.exists():
             completion_path = local_output / "job_completion.json"
             completion_path.write_text(completion_json)
@@ -4804,10 +4789,7 @@ async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
                 )
             if frozen_data is None:
                 workspace_path = (
-                    workspace_service.base_path
-                    / f"job_{job_id}"
-                    / "output"
-                    / "job_frozen.json"
+                    workspace_service.base_path / "output" / "job_frozen.json"
                 )
                 if workspace_path.exists():
                     frozen_data = json.loads(workspace_path.read_text())
@@ -4847,9 +4829,7 @@ async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
         vm_ctx["upgrade_command"] = frozen_data.get("command", "")
 
         # 5. Remove freeze file from local workspace
-        local_frozen = (
-            workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
-        )
+        local_frozen = workspace_service.base_path / "output" / "job_frozen.json"
         if local_frozen.exists():
             local_frozen.unlink()
 
@@ -5092,9 +5072,7 @@ async def _spawn_scholar_subjob(
             # Set worktree_path if subjob inherits a workspace backend
             worktree_path = None
             if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                worktree_path = (
-                    f"/home/agent-host/worktrees/{short_id}-{scholar_config_name}"
-                )
+                worktree_path = f"/home/agent-host/workspace/worktrees/{short_id}-{scholar_config_name}"
 
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -5769,9 +5747,7 @@ async def _trigger_verification_on_complete(
                 # Set worktree_path if subjob inherits a workspace backend
                 worktree_path = None
                 if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                    worktree_path = (
-                        f"/home/agent-host/worktrees/{short_id}-{critic_config}"
-                    )
+                    worktree_path = f"/home/agent-host/workspace/worktrees/{short_id}-{critic_config}"
 
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
@@ -6164,12 +6140,7 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
 
         # Fallback: local workspace
         if frozen_data is None:
-            workspace_path = (
-                workspace_service.base_path
-                / f"job_{job_id}"
-                / "output"
-                / "job_frozen.json"
-            )
+            workspace_path = workspace_service.base_path / "output" / "job_frozen.json"
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
 
@@ -8693,6 +8664,16 @@ async def create_thread(
                     thread_id,
                     {"git_remote_url": git_remote_url, "repo_name": repo_name},
                 )
+                # Grant thread creator read access to the Gitea repo
+                if user.get("email"):
+                    try:
+                        await gitea_client.grant_user_repo_access(
+                            user["email"], repo_name
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to grant Gitea access for thread {thread_id}: {e}"
+                        )
 
         # Provision Nextcloud session folder + share with user
         if not nextcloud_admin.is_initialized and nextcloud_admin.is_configured:

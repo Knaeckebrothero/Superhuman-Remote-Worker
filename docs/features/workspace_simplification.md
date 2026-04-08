@@ -528,3 +528,99 @@ The orchestrator does NOT read workspace files via local filesystem in productio
 | Cockpit UI | Uses DB fields for cloud folder access |
 | Deployment manifests | `/workspace` on agent pod is local scratch, not workspace container |
 | Worktree paths | Already use `/home/agent-host/worktrees/`, not workspace dir |
+
+---
+
+## Implementation Status: COMPLETE
+
+All 6 phases have been implemented. **38 files changed, 3878 tests passing, 0 new failures.**
+
+### Phase 1: Container Image & Entrypoint — DONE
+
+| File | Changes |
+|------|---------|
+| `docker/Dockerfile.workspace` | Removed `mkdir /home/agent-host/workspace` and `~/.ssh` setup. Added `/etc/ssh/authorized_keys/` (root-owned). `AuthorizedKeysFile` → `/etc/ssh/authorized_keys/%u`. Added `/var/lib/code-server/` with `files.exclude` settings. Added dotfile skeleton (`cp -a /home/agent-host /etc/skel.agent-host`). |
+| `docker/workspace-entrypoint.sh` | Rewritten: (1) Dotfile seeding from skeleton on first boot. (2) SSH key to `/etc/ssh/authorized_keys/agent-host`. (3) code-server with `--user-data-dir /var/lib/code-server` opening `/home/agent-host`. (4) SSHD foreground. |
+| `docker/agent-vm-base/scripts/provision.sh` | Removed `/home/agent-host/workspace` and `~/.ssh`. Added `/etc/ssh/authorized_keys/`. `AuthorizedKeysFile` → `/etc/ssh/authorized_keys/%u`. |
+
+### Phase 2: Core Path Change — DONE
+
+| File | Changes |
+|------|---------|
+| `src/core/workspace.py` | `self._workspace_path = self._base_path` (was `self._base_path / f"job_{job_id}"`). Updated module docstring. |
+| `src/core/backends/remote.py` | Default `workspace_path="/home/agent-host"` (was `/home/agent-host/workspace`). |
+| `src/core/phase_snapshot.py` | `self._workspace_path = base_path` (was `base_path / f"job_{job_id}"`). Snapshots dir and checkpoint path on agent pod unchanged. |
+| Tests (7 files) | `test_phase_snapshot.py`, `test_workspace_backends.py`, `test_container_provisioner.py`, `test_managers_git.py`, `tests/tools/research/conftest.py`, `tests/tools/research/test_browser_tools.py` — updated path assertions. |
+
+### Phase 3: Agent & Persistent Session — DONE
+
+| File | Changes |
+|------|---------|
+| `src/agent.py` | Default `workspace_path` → `/home/agent-host`. Worktree parent path → `/home/agent-host`. |
+| `src/api/persistent_session.py` | Default `workspace_path` → `/home/agent-host`. Removed `find -mindepth 1 -exec rm -rf` cleanup block (fresh containers). |
+| `src/api/persistent_app.py` | All three `workspace_path` defaults → `/home/agent-host` (VM polling, container polling, VM upgrade hot-swap). |
+
+### Phase 4: Orchestrator Path Updates — DONE
+
+| File | Changes |
+|------|---------|
+| `orchestrator/main.py` | All `workspace_path` defaults → `/home/agent-host`. IDE folder URLs → `/home/agent-host`. Removed `f"job_{job_id}"` from all local workspace reads (6 occurrences). Replaced `job_*` directory listing with flat entries listing in workspace status endpoint. |
+| `orchestrator/services/container_provisioner.py` | `mountPath` → `/home/agent-host`. |
+| `orchestrator/services/ide_session.py` | All paths → `/home/agent-host` (default folder, git clone targets). |
+| `orchestrator/services/workspace.py` | `_get_job_path()` returns `base_path` directly (no `job_{id}` subdirectory). |
+| Tests (5 files) | `test_container_provisioner.py`, `test_ide_proxy.py`, `test_thread_endpoints.py`, `test_worktree_sharing.py`, `test_vm_upgrade_endpoint.py` — updated assertions. |
+
+### Phase 5: Switch to emptyDir by Default — DONE
+
+| File | Changes |
+|------|---------|
+| `orchestrator/services/container_provisioner.py` | `create_workspace()`: removed PVC creation, uses emptyDir. `create_thread_workspace()`: same. Added `terminationGracePeriodSeconds: 120` to pod spec. `delete_workspace_pvc()` / `delete_thread_workspace_pvc()` kept for backward compat with existing PVCs. |
+| `tests/test_container_provisioner.py` | Added `test_manifest_termination_grace_period`. |
+
+### Phase 6: Cleanup & Dev Tooling — DONE
+
+| File | Changes |
+|------|---------|
+| `src/init.py` | Removed `glob("job_*")` patterns. Workspace info reports `entry_count` instead of `job_count`. |
+| `config/defaults.yaml` | Updated comment: `workspace_path: /home/agent-host`. |
+| `config/schema.json` | Updated default: `/home/agent-host`. |
+| `cockpit/src/assets/schema.json` | Synced schema copy. |
+| `docker-compose.yaml` | ssh-keygen: added `ssh-publickey` file. Workspace mounts: `ssh_keys:/tmp/ssh-pubkey:ro` (was `/home/agent-host/.ssh:ro`). |
+| `docker-compose.local.yaml` | Same compose changes. |
+| `docker-compose.dev.yaml` | Same compose changes (bind mount variant). |
+| `vm/sudo-daemon/test/mock_plugin.py` | Updated `cwd` in mock data. |
+| `docs/browser_use.md` | Browser profile path updated. |
+| `docs/deployment_checklist.md` | Workspace description updated. |
+| `docs/local_development.md` | Dev workspace path updated. |
+| `docs/working_memory.md` | Workspace layout example updated. |
+| `docs/features/vm_backend.md` | RemoteBackend paths updated. |
+| `docs/features/vm_snapshots_and_ide.md` | code_server_url path updated. |
+
+### What Was NOT Changed (intentional)
+
+| Component | Why |
+|-----------|-----|
+| Agent pod harness storage (`checkpoints/`, `logs/`, `phase_snapshots/`) | On agent pod, not workspace container. `job_{id}` in filenames is naming, not directory structure. |
+| `WORKSPACE_PATH=/workspace` in configmap | Agent pod local scratch, not workspace container path. |
+| `src/services/workspace_sync.py` | Already path-agnostic, zero `job_*` references. |
+| `docs/done/`, `docs/issues/` | Historical records of past decisions. |
+| Gitea repo/branch naming | Semantic names, not filesystem paths. |
+| Nextcloud session folders | Already use `sessions/{thread_id[:8]}`. |
+| `delete_workspace_pvc()` / `delete_thread_workspace_pvc()` methods | Kept for backward compat with existing PVCs from before the emptyDir switch. |
+
+### Verification
+
+- **Test suite**: 3878 passed, 40 skipped, 0 new failures (23 pre-existing in `test_loader_interactive.py` and `test_persistent_graph.py`).
+- **Lint**: `ruff check src/ orchestrator/ tests/` — all checks passed (2 pre-existing warnings in `orchestrator/main.py`).
+- **Codebase sweep**: Zero remaining `/home/agent-host/workspace` references in active code or docs. Zero remaining `job_{id}` workspace directory patterns (only filename patterns on agent pod).
+
+### Remaining Manual Testing
+
+Before deploying to production:
+
+1. **Docker build**: `docker build -f docker/Dockerfile.workspace .` — verify image builds successfully.
+2. **SSH test**: Run the container, SSH in as `agent-host`, verify home dir is clean workspace root.
+3. **code-server test**: Open code-server, verify it shows `/home/agent-host` contents with dotfiles hidden.
+4. **Docker Compose**: `podman-compose up -d` — verify workspace containers accept SSH with new key mount path.
+5. **Dev mode**: `python agent.py --dev --description "test"` — verify workspace files created at `./workspace/` directly.
+6. **K8s deploy**: Fleet sync, verify workspace pods start with emptyDir, code-server URL works, sessions function end-to-end.

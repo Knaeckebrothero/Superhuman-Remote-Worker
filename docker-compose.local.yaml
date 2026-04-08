@@ -517,8 +517,9 @@ services:
           apk add --no-cache openssh-keygen &&
           ssh-keygen -t ed25519 -f /keys/id_ed25519 -N "" -C "agent@srw" &&
           cat /keys/id_ed25519.pub > /keys/authorized_keys &&
+          cp /keys/id_ed25519.pub /keys/ssh-publickey &&
           chmod 600 /keys/id_ed25519 &&
-          chmod 644 /keys/authorized_keys;
+          chmod 644 /keys/authorized_keys /keys/ssh-publickey;
         fi
       '
     volumes:
@@ -534,7 +535,7 @@ services:
     environment:
       WORKSPACE_ID: "1"
     volumes:
-      - ssh_keys:/home/agent-host/.ssh:ro
+      - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -552,7 +553,7 @@ services:
     environment:
       WORKSPACE_ID: "2"
     volumes:
-      - ssh_keys:/home/agent-host/.ssh:ro
+      - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -570,7 +571,7 @@ services:
     environment:
       WORKSPACE_ID: "3"
     volumes:
-      - ssh_keys:/home/agent-host/.ssh:ro
+      - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -588,7 +589,7 @@ services:
     environment:
       WORKSPACE_ID: "4"
     volumes:
-      - ssh_keys:/home/agent-host/.ssh:ro
+      - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s
@@ -606,7 +607,7 @@ services:
     environment:
       WORKSPACE_ID: "5"
     volumes:
-      - ssh_keys:/home/agent-host/.ssh:ro
+      - ssh_keys:/tmp/ssh-pubkey:ro
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/22"]
       interval: 10s

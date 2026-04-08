@@ -7,9 +7,11 @@ Composes around UniversalAgent — reuses its initialized LLMs, DB connections,
 and config without subclassing or modifying it.
 """
 
+import asyncio
 import logging
 import os
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +29,7 @@ from ..core.loader import (
     render_instruction_content,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from ..core.workspace_backend import WorkspaceUnavailableError
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
 from ..tools.description_manager import apply_description_overrides
 
@@ -135,7 +138,7 @@ class PersistentSession:
         self.permission_mode = self.config.interactive.permission_mode
 
         # 1. Create workspace (with optional remote backend + git)
-        self._setup_workspace(
+        await self._setup_workspace(
             workspace_override=workspace_override, git_remote_url=git_remote_url
         )
 
@@ -169,12 +172,17 @@ class PersistentSession:
             f"mode={self.permission_mode}"
         )
 
-    def _setup_workspace(
+    async def _setup_workspace(
         self,
         workspace_override: Optional[Dict[str, Any]] = None,
         git_remote_url: Optional[str] = None,
     ) -> None:
-        """Create workspace, optionally using a remote backend.
+        """Create workspace using a remote backend (required).
+
+        Persistent sessions always require an isolated workspace container or
+        VM. If the remote backend is not immediately reachable (e.g. sshd
+        still starting), retries with exponential backoff for up to 5 minutes
+        before raising ``WorkspaceUnavailableError``.
 
         Args:
             workspace_override: If provided, overrides config workspace settings.
@@ -184,16 +192,27 @@ class PersistentSession:
         ws_data = self.config.workspace
         base_path = os.getenv("WORKSPACE_PATH", "./workspace")
 
-        # Determine backend: override > config > default (local)
-        workspace_backend = None
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
 
-        if effective_backend == "remote" and remote_cfg:
-            try:
-                from ..core.backends.remote import RemoteBackend
+        if not (effective_backend == "remote" and remote_cfg):
+            raise RuntimeError(
+                "No remote workspace configured. Persistent sessions require "
+                "an isolated workspace container or VM."
+            )
 
-                shell_config = self.config.extra.get("shell", {})
+        from ..core.backends.remote import RemoteBackend
+
+        shell_config = self.config.extra.get("shell", {})
+        max_duration = 300  # 5 minutes
+        start = time.monotonic()
+        backoff = 5.0
+        attempt = 0
+        workspace_backend = None
+
+        while True:
+            attempt += 1
+            try:
                 workspace_backend = RemoteBackend(
                     host=remote_cfg["host"],
                     port=remote_cfg.get("port", 22),
@@ -206,31 +225,29 @@ class PersistentSession:
                     default_timeout=shell_config.get("default_timeout", 120),
                     max_tabs=shell_config.get("max_tabs", 15),
                 )
-                workspace_backend.connect()
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, workspace_backend.connect)
                 logger.info(
                     f"Remote workspace backend connected to {remote_cfg['host']}"
                 )
-
-                # Clean stale files from previous sessions.
-                # Workspace containers are exclusive to one session at a time
-                # and use a flat directory (no job_* subdirs), so purge
-                # everything before the new session sets up its structure.
-                remote_ws = remote_cfg.get(
-                    "workspace_path", "/home/agent-host/workspace"
-                )
-                try:
-                    workspace_backend.exec_command(
-                        f"find {remote_ws} -mindepth 1 -maxdepth 1 "
-                        f"-exec rm -rf {{}} +",
-                        timeout=15,
-                    )
-                except Exception as e:
-                    logger.debug(f"Old workspace cleanup (non-fatal): {e}")
+                break
             except Exception as e:
+                elapsed = time.monotonic() - start
+                if elapsed >= max_duration:
+                    raise WorkspaceUnavailableError(
+                        f"Failed to connect to workspace {remote_cfg['host']} "
+                        f"after {attempt} attempts ({elapsed:.0f}s): {e}"
+                    ) from e
                 logger.warning(
-                    f"Failed to create remote backend (falling back to local): {e}"
+                    "Workspace connect attempt %d failed (%.0fs elapsed, "
+                    "retrying in %.0fs): %s",
+                    attempt,
+                    elapsed,
+                    backoff,
+                    e,
                 )
-                workspace_backend = None
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
 
         ws_config = WorkspaceManagerConfig(
             base_path=base_path,
@@ -246,10 +263,8 @@ class PersistentSession:
         )
         self.workspace_manager.initialize()
         self._deploy_instruction_files()
-        backend_label = "remote" if workspace_backend else "local"
         logger.info(
-            f"Workspace created at {self.workspace_manager.path} "
-            f"(backend={backend_label})"
+            f"Workspace created at {self.workspace_manager.path} (backend=remote)"
         )
 
     def _deploy_instruction_files(self) -> None:
