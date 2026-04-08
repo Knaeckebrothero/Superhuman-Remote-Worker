@@ -1325,6 +1325,7 @@ def load_agent_config(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(
@@ -1512,6 +1513,7 @@ def load_agent_config_from_dict(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(
