@@ -76,6 +76,7 @@ def _make_llm_response(content="Hi!", tool_calls=None):
 def _make_streaming_llm(response: AIMessage):
     """Return a mock LLM whose astream yields the response as a single chunk."""
     llm = AsyncMock()
+    llm.reasoning = None
 
     async def _astream(messages, **kw):
         yield response
@@ -408,6 +409,7 @@ class TestRunPersistentLoopCancellation:
 
         # LLM that raises CancelledError
         llm = AsyncMock()
+        llm.reasoning = None
 
         async def _astream(messages, **kw):
             raise asyncio.CancelledError
@@ -450,7 +452,7 @@ class TestRunPersistentLoopErrorHandling:
 
         # LLM that raises a runtime error on first call
         llm = AsyncMock()
-        llm.reasoning = None  # ensure astream path is used, not ainvoke
+        llm.reasoning = None
         invocation = 0
 
         async def _astream(messages, **kw):
@@ -494,6 +496,7 @@ class TestRunPersistentLoopErrorHandling:
             raise asyncio.CancelledError
 
         llm = AsyncMock()
+        llm.reasoning = None
 
         async def _astream(messages, **kw):
             raise ValueError("bad")
@@ -804,6 +807,7 @@ class TestAutoCommitGit:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("test_tool", "result")
@@ -906,6 +910,7 @@ class TestAutoCommitGit:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("test_tool", "r")
@@ -969,6 +974,7 @@ class TestAutoCommitGit:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("test_tool", "r")
@@ -1031,6 +1037,7 @@ class TestAutoCommitGit:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("test_tool", "r")
@@ -1109,6 +1116,7 @@ class TestExecuteTurnInterrupt:
             yield response_with_tool
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("test_tool", "result")
@@ -1669,6 +1677,7 @@ class TestLLMStreaming:
             yield chunk2
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1706,6 +1715,7 @@ class TestLLMStreaming:
             yield chunk
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1736,6 +1746,7 @@ class TestLLMStreaming:
             yield chunk
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1766,6 +1777,7 @@ class TestLLMStreaming:
             yield  # empty generator
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1807,6 +1819,7 @@ class TestLLMStreamingFallback:
 
         fallback_response = _make_llm_response("fallback response")
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
         llm.ainvoke = AsyncMock(return_value=fallback_response)
 
@@ -1843,6 +1856,7 @@ class TestLLMStreamingFallback:
 
         fallback_response = _make_llm_response("ok")
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
         llm.ainvoke = AsyncMock(return_value=fallback_response)
 
@@ -1875,6 +1889,7 @@ class TestLLMStreamingFallback:
             yield
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1908,6 +1923,7 @@ class TestLLMStreamingFallback:
 
         fallback_response = _make_llm_response("complete answer")
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
         llm.ainvoke = AsyncMock(return_value=fallback_response)
 
@@ -1946,6 +1962,7 @@ class TestLLMTimeout:
             yield
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -1996,6 +2013,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("search", "search results")
@@ -2049,6 +2067,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("dangerous", "should not run")
@@ -2098,6 +2117,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         callbacks = _make_callbacks()
@@ -2141,6 +2161,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("broken")
@@ -2190,6 +2211,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("noop", None)
@@ -2241,6 +2263,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("simple", "done")
@@ -2287,6 +2310,7 @@ class TestToolExecutionLoop:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("search", "data")
@@ -2365,6 +2389,7 @@ class TestVMUpgradeDetection:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("run_cmd", "ok")
@@ -2414,6 +2439,7 @@ class TestVMUpgradeDetection:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("run_cmd", "ok")
@@ -2463,6 +2489,7 @@ class TestVMUpgradeDetection:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("run_cmd", "ok")
@@ -2512,6 +2539,7 @@ class TestVMUpgradeDetection:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("run_cmd", "ok")
@@ -2556,6 +2584,7 @@ class TestVMUpgradeDetection:
                 yield final_response
 
         llm = AsyncMock()
+        llm.reasoning = None
         llm.astream = _astream
 
         tool = _make_tool("run_cmd", "ok")
