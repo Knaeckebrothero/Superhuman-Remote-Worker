@@ -74,7 +74,7 @@ spec:
           command: ["sh", "-c", "until nc -z srw-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: cockpit
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit:sha-6ba8a29
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit:sha-eab9500
           imagePullPolicy: Always
           ports:
             - containerPort: 4000
