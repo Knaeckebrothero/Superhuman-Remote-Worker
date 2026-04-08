@@ -146,12 +146,12 @@ data:
   HEADSCALE_URL: "https://headscale.superhuman-remote-worker.com"
 
   # Workspace containers (per-job sandboxed execution environments)
-  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-96e317d"
+  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-6ba8a29"
   WORKSPACE_NAMESPACE: "superhuman-remote-worker"
 
   # Agent pods (on-demand via AgentProvisioner, same image as worker agents)
   AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-376c3e4"
-  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-becc20e"
+  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-6ba8a29"
 
   # Agent pool sizing (AgentProvisioner — K8s dynamic provisioning)
   MAX_AGENTS: "10"
