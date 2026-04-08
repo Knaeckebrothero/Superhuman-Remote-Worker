@@ -2316,7 +2316,8 @@ class PostgresDB:
             rows = await conn.fetch(
                 f"""
                 SELECT id, name, description, type, connection_url, credentials,
-                       cli_hint, default_branch, job_id, created_at, updated_at
+                       cli_hint, default_branch, job_id, created_by, is_global,
+                       created_at, updated_at
                 FROM datasources
                 {where_clause}
                 ORDER BY created_at DESC
@@ -2345,7 +2346,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, name, description, type, connection_url, credentials,
-                       cli_hint, default_branch, job_id, created_at, updated_at
+                       cli_hint, default_branch, job_id, created_by, is_global,
+                       created_at, updated_at
                 FROM datasources
                 WHERE id = $1
                 """,
@@ -2364,6 +2366,8 @@ class PostgresDB:
         job_id: str | None = None,
         cli_hint: str | None = None,
         default_branch: str | None = None,
+        created_by: str | None = None,
+        is_global: bool = False,
     ) -> Dict[str, Any]:
         """Create a new datasource.
 
@@ -2379,24 +2383,29 @@ class PostgresDB:
             job_id: Job UUID (None for global)
             cli_hint: Suggested CLI command
             default_branch: Branch to clone (repository type)
+            created_by: Owner user UUID
+            is_global: Whether this datasource is visible to all users
 
         Returns:
             Created datasource dict
 
         Raises:
-            asyncpg.UniqueViolationError: If a datasource of this type
-                already exists for the given scope
+            asyncpg.UniqueViolationError: If a datasource with the same
+                name+type already exists for the same owner
         """
         job_uuid = UUID(job_id) if job_id else None
+        owner_uuid = UUID(created_by) if created_by else None
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO datasources (name, description, type, connection_url,
-                                         credentials, job_id, cli_hint, default_branch)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                         credentials, job_id, cli_hint, default_branch,
+                                         created_by, is_global)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id, name, description, type, connection_url, credentials,
-                          job_id, cli_hint, default_branch, created_at, updated_at
+                          job_id, cli_hint, default_branch, created_by, is_global,
+                          created_at, updated_at
                 """,
                 name,
                 description,
@@ -2406,6 +2415,8 @@ class PostgresDB:
                 job_uuid,
                 cli_hint,
                 default_branch,
+                owner_uuid,
+                is_global,
             )
 
         return dict(row)
@@ -2513,10 +2524,10 @@ class PostgresDB:
     ) -> List[Dict[str, Any]]:
         """Resolve datasources for a job.
 
-        Returns all applicable datasources: job-specific, then any linked
-        to the project via the project_datasources junction table, then
-        global ones. For each type, job-specific takes priority over
-        project-level which takes priority over global.
+        Returns all applicable datasources: those linked to the job's
+        project via the project_datasources junction table, plus any
+        unlinked global datasources. Multiple datasources of the same
+        type are allowed.
 
         For project-linked datasources, includes the project-level
         read_only setting which controls the access mode (CLI vs tools).
@@ -2526,7 +2537,7 @@ class PostgresDB:
             project_id: Optional project UUID for project-level datasources
 
         Returns:
-            List of resolved datasource dicts (one per type)
+            List of resolved datasource dicts (may contain multiple per type)
         """
         try:
             uuid_val = UUID(job_id)
@@ -2539,23 +2550,20 @@ class PostgresDB:
             if project_uuid:
                 rows = await conn.fetch(
                     """
-                    SELECT DISTINCT ON (d.type)
-                        d.id, d.name, d.description, d.type, d.connection_url,
-                        d.credentials, d.job_id, d.project_id,
+                    SELECT DISTINCT d.id, d.name, d.description, d.type,
+                        d.connection_url, d.credentials,
                         d.cli_hint, d.default_branch,
                         d.created_at, d.updated_at,
                         pd.read_only AS project_read_only
                     FROM datasources d
                     LEFT JOIN project_datasources pd
                         ON pd.datasource_id = d.id AND pd.project_id = $2
-                    WHERE d.job_id = $1
-                       OR pd.project_id IS NOT NULL
-                       OR (d.job_id IS NULL AND d.project_id IS NULL)
-                    ORDER BY d.type,
-                             CASE WHEN d.job_id IS NOT NULL THEN 0
-                                  WHEN pd.project_id IS NOT NULL THEN 1
-                                  ELSE 2
-                             END
+                    WHERE pd.project_id IS NOT NULL
+                       OR NOT EXISTS (
+                           SELECT 1 FROM project_datasources pd2
+                           WHERE pd2.datasource_id = d.id
+                       )
+                    ORDER BY d.type, d.name
                     """,
                     uuid_val,
                     project_uuid,
@@ -2563,16 +2571,18 @@ class PostgresDB:
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT DISTINCT ON (type)
-                        id, name, description, type, connection_url, credentials,
-                        job_id, project_id, cli_hint, default_branch,
-                        created_at, updated_at,
+                    SELECT DISTINCT d.id, d.name, d.description, d.type,
+                        d.connection_url, d.credentials,
+                        d.cli_hint, d.default_branch,
+                        d.created_at, d.updated_at,
                         NULL::boolean AS project_read_only
-                    FROM datasources
-                    WHERE job_id = $1 OR job_id IS NULL
-                    ORDER BY type, job_id NULLS LAST
+                    FROM datasources d
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM project_datasources pd2
+                        WHERE pd2.datasource_id = d.id
+                    )
+                    ORDER BY d.type, d.name
                     """,
-                    uuid_val,
                 )
 
         return [dict(row) for row in rows]
@@ -2584,17 +2594,17 @@ class PostgresDB:
     ) -> List[Dict[str, Any]]:
         """Resolve datasources for a persistent thread.
 
-        Returns all applicable datasources: explicitly attached to the thread,
-        then any linked to the thread's projects via the project_datasources
-        junction table, then global ones.  For each datasource type, explicit
-        IDs take priority over project-linked which take priority over global.
+        Returns all applicable datasources: explicitly attached by ID,
+        plus those linked to the thread's projects via project_datasources,
+        plus unlinked global datasources. Multiple datasources of the
+        same type are allowed.
 
         Args:
             datasource_ids: Explicit datasource UUIDs attached to the thread
             project_ids: Project UUIDs scoped to the thread
 
         Returns:
-            List of resolved datasource dicts (one per type)
+            List of resolved datasource dicts (may contain multiple per type)
         """
         ds_uuids = []
         for ds_id in datasource_ids or []:
@@ -2613,9 +2623,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT DISTINCT ON (d.type)
-                    d.id, d.name, d.description, d.type, d.connection_url,
-                    d.credentials, d.job_id, d.project_id,
+                SELECT DISTINCT d.id, d.name, d.description, d.type,
+                    d.connection_url, d.credentials,
                     d.cli_hint, d.default_branch,
                     d.created_at, d.updated_at,
                     pd.read_only AS project_read_only
@@ -2625,12 +2634,11 @@ class PostgresDB:
                    AND pd.project_id = ANY($2::uuid[])
                 WHERE d.id = ANY($1::uuid[])
                    OR pd.project_id IS NOT NULL
-                   OR (d.job_id IS NULL AND d.project_id IS NULL)
-                ORDER BY d.type,
-                         CASE WHEN d.id = ANY($1::uuid[]) THEN 0
-                              WHEN pd.project_id IS NOT NULL THEN 1
-                              ELSE 2
-                         END
+                   OR NOT EXISTS (
+                       SELECT 1 FROM project_datasources pd2
+                       WHERE pd2.datasource_id = d.id
+                   )
+                ORDER BY d.type, d.name
                 """,
                 ds_uuids,
                 proj_uuids,
@@ -2796,9 +2804,10 @@ class PostgresDB:
         connection_url: str,
         credentials: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
-        """Create or update a global (job_id=NULL) datasource.
+        """Create or update a system-seeded datasource (created_by=NULL).
 
         Used during init to seed default datasources from env vars.
+        These are always global (is_global=TRUE) and have no owner.
 
         Args:
             name: Datasource label
@@ -2814,16 +2823,16 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO datasources (name, type, connection_url, credentials, job_id, project_id)
-                VALUES ($1, $2, $3, $4, NULL, NULL)
-                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'))
-                WHERE project_id IS NULL
+                INSERT INTO datasources (name, type, connection_url, credentials,
+                                         created_by, is_global)
+                VALUES ($1, $2, $3, $4, NULL, TRUE)
+                ON CONFLICT (name, type, COALESCE(created_by, '00000000-0000-0000-0000-000000000000'))
                 DO UPDATE SET
-                    name = EXCLUDED.name,
                     connection_url = EXCLUDED.connection_url,
-                    credentials = EXCLUDED.credentials
+                    credentials = EXCLUDED.credentials,
+                    is_global = TRUE
                 RETURNING id, name, description, type, connection_url, credentials,
-                          job_id, created_at, updated_at
+                          created_by, is_global, created_at, updated_at
                 """,
                 name,
                 ds_type,

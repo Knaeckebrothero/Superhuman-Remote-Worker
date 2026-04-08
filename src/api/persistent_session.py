@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -19,8 +20,11 @@ from langchain_core.messages import BaseMessage
 from ..core.context import ContextConfig, ContextManager
 from ..core.loader import (
     AgentConfig,
+    FileResolver,
     get_all_tool_names,
     get_phase_system_prompt,
+    get_project_root,
+    render_instruction_content,
 )
 from ..core.workspace import WorkspaceManager, WorkspaceManagerConfig
 from ..tools import ToolContext, load_tools, apply_instruction_enforcement
@@ -206,6 +210,22 @@ class PersistentSession:
                 logger.info(
                     f"Remote workspace backend connected to {remote_cfg['host']}"
                 )
+
+                # Clean stale files from previous sessions.
+                # Workspace containers are exclusive to one session at a time
+                # and use a flat directory (no job_* subdirs), so purge
+                # everything before the new session sets up its structure.
+                remote_ws = remote_cfg.get(
+                    "workspace_path", "/home/agent-host/workspace"
+                )
+                try:
+                    workspace_backend.exec_command(
+                        f"find {remote_ws} -mindepth 1 -maxdepth 1 "
+                        f"-exec rm -rf {{}} +",
+                        timeout=15,
+                    )
+                except Exception as e:
+                    logger.debug(f"Old workspace cleanup (non-fatal): {e}")
             except Exception as e:
                 logger.warning(
                     f"Failed to create remote backend (falling back to local): {e}"
@@ -225,11 +245,46 @@ class PersistentSession:
             backend=workspace_backend,
         )
         self.workspace_manager.initialize()
+        self._deploy_instruction_files()
         backend_label = "remote" if workspace_backend else "local"
         logger.info(
             f"Workspace created at {self.workspace_manager.path} "
             f"(backend={backend_label})"
         )
+
+    def _deploy_instruction_files(self) -> None:
+        """Deploy instruction files from config to workspace.
+
+        Mirrors the worker-mode pattern in agent.py._deploy_instruction_files().
+        Copies files like design_guide.md from the expert config directory into
+        the workspace so the agent can read them via workspace tools.
+        """
+        if not self.config.instruction_files or not self.config._deployment_dir:
+            return
+
+        templates_dir = get_project_root() / "config" / "templates"
+        file_resolver = FileResolver(
+            deployment_dir=self.config._deployment_dir,
+            framework_dir=templates_dir,
+        )
+        for entry in self.config.instruction_files:
+            try:
+                # Skip if already present (don't overwrite on session resume)
+                target_path = self.workspace_manager.get_path(entry.file)
+                if target_path.exists():
+                    continue
+                content = file_resolver.load(Path(entry.file).name)
+                content = render_instruction_content(content, [])
+                # Ensure parent directory exists
+                parent_dir = str(Path(entry.file).parent)
+                if parent_dir and parent_dir != ".":
+                    self.workspace_manager.backend.mkdir(parent_dir)
+                self.workspace_manager.write_file(entry.file, content)
+                logger.debug(f"Deployed instruction file to workspace: {entry.file}")
+            except FileNotFoundError:
+                logger.warning(f"Instruction file not found: {entry.file}")
+            except Exception as e:
+                logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
 
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
@@ -296,6 +351,23 @@ class PersistentSession:
                     self.tools.extend(load_tools([name], self.tool_context))
                 except ValueError:
                     logger.debug(f"Tool not implemented: {name}")
+
+        # Generate tool documentation in workspace (before overrides so full
+        # docstrings are captured — mirrors agent.py._setup_job_tools)
+        try:
+            from ..tools import generate_workspace_tool_docs
+
+            tools_dir = self.workspace_manager.get_path("tools")
+
+            def _write_tool_doc(rel_path: str, content: str) -> None:
+                self.workspace_manager.write_file(f"tools/{rel_path}", content)
+
+            loaded_names = [t.name for t in self.tools]
+            generate_workspace_tool_docs(
+                loaded_names, tools_dir, tools=self.tools, write_fn=_write_tool_doc
+            )
+        except Exception as e:
+            logger.warning(f"Failed to generate tool docs: {e}")
 
         # Apply description overrides and enforcement
         self.tools = apply_description_overrides(self.tools)

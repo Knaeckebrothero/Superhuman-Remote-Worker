@@ -916,12 +916,11 @@ class InteractiveConfig:
     """Configuration for persistent interactive mode.
 
     Only used when the agent is started with --mode persistent.
-    Controls permission defaults, idle behavior, and the initial greeting.
+    Controls permission defaults and idle behavior.
     """
 
     permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
     idle_timeout_minutes: int = 60  # 0 = disabled
-    greeting: str = "Hello! I'm ready to help. What would you like to work on?"
 
 
 @dataclass
@@ -1325,7 +1324,6 @@ def load_agent_config(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
-        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(
@@ -1513,7 +1511,6 @@ def load_agent_config_from_dict(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
-        greeting=interactive_data.get("greeting", InteractiveConfig.greeting),
     )
 
     return AgentConfig(

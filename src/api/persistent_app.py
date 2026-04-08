@@ -246,17 +246,26 @@ async def _attach_session(
             pass
 
     # Process datasources: create connections, inject env vars, apply tool overrides
+    # Note: repository cloning is deferred until AFTER the workspace is
+    # initialized so that repos land inside the session workspace directory
+    # (./workspace/job_{thread_id}/repos/) instead of the agent process CWD.
     datasources_dict: Dict[str, Any] = {}
     datasource_clients: Dict[str, Any] = {}
+    repo_datasources: List[Dict[str, Any]] = []
     if datasources:
         from ..core.datasource_setup import (
             inject_datasource_index as _inject_ds_index,
             process_datasources,
+            setup_repository_datasource,
         )
 
-        workspace_dir = os.getcwd()
+        # Separate repos (cloned later) from other datasources
+        repo_datasources = [ds for ds in datasources if ds.get("type") == "repository"]
+        non_repo_datasources = [
+            ds for ds in datasources if ds.get("type") != "repository"
+        ]
         datasources_dict, datasource_clients, cli_ds_types = process_datasources(
-            datasources, workspace_dir=workspace_dir
+            non_repo_datasources, workspace_dir=os.getcwd()
         )
 
         # Inject datasource tool categories into config_override so the
@@ -376,6 +385,19 @@ async def _attach_session(
         git_remote_url=git_remote_url,
     )
 
+    # Clone repository datasources into the workspace (deferred from above)
+    if repo_datasources and _session.workspace_manager:
+        ws_path = str(_session.workspace_manager.path)
+        for ds in repo_datasources:
+            try:
+                setup_repository_datasource(ds, ws_path)
+            except Exception as e:
+                logger.warning(
+                    "Failed to clone repository datasource %s: %s",
+                    ds.get("name", "unnamed"),
+                    e,
+                )
+
     # Inject datasource index into workspace.md (after workspace is initialized)
     if datasources and _session.workspace_manager:
         try:
@@ -406,10 +428,11 @@ async def _attach_session(
             )
 
             _session.workspace_sync = WorkspaceSyncService(
-                workspace_path=_session.workspace_manager.workspace_path,
+                workspace_path=_session.workspace_manager.path,
                 webdav_url=webdav_url,
                 webdav_user=nc_user,
                 webdav_password=nc_pass,
+                workspace_backend=_session.workspace_manager.backend,
             )
             # Initial push of existing workspace files
             await _session.workspace_sync.push()
@@ -645,12 +668,6 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 "temperature": _session.config.llm.temperature,
             },
         )
-
-        # Send greeting only on first connect (no messages yet)
-        if not _session.messages or _session.turn_count == 0:
-            greeting = _session.config.interactive.greeting
-            if greeting:
-                await _ws_send(ws, "greeting", {"content": greeting})
 
         # Queue for user input (bridges WS receive loop → persistent loop)
         user_queue: asyncio.Queue[str] = asyncio.Queue()

@@ -49,7 +49,6 @@ tools:
 interactive:
   permission_mode: supervised
   idle_timeout_minutes: 120
-  greeting: "Hello! I'm ready to help. What would you like to work on?"
 
 memory:
   enabled: true

@@ -919,42 +919,55 @@ export class AdvancedAccordionComponent {
   readonly idleTimeout = signal<number | null>(null);
   readonly greeting = signal<string | null>(null);
   // ===== Resolved defaults =====
+  // Resolution order: phase-specific config → matrix for effective model → base config → hardcoded.
+  // The server sends raw config (no matrix baked in) + the raw settings_matrix.
+  // The client resolves matrix values for the effective model (user override or config default).
+
   private r(path: string): unknown { return readConfigPath(this.config(), path); }
 
-  /**
-   * Look up a settings_matrix value for a model override.
-   * When a user changes the model in the Settings tab, we re-resolve matrix defaults
-   * for the new model family so the Advanced tab shows correct values.
-   * Returns null if no model is given (meaning config() already has correct values).
-   */
+  /** Look up a settings_matrix value for a model. Returns null if key not found. */
   private mv(model: string | null, key: string): unknown {
     if (!model) return null;
     const resolved = resolveMatrixForModel(this.settingsMatrix(), model);
     return resolved[key] ?? null;
   }
 
+  // Effective models: user override falls back to config default.
+  private readonly effectiveStrategicModel = computed(() =>
+    this.strategicModelOverride() ?? (this.r('llm.strategic.model') as string) ?? (this.r('llm.model') as string) ?? null);
+  private readonly effectiveTacticalModel = computed(() =>
+    this.tacticalModelOverride() ?? (this.r('llm.tactical.model') as string) ?? (this.r('llm.model') as string) ?? null);
+  private readonly effectiveSessionModel = computed(() =>
+    this.sessionModelOverride() ?? (this.r('llm.model') as string) ?? null);
+
   readonly resolvedStrategicReasoning = computed(() => (this.r('llm.strategic.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
   readonly resolvedStrategicTemp = computed(() =>
-    (this.r('llm.strategic.temperature') ?? this.mv(this.strategicModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedStrategicMultimodal = computed(() => (this.r('llm.strategic.multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
+    (this.r('llm.strategic.temperature') ?? this.mv(this.effectiveStrategicModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedStrategicMultimodal = computed(() =>
+    (this.r('llm.strategic.multimodal') ?? this.mv(this.effectiveStrategicModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
   readonly resolvedTacticalReasoning = computed(() => (this.r('llm.tactical.reasoning_level') ?? this.r('llm.reasoning_level')) as string | null);
   readonly resolvedTacticalTemp = computed(() =>
-    (this.r('llm.tactical.temperature') ?? this.mv(this.tacticalModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedTacticalMultimodal = computed(() => (this.r('llm.tactical.multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
+    (this.r('llm.tactical.temperature') ?? this.mv(this.effectiveTacticalModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedTacticalMultimodal = computed(() =>
+    (this.r('llm.tactical.multimodal') ?? this.mv(this.effectiveTacticalModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
   readonly resolvedSessionReasoning = computed(() => this.r('llm.reasoning_level') as string | null);
   readonly resolvedSessionTemp = computed(() =>
-    (this.mv(this.sessionModelOverride(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
-  readonly resolvedSessionMultimodal = computed(() => (this.r('llm.multimodal') ?? false) as boolean);
+    (this.mv(this.effectiveSessionModel(), 'temperature') ?? this.r('llm.temperature') ?? 0) as number);
+  readonly resolvedSessionMultimodal = computed(() =>
+    (this.mv(this.effectiveSessionModel(), 'multimodal') ?? this.r('llm.multimodal') ?? false) as boolean);
   readonly resolvedTopP = computed(() => {
-    const override = this.mode() === 'session' ? this.sessionModelOverride() : this.strategicModelOverride();
-    return (this.mv(override, 'top_p') ?? this.r('llm.top_p')) as number | null;
+    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
+    return (this.mv(model, 'top_p') ?? this.r('llm.top_p')) as number | null;
   });
   readonly resolvedTopK = computed(() => {
-    const override = this.mode() === 'session' ? this.sessionModelOverride() : this.strategicModelOverride();
-    return (this.mv(override, 'top_k') ?? this.r('llm.top_k')) as number | null;
+    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
+    return (this.mv(model, 'top_k') ?? this.r('llm.top_k')) as number | null;
   });
   readonly resolvedMaxOutputTokens = computed(() => this.r('llm.max_output_tokens') as number | null);
-  readonly resolvedParallelToolCalls = computed(() => (this.r('llm.parallel_tool_calls') ?? false) as boolean);
+  readonly resolvedParallelToolCalls = computed(() => {
+    const model = this.mode() === 'session' ? this.effectiveSessionModel() : this.effectiveStrategicModel();
+    return (this.mv(model, 'parallel_tool_calls') ?? this.r('llm.parallel_tool_calls') ?? false) as boolean;
+  });
 
   readonly resolvedMessageCountThreshold = computed(() => (this.r('limits.message_count_threshold') ?? 300) as number);
   readonly resolvedToolRetryCount = computed(() => (this.r('limits.tool_retry_count') ?? 3) as number);

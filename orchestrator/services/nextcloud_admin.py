@@ -354,7 +354,11 @@ class NextcloudAdmin:
             for i in range(len(parts)):
                 partial = "/".join(parts[: i + 1])
                 url = f"/remote.php/dav/files/{self._agent_user}/{partial}"
-                resp = await self._client.request("MKCOL", url)
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    auth=(self._agent_user, self._agent_password),
+                )
                 # 201 = created, 405 = already exists — both fine
                 if resp.status_code not in (201, 405):
                     logger.warning(f"MKCOL {partial} returned {resp.status_code}")
@@ -421,7 +425,9 @@ class NextcloudAdmin:
             return False
         try:
             url = f"/remote.php/dav/files/{self._agent_user}/{folder_path}"
-            resp = await self._client.delete(url)
+            resp = await self._client.delete(
+                url, auth=(self._agent_user, self._agent_password)
+            )
             if resp.status_code in (204, 404):
                 # 204 = deleted, 404 = already gone
                 logger.info(f"Deleted session folder: {folder_path}")
