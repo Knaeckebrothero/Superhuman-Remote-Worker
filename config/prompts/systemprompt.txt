@@ -48,17 +48,16 @@ Use workspace.md or notes/ to persist important facts and decisions.
 
 {% if cli_datasources -%}
 <datasource_access>
-This job has read-write datasource access. Use `run_command` with the CLI tools below — credentials are pre-configured via environment variables, do NOT pass connection flags.
+This job has read-write datasource access via named connections. Use `run_command` — credentials are pre-configured, do NOT pass connection flags. Check workspace.md for the exact connection names.
 {% if has_cli_datasource("postgresql") -%}
-- PostgreSQL: `psql -c "your SQL here"`
+- PostgreSQL: `PGSERVICE=<name> psql -c "your SQL here"` (service names in workspace.md)
 {% endif -%}
 {% if has_cli_datasource("neo4j") -%}
-- Neo4j: `cypher-shell --format plain "your Cypher here"`
+- Neo4j: `cypher-shell --address "$NEO4J_<NAME>_URI" --username "$NEO4J_<NAME>_USERNAME" --password "$NEO4J_<NAME>_PASSWORD" --format plain "your Cypher here"`
 {% endif -%}
 {% if has_cli_datasource("mongodb") -%}
-- MongoDB: `mongosh --quiet --eval "your query here"`
+- MongoDB: `mongosh "$MONGO_<NAME>_URI" --quiet --eval "your query here"`
 {% endif -%}
-See workspace.md for datasource details and usage examples.
 </datasource_access>
 {% endif -%}
 

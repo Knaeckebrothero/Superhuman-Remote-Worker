@@ -14,11 +14,10 @@ llm:
   timeout: 600
   max_retries: 3
   max_output_tokens: null  # Auto-detected per provider; override for local models if needed
-  multimodal: false  # Set to true if model can process images directly
-  parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
-  # Model-specific inference params (temperature, top_p, top_k) and context limits
-  # are set via config/settings_matrix.yaml — the single source of truth for
-  # model-dependent settings. Do not set model_max_context_tokens here.
+  # Model-specific inference params (temperature, top_p, top_k, multimodal,
+  # parallel_tool_calls) and context limits are set via config/settings_matrix.yaml
+  # — the single source of truth for model-dependent settings.
+  # Do not set model_max_context_tokens here.
 
 workspace:
   structure:
@@ -300,5 +299,4 @@ shell:
 interactive:
   permission_mode: supervised   # supervised | auto_accept | autonomous
   idle_timeout_minutes: 15      # Auto-pause session after idle period (0 = disabled)
-  greeting: "Hello! I'm ready to help. What would you like to work on?"
 

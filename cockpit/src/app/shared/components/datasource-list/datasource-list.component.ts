@@ -85,11 +85,11 @@ import {
                   [disabled]="isSaving() || !!editingId()"
                   (ngModelChange)="onTypeChange()"
                 >
-                  <optgroup label="CLI-based (standard CLI tools)">
+                  <optgroup label="CLI-based">
                     <option value="generic">Generic</option>
                     <option value="repository">Repository</option>
                   </optgroup>
-                  <optgroup label="Managed connectors (read-only enforcement)">
+                  <optgroup label="Managed">
                     <option value="postgresql">PostgreSQL</option>
                     <option value="neo4j">Neo4j</option>
                     <option value="mongodb">MongoDB</option>
@@ -591,6 +591,7 @@ import {
       .form-row {
         display: flex;
         gap: 12px;
+        overflow: hidden;
       }
 
       .flex-1 {
@@ -658,6 +659,12 @@ import {
 
       .form-select {
         appearance: auto;
+        max-width: 100%;
+      }
+
+      .form-row > .form-group:not(.flex-1) {
+        min-width: 0;
+        max-width: 160px;
       }
 
       .form-footer {
@@ -1112,16 +1119,14 @@ export class DatasourceListComponent implements OnInit {
     return placeholders[this.formData.type] || '';
   });
 
-  // Whether the form can be saved
-  readonly canSave = computed(() => {
+  // Whether the form can be saved (method, not computed, because formData is a plain object)
+  canSave(): boolean {
     if (!this.formData.name) return false;
     if (this.formData.type === 'generic') {
-      // Generic needs either env vars or a connection URL
       return !!(this.formData.description);
     }
-    // All other types need a connection URL
     return !!this.formData.connection_url;
-  });
+  }
 
   // Form data (mutable object, not a signal, matching job-create pattern)
   formData: {
@@ -1222,6 +1227,17 @@ export class DatasourceListComponent implements OnInit {
   saveForm(): void {
     if (!this.formData.name) return;
 
+    // Warn when creating a repository without credentials
+    if (this.formData.type === 'repository' && this.buildCredentials()?.['read_only']) {
+      const confirmed = confirm(
+        'No authentication credentials provided.\n\n' +
+        'This repository will be cloned as read-only — the agent can browse ' +
+        'and read the code but will not be able to push changes.\n\n' +
+        'Continue?'
+      );
+      if (!confirmed) return;
+    }
+
     this.isSaving.set(true);
     this.clearMessages();
 
@@ -1268,17 +1284,14 @@ export class DatasourceListComponent implements OnInit {
       this.api.createDatasource(create).subscribe({
         next: (result) => {
           this.isSaving.set(false);
-          if (result) {
-            this.successMessage.set(`Datasource "${result.name}" created`);
-            this.closeForm();
-            this.refresh();
-          } else {
-            this.errorMessage.set('Failed to create datasource');
-          }
+          this.successMessage.set(`Datasource "${result.name}" created`);
+          this.closeForm();
+          this.refresh();
         },
-        error: () => {
+        error: (err) => {
           this.isSaving.set(false);
-          this.errorMessage.set('Error creating datasource');
+          const detail = err?.error?.detail;
+          this.errorMessage.set(detail || 'Failed to create datasource');
         },
       });
     }
@@ -1434,10 +1447,10 @@ export class DatasourceListComponent implements OnInit {
     }
     if (this.formData.type === 'repository') {
       if (this.gitAuthMethod === 'ssh') {
-        if (!this.gitSshKey) return undefined;
+        if (!this.gitSshKey) return { read_only: true };
         return { auth_method: 'ssh', ssh_key: this.gitSshKey };
       } else {
-        if (!this.formCredentials.password) return undefined;
+        if (!this.formCredentials.password) return { read_only: true };
         return { auth_method: 'token', token: this.formCredentials.password };
       }
     }

@@ -63,6 +63,7 @@ _orchestrator_client: Optional[OrchestratorClient] = None
 _heartbeat_task: Optional[asyncio.Task] = None
 _shutdown_requested = False
 _started_at: Optional[datetime] = None
+_pending_exit_task: Optional[asyncio.Task] = None
 
 # Worker-mode state (imported from app.py at runtime to avoid circular deps)
 _current_job_id: Optional[str] = None
@@ -243,6 +244,11 @@ async def lifespan(app: FastAPI):
 
 def _schedule_exit(delay: float = 1.0) -> None:
     """Schedule process exit after a short delay (allows response to be sent)."""
+    global _pending_exit_task
+
+    # Cancel any previously scheduled exit
+    if _pending_exit_task and not _pending_exit_task.done():
+        _pending_exit_task.cancel()
 
     async def _exit():
         await asyncio.sleep(delay)
@@ -250,7 +256,7 @@ def _schedule_exit(delay: float = 1.0) -> None:
         # Use os._exit to bypass uvicorn's signal handling
         os._exit(0)
 
-    asyncio.create_task(_exit())
+    _pending_exit_task = asyncio.create_task(_exit())
 
 
 def _should_loop() -> bool:
@@ -949,6 +955,14 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
+        global _pending_exit_task
+
+        # Cancel any pending exit from a previous WS disconnect (e.g. page refresh)
+        if _pending_exit_task and not _pending_exit_task.done():
+            _pending_exit_task.cancel()
+            _pending_exit_task = None
+            logger.info("Cancelled pending exit — new WebSocket connecting")
+
         if _pod_state != PodState.SESSION:
             await ws.accept()
             await ws.send_json(
@@ -1016,11 +1030,6 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
             "temperature": _session.config.llm.temperature,
         },
     )
-
-    if not _session.messages or _session.turn_count == 0:
-        greeting = _session.config.interactive.greeting
-        if greeting:
-            await _ws_send(ws, "greeting", {"content": greeting})
 
     user_queue: asyncio.Queue[str] = asyncio.Queue()
     interrupt_flag = False

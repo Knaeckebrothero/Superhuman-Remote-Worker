@@ -358,11 +358,12 @@ class GiteaClient:
         """Build an authenticated clone URL.
 
         Embeds credentials in the URL for git push from agents.
+        Uses GITEA_INTERNAL_URL when available so that workspace containers
+        (which can't reach the host via localhost) use a routable address.
         Internal network only — acceptable for this use case.
         """
-        # Parse URL to inject credentials
-        # http://gitea:3000 -> http://user:pass@gitea:3000/user/repo.git
-        url = self._url
+        # Prefer internal URL for container-to-host reachability
+        url = os.environ.get("GITEA_INTERNAL_URL", self._url)
         if "://" in url:
             scheme, rest = url.split("://", 1)
             return f"{scheme}://{self._user}:{self._password}@{rest}/{self._user}/{repo_name}.git"

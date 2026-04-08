@@ -21,8 +21,8 @@ llm:
   timeout: 600
   max_retries: 3
   max_output_tokens: null
-  multimodal: false
-  parallel_tool_calls: false
+  # multimodal and parallel_tool_calls are set per model family
+  # in config/settings_matrix.yaml — do not set them here.
 
 workspace:
   structure:
@@ -162,7 +162,6 @@ auxiliary:
 interactive:
   permission_mode: supervised
   idle_timeout_minutes: 15
-  greeting: "Hello! I'm ready to help. What would you like to work on?"
 
 # --- Extra config (flows to config.extra, read by tools) ---
 

@@ -475,8 +475,39 @@ async def _execute_turn(
         response: Optional[AIMessage] = None
         llm_start = time.monotonic()
 
+        # Responses API streaming has a LangChain bug where tool call
+        # arguments are lost (response.function_call_arguments.delta events
+        # may not be sent by all endpoints, and response.output_item.done
+        # for function_call type is not handled).  Use ainvoke for these
+        # models to get correct tool call parsing.
+        _use_ainvoke = bool(getattr(llm_with_tools, "reasoning", None))
+
         try:
-            try:
+            if _use_ainvoke:
+                response = await asyncio.wait_for(
+                    llm_with_tools.ainvoke(prepared),
+                    timeout=llm_timeout,
+                )
+                content = getattr(response, "content", None)
+                if content:
+                    if isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "text"
+                            ):
+                                text = block.get("text", "")
+                                if text:
+                                    response_content += text
+                                    await callbacks.on_token(text)
+                            elif isinstance(block, str) and block:
+                                response_content += block
+                                await callbacks.on_token(block)
+                    elif isinstance(content, str) and content:
+                        response_content = content
+                        await callbacks.on_token(content)
+            else:
+              try:
                 # Try astream for token-by-token streaming
                 chunks = []
                 streaming_interrupted = False
@@ -532,7 +563,7 @@ async def _execute_turn(
                         interrupted=True,
                     )
 
-            except Exception as stream_err:
+              except Exception as stream_err:
                 # Fallback to ainvoke when streaming fails
                 # (e.g. ReasoningCapturingClient can't handle stream=True)
                 err_name = type(stream_err).__name__
