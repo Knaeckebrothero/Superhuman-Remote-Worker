@@ -1738,8 +1738,8 @@ class TestLLMStreaming:
         callbacks.on_token.assert_called_once_with("Hello")
 
     @pytest.mark.asyncio
-    async def test_empty_text_blocks_not_streamed(self):
-        """Empty text blocks are NOT streamed via on_token."""
+    async def test_empty_text_blocks_produce_warning(self):
+        """Empty text blocks generate a user-visible warning (not silently dropped)."""
         chunk = AIMessage(content=[{"type": "text", "text": ""}])
 
         async def _astream(msgs, **kw):
@@ -1766,7 +1766,10 @@ class TestLLMStreaming:
             config=_make_config(),
         )
 
-        callbacks.on_token.assert_not_called()
+        callbacks.on_token.assert_called_once_with(
+            "⚠ The model returned an empty response. "
+            "Please try again or switch models."
+        )
 
     @pytest.mark.asyncio
     async def test_empty_chunks_return_error(self):
@@ -1798,6 +1801,137 @@ class TestLLMStreaming:
         )
 
         assert result.error == "Empty LLM response"
+
+    @pytest.mark.asyncio
+    async def test_empty_streaming_response_generates_warning(self):
+        """Streaming response with empty content and no tool calls sends warning."""
+        chunk = AIMessage(content="")
+
+        async def _astream(msgs, **kw):
+            yield chunk
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        callbacks = _make_callbacks()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        result = await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        callbacks.on_token.assert_called_once_with(
+            "⚠ The model returned an empty response. "
+            "Please try again or switch models."
+        )
+        assert result.error is None
+
+    @pytest.mark.asyncio
+    async def test_empty_streaming_response_with_refusal(self):
+        """Streaming response with refusal in additional_kwargs sends refusal msg."""
+        chunk = AIMessage(
+            content="",
+            additional_kwargs={"refusal": "I cannot help with that"},
+        )
+
+        async def _astream(msgs, **kw):
+            yield chunk
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        callbacks = _make_callbacks()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        callbacks.on_token.assert_called_once_with(
+            "⚠ The model declined to respond: I cannot help with that"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_text_with_tool_calls_no_warning(self):
+        """Streaming response with tool calls but no text should not warn."""
+        chunk = AIMessage(
+            content="",
+            tool_calls=[{"id": "tc1", "name": "test_tool", "args": {"x": 1}}],
+        )
+
+        async def _astream(msgs, **kw):
+            yield chunk
+
+        llm = AsyncMock()
+        llm.reasoning = None
+        llm.astream = _astream
+
+        callbacks = _make_callbacks()
+        messages = [SystemMessage(content="sys"), HumanMessage(content="hi")]
+
+        mock_tool = AsyncMock()
+        mock_tool.name = "test_tool"
+        mock_tool.ainvoke = AsyncMock(return_value="done")
+
+        # Need a second LLM call that returns no tool calls to end the turn
+        call_count = 0
+
+        async def _astream_second(msgs, **kw):
+            yield AIMessage(content="Tool result processed.")
+
+        original_astream = llm.astream
+
+        async def _astream_dispatch(msgs, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                async for c in original_astream(msgs, **kw):
+                    yield c
+            else:
+                async for c in _astream_second(msgs, **kw):
+                    yield c
+
+        llm.astream = _astream_dispatch
+
+        await _execute_turn(
+            llm_with_tools=llm,
+            tool_map={"test_tool": mock_tool},
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            messages=messages,
+            callbacks=callbacks,
+            llm_timeout=600,
+            auxiliary_llm=None,
+            workspace_content=None,
+            config=_make_config(),
+        )
+
+        # on_token should NOT have been called with the warning message
+        for call in callbacks.on_token.call_args_list:
+            assert "empty response" not in call.args[0].lower()
 
 
 # ---------------------------------------------------------------------------

@@ -238,7 +238,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
                 @if (chat.sessionReady()) {
                   Start a conversation...
                 } @else if (chat.isConnected()) {
-                  Session starting...
+                  @switch (chat.startupPhase()) {
+                    @case ('provisioning') { Provisioning agent... }
+                    @case ('booting') { Agent starting... }
+                    @case ('connecting') { Connecting to agent... }
+                    @default { Session starting... }
+                  }
                 } @else {
                   Connecting...
                 }
@@ -1727,10 +1732,9 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     openSessionFiles(): void {
         const folder = this.chat.ncSessionFolder();
-        if (!folder) return;
-        const ncUrl = environment.nextcloudUrl || 'http://localhost:8800';
+        if (!folder || !environment.nextcloudUrl) return;
         const folderName = folder.split('/').pop();
-        window.open(`${ncUrl}/apps/files/?dir=/${folderName}`, '_blank');
+        window.open(`${environment.nextcloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     private startIdePolling(threadId: string): void {

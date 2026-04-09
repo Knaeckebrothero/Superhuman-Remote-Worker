@@ -1,14 +1,14 @@
 # Superhuman Remote Worker
 
-A self-improving AI agent system. Three specialized agents form a continuous innovation cycle: one explores ideas, one tears them apart, one builds the survivors. The system gets better on its own.
+A self-improving AI agent system. Specialized agents form a continuous innovation cycle: one explores ideas, one tears them apart, one builds the survivors, one curates what was learned. The system gets better on its own.
 
-Built on LangGraph with a config-driven architecture. Same codebase, different YAML configs, different roles.
+Built on LangGraph with a config-driven architecture. Same codebase, different YAML configs, different roles. Runs as job-based workers or interactive persistent sessions.
 
 ## The Innovation Cycle
 
 The typical human-AI workflow looks like this: you have an idea, you dump it on the AI, the AI builds it, then you spend forever refactoring because your inner perfectionist won't let you merge something that works but isn't elegant. Repeat.
 
-This system replaces that loop with three agents that run it continuously:
+This system replaces that loop with four agents that run it continuously:
 
 ```
          ┌──────────────────────────────────────────────────┐
@@ -29,11 +29,19 @@ This system replaces that loop with three agents that run it continuously:
                                           ▼                │
                                    ┌──────────┐            │
                                    │DEVELOPER │            │
-                                   │          │            │
-                                   │ Builds,  │ ───────────┘
-                                   │ tests,   │  code changes feed
-                                   │ ships    │  back into the cycle
-                                   │ PRs      │
+                                   │          │  code changes feed
+                                   │ Builds,  │ ───────────┤
+                                   │ tests,   │            │
+                                   │ ships    │            │
+                                   │ PRs      │            │
+                                   └──────────┘            │
+                                                           │
+                                   ┌──────────┐            │
+                                   │ CURATOR  │            │
+                                   │          │ ───────────┘
+                                   │ Extracts │  knowledge feeds
+                                   │ insights │  back into the cycle
+                                   │ into KB  │
                                    └──────────┘
 ```
 
@@ -43,7 +51,9 @@ This system replaces that loop with three agents that run it continuously:
 
 **Developer** — The PR factory. Picks up approved ideas and Critic-identified issues, delegates implementation to Claude Code sessions, verifies results via git, and ships focused PRs. One feature per PR, one bug fix per PR. Throughput over perfection.
 
-The cycle repeats. Scholar sees the new code and finds more to explore. Critic reviews what Developer shipped. Developer picks up the next batch. The system improves because the loop never stops.
+**Curator** — The knowledge extractor. Runs as a subjob after other jobs complete, extracting structured insights from job artifacts into the project knowledge base. Ensures learnings from one job are available to future jobs.
+
+The cycle repeats. Scholar sees the new code and finds more to explore. Critic reviews what Developer shipped. Developer picks up the next batch. Curator distills what was learned. The system improves because the loop never stops.
 
 ### Why This Works
 
@@ -56,14 +66,23 @@ This system applies evolutionary pressure:
 
 No human bottleneck in the loop. You set the direction, the system iterates.
 
-### The General Secretary
+### Beyond the Cycle
 
-The default config (`config/defaults.yaml`) is the **General Secretary** — a jack-of-all-trades with all tools enabled and no specialization. This is the agent you talk to directly for ad-hoc tasks, the one that doesn't fit neatly into the innovation cycle. It's the escape hatch for "just do this thing."
+Not everything fits the innovation loop. The system also has agents for direct interaction and design work:
+
+**General Secretary** (`config/defaults.yaml`) — Jack-of-all-trades with all tools enabled and no specialization. The agent you talk to directly for ad-hoc tasks. The escape hatch for "just do this thing."
+
+**Interactive** — Conversational assistant for persistent sessions. No phase/todo structure — continuous tool-calling loop with WebSocket transport. For when you need an agent that stays online and responds in real time.
+
+**Designer** — UI/UX design specialist that creates self-contained HTML/CSS mockups using the project's design system. Analyzes interface patterns and produces structured design specifications.
+
+**Designer-Interactive** — Same design capability as Designer, but runs as a persistent session for real-time collaborative design iteration.
 
 ## What It Can Do
 
-Beyond the innovation cycle, each agent is a general-purpose LangGraph worker that can:
+Each agent is a general-purpose LangGraph worker that can:
 - Research topics on the web and synthesize findings
+- Browse websites and interact with web pages (Playwright)
 - Process and analyze documents (PDF, DOCX, PPTX, images)
 - Query and manipulate databases (PostgreSQL, Neo4j, MongoDB)
 - Write, review, and manage structured output
@@ -71,16 +90,19 @@ Beyond the innovation cycle, each agent is a general-purpose LangGraph worker th
 - Manage citations and literature
 
 **What makes it different:**
-- **Persistent memory** — workspace files survive context window limits, so it never loses track of long tasks
+- **Two operating modes** — job-based workers for batch tasks and persistent sessions for real-time interaction, both from the same codebase
+- **Persistent memory** — workspace files survive context window limits, plus a hybrid dense+sparse memory system (RecallStore) for cross-job knowledge sharing
 - **Phase-based execution** — alternates between strategic planning and tactical work, adapting its plan as it learns
 - **Crash recovery** — checkpoints at every step, resume any job from where it left off
 - **Config-driven roles** — same codebase, different YAML configs for different specializations
 - **Multi-database support** — attach PostgreSQL, Neo4j, or MongoDB datasources to any job
+- **Multi-backend workspaces** — local filesystem, SSH/SFTP to remote containers, or dedicated VMs via QEMU/KubeVirt
+- **Notifications** — email (SMTP), Slack, Discord, and ntfy webhooks for job status updates
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Production Deployment](#production-deployment)
+- [Docker Compose Deployment](#docker-compose-deployment)
 - [Development Setup](#development-setup)
 - [Architecture](#architecture)
 - [Debugging](#debugging)
@@ -132,7 +154,10 @@ Edit `.env` with your configuration:
 - `GOOGLE_API_KEY` — For Gemini models
 - `TAVILY_API_KEY` — For web search
 - `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` — SSO admin (default: admin/admin)
-- `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` — Email via ProtonMail Bridge or other SMTP
+- `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` — Email notifications via SMTP
+- `SLACK_WEBHOOK_URL` — Slack notifications
+- `DISCORD_WEBHOOK_URL` — Discord notifications
+- `NTFY_URL` / `NTFY_TOPIC` / `NTFY_TOKEN` — ntfy push notifications
 - `LOG_LEVEL` — DEBUG, INFO, WARNING, ERROR (default: INFO)
 
 Edit `docker/keycloak/realm-export.json` for OIDC client secrets if needed (see the example file for details).
@@ -147,17 +172,20 @@ This starts:
 - **PostgreSQL** — Job tracking and data storage (+ SSO databases for Keycloak/Nextcloud)
 - **PostgreSQL (Vector)** — Citations, embeddings, knowledge index (pgvector)
 - **MongoDB** — LLM request logging and audit trail
-- **Neo4j** — Graph database for agent datasources
+- **Neo4j** — Graph database for project knowledge base
 - **Keycloak** — SSO identity provider (OIDC for all services)
 - **Gitea** — Git server for agent workspace repositories (Keycloak OIDC login)
 - **Nextcloud** — Cloud storage / WebDAV datasource
-- **VPN Sidecars** — Route LLM and research traffic through university network
+- **VPN Sidecars** — Three VPN services routing LLM, research, and workstation traffic through the university network
 - **Orchestrator** — Backend API for job management and agent coordination
 - **Agent** — Worker instances (defaults to 2 replicas via `AGENT_REPLICAS`)
+- **Workspace containers** — Static pool of 5 isolated workspace containers (SSH access), auto-provisioned by the orchestrator
 - **MCP Server** — Claude Code integration (port 8055)
 - **Cockpit** — Web UI for job management and monitoring
-- **NATS** — Messaging for VM lifecycle (optional)
-- **MinIO** — S3-compatible object storage for snapshots and IDE sessions (optional)
+- **NATS** — Messaging for VM lifecycle and agent communication
+- **MinIO** — S3-compatible object storage for VM snapshots and IDE sessions
+- **pgAdmin / mongo-express** — Database admin UIs
+- **Dozzle** — Container log viewer
 
 ### 4. Access Services
 
@@ -243,7 +271,7 @@ When running outside containers (bare-metal development), use the `--dev` flag t
 python agent.py --dev --description "Your task here"
 
 # With a custom agent config
-python agent.py --dev --config my_agent --description "Your task"
+python agent.py --dev --config scholar --description "Your task"
 
 # Process a document
 python agent.py --dev --document-path ./data/doc.pdf --description "Extract key findings"
@@ -251,14 +279,29 @@ python agent.py --dev --document-path ./data/doc.pdf --description "Extract key 
 # Process a directory of documents
 python agent.py --dev --document-dir ./data/reports/ --description "Compare and summarize these reports"
 
-# Run as an API server (worker mode)
+# Clone a repo and work on it (coding agent)
+python agent.py --dev --config developer --git-url https://github.com/org/repo --description "Fix issue #42"
+
+# Run as an API server (dual mode — accepts jobs and persistent sessions)
 python agent.py --dev --port 8001
+
+# Run as a worker-only server (job processing only)
+python agent.py --dev --mode worker --port 8001
 
 # Run as a persistent interactive agent
 python agent.py --dev --mode persistent --port 8002
 
-# Resume a crashed job
+# Resume a crashed or frozen job
 python agent.py --dev --job-id <id> --resume
+
+# Resume with feedback
+python agent.py --dev --job-id <id> --resume --feedback "Please also check X"
+
+# Approve a frozen job (marks as completed)
+python agent.py --dev --job-id <id> --approve
+
+# Pass additional context
+python agent.py --dev --description "Analyze" --context '{"domain": "fintech"}'
 
 # Debug mode
 LOG_LEVEL=DEBUG python agent.py --dev --description "Your task"
@@ -288,7 +331,7 @@ pytest tests/ --cov=src                    # With coverage
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                           COCKPIT                                │
-│                   (Web UI — Job Management)                      │
+│              (Web UI — Jobs, Threads, Monitoring)                 │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -297,46 +340,58 @@ pytest tests/ --cov=src                    # With coverage
                  │                           │
                  │  Job queue & coordination │
                  │  Agent health monitoring  │
+                 │  Persistent sessions      │
                  │  Statistics & API         │
                  └─────────────┬─────────────┘
                                │
-         ┌─────────────┬───────┴───────┬─────────────┐
-         │             │               │             │
-         ▼             ▼               ▼             ▼
-   ┌──────────┐ ┌──────────┐  ┌───────────┐ ┌────────────┐
-   │ SCHOLAR  │ │  CRITIC  │  │ DEVELOPER │ │ GENERAL    │
-   │          │ │          │  │           │ │ SECRETARY  │
-   │ R&D,     │ │ Review,  │  │ Claude    │ │            │
-   │ ideas,   │ │ quality  │  │ Code PRs  │ │ All tools, │
-   │ research │ │ gating   │  │           │ │ ad-hoc     │
-   └──────────┘ └──────────┘  └───────────┘ └────────────┘
-         │             │               │
-         ▼             ▼               ▼
-   ┌───────────┐  ┌───────────┐  ┌─────────────────┐
-   │ PostgreSQL│  │  MongoDB  │  │  Datasources    │
-   │ (system)  │  │ (logging) │  │  (per-job)      │
-   └───────────┘  └───────────┘  └─────────────────┘
+       ┌───────────┬───────────┼───────────┬───────────┐
+       │           │           │           │           │
+       ▼           ▼           ▼           ▼           ▼
+ ┌──────────┐┌──────────┐┌─────────┐┌─────────┐┌───────────┐
+ │ SCHOLAR  ││  CRITIC  ││DEVELOPER││ CURATOR ││ DESIGNER  │
+ │          ││          ││         ││         ││           │
+ │ R&D,     ││ Review,  ││ Claude  ││ Extract ││ UI/UX     │
+ │ ideas,   ││ quality  ││ Code    ││ insights││ mockups,  │
+ │ research ││ gating   ││ PRs     ││ into KB ││ prototypes│
+ └──────────┘└──────────┘└─────────┘└─────────┘└───────────┘
+       │           │           │           │
+       ▼           ▼           ▼           ▼
+ ┌───────────┐ ┌───────────┐ ┌───────────┐ ┌───────────┐
+ │ PostgreSQL│ │  MongoDB  │ │   Neo4j   │ │Datasources│
+ │ (system)  │ │ (logging) │ │(knowledge)│ │ (per-job) │
+ └───────────┘ └───────────┘ └───────────┘ └───────────┘
 ```
 
 ### Expert Lineup
 
-| Expert | Config | Role |
-|--------|--------|------|
-| **General Secretary** | `config/defaults.yaml` | Default — all tools, no specialization, direct human interaction |
-| **Scholar** | `config/experts/scholar/` | Continuous R&D exploration, idea generation, web research |
-| **Critic** | `config/experts/critic/` | Code review, proposal review, codebase audits, test execution |
-| **Developer** | `config/experts/developer/` | Claude Code delegation, PR factory, implementation |
+| Expert | Config | Mode | Role |
+|--------|--------|------|------|
+| **General Secretary** | `config/defaults.yaml` | Worker | Default — all tools, no specialization, ad-hoc tasks |
+| **Scholar** | `config/experts/scholar/` | Worker | R&D exploration, idea generation, web research, paper analysis |
+| **Critic** | `config/experts/critic/` | Worker | Code review, proposal review, codebase audits, test execution |
+| **Developer** | `config/experts/developer/` | Worker | Claude Code delegation, PR factory, implementation |
+| **Curator** | `config/experts/curator/` | Worker | Knowledge extraction from job artifacts into project KB |
+| **Designer** | `config/experts/designer/` | Worker | UI/UX design, HTML/CSS mockups, design specifications |
+| **Interactive** | `config/experts/interactive/` | Persistent | Conversational assistant, real-time tool use via WebSocket |
+| **Designer-Interactive** | `config/experts/designer-interactive/` | Persistent | Collaborative design iteration in real-time sessions |
 
-All experts share the same universal agent codebase. Configs live in `config/` and use `$extends: defaults` for inheritance. See [config/README.md](config/README.md) for details.
+All experts share the same universal agent codebase. Worker-mode experts extend `config/defaults.yaml`, persistent-mode experts extend `config/persistent_defaults.yaml`. Both use `$extends` for deep-merge inheritance. See [config/README.md](config/README.md) for details.
 
-### Phase Alternation
+### Two Operating Modes
 
-The agent alternates between two modes:
+**Worker mode** (job-based) — Phase-alternating execution for batch tasks:
 
 - **Strategic phase** — Reviews progress, reflects on what worked, updates the plan, creates the next batch of tasks
 - **Tactical phase** — Executes tasks using domain-specific tools until all todos are complete
+- This loop continues until the job is done. Each phase boundary creates a snapshot for recovery.
 
-This loop continues until the job is done. Each phase boundary creates a snapshot for recovery.
+**Persistent mode** (session-based) — Continuous tool-calling loop for interactive use:
+
+- No phase/todo structure. The agent stays online and responds in real time via WebSocket.
+- Supports idle timeout handling and memory injection across turns.
+- Used by Interactive and Designer-Interactive experts.
+
+Agents run in `dual` mode by default, accepting both jobs and persistent sessions.
 
 ### Workspace-Centric Memory
 
@@ -346,25 +401,32 @@ Long-term memory lives in files, not in the LLM context window:
 - `plan.md` — Strategic plan, updated at phase boundaries
 - `archive/` — Phase retrospectives and completed task lists
 
-This means the agent can work on tasks that exceed any single context window.
+Cross-job knowledge sharing uses the **RecallStore** — a hybrid dense+sparse search system (pgvector) with TTL-managed memories scoped to projects. An auxiliary LLM extracts memories asynchronously while the agent continues working.
+
+This means the agent can work on tasks that exceed any single context window, and knowledge accumulates across jobs.
 
 ## Debugging
 
-- **Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md)
+- **Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md, output/)
 - **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite)
 - **Logs**: `workspace/logs/job_<id>.log`
 - **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`
+- **Persistent sessions**: `workspace/messages/<thread_id>/`
 
 ```bash
 # Phase recovery
 python agent.py --job-id <id> --list-phases
 python agent.py --job-id <id> --recover-phase 2 --resume
 
+# Resume a frozen job with feedback
+python agent.py --job-id <id> --resume --feedback "Check the edge case for empty input"
+
+# Approve a frozen job
+python agent.py --job-id <id> --approve
+
 # Clean up
 rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 ```
-
-See [CLAUDE.md](CLAUDE.md) for full development documentation.
 
 ## License
 

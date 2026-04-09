@@ -664,6 +664,32 @@ async def _execute_turn(
                 error="Empty LLM response",
             )
 
+        # Detect streaming that produced no visible content and no tool calls
+        if not response_content and (
+            not hasattr(response, "tool_calls") or not response.tool_calls
+        ):
+            extra = getattr(response, "additional_kwargs", None) or {}
+            refusal = extra.get("refusal")
+            logger.warning(
+                "Streaming produced empty content "
+                "(type=%s, has_tool_calls=%s, additional_kwargs=%s)",
+                type(getattr(response, "content", None)).__name__,
+                bool(getattr(response, "tool_calls", None)),
+                list(extra.keys()),
+            )
+            if refusal:
+                logger.warning("Model refusal: %s", refusal)
+                response_content = (
+                    f"⚠ The model declined to respond: {refusal}"
+                )
+                await callbacks.on_token(response_content)
+            else:
+                response_content = (
+                    "⚠ The model returned an empty response. "
+                    "Please try again or switch models."
+                )
+                await callbacks.on_token(response_content)
+
         # Sanitize for Responses API compatibility (null IDs from OpenRouter)
         response = _sanitize_ai_response(response)
 

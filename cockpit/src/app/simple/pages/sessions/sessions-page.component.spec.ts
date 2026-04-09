@@ -70,7 +70,7 @@ function makeThread(overrides: Partial<any> = {}) {
         id: 'thread-1',
         title: 'Test Session',
         status: 'active',
-        config_name: 'interactive',
+        config_name: 'persistent_defaults',
         permission_mode: 'supervised',
         created_at: '2026-01-01T00:00:00Z',
         last_activity: '2026-01-01T01:00:00Z',
@@ -122,7 +122,7 @@ describe('SessionsPageComponent', () => {
         });
 
         it('should have default form values', () => {
-            expect(component.newConfig).toBe('interactive');
+            expect(component.newConfig).toBe('persistent_defaults');
             expect(component.newPermission).toBe('supervised');
             expect(component.newModel).toBe('');
             expect(component.newTitle).toBe('');

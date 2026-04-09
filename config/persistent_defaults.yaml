@@ -171,7 +171,7 @@ auxiliary:
 
 interactive:
   permission_mode: supervised
-  idle_timeout_minutes: 15
+  idle_timeout_minutes: 120
 
 # --- Extra config (flows to config.extra, read by tools) ---
 

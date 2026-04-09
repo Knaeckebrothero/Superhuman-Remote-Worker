@@ -38,7 +38,7 @@ async def agent_create_thread(
     gitea,
     provisioner,
     *,
-    config_name="interactive",
+    config_name="persistent_defaults",
     permission_mode="supervised",
     title="Local Session",
 ):
@@ -405,7 +405,7 @@ def _make_thread(
     thread_id="aaaaaaaa-1111-2222-3333-444444444444",
     user_id=None,
     agent_id=None,
-    config_name="interactive",
+    config_name="persistent_defaults",
     title="Test Session",
     metadata=None,
     status="active",
@@ -439,7 +439,7 @@ class TestAgentCreateThread:
 
         db.create_thread.assert_awaited_once_with(
             user_id=None,
-            config_name="interactive",
+            config_name="persistent_defaults",
             permission_mode="supervised",
             title="Local Session",
         )
@@ -1202,7 +1202,7 @@ class TestInspectSessionEvent:
             "tid-1",
             "",
             "Title",
-            "interactive",
+            "persistent_defaults",
             broadcast,
         )
         broadcast.assert_not_called()
@@ -1220,7 +1220,7 @@ class TestInspectSessionEvent:
             }
         )
         inspect_session_event(
-            raw, "tid-1", "user-1", "My Session", "interactive", broadcast
+            raw, "tid-1", "user-1", "My Session", "persistent_defaults", broadcast
         )
         broadcast.assert_called_once()
         call_kwargs = broadcast.call_args[1]
@@ -1245,20 +1245,20 @@ class TestInspectSessionEvent:
     def test_broadcasts_ready_as_session_waiting(self):
         broadcast = MagicMock()
         raw = json.dumps({"method": "ready"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "interactive", broadcast)
+        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["event_type"] == "session.waiting"
 
     def test_ignores_non_notify_methods(self):
         broadcast = MagicMock()
         raw = json.dumps({"method": "text.delta"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "interactive", broadcast)
+        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
         broadcast.assert_not_called()
 
     def test_ignores_invalid_json(self):
         broadcast = MagicMock()
         inspect_session_event(
-            "not-json{", "tid-1", "user-1", "Title", "interactive", broadcast
+            "not-json{", "tid-1", "user-1", "Title", "persistent_defaults", broadcast
         )
         broadcast.assert_not_called()
 
@@ -1266,7 +1266,7 @@ class TestInspectSessionEvent:
         """params defaults to {} when absent."""
         broadcast = MagicMock()
         raw = json.dumps({"method": "permission.request"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "interactive", broadcast)
+        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["data"]["tool"] is None
         assert call_kwargs["data"]["args"] is None
