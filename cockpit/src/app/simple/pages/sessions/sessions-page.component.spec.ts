@@ -208,14 +208,13 @@ describe('SessionsPageComponent', () => {
     // =========================================================================
 
     describe('createSession()', () => {
-        it('should POST to create thread endpoint', async () => {
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
-
+        it('should navigate to _creating route with create body', async () => {
             await component.createSession();
 
-            expect(mockHttp.post).toHaveBeenCalled();
-            const [url, body] = mockHttp.post.mock.calls[0];
-            expect(url).toContain('/persistent/threads');
+            expect(mockRouter.navigate).toHaveBeenCalledWith(
+                ['/sessions', '_creating'],
+                expect.objectContaining({state: expect.objectContaining({createBody: expect.any(Object)})})
+            );
         });
 
         it('should include title, config, and permission in body', async () => {
@@ -223,62 +222,57 @@ describe('SessionsPageComponent', () => {
             component.newConfig = 'developer';
             component.newPermission = 'autonomous';
 
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
-
             await component.createSession();
 
-            const body = mockHttp.post.mock.calls[0][1];
-            expect(body.title).toBe('My Session');
-            expect(body.config_name).toBe('developer');
-            expect(body.permission_mode).toBe('autonomous');
+            const state = mockRouter.navigate.mock.calls[0][1].state;
+            expect(state.createBody.title).toBe('My Session');
+            expect(state.createBody.config_name).toBe('developer');
+            expect(state.createBody.permission_mode).toBe('autonomous');
         });
 
         it('should use "Untitled Session" when title is empty', async () => {
             component.newTitle = '';
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
-            const body = mockHttp.post.mock.calls[0][1];
-            expect(body.title).toBe('Untitled Session');
+            const state = mockRouter.navigate.mock.calls[0][1].state;
+            expect(state.createBody.title).toBe('Untitled Session');
         });
 
         it('should include model when specified', async () => {
             component.newModel = 'gpt-5.4';
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
-            const body = mockHttp.post.mock.calls[0][1];
-            expect(body.model).toBe('gpt-5.4');
+            const state = mockRouter.navigate.mock.calls[0][1].state;
+            expect(state.createBody.model).toBe('gpt-5.4');
         });
 
         it('should NOT include model when empty', async () => {
             component.newModel = '';
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
-            const body = mockHttp.post.mock.calls[0][1];
-            expect(body.model).toBeUndefined();
+            const state = mockRouter.navigate.mock.calls[0][1].state;
+            expect(state.createBody.model).toBeUndefined();
         });
 
         it('should include project_ids when selected', async () => {
             component.selectedProjectIds.set(['proj-1', 'proj-2']);
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
-            const body = mockHttp.post.mock.calls[0][1];
-            expect(body.project_ids).toEqual(['proj-1', 'proj-2']);
+            const state = mockRouter.navigate.mock.calls[0][1].state;
+            expect(state.createBody.project_ids).toEqual(['proj-1', 'proj-2']);
         });
 
-        it('should navigate to new session on success', async () => {
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
-
+        it('should navigate to _creating route', async () => {
             await component.createSession();
 
-            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'new-123']);
+            expect(mockRouter.navigate).toHaveBeenCalledWith(
+                ['/sessions', '_creating'],
+                expect.any(Object)
+            );
         });
 
         it('should reset form state after creation', async () => {
@@ -286,8 +280,6 @@ describe('SessionsPageComponent', () => {
             component.newModel = 'gpt-5.4';
             component.selectedProjectIds.set(['proj-1']);
             component.showCreate = true;
-
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
 
             await component.createSession();
 
@@ -298,25 +290,16 @@ describe('SessionsPageComponent', () => {
         });
 
         it('should set creating signal during creation', async () => {
-            let resolvePost: (value: any) => void;
-            const postPromise = new Promise(r => {
-                resolvePost = r;
-            });
-            mockHttp.post.mockReturnValue(of({thread_id: 'new-123'}));
-
             await component.createSession();
 
             // After completion, creating should be false
             expect(component.creating()).toBe(false);
         });
 
-        it('should handle creation failure gracefully', async () => {
-            mockHttp.post.mockReturnValue(throwError(() => new Error('fail')));
-
+        it('should not make an HTTP POST (deferred to chat view)', async () => {
             await component.createSession();
 
-            expect(component.creating()).toBe(false);
-            expect(mockRouter.navigate).not.toHaveBeenCalled();
+            expect(mockHttp.post).not.toHaveBeenCalled();
         });
     });
 
