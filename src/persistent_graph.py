@@ -679,9 +679,7 @@ async def _execute_turn(
             )
             if refusal:
                 logger.warning("Model refusal: %s", refusal)
-                response_content = (
-                    f"⚠ The model declined to respond: {refusal}"
-                )
+                response_content = f"⚠ The model declined to respond: {refusal}"
                 await callbacks.on_token(response_content)
             else:
                 response_content = (

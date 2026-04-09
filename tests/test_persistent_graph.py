@@ -1767,8 +1767,7 @@ class TestLLMStreaming:
         )
 
         callbacks.on_token.assert_called_once_with(
-            "⚠ The model returned an empty response. "
-            "Please try again or switch models."
+            "⚠ The model returned an empty response. Please try again or switch models."
         )
 
     @pytest.mark.asyncio
@@ -1832,8 +1831,7 @@ class TestLLMStreaming:
         )
 
         callbacks.on_token.assert_called_once_with(
-            "⚠ The model returned an empty response. "
-            "Please try again or switch models."
+            "⚠ The model returned an empty response. Please try again or switch models."
         )
         assert result.error is None
 
