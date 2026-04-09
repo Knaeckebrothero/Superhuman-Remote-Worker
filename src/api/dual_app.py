@@ -892,6 +892,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     thread_id=thread_id,
                     config_override=request.get("config_override"),
                     project_ids=request.get("project_ids"),
+                    datasources=request.get("datasources"),
                 )
                 logger.info(f"Session setup complete for thread {thread_id}")
             except Exception:
