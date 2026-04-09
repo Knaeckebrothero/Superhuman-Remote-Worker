@@ -396,9 +396,7 @@ async def _attach_session(
 
         ws_mgr = _session.workspace_manager
         backend = ws_mgr.backend if hasattr(ws_mgr, "backend") else None
-        use_backend = backend is not None and getattr(
-            backend, "supports_shell", False
-        )
+        use_backend = backend is not None and getattr(backend, "supports_shell", False)
         for ds in repo_datasources:
             try:
                 name = _re.sub(
@@ -480,9 +478,7 @@ async def _attach_session(
                             repo_url,
                         )
 
-                elif (auth_method == "token" or not auth_method) and creds.get(
-                    "token"
-                ):
+                elif (auth_method == "token" or not auth_method) and creds.get("token"):
                     from urllib.parse import urlparse
 
                     parsed = urlparse(repo_url)
