@@ -122,9 +122,7 @@ class ContainerProvisioner:
 
             # Verify connectivity with a namespace-scoped call (works with
             # Role-based RBAC; the old list_namespace required ClusterRole)
-            api.list_namespaced_pod(
-                self._namespace, limit=1, _request_timeout=5
-            )
+            api.list_namespaced_pod(self._namespace, limit=1, _request_timeout=5)
 
             self._core_api = api
             self._k8s_available = True
