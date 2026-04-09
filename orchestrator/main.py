@@ -1092,7 +1092,7 @@ async def _find_idle_persistent_agent() -> Optional[dict]:
             SELECT id, pod_ip, pod_port, hostname, status, config_name
             FROM agents
             WHERE agent_mode IN ('persistent', 'dual')
-              AND status IN ('available', 'ready')
+              AND status IN ('ready')
               AND thread_id IS NULL
             ORDER BY last_heartbeat DESC
             LIMIT 1
