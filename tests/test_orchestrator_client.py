@@ -337,7 +337,7 @@ class TestCreateThread:
             pod_ip="10.0.0.5",
             pod_port=8001,
             hostname="test-agent",
-            config_name="interactive",
+            config_name="persistent_defaults",
             pid=12345,
         )
 
@@ -350,12 +350,12 @@ class TestCreateThread:
 
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.post = AsyncMock(return_value=mock_response)
-            await client.create_thread("interactive", "supervised", "My Session")
+            await client.create_thread("persistent_defaults", "supervised", "My Session")
 
             mock_http.post.assert_called_once_with(
                 "http://localhost:8085/api/agents/threads",
                 json={
-                    "config_name": "interactive",
+                    "config_name": "persistent_defaults",
                     "permission_mode": "supervised",
                     "title": "My Session",
                 },
@@ -415,7 +415,7 @@ class TestCreateThread:
 
     @pytest.mark.asyncio
     async def test_uses_default_args(self, client):
-        """Default args: config_name='interactive', permission_mode='supervised', title='Local Session'."""
+        """Default args: config_name='persistent_defaults', permission_mode='supervised', title='Local Session'."""
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {"thread_id": "tid-3"}
@@ -425,7 +425,7 @@ class TestCreateThread:
             await client.create_thread()
 
             call_payload = mock_http.post.call_args[1]["json"]
-            assert call_payload["config_name"] == "interactive"
+            assert call_payload["config_name"] == "persistent_defaults"
             assert call_payload["permission_mode"] == "supervised"
             assert call_payload["title"] == "Local Session"
 
@@ -440,7 +440,7 @@ class TestSaveThreadMessage:
             pod_ip="10.0.0.5",
             pod_port=8001,
             hostname="test-agent",
-            config_name="interactive",
+            config_name="persistent_defaults",
             pid=12345,
         )
 
@@ -538,7 +538,7 @@ class TestRequestThreadVmUpgrade:
             pod_ip="10.0.0.5",
             pod_port=8001,
             hostname="test-agent",
-            config_name="interactive",
+            config_name="persistent_defaults",
             pid=12345,
         )
 
@@ -632,7 +632,7 @@ class TestGetThreadWorkspace:
             pod_ip="10.0.0.5",
             pod_port=8001,
             hostname="test-agent",
-            config_name="interactive",
+            config_name="persistent_defaults",
             pid=12345,
         )
 

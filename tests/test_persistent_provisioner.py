@@ -375,7 +375,7 @@ class TestPodManifest:
         m = p._build_agent_pod_manifest(
             pod_name="persistent-test",
             thread_id="test-id",
-            config_name="interactive",
+            config_name="persistent_defaults",
             cpu_request="250m",
             memory_request="512Mi",
             cpu_limit="1000m",

@@ -15,6 +15,7 @@ data:
       window['env']['pgadminUrl'] = 'https://pgadmin.superhuman-remote-worker.com';
       window['env']['mongoExpressUrl'] = 'https://mongo.superhuman-remote-worker.com';
       window['env']['mcpUrl'] = 'https://mcp.superhuman-remote-worker.com/mcp';
+      window['env']['nextcloudUrl'] = 'https://cloud.superhuman-remote-worker.com';
 
       // Keycloak SSO
       window['env']['keycloakUrl'] = 'https://auth.superhuman-remote-worker.com';

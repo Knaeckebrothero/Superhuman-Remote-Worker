@@ -444,7 +444,7 @@ export class SessionCreateComponent implements OnInit {
     this.creating.set(true);
 
     const expert = this.selectedExpert();
-    const configName = expert?.id ?? 'interactive';
+    const configName = expert?.id ?? 'persistent_defaults';
     const projectIds = Array.from(this.selectedProjectIds());
 
     // Build config_override from settings component

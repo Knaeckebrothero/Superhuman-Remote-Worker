@@ -8184,7 +8184,7 @@ async def register_agent(registration: AgentRegistration) -> AgentRegistrationRe
 class AgentThreadCreateRequest(BaseModel):
     """Request from agent to create its own thread on startup."""
 
-    config_name: str = Field("interactive", description="Agent config name")
+    config_name: str = Field("persistent_defaults", description="Agent config name")
     permission_mode: str = Field("supervised", description="Permission mode")
     title: str = Field("Local Session", description="Session title")
 
@@ -8630,7 +8630,7 @@ async def create_thread(
             user_id=str(user["id"]),
             project_id=effective_project_ids[0] if effective_project_ids else None,
             config_name=request_body.config_name
-            or user_settings.get("config_name", "interactive"),
+            or user_settings.get("config_name", "persistent_defaults"),
             permission_mode=request_body.permission_mode,
             title=request_body.title,
         )
@@ -8714,7 +8714,7 @@ async def create_thread(
         if use_k8s_agent:
             # Kubernetes mode: create agent pod on demand, with pool fallback
             effective_config = request_body.config_name or user_settings.get(
-                "config_name", "interactive"
+                "config_name", "persistent_defaults"
             )
 
             async def _provision_or_assign(
@@ -8724,37 +8724,41 @@ async def create_thread(
                 pids: list,
                 ds_ids: list[str] | None,
             ) -> None:
+                # Try to attach an idle dual-mode agent from the warm pool
+                # first — this is instant (no image pull or pod boot needed).
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                        datasource_ids=ds_ids, project_ids=pids
+                    )
+                    ds_payload = _build_datasources_payload(resolved_ds)
+                    attach_co = co
+                    if resolved_ds:
+                        attach_co = _build_datasource_tool_override(resolved_ds, co)
+                    ok = await _send_session_attach(
+                        idle_agent, tid, attach_co, pids, datasources=ds_payload
+                    )
+                    if ok:
+                        logger.info(
+                            "Thread %s: attached to idle pool agent %s",
+                            tid,
+                            idle_agent["hostname"],
+                        )
+                        return
+
+                # No idle agent available — create a dedicated session pod.
                 pod_name = await agent_provisioner.provision_agent(
                     purpose="session", thread_id=tid, config_name=cfg
                 )
                 if pod_name:
                     return
 
-                # K8s provisioning failed (capacity, error, etc.) — try
-                # attaching an existing idle agent from the pool as fallback.
-                logger.warning(
-                    "Thread %s: K8s provisioning failed, trying pool fallback",
+                logger.error(
+                    "Thread %s: no idle agents and pod provisioning failed. "
+                    "Check image availability, RBAC, node resources, "
+                    "or increase MAX_AGENTS.",
                     tid,
                 )
-                resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                    datasource_ids=ds_ids, project_ids=pids
-                )
-                ds_payload = _build_datasources_payload(resolved_ds)
-                if resolved_ds:
-                    co = _build_datasource_tool_override(resolved_ds, co)
-
-                idle_agent = await _find_idle_persistent_agent()
-                if idle_agent:
-                    await _send_session_attach(
-                        idle_agent, tid, co, pids, datasources=ds_payload
-                    )
-                else:
-                    logger.error(
-                        "Thread %s: agent pod provisioning failed and "
-                        "no idle agents available. Check image availability, "
-                        "RBAC, node resources, or increase MAX_AGENTS.",
-                        tid,
-                    )
 
             asyncio.create_task(
                 _provision_or_assign(
@@ -9013,19 +9017,10 @@ async def resume_thread(
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:
-        config_name = thread.get("config_name", "interactive")
+        config_name = thread.get("config_name", "persistent_defaults")
 
         async def _reprovision(tid: str, cfg: str) -> None:
-            pod_name = await agent_provisioner.provision_agent(
-                purpose="session", thread_id=tid, config_name=cfg
-            )
-            if pod_name:
-                return
-            # K8s provisioning failed — try attaching an idle pool agent
-            logger.warning(
-                "Thread %s: resume provisioning failed, trying pool fallback",
-                tid,
-            )
+            # Try idle pool agent first (instant attach, no pod boot).
             idle_agent = await _find_idle_persistent_agent()
             if idle_agent:
                 co = thread.get("config_override") or {}
@@ -9041,19 +9036,32 @@ async def resume_thread(
                 ds_payload = _build_datasources_payload(resolved_ds)
                 if resolved_ds:
                     co = _build_datasource_tool_override(resolved_ds, co)
-                await _send_session_attach(
+                ok = await _send_session_attach(
                     idle_agent, tid, co, pids, datasources=ds_payload
                 )
-            else:
-                logger.error(
-                    "Thread %s: resume failed — no capacity and "
-                    "no idle agents available",
-                    tid,
-                )
+                if ok:
+                    logger.info(
+                        "Thread %s: resumed via idle pool agent %s",
+                        tid,
+                        idle_agent["hostname"],
+                    )
+                    return
+
+            # No idle agent — create a dedicated session pod.
+            pod_name = await agent_provisioner.provision_agent(
+                purpose="session", thread_id=tid, config_name=cfg
+            )
+            if pod_name:
+                return
+
+            logger.error(
+                "Thread %s: resume failed — no idle agents and pod provisioning failed",
+                tid,
+            )
 
         asyncio.create_task(_reprovision(thread_id, config_name))
     elif persistent_provisioner.is_available:
-        config_name = thread.get("config_name", "interactive")
+        config_name = thread.get("config_name", "persistent_defaults")
         asyncio.create_task(
             persistent_provisioner.create_agent_pod(thread_id, config_name=config_name)
         )
@@ -9296,7 +9304,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         if agent_provisioner.is_available:
             pod_status = await agent_provisioner.get_pod_status(thread_id)
             if not pod_status:
-                config_name = thread.get("config_name", "interactive")
+                config_name = thread.get("config_name", "persistent_defaults")
 
                 async def _ws_provision(tid: str, cfg: str) -> None:
                     await agent_provisioner.provision_agent(
@@ -9307,7 +9315,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         elif persistent_provisioner.is_available:
             pod_status = await persistent_provisioner.get_pod_status(thread_id)
             if not pod_status:
-                config_name = thread.get("config_name", "interactive")
+                config_name = thread.get("config_name", "persistent_defaults")
                 asyncio.create_task(
                     persistent_provisioner.create_agent_pod(
                         thread_id, config_name=config_name
@@ -9315,6 +9323,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                 )
 
         # Poll for agent registration (agent calls /api/agents/register on startup)
+        await ws.send_json({"method": "status", "params": {"phase": "provisioning"}})
         agent_bound = False
         for _ in range(90):  # 180s timeout
             await asyncio.sleep(2)
@@ -9339,6 +9348,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         return
 
     # Wait for agent readiness before proxying WS
+    await ws.send_json({"method": "status", "params": {"phase": "booting"}})
     agent_ready = False
     for _ in range(30):  # 60s timeout
         try:
@@ -9359,6 +9369,8 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
     if not agent_ready:
         await ws.close(code=4503, reason="Agent not ready within timeout")
         return
+
+    await ws.send_json({"method": "status", "params": {"phase": "connecting"}})
 
     upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
     logger.info(f"Proxying WS for thread {thread_id} to {upstream_url}")

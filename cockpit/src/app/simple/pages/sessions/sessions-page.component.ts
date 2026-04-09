@@ -58,8 +58,7 @@ interface Project {
           <div class="form-group">
             <label>Config</label>
             <select [(ngModel)]="newConfig">
-              <option value="interactive">Interactive (default)</option>
-              <option value="defaults">Framework Defaults</option>
+              <option value="persistent_defaults">Default</option>
               <option value="developer">Developer</option>
               <option value="scholar">Scholar</option>
             </select>
@@ -555,7 +554,7 @@ export class SessionsPageComponent implements OnInit {
 
     showCreate = false;
     newTitle = '';
-    newConfig = 'interactive';
+    newConfig = 'persistent_defaults';
     newModel = this.loadSavedSessionModel();
     newPermission = 'supervised';
 
@@ -658,10 +657,9 @@ export class SessionsPageComponent implements OnInit {
     }
 
     openSessionFiles(thread: Thread): void {
-        if (!thread.nc_session_folder) return;
-        const ncUrl = environment.nextcloudUrl || 'http://localhost:8800';
+        if (!thread.nc_session_folder || !environment.nextcloudUrl) return;
         const folderName = thread.nc_session_folder.split('/').pop();
-        window.open(`${ncUrl}/apps/files/?dir=/${folderName}`, '_blank');
+        window.open(`${environment.nextcloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     async endSession(thread: Thread): Promise<void> {

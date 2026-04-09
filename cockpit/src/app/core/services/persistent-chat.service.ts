@@ -82,6 +82,9 @@ export class PersistentChatService {
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
 
+    // --- Startup progress phase (sent by orchestrator while waiting for agent) ---
+    readonly startupPhase = signal<string | null>(null);
+
     // --- Pending message (submitted before session was ready) ---
     readonly pendingMessage = signal<string | null>(null);
 
@@ -109,6 +112,7 @@ export class PersistentChatService {
         this.error.set(null);
         this.historyLoaded.set(false);
         this.sessionReady.set(false);
+        this.startupPhase.set(null);
         this.pendingMessage.set(null);
         this.sessionTitle.set(null);
         this.modelName.set(null);
@@ -232,6 +236,7 @@ export class PersistentChatService {
         this.isStreaming.set(false);
         this.isWaitingForInput.set(false);
         this.sessionReady.set(false);
+        this.startupPhase.set(null);
         this.pendingMessage.set(null);
         this.pendingPermission.set(null);
         this.sessionTitle.set(null);
@@ -358,6 +363,11 @@ export class PersistentChatService {
         const params = data.params ?? {};
 
         switch (data.method) {
+            case 'status':
+                // Startup progress from orchestrator (provisioning → booting → connecting)
+                this.startupPhase.set((params['phase'] as string) || null);
+                break;
+
             case 'session.state':
                 // Sync client state with agent's current state on connect
                 if (params['permission_mode']) {
@@ -372,6 +382,9 @@ export class PersistentChatService {
                 if (params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
                 }
+                // session.state comes from the agent — implies agent is alive.
+                // Mark ready as fallback in case the 'ready' message is lost.
+                this.markSessionReady();
                 break;
 
             case 'greeting':

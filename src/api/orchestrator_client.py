@@ -175,7 +175,7 @@ class OrchestratorClient:
 
     async def create_thread(
         self,
-        config_name: str = "interactive",
+        config_name: str = "persistent_defaults",
         permission_mode: str = "supervised",
         title: str = "Local Session",
     ) -> str | None:
