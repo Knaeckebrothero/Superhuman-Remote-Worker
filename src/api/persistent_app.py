@@ -130,7 +130,7 @@ async def lifespan(app: FastAPI):
 
             # Start heartbeat
             def _heartbeat_status():
-                return "available" if _session is None else "ready"
+                return "ready" if _session is None else "session"
 
             _heartbeat_task = asyncio.create_task(
                 _orchestrator_client.run_heartbeat_loop(
