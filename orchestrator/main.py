@@ -9792,16 +9792,14 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     """Load full expert detail: merged config + instructions content."""
     config_dir = _get_config_dir()
 
-    # Load defaults
-    defaults_path = config_dir / "defaults.yaml"
-    if defaults_path.exists():
-        with open(defaults_path) as f:
-            defaults = yaml.safe_load(f) or {}
-    else:
-        defaults = {}
-
     # Load expert config
     if expert_id == "defaults":
+        defaults_path = config_dir / "defaults.yaml"
+        if defaults_path.exists():
+            with open(defaults_path) as f:
+                defaults = yaml.safe_load(f) or {}
+        else:
+            defaults = {}
         merged = dict(defaults)
         expert_config_dir = config_dir
     else:
@@ -9811,8 +9809,19 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
             return {}
         with open(config_path) as f:
             expert_data = yaml.safe_load(f) or {}
-        # Remove meta keys before merge
-        expert_data.pop("$extends", None)
+
+        # Resolve $extends to load the correct base config
+        # (e.g. persistent_defaults for interactive, defaults for worker experts)
+        extends_name = expert_data.pop("$extends", "defaults")
+        base_path = config_dir / f"{extends_name}.yaml"
+        if not base_path.exists():
+            base_path = config_dir / "defaults.yaml"
+        if base_path.exists():
+            with open(base_path) as f:
+                defaults = yaml.safe_load(f) or {}
+        else:
+            defaults = {}
+
         merged = _deep_merge(defaults, expert_data)
         expert_config_dir = expert_dir
 

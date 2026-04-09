@@ -192,10 +192,11 @@ class TestSetup:
 
     @pytest.mark.asyncio
     async def test_setup_calls_submethods_in_order(self):
-        """Verifies setup calls sub-methods: workspace → shell → tools → bind → context → prompt → memory.
+        """Verifies setup calls sub-methods: workspace → shell → knowledge → tools → bind → context → prompt → memory.
 
         Shell must come before tools so that create_shell_tools() sees a
         non-None shell_manager and includes run_command/shell_read.
+        Knowledge must come before tools so that has_knowledge() passes.
         """
         cfg = _make_config()
         session = _make_session(config=cfg)
@@ -214,6 +215,7 @@ class TestSetup:
                 new_callable=AsyncMock,
                 side_effect=track("workspace"),
             ),
+            patch.object(session, "_setup_knowledge", side_effect=track("knowledge")),
             patch.object(session, "_setup_tools", side_effect=track("tools")),
             patch.object(session, "_bind_tools", side_effect=track("bind")),
             patch.object(
@@ -231,6 +233,7 @@ class TestSetup:
         assert call_order == [
             "workspace",
             "shell",
+            "knowledge",
             "tools",
             "bind",
             "context",
