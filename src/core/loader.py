@@ -1843,22 +1843,21 @@ def _create_openai_llm(
     if config.top_k is not None:
         model_kwargs["top_k"] = config.top_k
 
-    # Build kwargs for ChatOpenAI
+    # Build kwargs for ChatOpenAI.
+    # Force Chat Completions API — LangChain auto-detects Responses API for
+    # gpt-5.*/o3/o4 models, but its streaming is broken for tool calls
+    # (https://github.com/langchain-ai/langchain/issues/34660, still open).
     llm_kwargs = {
         "model": config.model,
         "temperature": config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
+        "use_responses_api": False,
     }
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Add reasoning parameters.
-    # NOTE: We always use Chat Completions API (reasoning_effort in model_kwargs)
-    # rather than Responses API (reasoning={} top-level). LangChain's Responses API
-    # streaming is broken for tool calls — streamed tool_call args arrive as {}
-    # (see https://github.com/langchain-ai/langchain/issues/34660, still open).
-    # Chat Completions handles streaming + tool calls correctly.
+    # Reasoning via Chat Completions API (reasoning_effort in model_kwargs).
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
         level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
@@ -2247,7 +2246,12 @@ def _create_codex_llm(
     if config.top_k is not None:
         model_kwargs["top_k"] = config.top_k
 
-    # Build kwargs for ReasoningChatOpenAI
+    # Build kwargs for ReasoningChatOpenAI.
+    # The Codex proxy (CLIProxyAPI) only supports the Responses API endpoint
+    # (/v1/responses), NOT Chat Completions (/v1/chat/completions).
+    # We must use the Responses API here. LangChain's Responses API streaming
+    # has a known bug with tool call args (langchain-ai/langchain#34660),
+    # but the ainvoke workaround in persistent_graph.py handles this.
     llm_kwargs = {
         "model": model,
         "temperature": config.temperature,
@@ -2258,15 +2262,19 @@ def _create_codex_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Add reasoning parameters — proxy forwards to real OpenAI which supports them.
-    # NOTE: Always use Chat Completions API (reasoning_effort in model_kwargs)
-    # rather than Responses API. LangChain's Responses API streaming is broken
-    # for tool calls (https://github.com/langchain-ai/langchain/issues/34660).
+    # Reasoning via Responses API (required by Codex proxy).
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
         level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
-        model_kwargs["reasoning_effort"] = level
-        reasoning_mode = f"chat_completions(effort={level})"
+        if _should_use_reasoning_summary(model):
+            llm_kwargs["reasoning"] = {
+                "effort": level,
+                "summary": "auto",
+            }
+            reasoning_mode = f"responses_api(effort={level})"
+        else:
+            model_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"chat_completions(effort={level})"
 
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout

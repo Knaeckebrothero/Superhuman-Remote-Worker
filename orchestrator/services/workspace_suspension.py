@@ -30,6 +30,8 @@ class WorkspaceSuspensionService:
         self._db: Optional[Any] = None
         self._snapshot_service: Optional[Any] = None
         self._container_provisioner: Optional[Any] = None
+        self._docker_provisioner: Optional[Any] = None
+        self._vm_provisioner: Optional[Any] = None
         self._agent_provisioner: Optional[Any] = None
 
     def connect(
@@ -37,29 +39,48 @@ class WorkspaceSuspensionService:
         db: Any,
         snapshot_service: Any,
         container_provisioner: Any,
+        docker_provisioner: Any = None,
+        vm_provisioner: Any = None,
         agent_provisioner: Any = None,
     ) -> None:
         self._db = db
         self._snapshot_service = snapshot_service
         self._container_provisioner = container_provisioner
+        self._docker_provisioner = docker_provisioner
+        self._vm_provisioner = vm_provisioner
         self._agent_provisioner = agent_provisioner
 
         if self.is_enabled:
+            backends = []
+            if self._container_provisioner and self._container_provisioner.is_available:
+                backends.append("k8s")
+            if self._docker_provisioner and self._docker_provisioner.is_available:
+                backends.append("docker")
+            if self._vm_provisioner and self._vm_provisioner.is_available:
+                backends.append("vm")
             logger.info(
-                "Workspace suspension enabled (idle_timeout=%dm)",
+                "Workspace suspension enabled (idle_timeout=%dm, backends=%s)",
                 self.idle_timeout_minutes,
+                ",".join(backends),
             )
         else:
-            logger.info("Workspace suspension disabled (S3 or K8s unavailable)")
+            logger.info("Workspace suspension disabled (S3 or provisioner unavailable)")
 
     @property
     def is_enabled(self) -> bool:
-        """True only if container provisioner AND S3 snapshots are both available."""
+        """True if S3 snapshots and at least one provisioner are available."""
+        if not self._snapshot_service or not self._snapshot_service.is_available:
+            return False
         return (
-            self._container_provisioner is not None
-            and self._container_provisioner.is_available
-            and self._snapshot_service is not None
-            and self._snapshot_service.is_available
+            (
+                self._container_provisioner is not None
+                and self._container_provisioner.is_available
+            )
+            or (
+                self._docker_provisioner is not None
+                and self._docker_provisioner.is_available
+            )
+            or (self._vm_provisioner is not None and self._vm_provisioner.is_available)
         )
 
     @property
@@ -71,71 +92,108 @@ class WorkspaceSuspensionService:
     # =========================================================================
 
     async def suspend_workspace(self, job_id: str) -> bool:
-        """Capture snapshot to S3, then delete the workspace pod.
+        """Capture snapshot to S3, then tear down the workspace.
 
-        Returns True if snapshot + deletion succeeded.
-        On failure, reverts status to 'ready' and keeps the pod alive.
+        Dispatches to the correct provisioner based on workspace metadata:
+        - K8s container: snapshot → delete pod
+        - Docker Compose: snapshot → SSH reset (container stays alive)
+        - VM: snapshot → delete VM
+
+        Returns True if snapshot + teardown succeeded.
+        On failure, reverts status to 'ready' and keeps the workspace alive.
         """
         if not self.is_enabled or not self._db:
             return False
 
-        # Get current container context for pod IP
         job = await self._db.get_job(job_id)
         if not job:
             return False
 
         ctx = job.get("context") or {}
-        ws_ctx = ctx.get("workspace_container", {})
-        pod_ip = ws_ctx.get("pod_ip")
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
 
-        if not pod_ip or ws_ctx.get("status") != "ready":
+        ws_ctx = ctx.get("workspace_container", {})
+        vm_ctx = ctx.get("vm", {})
+        provisioner_type = ws_ctx.get("provisioner")
+
+        # Determine SSH host for snapshot
+        ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
+        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+
+        if not ssh_host:
+            return False
+
+        ws_status = ws_ctx.get("status") if ws_ctx else vm_ctx.get("status")
+        if ws_status != "ready":
             return False
 
         # Mark as suspending (prevents re-entry from sweeper)
-        await self._db.merge_workspace_container_context(
-            job_id, {"status": "suspending"}
-        )
+        if ws_ctx:
+            await self._db.merge_workspace_container_context(
+                job_id, {"status": "suspending"}
+            )
+        elif vm_ctx:
+            await self._db.merge_vm_context(job_id, {"status": "suspending"})
 
         try:
             # Capture environment to S3
+            source_type = "vm" if vm_ctx and not ws_ctx else "pod"
             ok = await self._snapshot_service.capture_vm_snapshot(
                 job_id=job_id,
-                ssh_host=pod_ip,
-                ssh_port=22,
-                source_type="pod",
+                ssh_host=ssh_host,
+                ssh_port=int(ssh_port),
+                source_type=source_type,
             )
             if not ok:
                 logger.warning(
-                    "Snapshot capture failed for job %s — keeping pod alive", job_id
+                    "Snapshot capture failed for job %s — keeping workspace alive",
+                    job_id,
                 )
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "ready"}
-                )
+                if ws_ctx:
+                    await self._db.merge_workspace_container_context(
+                        job_id, {"status": "ready"}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_vm_context(job_id, {"status": "ready"})
                 return False
 
-            # Delete the pod
-            await self._container_provisioner.delete_workspace(job_id)
+            # Tear down based on provisioner type
+            suspended_ctx: dict[str, Any] = {
+                "status": "suspended",
+                "suspended_at": datetime.now(timezone.utc).isoformat(),
+            }
 
-            # Mark as suspended
-            await self._db.merge_workspace_container_context(
-                job_id,
-                {
-                    "status": "suspended",
-                    "suspended_at": datetime.now(timezone.utc).isoformat(),
-                    "pod_ip": None,
-                    "pod_name": None,
-                },
-            )
+            if provisioner_type == "docker" and self._docker_provisioner:
+                await self._docker_provisioner._reset_workspace_via_ssh(
+                    ws_ctx.get("host", ""), int(ws_ctx.get("port", 22))
+                )
+                suspended_ctx.update({"pod_ip": None, "pod_name": None})
+                await self._db.merge_workspace_container_context(job_id, suspended_ctx)
+            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+                await self._vm_provisioner.delete_vm(job_id)
+                await self._db.merge_vm_context(job_id, suspended_ctx)
+            else:
+                # K8s container (default)
+                await self._container_provisioner.delete_workspace(job_id)
+                suspended_ctx.update({"pod_ip": None, "pod_name": None})
+                await self._db.merge_workspace_container_context(job_id, suspended_ctx)
+
             logger.info("Workspace suspended to S3 for job %s", job_id)
             return True
 
         except Exception:
             logger.exception("Failed to suspend workspace for job %s", job_id)
-            # Try to revert to ready so the sweeper can retry
             try:
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "ready"}
-                )
+                if ws_ctx:
+                    await self._db.merge_workspace_container_context(
+                        job_id, {"status": "ready"}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_vm_context(job_id, {"status": "ready"})
             except Exception:
                 pass
             return False
@@ -145,61 +203,137 @@ class WorkspaceSuspensionService:
     # =========================================================================
 
     async def restore_workspace(self, job_id: str) -> bool:
-        """Create a new pod and extract the S3 snapshot into it.
+        """Provision a fresh workspace and extract the S3 snapshot into it.
 
-        Returns True if pod creation + snapshot extraction succeeded.
+        Dispatches to the correct provisioner based on workspace metadata:
+        - K8s container: create pod → SSH extract
+        - Docker Compose: container already running → SSH extract
+        - VM: create VM → SSH extract
+
+        Returns True if provisioning + snapshot extraction succeeded.
         """
         if not self.is_enabled or not self._db:
             return False
 
-        await self._db.merge_workspace_container_context(
-            job_id, {"status": "restoring"}
-        )
+        job = await self._db.get_job(job_id)
+        if not job:
+            return False
+
+        ctx = job.get("context") or {}
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except (json.JSONDecodeError, TypeError):
+                ctx = {}
+
+        ws_ctx = ctx.get("workspace_container", {})
+        vm_ctx = ctx.get("vm", {})
+        provisioner_type = ws_ctx.get("provisioner")
+
+        if ws_ctx:
+            await self._db.merge_workspace_container_context(
+                job_id, {"status": "restoring"}
+            )
+        elif vm_ctx:
+            await self._db.merge_vm_context(job_id, {"status": "restoring"})
 
         try:
-            # Create a fresh pod (waits for readiness + IP)
-            ok = await self._container_provisioner.create_workspace(job_id)
-            if not ok:
-                logger.error("Failed to create pod for restore of job %s", job_id)
-                await self._db.merge_workspace_container_context(
-                    job_id,
-                    {"status": "failed", "error": "pod creation failed on restore"},
-                )
+            ssh_host = None
+
+            if provisioner_type == "docker" and self._docker_provisioner:
+                # Docker Compose: container is already running, just get its host
+                ssh_host = ws_ctx.get("host")
+                if not ssh_host:
+                    # Need to re-assign a workspace slot
+                    result = await self._docker_provisioner.assign_workspace(job_id)
+                    if not result:
+                        await self._db.merge_workspace_container_context(
+                            job_id,
+                            {
+                                "status": "failed",
+                                "error": "no workspace available for restore",
+                            },
+                        )
+                        return False
+                    ssh_host = result["host"]
+
+            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+                # VM: create a fresh VM
+                ok = await self._vm_provisioner.create_vm(job_id)
+                if not ok:
+                    logger.error("Failed to create VM for restore of job %s", job_id)
+                    await self._db.merge_vm_context(
+                        job_id,
+                        {"status": "failed", "error": "VM creation failed on restore"},
+                    )
+                    return False
+
+                # Re-read context to get SSH coordinates
+                job = await self._db.get_job(job_id)
+                vm_ctx = (job.get("context") or {}).get("vm", {})
+                ssh_host = vm_ctx.get("ssh_host")
+
+            else:
+                # K8s container (default): create a fresh pod
+                ok = await self._container_provisioner.create_workspace(job_id)
+                if not ok:
+                    logger.error("Failed to create pod for restore of job %s", job_id)
+                    await self._db.merge_workspace_container_context(
+                        job_id,
+                        {
+                            "status": "failed",
+                            "error": "pod creation failed on restore",
+                        },
+                    )
+                    return False
+
+                job = await self._db.get_job(job_id)
+                ws_ctx = (job.get("context") or {}).get("workspace_container", {})
+                ssh_host = ws_ctx.get("pod_ip")
+
+            if not ssh_host:
+                error_msg = "no SSH host after provisioning for restore"
+                logger.error("%s (job %s)", error_msg, job_id)
+                if ws_ctx:
+                    await self._db.merge_workspace_container_context(
+                        job_id, {"status": "failed", "error": error_msg}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_vm_context(
+                        job_id, {"status": "failed", "error": error_msg}
+                    )
                 return False
 
-            # Re-read context to get the new pod IP
-            job = await self._db.get_job(job_id)
-            ws_ctx = (job.get("context") or {}).get("workspace_container", {})
-            pod_ip = ws_ctx.get("pod_ip")
-
-            if not pod_ip:
-                logger.error("No pod IP after restore creation for job %s", job_id)
-                await self._db.merge_workspace_container_context(
-                    job_id, {"status": "failed", "error": "no pod IP after creation"}
-                )
-                return False
-
-            # Extract snapshot into the new pod
-            await self._extract_snapshot(job_id, pod_ip)
+            # Extract snapshot into the workspace
+            await self._extract_snapshot(job_id, ssh_host)
 
             # Mark as ready
-            await self._db.merge_workspace_container_context(
-                job_id,
-                {
-                    "status": "ready",
-                    "restored_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
+            restored_ctx = {
+                "status": "ready",
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if ws_ctx:
+                await self._db.merge_workspace_container_context(job_id, restored_ctx)
+            elif vm_ctx:
+                await self._db.merge_vm_context(job_id, restored_ctx)
+
             logger.info(
-                "Workspace restored from S3 for job %s (pod_ip=%s)", job_id, pod_ip
+                "Workspace restored from S3 for job %s (ssh_host=%s)",
+                job_id,
+                ssh_host,
             )
             return True
 
         except Exception:
             logger.exception("Failed to restore workspace for job %s", job_id)
-            await self._db.merge_workspace_container_context(
-                job_id, {"status": "failed", "error": "restore exception"}
-            )
+            if ws_ctx:
+                await self._db.merge_workspace_container_context(
+                    job_id, {"status": "failed", "error": "restore exception"}
+                )
+            elif vm_ctx:
+                await self._db.merge_vm_context(
+                    job_id, {"status": "failed", "error": "restore exception"}
+                )
             return False
 
     async def _extract_snapshot(
@@ -265,10 +399,12 @@ class WorkspaceSuspensionService:
     # =========================================================================
 
     async def suspend_thread_workspace(self, thread_id: str) -> bool:
-        """Capture thread workspace snapshot to S3, then delete the pod.
+        """Capture thread workspace snapshot to S3, then tear down.
 
-        Returns True if snapshot + deletion succeeded.
-        On failure, reverts status to 'ready' and keeps the pod alive.
+        Dispatches to the correct provisioner based on workspace metadata.
+
+        Returns True if snapshot + teardown succeeded.
+        On failure, reverts status to 'ready' and keeps the workspace alive.
         """
         if not self.is_enabled or not self._db:
             return False
@@ -284,136 +420,251 @@ class WorkspaceSuspensionService:
             except (ValueError, TypeError):
                 metadata = {}
         ws_ctx = metadata.get("workspace_container", {})
-        pod_ip = ws_ctx.get("pod_ip")
+        vm_ctx = metadata.get("vm", {})
+        provisioner_type = ws_ctx.get("provisioner")
 
-        if not pod_ip or ws_ctx.get("status") != "ready":
+        ssh_host = ws_ctx.get("pod_ip") or ws_ctx.get("host") or vm_ctx.get("ssh_host")
+        ssh_port = ws_ctx.get("port", vm_ctx.get("ssh_port", 22))
+
+        if not ssh_host:
             return False
 
-        await self._db.merge_thread_workspace_context(
-            thread_id, {"status": "suspending"}
-        )
+        ws_status = ws_ctx.get("status") if ws_ctx else vm_ctx.get("status")
+        if ws_status != "ready":
+            return False
+
+        if ws_ctx:
+            await self._db.merge_thread_workspace_context(
+                thread_id, {"status": "suspending"}
+            )
+        elif vm_ctx:
+            await self._db.merge_thread_vm_context(thread_id, {"status": "suspending"})
 
         try:
+            source_type = "vm" if vm_ctx and not ws_ctx else "pod"
             ok = await self._snapshot_service.capture_vm_snapshot(
                 job_id=thread_id,
-                ssh_host=pod_ip,
-                ssh_port=22,
-                source_type="pod",
+                ssh_host=ssh_host,
+                ssh_port=int(ssh_port),
+                source_type=source_type,
                 entity_type="threads",
             )
             if not ok:
                 logger.warning(
-                    "Snapshot capture failed for thread %s — keeping pod alive",
+                    "Snapshot capture failed for thread %s — keeping workspace alive",
                     thread_id,
                 )
-                await self._db.merge_thread_workspace_context(
-                    thread_id, {"status": "ready"}
-                )
+                if ws_ctx:
+                    await self._db.merge_thread_workspace_context(
+                        thread_id, {"status": "ready"}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_thread_vm_context(
+                        thread_id, {"status": "ready"}
+                    )
                 return False
 
-            await self._container_provisioner.delete_thread_workspace(thread_id)
+            # Tear down based on provisioner type
+            suspended_ctx: dict[str, Any] = {
+                "status": "suspended",
+                "suspended_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            if provisioner_type == "docker" and self._docker_provisioner:
+                await self._docker_provisioner._reset_workspace_via_ssh(
+                    ws_ctx.get("host", ""), int(ws_ctx.get("port", 22))
+                )
+                suspended_ctx.update({"pod_ip": None, "pod_name": None})
+                await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
+            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+                await self._vm_provisioner.delete_thread_vm(thread_id)
+                await self._db.merge_thread_vm_context(thread_id, suspended_ctx)
+            else:
+                await self._container_provisioner.delete_thread_workspace(thread_id)
+                suspended_ctx.update({"pod_ip": None, "pod_name": None})
+                await self._db.merge_thread_workspace_context(thread_id, suspended_ctx)
 
             # Also delete the agent pod (it's stateless, state is in the workspace)
             if self._agent_provisioner and self._agent_provisioner.is_available:
                 await self._agent_provisioner.delete_agent_pod_by_thread(thread_id)
 
-            await self._db.merge_thread_workspace_context(
-                thread_id,
-                {
-                    "status": "suspended",
-                    "suspended_at": datetime.now(timezone.utc).isoformat(),
-                    "pod_ip": None,
-                    "pod_name": None,
-                },
-            )
             logger.info("Workspace suspended to S3 for thread %s", thread_id)
             return True
 
         except Exception:
             logger.exception("Failed to suspend workspace for thread %s", thread_id)
             try:
-                await self._db.merge_thread_workspace_context(
-                    thread_id, {"status": "ready"}
-                )
+                if ws_ctx:
+                    await self._db.merge_thread_workspace_context(
+                        thread_id, {"status": "ready"}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_thread_vm_context(
+                        thread_id, {"status": "ready"}
+                    )
             except Exception:
                 pass
             return False
 
     async def restore_thread_workspace(self, thread_id: str) -> bool:
-        """Create a new pod and extract the S3 snapshot into it.
+        """Provision a fresh workspace and extract the S3 snapshot into it.
 
-        Returns True if pod creation + snapshot extraction succeeded.
+        Dispatches to the correct provisioner based on workspace metadata.
+
+        Returns True if provisioning + snapshot extraction succeeded.
         """
         if not self.is_enabled or not self._db:
             return False
 
-        await self._db.merge_thread_workspace_context(
-            thread_id, {"status": "restoring"}
-        )
+        thread = await self._db.get_thread(thread_id)
+        if not thread:
+            return False
+
+        metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (ValueError, TypeError):
+                metadata = {}
+
+        ws_ctx = metadata.get("workspace_container", {})
+        vm_ctx = metadata.get("vm", {})
+        provisioner_type = ws_ctx.get("provisioner")
+
+        if ws_ctx:
+            await self._db.merge_thread_workspace_context(
+                thread_id, {"status": "restoring"}
+            )
+        elif vm_ctx:
+            await self._db.merge_thread_vm_context(thread_id, {"status": "restoring"})
 
         try:
-            ok = await self._container_provisioner.create_thread_workspace(thread_id)
-            if not ok:
-                logger.error("Failed to create pod for restore of thread %s", thread_id)
-                await self._db.merge_thread_workspace_context(
-                    thread_id,
-                    {"status": "failed", "error": "pod creation failed on restore"},
+            ssh_host = None
+
+            if provisioner_type == "docker" and self._docker_provisioner:
+                # Docker: container already running, get its host
+                ssh_host = ws_ctx.get("host")
+                if not ssh_host:
+                    result = await self._docker_provisioner.assign_thread_workspace(
+                        thread_id
+                    )
+                    if not result:
+                        await self._db.merge_thread_workspace_context(
+                            thread_id,
+                            {
+                                "status": "failed",
+                                "error": "no workspace available for restore",
+                            },
+                        )
+                        return False
+                    ssh_host = result["host"]
+
+            elif vm_ctx and self._vm_provisioner and self._vm_provisioner.is_available:
+                ok = await self._vm_provisioner.create_thread_vm(thread_id)
+                if not ok:
+                    logger.error(
+                        "Failed to create VM for restore of thread %s", thread_id
+                    )
+                    await self._db.merge_thread_vm_context(
+                        thread_id,
+                        {
+                            "status": "failed",
+                            "error": "VM creation failed on restore",
+                        },
+                    )
+                    return False
+
+                thread = await self._db.get_thread(thread_id)
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (ValueError, TypeError):
+                        metadata = {}
+                vm_ctx = metadata.get("vm", {})
+                ssh_host = vm_ctx.get("ssh_host")
+
+            else:
+                # K8s container (default)
+                ok = await self._container_provisioner.create_thread_workspace(
+                    thread_id
                 )
+                if not ok:
+                    logger.error(
+                        "Failed to create pod for restore of thread %s", thread_id
+                    )
+                    await self._db.merge_thread_workspace_context(
+                        thread_id,
+                        {
+                            "status": "failed",
+                            "error": "pod creation failed on restore",
+                        },
+                    )
+                    return False
+
+                thread = await self._db.get_thread(thread_id)
+                metadata = thread.get("metadata") or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (ValueError, TypeError):
+                        metadata = {}
+                ws_ctx = metadata.get("workspace_container", {})
+                ssh_host = ws_ctx.get("pod_ip")
+
+            if not ssh_host:
+                error_msg = "no SSH host after provisioning for restore"
+                logger.error("%s (thread %s)", error_msg, thread_id)
+                if ws_ctx:
+                    await self._db.merge_thread_workspace_context(
+                        thread_id, {"status": "failed", "error": error_msg}
+                    )
+                elif vm_ctx:
+                    await self._db.merge_thread_vm_context(
+                        thread_id, {"status": "failed", "error": error_msg}
+                    )
                 return False
 
-            # Re-read to get new pod IP
-            thread = await self._db.get_thread(thread_id)
-            metadata = thread.get("metadata") or {}
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except (ValueError, TypeError):
-                    metadata = {}
-            ws_ctx = metadata.get("workspace_container", {})
-            pod_ip = ws_ctx.get("pod_ip")
+            # Extract snapshot into the workspace
+            await self._extract_snapshot(thread_id, ssh_host, entity_type="threads")
 
-            if not pod_ip:
-                logger.error(
-                    "No pod IP after restore creation for thread %s", thread_id
-                )
-                await self._db.merge_thread_workspace_context(
-                    thread_id, {"status": "failed", "error": "no pod IP after creation"}
-                )
-                return False
+            restored_ctx = {
+                "status": "ready",
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if ws_ctx:
+                await self._db.merge_thread_workspace_context(thread_id, restored_ctx)
+            elif vm_ctx:
+                await self._db.merge_thread_vm_context(thread_id, restored_ctx)
 
-            # Extract snapshot into the new pod
-            await self._extract_snapshot(thread_id, pod_ip, entity_type="threads")
-
-            await self._db.merge_thread_workspace_context(
-                thread_id,
-                {
-                    "status": "ready",
-                    "restored_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
             logger.info(
-                "Workspace restored from S3 for thread %s (pod_ip=%s)",
+                "Workspace restored from S3 for thread %s (ssh_host=%s)",
                 thread_id,
-                pod_ip,
+                ssh_host,
             )
             return True
 
         except Exception:
             logger.exception("Failed to restore workspace for thread %s", thread_id)
-            await self._db.merge_thread_workspace_context(
-                thread_id, {"status": "failed", "error": "restore exception"}
-            )
+            if ws_ctx:
+                await self._db.merge_thread_workspace_context(
+                    thread_id, {"status": "failed", "error": "restore exception"}
+                )
+            elif vm_ctx:
+                await self._db.merge_thread_vm_context(
+                    thread_id, {"status": "failed", "error": "restore exception"}
+                )
             return False
 
     async def check_idle_threads(self) -> int:
-        """Sweep idle thread workspace containers and suspend them.
+        """Sweep idle thread workspaces (containers + VMs) and suspend them.
 
-        A thread container is idle if:
+        A thread workspace is idle if:
         - Thread status is 'idle' (no active WebSocket)
-        - Workspace container status is 'ready'
+        - Workspace or VM status is 'ready'
         - last_activity is older than idle_timeout_minutes
 
-        Returns the count of containers suspended.
+        Returns the count of workspaces suspended.
         """
         if not self.is_enabled or not self._db:
             return 0
@@ -428,8 +679,11 @@ class WorkspaceSuspensionService:
                     """
                     SELECT id, metadata, last_activity
                     FROM threads
-                    WHERE metadata->'workspace_container'->>'status' = 'ready'
-                      AND status = 'idle'
+                    WHERE status = 'idle'
+                      AND (
+                          metadata->'workspace_container'->>'status' = 'ready'
+                          OR metadata->'vm'->>'status' = 'ready'
+                      )
                     """,
                 )
         except Exception:
@@ -463,13 +717,13 @@ class WorkspaceSuspensionService:
     # =========================================================================
 
     async def check_idle_all(self) -> int:
-        """Sweep all ready workspace containers and suspend idle ones.
+        """Sweep all ready workspaces (containers + VMs) and suspend idle ones.
 
-        A container is idle if:
+        A workspace is idle if:
         - The job is in paused/pending_review/waiting_for_reply status
         - last_activity (or updated_at) is older than idle_timeout_minutes
 
-        Returns the count of containers suspended.
+        Returns the count of workspaces suspended.
         """
         if not self.is_enabled or not self._db:
             return 0
@@ -484,12 +738,15 @@ class WorkspaceSuspensionService:
                     """
                     SELECT id, context, updated_at
                     FROM jobs
-                    WHERE context->'workspace_container'->>'status' = 'ready'
-                      AND status IN ('paused', 'pending_review', 'waiting_for_reply')
+                    WHERE status IN ('paused', 'pending_review', 'waiting_for_reply')
+                      AND (
+                          context->'workspace_container'->>'status' = 'ready'
+                          OR context->'vm'->>'status' = 'ready'
+                      )
                     """,
                 )
         except Exception:
-            logger.exception("Failed to query idle workspace containers")
+            logger.exception("Failed to query idle workspaces")
             return 0
 
         for row in rows:
@@ -502,10 +759,14 @@ class WorkspaceSuspensionService:
                     ctx = {}
             if not isinstance(ctx, dict):
                 ctx = {}
-            ws_ctx = ctx.get("workspace_container", {})
 
-            # Determine last activity time
-            last_activity_str = ws_ctx.get("last_activity")
+            # Check both workspace_container and vm contexts
+            ws_ctx = ctx.get("workspace_container", {})
+            vm_ctx = ctx.get("vm", {})
+            last_activity_str = ws_ctx.get("last_activity") or vm_ctx.get(
+                "last_activity"
+            )
+
             if last_activity_str:
                 try:
                     last_activity = datetime.fromisoformat(last_activity_str)
@@ -514,7 +775,6 @@ class WorkspaceSuspensionService:
             else:
                 last_activity = row.get("updated_at", now)
 
-            # Ensure timezone-aware
             if last_activity.tzinfo is None:
                 last_activity = last_activity.replace(tzinfo=timezone.utc)
 

@@ -83,7 +83,10 @@ claude-opus:
 gpt-5:
   temperature: 1.0  # Reasoning model: only default 1.0 is supported
   multimodal: true  # GPT-5 supports image inputs
-  parallel_tool_calls: true
+  # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+  # LangChain's Responses API streaming corrupts parallel tool call args,
+  # and the Codex proxy only supports the Responses API.
+  parallel_tool_calls: false
   model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
   limits:
     model_max_context_tokens: 200000
@@ -95,7 +98,10 @@ gpt-5:
 codex:
   temperature: 1.0  # Reasoning model: temperature effectively disabled
   multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
-  parallel_tool_calls: true
+  # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+  # LangChain's Responses API streaming corrupts parallel tool call args,
+  # and the Codex proxy only supports the Responses API.
+  parallel_tool_calls: false
   model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
   limits:
     model_max_context_tokens: 350000
@@ -107,7 +113,8 @@ codex:
 codex-spark:
   temperature: 1.0  # Reasoning model: temperature effectively disabled
   multimodal: false  # Codex Spark is code-focused, no vision
-  parallel_tool_calls: true
+  # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+  parallel_tool_calls: false
   model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
   limits:
     model_max_context_tokens: 110000

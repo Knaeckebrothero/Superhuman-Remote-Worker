@@ -94,6 +94,9 @@ export class PersistentChatService {
     // --- File undo ---
     readonly undoAvailable = signal(false);
 
+    // --- Creating state (thread being created via API before connect) ---
+    readonly isCreating = signal(false);
+
     // --- Error ---
     readonly error = signal<string | null>(null);
 
@@ -133,6 +136,31 @@ export class PersistentChatService {
         const url = `${wsBase}/ws/persistent/${threadId}`;
 
         this._connectWs(url);
+    }
+
+    /**
+     * Create a new persistent thread via REST, then connect.
+     * Sets isCreating=true immediately so the UI can show a spinner.
+     */
+    async createAndConnect(body: Record<string, any>): Promise<string> {
+        this.disconnect();
+        this.isCreating.set(true);
+        this.connectionState.set('connecting');
+        this.startupPhase.set('creating');
+        try {
+            const resp = await firstValueFrom(
+                this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
+            );
+            const threadId = resp.thread_id;
+            this.isCreating.set(false);
+            await this.connect(threadId);
+            return threadId;
+        } catch (e) {
+            this.isCreating.set(false);
+            this.connectionState.set('error');
+            this.startupPhase.set(null);
+            throw e;
+        }
     }
 
     /** Load message history from REST endpoint. */

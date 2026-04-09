@@ -614,35 +614,28 @@ export class SessionsPageComponent implements OnInit {
 
     async createSession(): Promise<void> {
         this.creating.set(true);
-        try {
-            const body: Record<string, any> = {
-                title: this.newTitle || 'Untitled Session',
-                config_name: this.newConfig,
-                permission_mode: this.newPermission,
-            };
-            if (this.newModel) {
-                body['model'] = this.newModel;
-                this.persistSessionModel(this.newModel);
-            }
-            if (this.selectedProjectIds().length > 0) {
-                body['project_ids'] = this.selectedProjectIds();
-            }
-            const data = await firstValueFrom(
-                this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
-            );
-            this.showCreate = false;
-            this.newTitle = '';
-            this.selectedProjectIds.set([]);
-            this.router.navigate(['/sessions', data.thread_id]);
-        } catch (e: any) {
-            console.error('Failed to create session:', e);
-            this.toast.error(e?.error?.detail || 'Failed to create session');
+        const body: Record<string, any> = {
+            title: this.newTitle || 'Untitled Session',
+            config_name: this.newConfig,
+            permission_mode: this.newPermission,
+        };
+        if (this.newModel) {
+            body['model'] = this.newModel;
+            this.persistSessionModel(this.newModel);
         }
+        if (this.selectedProjectIds().length > 0) {
+            body['project_ids'] = this.selectedProjectIds();
+        }
+        this.showCreate = false;
+        this.newTitle = '';
+        this.selectedProjectIds.set([]);
+        // Navigate immediately to chat view with spinner, create thread in background
+        this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
         this.creating.set(false);
     }
 
     async resumeSession(thread: Thread): Promise<void> {
-        if (thread.status === 'ended') {
+        if (thread.status === 'ended' || thread.status === 'idle') {
             try {
                 await firstValueFrom(
                     this.http.post(`${environment.apiUrl}/persistent/threads/${thread.id}/resume`, {})

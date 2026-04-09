@@ -295,6 +295,15 @@ class WorkspaceManager:
             return
 
         # No remote — standard path: create dirs, then git init
+        if self._backend_has_shell:
+            # Remote backend: workspace dir may have leftover files from a
+            # previous session (static container pool reuse). Clear it so
+            # the new session starts with a clean workspace.
+            self._backend.shell_run(
+                f"rm -rf {self._backend.root}/* {self._backend.root}/.[!.]* 2>/dev/null || true",
+                timeout=30,
+                tab_name="init",
+            )
         self._workspace_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Initialized workspace at {self._workspace_path}")
 
