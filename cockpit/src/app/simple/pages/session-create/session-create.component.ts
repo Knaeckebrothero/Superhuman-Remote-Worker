@@ -475,17 +475,8 @@ export class SessionCreateComponent implements OnInit {
     const dsIds = this.agentSettings?.getSelectedDatasourceIds() ?? [];
     if (dsIds.length > 0) body['datasource_ids'] = dsIds;
 
-    try {
-      const resp = await firstValueFrom(
-        this.http.post<{ thread_id: string }>(`${environment.apiUrl}/persistent/threads`, body)
-      );
-      if (resp?.thread_id) {
-        this.router.navigate(['/sessions', resp.thread_id]);
-      }
-    } catch (err: any) {
-      this.toast.error('Failed to create session: ' + (err.error?.detail || err.message));
-      this.creating.set(false);
-    }
+    // Navigate immediately to chat view with spinner, create thread in background
+    this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
   }
 
   cancel(): void {

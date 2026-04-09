@@ -234,20 +234,27 @@ const SLASH_COMMANDS: SlashCommand[] = [
         } @empty {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
-              <span class="empty-state-text">
-                @if (chat.sessionReady()) {
-                  Start a conversation...
-                } @else if (chat.isConnected()) {
-                  @switch (chat.startupPhase()) {
-                    @case ('provisioning') { Provisioning agent... }
-                    @case ('booting') { Agent starting... }
-                    @case ('connecting') { Connecting to agent... }
-                    @default { Session starting... }
-                  }
-                } @else {
-                  Connecting...
-                }
-              </span>
+              @if (chat.sessionReady()) {
+                <span class="empty-state-text">Start a conversation...</span>
+              } @else {
+                <div class="startup-spinner-container">
+                  <div class="startup-spinner"></div>
+                  <span class="startup-label">
+                    @if (chat.isCreating()) {
+                      Creating session...
+                    } @else if (chat.isConnected()) {
+                      @switch (chat.startupPhase()) {
+                        @case ('provisioning') { Provisioning agent... }
+                        @case ('booting') { Agent starting... }
+                        @case ('connecting') { Connecting to agent... }
+                        @default { Session starting... }
+                      }
+                    } @else {
+                      Connecting...
+                    }
+                  </span>
+                </div>
+              }
             </div>
           }
         }
@@ -758,6 +765,27 @@ const SLASH_COMMANDS: SlashCommand[] = [
         color: var(--text-muted, #6c7086);
         font-size: 14px;
         scrollbar-color: var(--border-color, #313244) transparent;
+      }
+
+      .startup-spinner-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .startup-spinner {
+        width: 32px;
+        height: 32px;
+        border: 3px solid var(--border-color, #313244);
+        border-top-color: var(--accent-color, #cba6f7);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      .startup-label {
+        color: var(--text-muted, #6c7086);
+        font-size: 13px;
       }
 
       .message {

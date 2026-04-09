@@ -2,6 +2,7 @@ import {Component, inject, OnDestroy, OnInit} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {PersistentChatComponent} from '../../../shared/components/persistent-chat/persistent-chat.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {ToastService} from '../../../core/services/toast.service';
 
 @Component({
     selector: 'app-chat-page',
@@ -21,11 +22,26 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly route = inject(ActivatedRoute);
     private readonly router = inject(Router);
     private readonly chat = inject(PersistentChatService);
+    private readonly toast = inject(ToastService);
 
     ngOnInit(): void {
         const threadId = this.route.snapshot.paramMap.get('threadId');
 
-        if (threadId) {
+        if (threadId === '_creating') {
+            // Navigate arrived before thread exists — create it now
+            const state = history.state as { createBody?: Record<string, any> };
+            if (state?.createBody) {
+                this.chat.createAndConnect(state.createBody).then(
+                    id => this.router.navigate(['/sessions', id], {replaceUrl: true}),
+                    err => {
+                        this.toast.error(err?.error?.detail || 'Failed to create session');
+                        this.router.navigate(['/sessions']);
+                    }
+                );
+            } else {
+                this.router.navigate(['/sessions']);
+            }
+        } else if (threadId) {
             // Already connected to this thread? Don't reconnect.
             if (this.chat.isConnected() && this.chat.threadId() === threadId) return;
 

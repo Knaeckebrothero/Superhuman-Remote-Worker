@@ -42,6 +42,7 @@ class ContainerProvisioner:
 
     def __init__(self):
         self._db: Optional[Any] = None
+        self._snapshot_service: Optional[Any] = None
         self._core_api: Optional[Any] = None
         self._k8s_available: bool = False
         self._in_cluster: bool = False
@@ -73,13 +74,19 @@ class ContainerProvisioner:
     # Lifecycle
     # =========================================================================
 
-    def connect(self, db: Any) -> None:
+    def connect(
+        self,
+        db: Any,
+        snapshot_service: Optional[Any] = None,
+    ) -> None:
         """Initialize the provisioner.
 
         Args:
             db: PostgresDB instance for job context updates.
+            snapshot_service: Optional SnapshotService for archival before deletion.
         """
         self._db = db
+        self._snapshot_service = snapshot_service
         self._init_k8s()
 
         if self._k8s_available:
@@ -268,6 +275,97 @@ class ContainerProvisioner:
         """
         pvc_name = f"pvc-workspace-{job_id[:12]}"
         return await self._delete_pvc(pvc_name)
+
+    async def release_workspace(self, job_id: str) -> bool:
+        """Snapshot a job workspace to S3, then delete the pod.
+
+        K8s pods use emptyDir so data dies with the pod. Snapshotting before
+        deletion enables resume support (a new pod can restore from S3).
+
+        Returns:
+            True if deletion succeeded (snapshot failure is non-fatal).
+        """
+        # Get pod IP for SSH-based snapshot
+        status = await self.get_workspace_status(job_id)
+        if (
+            self._snapshot_service
+            and self._snapshot_service.is_available
+            and status
+            and status.get("pod_ip")
+            and status.get("ready")
+        ):
+            try:
+                await self._snapshot_service.capture_vm_snapshot(
+                    job_id=job_id,
+                    ssh_host=status["pod_ip"],
+                    ssh_port=22,
+                    source_type="pod",
+                )
+                logger.info(
+                    "Workspace snapshot captured for job %s before release", job_id
+                )
+            except Exception:
+                logger.exception(
+                    "Workspace snapshot failed for job %s — deleting anyway", job_id
+                )
+
+        deleted = await self.delete_workspace(job_id)
+        await self.delete_workspace_pvc(job_id)
+        return deleted
+
+    async def release_thread_workspace(self, thread_id: str) -> bool:
+        """Snapshot a thread workspace to S3, then delete the pod.
+
+        Returns:
+            True if deletion succeeded (snapshot failure is non-fatal).
+        """
+        if not self._k8s_available:
+            return False
+
+        pod_name = f"ws-thread-{thread_id[:12]}"
+
+        # Get pod IP for snapshot
+        try:
+            pod = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+            )
+            pod_ip = pod.status.pod_ip
+            ready = pod.status.container_statuses and all(
+                cs.ready for cs in pod.status.container_statuses
+            )
+        except Exception:
+            pod_ip = None
+            ready = False
+
+        if (
+            self._snapshot_service
+            and self._snapshot_service.is_available
+            and pod_ip
+            and ready
+        ):
+            try:
+                await self._snapshot_service.capture_vm_snapshot(
+                    job_id=thread_id,
+                    ssh_host=pod_ip,
+                    ssh_port=22,
+                    source_type="pod",
+                    entity_type="threads",
+                )
+                logger.info(
+                    "Workspace snapshot captured for thread %s before release",
+                    thread_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Workspace snapshot failed for thread %s — deleting anyway",
+                    thread_id,
+                )
+
+        deleted = await self.delete_thread_workspace(thread_id)
+        await self.delete_thread_workspace_pvc(thread_id)
+        return deleted
 
     async def get_workspace_status(self, job_id: str) -> Optional[dict]:
         """Query the workspace container status.

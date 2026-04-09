@@ -2634,9 +2634,12 @@ class PostgresDB:
                    AND pd.project_id = ANY($2::uuid[])
                 WHERE d.id = ANY($1::uuid[])
                    OR pd.project_id IS NOT NULL
-                   OR NOT EXISTS (
-                       SELECT 1 FROM project_datasources pd2
-                       WHERE pd2.datasource_id = d.id
+                   OR (
+                       d.is_global = true
+                       AND NOT EXISTS (
+                           SELECT 1 FROM project_datasources pd2
+                           WHERE pd2.datasource_id = d.id
+                       )
                    )
                 ORDER BY d.type, d.name
                 """,

@@ -559,16 +559,16 @@ class TestCodexLLMCreation:
         assert call_kwargs["api_key"] == "sk-codex-test"
 
     @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_reasoning_uses_chat_completions_for_native_models(self, mock_chat):
-        """Native OpenAI reasoning models should use Chat Completions reasoning_effort."""
+    def test_reasoning_uses_responses_api_for_native_models(self, mock_chat):
+        """Native OpenAI reasoning models use Responses API (Codex proxy requires it)."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="codex/o3-pro", reasoning_level="high")
 
         _create_codex_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_reasoning_uses_chat_completions_for_proxy_models(self, mock_chat):
@@ -591,8 +591,7 @@ class TestCodexLLMCreation:
         _create_codex_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
 
     @patch.dict(os.environ, {"CODEX_API_KEY": "sk-key1,sk-key2"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
