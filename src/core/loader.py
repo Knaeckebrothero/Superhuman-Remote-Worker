@@ -769,6 +769,7 @@ class ToolsConfig:
     workspace: List[str] = field(default_factory=list)
     core: List[str] = field(default_factory=list)
     research: List[str] = field(default_factory=list)
+    browser_direct: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
     sql: List[str] = field(default_factory=list)
@@ -1213,6 +1214,7 @@ def load_agent_config(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         sql=tools_data.get("sql", []),
@@ -1221,6 +1223,7 @@ def load_agent_config(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        cloud=tools_data.get("cloud", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -1400,6 +1403,7 @@ def load_agent_config_from_dict(
         workspace=tools_data.get("workspace", []),
         core=tools_data.get("core", []),
         research=tools_data.get("research", []),
+        browser_direct=tools_data.get("browser_direct", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         sql=tools_data.get("sql", []),
@@ -1408,6 +1412,7 @@ def load_agent_config_from_dict(
         shell=tools_data.get("shell", tools_data.get("coding", [])),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        cloud=tools_data.get("cloud", []),
         delegation=tools_data.get("delegation", []),
         orchestrator=tools_data.get("orchestrator", []),
     )
@@ -2651,6 +2656,7 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.workspace
         + config.tools.core
         + config.tools.research
+        + config.tools.browser_direct
         + config.tools.citation
         + config.tools.graph
         + config.tools.sql

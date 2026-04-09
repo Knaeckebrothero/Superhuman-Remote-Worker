@@ -83,6 +83,7 @@ class PersistentSession:
     # Memory/knowledge stores (initialized during setup)
     recall_store: Optional[Any] = None
     knowledge_store: Optional[Any] = None
+    _knowledge_graph: Optional[Any] = None
     project_ids: List[str] = field(default_factory=list)
 
     # Raw LLM (without tools bound, for summarization fallback)
@@ -145,16 +146,20 @@ class PersistentSession:
         # 2. Set up shell manager BEFORE tools so shell tools can detect it
         self._setup_shell_manager()
 
-        # 3. Create tool context and load tools
+        # 3. Initialize knowledge base connections BEFORE tools so knowledge
+        #    tools can detect them via ToolContext.has_knowledge()
+        self._setup_knowledge(vector_conn)
+
+        # 4. Create tool context and load tools
         self._setup_tools(postgres_conn)
 
-        # 4. Bind tools to LLM
+        # 5. Bind tools to LLM
         self._bind_tools()
 
-        # 5. Create context manager
+        # 6. Create context manager
         self._setup_context_manager()
 
-        # 6. Build system prompt (interactive mode has its own prompt files)
+        # 7. Build system prompt (interactive mode has its own prompt files)
         self.system_prompt = get_phase_system_prompt(
             self.config,
             is_strategic=False,
@@ -163,7 +168,7 @@ class PersistentSession:
             prompt_type="interactive",
         )
 
-        # 7. Set up memory (RecallStore) if enabled
+        # 8. Set up memory (RecallStore) if enabled
         self._setup_memory(postgres_conn, vector_conn)
 
         logger.info(
@@ -301,6 +306,40 @@ class PersistentSession:
             except Exception as e:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
 
+    def _setup_knowledge(self, vector_conn: Optional[Any]) -> None:
+        """Initialize knowledge base connections (Neo4j + pgvector).
+
+        Must be called BEFORE _setup_tools() so that the ToolContext
+        has knowledge_graph and knowledge_store set, allowing knowledge
+        tools to pass the has_knowledge() guard in load_tools().
+
+        Mirrors the worker agent pattern in agent.py._setup_job_tools().
+        """
+        if not self.project_ids:
+            return  # No project context — knowledge base not applicable
+
+        try:
+            from src.services.knowledge_graph import KnowledgeGraphDB
+            from src.services.knowledge_store import KnowledgeStore
+            from src.services.embedding_service import get_embedding_service
+
+            kg = KnowledgeGraphDB()
+            if kg.connect():
+                embedding_service = get_embedding_service()
+                ks = KnowledgeStore(
+                    db=vector_conn,
+                    embedding_service=embedding_service,
+                )
+                self._knowledge_graph = kg
+                self.knowledge_store = ks
+                logger.info(
+                    f"Knowledge base initialized for project(s) {self.project_ids}"
+                )
+            else:
+                logger.warning("Failed to connect to Neo4j — knowledge tools disabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
+
     def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
         """Load tools from config, excluding phase-specific ones."""
         tool_config = {
@@ -324,7 +363,11 @@ class PersistentSession:
             _instruction_files=self.config.instruction_files,
             shell_manager=self.shell_manager,  # Set before tool loading
             session_task_manager=self.session_task_manager,
+            knowledge_graph=self._knowledge_graph,
+            knowledge_store=self.knowledge_store,
         )
+        if self.project_ids:
+            self.tool_context.project_ids = self.project_ids
 
         # Wire file checkpoint callback for undo support
         self.tool_context._snapshot_callback = lambda path: self.snapshot_file(
@@ -525,22 +568,20 @@ class PersistentSession:
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 
         # KnowledgeStore (knowledge injection, project-scoped)
-        try:
-            from src.services.embedding_service import get_embedding_service
-            from src.services.knowledge_store import KnowledgeStore
+        # Skip if already initialized by _setup_knowledge() (for tool loading)
+        if self.knowledge_store is None:
+            try:
+                from src.services.embedding_service import get_embedding_service
+                from src.services.knowledge_store import KnowledgeStore
 
-            embedding_service = get_embedding_service()
-            self.knowledge_store = KnowledgeStore(
-                db=vector_conn,
-                embedding_service=embedding_service,
-            )
-            logger.info("KnowledgeStore initialized for persistent session")
-        except Exception as e:
-            logger.warning(f"Failed to initialize KnowledgeStore (non-fatal): {e}")
-
-        # Set project_ids on tool_context for knowledge tools
-        if self.tool_context and self.project_ids:
-            self.tool_context.project_ids = self.project_ids
+                embedding_service = get_embedding_service()
+                self.knowledge_store = KnowledgeStore(
+                    db=vector_conn,
+                    embedding_service=embedding_service,
+                )
+                logger.info("KnowledgeStore initialized for persistent session")
+            except Exception as e:
+                logger.warning(f"Failed to initialize KnowledgeStore (non-fatal): {e}")
 
     def swap_backend(self, new_backend: Any) -> None:
         """Hot-swap workspace backend at runtime (e.g. container → VM).
@@ -606,6 +647,15 @@ class PersistentSession:
             close_datasource_connections(self.datasources, self._datasource_clients)
             self.datasources = {}
             self._datasource_clients = {}
+
+        # Close knowledge graph connection
+        if self._knowledge_graph:
+            try:
+                self._knowledge_graph.close()
+                logger.debug("Closed knowledge graph connection")
+            except Exception as e:
+                logger.warning(f"Error closing knowledge graph: {e}")
+            self._knowledge_graph = None
 
         # Disconnect remote backend if connected
         if self.workspace_manager:

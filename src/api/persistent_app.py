@@ -259,7 +259,6 @@ async def _attach_session(
         from ..core.datasource_setup import (
             inject_datasource_index as _inject_ds_index,
             process_datasources,
-            setup_repository_datasource,
         )
 
         # Separate repos (cloned later) from other datasources
@@ -388,12 +387,49 @@ async def _attach_session(
         git_remote_url=git_remote_url,
     )
 
-    # Clone repository datasources into the workspace (deferred from above)
+    # Clone repository datasources into the workspace (deferred from above).
+    # Uses GitManager.clone() with the workspace backend so that repos are
+    # cloned on the remote workspace container (not the agent pod).
     if repo_datasources and _session.workspace_manager:
-        ws_path = str(_session.workspace_manager.path)
+        from ..managers.git_manager import GitManager
+        import re as _re
+
+        ws_mgr = _session.workspace_manager
+        backend = ws_mgr.backend if hasattr(ws_mgr, "backend") else None
         for ds in repo_datasources:
             try:
-                setup_repository_datasource(ds, ws_path)
+                name = _re.sub(
+                    r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()
+                ).strip("-")
+                repo_url = ds.get("connection_url", "")
+                branch = ds.get("default_branch")
+                creds = ds.get("credentials") or {}
+
+                # Inject credentials into URL for token auth
+                if creds.get("auth_method") == "token" and creds.get("token"):
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(repo_url)
+                    repo_url = parsed._replace(
+                        netloc=f"oauth2:{creds['token']}@{parsed.hostname}"
+                        + (f":{parsed.port}" if parsed.port else "")
+                    ).geturl()
+
+                target = ws_mgr.path / "repos" / name
+                remote_cwd = f"repos/{name}"
+                git_mgr = GitManager.clone(
+                    repo_url,
+                    target,
+                    backend=backend,
+                    remote_cwd=remote_cwd,
+                )
+                if git_mgr:
+                    if branch:
+                        git_mgr.checkout_branch(branch)
+                    ws_mgr.source_repos[name] = git_mgr
+                    logger.info("Cloned repository datasource: %s", name)
+                else:
+                    logger.warning("Failed to clone repository datasource: %s", name)
             except Exception as e:
                 logger.warning(
                     "Failed to clone repository datasource %s: %s",
@@ -843,8 +879,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 except asyncio.TimeoutError:
                     logger.warning("AI message save timed out (5s) — proceeding")
 
-            # Auto-generate title after first turn (fire-and-forget)
-            if turn_id == 1 and _session.postgres_conn:
+            # Auto-generate title after first few turns (fire-and-forget).
+            # Retry on turns 1-3 in case the LLM is transiently unreachable.
+            if turn_id <= 3 and _session.postgres_conn:
                 asyncio.create_task(_auto_title_after_first_turn(ws))
 
             # Push workspace changes to Nextcloud (fire-and-forget)

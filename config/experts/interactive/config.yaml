@@ -57,4 +57,4 @@ workspace:
   structure:
     - documents/
     - notes/
-  git_versioning: false
+  git_versioning: true
