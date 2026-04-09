@@ -468,6 +468,32 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: AUTO_ASSIGN_ENABLED
+            # Agent pool sizing (AgentProvisioner)
+            - name: MAX_AGENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MAX_AGENTS
+            - name: MIN_AGENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MIN_AGENTS
+            - name: AGENT_BUFFER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: AGENT_BUFFER
+            - name: RESERVED_SESSION_SLOTS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: RESERVED_SESSION_SLOTS
+            - name: RESERVED_JOB_SLOTS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: RESERVED_JOB_SLOTS
             # Logging
             - name: LOG_LEVEL
               valueFrom:
