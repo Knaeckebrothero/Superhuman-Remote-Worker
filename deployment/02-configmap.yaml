@@ -16,7 +16,7 @@ data:
   MONGODB_URL: "mongodb://srw-mongodb:27017/srw_logs"
 
   # Gitea
-  GITEA_URL: "http://srw-gitea:3000"
+  GITEA_URL: "https://git.superhuman-remote-worker.com"
   GITEA_INTERNAL_URL: "http://srw-gitea:3000"
 
   # Orchestrator

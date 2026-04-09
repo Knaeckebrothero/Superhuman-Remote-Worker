@@ -8655,55 +8655,9 @@ async def create_thread(
                     json.dumps(metadata_patch),
                 )
 
-        # Create Gitea repo for workspace versioning
-        if not gitea_client.is_initialized and gitea_client.is_configured:
-            await gitea_client.ensure_initialized()
-        if gitea_client.is_initialized:
-            repo_name = f"thread-{thread_id[:8]}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id,
-                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
-                )
-                # Grant thread creator read access to the Gitea repo
-                if user.get("email"):
-                    try:
-                        await gitea_client.grant_user_repo_access(
-                            user["email"], repo_name
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to grant Gitea access for thread {thread_id}: {e}"
-                        )
-
-        # Provision Nextcloud session folder + share with user
-        if not nextcloud_admin.is_initialized and nextcloud_admin.is_configured:
-            await nextcloud_admin.ensure_initialized()
-        if nextcloud_admin.is_initialized:
-            try:
-                nc_folder = f"sessions/{thread_id[:8]}"
-                folder_ok = await nextcloud_admin.create_session_folder(nc_folder)
-                if folder_ok:
-                    share_id = None
-                    nc_username = await nextcloud_admin.resolve_nc_username(
-                        user.get("email"),
-                        user.get("display_name", "").lower(),
-                    )
-                    if nc_username:
-                        share_id = await nextcloud_admin.share_folder_with_user(
-                            nc_folder, nc_username
-                        )
-                    await postgres_db.update_thread_nextcloud(
-                        thread_id, nc_folder, share_id
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to provision Nextcloud session folder for "
-                    f"thread {thread_id}: {e}"
-                )
-
-        # Provision workspace container in background
+        # Provision workspace container + agent pod FIRST (non-blocking).
+        # Start image pull / pod creation immediately so it runs in parallel
+        # with the Gitea + Nextcloud setup below.
         # Same priority as dispatcher: in-cluster K8s → Docker Compose → kubeconfig K8s
         use_k8s = container_provisioner.is_available and (
             container_provisioner.in_cluster or not docker_provisioner.is_available
@@ -8855,6 +8809,63 @@ async def create_thread(
                 thread_id,
                 thread_id,
             )
+
+        # Run Gitea + Nextcloud setup in parallel (non-blocking services,
+        # independent of each other). This runs AFTER the workspace/agent
+        # tasks are already fired so image pull happens concurrently.
+        async def _setup_gitea() -> None:
+            if not gitea_client.is_initialized and gitea_client.is_configured:
+                await gitea_client.ensure_initialized()
+            if not gitea_client.is_initialized:
+                return
+            repo_name = f"thread-{thread_id[:8]}"
+            git_remote_url = await gitea_client.create_repo(repo_name)
+            if git_remote_url:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id,
+                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
+                )
+                if user.get("email"):
+                    try:
+                        await gitea_client.grant_user_repo_access(
+                            user["email"], repo_name
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to grant Gitea access for thread %s: %s",
+                            thread_id,
+                            e,
+                        )
+
+        async def _setup_nextcloud() -> None:
+            if not nextcloud_admin.is_initialized and nextcloud_admin.is_configured:
+                await nextcloud_admin.ensure_initialized()
+            if not nextcloud_admin.is_initialized:
+                return
+            try:
+                nc_folder = f"sessions/{thread_id[:8]}"
+                folder_ok = await nextcloud_admin.create_session_folder(nc_folder)
+                if folder_ok:
+                    share_id = None
+                    nc_username = await nextcloud_admin.resolve_nc_username(
+                        user.get("email"),
+                        user.get("display_name", "").lower(),
+                    )
+                    if nc_username:
+                        share_id = await nextcloud_admin.share_folder_with_user(
+                            nc_folder, nc_username
+                        )
+                    await postgres_db.update_thread_nextcloud(
+                        thread_id, nc_folder, share_id
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to provision Nextcloud session folder for thread %s: %s",
+                    thread_id,
+                    e,
+                )
+
+        await asyncio.gather(_setup_gitea(), _setup_nextcloud())
 
         return {"thread_id": thread_id, "status": "created"}
     except HTTPException:
