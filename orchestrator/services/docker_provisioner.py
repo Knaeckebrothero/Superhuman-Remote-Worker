@@ -15,6 +15,7 @@ Selection logic:
   - Empty / unset → disabled
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -217,11 +218,8 @@ class DockerProvisioner:
         Steps:
           1. Read the current workspace assignment from DB.
           2. Snapshot workspace to S3 (if snapshot service available).
-          3. Clear the ``workspace_container`` context from the job.
-
-        The actual container restart (to get a clean filesystem) is
-        handled separately — either by the orchestrator sending a
-        restart signal or by the next job's setup phase.
+          3. Reset workspace directory via SSH (clean slate for next job).
+          4. Mark the slot as released in DB.
 
         Returns:
             True if released successfully, False otherwise.
@@ -234,6 +232,7 @@ class DockerProvisioner:
             return False
 
         host = ctx.get("host", "unknown")
+        port = ctx.get("port", 22)
 
         # Snapshot to S3 before release (best-effort)
         if self._snapshot_service and self._snapshot_service.is_available:
@@ -241,7 +240,7 @@ class DockerProvisioner:
                 await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,
                     ssh_host=host,
-                    ssh_port=ctx.get("port", 22),
+                    ssh_port=port,
                     source_type="container",
                 )
                 logger.info(
@@ -257,6 +256,9 @@ class DockerProvisioner:
                     job_id,
                     host,
                 )
+
+        # Reset workspace directory via SSH (clean slate for next job)
+        await self._reset_workspace_via_ssh(host, port)
 
         # Mark workspace as released in DB
         await self._db.merge_workspace_container_context(
@@ -341,6 +343,7 @@ class DockerProvisioner:
             return False
 
         host = ctx.get("host", "unknown")
+        port = ctx.get("port", 22)
 
         # Snapshot before release (best-effort)
         if self._snapshot_service and self._snapshot_service.is_available:
@@ -348,7 +351,7 @@ class DockerProvisioner:
                 await self._snapshot_service.capture_vm_snapshot(
                     job_id=thread_id,
                     ssh_host=host,
-                    ssh_port=ctx.get("port", 22),
+                    ssh_port=port,
                     source_type="container",
                     entity_type="threads",
                 )
@@ -357,6 +360,9 @@ class DockerProvisioner:
                     "Docker provisioner: snapshot failed for thread %s",
                     thread_id,
                 )
+
+        # Reset workspace directory via SSH (clean slate for next session)
+        await self._reset_workspace_via_ssh(host, port)
 
         await self._db.merge_thread_workspace_context(
             thread_id, {"status": "released", "host": host}
@@ -409,6 +415,78 @@ class DockerProvisioner:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _reset_workspace_via_ssh(self, host: str, port: int) -> bool:
+        """Clear workspace directory via SSH after snapshot.
+
+        The orchestrator has no Docker socket access, so we use SSH to
+        remove stale files and recreate the workspace directory.
+
+        Returns:
+            True if the reset succeeded, False otherwise.
+        """
+        ssh_key = os.environ.get("SSH_KEY_PATH", "")
+        if not ssh_key:
+            logger.warning(
+                "Docker provisioner: SSH_KEY_PATH not set — cannot reset workspace on %s:%d",
+                host,
+                port,
+            )
+            return False
+
+        cmd = [
+            "ssh",
+            "-i",
+            ssh_key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            str(port),
+            f"agent-host@{host}",
+            "rm -rf ~/workspace/* ~/workspace/.[!.]* 2>/dev/null; mkdir -p ~/workspace",
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode == 0:
+                logger.info(
+                    "Docker provisioner: workspace reset via SSH on %s:%d",
+                    host,
+                    port,
+                )
+                return True
+            else:
+                logger.warning(
+                    "Docker provisioner: workspace reset failed on %s:%d (rc=%d): %s",
+                    host,
+                    port,
+                    proc.returncode,
+                    stderr.decode(errors="replace").strip() if stderr else "",
+                )
+                return False
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Docker provisioner: workspace reset timed out on %s:%d",
+                host,
+                port,
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Docker provisioner: workspace reset error on %s:%d", host, port
+            )
+            return False
 
     async def _get_occupied_keys(self, include_threads: bool = False) -> set[str]:
         """Return ``host:port`` keys for workspaces currently assigned to

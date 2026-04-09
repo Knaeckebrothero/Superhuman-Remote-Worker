@@ -56,6 +56,10 @@ def make_service(*, s3_available=True, k8s_available=True):
     svc = WorkspaceSuspensionService()
 
     mock_db = make_mock_db()
+    # Default get_job return — restore_workspace reads the job to detect
+    # provisioner type before dispatching.
+    mock_db.get_job.return_value = make_job()
+
     mock_snapshot = MagicMock()
     type(mock_snapshot).is_available = PropertyMock(return_value=s3_available)
     mock_snapshot.capture_vm_snapshot = AsyncMock(return_value=True)
@@ -65,6 +69,7 @@ def make_service(*, s3_available=True, k8s_available=True):
     type(mock_container).is_available = PropertyMock(return_value=k8s_available)
     mock_container.create_workspace = AsyncMock(return_value=True)
     mock_container.delete_workspace = AsyncMock(return_value=True)
+    mock_container.delete_workspace_pvc = AsyncMock(return_value=True)
 
     svc.connect(
         db=mock_db,

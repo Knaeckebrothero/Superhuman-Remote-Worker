@@ -1244,6 +1244,83 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+async def _archive_and_cleanup_workspace(
+    entity_id: str,
+    entity_type: str = "jobs",
+) -> list[str]:
+    """Snapshot workspace to S3, then delete container/VM.
+
+    Centralized cleanup for all workspace teardown paths (job completion,
+    cancellation, cascade cleanup, thread end). Each provisioner's release
+    method handles snapshot-before-delete internally.
+
+    Args:
+        entity_id: Job or thread UUID.
+        entity_type: "jobs" or "threads".
+
+    Returns:
+        List of action descriptions for logging.
+    """
+    actions: list[str] = []
+
+    if entity_type == "threads":
+        thread = await postgres_db.get_thread(entity_id)
+        if not thread:
+            return actions
+        metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        ws_ctx = metadata.get("workspace_container") or {}
+        vm_ctx = metadata.get("vm") or {}
+
+        # Workspace container cleanup (snapshot + delete)
+        if ws_ctx.get("status") not in ("deleted", "deleting", "released", None):
+            if ws_ctx.get("provisioner") == "docker":
+                await docker_provisioner.release_thread_workspace(entity_id)
+                actions.append("docker thread workspace released")
+            elif container_provisioner.is_available:
+                await container_provisioner.release_thread_workspace(entity_id)
+                actions.append("k8s thread workspace released")
+
+        # VM cleanup (snapshot + delete)
+        if vm_ctx.get("status") in ("provisioning", "created", "ready"):
+            if vm_provisioner.is_available:
+                await vm_provisioner.release_thread_vm(entity_id)
+                actions.append("thread vm released")
+
+    else:
+        job = await postgres_db.get_job(entity_id)
+        if not job:
+            return actions
+        ws_ctx = _get_container_context(job)
+        vm_ctx = _get_vm_context(job)
+
+        # VM cleanup (snapshot + delete)
+        if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+            if vm_provisioner.is_available:
+                await vm_provisioner.release_vm(entity_id)
+                actions.append("vm released")
+
+        # Workspace container cleanup (snapshot + delete)
+        if ws_ctx and ws_ctx.get("status") not in (
+            "deleted",
+            "deleting",
+            "released",
+            None,
+        ):
+            if ws_ctx.get("provisioner") == "docker":
+                await docker_provisioner.release_workspace(entity_id)
+                actions.append("docker workspace released")
+            else:
+                await container_provisioner.release_workspace(entity_id)
+                actions.append("k8s workspace released")
+
+    return actions
+
+
 def _detect_provider_from_model(model: str) -> str:
     """Detect LLM provider from a model name string.
 
@@ -2112,14 +2189,14 @@ async def lifespan(app: FastAPI):
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
 
-    # Initialize VM provisioner (uses NATS if available, else direct K8s)
-    vm_provisioner.connect(db=postgres_db)
-
-    # Initialize container provisioner for workspace containers (direct K8s)
-    container_provisioner.connect(db=postgres_db)
-
     # Initialize S3 snapshot service (graceful if S3 not configured)
     await snapshot_service.connect(db=postgres_db)
+
+    # Initialize VM provisioner (uses NATS if available, else direct K8s)
+    vm_provisioner.connect(db=postgres_db, snapshot_service=snapshot_service)
+
+    # Initialize container provisioner for workspace containers (direct K8s)
+    container_provisioner.connect(db=postgres_db, snapshot_service=snapshot_service)
 
     # Initialize Docker Compose provisioner (static workspace pool, used when k8s unavailable)
     docker_provisioner.connect(db=postgres_db, snapshot_service=snapshot_service)
@@ -2172,6 +2249,8 @@ async def lifespan(app: FastAPI):
         db=postgres_db,
         snapshot_service=snapshot_service,
         container_provisioner=container_provisioner,
+        docker_provisioner=docker_provisioner,
+        vm_provisioner=vm_provisioner,
         agent_provisioner=agent_provisioner,
     )
 
@@ -2894,25 +2973,12 @@ async def _cascade_cancel_to_children(job_id: str) -> None:
         if vm_ctx:
             try:
                 await vm_provisioner.send_control(child_id, "terminate")
-                if vm_ctx.get("status") not in ("deleted", "deleting"):
-                    await vm_provisioner.delete_vm(child_id)
             except Exception as e:
-                logger.warning(f"VM cleanup failed for child {child_id}: {e}")
-        ws_ctx = _get_container_context(child)
-        if ws_ctx and ws_ctx.get("status") not in (
-            "deleted",
-            "deleting",
-            "released",
-            None,
-        ):
-            try:
-                if ws_ctx.get("provisioner") == "docker":
-                    await docker_provisioner.release_workspace(child_id)
-                else:
-                    await container_provisioner.delete_workspace(child_id)
-                    await container_provisioner.delete_workspace_pvc(child_id)
-            except Exception as e:
-                logger.warning(f"Container cleanup failed for child {child_id}: {e}")
+                logger.warning(f"VM terminate signal failed for child {child_id}: {e}")
+        try:
+            await _archive_and_cleanup_workspace(child_id)
+        except Exception as e:
+            logger.warning(f"Workspace cleanup failed for child {child_id}: {e}")
 
     await asyncio.gather(
         *[_signal_cancel(c) for c in children],
@@ -3034,30 +3100,18 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                     # Agent might be unreachable — still cancel in DB
                     logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
-        # If job has a VM, send terminate and request deletion
-        vm_ctx = (
-            (job.get("context") or {}).get("vm")
-            if isinstance(job.get("context"), dict)
-            else None
-        )
+        # Send terminate signal to VM management daemon (if applicable)
+        vm_ctx = _get_vm_context(job)
         if vm_ctx:
             await vm_provisioner.send_control(job_id, "terminate")
-            if vm_ctx.get("status") not in ("deleted", "deleting"):
-                await vm_provisioner.delete_vm(job_id)
 
-        # If job has a workspace container, delete it (k8s) or release it (docker)
-        ws_container_ctx = _get_container_context(job)
-        if ws_container_ctx and ws_container_ctx.get("status") not in (
-            "deleted",
-            "deleting",
-            "released",
-            None,
-        ):
-            if ws_container_ctx.get("provisioner") == "docker":
-                await docker_provisioner.release_workspace(job_id)
-            else:
-                await container_provisioner.delete_workspace(job_id)
-                await container_provisioner.delete_workspace_pvc(job_id)
+        # Archive workspace (snapshot to S3) and clean up VM/container
+        try:
+            await _archive_and_cleanup_workspace(job_id)
+        except Exception as e:
+            logger.warning(
+                "Workspace cleanup failed for cancelled job %s: %s", job_id, e
+            )
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -6035,70 +6089,18 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
 
-        # 7. Capture environment snapshot to S3 (non-blocking)
-        if (
-            job.get("status") in ("completed", "failed")
-            and snapshot_service.is_available
-        ):
-            snapshot_on_failure = (
-                job.get("status") == "completed" or True
-            )  # on_failure=true by default
-            if snapshot_on_failure:
-                ctx = job.get("context") or {}
-                if isinstance(ctx, str):
-                    ctx = json.loads(ctx)
-                vm_ctx = ctx.get("vm", {})
-                ssh_host = vm_ctx.get("ssh_host")
-                ssh_port = vm_ctx.get("ssh_port")
-
-                if (
-                    ssh_host
-                    and ssh_port
-                    and vm_ctx.get("status") not in ("deleted", "deleting")
-                ):
-                    try:
-                        config_name = job.get("config_name") or "defaults"
-                        await snapshot_service.capture_vm_snapshot(
-                            job_id=job_id,
-                            ssh_host=ssh_host,
-                            ssh_port=int(ssh_port),
-                            source_type="vm",
-                            agent_config=config_name,
-                        )
-                        actions.append("snapshot captured")
-                    except Exception as e:
-                        logger.warning(
-                            f"Snapshot capture failed for job {job_id} (non-blocking): {e}"
-                        )
-                        actions.append(f"snapshot capture failed: {e}")
-
-        # 8. If job had a VM, request teardown
-        if job.get("status") in ("completed", "failed") and vm_provisioner.is_available:
-            vm_ctx = (
-                (job.get("context") or {}).get("vm")
-                if isinstance(job.get("context"), dict)
-                else None
-            )
-            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                await vm_provisioner.delete_vm(job_id)
-                actions.append("vm deletion requested")
-
-        # 9. If job had a workspace container, request teardown (k8s) or release (docker)
+        # 7. Archive workspace (snapshot to S3) and clean up VM/container
         if job.get("status") in ("completed", "failed"):
-            ws_container_ctx = _get_container_context(job)
-            if ws_container_ctx and ws_container_ctx.get("status") not in (
-                "deleted",
-                "deleting",
-                "released",
-                None,
-            ):
-                if ws_container_ctx.get("provisioner") == "docker":
-                    await docker_provisioner.release_workspace(job_id)
-                    actions.append("docker workspace released")
-                else:
-                    await container_provisioner.delete_workspace(job_id)
-                    await container_provisioner.delete_workspace_pvc(job_id)
-                    actions.append("workspace container deletion requested")
+            try:
+                cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                actions.extend(cleanup_actions)
+            except Exception as e:
+                logger.warning(
+                    "Workspace cleanup failed for job %s (non-blocking): %s",
+                    job_id,
+                    e,
+                )
+                actions.append(f"workspace cleanup failed: {e}")
 
         return {
             "status": "handled",
@@ -8937,23 +8939,11 @@ async def end_thread(
             metadata = {}
     ws_ctx = metadata.get("workspace_container") or {}
 
-    # Capture S3 snapshot before deleting workspace
-    ws_host = ws_ctx.get("pod_ip") or ws_ctx.get("host")
-    if snapshot_service.is_available and ws_host and ws_ctx.get("status") == "ready":
-        await snapshot_service.capture_vm_snapshot(
-            job_id=thread_id,
-            ssh_host=ws_host,
-            ssh_port=ws_ctx.get("port", 22),
-            source_type="pod",
-            entity_type="threads",
-        )
-
-    # Clean up workspace container if one was provisioned
-    if ws_ctx.get("provisioner") == "docker":
-        await docker_provisioner.release_thread_workspace(thread_id)
-    elif container_provisioner.is_available:
-        await container_provisioner.delete_thread_workspace(thread_id)
-        await container_provisioner.delete_thread_workspace_pvc(thread_id)
+    # Archive workspace (snapshot to S3) and clean up workspace container + VM
+    try:
+        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
+    except Exception as e:
+        logger.warning("Workspace cleanup failed for thread %s: %s", thread_id, e)
 
     # Clean up agent pod (unified provisioner, then legacy fallback)
     if agent_provisioner.is_available:
@@ -8961,12 +8951,6 @@ async def end_thread(
     elif persistent_provisioner.is_available:
         await persistent_provisioner.delete_agent_pod(thread_id)
         await persistent_provisioner.delete_agent_pvc(thread_id)
-
-    # Clean up VM if one was provisioned
-    vm_ctx = metadata.get("vm") or {}
-    if vm_ctx.get("status") in ("provisioning", "created", "ready"):
-        if vm_provisioner.is_available:
-            await vm_provisioner.delete_thread_vm(thread_id)
 
     # Clean up Gitea repo
     repo_name = ws_ctx.get("repo_name")
@@ -9299,19 +9283,68 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
             await ws.close(code=4503, reason="Failed to restore workspace")
             return
 
+    # If agent_id is set but the agent is offline, clear the stale binding
+    # so we can re-provision.  This handles the case where the desktop cockpit
+    # opens the WS directly (without calling the resume endpoint first).
+    if thread.get("agent_id"):
+        bound_agent = await postgres_db.get_agent(str(thread["agent_id"]))
+        if not bound_agent or bound_agent.get("status") == "offline":
+            logger.warning(
+                "Thread %s: bound agent %s is %s — clearing stale binding",
+                thread_id,
+                thread.get("agent_id"),
+                "missing" if not bound_agent else "offline",
+            )
+            await postgres_db.resume_thread(thread_id)
+            thread = await postgres_db.get_thread(thread_id)
+
     if not thread.get("agent_id"):
-        # On-demand: provision agent pod if needed, then wait for registration
+        # On-demand: try idle pool agent first (instant), then new pod.
         if agent_provisioner.is_available:
-            pod_status = await agent_provisioner.get_pod_status(thread_id)
-            if not pod_status:
-                config_name = thread.get("config_name", "persistent_defaults")
+            config_name = thread.get("config_name", "persistent_defaults")
 
-                async def _ws_provision(tid: str, cfg: str) -> None:
-                    await agent_provisioner.provision_agent(
-                        purpose="session", thread_id=tid, config_name=cfg
+            async def _ws_provision(
+                tid: str,
+                cfg: str,
+                thr: dict,
+            ) -> None:
+                # Pool-first: attach an idle dual-mode agent (no boot).
+                idle_agent = await _find_idle_persistent_agent()
+                if idle_agent:
+                    co = thr.get("config_override") or {}
+                    if isinstance(co, str):
+                        try:
+                            co = json.loads(co)
+                        except (json.JSONDecodeError, TypeError):
+                            co = {}
+                    pids = thr.get("project_ids") or []
+                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
+                        project_ids=pids
                     )
+                    ds_payload = _build_datasources_payload(resolved_ds)
+                    if resolved_ds:
+                        co = _build_datasource_tool_override(resolved_ds, co)
+                    ok = await _send_session_attach(
+                        idle_agent,
+                        tid,
+                        co,
+                        pids,
+                        datasources=ds_payload,
+                    )
+                    if ok:
+                        logger.info(
+                            "Thread %s: WS attached to idle pool agent %s",
+                            tid,
+                            idle_agent["hostname"],
+                        )
+                        return
 
-                asyncio.create_task(_ws_provision(thread_id, config_name))
+                # Fallback: create a dedicated session pod.
+                await agent_provisioner.provision_agent(
+                    purpose="session", thread_id=tid, config_name=cfg
+                )
+
+            asyncio.create_task(_ws_provision(thread_id, config_name, thread))
         elif persistent_provisioner.is_available:
             pod_status = await persistent_provisioner.get_pod_status(thread_id)
             if not pod_status:

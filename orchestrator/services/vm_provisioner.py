@@ -42,6 +42,19 @@ KUBEVIRT_VERSION = "v1"
 KUBEVIRT_PLURAL = "virtualmachines"
 
 
+def _extract_vm_context(job: dict) -> dict:
+    """Extract the vm sub-dict from a job's context."""
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        import json
+
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    return ctx.get("vm", {})
+
+
 class VMProvisioner:
     """Unified VM provisioner with automatic backend selection.
 
@@ -53,6 +66,7 @@ class VMProvisioner:
 
     def __init__(self):
         self._db: Optional[Any] = None
+        self._snapshot_service: Optional[Any] = None
         self._k8s: Optional[Any] = None
         self._k8s_available: bool = False
         self._template_text: str = ""
@@ -89,13 +103,19 @@ class VMProvisioner:
     # Lifecycle
     # =========================================================================
 
-    def connect(self, db: Any) -> None:
+    def connect(
+        self,
+        db: Any,
+        snapshot_service: Optional[Any] = None,
+    ) -> None:
         """Initialize the provisioner.
 
         Args:
             db: PostgresDB instance for job context updates.
+            snapshot_service: Optional SnapshotService for archival before deletion.
         """
         self._db = db
+        self._snapshot_service = snapshot_service
         self._init_k8s()
 
         if self._k8s_available:
@@ -244,6 +264,112 @@ class VMProvisioner:
             return await self._delete_direct(job_id)
 
         return False
+
+    async def release_vm(
+        self,
+        job_id: str,
+        ssh_host: Optional[str] = None,
+        ssh_port: Optional[int] = None,
+    ) -> bool:
+        """Snapshot a job VM to S3, then delete it.
+
+        Args:
+            job_id: Job UUID.
+            ssh_host: SSH host for snapshot (read from DB context if omitted).
+            ssh_port: SSH port for snapshot (read from DB context if omitted).
+
+        Returns:
+            True if deletion succeeded (snapshot failure is non-fatal).
+        """
+        # Resolve SSH coordinates from DB if not provided
+        if not ssh_host and self._db:
+            try:
+                job = await self._db.get_job(job_id)
+                if job:
+                    vm_ctx = _extract_vm_context(job)
+                    ssh_host = ssh_host or vm_ctx.get("ssh_host")
+                    ssh_port = ssh_port or vm_ctx.get("ssh_port")
+            except Exception:
+                logger.debug("Could not read VM context for job %s", job_id)
+
+        # Snapshot before delete (best-effort)
+        if (
+            self._snapshot_service
+            and self._snapshot_service.is_available
+            and ssh_host
+            and ssh_port
+        ):
+            try:
+                await self._snapshot_service.capture_vm_snapshot(
+                    job_id=job_id,
+                    ssh_host=ssh_host,
+                    ssh_port=int(ssh_port),
+                    source_type="vm",
+                )
+                logger.info("VM snapshot captured for job %s before release", job_id)
+            except Exception:
+                logger.exception(
+                    "VM snapshot failed for job %s — deleting anyway", job_id
+                )
+
+        return await self.delete_vm(job_id)
+
+    async def release_thread_vm(
+        self,
+        thread_id: str,
+        ssh_host: Optional[str] = None,
+        ssh_port: Optional[int] = None,
+    ) -> bool:
+        """Snapshot a thread VM to S3, then delete it.
+
+        Args:
+            thread_id: Thread UUID.
+            ssh_host: SSH host for snapshot (read from DB if omitted).
+            ssh_port: SSH port for snapshot (read from DB if omitted).
+
+        Returns:
+            True if deletion succeeded (snapshot failure is non-fatal).
+        """
+        # Resolve SSH coordinates from DB if not provided
+        if not ssh_host and self._db:
+            try:
+                thread = await self._db.get_thread(thread_id)
+                if thread:
+                    metadata = thread.get("metadata") or {}
+                    if isinstance(metadata, str):
+                        import json
+
+                        metadata = json.loads(metadata)
+                    vm_ctx = metadata.get("vm") or {}
+                    ssh_host = ssh_host or vm_ctx.get("ssh_host")
+                    ssh_port = ssh_port or vm_ctx.get("ssh_port")
+            except Exception:
+                logger.debug("Could not read VM context for thread %s", thread_id)
+
+        # Snapshot before delete (best-effort)
+        if (
+            self._snapshot_service
+            and self._snapshot_service.is_available
+            and ssh_host
+            and ssh_port
+        ):
+            try:
+                await self._snapshot_service.capture_vm_snapshot(
+                    job_id=thread_id,
+                    ssh_host=ssh_host,
+                    ssh_port=int(ssh_port),
+                    source_type="vm",
+                    entity_type="threads",
+                )
+                logger.info(
+                    "VM snapshot captured for thread %s before release", thread_id
+                )
+            except Exception:
+                logger.exception(
+                    "VM snapshot failed for thread %s — deleting anyway", thread_id
+                )
+
+        return await self.delete_thread_vm(thread_id)
 
     async def query_status(self, job_id: str, timeout: float = 5.0) -> Optional[dict]:
         """Query live VM status.

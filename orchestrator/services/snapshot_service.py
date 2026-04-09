@@ -283,12 +283,16 @@ class SnapshotService:
                 "/usr/local/",
             ]
             exclude_patterns = [
+                # System/build caches
                 "--exclude=/var/cache/*",
                 "--exclude=/tmp/*",
                 "--exclude=*.pyc",
                 "--exclude=__pycache__",
                 "--exclude=node_modules/.cache",
                 "--exclude=.git/objects",
+                # Workspace content re-cloned/regenerated on restore
+                "--exclude=*/repos/*",
+                "--exclude=*/node_modules/*",
             ]
 
             # Build SSH tar command
