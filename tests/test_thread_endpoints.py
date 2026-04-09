@@ -1245,14 +1245,18 @@ class TestInspectSessionEvent:
     def test_broadcasts_ready_as_session_waiting(self):
         broadcast = MagicMock()
         raw = json.dumps({"method": "ready"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
+        inspect_session_event(
+            raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast
+        )
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["event_type"] == "session.waiting"
 
     def test_ignores_non_notify_methods(self):
         broadcast = MagicMock()
         raw = json.dumps({"method": "text.delta"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
+        inspect_session_event(
+            raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast
+        )
         broadcast.assert_not_called()
 
     def test_ignores_invalid_json(self):
@@ -1266,7 +1270,9 @@ class TestInspectSessionEvent:
         """params defaults to {} when absent."""
         broadcast = MagicMock()
         raw = json.dumps({"method": "permission.request"})
-        inspect_session_event(raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast)
+        inspect_session_event(
+            raw, "tid-1", "user-1", "Title", "persistent_defaults", broadcast
+        )
         call_kwargs = broadcast.call_args[1]
         assert call_kwargs["data"]["tool"] is None
         assert call_kwargs["data"]["args"] is None

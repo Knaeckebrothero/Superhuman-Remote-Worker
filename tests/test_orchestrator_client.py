@@ -350,7 +350,9 @@ class TestCreateThread:
 
         with patch.object(client, "_client", AsyncMock()) as mock_http:
             mock_http.post = AsyncMock(return_value=mock_response)
-            await client.create_thread("persistent_defaults", "supervised", "My Session")
+            await client.create_thread(
+                "persistent_defaults", "supervised", "My Session"
+            )
 
             mock_http.post.assert_called_once_with(
                 "http://localhost:8085/api/agents/threads",
