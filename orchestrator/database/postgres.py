@@ -1519,6 +1519,7 @@ class PostgresDB:
         pid: int | None = None,
         agent_mode: str = "worker",
         thread_id: str | None = None,
+        build_sha: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -1573,7 +1574,8 @@ class PostgresDB:
                             last_heartbeat = CURRENT_TIMESTAMP,
                             registered_at = CURRENT_TIMESTAMP,
                             agent_mode    = $6,
-                            thread_id     = $7
+                            thread_id     = $7,
+                            metadata = COALESCE(metadata, '{}') || $8::jsonb
                         WHERE id = $5
                         """,
                         pod_ip,
@@ -1583,6 +1585,7 @@ class PostgresDB:
                         agent_id,
                         agent_mode,
                         thread_id,
+                        json.dumps({"build_sha": build_sha or ""}),
                     )
                     return {
                         "agent_id": str(agent_id),
@@ -1592,8 +1595,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
                 RETURNING id
                 """,
                 config_name,
@@ -1603,6 +1606,7 @@ class PostgresDB:
                 pid,
                 agent_mode,
                 thread_id,
+                json.dumps({"build_sha": build_sha or ""}),
             )
 
             return {
