@@ -234,12 +234,12 @@ class TestFormatCreatedThread:
     def test_shows_thread_id(self):
         result = self.fmt(
             {"thread_id": "abc-123", "status": "created"},
-            config_name="interactive",
+            config_name="persistent_defaults",
             title="My Session",
         )
         assert "abc-123" in result
         assert "My Session" in result
-        assert "interactive" in result
+        assert "persistent_defaults" in result
         assert "created" in result
 
     def test_includes_usage_hint(self):
@@ -401,7 +401,7 @@ class TestAsyncCockpitClientPersistentThreads:
 
         with patch.object(client._client, "post", AsyncMock(return_value=resp)) as mock:
             await client.create_persistent_thread(
-                config_name="interactive",
+                config_name="persistent_defaults",
                 title="Research Session",
                 permission_mode="autonomous",
                 project_id="proj-1",
@@ -411,7 +411,7 @@ class TestAsyncCockpitClientPersistentThreads:
             )
 
             body = mock.call_args[1]["json"]
-            assert body["config_name"] == "interactive"
+            assert body["config_name"] == "persistent_defaults"
             assert body["title"] == "Research Session"
             assert body["permission_mode"] == "autonomous"
             assert body["project_id"] == "proj-1"

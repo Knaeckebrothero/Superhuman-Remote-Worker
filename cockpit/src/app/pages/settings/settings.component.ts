@@ -1,6 +1,7 @@
 import {Component, effect, inject, OnInit, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {Router} from '@angular/router';
+import {environment} from '../../core/environment';
 import {McpTokenService} from '../../core/services/mcp-token.service';
 import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
@@ -247,11 +248,9 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               <div>
                 <label class="field-label">Config</label>
                 <select class="form-input" [(ngModel)]="paConfigName">
-                  <option value="">Default (interactive)</option>
-                  <option value="interactive">Interactive</option>
+                  <option value="">Default</option>
                   <option value="developer">Developer</option>
                   <option value="scholar">Scholar</option>
-                  <option value="defaults">Framework Defaults</option>
                 </select>
               </div>
             </div>
@@ -1287,7 +1286,7 @@ export class SettingsComponent implements OnInit {
 
   mcpJsonSnippet = () => {
     const token = this.newToken()?.token ?? 'srw_YOUR_TOKEN_HERE';
-    const mcpUrl = (window as any)['env']?.['mcpUrl'] || 'http://localhost:8055/mcp';
+    const mcpUrl = environment.mcpUrl;
     return JSON.stringify(
       {
         mcpServers: {
@@ -1306,7 +1305,7 @@ export class SettingsComponent implements OnInit {
   };
 
   mcpServerUrl = () => {
-    return (window as any)['env']?.['mcpUrl'] || 'http://localhost:8055/mcp';
+    return environment.mcpUrl;
   };
 
   copyText(text: string, target: string = 'snippet'): void {

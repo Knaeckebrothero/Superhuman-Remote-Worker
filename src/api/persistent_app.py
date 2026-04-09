@@ -106,9 +106,9 @@ async def lifespan(app: FastAPI):
                 # Dedicated mode: auto-create thread if needed (backwards compatible)
                 if _thread_id is None:
                     created_id = await _orchestrator_client.create_thread(
-                        config_name=_config_path or "interactive",
+                        config_name=_config_path or "persistent_defaults",
                         permission_mode=_agent.config.interactive.permission_mode,
-                        title=f"Local Session ({_config_path or 'interactive'})",
+                        title=f"Local Session ({_config_path or 'persistent_defaults'})",
                     )
                     if created_id:
                         _thread_id = created_id
@@ -396,6 +396,9 @@ async def _attach_session(
 
         ws_mgr = _session.workspace_manager
         backend = ws_mgr.backend if hasattr(ws_mgr, "backend") else None
+        use_backend = backend is not None and getattr(
+            backend, "supports_shell", False
+        )
         for ds in repo_datasources:
             try:
                 name = _re.sub(
@@ -405,8 +408,81 @@ async def _attach_session(
                 branch = ds.get("default_branch")
                 creds = ds.get("credentials") or {}
 
-                # Inject credentials into URL for token auth
-                if creds.get("auth_method") == "token" and creds.get("token"):
+                # Determine auth method: explicit field, or infer from
+                # credentials keys (ssh_key present → ssh).
+                auth_method = creds.get("auth_method")
+                if not auth_method:
+                    if creds.get("ssh_key"):
+                        auth_method = "ssh"
+                    elif creds.get("token"):
+                        auth_method = "token"
+
+                if auth_method == "ssh" and creds.get("ssh_key"):
+                    import shlex
+                    from urllib.parse import urlparse
+
+                    parsed = urlparse(repo_url)
+                    host = parsed.hostname or "localhost"
+
+                    if use_backend:
+                        # Write SSH key and configure on the remote container
+                        key_path = f"/home/agent-host/.ssh/repo_{name}"
+                        backend.shell_run(
+                            "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
+                            timeout=10,
+                            tab_name="git",
+                        )
+                        backend.write_file(
+                            f"/home/agent-host/.ssh/repo_{name}",
+                            creds["ssh_key"],
+                        )
+                        backend.shell_run(
+                            f"chmod 600 {shlex.quote(key_path)}",
+                            timeout=10,
+                            tab_name="git",
+                        )
+                        # Append SSH config for this host
+                        ssh_config = (
+                            f"\nHost {host}\n"
+                            f"  IdentityFile {key_path}\n"
+                            f"  StrictHostKeyChecking accept-new\n"
+                        )
+                        backend.shell_run(
+                            f"printf %s {shlex.quote(ssh_config)} >> ~/.ssh/config",
+                            timeout=10,
+                            tab_name="git",
+                        )
+                    else:
+                        # Local: write SSH key to agent filesystem
+                        ssh_dir = os.path.expanduser("~/.ssh")
+                        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+                        key_file = os.path.join(ssh_dir, f"repo_{name}")
+                        with open(key_file, "w") as f:
+                            f.write(creds["ssh_key"])
+                        os.chmod(key_file, 0o600)
+                        config_path = os.path.join(ssh_dir, "config")
+                        with open(config_path, "a") as f:
+                            f.write(
+                                f"\nHost {host}\n"
+                                f"  IdentityFile {key_file}\n"
+                                f"  StrictHostKeyChecking accept-new\n"
+                            )
+
+                    # Convert HTTPS URL to SSH URL so git uses the key
+                    if parsed.scheme in ("http", "https"):
+                        path = parsed.path.lstrip("/")
+                        if not path.endswith(".git"):
+                            path += ".git"
+                        repo_url = f"git@{host}:{path}"
+                        logger.info(
+                            "Converted HTTPS URL to SSH for %s: %s",
+                            name,
+                            repo_url,
+                        )
+
+                elif (auth_method == "token" or not auth_method) and creds.get(
+                    "token"
+                ):
                     from urllib.parse import urlparse
 
                     parsed = urlparse(repo_url)

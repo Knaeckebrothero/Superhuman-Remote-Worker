@@ -84,7 +84,7 @@ class TestCreateThread:
         await db.create_thread(
             user_id="user-1",
             project_id="proj-1",
-            config_name="interactive",
+            config_name="persistent_defaults",
             permission_mode="autonomous",
             title="My Session",
         )
@@ -93,7 +93,7 @@ class TestCreateThread:
         # Positional args after the SQL query
         assert call_args[0][1] == "user-1"  # user_id
         assert call_args[0][2] == "proj-1"  # project_id
-        assert call_args[0][3] == "interactive"  # config_name
+        assert call_args[0][3] == "persistent_defaults"  # config_name
         assert call_args[0][4] == "autonomous"  # permission_mode
         assert call_args[0][5] == "My Session"  # title
 

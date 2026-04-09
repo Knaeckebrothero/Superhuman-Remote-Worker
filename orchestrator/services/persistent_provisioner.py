@@ -10,7 +10,7 @@ Lifecycle:
     get_pod_status()     — check if pod is running for a thread
 
 For local development, persistent agents are started manually via:
-    python agent.py --mode persistent --thread-id <uuid> --config interactive
+    python agent.py --mode persistent --thread-id <uuid> --config persistent_defaults
 """
 
 import asyncio
@@ -120,7 +120,7 @@ class PersistentProvisioner:
     async def create_agent_pod(
         self,
         thread_id: str,
-        config_name: str = "interactive",
+        config_name: str = "persistent_defaults",
         cpu_request: str = "250m",
         memory_request: str = "512Mi",
         cpu_limit: str = "1000m",
@@ -130,7 +130,7 @@ class PersistentProvisioner:
 
         Args:
             thread_id: Thread UUID to bind the agent to.
-            config_name: Agent config to use (e.g. ``interactive``).
+            config_name: Agent config to use (e.g. ``persistent_defaults``).
             cpu_request: CPU request.
             memory_request: Memory request.
             cpu_limit: CPU limit.
