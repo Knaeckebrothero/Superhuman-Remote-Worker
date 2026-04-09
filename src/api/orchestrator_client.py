@@ -146,6 +146,7 @@ class OrchestratorClient:
             "agent_mode": agent_mode,
             "thread_id": thread_id,
             "dev_mode": os.environ.get("DEV_MODE", "").strip() == "1",
+            "build_sha": os.environ.get("BUILD_SHA", ""),
         }
 
         try:

@@ -68,13 +68,17 @@ LABEL description="Universal Agent for document processing and requirement valid
 # Create non-root user early so COPY --chown can reference it
 RUN groupadd -r srw && useradd -r -g srw -m srw
 
+# Build SHA for stale-image detection (passed via --build-arg)
+ARG BUILD_SHA=""
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
     AGENT_PORT=8001 \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
+    BUILD_SHA=${BUILD_SHA}
 
 WORKDIR /app
 

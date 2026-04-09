@@ -390,6 +390,9 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
                 await agent_provisioner.cleanup_completed_pods()
                 await agent_provisioner.reap_stale_pods()
                 await agent_provisioner.scale_down_idle()
+                # Drain idle agents running stale images so new pods
+                # with the current image can be provisioned.
+                await _drain_stale_image_agents()
         except Exception as e:
             logger.error("Error in agent pool reconciler: %s", e)
 
@@ -400,6 +403,50 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Agent pool reconciler stopped")
+
+
+async def _drain_stale_image_agents() -> None:
+    """Mark idle agents with outdated build SHAs as draining.
+
+    Called by the reconciler every 60s.  Only touches agents that are
+    idle (ready, no job, no thread) so active work is never interrupted.
+    The existing ``reap_stale_pods`` pass will clean up draining pods.
+    """
+    expected = _expected_agent_shas()
+    if not expected:
+        return  # No SHA-tagged images — nothing to compare
+
+    try:
+        rows = await postgres_db.fetch(
+            """
+            SELECT id, metadata
+            FROM agents
+            WHERE status = 'ready'
+              AND current_job_id IS NULL
+              AND thread_id IS NULL
+            """,
+        )
+        for row in rows:
+            meta = row["metadata"] or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, ValueError):
+                    meta = {}
+            build_sha = meta.get("build_sha", "")
+            if build_sha and build_sha not in expected:
+                logger.info(
+                    "Draining stale idle agent %s (build_sha=%s, expected=%s)",
+                    row["id"],
+                    build_sha,
+                    expected,
+                )
+                await postgres_db.execute(
+                    "UPDATE agents SET status = 'draining' WHERE id = $1",
+                    row["id"],
+                )
+    except Exception:
+        logger.exception("Error draining stale image agents")
 
 
 async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -1079,26 +1126,82 @@ async def _initiate_pause(job: dict) -> None:
         _pause_pending_job_ids.discard(job_id)
 
 
+def _expected_agent_shas() -> set[str]:
+    """Extract short commit SHAs from configured agent image tags.
+
+    Reads AGENT_IMAGE and PERSISTENT_AGENT_IMAGE env vars and extracts
+    the SHA suffix from tags formatted as ``...:sha-<hash>``.
+    """
+    shas: set[str] = set()
+    for var in ("AGENT_IMAGE", "PERSISTENT_AGENT_IMAGE"):
+        tag = os.environ.get(var, "")
+        if ":sha-" in tag:
+            shas.add(tag.rsplit(":sha-", 1)[-1])
+    return shas
+
+
+def _agent_sha_is_current(metadata: dict | None) -> bool:
+    """Check if an agent's build SHA matches any expected image SHA."""
+    if not metadata:
+        return False
+    build_sha = metadata.get("build_sha")
+    if not build_sha:
+        return False
+    expected = _expected_agent_shas()
+    if not expected:
+        # No SHA-tagged images configured — skip check
+        return True
+    return build_sha in expected
+
+
 async def _find_idle_persistent_agent() -> Optional[dict]:
     """Find an idle persistent or dual-mode agent in the pool.
 
     Returns the agent row dict or None if no idle agents are available.
     An agent is idle when: agent_mode in ('persistent', 'dual'),
-    status in ('available', 'ready'), and no thread currently attached.
+    status in ('ready'), and no thread currently attached.
+
+    Agents whose build SHA doesn't match the current expected images
+    are skipped and marked as draining so they get cleaned up.
     """
     try:
         rows = await postgres_db.fetch(
             """
-            SELECT id, pod_ip, pod_port, hostname, status, config_name
+            SELECT id, pod_ip, pod_port, hostname, status, config_name,
+                   metadata
             FROM agents
             WHERE agent_mode IN ('persistent', 'dual')
               AND status IN ('ready')
               AND thread_id IS NULL
             ORDER BY last_heartbeat DESC
-            LIMIT 1
+            LIMIT 10
             """,
         )
-        return dict(rows[0]) if rows else None
+        for row in rows:
+            agent = dict(row)
+            meta = agent.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, ValueError):
+                    meta = {}
+            if _agent_sha_is_current(meta):
+                return agent
+            # Stale agent — mark as draining so reconciler cleans it up
+            logger.info(
+                "Skipping stale agent %s (build_sha=%s, expected=%s)",
+                agent["id"],
+                meta.get("build_sha", ""),
+                _expected_agent_shas(),
+            )
+            try:
+                await postgres_db.execute(
+                    "UPDATE agents SET status = 'draining' WHERE id = $1",
+                    agent["id"],
+                )
+            except Exception:
+                pass
+        return None
     except Exception:
         logger.exception("Failed to find idle persistent agent")
         return None
@@ -1581,8 +1684,31 @@ async def _try_dispatch_pending_jobs() -> None:
             if not dispatchable_jobs:
                 return
 
-            # Get available agents (ready, cooldown passed)
-            available_agents = await postgres_db.get_available_agents(limit=50)
+            # Get available agents (ready, cooldown passed), skip stale images
+            all_agents = await postgres_db.get_available_agents(limit=50)
+            available_agents = []
+            for ag in all_agents:
+                meta = ag.get("metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except (json.JSONDecodeError, ValueError):
+                        meta = {}
+                if _agent_sha_is_current(meta):
+                    available_agents.append(ag)
+                else:
+                    logger.info(
+                        "Skipping stale worker agent %s (build_sha=%s)",
+                        ag["id"],
+                        meta.get("build_sha", ""),
+                    )
+                    try:
+                        await postgres_db.execute(
+                            "UPDATE agents SET status = 'draining' WHERE id = $1",
+                            ag["id"],
+                        )
+                    except Exception:
+                        pass
 
             # Phase 1: Direct assignment
             matched_job_ids = set()
@@ -1778,6 +1904,9 @@ class AgentRegistration(BaseModel):
         "worker", description="Agent mode: 'worker' or 'persistent'"
     )
     thread_id: str | None = Field(None, description="Thread UUID for persistent agents")
+    build_sha: str | None = Field(
+        None, description="Build commit SHA baked into the agent image"
+    )
 
 
 class AgentRegistrationResponse(BaseModel):
@@ -8166,6 +8295,7 @@ async def register_agent(registration: AgentRegistration) -> AgentRegistrationRe
             pid=registration.pid,
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
+            build_sha=registration.build_sha,
         )
         # Bind persistent agent to its thread
         if registration.agent_mode == "persistent" and registration.thread_id:

@@ -341,6 +341,10 @@ jobs:
             type=raw,value=latest
             type=sha,format=short,prefix=sha-
 
+      - name: Compute short SHA for build arg
+        id: short_sha
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Agent image
         uses: docker/build-push-action@v5
         with:
@@ -352,6 +356,8 @@ jobs:
           provenance: false
           cache-from: type=gha,ignore-error=true
           cache-to: type=gha,mode=max,ignore-error=true
+          build-args: |
+            BUILD_SHA=${{ steps.short_sha.outputs.sha }}
 
       - name: Inspect pushed image
         if: success()
@@ -885,9 +891,11 @@ jobs:
           sed -i 's|superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}|g' \
             deployment/21-agent.yaml
 
-      - name: Update persistent agent image in ConfigMap
+      - name: Update agent images in ConfigMap
         if: needs.build-agent.result == 'success'
         run: |
+          sed -i 's|AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*"|AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}"|g' \
+            deployment/02-configmap.yaml
           sed -i 's|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*"|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}"|g' \
             deployment/02-configmap.yaml
 
