@@ -1853,22 +1853,17 @@ def _create_openai_llm(
     if config.top_p is not None:
         llm_kwargs["top_p"] = config.top_p
 
-    # Add reasoning parameters
+    # Add reasoning parameters.
+    # NOTE: We always use Chat Completions API (reasoning_effort in model_kwargs)
+    # rather than Responses API (reasoning={} top-level). LangChain's Responses API
+    # streaming is broken for tool calls — streamed tool_call args arrive as {}
+    # (see https://github.com/langchain-ai/langchain/issues/34660, still open).
+    # Chat Completions handles streaming + tool calls correctly.
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
         level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
-        if _should_use_reasoning_summary(config.model):
-            # Native OpenAI reasoning models: use Responses API with readable summaries.
-            # Passing reasoning={} triggers LangChain's automatic Responses API routing.
-            llm_kwargs["reasoning"] = {
-                "effort": level,
-                "summary": "auto",
-            }
-            reasoning_mode = f"responses_api(effort={level})"
-        else:
-            # Other models (DeepSeek, vLLM-hosted, etc.): use Chat Completions API.
-            model_kwargs["reasoning_effort"] = level
-            reasoning_mode = f"chat_completions(effort={level})"
+        model_kwargs["reasoning_effort"] = level
+        reasoning_mode = f"chat_completions(effort={level})"
 
     # Add timeout if specified
     if config.timeout is not None:
@@ -2264,21 +2259,14 @@ def _create_codex_llm(
         llm_kwargs["top_p"] = config.top_p
 
     # Add reasoning parameters — proxy forwards to real OpenAI which supports them.
+    # NOTE: Always use Chat Completions API (reasoning_effort in model_kwargs)
+    # rather than Responses API. LangChain's Responses API streaming is broken
+    # for tool calls (https://github.com/langchain-ai/langchain/issues/34660).
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
         level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
-        if _should_use_reasoning_summary(model):
-            # Native OpenAI reasoning models (gpt-5.x, o3, o4, etc.):
-            # use Responses API with readable summaries.
-            llm_kwargs["reasoning"] = {
-                "effort": level,
-                "summary": "auto",
-            }
-            reasoning_mode = f"responses_api(effort={level})"
-        else:
-            # Other models: use Chat Completions API.
-            model_kwargs["reasoning_effort"] = level
-            reasoning_mode = f"chat_completions(effort={level})"
+        model_kwargs["reasoning_effort"] = level
+        reasoning_mode = f"chat_completions(effort={level})"
 
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
