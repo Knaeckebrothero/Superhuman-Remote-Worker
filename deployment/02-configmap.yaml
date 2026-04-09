@@ -151,7 +151,7 @@ data:
 
   # Agent pods (on-demand via AgentProvisioner, same image as worker agents)
   AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-376c3e4"
-  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-7ceb4d1"
+  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-622b072"
 
   # Agent pool sizing (AgentProvisioner — K8s dynamic provisioning)
   MAX_AGENTS: "10"
