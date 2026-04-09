@@ -29,7 +29,7 @@ spec:
           command: ["sh", "-c", "until nc -z srw-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: agent
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-cdc0e0b
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-b5656fc
           imagePullPolicy: Always
           securityContext:
             runAsNonRoot: true
