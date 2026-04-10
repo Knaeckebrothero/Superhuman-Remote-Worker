@@ -268,7 +268,7 @@ GRANT ALL PRIVILEGES ON DATABASE nextcloud TO nextcloud;
 - `Login with email: ON`
 
 **Default Users (dev):**
-- `admin` / `admin` — Realm admin, mapped to orchestrator admin
+- `test` / `test` — Realm admin, mapped to orchestrator admin
 - Matches current `ADMIN_EMAIL` / `ADMIN_PASSWORD` defaults for zero-friction migration
 
 ### Account Creation & User Management

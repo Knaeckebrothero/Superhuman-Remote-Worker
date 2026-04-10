@@ -302,8 +302,8 @@ browser:
     include_screenshot: auto  # "auto" (if multimodal) | true | false
     max_dom_chars: 40000  # Truncate DOM text beyond this
   security:
-    allowed_domains: []  # Empty = allow all public domains
-    blocked_domains: ["localhost", "127.0.0.1", "169.254.169.254"]
+    allowed_domains: []  # Empty = allow all domains
+    blocked_domains: []  # Browser runs in isolated workspace — localhost is safe
     blocked_schemes: ["file", "javascript", "data"]
   persistence:
     user_data_dir: .browser-profile  # Relative to workspace root

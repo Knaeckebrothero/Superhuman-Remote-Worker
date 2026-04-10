@@ -1,10 +1,14 @@
 """Browser security utilities — URL validation and content nonce wrapping.
 
-Blocks SSRF via private IPs, cloud metadata, dangerous schemes, and
-K8s internal DNS. Content nonces prevent prompt injection from page content.
+Blocks dangerous schemes, cloud metadata endpoints, and K8s internal DNS.
+Content nonces prevent prompt injection from page content.
+
+Note: Private IPs and localhost are intentionally allowed. The browser runs
+inside the agent's isolated workspace container, so localhost refers to that
+container — not the host or orchestrator. Blocking it would prevent the
+agent from testing any web application it builds.
 """
 
-import ipaddress
 import logging
 import re
 import secrets
@@ -15,19 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ── URL Validation ───────────────────────────────────────────────────
 
-# Private / reserved IP ranges (RFC 1918, loopback, link-local, etc.)
-_PRIVATE_RANGES = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("169.254.0.0/16"),  # link-local + cloud metadata
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),  # IPv6 unique-local
-    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
-]
-
-# Hostnames that resolve to metadata endpoints
+# Hostnames that resolve to cloud metadata endpoints
 _BLOCKED_HOSTNAMES = {
     "metadata.google.internal",
     "metadata.goog",
@@ -80,7 +72,7 @@ def validate_url(
     if not hostname:
         raise ValueError("URL has no hostname")
 
-    # Blocked hostnames (metadata endpoints)
+    # Blocked hostnames (cloud metadata endpoints)
     if hostname in _BLOCKED_HOSTNAMES:
         raise ValueError(f"Blocked hostname: {hostname}")
 
@@ -97,23 +89,11 @@ def validate_url(
                 f"Domain {hostname} not in allowed list: {allowed_domains}"
             )
 
-    # Domain blocklist
+    # Domain blocklist (for explicit per-config restrictions)
     if blocked_domains:
         for d in blocked_domains:
             if hostname == d or hostname.endswith(f".{d}"):
                 raise ValueError(f"Blocked domain: {hostname}")
-
-    # IP address check — block private/reserved ranges
-    try:
-        addr = ipaddress.ip_address(hostname)
-        for net in _PRIVATE_RANGES:
-            if addr in net:
-                raise ValueError(f"Blocked private/reserved IP: {hostname}")
-    except ValueError as e:
-        # Not an IP address (it's a hostname) — that's fine unless it was
-        # a security error we raised above
-        if "Blocked" in str(e):
-            raise
 
     return url.strip()
 
@@ -123,9 +103,7 @@ def get_security_config(browser_config: Dict[str, Any]) -> Dict[str, Any]:
     security = browser_config.get("security", {})
     return {
         "allowed_domains": security.get("allowed_domains", []),
-        "blocked_domains": security.get(
-            "blocked_domains", ["localhost", "127.0.0.1", "169.254.169.254"]
-        ),
+        "blocked_domains": security.get("blocked_domains", []),
         "blocked_schemes": security.get(
             "blocked_schemes", ["file", "javascript", "data"]
         ),

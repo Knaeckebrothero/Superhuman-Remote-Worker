@@ -8,6 +8,8 @@ export interface ChatMessage {
     role: 'user' | 'assistant' | 'system';
     content: string;
     toolCalls?: ToolCallInfo[];
+    /** Model reasoning/thinking text (collapsed by default in UI). */
+    thinking?: string;
     timestamp: Date;
     /** True for messages loaded from DB history (not live). */
     historical?: boolean;
@@ -60,6 +62,7 @@ export class PersistentChatService {
     // --- Chat state ---
     readonly messages = signal<ChatMessage[]>([]);
     readonly streamingText = signal('');
+    readonly streamingThinking = signal('');
     readonly isStreaming = signal(false);
     readonly currentToolCalls = signal<ToolCallInfo[]>([]);
     readonly historyLoaded = signal(false);
@@ -455,11 +458,16 @@ export class PersistentChatService {
                 this.turnCount.update(c => c + 1);
                 this.isStreaming.set(true);
                 this.streamingText.set('');
+                this.streamingThinking.set('');
                 this.currentToolCalls.set([]);
                 break;
 
             case 'token':
                 this.streamingText.update((t) => t + ((params['content'] as string) || ''));
+                break;
+
+            case 'thinking':
+                this.streamingThinking.update((t) => t + ((params['content'] as string) || ''));
                 break;
 
             case 'tool.started': {
@@ -616,24 +624,27 @@ export class PersistentChatService {
         }
     }
 
-    /** Move accumulated streaming text + tool calls into the messages array. */
+    /** Move accumulated streaming text + tool calls + thinking into the messages array. */
     private finalizeStreaming(): void {
         const text = this.streamingText();
+        const thinking = this.streamingThinking();
         const tools = this.currentToolCalls();
 
-        if (text || tools.length > 0) {
+        if (text || thinking || tools.length > 0) {
             this.messages.update((msgs) => [
                 ...msgs,
                 {
                     role: 'assistant',
                     content: text,
                     toolCalls: tools.length > 0 ? [...tools] : undefined,
+                    thinking: thinking || undefined,
                     timestamp: new Date(),
                 },
             ]);
         }
 
         this.streamingText.set('');
+        this.streamingThinking.set('');
         this.currentToolCalls.set([]);
     }
 }

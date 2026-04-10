@@ -240,7 +240,7 @@
   ],
   "users": [
     {
-      "username": "admin",
+      "username": "test",
       "email": "admin@srw.dev",
       "emailVerified": true,
       "enabled": true,
@@ -257,7 +257,7 @@
       "credentials": [
         {
           "type": "password",
-          "value": "admin",
+          "value": "test",
           "temporary": false
         }
       ]

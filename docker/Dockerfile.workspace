@@ -190,7 +190,8 @@ RUN chown agent-host:agent-host /home/agent-host/.tmux.conf
 RUN su -c 'git config --global init.defaultBranch main' agent-host \
     && su -c 'git config --global user.name "Agent Worker"' agent-host \
     && su -c 'git config --global user.email "agent@srw.local"' agent-host \
-    && su -c 'git config --global core.editor vim' agent-host
+    && su -c 'git config --global core.editor vim' agent-host \
+    && su -c 'git config --global core.pager cat' agent-host
 
 # ---------------------------------------------------------------------------
 # 8. code-server config (state outside home so it doesn't clutter workspace)

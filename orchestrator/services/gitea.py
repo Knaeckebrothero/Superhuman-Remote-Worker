@@ -118,15 +118,32 @@ class GiteaClient:
                     else:
                         logger.info(f"Created Gitea admin user '{self._user}'")
                 else:
-                    # Try user registration endpoint as fallback
+                    # Try user registration endpoint as fallback.
+                    # Fetch the sign-up page first to get a CSRF token.
+                    import re as _re
+
+                    page_resp = await anon_client.get(
+                        f"{self._url}/user/sign_up"
+                    )
+                    csrf_token = ""
+                    if page_resp.status_code == 200:
+                        m = _re.search(
+                            r'name="_csrf"\s+(?:content|value)="([^"]+)"',
+                            page_resp.text,
+                        )
+                        if m:
+                            csrf_token = m.group(1)
+
                     resp = await anon_client.post(
                         f"{self._url}/user/sign_up",
                         data={
+                            "_csrf": csrf_token,
                             "user_name": self._user,
                             "email": f"{self._user}@srw.local",
                             "password": self._password,
                             "retype": self._password,
                         },
+                        cookies=page_resp.cookies,
                     )
                     if resp.status_code in (200, 302, 303):
                         logger.info(

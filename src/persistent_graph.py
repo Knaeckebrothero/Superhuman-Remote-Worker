@@ -111,6 +111,9 @@ class PersistentLoopCallbacks:
     on_turn_start: Callable[[int], Awaitable[None]]
     on_turn_complete: Callable[[int, Optional[dict]], Awaitable[None]]
 
+    # Stream a thinking/reasoning chunk to the client
+    on_thinking: Callable[[str], Awaitable[None]]
+
     # Notify client of errors
     on_error: Callable[[str], Awaitable[None]]
 
@@ -496,6 +499,13 @@ async def _execute_turn(
                                     if text:
                                         response_content += text
                                         await callbacks.on_token(text)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "thinking"
+                                ):
+                                    thinking = block.get("thinking", "")
+                                    if thinking:
+                                        await callbacks.on_thinking(thinking)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -547,6 +557,13 @@ async def _execute_turn(
                                     if text:
                                         response_content += text
                                         await callbacks.on_token(text)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "thinking"
+                                ):
+                                    thinking = block.get("thinking", "")
+                                    if thinking:
+                                        await callbacks.on_thinking(thinking)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -615,6 +632,13 @@ async def _execute_turn(
                                     if text:
                                         response_content += text
                                         await callbacks.on_token(text)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "thinking"
+                                ):
+                                    thinking = block.get("thinking", "")
+                                    if thinking:
+                                        await callbacks.on_thinking(thinking)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -677,6 +701,14 @@ async def _execute_turn(
                 "model": meta.get("model_name"),
             }
             turn_metrics = {k: v for k, v in turn_metrics.items() if v is not None}
+
+        # Send reasoning from additional_kwargs if not already streamed
+        # (covers DeepSeek, OpenRouter, and other non-Anthropic reasoning models)
+        if response:
+            extra = getattr(response, "additional_kwargs", None) or {}
+            reasoning = extra.get("reasoning_content")
+            if reasoning and isinstance(reasoning, str):
+                await callbacks.on_thinking(reasoning)
 
         if response is None:
             return TurnResult(
