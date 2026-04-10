@@ -41,6 +41,7 @@ def _make_callbacks(**overrides) -> PersistentLoopCallbacks:
     defaults = dict(
         get_user_input=AsyncMock(return_value="hello"),
         on_token=AsyncMock(),
+        on_thinking=AsyncMock(),
         on_tool_start=AsyncMock(),
         on_tool_result=AsyncMock(),
         permission_check=AsyncMock(return_value=True),

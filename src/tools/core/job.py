@@ -75,10 +75,11 @@ def create_job_tools(context: ToolContext) -> List[Any]:
         confidence: float = 1.0,
         notes: Optional[str] = None,
     ) -> str:
-        """Signal that the assigned task is complete.
+        """Write a completion report to output/completion.json.
 
-        Call this tool ONLY when you have finished all work on the task.
-        This will write a completion report and end the agent loop.
+        This records your assessment of task completion but does NOT stop
+        the agent loop. Use job_complete instead to actually finish the
+        job and stop execution.
 
         Args:
             summary: Brief description of what was accomplished (1-3 sentences)
