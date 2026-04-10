@@ -16,6 +16,8 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from services import resolve_ssh_key_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -305,7 +307,8 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            await self._extract_snapshot(job_id, ssh_host)
+            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            await self._extract_snapshot(job_id, ssh_host, ssh_port=ssh_port)
 
             # Mark as ready
             restored_ctx = {
@@ -337,7 +340,11 @@ class WorkspaceSuspensionService:
             return False
 
     async def _extract_snapshot(
-        self, entity_id: str, ssh_host: str, entity_type: str = "jobs"
+        self,
+        entity_id: str,
+        ssh_host: str,
+        ssh_port: int = 22,
+        entity_type: str = "jobs",
     ) -> None:
         """Download snapshot from S3 and extract into the pod via SSH.
 
@@ -359,8 +366,16 @@ class WorkspaceSuspensionService:
                 )
                 return
 
+            key_path = resolve_ssh_key_path()
+            if not key_path:
+                logger.warning(
+                    "No SSH key available for snapshot extraction (%s %s)",
+                    entity_type.rstrip("s"),
+                    entity_id,
+                )
             ssh_cmd = [
                 "ssh",
+                *(["-i", key_path] if key_path else []),
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -368,7 +383,7 @@ class WorkspaceSuspensionService:
                 "-o",
                 "ConnectTimeout=10",
                 "-p",
-                "22",
+                str(ssh_port),
                 f"agent-host@{ssh_host}",
                 "zstd -d | tar -xf - -C /",
             ]
@@ -626,7 +641,10 @@ class WorkspaceSuspensionService:
                 return False
 
             # Extract snapshot into the workspace
-            await self._extract_snapshot(thread_id, ssh_host, entity_type="threads")
+            ssh_port = int(ws_ctx.get("port", vm_ctx.get("ssh_port", 22)))
+            await self._extract_snapshot(
+                thread_id, ssh_host, ssh_port=ssh_port, entity_type="threads"
+            )
 
             restored_ctx = {
                 "status": "ready",

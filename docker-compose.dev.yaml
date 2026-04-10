@@ -534,6 +534,7 @@ services:
   #   Docker:          /var/run/docker.sock
   codex-proxy:
     image: docker.io/eceasy/cli-proxy-api:latest
+    pull_policy: always
     container_name: srw-codex-proxy
     environment:
       MANAGEMENT_PASSWORD: ${CODEX_MANAGEMENT_KEY:-}
@@ -544,7 +545,7 @@ services:
       - ./docker/codex-proxy/config.yaml:/CLIProxyAPI/config.yaml:Z
       - codex_proxy_auths:/root/.cli-proxy-api
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8317/v1/models", "||", "exit", "1"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8317/v1/models"]
       interval: 15s
       timeout: 5s
       retries: 3

@@ -17,6 +17,9 @@ import pytest
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
+_orchestrator_dir = str(project_root / "orchestrator")
+if _orchestrator_dir not in sys.path:
+    sys.path.insert(0, _orchestrator_dir)
 
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService  # noqa: E402
 
@@ -261,7 +264,7 @@ class TestRestoreWorkspace:
         assert result is True
         svc._container_provisioner.create_workspace.assert_awaited_once()
         mock_extract.assert_awaited_once_with(
-            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99"
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "10.0.0.99", ssh_port=22
         )
         # Status transitions: restoring → ready
         calls = svc._db.merge_workspace_container_context.call_args_list
@@ -754,7 +757,7 @@ class TestSuspendRestoreRoundTrip:
         svc._container_provisioner.create_workspace.assert_awaited_once_with(job_id)
 
         # Snapshot extracted to new pod IP
-        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99")
+        mock_extract.assert_awaited_once_with(job_id, "10.0.0.99", ssh_port=22)
 
         # Final status is ready
         calls = svc._db.merge_workspace_container_context.call_args_list
