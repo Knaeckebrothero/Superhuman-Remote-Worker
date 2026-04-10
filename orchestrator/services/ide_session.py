@@ -18,6 +18,8 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+from services import resolve_ssh_key_path
+
 logger = logging.getLogger(__name__)
 
 
@@ -569,8 +571,10 @@ class IdeSessionService:
             f"git checkout FETCH_HEAD)"
         )
 
+        key_path = resolve_ssh_key_path()
         ssh_cmd = [
             "ssh",
+            *(["-i", key_path] if key_path else []),
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -801,8 +805,15 @@ class IdeSessionService:
                 return
 
             # Extract into VM via SSH
+            key_path = resolve_ssh_key_path()
+            if not key_path:
+                logger.warning(
+                    "No SSH key available for snapshot extraction (job %s)",
+                    job_id,
+                )
             ssh_cmd = [
                 "ssh",
+                *(["-i", key_path] if key_path else []),
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -853,8 +864,10 @@ class IdeSessionService:
             f"2>/dev/null || true"
         )
 
+        key_path = resolve_ssh_key_path()
         ssh_cmd = [
             "ssh",
+            *(["-i", key_path] if key_path else []),
             "-o",
             "StrictHostKeyChecking=no",
             "-o",

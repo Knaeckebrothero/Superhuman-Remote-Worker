@@ -1,4 +1,4 @@
-import {Component, computed, input, output, signal, ViewChild} from '@angular/core';
+import {Component, computed, effect, ElementRef, input, output, signal, ViewChild} from '@angular/core';
 import {Datasource} from '../../../core/models/api.model';
 import {SettingsMode} from './agent-settings.types';
 import {ExecutionGroupComponent} from './execution-group.component';
@@ -64,7 +64,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
       </div>
 
       <!-- Tab content -->
-      <div class="tab-content">
+      <div class="tab-content" #tabContent>
         <div class="tab-panel settings-panel" [class.tab-hidden]="activeTab() !== 'settings'">
           <app-execution-group
             [config]="config()"
@@ -234,7 +234,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
       padding: 16px;
     }
     .tab-hidden {
-      display: none;
+      display: none !important;
     }
     .instructions-panel {
       display: flex;
@@ -281,8 +281,16 @@ export class AgentSettingsComponent {
   @ViewChild(DatasourcesGroupComponent) datasourcesGroup?: DatasourcesGroupComponent;
   @ViewChild(InstructionsTabComponent) instructionsTab?: InstructionsTabComponent;
   @ViewChild(AdvancedAccordionComponent) advancedAccordion?: AdvancedAccordionComponent;
+  @ViewChild('tabContent') private tabContentEl?: ElementRef<HTMLElement>;
 
   readonly activeTab = signal<'settings' | 'instructions' | 'advanced'>('settings');
+
+  constructor() {
+    effect(() => {
+      this.activeTab(); // track tab changes
+      this.tabContentEl?.nativeElement.scrollTo(0, 0);
+    });
+  }
 
   readonly settingsModifiedCount = computed(() => {
     const exec = this.executionGroup?.modifiedCount() ?? 0;

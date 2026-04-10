@@ -1142,15 +1142,15 @@ def _expected_agent_shas() -> set[str]:
 
 def _agent_sha_is_current(metadata: dict | None) -> bool:
     """Check if an agent's build SHA matches any expected image SHA."""
+    expected = _expected_agent_shas()
+    if not expected:
+        # No SHA-tagged images configured (local dev) — skip check
+        return True
     if not metadata:
         return False
     build_sha = metadata.get("build_sha")
     if not build_sha:
         return False
-    expected = _expected_agent_shas()
-    if not expected:
-        # No SHA-tagged images configured — skip check
-        return True
     return build_sha in expected
 
 

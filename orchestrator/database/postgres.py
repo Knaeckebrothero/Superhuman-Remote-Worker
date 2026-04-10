@@ -2561,7 +2561,7 @@ class PostgresDB:
                         pd.read_only AS project_read_only
                     FROM datasources d
                     LEFT JOIN project_datasources pd
-                        ON pd.datasource_id = d.id AND pd.project_id = $2
+                        ON pd.datasource_id = d.id AND pd.project_id = $1
                     WHERE pd.project_id IS NOT NULL
                        OR NOT EXISTS (
                            SELECT 1 FROM project_datasources pd2
@@ -2569,7 +2569,6 @@ class PostgresDB:
                        )
                     ORDER BY d.type, d.name
                     """,
-                    uuid_val,
                     project_uuid,
                 )
             else:
