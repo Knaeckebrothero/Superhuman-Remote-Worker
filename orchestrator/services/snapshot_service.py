@@ -23,6 +23,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from services import resolve_ssh_key_path
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -300,8 +302,16 @@ class SnapshotService:
                 f"tar -cf - {' '.join(exclude_patterns)} {' '.join(include_dirs)} 2>/dev/null"
                 " | zstd -1 -T0"
             )
+            key_path = resolve_ssh_key_path()
+            if not key_path:
+                logger.warning(
+                    "No SSH key available for snapshot capture (%s %s)",
+                    entity_type.rstrip("s"),
+                    job_id,
+                )
             ssh_cmd = [
                 "ssh",
+                *(["-i", key_path] if key_path else []),
                 "-o",
                 "StrictHostKeyChecking=no",
                 "-o",
@@ -446,10 +456,12 @@ class SnapshotService:
             "python_version": "python3 --version 2>/dev/null | awk '{print $2}'",
         }
 
+        key_path = resolve_ssh_key_path()
         for key, cmd in commands.items():
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "ssh",
+                    *(["-i", key_path] if key_path else []),
                     "-o",
                     "StrictHostKeyChecking=no",
                     "-o",

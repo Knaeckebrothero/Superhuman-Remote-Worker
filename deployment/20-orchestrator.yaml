@@ -441,6 +441,8 @@ spec:
                   optional: true
             - name: WORKSPACE_SSH_SECRET
               value: "vm-ssh-key"
+            - name: SSH_KEY_PATH
+              value: "/run/secrets/vm-ssh-key"
             # Persistent agent pods (on-demand provisioning)
             - name: PERSISTENT_AGENT_IMAGE
               valueFrom:
@@ -503,6 +505,10 @@ spec:
           volumeMounts:
             - name: workspace
               mountPath: /workspace
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /api/health
@@ -526,6 +532,10 @@ spec:
         - name: workspace
           persistentVolumeClaim:
             claimName: srw-workspace
+        - name: vm-ssh-key
+          secret:
+            secretName: vm-ssh-key
+            defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service
