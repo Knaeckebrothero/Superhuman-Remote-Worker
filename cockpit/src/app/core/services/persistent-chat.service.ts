@@ -22,6 +22,8 @@ export interface ToolCallInfo {
     args: Record<string, unknown>;
     result?: string;
     status: 'pending' | 'running' | 'completed' | 'denied';
+    /** Tool category from the registry (e.g. workspace, git, research). */
+    category?: string;
 }
 
 /** Permission request from the agent. */
@@ -41,6 +43,7 @@ export interface SessionTask {
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
 type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
+export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 /**
  * WebSocket client for persistent agent sessions.
@@ -64,12 +67,16 @@ export class PersistentChatService {
     readonly streamingText = signal('');
     readonly streamingThinking = signal('');
     readonly isStreaming = signal(false);
+    readonly isInterrupting = signal(false);
     readonly currentToolCalls = signal<ToolCallInfo[]>([]);
     readonly historyLoaded = signal(false);
 
     // --- Permission state ---
     readonly permissionMode = signal<PermissionMode>('supervised');
     readonly pendingPermission = signal<PermissionRequest | null>(null);
+
+    // --- Narration state ---
+    readonly narrationMode = signal<NarrationMode>('auto');
 
     // --- Turn tracking ---
     readonly currentTurnId = signal<number | null>(null);
@@ -356,6 +363,12 @@ export class PersistentChatService {
             case '/autonomous':
                 this.setMode('autonomous');
                 return true;
+            case '/silent':
+                this.setNarrationMode('silent');
+                return true;
+            case '/verbose':
+                this.setNarrationMode('verbose');
+                return true;
             case '/undo':
                 this.send({method: 'undo'});
                 this.messages.update(msgs => [...msgs, {
@@ -381,6 +394,8 @@ export class PersistentChatService {
 
     /** Interrupt the current turn. */
     interrupt(): void {
+        if (this.isInterrupting()) return; // Already interrupting
+        this.isInterrupting.set(true);
         this.send({method: 'interrupt'});
     }
 
@@ -388,6 +403,11 @@ export class PersistentChatService {
     setMode(mode: PermissionMode): void {
         this.permissionMode.set(mode);
         this.send({method: 'mode.set', mode});
+    }
+
+    setNarrationMode(mode: NarrationMode): void {
+        this.narrationMode.set(mode);
+        this.send({method: 'narration.set', mode});
     }
 
     /** Update session config (model, temperature, etc.) at runtime. */
@@ -421,6 +441,9 @@ export class PersistentChatService {
                 // Sync client state with agent's current state on connect
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
+                }
+                if (params['narration_mode']) {
+                    this.narrationMode.set(params['narration_mode'] as NarrationMode);
                 }
                 if (params['turn_count'] != null) {
                     this.turnCount.set(params['turn_count'] as number);
@@ -476,6 +499,7 @@ export class PersistentChatService {
                     tool: (params['tool'] as string) || '',
                     args: (params['args'] as Record<string, unknown>) || {},
                     status: 'running',
+                    category: (params['category'] as string) || undefined,
                 };
                 this.currentToolCalls.update((calls) => [...calls, tc]);
                 break;
@@ -503,11 +527,24 @@ export class PersistentChatService {
             case 'turn.completed':
                 this.finalizeStreaming();
                 this.isStreaming.set(false);
+                this.isInterrupting.set(false);
+                this.currentTurnId.set(null);
+                break;
+
+            case 'interrupt.ack':
+                // Backend confirmed interrupt — immediately finalize UI
+                this.finalizeStreaming();
+                this.isStreaming.set(false);
+                this.isInterrupting.set(false);
                 this.currentTurnId.set(null);
                 break;
 
             case 'mode.changed':
                 this.permissionMode.set((params['mode'] as PermissionMode) || 'supervised');
+                break;
+
+            case 'narration.changed':
+                this.narrationMode.set((params['mode'] as NarrationMode) || 'auto');
                 break;
 
             case 'config.changed':

@@ -30,6 +30,8 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/auto', description: 'Switch to auto-accept mode (approve all except shell)'},
     {command: '/supervised', description: 'Switch to supervised mode (approve all writes)'},
     {command: '/autonomous', description: 'Switch to autonomous mode (approve nothing)'},
+    {command: '/silent', description: 'Hide reasoning and minimize tool detail'},
+    {command: '/verbose', description: 'Show full reasoning and tool detail'},
 ];
 
 const TOOL_LABELS: Record<string, string> = {
@@ -117,6 +119,26 @@ const TOOL_LABELS: Record<string, string> = {
     job_complete: 'Completing job',
 };
 
+const CATEGORY_LABELS: Record<string, string> = {
+    workspace: 'Working with files',
+    git: 'Version control',
+    shell: 'Running commands',
+    research: 'Research & browsing',
+    browser_direct: 'Browsing',
+    core: 'Task management',
+    session_task: 'Task management',
+    knowledge: 'Knowledge base',
+    citation: 'Citations & sources',
+    sql: 'Database queries',
+    mongodb: 'Database queries',
+    graph: 'Knowledge graph',
+    cloud: 'Cloud storage',
+    communication: 'Communication',
+    delegation: 'Delegating work',
+    orchestrator: 'Orchestrator',
+    evaluation: 'Evaluation',
+};
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -200,6 +222,16 @@ const TOOL_LABELS: Record<string, string> = {
               <option value="supervised">Supervised</option>
               <option value="auto_accept">Auto-accept</option>
               <option value="autonomous">Autonomous</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Narration</label>
+            <select class="settings-select"
+                    [value]="chat.narrationMode()"
+                    (change)="onNarrationModeChange($event)">
+              <option value="auto">Auto</option>
+              <option value="verbose">Verbose</option>
+              <option value="silent">Silent</option>
             </select>
           </div>
           <div class="settings-row">
@@ -292,7 +324,7 @@ const TOOL_LABELS: Record<string, string> = {
               <div class="tool-only-row">
                 <span class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</span>
                 <span class="tool-only-label">
-                  {{ groupToolCallsHuman(msg.toolCalls!) }}
+                  {{ toolSummaryLabel(msg.toolCalls!) }}
                 </span>
                 <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
               </div>
@@ -304,8 +336,8 @@ const TOOL_LABELS: Record<string, string> = {
                 @if (msg.role === 'user') {
                   <div class="user-text">{{ msg.content }}</div>
                 } @else {
-                  @if (msg.thinking) {
-                    <details class="thinking-block">
+                  @if (msg.thinking && chat.narrationMode() !== 'silent') {
+                    <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="thinking-header">
                         <span class="thinking-icon">psychology</span>
                         <span class="thinking-label">Thought for a moment</span>
@@ -317,12 +349,12 @@ const TOOL_LABELS: Record<string, string> = {
                     <markdown [data]="msg.content"></markdown>
                   }
                   @if (msg.toolCalls?.length) {
-                    <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) ? '' : null">
+                    <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="tool-summary-line">
                         <span class="tool-summary-chevron">chevron_right</span>
                         <span class="tool-summary-text">
                           Used {{ msg.toolCalls!.length }} tool{{ msg.toolCalls!.length !== 1 ? 's' : '' }}:
-                          {{ groupToolCallsHuman(msg.toolCalls!) }}
+                          {{ toolSummaryLabel(msg.toolCalls!) }}
                         </span>
                         <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
                       </summary>
@@ -411,7 +443,7 @@ const TOOL_LABELS: Record<string, string> = {
               <span class="avatar-icon">smart_toy</span>
             </div>
             <div class="message-body">
-              @if (chat.streamingThinking()) {
+              @if (chat.streamingThinking() && chat.narrationMode() !== 'silent') {
                 <details class="thinking-block" open>
                   <summary class="thinking-header">
                     <span class="thinking-icon">psychology</span>
@@ -436,7 +468,7 @@ const TOOL_LABELS: Record<string, string> = {
                       <span class="tool-summary-chevron">chevron_right</span>
                       <span class="tool-summary-text">
                         Used {{ completedToolCount(chat.currentToolCalls()) }} tool{{ completedToolCount(chat.currentToolCalls()) !== 1 ? 's' : '' }}:
-                        {{ groupToolCallsHuman(completedOnly(chat.currentToolCalls())) }}
+                        {{ toolSummaryLabel(completedOnly(chat.currentToolCalls())) }}
                       </span>
                       <span class="tool-summary-dot completed"></span>
                     </summary>
@@ -499,13 +531,7 @@ const TOOL_LABELS: Record<string, string> = {
 
       <!-- Input -->
       <div class="input-area">
-        @if (chat.isStreaming()) {
-          <button class="interrupt-btn" (click)="chat.interrupt()">
-            <span class="interrupt-icon">stop_circle</span>
-            Stop
-          </button>
-        }
-        <div class="input-wrapper">
+        <div class="input-card" [class.focused]="inputFocused()">
           <!-- Slash command autocomplete -->
           @if (showSlashMenu()) {
             <div class="slash-menu">
@@ -528,23 +554,29 @@ const TOOL_LABELS: Record<string, string> = {
             [(ngModel)]="inputText"
             (ngModelChange)="onInputChange($event)"
             (keydown)="onKeydown($event)"
+            (focus)="inputFocused.set(true)"
+            (blur)="inputFocused.set(false)"
             [placeholder]="inputPlaceholder()"
             [disabled]="!chat.isConnected()"
             rows="1"
           ></textarea>
+          <button
+            class="action-btn"
+            [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
+            [class.interrupting]="chat.isInterrupting()"
+            [class.pending]="isPendingSend()"
+            (click)="chat.isStreaming() ? chat.interrupt() : send()"
+            [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
+          >
+            @if (isPendingSend() || chat.isInterrupting()) {
+              <span class="action-spinner"></span>
+            } @else if (chat.isStreaming()) {
+              <span class="action-icon">stop</span>
+            } @else {
+              <span class="action-icon">arrow_upward</span>
+            }
+          </button>
         </div>
-        <button
-          class="send-btn"
-          (click)="send()"
-          [disabled]="!canSend()"
-          [class.pending]="isPendingSend()"
-        >
-          @if (isPendingSend()) {
-            <span class="send-spinner"></span>
-          } @else {
-            <span class="send-icon">send</span>
-          }
-        </button>
       </div>
     </div>
   `,
@@ -1468,53 +1500,47 @@ const TOOL_LABELS: Record<string, string> = {
       /* Input area */
 
       .input-area {
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-        padding: 12px 16px;
-        border-top: 1px solid var(--border-color, #313244);
+        padding: 12px 16px 16px;
         background: var(--panel-bg, #181825);
         flex-shrink: 0;
       }
 
-      .interrupt-btn {
+      .input-card {
+        position: relative;
         display: flex;
-        align-items: center;
-        gap: 4px;
-        padding: 6px 12px;
-        border-radius: 6px;
-        border: 1px solid #f38ba8;
-        background: transparent;
-        color: #f38ba8;
-        font-size: 12px;
-        font-family: inherit;
-        cursor: pointer;
-        flex-shrink: 0;
+        align-items: flex-end;
+        gap: 8px;
+        padding: 8px 8px 8px 16px;
+        border-radius: 20px;
+        border: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, #313244);
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
       }
 
-      .interrupt-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
+      .input-card.focused {
+        border-color: var(--accent-color, #cba6f7);
+        box-shadow: 0 0 0 1px rgba(203, 166, 247, 0.15);
       }
 
       .chat-input {
         flex: 1;
-        padding: 8px 12px;
-        border-radius: 8px;
-        border: 1px solid var(--border-color, #313244);
-        background: var(--surface-0, #313244);
+        padding: 6px 0;
+        border: none;
+        background: transparent;
         color: var(--text-primary, #cdd6f4);
-        font-size: 13px;
+        font-size: 14px;
         font-family: inherit;
         resize: none;
-        min-height: 38px;
+        min-height: 24px;
         max-height: 120px;
-        line-height: 1.4;
+        line-height: 1.5;
       }
 
-      .chat-input:focus {
+      .chat-input:focus,
+      .chat-input:focus-visible {
         outline: none;
-        border-color: var(--accent-color, #cba6f7);
+        border: none;
+        box-shadow: none;
       }
 
       .chat-input:disabled {
@@ -1522,37 +1548,54 @@ const TOOL_LABELS: Record<string, string> = {
         cursor: not-allowed;
       }
 
-      .send-btn {
+      .chat-input::placeholder {
+        color: var(--text-muted, #6c7086);
+      }
+
+      /* Action button — send / stop / spinner in one spot */
+
+      .action-btn {
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 38px;
-        height: 38px;
-        border-radius: 8px;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
         border: none;
         background: var(--accent-color, #cba6f7);
         color: var(--timeline-bg, #11111b);
         cursor: pointer;
         flex-shrink: 0;
-        transition: opacity 0.15s ease;
+        transition: background 0.15s ease, opacity 0.15s ease;
       }
 
-      .send-btn:disabled {
+      .action-btn:disabled {
         opacity: 0.3;
         cursor: not-allowed;
       }
 
-      .send-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
+      .action-btn.stop {
+        background: #f38ba8;
+        opacity: 1;
       }
 
-      .send-btn.pending {
+      .action-btn.pending,
+      .action-btn.interrupting {
         opacity: 0.7;
         cursor: wait;
       }
 
-      .send-spinner {
+      .action-btn.interrupting {
+        background: #f38ba8;
+      }
+
+      .action-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 20px;
+        line-height: 1;
+      }
+
+      .action-spinner {
         width: 16px;
         height: 16px;
         border: 2px solid var(--timeline-bg, #11111b);
@@ -1567,27 +1610,17 @@ const TOOL_LABELS: Record<string, string> = {
 
       /* Slash command autocomplete */
 
-      .input-wrapper {
-        flex: 1;
-        position: relative;
-        min-width: 0;
-      }
-
-      .input-wrapper .chat-input {
-        width: 100%;
-      }
-
       .slash-menu {
         position: absolute;
         bottom: 100%;
         left: 0;
         right: 0;
-        margin-bottom: 4px;
+        margin-bottom: 8px;
         background: var(--panel-bg, #181825);
         border: 1px solid var(--border-color, #313244);
-        border-radius: 8px;
+        border-radius: 12px;
         padding: 4px;
-        box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.3);
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
         z-index: 10;
       }
 
@@ -1595,8 +1628,8 @@ const TOOL_LABELS: Record<string, string> = {
         display: flex;
         align-items: center;
         gap: 10px;
-        padding: 8px 10px;
-        border-radius: 6px;
+        padding: 8px 12px;
+        border-radius: 8px;
         cursor: pointer;
         transition: background 0.1s ease;
       }
@@ -1828,6 +1861,9 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     // Resume state
     readonly isResuming = signal(false);
 
+    // Input state
+    readonly inputFocused = signal(false);
+
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
@@ -1900,6 +1936,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     readonly inputPlaceholder = computed(() => {
         if (!this.chat.isConnected()) return 'Connect to start chatting...';
         if (this.chat.isConnected() && !this.chat.sessionReady()) return 'Type your message while the session starts...';
+        if (this.chat.isInterrupting()) return 'Stopping...';
         if (this.chat.isStreaming()) return 'Agent is working...';
         return 'Type a message... (Enter to send, Shift+Enter for newline)';
     });
@@ -2011,6 +2048,11 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     onModeChange(event: Event): void {
         const mode = (event.target as HTMLSelectElement).value as 'supervised' | 'auto_accept' | 'autonomous';
         this.chat.setMode(mode);
+    }
+
+    onNarrationModeChange(event: Event): void {
+        const mode = (event.target as HTMLSelectElement).value as 'silent' | 'verbose' | 'auto';
+        this.chat.setNarrationMode(mode);
     }
 
     onModelChange(model: string): void {
@@ -2219,6 +2261,23 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     hasDeniedTools(calls: ToolCallInfo[]): boolean {
         return calls.some(tc => tc.status === 'denied');
+    }
+
+    groupToolCallsByIntent(calls: ToolCallInfo[]): string {
+        const groups = new Map<string, number>();
+        for (const tc of calls) {
+            const label = CATEGORY_LABELS[tc.category || ''] || this.toolLabel(tc);
+            groups.set(label, (groups.get(label) || 0) + 1);
+        }
+        return Array.from(groups.entries())
+            .map(([label, count]) => count > 1 ? `${label} x${count}` : label)
+            .join(', ');
+    }
+
+    toolSummaryLabel(calls: ToolCallInfo[]): string {
+        // Use intent grouping when categories are available, else human labels
+        const hasCategories = calls.some(tc => tc.category);
+        return hasCategories ? this.groupToolCallsByIntent(calls) : this.groupToolCallsHuman(calls);
     }
 
     groupToolCalls(calls: ToolCallInfo[]): string {

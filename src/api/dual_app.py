@@ -1010,6 +1010,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
         PersistentLoopCallbacks,
         run_persistent_loop,
     )
+    from ..tools.registry import TOOL_REGISTRY
 
     _session = pa._session
     _thread_id = pa._thread_id
@@ -1025,6 +1026,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
         {
             "thread_id": _thread_id,
             "permission_mode": _session.permission_mode,
+            "narration_mode": _session.narration_mode,
             "turn_count": _session.turn_count,
             "message_count": len(_session.messages),
             "model": _session.config.llm.model,
@@ -1082,6 +1084,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
         await _ws_send(ws, "thinking", {"content": content})
 
     async def on_tool_start(tool_name: str, tool_args, tool_call_id: str) -> None:
+        meta = TOOL_REGISTRY.get(tool_name, {})
         await _ws_send(
             ws,
             "tool.started",
@@ -1089,6 +1092,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 "tool": tool_name,
                 "args": pa._safe_serialize(tool_args),
                 "id": tool_call_id,
+                "category": meta.get("category", ""),
             },
         )
 
@@ -1247,6 +1251,8 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 await user_queue.put(DENY_SENTINEL)
             elif method == "interrupt":
                 interrupt_flag = True
+                await _ws_send(ws, "interrupt.ack", {})
+                logger.info("Interrupt acknowledged")
             elif method == "mode.set":
                 new_mode = data.get("mode", "supervised")
                 if new_mode in ("supervised", "auto_accept", "autonomous"):
@@ -1255,6 +1261,19 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 else:
                     await _ws_send(
                         ws, "error", {"message": f"Invalid mode: {new_mode}"}
+                    )
+            elif method == "narration.set":
+                new_mode = data.get("mode", "auto")
+                if new_mode in ("silent", "verbose", "auto"):
+                    _session.narration_mode = new_mode
+                    await _ws_send(
+                        ws, "narration.changed", {"mode": new_mode}
+                    )
+                else:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": f"Invalid narration mode: {new_mode}"},
                     )
             elif method == "config.update":
                 config_override = data.get("config", {})

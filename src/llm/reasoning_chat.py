@@ -320,8 +320,10 @@ class ReasoningCapturingClient(httpx.Client):
             if rotated_response is not None:
                 response = rotated_response
 
-        # Capture reasoning_content from response
-        if is_chat:
+        # Capture reasoning_content from response (non-streaming only).
+        # When stream=True, httpx doesn't eagerly read the body, so
+        # response.content raises ResponseNotRead — skip capture in that case.
+        if is_chat and not kwargs.get("stream", False):
             try:
                 data = json.loads(response.content)
                 self._last_reasoning_content = _extract_reasoning_from_response(data)
@@ -504,8 +506,10 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
             if rotated_response is not None:
                 response = rotated_response
 
-        # Capture reasoning_content from response
-        if is_chat:
+        # Capture reasoning_content from response (non-streaming only).
+        # When stream=True, httpx doesn't eagerly read the body, so
+        # response.content raises ResponseNotRead — skip capture in that case.
+        if is_chat and not kwargs.get("stream", False):
             try:
                 data = json.loads(response.content)
                 self._last_reasoning_content = _extract_reasoning_from_response(data)
