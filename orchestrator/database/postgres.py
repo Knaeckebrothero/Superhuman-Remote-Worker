@@ -2544,7 +2544,7 @@ class PostgresDB:
             List of resolved datasource dicts (may contain multiple per type)
         """
         try:
-            uuid_val = UUID(job_id)
+            UUID(job_id)
         except ValueError:
             return []
 
