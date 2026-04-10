@@ -61,6 +61,8 @@ class PersistentSession:
 
     # Permission mode (switchable at runtime)
     permission_mode: str = "supervised"
+    # Narration mode (switchable at runtime)
+    narration_mode: str = "auto"
 
     # Conversation state
     messages: List[BaseMessage] = field(default_factory=list)
@@ -137,6 +139,7 @@ class PersistentSession:
         self.postgres_conn = postgres_conn
         self.vector_conn = vector_conn
         self.permission_mode = self.config.interactive.permission_mode
+        self.narration_mode = self.config.interactive.narration_mode
 
         # 1. Create workspace (with optional remote backend + git)
         await self._setup_workspace(

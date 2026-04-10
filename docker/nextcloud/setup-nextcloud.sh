@@ -48,6 +48,13 @@ fi
 # =============================================================================
 occ config:system:set allow_local_remote_servers --value=true --type=boolean 2>&1 || true
 
+# Allow OIDC login over plain HTTP (local dev without TLS reverse proxy).
+# Only effective when OVERWRITEPROTOCOL != https (i.e. dev environments).
+if [ "$(occ config:system:get overwriteprotocol 2>/dev/null)" != "https" ]; then
+    echo "[nc-setup] Plain HTTP detected, enabling allow_insecure_http for OIDC..."
+    occ config:app:set user_oidc allow_insecure_http --value=1 2>&1 || true
+fi
+
 # =============================================================================
 # 1. OIDC provider registration
 # =============================================================================

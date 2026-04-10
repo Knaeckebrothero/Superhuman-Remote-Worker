@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from .persistent_session import PersistentSession
+from ..tools.registry import TOOL_REGISTRY
 from ..agent import UniversalAgent
 from ..persistent_graph import (
     APPROVE_SENTINEL,
@@ -773,6 +774,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             {
                 "thread_id": _thread_id,
                 "permission_mode": _session.permission_mode,
+                "narration_mode": _session.narration_mode,
                 "turn_count": _session.turn_count,
                 "message_count": len(_session.messages),
                 "model": _session.config.llm.model,
@@ -839,6 +841,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         async def on_tool_start(
             tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
         ) -> None:
+            meta = TOOL_REGISTRY.get(tool_name, {})
             await _ws_send(
                 ws,
                 "tool.started",
@@ -846,6 +849,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "tool": tool_name,
                     "args": _safe_serialize(tool_args),
                     "id": tool_call_id,
+                    "category": meta.get("category", ""),
                 },
             )
 
@@ -1039,6 +1043,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
                 elif method == "interrupt":
                     interrupt_flag = True
+                    await _ws_send(ws, "interrupt.ack", {})
+                    logger.info("Interrupt acknowledged")
 
                 elif method == "mode.set":
                     new_mode = data.get("mode", "supervised")
@@ -1051,6 +1057,21 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                             ws,
                             "error",
                             {"message": f"Invalid mode: {new_mode}"},
+                        )
+
+                elif method == "narration.set":
+                    new_mode = data.get("mode", "auto")
+                    if new_mode in ("silent", "verbose", "auto"):
+                        _session.narration_mode = new_mode
+                        await _ws_send(
+                            ws, "narration.changed", {"mode": new_mode}
+                        )
+                        logger.info(f"Narration mode changed to: {new_mode}")
+                    else:
+                        await _ws_send(
+                            ws,
+                            "error",
+                            {"message": f"Invalid narration mode: {new_mode}"},
                         )
 
                 elif method == "config.update":
@@ -1398,6 +1419,9 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             _session.permission_mode = pm
+        nm = (config_override.get("interactive") or {}).get("narration_mode")
+        if nm and nm in ("silent", "verbose", "auto"):
+            _session.narration_mode = nm
 
         # Persist to orchestrator DB (fire-and-forget)
         if _orchestrator_client and _thread_id:

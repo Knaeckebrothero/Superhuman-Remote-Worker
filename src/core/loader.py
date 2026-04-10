@@ -921,6 +921,7 @@ class InteractiveConfig:
     """
 
     permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
+    narration_mode: str = "auto"  # silent | verbose | auto
     idle_timeout_minutes: int = 60  # 0 = disabled
     greeting: str = "Hello! I'm ready to help. What would you like to work on?"
 

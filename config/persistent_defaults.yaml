@@ -171,6 +171,7 @@ auxiliary:
 
 interactive:
   permission_mode: supervised
+  narration_mode: auto
   idle_timeout_minutes: 120
 
 # --- Extra config (flows to config.extra, read by tools) ---
