@@ -122,9 +122,7 @@ class GiteaClient:
                     # Fetch the sign-up page first to get a CSRF token.
                     import re as _re
 
-                    page_resp = await anon_client.get(
-                        f"{self._url}/user/sign_up"
-                    )
+                    page_resp = await anon_client.get(f"{self._url}/user/sign_up")
                     csrf_token = ""
                     if page_resp.status_code == 200:
                         m = _re.search(
