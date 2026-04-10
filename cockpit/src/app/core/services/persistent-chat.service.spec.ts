@@ -130,6 +130,10 @@ describe('PersistentChatService', () => {
         it('should start with null error', () => {
             expect(service.error()).toBeNull();
         });
+
+        it('should start with isSessionPaused false', () => {
+            expect(service.isSessionPaused()).toBe(false);
+        });
     });
 
     // =========================================================================
@@ -1043,6 +1047,68 @@ describe('PersistentChatService', () => {
             const {ws} = await connectService(service);
             if (ws.onerror) ws.onerror();
             expect(service.connectionState()).toBe('error');
+        });
+    });
+
+    // =========================================================================
+    // Session pause and resume
+    // =========================================================================
+
+    describe('session.idle_timeout', () => {
+        it('should set isSessionPaused and add system message', async () => {
+            const {ws} = await connectService(service);
+            fireWsMessage(ws, {method: 'session.idle_timeout', params: {timeout_minutes: 15}});
+
+            expect(service.isSessionPaused()).toBe(true);
+            const msgs = service.messages();
+            const last = msgs[msgs.length - 1];
+            expect(last.role).toBe('system');
+            expect(last.content).toContain('15 minutes');
+        });
+
+        it('should stop waiting for input', async () => {
+            const {ws} = await connectService(service);
+            service.isWaitingForInput.set(true);
+            fireWsMessage(ws, {method: 'session.idle_timeout', params: {}});
+
+            expect(service.isWaitingForInput()).toBe(false);
+        });
+    });
+
+    describe('resumeSession()', () => {
+        it('should POST to resume endpoint and reconnect', async () => {
+            await connectService(service);
+            // Set paused state
+            service.isSessionPaused.set(true);
+
+            mockHttp.post.mockReturnValue(of({}));
+            mockHttp.get.mockReturnValue(of({messages: [], total: 0}));
+
+            await service.resumeSession();
+
+            expect(service.isSessionPaused()).toBe(false);
+            // Verify POST was called with the resume URL
+            const postCalls = mockHttp.post.mock.calls;
+            const resumeCall = postCalls.find((c: any[]) => c[0].includes('/resume'));
+            expect(resumeCall).toBeTruthy();
+            expect(resumeCall[0]).toContain('/persistent/threads/test-thread-123/resume');
+        });
+
+        it('should do nothing if no threadId', async () => {
+            // Service not connected — threadId is null
+            await service.resumeSession();
+            // No HTTP calls should have been made for resume
+            const postCalls = mockHttp.post.mock.calls;
+            const resumeCall = postCalls.find((c: any[]) => c[0]?.includes('/resume'));
+            expect(resumeCall).toBeUndefined();
+        });
+    });
+
+    describe('connect() resets isSessionPaused', () => {
+        it('should reset isSessionPaused to false on connect', async () => {
+            service.isSessionPaused.set(true);
+            await connectService(service);
+            expect(service.isSessionPaused()).toBe(false);
         });
     });
 });

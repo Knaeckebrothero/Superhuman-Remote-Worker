@@ -172,6 +172,17 @@ const SLASH_COMMANDS: SlashCommand[] = [
                 <span class="system-icon">info</span>
                 {{ msg.content }}
               </div>
+              @if (chat.isSessionPaused() && $last) {
+                <button class="resume-btn" (click)="resumeSession()" [disabled]="isResuming()">
+                  @if (isResuming()) {
+                    <span class="resume-btn-spinner"></span>
+                    Resuming...
+                  } @else {
+                    <span class="resume-icon">play_arrow</span>
+                    Resume Session
+                  }
+                </button>
+              }
             } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
               <!-- Tool-only message: compact inline indicator -->
               <div class="tool-only-row">
@@ -257,6 +268,27 @@ const SLASH_COMMANDS: SlashCommand[] = [
               }
             </div>
           }
+        }
+
+        <!-- Resume spinner: shown when history exists but session not yet ready -->
+        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming()) {
+          <div class="startup-spinner-container resume-spinner">
+            <div class="startup-spinner"></div>
+            <span class="startup-label">
+              @if (chat.isCreating()) {
+                Creating session...
+              } @else if (chat.isConnected()) {
+                @switch (chat.startupPhase()) {
+                  @case ('provisioning') { Provisioning agent... }
+                  @case ('booting') { Agent starting... }
+                  @case ('connecting') { Connecting to agent... }
+                  @default { Reconnecting agent... }
+                }
+              } @else {
+                Connecting...
+              }
+            </span>
+          </div>
         }
 
         <!-- Streaming response -->
@@ -871,6 +903,44 @@ const SLASH_COMMANDS: SlashCommand[] = [
       .system-icon {
         font-family: 'Material Symbols Outlined';
         font-size: 14px;
+      }
+
+      .resume-btn {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin: 8px auto 0;
+        padding: 6px 16px;
+        border-radius: 6px;
+        border: 1px solid var(--accent-color, #cba6f7);
+        background: var(--accent-color, #cba6f7);
+        color: var(--app-bg, #1e1e2e);
+        font-size: 12px;
+        font-family: inherit;
+        font-weight: 600;
+        cursor: pointer;
+        transition: opacity 0.15s ease;
+      }
+
+      .resume-btn:hover { opacity: 0.85; }
+      .resume-btn:disabled { opacity: 0.5; cursor: wait; }
+
+      .resume-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .resume-btn-spinner {
+        width: 14px;
+        height: 14px;
+        border: 2px solid var(--app-bg, #1e1e2e);
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      .resume-spinner {
+        padding: 24px 0;
       }
 
       /* Tool-only messages: compact inline indicators (no avatar/bubble) */
@@ -1564,6 +1634,9 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     // Settings panel
     readonly showSettings = signal(false);
 
+    // Resume state
+    readonly isResuming = signal(false);
+
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
@@ -1763,6 +1836,17 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         if (!folder || !environment.nextcloudUrl) return;
         const folderName = folder.split('/').pop();
         window.open(`${environment.nextcloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
+    }
+
+    async resumeSession(): Promise<void> {
+        this.isResuming.set(true);
+        try {
+            await this.chat.resumeSession();
+        } catch (e: any) {
+            this.chat.error.set(e?.error?.detail || 'Failed to resume session');
+        } finally {
+            this.isResuming.set(false);
+        }
     }
 
     private startIdePolling(threadId: string): void {

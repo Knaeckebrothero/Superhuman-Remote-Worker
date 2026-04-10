@@ -97,6 +97,9 @@ export class PersistentChatService {
     // --- Creating state (thread being created via API before connect) ---
     readonly isCreating = signal(false);
 
+    // --- Session paused (idle timeout received) ---
+    readonly isSessionPaused = signal(false);
+
     // --- Error ---
     readonly error = signal<string | null>(null);
 
@@ -124,6 +127,7 @@ export class PersistentChatService {
         this.ncSessionFolder.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
+        this.isSessionPaused.set(false);
 
         this.threadId.set(threadId);
         await this.loadHistory(threadId);
@@ -274,6 +278,20 @@ export class PersistentChatService {
         this.ncSessionFolder.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
+        this.isSessionPaused.set(false);
+    }
+
+    /**
+     * Resume a paused/idle session: POST to resume endpoint, then reconnect.
+     */
+    async resumeSession(): Promise<void> {
+        const threadId = this.threadId();
+        if (!threadId) return;
+        this.isSessionPaused.set(false);
+        await firstValueFrom(
+            this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
+        );
+        await this.connect(threadId);
     }
 
     /** Send a user message (with slash command parsing).
@@ -518,9 +536,10 @@ export class PersistentChatService {
                 break;
 
             case 'session.idle_timeout':
+                this.isSessionPaused.set(true);
                 this.messages.update(msgs => [...msgs, {
                     role: 'system',
-                    content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved \u2014 click Resume to continue.`,
+                    content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
                     timestamp: new Date(),
                 }]);
                 this.isWaitingForInput.set(false);
