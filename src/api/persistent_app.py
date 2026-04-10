@@ -1063,9 +1063,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     new_mode = data.get("mode", "auto")
                     if new_mode in ("silent", "verbose", "auto"):
                         _session.narration_mode = new_mode
-                        await _ws_send(
-                            ws, "narration.changed", {"mode": new_mode}
-                        )
+                        await _ws_send(ws, "narration.changed", {"mode": new_mode})
                         logger.info(f"Narration mode changed to: {new_mode}")
                     else:
                         await _ws_send(
