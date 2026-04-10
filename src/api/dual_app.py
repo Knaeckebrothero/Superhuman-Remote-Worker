@@ -1266,9 +1266,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 new_mode = data.get("mode", "auto")
                 if new_mode in ("silent", "verbose", "auto"):
                     _session.narration_mode = new_mode
-                    await _ws_send(
-                        ws, "narration.changed", {"mode": new_mode}
-                    )
+                    await _ws_send(ws, "narration.changed", {"mode": new_mode})
                 else:
                     await _ws_send(
                         ws,
