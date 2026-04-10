@@ -271,8 +271,8 @@ data:
           "email": "admin@superhuman-remote-worker.com",
           "emailVerified": true,
           "enabled": true,
-          "firstName": "SRW",
-          "lastName": "Admin",
+          "firstName": "Test",
+          "lastName": "User",
           "attributes": {
             "gitea_username": ["srw-admin"]
           },
