@@ -27,9 +27,11 @@ Backend abstraction:
 import logging
 import os
 import shutil
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, Generator, Optional, List
 
 if TYPE_CHECKING:
     from ..managers.git_manager import GitManager
@@ -510,6 +512,41 @@ class WorkspaceManager:
             ValueError: If path attempts to escape workspace
         """
         return Path(self._backend.resolve_path(relative_path))
+
+    @contextmanager
+    def local_copy(self, relative_path: str) -> Generator[Path, None, None]:
+        """Yield a local filesystem path to a workspace file.
+
+        For local backends the resolved path already exists on the local
+        filesystem, so it is yielded directly (no copy, no cleanup).
+
+        For remote backends the file is downloaded via SFTP to a temporary
+        file which is cleaned up when the context manager exits.
+
+        Use this whenever a service (AudioHelper, VisionHelper, PDFReader,
+        etc.) needs to open a file with local I/O.
+
+        Args:
+            relative_path: Path relative to workspace root
+
+        Yields:
+            A Path on the local filesystem containing the file data
+        """
+        local_path = self.get_path(relative_path)
+        if local_path.exists():
+            yield local_path
+            return
+
+        # Remote file — download to a local temp file
+        data = self._backend.read_file(relative_path, binary=True)
+        suffix = Path(relative_path).suffix
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            tmp.write(data)
+            tmp.close()
+            yield Path(tmp.name)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
 
     def exists(self, relative_path: str) -> bool:
         """Check if a file or directory exists in workspace.

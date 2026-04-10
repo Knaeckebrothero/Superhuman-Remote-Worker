@@ -151,7 +151,7 @@ services:
       GITEA__security__INSTALL_LOCK: "true"
       GITEA__server__DISABLE_SSH: "true"
       GITEA__service__DISABLE_REGISTRATION: "false"
-      GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
+      GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "false"
       GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
       GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
       GITEA__service__ENABLE_CAPTCHA: "false"
@@ -161,6 +161,45 @@ services:
       GITEA__oauth2_client__UPDATE_EXISTING: "true"
       GITEA__repository__DEFAULT_PRIVATE: private
       GITEA__repository__ENABLE_PUSH_CREATE_USER: "true"
+      # Bootstrap env vars (used by entrypoint wrapper)
+      GITEA_ADMIN_USER: "${GITEA_ADMIN_USER:-srw}"
+      GITEA_ADMIN_PASSWORD: "${GITEA_ADMIN_PASSWORD:-srw_gitea}"
+      GITEA_OIDC_CLIENT_SECRET: "${GITEA_OIDC_CLIENT_SECRET:-gitea-client-secret}"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        # Start Gitea in the background
+        /usr/local/bin/docker-entrypoint.sh &
+        GITEA_PID=$$!
+        # Wait for Gitea to be ready
+        until wget -qO- http://localhost:3000/api/v1/version >/dev/null 2>&1; do sleep 2; done
+        # Create admin user (idempotent)
+        gitea admin user create --admin \
+          --username "$$GITEA_ADMIN_USER" \
+          --password "$$GITEA_ADMIN_PASSWORD" \
+          --email "$${GITEA_ADMIN_USER}@srw.local" \
+          --must-change-password=false 2>/dev/null || true
+        # Wait for Keycloak to be reachable before OIDC setup
+        until wget -qO- http://srw-keycloak:8080/realms/srw/.well-known/openid-configuration >/dev/null 2>&1; do sleep 3; done
+        # Register Keycloak OIDC if not already present
+        if ! gitea admin auth list 2>/dev/null | grep -q "Keycloak"; then
+          KI="http://srw-keycloak:8080"
+          KP="http://localhost:${KEYCLOAK_PORT:-8180}"
+          R="srw"
+          gitea admin auth add-oauth \
+            --name "Keycloak" --provider "openidConnect" \
+            --key "gitea" --secret "$$GITEA_OIDC_CLIENT_SECRET" \
+            --auto-discover-url "$${KI}/realms/$${R}/.well-known/openid-configuration" \
+            --use-custom-urls \
+            --custom-auth-url "$${KP}/realms/$${R}/protocol/openid-connect/auth" \
+            --custom-token-url "$${KI}/realms/$${R}/protocol/openid-connect/token" \
+            --custom-profile-url "$${KI}/realms/$${R}/protocol/openid-connect/userinfo" \
+            --group-claim-name "groups" --admin-group "admin" \
+            --skip-local-2fa 2>/dev/null || true
+        fi
+        # Wait for Gitea process
+        wait $$GITEA_PID
     volumes:
       - gitea_data:/var/lib/gitea
     ports:

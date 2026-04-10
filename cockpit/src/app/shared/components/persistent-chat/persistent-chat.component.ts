@@ -32,6 +32,91 @@ const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/autonomous', description: 'Switch to autonomous mode (approve nothing)'},
 ];
 
+const TOOL_LABELS: Record<string, string> = {
+    // Workspace — files
+    read_file: 'Reading',
+    write_file: 'Writing',
+    edit_file: 'Editing',
+    list_files: 'Exploring files',
+    file_exists: 'Checking file',
+    delete_file: 'Deleting file',
+    search_files: 'Searching files',
+    move_file: 'Moving file',
+    rename_file: 'Renaming file',
+    copy_file: 'Copying file',
+    create_directory: 'Creating directory',
+    delete_directory: 'Deleting directory',
+    get_document_info: 'Inspecting document',
+
+    // Shell
+    run_command: 'Running command',
+    shell_execute: 'Running command',
+    shell_read: 'Reading output',
+
+    // Git
+    git_log: 'Viewing git history',
+    git_show: 'Viewing commit',
+    git_diff: 'Comparing changes',
+    git_status: 'Checking git status',
+    git_tags: 'Listing tags',
+    git_merge_squash: 'Merging changes',
+    git_worktree_cleanup: 'Cleaning worktree',
+
+    // Research & web
+    web_search: 'Searching the web',
+    extract_webpage: 'Extracting page content',
+    crawl_website: 'Crawling website',
+    map_website: 'Mapping website',
+    browse_website: 'Browsing website',
+    download_from_website: 'Downloading from web',
+    research_topic: 'Researching topic',
+    search_papers: 'Searching papers',
+    download_paper: 'Downloading paper',
+    get_paper_info: 'Getting paper info',
+
+    // Browser (direct)
+    browser_navigate: 'Navigating to page',
+    browser_snapshot: 'Capturing page',
+    browser_click: 'Clicking element',
+    browser_type: 'Typing in browser',
+    browser_select: 'Selecting option',
+    browser_scroll: 'Scrolling page',
+    browser_screenshot: 'Taking screenshot',
+    browser_back: 'Going back',
+    browser_close: 'Closing browser',
+
+    // Tasks & todos
+    task_add: 'Adding task',
+    task_complete: 'Completing task',
+    task_list: 'Listing tasks',
+    next_phase_todos: 'Planning next phase',
+    todo_complete: 'Completing todo',
+    todo_list: 'Listing todos',
+    todo_rewind: 'Rewinding todo',
+
+    // Knowledge base
+    kb_write: 'Writing to knowledge base',
+    kb_update: 'Updating knowledge',
+    kb_read: 'Reading knowledge',
+    kb_list: 'Listing knowledge',
+    kb_search: 'Searching knowledge',
+    kb_related: 'Finding related knowledge',
+
+    // Citation
+    cite_document: 'Citing document',
+    cite_web: 'Citing web source',
+    list_sources: 'Listing sources',
+    search_library: 'Searching library',
+
+    // Communication & delegation
+    send_message: 'Sending message',
+    delegate_work: 'Delegating work',
+
+    // Job lifecycle
+    mark_complete: 'Marking complete',
+    job_complete: 'Completing job',
+};
+
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
@@ -146,16 +231,35 @@ const SLASH_COMMANDS: SlashCommand[] = [
       <!-- Task bar -->
       @if (chat.tasks().length) {
         <div class="task-bar">
-          <div class="task-header">
+          <div class="task-header"
+               [class.task-header-clickable]="chat.tasks().length > 1"
+               (click)="chat.tasks().length > 1 ? toggleTasksCollapsed() : null">
             <span class="task-header-icon">checklist</span>
             Tasks {{ completedTaskCount() }}/{{ chat.tasks().length }}
+            @if (chat.tasks().length > 1) {
+              <span class="task-chevron" [class.task-chevron-open]="!tasksCollapsed()">expand_more</span>
+            }
           </div>
           <div class="task-list">
-            @for (task of chat.tasks(); track task.id) {
-              <div class="task-item" [class.task-completed]="task.status === 'completed'">
-                <span class="task-check">{{ task.status === 'completed' ? 'check_circle' : 'radio_button_unchecked' }}</span>
-                <span class="task-desc">{{ task.description }}</span>
-              </div>
+            @if (chat.tasks().length <= 1 || !tasksCollapsed()) {
+              @for (task of chat.tasks(); track task.id) {
+                <div class="task-item" [class.task-completed]="task.status === 'completed'">
+                  <span class="task-check">{{ task.status === 'completed' ? 'check_circle' : 'radio_button_unchecked' }}</span>
+                  <span class="task-desc">{{ task.description }}</span>
+                </div>
+              }
+            } @else {
+              @if (nextPendingTask(); as task) {
+                <div class="task-item">
+                  <span class="task-check">radio_button_unchecked</span>
+                  <span class="task-desc">{{ task.description }}</span>
+                </div>
+              } @else {
+                <div class="task-item task-completed">
+                  <span class="task-check" style="color: #a6e3a1">check_circle</span>
+                  <span class="task-desc">All tasks completed</span>
+                </div>
+              }
             }
           </div>
         </div>
@@ -188,7 +292,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
               <div class="tool-only-row">
                 <span class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</span>
                 <span class="tool-only-label">
-                  {{ groupToolCalls(msg.toolCalls!) }}
+                  {{ groupToolCallsHuman(msg.toolCalls!) }}
                 </span>
                 <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
               </div>
@@ -200,22 +304,31 @@ const SLASH_COMMANDS: SlashCommand[] = [
                 @if (msg.role === 'user') {
                   <div class="user-text">{{ msg.content }}</div>
                 } @else {
+                  @if (msg.thinking) {
+                    <details class="thinking-block">
+                      <summary class="thinking-header">
+                        <span class="thinking-icon">psychology</span>
+                        <span class="thinking-label">Thought for a moment</span>
+                      </summary>
+                      <div class="thinking-content">{{ msg.thinking }}</div>
+                    </details>
+                  }
                   @if (msg.content) {
                     <markdown [data]="msg.content"></markdown>
                   }
                   @if (msg.toolCalls?.length) {
-                    <details class="tool-summary">
+                    <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) ? '' : null">
                       <summary class="tool-summary-line">
                         <span class="tool-summary-chevron">chevron_right</span>
                         <span class="tool-summary-text">
                           Used {{ msg.toolCalls!.length }} tool{{ msg.toolCalls!.length !== 1 ? 's' : '' }}:
-                          {{ groupToolCalls(msg.toolCalls!) }}
+                          {{ groupToolCallsHuman(msg.toolCalls!) }}
                         </span>
                         <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
                       </summary>
                       <div class="tool-detail-list">
                         @for (tc of msg.toolCalls; track tc.id) {
-                          <details class="tool-detail-item">
+                          <details class="tool-detail-item" [attr.open]="tc.status === 'denied' ? '' : null">
                             <summary class="tool-detail-header">
                               <span class="tool-icon">{{ toolIcon(tc.tool) }}</span>
                               <span class="tool-detail-name">{{ tc.tool }}</span>
@@ -298,6 +411,15 @@ const SLASH_COMMANDS: SlashCommand[] = [
               <span class="avatar-icon">smart_toy</span>
             </div>
             <div class="message-body">
+              @if (chat.streamingThinking()) {
+                <details class="thinking-block" open>
+                  <summary class="thinking-header">
+                    <span class="thinking-icon">psychology</span>
+                    <span class="thinking-label">Thinking...</span>
+                  </summary>
+                  <div class="thinking-content">{{ chat.streamingThinking() }}</div>
+                </details>
+              }
               @if (chat.streamingText()) {
                 <markdown [data]="chat.streamingText()"></markdown>
               }
@@ -305,16 +427,16 @@ const SLASH_COMMANDS: SlashCommand[] = [
                 @if (hasRunningTools(chat.currentToolCalls())) {
                   <div class="tool-progress">
                     <span class="tool-progress-spinner"></span>
-                    <span class="tool-progress-text">Running {{ currentToolLabel(chat.currentToolCalls()) }}...</span>
+                    <span class="tool-progress-text">{{ currentToolLabelHuman(chat.currentToolCalls()) }}...</span>
                   </div>
                 }
                 @if (hasCompletedTools(chat.currentToolCalls())) {
-                  <details class="tool-summary">
+                  <details class="tool-summary" open>
                     <summary class="tool-summary-line">
                       <span class="tool-summary-chevron">chevron_right</span>
                       <span class="tool-summary-text">
                         Used {{ completedToolCount(chat.currentToolCalls()) }} tool{{ completedToolCount(chat.currentToolCalls()) !== 1 ? 's' : '' }}:
-                        {{ groupToolCalls(completedOnly(chat.currentToolCalls())) }}
+                        {{ groupToolCallsHuman(completedOnly(chat.currentToolCalls())) }}
                       </span>
                       <span class="tool-summary-dot completed"></span>
                     </summary>
@@ -575,6 +697,24 @@ const SLASH_COMMANDS: SlashCommand[] = [
       }
       .task-completed .task-check {
         color: #a6e3a1;
+      }
+      .task-header-clickable {
+        cursor: pointer;
+        user-select: none;
+        border-radius: 4px;
+        transition: background 0.15s;
+      }
+      .task-header-clickable:hover {
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .task-chevron {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+        margin-left: auto;
+        transition: transform 0.2s ease;
+      }
+      .task-chevron-open {
+        transform: rotate(180deg);
       }
 
       .header-right {
@@ -1157,6 +1297,57 @@ const SLASH_COMMANDS: SlashCommand[] = [
         to { transform: rotate(360deg); }
       }
 
+      /* Thinking/reasoning block */
+
+      .thinking-block {
+        margin: 4px 0 8px;
+        border-left: 2px solid var(--border, #45475a);
+        border-radius: 4px;
+      }
+
+      .thinking-block > .thinking-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 12px;
+        color: var(--text-muted, #6c7086);
+        list-style: none;
+        user-select: none;
+      }
+
+      .thinking-block > .thinking-header::-webkit-details-marker {
+        display: none;
+      }
+
+      .thinking-block > .thinking-header:hover {
+        color: var(--text-secondary, #a6adc8);
+      }
+
+      .thinking-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .thinking-label {
+        font-style: italic;
+      }
+
+      .thinking-content {
+        padding: 4px 10px 10px;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-muted, #6c7086);
+        white-space: pre-wrap;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+
+      .thinking-block[open] > .thinking-header {
+        padding-bottom: 2px;
+      }
+
       /* Thinking dots */
 
       .thinking {
@@ -1681,6 +1872,17 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.chat.tasks().filter(t => t.status === 'completed').length
     );
 
+    readonly tasksCollapsed = signal(true);
+
+    readonly nextPendingTask = computed(() => {
+        const tasks = this.chat.tasks();
+        return tasks.filter(t => t.status === 'pending' || t.status === 'in_progress').pop() ?? null;
+    });
+
+    toggleTasksCollapsed(): void {
+        this.tasksCollapsed.update(v => !v);
+    }
+
     readonly connectionClass = computed(() => this.chat.connectionState());
     readonly connectionLabel = computed(() => {
         switch (this.chat.connectionState()) {
@@ -1934,6 +2136,90 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     // Tool call display helpers
+
+    toolLabel(tc: ToolCallInfo): string {
+        const base = TOOL_LABELS[tc.tool];
+        if (base) {
+            const context = this.toolLabelContext(tc.tool, tc.args);
+            return context ? `${base} ${context}` : base;
+        }
+        return this.fallbackToolLabel(tc.tool);
+    }
+
+    private toolLabelContext(tool: string, args: Record<string, unknown>): string {
+        if (!args) return '';
+        const t = tool.toLowerCase();
+
+        // File operations: show the filename
+        if (t.includes('read') || t.includes('write') || t.includes('edit') || t === 'list_files' || t === 'file_exists') {
+            const filePath = (args['file_path'] || args['path'] || args['file'] || args['pattern'] || '') as string;
+            if (filePath) {
+                const name = filePath.split('/').pop() || filePath;
+                return name.length > 40 ? name.substring(0, 40) + '...' : name;
+            }
+        }
+
+        // Grep/search: show the pattern
+        if (t.includes('grep') || t.includes('search')) {
+            const pattern = (args['pattern'] || args['query'] || '') as string;
+            if (pattern) {
+                const display = pattern.length > 30 ? pattern.substring(0, 30) + '...' : pattern;
+                return `for "${display}"`;
+            }
+        }
+
+        // Shell: show truncated command
+        if (t === 'run_command' || t === 'shell_execute' || t === 'bash') {
+            const cmd = (args['command'] || args['description'] || '') as string;
+            if (cmd) {
+                const display = cmd.length > 40 ? cmd.substring(0, 40) + '...' : cmd;
+                return `\u2014 ${display}`;
+            }
+        }
+
+        return '';
+    }
+
+    private fallbackToolLabel(name: string): string {
+        return name
+            .replace(/_/g, ' ')
+            .replace(/([a-z])([A-Z])/g, '$1 $2')
+            .replace(/^./, c => c.toUpperCase());
+    }
+
+    groupToolCallsHuman(calls: ToolCallInfo[]): string {
+        const groups = new Map<string, { count: number; label: string }>();
+        for (const tc of calls) {
+            const existing = groups.get(tc.tool);
+            if (existing) {
+                existing.count++;
+            } else {
+                groups.set(tc.tool, {count: 1, label: this.toolLabel(tc)});
+            }
+        }
+        return Array.from(groups.values())
+            .map(({count, label}) => count > 1 ? `${label} x${count}` : label)
+            .join(', ');
+    }
+
+    currentToolLabelHuman(calls: ToolCallInfo[]): string {
+        const running = calls.filter(tc => tc.status === 'running' || tc.status === 'pending');
+        if (running.length === 0) return '';
+        if (running.length === 1) return this.toolLabel(running[0]);
+        const unique = new Map<string, ToolCallInfo>();
+        for (const tc of running) {
+            if (!unique.has(tc.tool)) unique.set(tc.tool, tc);
+        }
+        if (unique.size === 1) {
+            const first = unique.values().next().value!;
+            return `${this.toolLabel(first)} (${running.length})`;
+        }
+        return Array.from(unique.values()).map(tc => this.toolLabel(tc)).join(', ');
+    }
+
+    hasDeniedTools(calls: ToolCallInfo[]): boolean {
+        return calls.some(tc => tc.status === 'denied');
+    }
 
     groupToolCalls(calls: ToolCallInfo[]): string {
         const counts = new Map<string, number>();

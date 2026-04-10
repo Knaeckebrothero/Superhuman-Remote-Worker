@@ -166,25 +166,33 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             return f"Error reading PDF: {str(e)}"
 
     def _handle_image_file(
-        full_path: Path,
+        local_path: Path,
         describe: Optional[str],
+        display_name: str = "",
     ) -> str:
         """Handle standalone image files.
 
         For multimodal models: Returns base64-encoded image data.
         For text-only models: Returns AI-generated description.
+
+        Args:
+            local_path: Path on the local filesystem (may be a temp file
+                        downloaded from a remote workspace).
+            describe: Optional query for visual analysis.
+            display_name: Original filename for display headers.
         """
+        name = display_name or local_path.name
         if context.get_phase_multimodal():
             # Return image for multimodal model to see directly
             try:
-                image_data = full_path.read_bytes()
+                image_data = local_path.read_bytes()
                 base64_image = base64.b64encode(image_data).decode()
-                mime_type = _get_mime_type(full_path)
+                mime_type = _get_mime_type(local_path)
 
                 # Return in a format that can be parsed by the agent
                 # The LLM will receive this as text, but we format it clearly
                 return (
-                    f"[IMAGE: {full_path.name}]\n"
+                    f"[IMAGE: {name}]\n"
                     f"Type: {mime_type}\n"
                     f"Size: {len(image_data):,} bytes\n\n"
                     f'<image_data mime_type="{mime_type}">\n'
@@ -192,7 +200,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"</image_data>"
                 )
             except Exception as e:
-                logger.error(f"Error reading image {full_path}: {e}")
+                logger.error(f"Error reading image {local_path}: {e}")
                 return f"Error reading image: {str(e)}"
         else:
             # Get AI description for text-only model
@@ -204,46 +212,55 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 vision = get_vision_helper()
 
                 # Check cache first
-                cached = cache.get(full_path, query=describe)
+                cached = cache.get(local_path, query=describe)
                 if cached:
-                    logger.debug(f"Cache hit for image: {full_path.name}")
-                    return f"[IMAGE: {full_path.name}]\n\n{cached}"
+                    logger.debug(f"Cache hit for image: {name}")
+                    return f"[IMAGE: {name}]\n\n{cached}"
 
                 # Generate description
-                image_data = full_path.read_bytes()
+                image_data = local_path.read_bytes()
                 description = vision.describe_image_sync(
                     image_data,
-                    mime_type=_get_mime_type(full_path),
+                    mime_type=_get_mime_type(local_path),
                     query=describe,
                     job_id=context.job_id,
                 )
 
                 # Cache for future use
-                cache.set(full_path, description, query=describe)
+                cache.set(local_path, description, query=describe)
 
-                return f"[IMAGE: {full_path.name}]\n\n{description}"
+                return f"[IMAGE: {name}]\n\n{description}"
 
             except ImportError as e:
                 logger.warning(f"Vision services not available: {e}")
                 return (
-                    f"[IMAGE: {full_path.name}]\n"
+                    f"[IMAGE: {name}]\n"
                     f"(Visual description not available - vision services not configured)"
                 )
             except Exception as e:
-                logger.error(f"Error describing image {full_path}: {e}")
-                return f"[IMAGE: {full_path.name}]\n(Error generating description: {str(e)})"
+                logger.error(f"Error describing image {local_path}: {e}")
+                return f"[IMAGE: {name}]\n(Error generating description: {str(e)})"
 
     def _handle_audio_file(
-        full_path: Path,
+        local_path: Path,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
+        display_name: str = "",
     ) -> str:
         """Handle audio files via Whisper transcription with line-numbered paging.
 
         Transcribes audio to text using AudioHelper (large files are
         transparently chunked). Results are cached via DescriptionCache.
         Output is line-numbered with offset/limit paging, matching text files.
+
+        Args:
+            local_path: Path on the local filesystem (may be a temp file
+                        downloaded from a remote workspace).
+            offset: Starting line number (1-indexed).
+            limit: Number of lines to return.
+            display_name: Original filename for display headers.
         """
+        name = display_name or local_path.name
         try:
             from src.services.audio_helper import (
                 get_audio_helper,
@@ -254,31 +271,31 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             cache = get_description_cache()
 
             # Get transcript from cache or via transcription
-            cached = cache.get(full_path)
+            cached = cache.get(local_path)
             if cached:
-                logger.debug(f"Cache hit for audio: {full_path.name}")
+                logger.debug(f"Cache hit for audio: {name}")
                 transcript = cached
             else:
                 audio = get_audio_helper()
                 transcript = audio.transcribe_sync(
-                    full_path,
+                    local_path,
                     job_id=context.job_id,
                 )
 
                 # Don't cache error results
                 if not transcript.startswith("[Error"):
-                    cache.set(full_path, transcript)
+                    cache.set(local_path, transcript)
 
             # Return errors directly (no line numbering)
             if transcript.startswith("[Error"):
-                return f"[AUDIO: {full_path.name}]\n\n{transcript}"
+                return f"[AUDIO: {name}]\n\n{transcript}"
 
             # Split into lines for paging
             lines = split_transcript_into_lines(transcript)
             total_lines = len(lines)
 
             if total_lines == 0:
-                return f"[AUDIO: {full_path.name}]\n\n(No speech content detected)"
+                return f"[AUDIO: {name}]\n\n(No speech content detected)"
 
             # Apply offset/limit defaults (same as text files)
             start_line = offset if offset is not None else 1
@@ -304,7 +321,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     line = line[:MAX_LINE_LENGTH] + "..."
                 output_lines.append(f"{i:6}\t{line}")
 
-            result = f"[AUDIO: {full_path.name}]\n\n" + "\n".join(output_lines)
+            result = f"[AUDIO: {name}]\n\n" + "\n".join(output_lines)
 
             # Word count cap (same as text files)
             word_count = len(result.split())
@@ -333,12 +350,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         except ImportError as e:
             logger.warning(f"Audio services not available: {e}")
             return (
-                f"[AUDIO: {full_path.name}]\n"
+                f"[AUDIO: {name}]\n"
                 f"(Transcription not available - audio services not configured)"
             )
         except Exception as e:
-            logger.error(f"Error transcribing audio {full_path}: {e}")
-            return f"[AUDIO: {full_path.name}]\n(Error transcribing: {str(e)})"
+            logger.error(f"Error transcribing audio {local_path}: {e}")
+            return f"[AUDIO: {name}]\n(Error transcribing: {str(e)})"
 
     def _get_visual_content(
         full_path: Path,
@@ -639,24 +656,37 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 return f"Error: '{path}' is a directory, not a file. Use list_files to see its contents."
 
             # Handle image files
+            # Use local_copy() to ensure the file is on the local
+            # filesystem — required for remote workspace backends
+            # where get_path() returns a remote-only path.
             if _is_image_file(full_path):
-                result = _handle_image_file(full_path, describe)
+                with workspace.local_copy(path) as local_path:
+                    result = _handle_image_file(
+                        local_path, describe, display_name=full_path.name
+                    )
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result
 
             # Handle audio files (transcribe via Whisper, line-numbered paging)
             if _is_audio_file(full_path):
-                result = _handle_audio_file(full_path, offset=offset, limit=limit)
+                with workspace.local_copy(path) as local_path:
+                    result = _handle_audio_file(
+                        local_path,
+                        offset=offset,
+                        limit=limit,
+                        display_name=full_path.name,
+                    )
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result
 
             # Handle visual documents (PDF, PPTX, DOCX) with page-based reading + visual content
             if _is_visual_document(full_path):
-                result = _read_visual_document(
-                    full_path, path, page_start, page_end, describe
-                )
+                with workspace.local_copy(path) as local_path:
+                    result = _read_visual_document(
+                        local_path, path, page_start, page_end, describe
+                    )
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result

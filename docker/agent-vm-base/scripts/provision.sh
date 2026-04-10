@@ -302,5 +302,6 @@ sudo -u agent-host git config --global init.defaultBranch main
 sudo -u agent-host git config --global user.name "Agent Worker"
 sudo -u agent-host git config --global user.email "agent@srw.local"
 sudo -u agent-host git config --global core.editor vim
+sudo -u agent-host git config --global core.pager cat
 
 echo "=== Provisioning complete ==="

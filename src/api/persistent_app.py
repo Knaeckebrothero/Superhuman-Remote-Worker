@@ -833,6 +833,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         async def on_token(token: str) -> None:
             await _ws_send(ws, "token", {"content": token})
 
+        async def on_thinking(content: str) -> None:
+            await _ws_send(ws, "thinking", {"content": content})
+
         async def on_tool_start(
             tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
         ) -> None:
@@ -977,6 +980,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         callbacks = PersistentLoopCallbacks(
             get_user_input=get_user_input,
             on_token=on_token,
+            on_thinking=on_thinking,
             on_tool_start=on_tool_start,
             on_tool_result=on_tool_result,
             permission_check=permission_check,
