@@ -55,7 +55,7 @@ logging.getLogger("uvicorn.access").disabled = True
 
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
-from typing import Any, Optional  # noqa: E402
+from typing import Any, Literal, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
@@ -6634,21 +6634,35 @@ async def get_job_audit(
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+    offset: Optional[int] = Query(default=None, ge=0),
+    limit: Optional[int] = Query(default=None, ge=1, le=200),
+    order: Literal["asc", "desc"] = Query(default="asc"),
     filter: FilterCategory = Query(default="all"),
 ) -> dict[str, Any]:
     """Get paginated audit entries for a job from MongoDB.
 
+    Two pagination styles are supported; use whichever you prefer:
+        - offset/limit (REST-style): ?offset=50&limit=50
+        - page/pageSize (legacy):    ?page=2&pageSize=50
+    If both are provided, offset/limit wins. The response echoes both styles.
+
     Query params:
-        page: Page number (1-indexed). Use -1 to request the last page.
-        pageSize: Number of entries per page (max 200)
-        filter: Filter category - all, messages, tools, or errors
+        offset: Entries to skip (overrides page if set)
+        limit: Max entries to return, max 200 (overrides pageSize if set)
+        page: 1-indexed page number; -1 = last page
+        pageSize: Entries per page, max 200
+        order: asc (oldest first, default) or desc (newest first)
+        filter: all, messages, tools, or errors
     """
+    effective_size = limit if limit is not None else page_size
     if not mongodb.is_available:
         return {
             "entries": [],
             "total": 0,
             "page": page,
-            "pageSize": page_size,
+            "pageSize": effective_size,
+            "offset": offset if offset is not None else 0,
+            "limit": effective_size,
             "hasMore": False,
             "error": "MongoDB not available",
         }
@@ -6659,6 +6673,9 @@ async def get_job_audit(
             page=page,
             page_size=page_size,
             filter_category=filter,
+            offset=offset,
+            limit=limit,
+            order=order,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
