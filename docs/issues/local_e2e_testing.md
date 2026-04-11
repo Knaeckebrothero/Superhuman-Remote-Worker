@@ -167,15 +167,14 @@ running the agent in persistent mode.
 
 ### Workspace backend abstraction (already exists)
 
-The agent already has a clean `WorkspaceBackend` interface
-(`src/core/workspace_backend.py`) with two implementations:
+The agent has a `WorkspaceBackend` interface (`src/core/workspace_backend.py`)
+with a single production implementation: **`RemoteBackend`** (paramiko
+SSH/SFTP, `supports_shell = True`). `LocalBackend` was removed in the
+2026-04-11 cleanup — the agent never operates on its own filesystem, and
+the config schema rejects `backend: local`.
 
-- **`LocalBackend`** — pathlib file I/O, `supports_shell = False`
-- **`RemoteBackend`** — paramiko SSH/SFTP, `supports_shell = True`
-
-The decision is per-job via `workspace.backend: "local"|"remote"` in config.
-When `backend == "remote"`, the orchestrator injects the VM's Tailscale IP
-into `config_override.workspace.remote.host`. No changes needed to this
+The orchestrator injects the workspace container's Tailscale/SSH host into
+`config_override.workspace.remote.host`. No changes needed to this
 abstraction — the simulator just needs to provide a reachable SSH host.
 
 ### VMProvisioner dual-mode (already exists)

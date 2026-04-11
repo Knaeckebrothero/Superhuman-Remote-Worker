@@ -622,5 +622,5 @@ Before deploying to production:
 2. **SSH test**: Run the container, SSH in as `agent-host`, verify home dir is clean workspace root.
 3. **code-server test**: Open code-server, verify it shows `/home/agent-host` contents with dotfiles hidden.
 4. **Docker Compose**: `podman-compose up -d` — verify workspace containers accept SSH with new key mount path.
-5. **Dev mode**: `python agent.py --dev --description "test"` — verify workspace files created at `./workspace/` directly.
+5. **Dev mode** (historical): this step used `python agent.py --dev --description "test"` to verify workspace files at `./workspace/`. The `--dev` flag and `LocalBackend` have since been removed — dev now always goes through SSH to a workspace container.
 6. **K8s deploy**: Fleet sync, verify workspace pods start with emptyDir, code-server URL works, sessions function end-to-end.

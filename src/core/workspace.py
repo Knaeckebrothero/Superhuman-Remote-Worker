@@ -7,11 +7,6 @@ store plans, documents, notes, and intermediate work products.
 The workspace IS the base path — no per-job subdirectories. Isolation is
 provided by the container/VM boundary, not directory structure.
 
-Environment-aware path resolution:
-- Remote workspace container: /home/agent-host (= home dir)
-- VM workspace: /home/agent-host (= home dir)
-- Dev mode (local): ./workspace
-
 Git versioning:
 - Optional git repository per workspace for automatic change tracking
 - Commits on todo completion for audit trail
@@ -19,8 +14,7 @@ Git versioning:
 
 Backend abstraction:
 - File I/O is delegated to a WorkspaceBackend implementation
-- LocalBackend (default): pathlib-based, current behavior
-- RemoteBackend: SSH/SFTP to a remote VM or workspace container
+- RemoteBackend (SSH/SFTP) is the only production backend
 - See docs/features/vm_backend.md for the full design
 """
 
@@ -153,13 +147,15 @@ class WorkspaceManager:
     The workspace provides persistent storage for plans, documents, notes,
     and intermediate work products.
 
-    File I/O is delegated to a WorkspaceBackend instance. By default, a
-    LocalBackend is created automatically (identical to previous behavior).
+    File I/O is delegated to a WorkspaceBackend instance, which the caller
+    must provide. Production constructs a RemoteBackend that SSHes into a
+    workspace container or VM. Tests use a filesystem-backed backend from
+    tests/_fs_backend.py.
 
     Example:
         ```python
         # Create workspace for a job
-        ws = WorkspaceManager(job_id="abc123")
+        ws = WorkspaceManager(job_id="abc123", backend=backend)
         await ws.initialize()
 
         # Access paths
@@ -181,19 +177,26 @@ class WorkspaceManager:
     def __init__(
         self,
         job_id: str,
+        backend: "WorkspaceBackend",
         config: Optional[WorkspaceManagerConfig] = None,
         base_path: Optional[Path] = None,
-        backend: Optional["WorkspaceBackend"] = None,
     ):
         """Initialize workspace manager.
 
         Args:
             job_id: Unique job identifier (usually UUID)
+            backend: Workspace backend. Production must pass a RemoteBackend;
+                     the agent process never operates on its own filesystem.
             config: Optional workspace configuration
             base_path: Override base path (for testing)
-            backend: Optional workspace backend. If None, a LocalBackend
-                     is created automatically (default, backward compatible).
         """
+        if backend is None:
+            raise TypeError(
+                "WorkspaceManager requires a backend. Production must pass a "
+                "RemoteBackend; tests should import FilesystemTestBackend from "
+                "tests/_fs_backend.py."
+            )
+
         self.job_id = job_id
         self.config = config or WorkspaceManagerConfig()
 
@@ -210,15 +213,7 @@ class WorkspaceManager:
         self._workspace_path = self._base_path
         self._initialized = False
 
-        # Create or accept backend
-        if backend is not None:
-            self._backend = backend
-        else:
-            try:
-                from .backends.local import LocalBackend
-            except ImportError:
-                from src.core.backends.local import LocalBackend
-            self._backend = LocalBackend(self._workspace_path)
+        self._backend = backend
 
         # Git manager (created during initialize if git_versioning enabled)
         self._git_manager: Optional["GitManager"] = None

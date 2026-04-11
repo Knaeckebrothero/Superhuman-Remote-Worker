@@ -9,6 +9,8 @@ tags:
 
 Design document for dynamically creating agent pods on the same cluster when jobs are dispatched, eliminating the need for pre-registered long-running agent processes.
 
+> **Status (2026-04-11):** Retained as design context only. The entire premise of this document — single-job CLI mode on `agent.py` (`--job-id`, `--pod-mode`, `run_single_job()`) — no longer exists. The agent is always run as a server (`python agent.py --port 8001 --loop`) and jobs are dispatched over HTTP by the orchestrator. If a pod-per-task dispatch mode is still desired, it would need to be designed around the current server-mode entry point (e.g. spawn a pod, wait for `/ready`, POST the job, let it exit). Everything below describes a CLI-mode integration that has been deleted.
+
 ## Motivation
 
 Today, agents are long-running Deployments (2 replicas, see `deployment/21-agent.yaml`) that register with the orchestrator via heartbeat and wait for jobs. The dispatcher (`_try_dispatch_pending_jobs` in `orchestrator/main.py:883`) matches pending jobs to available agents, then POSTs the full `JobStartRequest` to the agent's `/job/start` endpoint. This model has drawbacks:

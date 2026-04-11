@@ -189,9 +189,9 @@
         },
         "backend": {
           "type": "string",
-          "enum": ["local", "remote", "container"],
-          "default": "local",
-          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM. 'container' uses a per-job workspace container (default for production when provisioner is available)."
+          "enum": ["remote", "container"],
+          "default": "remote",
+          "description": "Workspace backend type. 'remote' uses SSH/SFTP to a pre-provisioned VM or workspace container. 'container' has the orchestrator provision a per-job workspace container. The agent never operates on its own filesystem."
         },
         "container": {
           "type": "object",

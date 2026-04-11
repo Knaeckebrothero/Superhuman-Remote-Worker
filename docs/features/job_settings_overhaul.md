@@ -125,7 +125,7 @@ AT DISPATCH (orchestrator → agent pod):
     - users.settings.embedding_provider    → env_keys (always)
 
 AT AGENT START (src/agent.py → loader):
-  + safety guard: agent refuses workspace.backend=local unless DEV_MODE=1
+  + safety guard: WorkspaceConfig rejects workspace.backend=local; agent only accepts backend=remote with SSH credentials
   + settings_matrix.yaml (model-family-specific inference params)
     - Applies temperature, top_p, top_k per model family
     - Applies context limits (always from matrix, expert can't override)
@@ -497,6 +497,6 @@ This replaces the current approach where `buildConfigOverride()` silently diffs 
 ### Config
 | File | Change |
 |------|--------|
-| `config/defaults.yaml` | Workspace backend default changed from `local` to `remote`. Agent now refuses `backend=local` without `DEV_MODE=1` (`--dev` flag). In production, orchestrator always injects `backend=remote` with provisioned workspace credentials |
+| `config/defaults.yaml` | Workspace backend is `remote`. `local` has been removed entirely from the schema — `WorkspaceConfig.__post_init__` raises if it is set. The orchestrator always injects `backend=remote` with provisioned workspace credentials |
 | `config/schema.json` | Source of truth — ensure cockpit asset stays in sync |
 | `config/settings_matrix.yaml` | No change, but the new `GET /api/config/resolve` endpoint should apply it |

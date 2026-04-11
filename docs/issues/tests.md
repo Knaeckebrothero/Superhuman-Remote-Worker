@@ -336,7 +336,9 @@ _Detection (`is_workspace_injection_message`):_
 
 ### 1.6 `src/core/phase_snapshot.py` — Phase Recovery (505 lines, 0 tests)
 
-User-facing `--recover-phase` feature. Completely untested.
+Phase snapshot recovery (was originally surfaced as the CLI `--recover-phase`
+flag, now exclusively driven through the orchestrator resume flow). Completely
+untested.
 
 **What to test:**
 

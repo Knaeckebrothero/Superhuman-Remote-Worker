@@ -78,8 +78,8 @@ The backend plumbing for this flow already exists:
 | `job_complete` freezes the job | `src/tools/core/job.py` — writes `output/job_frozen.json` | Done |
 | `check_goal` detects frozen state | `src/graph.py:1064-1095` — stops graph with `should_stop=True` | Done |
 | `pending_review` job status | `orchestrator/database/schema.sql:62` — valid DB status | Done |
-| `--approve` CLI command | `src/agent.py:1406-1486` — writes `output/job_completion.json` | Done |
-| `--resume --feedback` CLI command | `src/agent.py:343-351` — injects feedback into `instructions.md` | Done |
+| Approve frozen job | `POST /api/jobs/{id}/approve` on the orchestrator — writes `output/job_completion.json` (implementation in `orchestrator/main.py`; the CLI `--approve` flag was removed on 2026-04-11) | Done |
+| Resume with feedback | `POST /api/jobs/{id}/resume` on the orchestrator — injects feedback into `instructions.md` and dispatches to an agent (the CLI `--resume --feedback` flag was removed on 2026-04-11) | Done |
 | Git push on freeze | `src/core/phase.py:535-537` — commits and pushes workspace to Gitea | Done |
 | Gitea per-job repos | `orchestrator/services/gitea.py` — auto-creates repo on job creation | Done |
 

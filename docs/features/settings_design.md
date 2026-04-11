@@ -146,7 +146,7 @@ These are **not** part of the `AgentSettingsComponent` — they remain on the gl
 | Max read words | `workspace.max_read_words` | number | 25000 | Admin |
 | Max write words | `workspace.max_write_words` | number | 10000 | Admin |
 | Git versioning | `workspace.git_versioning` | boolean | true (job) / false (session) | Admin |
-| Backend | `workspace.backend` | enum | `remote` (prod default; `local` requires `DEV_MODE=1`) | Admin |
+| Backend | `workspace.backend` | enum (`remote`, `container`) | `remote` | Admin |
 
 ### Limits & Safety (rarely user-facing)
 
@@ -445,7 +445,7 @@ Each accordion section expands to show its settings:
 | Max read words | Number input |
 | Max write words | Number input |
 | Git versioning | Toggle |
-| Backend | Dropdown (`remote` default, `local` dev-only — agent refuses `local` without `DEV_MODE=1`). In production, the orchestrator always injects `backend=remote` with workspace credentials from K8s ContainerProvisioner or DockerProvisioner |
+| Backend | Dropdown (`remote` default or `container`). `local` has been removed entirely — the agent never operates on its own filesystem. The orchestrator always injects `backend=remote` with workspace credentials from K8s ContainerProvisioner or DockerProvisioner |
 
 **Shell:**
 | Setting | Control |
@@ -740,7 +740,7 @@ AT DISPATCH (orchestrator/main.py:563-850):
     users.settings.embedding_provider      → env_keys
 
 AT AGENT START (src/agent.py → src/core/loader.py):
-  + safety guard: agent refuses workspace.backend=local unless DEV_MODE=1
+  + safety guard: WorkspaceConfig rejects workspace.backend=local; agent only accepts backend=remote with SSH credentials
   + $extends chain resolved (expert → defaults.yaml)
   + settings_matrix.yaml applied (model-family inference params):
     - temperature, top_p, top_k per model family (expert explicit values win)

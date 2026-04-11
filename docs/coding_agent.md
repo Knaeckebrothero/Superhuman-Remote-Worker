@@ -100,30 +100,33 @@ When running in k3s (see [cloud_workspace.md](./cloud_workspace.md)), `run_comma
 
 ### Running a Coding Job
 
+Coding jobs are submitted through the orchestrator REST API or the Cockpit UI — there is no CLI that creates jobs directly. Start the `coder` agent as a server and then create a job with the appropriate context:
+
 ```bash
-python agent.py --config coder \
-  --git-url https://gitea.example.com/user/repo.git \
-  --git-branch feature/my-feature \
-  --description "Implement the feature described in the attached document" \
-  --document-path docs/some_feature.md
+# Start the orchestrator + a coder agent
+uvicorn orchestrator.main:app --reload --port 8085
+python agent.py --config coder --port 8001 --loop
 ```
 
+Then submit a job with `git_url`, `git_branch`, `description`, and any reference documents in the job context. The orchestrator dispatches it to the agent. See `orchestrator/main.py` `/api/jobs/` endpoints or create the job from the Cockpit UI.
+
 **What happens:**
-1. A new job is created in PostgreSQL
-2. Workspace `workspace/job_<uuid>/` is initialized with `archive/`, `documents/`, `output/`, `repo/` directories
-3. The repository is cloned into `workspace/job_<uuid>/repo/` and the specified branch is checked out
-4. Documents are copied to `workspace/job_<uuid>/documents/`
-5. The agent starts its phase alternation loop
+1. A job is created in PostgreSQL and dispatched to the coder agent
+2. The orchestrator provisions a workspace container and injects SSH credentials (`backend: remote`)
+3. The workspace is initialized with `archive/`, `documents/`, `output/`, `repo/` directories inside the container
+4. The repository is cloned into `repo/` and the specified branch is checked out
+5. Reference documents are uploaded to `documents/`
+6. The agent starts its phase alternation loop
 
-### CLI Arguments
+### Job Context Fields
 
-| Argument | Default | Description |
+| Field | Default | Description |
 |----------|---------|-------------|
-| `--config coder` | — | Use the coder expert config |
-| `--git-url` | — | Git repository URL to clone into `workspace/repo/` |
-| `--git-branch` | `main` | Branch to checkout (created if it doesn't exist) |
-| `--description` | — | What the agent should accomplish |
-| `--document-path` | — | Reference document (copied to `workspace/documents/`) |
+| `config_name` | — | `coder` — use the coder expert config |
+| `context.git_url` | — | Git repository URL to clone into `repo/` |
+| `context.git_branch` | `main` | Branch to checkout (created if it doesn't exist) |
+| `description` | — | What the agent should accomplish |
+| `document_ids` | — | Reference documents (uploaded to `documents/`) |
 
 ### What the Agent Does
 
@@ -181,7 +184,7 @@ workspace/job_<uuid>/
 | `config/schema.json` | Modified | Added `coding` tool category to schema |
 | `src/core/loader.py` | Modified | Added `coding` field to `ToolsConfig`, wired into both config parsers and `get_all_tool_names()` |
 | `src/tools/registry.py` | Modified | Import + register coding metadata, `coding` category handling in `load_tools()` |
-| `agent.py` | Modified | `--git-url` / `--git-branch` CLI args, passes git info into job context |
+| `src/agent.py` | Modified | Reads `git_url` / `git_branch` from job context in `_setup_job_workspace()` |
 | `src/agent.py` | Modified | Repo clone logic in `_setup_job_workspace()` |
 | `docker/Dockerfile.agent` | Modified | Added `ripgrep` and `jq` |
 | `CLAUDE.md` | Modified | Documented `coding` tool category |
@@ -238,12 +241,12 @@ tools:
 
 ### Repo Bootstrap (in `src/agent.py`)
 
-When `--git-url` is provided, `_setup_job_workspace()` clones the repo after workspace initialization:
+When `context.git_url` is set on a job, `_setup_job_workspace()` clones the repo after workspace initialization:
 
 1. Runs `git clone --branch <branch> <url> <workspace>/repo/`
 2. If the branch doesn't exist yet, clones default branch and creates + checks out the new branch
 3. Timeout: 300s for the clone operation
-4. Skipped on `--resume` (workspace already has the repo)
+4. Skipped when resuming a job (workspace already has the repo)
 
 ### `instructions.md` — Key Principles
 

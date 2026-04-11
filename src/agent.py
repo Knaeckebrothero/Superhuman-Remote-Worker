@@ -1034,55 +1034,51 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
-        # Safety guard: refuse local backend in production
-        # In production (k8s or Docker Compose), the orchestrator always injects
-        # backend=remote.  If we reach here with backend=local and DEV_MODE is
-        # not set, it means the override failed — refuse the job rather than
-        # running LLM shell commands inside the agent container.
-        dev_mode = os.environ.get("DEV_MODE", "").strip() == "1"
-        if self.config.workspace.backend == "local" and not dev_mode:
+        # Create workspace backend. The agent never operates on its own
+        # filesystem — backend must be "remote" with SSH credentials provided
+        # by the orchestrator at dispatch time.
+        if self.config.workspace.backend != "remote":
             raise RuntimeError(
-                "Workspace backend is 'local' but DEV_MODE is not enabled. "
-                "In production, the orchestrator must inject "
-                "workspace.backend='remote' with a provisioned workspace "
-                "container or VM.  If you are developing locally without "
-                "containers, restart the agent with --dev."
+                f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
+                f"The agent requires backend='remote' with SSH credentials "
+                f"injected by the orchestrator."
+            )
+        if not self.config.workspace.remote:
+            raise RuntimeError(
+                "workspace.backend='remote' but no workspace.remote config was "
+                "provided. The orchestrator must inject SSH credentials pointing "
+                "at a provisioned workspace container or VM."
             )
 
-        # Create workspace backend based on config
-        workspace_backend = None
-        if self.config.workspace.backend == "remote" and self.config.workspace.remote:
-            try:
-                from .core.backends.remote import RemoteBackend
+        try:
+            from .core.backends.remote import RemoteBackend
 
-                remote_cfg = self.config.workspace.remote
-                workspace_backend = RemoteBackend(
-                    host=remote_cfg["host"],
-                    port=remote_cfg.get("port", 22),
-                    username=remote_cfg.get("username", "agent-host"),
-                    key_path=remote_cfg.get("key_path"),
-                    workspace_path=remote_cfg.get(
-                        "workspace_path", "/home/agent-host/workspace"
-                    ),
-                    job_id=job_id,
-                    scrollback_limit=self.config.extra.get("shell", {}).get(
-                        "scrollback_limit", 5000
-                    ),
-                    default_timeout=self.config.extra.get("shell", {}).get(
-                        "default_timeout", 120
-                    ),
-                    max_tabs=self.config.extra.get("shell", {}).get("max_tabs", 15),
-                    blocked_commands=self.config.extra.get("shell", {}).get(
-                        "blocked_commands"
-                    ),
-                )
-                workspace_backend.connect()
-                logger.info(
-                    f"Remote workspace backend connected to {remote_cfg['host']}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to create remote backend: {e}")
-                raise
+            remote_cfg = self.config.workspace.remote
+            workspace_backend = RemoteBackend(
+                host=remote_cfg["host"],
+                port=remote_cfg.get("port", 22),
+                username=remote_cfg.get("username", "agent-host"),
+                key_path=remote_cfg.get("key_path"),
+                workspace_path=remote_cfg.get(
+                    "workspace_path", "/home/agent-host/workspace"
+                ),
+                job_id=job_id,
+                scrollback_limit=self.config.extra.get("shell", {}).get(
+                    "scrollback_limit", 5000
+                ),
+                default_timeout=self.config.extra.get("shell", {}).get(
+                    "default_timeout", 120
+                ),
+                max_tabs=self.config.extra.get("shell", {}).get("max_tabs", 15),
+                blocked_commands=self.config.extra.get("shell", {}).get(
+                    "blocked_commands"
+                ),
+            )
+            workspace_backend.connect()
+            logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
+        except Exception as e:
+            logger.error(f"Failed to create remote backend: {e}")
+            raise
 
         # Worktree creation: subjobs on shared VM/container get a git worktree
         # instead of a full clone. The worktree is created on the remote machine.
