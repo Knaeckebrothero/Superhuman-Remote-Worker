@@ -91,7 +91,7 @@ Survey of how major AI providers implement subagent delegation (as of March 2026
 |---------|-------------------|--------------|
 | **Delegation primitive** | Tool call (universal) | `delegate_work` tool |
 | **Context isolation** | Fresh context per child, only task description down, only result up | Git branch + worktree per child, squash merge results back |
-| **Parent waiting** | Process-level: Codex blocks in `wait_agent`; Kimi K2.5 orchestrator waits for frozen subagents | Checkpoint + wake (resource-efficient, fits existing `--resume`) |
+| **Parent waiting** | Process-level: Codex blocks in `wait_agent`; Kimi K2.5 orchestrator waits for frozen subagents | Checkpoint + wake (resource-efficient, fits existing resume infrastructure) |
 | **Nesting depth** | Capped at 1 everywhere | `max_depth: 1` default |
 | **Parallelism** | Codex: 6 threads; K2.5: up to 100; Claude Code: unlimited background | Hard cap: 5 subagents |
 | **Result format** | Final text/structured output only, no intermediate traces | Child `completion.json` + summary injection |
@@ -101,7 +101,7 @@ Survey of how major AI providers implement subagent delegation (as of March 2026
 
 1. **Synchronous only, no async mode.** No provider implements truly async subagents where the parent continues its own work. Claude Code's "background" agents are the closest, but still within a live process. We follow the industry consensus: parent suspends, children run, parent resumes with results.
 2. **Single tool, not spawn/wait split.** Codex separates `spawn_agent` + `wait_agent` to allow parent work between spawning and blocking. Since our parent suspends entirely (checkpoint + wake), this separation adds complexity without benefit.
-3. **Checkpoint + wake over long-polling.** Validated by Kimi K2.5's frozen-subagent pattern and by our existing `--resume` infrastructure. Claude Code and Codex hold processes alive, which wastes resources for long-running jobs.
+3. **Checkpoint + wake over long-polling.** Validated by Kimi K2.5's frozen-subagent pattern and by our existing resume infrastructure (the orchestrator re-dispatches a paused job to a fresh agent pod). Claude Code and Codex hold processes alive, which wastes resources for long-running jobs.
 4. **Hard cap of 5 subagents.** Codex allows 6, K2.5 up to 100 (model-native). 5 is practical for our use cases and keeps resource consumption bounded.
 5. **Git worktree isolation (like Codex and Claude Code).** Children branch off the parent workspace and work in their own worktree. Context is isolated at the LLM level (fresh context window) but the filesystem is shared via git — children see everything the parent had at branch point. Squash merge keeps history clean.
 6. **Children default to `autonomy: full`.** Prevents the deadlock where parent waits for children that are waiting for human review. The parent is already supervised.
@@ -250,7 +250,7 @@ Merge order is deterministic: subagent/0 merges first, then subagent/1, then sub
 | **Graph wait node** | No process exit needed | Still holds resources, complex graph modification |
 | **Checkpoint + wake** | Resource-efficient, clean separation | Requires orchestrator completion hook, resume injection |
 
-The checkpoint approach fits naturally: the agent already supports `--resume`, checkpoints already exist, and the orchestrator already tracks job status. The parent's process exits cleanly and restarts only when needed.
+The checkpoint approach fits naturally: the agent already supports resume (via the orchestrator), checkpoints already exist, and the orchestrator already tracks job status. The parent's process exits cleanly and restarts only when needed.
 
 ## Data Model Changes
 
@@ -326,7 +326,7 @@ When all children are done, the orchestrator:
 
 1. Sets parent status back to `assigned` (or a new `resuming` status)
 2. Builds a results summary from child jobs **in creation order**
-3. The dispatch loop picks up the parent for `--resume`
+3. The dispatch loop picks up the parent and dispatches it for resume
 4. On resume, the parent enters the review + merge loop
 
 ### Merge Order
@@ -471,7 +471,7 @@ The tool is only loaded when `delegation.enabled: true`. Maximum 5 subagents per
 
 The child's kickoff comes from two sources:
 
-1. **`description`** (per task) — becomes the child's job description, equivalent to `--description` on the CLI. This is what the child sees as its assignment.
+1. **`description`** (per task) — becomes the child's job description, i.e. the same field the orchestrator passes to the agent for any dispatched job. This is what the child sees as its assignment.
 2. **`context`** (shared across all tasks) — injected as additional context. Provides shared background that all children need.
 
 The child starts a normal job lifecycle from there — first strategic phase, todo creation, etc. It doesn't know it's a subagent (except that `delegate_work` is unavailable due to `max_depth`).

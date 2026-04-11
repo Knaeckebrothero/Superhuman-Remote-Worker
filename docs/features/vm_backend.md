@@ -12,6 +12,8 @@ Design document for decoupling the agent's tool layer from the local filesystem,
 
 **Status (March 2026):** Phases 1-4 code-complete. `WorkspaceBackend` ABC, `LocalBackend` (pathlib), `RemoteBackend` (SSH/SFTP + remote tmux), config integration, `ShellManager` delegation, NATS Helm values, VM Controller service + K8s manifest, NATS bridge + VM provisioner in orchestrator, REST endpoints, lifecycle hooks, auto-dispatch wiring (VM IP injection into config_override), remote-aware phase snapshots (extract from VM / push to VM), VM failure recovery (detect → re-provision → seed → resume). Needs deployment and integration testing against real KubeVirt infrastructure.
 
+> **Update (2026-04-11):** `LocalBackend` has since been **removed entirely** from production paths. The agent never operates on its own filesystem — `backend: remote` is the only supported configuration and `WorkspaceConfig.__post_init__` rejects `backend: local`. A stripped-down `FilesystemTestBackend` lives in `tests/_fs_backend.py` for unit tests that need a tmp_path workspace; it is deliberately not importable from `src/`. Everything below that describes `LocalBackend` as a live class is retained as historical design context — read it with that caveat. The rest of the design (RemoteBackend, the ABC, shell delegation, VM provisioning) is unchanged.
+
 ## Motivation
 
 The [VM isolation design](./vm.md) establishes that each agent job gets a dedicated VM on the agent cluster. The original design (option 2) placed the agent process inside the VM alongside the workspace. This document specifies option 1: **the agent pod runs on the main cluster, the VM is a remote workspace only**.

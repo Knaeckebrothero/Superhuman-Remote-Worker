@@ -41,7 +41,7 @@ def _job_needs_container_logic(job: dict, provisioner_available: bool = False) -
     backend = co.get("workspace", {}).get("backend")
     if backend == "container":
         return True
-    if backend in ("local", "remote"):
+    if backend == "remote":
         return False
     return provisioner_available
 
@@ -104,14 +104,6 @@ class TestJobNeedsContainerInherited:
             "config_override": {"workspace": {"backend": "container"}},
         }
         # Inherited VM check returns False first — intentional
-        assert _job_needs_container_logic(job) is False
-
-    def test_explicit_local_backend(self):
-        """Explicit local backend returns False."""
-        job = {
-            "context": {},
-            "config_override": {"workspace": {"backend": "local"}},
-        }
         assert _job_needs_container_logic(job) is False
 
     def test_config_override_as_json_string(self):
@@ -320,7 +312,7 @@ class TestDispatchWorktreePath:
 
     def test_no_override_without_remote_config(self):
         """No crash when config_override has no remote section."""
-        config_override = {"workspace": {"backend": "local"}}
+        config_override = {"workspace": {"backend": "container"}}
         worktree_path = "/home/agent-host/workspace/worktrees/abc12345-critic"
 
         if worktree_path and config_override:

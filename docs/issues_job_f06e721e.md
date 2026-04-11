@@ -46,7 +46,7 @@ Systematic / prompt issues (AGENT-1..4) deferred per scoping decision.
 - `src/tools/workspace/files.py:637-653` — passes remote path to local-only handler
 - `src/services/audio_helper.py:242-245` — uses `Path.exists()` which is local-only
 
-**Impact**: Audio transcription is completely non-functional on remote workspaces (Docker Compose, Kubernetes, VM backends). Only works with `--dev` (local backend).
+**Impact**: Audio transcription is completely non-functional. The only code path that worked (the local backend) has been removed — dev and production both go through SSH to a workspace container now. Audio tools need to stage files on the remote workspace via SFTP before transcription.
 
 **Note**: The same abstraction leak likely affects `_handle_image_file()` (`files.py:642-643`) which calls `full_path.read_bytes()` — this would also fail on remote paths. Image handling may silently fail or produce different error messages.
 

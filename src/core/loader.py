@@ -751,15 +751,26 @@ class LLMConfig:
 class WorkspaceConfig:
     """Workspace configuration."""
 
+    _VALID_BACKENDS = ("remote", "container")
+
     structure: List[str] = field(default_factory=list)
     instructions_template: str = ""
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    backend: str = "local"  # "local" or "remote"
+    backend: str = "remote"  # "remote" (SSH workspace container/VM) or "container" (orchestrator-provisioned)
     remote: Optional[Dict[str, Any]] = (
         None  # {host, port, username, key_path, workspace_path}
     )
+
+    def __post_init__(self) -> None:
+        if self.backend not in self._VALID_BACKENDS:
+            raise ValueError(
+                f"Invalid workspace.backend={self.backend!r}. "
+                f"Expected one of {self._VALID_BACKENDS}. The agent never "
+                f"operates on its own filesystem — every workspace must live "
+                f"in an isolated SSH-accessible container or VM."
+            )
 
 
 @dataclass
@@ -1206,7 +1217,7 @@ def load_agent_config(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        backend=workspace_data.get("backend", "local"),
+        backend=workspace_data.get("backend", "remote"),
         remote=workspace_data.get("remote"),
     )
 
@@ -1395,7 +1406,7 @@ def load_agent_config_from_dict(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        backend=workspace_data.get("backend", "local"),
+        backend=workspace_data.get("backend", "remote"),
         remote=workspace_data.get("remote"),
     )
 

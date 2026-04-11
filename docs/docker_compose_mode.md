@@ -1,8 +1,12 @@
 # Docker Compose Deployment Mode
 
-**Status:** Implementing (Phase 1-4 complete)  
-**Last updated:** 2026-04-04  
-**Supersedes:** `docs/local_development.md` (the `--dev` flag approach)
+**Status:** Implementing (Phase 1-4 complete)
+**Last updated:** 2026-04-11
+**Historical note:** An earlier plan (`docs/local_development.md`, now removed)
+introduced a `--dev` flag that let the agent use its own filesystem as the
+workspace. That escape hatch and the `LocalBackend` class it depended on have
+both been deleted — production and dev now both go through SSH to a workspace
+container. See "Production safety guard" below for the current design.
 
 ## Context
 
@@ -678,29 +682,31 @@ template is committed with placeholder values.
 
 While designing this, we discovered a safety gap in the current architecture.
 
-`config/defaults.yaml` ships with `workspace.backend: local`. In production, the
-orchestrator always overrides this to `remote` after provisioning a workspace. But if
-the override fails to apply (race condition, config bug, orchestrator restart), the
-agent silently falls back to `LocalBackend` -- using the **agent pod's own filesystem**
-as the workspace.
+`config/defaults.yaml` historically shipped with `workspace.backend: local`.
+In production, the orchestrator overrode this to `remote` after provisioning
+a workspace, but if the override failed to apply (race condition, config bug,
+orchestrator restart) the agent would silently fall back to `LocalBackend` --
+using the **agent pod's own filesystem** as the workspace.
 
-This means:
-- LLM shell commands execute inside the agent pod (no isolation)
-- `sandbox_cwd` is only a `cd`, not a real security boundary
+This meant:
+- LLM shell commands executed inside the agent pod (no isolation)
+- `sandbox_cwd` was only a `cd`, not a real security boundary
 - No separate container constraining the agent process
 
-### Fix (part of this work)
+### Fix
 
-1. **Change default** in `config/defaults.yaml`: `workspace.backend: remote`
-2. **Hard guard in agent**: If `backend` resolves to `local` at job start, refuse the
-   job with an explicit error -- unless a `--dev` flag is set (for running outside of
-   any container, on a developer's machine)
-3. **Docker Compose mode eliminates the issue**: Agents always get `backend: remote`
-   pointing to a workspace container, same as in k8s mode
-
-The `--dev` flag (from the original `local_development.md` plan) remains useful for
-a single developer running `python agent.py` directly on their machine without any
-containers at all. But it's a developer convenience, not a deployment mode.
+1. **`LocalBackend` removed entirely**, along with the `--dev` flag and all
+   CLI job-submission flags (`--description`, `--job-id`, `--resume`, etc.).
+   The agent is only ever run as a server; jobs come in via the orchestrator.
+2. **Schema rejects `backend: local`**: `WorkspaceConfig.__post_init__`
+   raises `ValueError` if the config loads with `backend="local"`. There is
+   no escape hatch.
+3. **Agent refuses non-remote backends**: `src/agent.py` `process_job()`
+   raises `RuntimeError` unless `backend == "remote"` and SSH credentials
+   are present. Production and dev both go through SSH to a workspace
+   container.
+4. **Docker Compose mode**: agents always get `backend: remote` pointing
+   to a workspace container in the static pool, same as k8s mode.
 
 
 ## Implementation Status
@@ -722,14 +728,14 @@ All core phases are implemented. Remaining work is integration testing and polis
 | Thread workspace cleanup | `orchestrator/main.py` — thread deletion path updated |
 | Tests | `tests/test_docker_provisioner.py` — 15 tests |
 
-### Phase 2: Production safety guard — DONE
+### Phase 2: Production safety guard — DONE (and later hardened)
 
 | What | Where |
 |------|-------|
 | Default changed to `backend: remote` | `config/defaults.yaml` |
-| `--dev` flag | `agent.py` — sets `DEV_MODE=1` env var |
-| Hard refusal guard | `src/agent.py` `_setup_job_workspace()` — `RuntimeError` if local without dev |
-| Registration includes `dev_mode` | `src/api/orchestrator_client.py` |
+| Schema rejects `backend: local` | `src/core/loader.py` `WorkspaceConfig.__post_init__` |
+| Hard refusal guard | `src/agent.py` `process_job()` — raises unless `backend == "remote"` with SSH creds |
+| `LocalBackend` class deleted | `src/core/backends/` (test-only `FilesystemTestBackend` in `tests/_fs_backend.py`) |
 
 ### Phase 3: Persistent agent pool — DONE
 
@@ -822,8 +828,6 @@ Collected from Coder, DevPod, OpenHands, Docker Sandboxes, and Spacelift:
 ## Related Documents
 
 - `docs/deployment.md` -- Deployment strategy (updated to reference this doc)
-- `docs/local_development.md` -- Original `--dev` flag plan (superseded; `--dev`
-  concept retained as Phase 2 for bare-metal development)
 - `docs/features/vm_snapshots_and_ide.md` -- S3 snapshot architecture
 - `docs/features/vm_backend.md` -- VM workspace design
 - `docs/features/sessions.md` -- Persistent agent session architecture

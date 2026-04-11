@@ -11,8 +11,11 @@
 #   1. cp .env.example .env              # Fill in API keys
 #   2. podman-compose -f docker-compose.dev.yaml up -d
 #   3. cd orchestrator && uvicorn main:app --reload --port 8085
-#   4. python agent.py --port 8001
+#   4. python agent.py --port 8001 --loop
 #   5. cd cockpit && npm start
+#
+# Why --loop: without it the agent process exits after the first job,
+# which is fine on K8s (pod restart) but kills the dev loop here.
 #
 # WORKSPACE_HOSTS and SSH_KEY_PATH are auto-detected by the orchestrator
 # when the dev compose SSH key (.dev/ssh-keys/id_ed25519) exists on disk.

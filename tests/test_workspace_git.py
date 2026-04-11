@@ -18,6 +18,7 @@ if str(project_root) not in sys.path:
 
 from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
 from src.managers.git_manager import GitManager  # noqa: E402
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
 def git_available():
@@ -50,6 +51,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -65,6 +67,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=False,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -79,6 +82,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -94,6 +98,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -117,6 +122,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -132,6 +138,7 @@ class TestWorkspaceGitInitialization:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -211,6 +218,7 @@ class TestWorkspaceGitOperations:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -233,6 +241,7 @@ class TestWorkspaceGitOperations:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -252,6 +261,7 @@ class TestWorkspaceGitOperations:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 
@@ -288,6 +298,7 @@ class TestWorkspaceGitGracefulDegradation:
                 git_versioning=True,
             ),
             base_path=temp_base,
+            backend=FilesystemTestBackend(temp_base),
         )
         ws.initialize()
 

@@ -161,7 +161,7 @@ class AgentProvisioner:
         if not self._k8s_available:
             logger.info(
                 "K8s not available — start agent manually: "
-                "python agent.py --dev --port 8001"
+                "python agent.py --port 8001 --loop"
             )
             return None
 

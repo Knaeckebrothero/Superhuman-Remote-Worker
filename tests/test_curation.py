@@ -244,8 +244,13 @@ class TestInlineCurationWiring:
     @pytest.fixture
     def workspace_manager(self, temp_workspace):
         from src.core.workspace import WorkspaceManager
+        from tests._fs_backend import FilesystemTestBackend
 
-        ws = WorkspaceManager(job_id="test-job-123", base_path=temp_workspace)
+        ws = WorkspaceManager(
+            job_id="test-job-123",
+            base_path=temp_workspace,
+            backend=FilesystemTestBackend(temp_workspace),
+        )
         ws.initialize()
         return ws
 

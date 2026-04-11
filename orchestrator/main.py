@@ -1303,7 +1303,7 @@ def _job_needs_container(job: dict) -> bool:
 
     Returns True if:
     - config_override.workspace.backend == "container", OR
-    - backend is not explicitly set to "local" or "remote" AND a workspace
+    - backend is not explicitly set to "remote" AND a workspace
       provisioner is available (k8s ContainerProvisioner OR DockerProvisioner).
 
     Returns False if the job already has a ready VM or container inherited
@@ -1330,7 +1330,7 @@ def _job_needs_container(job: dict) -> bool:
     backend = co.get("workspace", {}).get("backend")
     if backend == "container":
         return True
-    if backend in ("local", "remote"):
+    if backend == "remote":
         return False
     # No explicit backend — default to container if any provisioner is available
     return container_provisioner.is_available or docker_provisioner.is_available
