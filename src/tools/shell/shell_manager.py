@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 
 
-def build_sentinel_command(
-    command: str, sentinel: str
-) -> Tuple[str, Optional[str]]:
+def build_sentinel_command(command: str, sentinel: str) -> Tuple[str, Optional[str]]:
     """Build the command string to send to tmux for sentinel-based completion.
 
     Single-line commands use simple ';' chaining: this preserves the
@@ -65,6 +63,7 @@ def build_sentinel_command(
         f"{outer_delim}"
     )
     return full_cmd, start_marker
+
 
 # Auto-detected tab types based on command prefix
 COMMAND_TYPE_MAP = {
@@ -776,9 +775,7 @@ class ShellManager:
                         # Extract output: lines between echoed command and sentinel.
                         new_lines = all_lines[pre_count:sentinel_line_idx]
                         # Filter out lines containing the sentinel (echoed command lines)
-                        output_lines = [
-                            ol for ol in new_lines if sentinel not in ol
-                        ]
+                        output_lines = [ol for ol in new_lines if sentinel not in ol]
                         # Skip prompt/command echo lines at the start
                         while output_lines and (
                             command.split()[0] in output_lines[0]
