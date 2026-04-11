@@ -209,13 +209,7 @@ class TestRunCommand:
         tool = self._get_run_command(manager)
         result = tool.invoke(
             {
-                "command": (
-                    "bash <<'EOF'\n"
-                    "echo one\n"
-                    "echo two\n"
-                    "echo three\n"
-                    "EOF"
-                ),
+                "command": ("bash <<'EOF'\necho one\necho two\necho three\nEOF"),
                 "timeout": 10,
             }
         )

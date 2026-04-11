@@ -829,9 +829,7 @@ class RemoteBackend(WorkspaceBackend):
                             ]
                     else:
                         new_lines = all_lines[pre_count:sentinel_line_idx]
-                        output_lines = [
-                            ol for ol in new_lines if sentinel not in ol
-                        ]
+                        output_lines = [ol for ol in new_lines if sentinel not in ol]
                         # Skip prompt/command echo lines
                         while output_lines and (
                             command.split()[0] in output_lines[0]
