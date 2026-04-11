@@ -183,24 +183,38 @@ class MongoDB:
         page: int = 1,
         page_size: int = 50,
         filter_category: FilterCategory = "all",
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+        order: Literal["asc", "desc"] = "asc",
     ) -> Dict[str, Any]:
         """Get paginated audit entries for a job.
 
+        Accepts two pagination styles; both map to MongoDB skip/limit under
+        the hood. If offset/limit are provided they take precedence over
+        page/page_size.
+
         Args:
             job_id: The job UUID to query
-            page: Page number (1-indexed). Use -1 to request the last page.
-            page_size: Number of entries per page
+            page: 1-indexed page number; -1 = last page (ignored if offset set)
+            page_size: entries per page (ignored if limit set)
             filter_category: Filter by entry type (all, messages, tools, errors)
+            offset: Entries to skip, REST-style. Overrides page if set.
+            limit: Max entries to return, REST-style. Overrides page_size if set.
+            order: asc = oldest-first (default), desc = newest-first
 
         Returns:
-            Dict with entries, total count, pagination info
+            Dict with entries, total, page, pageSize, offset, limit, hasMore
         """
+        effective_size = limit if limit is not None else page_size
+
         if not self._available or self._db is None:
             return {
                 "entries": [],
                 "total": 0,
                 "page": max(1, page),
-                "pageSize": page_size,
+                "pageSize": effective_size,
+                "offset": offset if offset is not None else 0,
+                "limit": effective_size,
                 "hasMore": False,
             }
 
@@ -215,17 +229,27 @@ class MongoDB:
         # Get total count for pagination
         total = await collection.count_documents(query)
 
-        # Handle last page request (page=-1)
-        if page == -1:
-            page = max(1, math.ceil(total / page_size))
+        # Resolve effective skip — offset wins over page if both present.
+        if offset is not None:
+            effective_skip = offset
+        else:
+            effective_page = page
+            # Honor page=-1 (last page) for the legacy path
+            if effective_page == -1:
+                effective_page = (
+                    max(1, math.ceil(total / effective_size)) if effective_size else 1
+                )
+            effective_skip = (effective_page - 1) * effective_size
 
-        # Calculate skip and check if there are more pages
-        skip = (page - 1) * page_size
-        has_more = (skip + page_size) < total
+        has_more = (effective_skip + effective_size) < total
+        direction = 1 if order == "asc" else -1
 
         # Fetch paginated entries, sorted by step_number
         cursor = (
-            collection.find(query).sort("step_number", 1).skip(skip).limit(page_size)
+            collection.find(query)
+            .sort("step_number", direction)
+            .skip(effective_skip)
+            .limit(effective_size)
         )
 
         entries = []
@@ -234,11 +258,16 @@ class MongoDB:
             doc["_id"] = str(doc["_id"])
             entries.append(doc)
 
+        # Echo back both param styles so either consumer can find its values
+        response_page = (effective_skip // effective_size) + 1 if effective_size else 1
+
         return {
             "entries": entries,
             "total": total,
-            "page": page,
-            "pageSize": page_size,
+            "page": response_page,
+            "pageSize": effective_size,
+            "offset": effective_skip,
+            "limit": effective_size,
             "hasMore": has_more,
         }
 

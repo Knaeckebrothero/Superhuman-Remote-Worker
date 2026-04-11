@@ -26,6 +26,7 @@ try:
 except ImportError:
     paramiko = None  # Deferred — only needed when backend: remote is used
 
+from ...tools.shell.shell_manager import build_sentinel_command
 from ..workspace_backend import WorkspaceBackend, WorkspaceUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -769,8 +770,11 @@ class RemoteBackend(WorkspaceBackend):
 
             pre_count = len(pre_lines)
 
-            # Send command with sentinel
-            full_cmd = f'{command}; echo "{sentinel} $?"'
+            # Build the sentinel-suffixed command. Multi-line commands get
+            # wrapped in a bash heredoc so inner heredocs / multi-statement
+            # scripts work correctly (BUG-5). See build_sentinel_command in
+            # shell_manager.py for the rationale.
+            full_cmd, start_marker = build_sentinel_command(command, sentinel)
             self._tmux_send_keys(tab_name, full_cmd, enter=True)
 
             # Poll for sentinel
@@ -803,14 +807,37 @@ class RemoteBackend(WorkspaceBackend):
                     except (ValueError, IndexError):
                         exit_code = 1
 
-                    new_lines = all_lines[pre_count:sentinel_line_idx]
-                    output_lines = [ol for ol in new_lines if sentinel not in ol]
-                    # Skip prompt/command echo lines
-                    while output_lines and (
-                        command.split()[0] in output_lines[0]
-                        or output_lines[0].strip().endswith("$")
-                    ):
-                        output_lines = output_lines[1:]
+                    if start_marker is not None:
+                        # Multi-line wrap path: locate the start marker output
+                        # line and extract everything between it and the sentinel.
+                        start_idx = None
+                        for i in range(sentinel_line_idx - 1, -1, -1):
+                            if all_lines[i].strip().startswith(start_marker):
+                                start_idx = i
+                                break
+                        if start_idx is not None:
+                            new_lines = all_lines[start_idx + 1 : sentinel_line_idx]
+                            output_lines = [
+                                ol
+                                for ol in new_lines
+                                if start_marker not in ol and sentinel not in ol
+                            ]
+                        else:
+                            new_lines = all_lines[pre_count:sentinel_line_idx]
+                            output_lines = [
+                                ol for ol in new_lines if sentinel not in ol
+                            ]
+                    else:
+                        new_lines = all_lines[pre_count:sentinel_line_idx]
+                        output_lines = [
+                            ol for ol in new_lines if sentinel not in ol
+                        ]
+                        # Skip prompt/command echo lines
+                        while output_lines and (
+                            command.split()[0] in output_lines[0]
+                            or output_lines[0].strip().endswith("$")
+                        ):
+                            output_lines = output_lines[1:]
 
                     output_text = "\n".join(output_lines).strip()
                     break
