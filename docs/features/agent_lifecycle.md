@@ -159,7 +159,7 @@ Both modes share the same container image and >95% of the codebase. The executio
 | Config system | `config/`, `src/core/loader.py` | YAML configs, matrix resolvers, `$extends` |
 | CitationEngine | External package | Citation management |
 | RecallStore | `src/services/recall_store.py` | Memory Light retrieval (pgvector) |
-| VM backends | `src/core/backends/` | LocalBackend, RemoteBackend (SSH/SFTP) |
+| VM backends | `src/core/backends/` | RemoteBackend (SSH/SFTP); no local backend — agent never uses its own filesystem as workspace |
 | UniversalAgent | `src/agent.py` | Setup: connections, tools, workspace, LLMs |
 
 The persistent agent's `while(tool_call)` loop calls the same `create_llm()`, loads tools via the same `load_tools()`, manages context via the same `ContextManager`, and injects workspace.md via the same transient injection pattern. The difference is that the persistent agent's loop waits for user input between turns, while the worker's graph drives execution via todos and phase transitions.

@@ -7,7 +7,7 @@ Pod-per-task mode (default, for K8s):
     IDLE  ──/job/start──>  WORKING  ──job done──>  EXIT
     IDLE  ──/session/attach──>  SESSION  ──detach──>  EXIT
 
-Loop mode (AGENT_LOOP=1, default in --dev):
+Loop mode (AGENT_LOOP=1, enable with --loop):
     IDLE  ──/job/start──>  WORKING  ──job done──>  IDLE
     IDLE  ──/session/attach──>  SESSION  ──detach──>  IDLE
 

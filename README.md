@@ -118,12 +118,17 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env  # Add your API keys
 
-# Start databases
+# Start databases + workspace containers
 podman-compose -f docker-compose.dev.yaml up -d
 python init.py
 
-# Give it a task
-python agent.py --description "Research the current state of EU AI regulation and summarize key requirements"
+# Start the orchestrator (terminal 1)
+uvicorn orchestrator.main:app --reload --port 8085
+
+# Start the agent server (terminal 2) — --loop keeps it alive between jobs
+python agent.py --port 8001 --loop
+
+# Submit a job via the Cockpit UI (http://localhost:4200) or the orchestrator REST API
 ```
 
 ## Docker Compose Deployment
@@ -264,50 +269,36 @@ python init.py --only-agent             # Workspace only
 
 ### 5. Run the Agent
 
-When running outside containers (bare-metal development), use the `--dev` flag to allow the agent to use its local filesystem as the workspace instead of SSH-ing into a workspace container:
+The agent is always driven by the orchestrator over HTTP — there is no CLI
+mode that processes jobs directly. Start the agent as a server and let the
+orchestrator dispatch work to it:
 
 ```bash
-# Give it a task (--dev enables local workspace)
-python agent.py --dev --description "Your task here"
+# Dual-mode server (accepts jobs and persistent sessions — default)
+python agent.py --port 8001 --loop
 
-# With a custom agent config
-python agent.py --dev --config scholar --description "Your task"
+# Worker-only (jobs, no persistent sessions)
+python agent.py --mode worker --port 8001 --loop
 
-# Process a document
-python agent.py --dev --document-path ./data/doc.pdf --description "Extract key findings"
+# Persistent-only interactive agent
+python agent.py --mode persistent --port 8002 --loop
 
-# Process a directory of documents
-python agent.py --dev --document-dir ./data/reports/ --description "Compare and summarize these reports"
-
-# Clone a repo and work on it (coding agent)
-python agent.py --dev --config developer --git-url https://github.com/org/repo --description "Fix issue #42"
-
-# Run as an API server (dual mode — accepts jobs and persistent sessions)
-python agent.py --dev --port 8001
-
-# Run as a worker-only server (job processing only)
-python agent.py --dev --mode worker --port 8001
-
-# Run as a persistent interactive agent
-python agent.py --dev --mode persistent --port 8002
-
-# Resume a crashed or frozen job
-python agent.py --dev --job-id <id> --resume
-
-# Resume with feedback
-python agent.py --dev --job-id <id> --resume --feedback "Please also check X"
-
-# Approve a frozen job (marks as completed)
-python agent.py --dev --job-id <id> --approve
-
-# Pass additional context
-python agent.py --dev --description "Analyze" --context '{"domain": "fintech"}'
+# With a non-default agent config
+python agent.py --config scholar --port 8001 --loop
 
 # Debug mode
-LOG_LEVEL=DEBUG python agent.py --dev --description "Your task"
+LOG_LEVEL=DEBUG python agent.py --port 8001 --loop
 ```
 
-The `--dev` flag is only needed for bare-metal development. When running inside Docker Compose or Kubernetes, workspace containers are provisioned automatically and the agent receives `backend: remote` from the orchestrator.
+Why `--loop`: without it the agent process exits after the first job, which
+is fine in K8s (pod restart) but kills the dev loop on bare metal or Docker
+Compose. Jobs, documents, descriptions, git URLs, feedback, and freeze
+approvals are all submitted to the orchestrator (REST API or Cockpit UI)
+and dispatched to the running agent — not passed as CLI flags.
+
+The workspace always lives in an SSH-accessible container or VM; the agent
+process never operates on its own filesystem. The orchestrator injects the
+SSH credentials at dispatch time.
 
 ### 6. Backup and Restore
 
@@ -407,24 +398,16 @@ This means the agent can work on tasks that exceed any single context window, an
 
 ## Debugging
 
-- **Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md, output/)
-- **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite)
+- **Workspace files** (inside the workspace container, SSH in to look): `workspace.md`, `todos.yaml`, `plan.md`, `output/`
+- **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite, on the agent host)
 - **Logs**: `workspace/logs/job_<id>.log`
 - **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`
 - **Persistent sessions**: `workspace/messages/<thread_id>/`
 
+Job lifecycle actions (resume, recover-to-phase, approve-frozen, inject feedback) are all driven through the orchestrator REST API or the Cockpit UI — there are no CLI flags on `agent.py` for them. See the `/api/jobs/` endpoints in `orchestrator/main.py` or the job detail page in Cockpit.
+
 ```bash
-# Phase recovery
-python agent.py --job-id <id> --list-phases
-python agent.py --job-id <id> --recover-phase 2 --resume
-
-# Resume a frozen job with feedback
-python agent.py --job-id <id> --resume --feedback "Check the edge case for empty input"
-
-# Approve a frozen job
-python agent.py --job-id <id> --approve
-
-# Clean up
+# Clean up local checkpoint/log state
 rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 ```
 

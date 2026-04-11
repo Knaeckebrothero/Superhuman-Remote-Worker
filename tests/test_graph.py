@@ -19,6 +19,7 @@ if str(src_path) not in sys.path:
 # Import from src package (requires langgraph in environment)
 from src.core.workspace import WorkspaceManager  # noqa: E402
 from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 from src.graph import (  # noqa: E402
     route_entry,
     route_after_execute,
@@ -53,6 +54,7 @@ def workspace_manager(temp_workspace):
     ws = WorkspaceManager(
         job_id="test-job-123",
         base_path=temp_workspace,
+        backend=FilesystemTestBackend(temp_workspace),
     )
     ws.initialize()
     return ws

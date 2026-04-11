@@ -21,6 +21,8 @@ This document outlines the design considerations for deploying agent workspaces 
 
 > **Research Reference:** For detailed analysis, benchmarks, and citations, see [cloud_workspace_research.pdf](./cloud_workspace_research.pdf).
 
+> **Status note (2026-04-11):** The pod-per-task dispatch pattern shown in the architecture diagram below (`python agent.py --config X --job-id Y` as the pod command) was never implemented. The agent CLI no longer supports `--job-id` or any other job-submission flag — agents always run as servers (`python agent.py --port 8001 --loop`) and receive jobs over HTTP from the orchestrator. Treat the diagram as aspirational design context, not current state.
+
 ## Vision
 
 Each agent gets its own isolated, containerized Linux workspace. This provides:

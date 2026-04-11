@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
 from src.core.workspace import WorkspaceManager  # noqa: E402
 from src.tools.context import ToolContext  # noqa: E402
 from src.tools.workspace import create_workspace_tools  # noqa: E402
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
 @pytest.fixture
@@ -32,6 +33,7 @@ def workspace_manager(temp_workspace):
     ws = WorkspaceManager(
         job_id="test-job-123",
         base_path=temp_workspace,
+        backend=FilesystemTestBackend(temp_workspace),
     )
     ws.initialize()
     return ws

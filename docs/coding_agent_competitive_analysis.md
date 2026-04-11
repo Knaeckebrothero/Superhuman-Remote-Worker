@@ -269,7 +269,7 @@ All three competitors have todo/task tools available during interactive sessions
 
 | Feature | SRW | Claude Code | Codex CLI | Gemini CLI |
 |---|---|---|---|---|
-| **Non-interactive mode** | Worker agents (--description flag) | -p/--print flag | codex exec | -p/--prompt flag |
+| **Non-interactive mode** | Worker agents dispatched via orchestrator REST API | -p/--print flag | codex exec | -p/--prompt flag |
 | **Output formats** | Job artifacts in workspace | text, json, stream-json | json, stream-json | json, stream-json |
 | **CI/CD integration** | Custom (orchestrator API) | GitHub Action (claude-code-action) | GitHub Action (codex-action) | GitHub Action |
 | **SDK** | Python (orchestrator client) | Python + TypeScript Agent SDK | TypeScript SDK | — |

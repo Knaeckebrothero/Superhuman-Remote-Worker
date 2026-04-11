@@ -22,6 +22,7 @@ from src.core.phase import (  # noqa: E402
     on_tactical_phase_complete,
 )
 from src.managers.todo import TodoManager  # noqa: E402
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
 
 
 def git_available():
@@ -52,6 +53,7 @@ def workspace_with_git(temp_base):
             git_versioning=True,
         ),
         base_path=temp_base,
+        backend=FilesystemTestBackend(temp_base),
     )
     ws.initialize()
     # Commit initial state to have a clean baseline

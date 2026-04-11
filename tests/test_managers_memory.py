@@ -29,6 +29,8 @@ workspace_path = project_root / "src" / "core" / "workspace.py"
 workspace_module = _import_module_directly(workspace_path, "test_memory_workspace_mgr")
 WorkspaceManager = workspace_module.WorkspaceManager
 
+from tests._fs_backend import FilesystemTestBackend  # noqa: E402
+
 # Import the memory module
 memory_path = project_root / "src" / "managers" / "memory.py"
 memory_module = _import_module_directly(memory_path, "test_memory_manager")
@@ -48,6 +50,7 @@ def workspace_manager(temp_workspace):
     ws = WorkspaceManager(
         job_id="test-job-123",
         base_path=temp_workspace,
+        backend=FilesystemTestBackend(temp_workspace),
     )
     ws.initialize()
     return ws

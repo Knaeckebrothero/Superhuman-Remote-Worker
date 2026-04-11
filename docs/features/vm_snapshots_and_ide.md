@@ -552,7 +552,7 @@ Idle detection reuses the existing `agent.vm.{job_id}.heartbeat` subject — the
 - [ ] Add TTL enforcement (idle timeout + max lifetime) to orchestrator periodic task
 - [ ] Upgrade cockpit IDE button from static link to session-aware (spinner, polling, redirect)
 - [ ] Integrate snapshot restore into job resume flow (restore S3 snapshot → inject checkpoint → start agent)
-- [ ] Support phase-specific restore: `--recover-phase N` uses phase N's S3 snapshot + checkpoint
+- [ ] Support phase-specific restore: orchestrator resume with a target phase number uses phase N's S3 snapshot + checkpoint
 
 ### Phase 3: Gitea Fallback
 

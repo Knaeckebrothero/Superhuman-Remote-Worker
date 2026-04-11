@@ -816,15 +816,6 @@ class TestDispatchHelpers:
         }
         assert self._get_backend(job) == "container"
 
-    def test_job_needs_container_explicit_local(self):
-        """Job with backend: local is detected."""
-        import json
-
-        job = {
-            "config_override": json.dumps({"workspace": {"backend": "local"}}),
-        }
-        assert self._get_backend(job) == "local"
-
     def test_job_needs_container_explicit_remote(self):
         """Job with backend: remote is detected."""
         import json

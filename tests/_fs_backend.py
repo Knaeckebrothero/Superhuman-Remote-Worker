@@ -1,20 +1,20 @@
-"""Local filesystem workspace backend.
+"""Filesystem-backed WorkspaceBackend for tests only.
 
-Wraps the current pathlib-based file I/O that was previously inline in
-WorkspaceManager. This is a mechanical extraction — no behavioral change.
+Production code must never import this module. The real system uses
+RemoteBackend exclusively — the agent process never operates on its own
+filesystem as the workspace. This helper exists purely so unit tests can
+exercise WorkspaceManager and its dependents against a tmp_path without
+standing up an SSH-accessible workspace container.
 """
 
-import logging
 import shutil
 from pathlib import Path
 
-from ..workspace_backend import WorkspaceBackend
-
-logger = logging.getLogger(__name__)
+from src.core.workspace_backend import WorkspaceBackend
 
 
-class LocalBackend(WorkspaceBackend):
-    """Workspace backed by the local filesystem (current behavior)."""
+class FilesystemTestBackend(WorkspaceBackend):
+    """pathlib-backed WorkspaceBackend for pytest fixtures."""
 
     def __init__(self, workspace_path: Path):
         self._root_path = Path(workspace_path)
@@ -25,18 +25,9 @@ class LocalBackend(WorkspaceBackend):
 
     @property
     def root_path(self) -> Path:
-        """Return the workspace root as a Path object.
-
-        Convenience for WorkspaceManager which still operates on Path objects
-        internally. Not part of the abstract interface.
-        """
         return self._root_path
 
     def _resolve(self, relative_path: str) -> Path:
-        """Resolve relative path to absolute, validate workspace boundaries.
-
-        This is the core path validation previously in WorkspaceManager.get_path().
-        """
         if not relative_path:
             return self._root_path.resolve()
 
@@ -49,8 +40,6 @@ class LocalBackend(WorkspaceBackend):
             raise ValueError(f"Path '{relative_path}' escapes workspace boundary")
 
         return full_path
-
-    # --- File operations ---
 
     def read_file(self, path: str, binary: bool = False) -> str | bytes:
         full_path = self._resolve(path)
@@ -73,8 +62,6 @@ class LocalBackend(WorkspaceBackend):
             full_path.write_bytes(content)
         else:
             full_path.write_text(content, encoding="utf-8")
-
-        logger.debug(f"Wrote file: {path}")
 
     def append_file(self, path: str, content: str) -> None:
         full_path = self._resolve(path)
@@ -133,7 +120,6 @@ class LocalBackend(WorkspaceBackend):
             if not file_path.is_file():
                 continue
 
-            # Skip binary files
             if file_path.suffix in [".pdf", ".docx", ".png", ".jpg", ".gif", ".zip"]:
                 continue
 
@@ -160,7 +146,6 @@ class LocalBackend(WorkspaceBackend):
     def mkdir(self, path: str) -> None:
         dir_path = self._resolve(path)
         dir_path.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Created directory: {path}")
 
     def delete_file(self, path: str) -> bool:
         file_path = self._resolve(path)
@@ -170,14 +155,12 @@ class LocalBackend(WorkspaceBackend):
 
         if file_path.is_file():
             file_path.unlink()
-            logger.debug(f"Deleted file: {path}")
             return True
 
         if file_path.is_dir():
             if any(file_path.iterdir()):
                 raise ValueError(f"Cannot delete non-empty directory: {path}")
             file_path.rmdir()
-            logger.debug(f"Deleted directory: {path}")
             return True
 
         return False
@@ -195,7 +178,6 @@ class LocalBackend(WorkspaceBackend):
             raise ValueError(f"Not a directory: {path}")
 
         shutil.rmtree(dir_path)
-        logger.debug(f"Deleted directory: {path}")
         return True
 
     def move(self, src: str, dst: str) -> None:
@@ -207,7 +189,6 @@ class LocalBackend(WorkspaceBackend):
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source_path), str(dest_path))
-        logger.debug(f"Moved: {src} -> {dst}")
 
     def copy(self, src: str, dst: str) -> None:
         source_path = self._resolve(src)
@@ -221,7 +202,6 @@ class LocalBackend(WorkspaceBackend):
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(str(source_path), str(dest_path))
-        logger.debug(f"Copied: {src} -> {dst}")
 
     def stat(self, path: str) -> int:
         target_path = self._resolve(path)
@@ -241,16 +221,11 @@ class LocalBackend(WorkspaceBackend):
     def resolve_path(self, relative_path: str) -> str:
         return str(self._resolve(relative_path))
 
-    # --- Lifecycle ---
-
     def connect(self) -> None:
-        """No-op for local backend."""
         pass
 
     def disconnect(self) -> None:
-        """No-op for local backend."""
         pass
 
     def is_connected(self) -> bool:
-        """Local backend is always connected."""
         return True
