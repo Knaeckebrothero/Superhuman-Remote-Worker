@@ -173,6 +173,67 @@ class TestRunCommand:
         result = tool.invoke({"command": "true"})
         assert "Exit code: 0" in result
 
+    def test_heredoc_python_executes(self, manager):
+        """BUG-5 regression: heredoc terminator must land on its own line
+        so the shell can close the heredoc and run the sentinel echo."""
+        tool = self._get_run_command(manager)
+        result = tool.invoke(
+            {
+                "command": "python3 <<'PY'\nprint('heredoc-works')\nPY",
+                "timeout": 10,
+            }
+        )
+        assert "Exit code: 0" in result
+        assert "heredoc-works" in result
+
+    def test_multiline_python_script(self, manager):
+        tool = self._get_run_command(manager)
+        result = tool.invoke(
+            {
+                "command": (
+                    "python3 <<'PY'\n"
+                    "import os\n"
+                    "x = 2 + 3\n"
+                    "print(f'result={x}')\n"
+                    "print('cwd_ok' if os.getcwd() else 'cwd_bad')\n"
+                    "PY"
+                ),
+                "timeout": 10,
+            }
+        )
+        assert "Exit code: 0" in result
+        assert "result=5" in result
+        assert "cwd_ok" in result
+
+    def test_bash_heredoc_multiple_commands(self, manager):
+        tool = self._get_run_command(manager)
+        result = tool.invoke(
+            {
+                "command": (
+                    "bash <<'EOF'\n"
+                    "echo one\n"
+                    "echo two\n"
+                    "echo three\n"
+                    "EOF"
+                ),
+                "timeout": 10,
+            }
+        )
+        assert "Exit code: 0" in result
+        assert "one" in result
+        assert "two" in result
+        assert "three" in result
+
+    def test_heredoc_propagates_nonzero_exit(self, manager):
+        tool = self._get_run_command(manager)
+        result = tool.invoke(
+            {
+                "command": "python3 <<'PY'\nimport sys\nsys.exit(7)\nPY",
+                "timeout": 10,
+            }
+        )
+        assert "Exit code: 7" in result
+
 
 class TestToolNameAliasing:
     """Tests for shell mode aliasing in get_all_tool_names."""

@@ -29,6 +29,43 @@ logger = logging.getLogger(__name__)
 # Tab name validation pattern
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 
+
+def build_sentinel_command(
+    command: str, sentinel: str
+) -> Tuple[str, Optional[str]]:
+    """Build the command string to send to tmux for sentinel-based completion.
+
+    Single-line commands use simple ';' chaining: this preserves the
+    existing interactive-prompt detection semantics — when a single-line
+    command waits on stdin (e.g. `read`, ssh password prompt), the polling
+    loop sees the prompt and reports it.
+
+    Multi-line commands are wrapped in an outer bash heredoc so the user's
+    command (including any inner heredocs like `python3 <<'PY' ... PY`) is
+    read by inner bash from a captured heredoc body, instead of being typed
+    line-by-line into tmux. This fixes BUG-5: previously the heredoc
+    terminator landed on the same line as the sentinel echo (`PY; echo ...`)
+    and the heredoc never closed, leaving the tab permanently stuck.
+
+    Returns:
+        (full_cmd, start_marker) where start_marker is a unique string for
+        multi-line commands (used by extraction to locate where the user
+        command's stdout begins) or None for single-line commands.
+    """
+    if "\n" not in command:
+        return f'{command}; echo "{sentinel} $?"', None
+
+    outer_delim = f"SRW_DELIM_{uuid.uuid4().hex[:12]}"
+    start_marker = f"__SRW_START_{uuid.uuid4().hex[:12]}__"
+    full_cmd = (
+        f'bash << "{outer_delim}"\n'
+        f'echo "{start_marker}"\n'
+        f"{command}\n"
+        f'echo "{sentinel} $?"\n'
+        f"{outer_delim}"
+    )
+    return full_cmd, start_marker
+
 # Auto-detected tab types based on command prefix
 COMMAND_TYPE_MAP = {
     "ssh": "ssh",
@@ -671,8 +708,10 @@ class ShellManager:
             # Record buffer position before command
             pre_count = len(pre_check_lines)
 
-            # Send command with sentinel
-            full_cmd = f'{command}; echo "{sentinel} $?"'
+            # Build the sentinel-suffixed command. Multi-line commands get
+            # wrapped in a bash heredoc so inner heredocs / multi-statement
+            # scripts work correctly (BUG-5). See build_sentinel_command.
+            full_cmd, start_marker = build_sentinel_command(command, sentinel)
             tab.pane.send_keys(full_cmd, enter=True)
 
             # Poll for sentinel
@@ -711,16 +750,41 @@ class ShellManager:
                     except (ValueError, IndexError):
                         exit_code = 1
 
-                    # Extract output: lines between echoed command and sentinel.
-                    new_lines = all_lines[pre_count:sentinel_line_idx]
-                    # Filter out lines containing the sentinel (echoed command lines)
-                    output_lines = [ol for ol in new_lines if sentinel not in ol]
-                    # Skip prompt/command echo lines at the start
-                    while output_lines and (
-                        command.split()[0] in output_lines[0]
-                        or output_lines[0].strip().endswith("$")
-                    ):
-                        output_lines = output_lines[1:]
+                    if start_marker is not None:
+                        # Multi-line wrap path: locate the start marker output
+                        # line and extract everything between it and the sentinel.
+                        start_idx = None
+                        for i in range(sentinel_line_idx - 1, -1, -1):
+                            if all_lines[i].strip().startswith(start_marker):
+                                start_idx = i
+                                break
+                        if start_idx is not None:
+                            new_lines = all_lines[start_idx + 1 : sentinel_line_idx]
+                            output_lines = [
+                                ol
+                                for ol in new_lines
+                                if start_marker not in ol and sentinel not in ol
+                            ]
+                        else:
+                            # Marker not found — defensive fallback
+                            new_lines = all_lines[pre_count:sentinel_line_idx]
+                            output_lines = [
+                                ol for ol in new_lines if sentinel not in ol
+                            ]
+                    else:
+                        # Single-line path: existing extraction logic.
+                        # Extract output: lines between echoed command and sentinel.
+                        new_lines = all_lines[pre_count:sentinel_line_idx]
+                        # Filter out lines containing the sentinel (echoed command lines)
+                        output_lines = [
+                            ol for ol in new_lines if sentinel not in ol
+                        ]
+                        # Skip prompt/command echo lines at the start
+                        while output_lines and (
+                            command.split()[0] in output_lines[0]
+                            or output_lines[0].strip().endswith("$")
+                        ):
+                            output_lines = output_lines[1:]
 
                     output_text = "\n".join(output_lines).strip()
                     break
