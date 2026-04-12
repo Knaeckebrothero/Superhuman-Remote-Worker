@@ -219,6 +219,183 @@ class TestClearOldToolResults:
 
 
 # =============================================================================
+# Evidence preservation (phase audit protocol prerequisite)
+# =============================================================================
+
+
+class TestEvidencePreservation:
+    """Tests that write-type and error-bearing tool results survive recency
+    clearing so the strategic phase audit can cite them verbatim.
+
+    See docs/features/phase_audit_protocol.md.
+    """
+
+    def test_write_file_result_preserved_when_old(self, mgr):
+        """Old write_file results must survive clearing — they prove a side effect."""
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "write_file", "id": "tc0", "args": {}},
+                    {"name": "read_file", "id": "tc1", "args": {}},
+                    {"name": "read_file", "id": "tc2", "args": {}},
+                    {"name": "read_file", "id": "tc3", "args": {}},
+                ],
+            ),
+            ToolMessage(
+                content="Wrote 1234 bytes to output/transcriptions.md",
+                tool_call_id="tc0",
+                name="write_file",
+            ),
+            ToolMessage(content="read result 1", tool_call_id="tc1", name="read_file"),
+            ToolMessage(content="read result 2", tool_call_id="tc2", name="read_file"),
+            ToolMessage(content="read result 3", tool_call_id="tc3", name="read_file"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=2)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+
+        # write_file result at index 0 must be preserved verbatim
+        assert tool_msgs[0].content == "Wrote 1234 bytes to output/transcriptions.md"
+        assert tool_msgs[0].name == "write_file"
+        # Non-evidence read_file at index 1 should be cleared
+        assert tool_msgs[1].content == "[cleared]"
+        # Recent ones kept
+        assert tool_msgs[2].content == "read result 2"
+        assert tool_msgs[3].content == "read result 3"
+
+    def test_error_content_preserved_when_old(self, mgr):
+        """Old tool results containing error signals must survive clearing."""
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "read_file", "id": f"tc{i}", "args": {}} for i in range(4)
+                ],
+            ),
+            ToolMessage(
+                content="Error: ENOENT - audio.ogg not found",
+                tool_call_id="tc0",
+                name="read_file",
+            ),
+            ToolMessage(content="plain result", tool_call_id="tc1", name="read_file"),
+            ToolMessage(content="recent 1", tool_call_id="tc2", name="read_file"),
+            ToolMessage(content="recent 2", tool_call_id="tc3", name="read_file"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=2)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+
+        # Error message at index 0 preserved, non-error at index 1 cleared
+        assert "ENOENT" in tool_msgs[0].content
+        assert tool_msgs[1].content == "[cleared]"
+        assert tool_msgs[2].content == "recent 1"
+        assert tool_msgs[3].content == "recent 2"
+
+    def test_traceback_content_preserved(self, mgr):
+        """Python traceback text must survive clearing."""
+        traceback_content = (
+            'Traceback (most recent call last):\n  File "x.py", line 1\n'
+            "ValueError: bad input"
+        )
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "run_command", "id": f"tc{i}", "args": {}}
+                    for i in range(3)
+                ],
+            ),
+            ToolMessage(
+                content=traceback_content, tool_call_id="tc0", name="run_command"
+            ),
+            ToolMessage(content="ok", tool_call_id="tc1", name="run_command"),
+            ToolMessage(content="ok", tool_call_id="tc2", name="run_command"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=1)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        assert "Traceback" in tool_msgs[0].content
+        assert "ValueError" in tool_msgs[0].content
+
+    def test_non_evidence_still_cleared(self, mgr):
+        """Ordinary tool results with no evidence markers still get cleared."""
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "kb_search", "id": f"tc{i}", "args": {}} for i in range(3)
+                ],
+            ),
+            ToolMessage(
+                content="search hit: foo", tool_call_id="tc0", name="kb_search"
+            ),
+            ToolMessage(content="recent 1", tool_call_id="tc1", name="kb_search"),
+            ToolMessage(content="recent 2", tool_call_id="tc2", name="kb_search"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=2)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        assert tool_msgs[0].content == "[cleared]"
+
+    def test_cleared_placeholder_preserves_tool_name(self, mgr):
+        """Replaced ToolMessages must retain their original tool name so the
+        audit protocol can still see which tool produced the cleared result."""
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "kb_search", "id": "tc0", "args": {}},
+                    {"name": "kb_search", "id": "tc1", "args": {}},
+                ],
+            ),
+            ToolMessage(content="old hit", tool_call_id="tc0", name="kb_search"),
+            ToolMessage(content="recent hit", tool_call_id="tc1", name="kb_search"),
+        ]
+        result = mgr.clear_old_tool_results(messages, keep_recent=1)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        assert tool_msgs[0].content == "[cleared]"
+        assert tool_msgs[0].name == "kb_search"
+
+    def test_error_content_not_truncated_when_long(self, mgr):
+        """Long error content must survive length-based truncation too."""
+        long_error = "Error: " + ("x" * 500) + " Exception details"
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "run_command", "id": f"tc{i}", "args": {}}
+                    for i in range(3)
+                ],
+            ),
+            ToolMessage(content=long_error, tool_call_id="tc0", name="run_command"),
+            ToolMessage(content="short", tool_call_id="tc1", name="run_command"),
+            ToolMessage(content="short", tool_call_id="tc2", name="run_command"),
+        ]
+        result = mgr.truncate_long_tool_results(messages)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        # The full error content must be intact
+        assert tool_msgs[0].content == long_error
+        assert "TRUNCATED" not in tool_msgs[0].content
+
+    def test_write_file_result_not_truncated_when_long(self, mgr):
+        """write_file outputs survive length truncation."""
+        long_write = "Wrote file " + ("x" * 500)
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "write_file", "id": "tc0", "args": {}},
+                    {"name": "read_file", "id": "tc1", "args": {}},
+                    {"name": "read_file", "id": "tc2", "args": {}},
+                ],
+            ),
+            ToolMessage(content=long_write, tool_call_id="tc0", name="write_file"),
+            ToolMessage(content="short", tool_call_id="tc1", name="read_file"),
+            ToolMessage(content="short", tool_call_id="tc2", name="read_file"),
+        ]
+        result = mgr.truncate_long_tool_results(messages)
+        tool_msgs = [m for m in result if isinstance(m, ToolMessage)]
+        assert tool_msgs[0].content == long_write
+
+
+# =============================================================================
 # truncate_long_tool_results
 # =============================================================================
 

@@ -83,7 +83,18 @@ from security.auth import (  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
-from services.nextcloud_admin import NextcloudAdmin  # noqa: E402
+from services.cloud import (  # noqa: E402
+    MainCloudRouter,
+    ProjectFolderHandle,
+    SessionFolderHandle,
+    UserId,
+    build_backend,
+)
+from services.cloud.reload import (  # noqa: E402
+    _reload_from_db_and_swap,
+    fire_reload,
+    run_listen_loop,
+)
 from services.builder_tools import (  # noqa: E402
     BUILDER_TOOLS,
     SERVER_SIDE_TOOLS,
@@ -134,7 +145,7 @@ postgres_db = PostgresDB()
 mongodb = MongoDB()
 gitea_client = GiteaClient()
 keycloak_groups = KeycloakGroupSync()
-nextcloud_admin = NextcloudAdmin()
+main_cloud_router = MainCloudRouter(build_backend())
 
 # Vector DB — separate pgvector instance for citations, memories + knowledge_index.
 _vector_url = os.getenv("VECTOR_DB_URL")
@@ -2313,7 +2324,24 @@ async def lifespan(app: FastAPI):
 
     # Initialize Keycloak group sync (graceful if unavailable)
     await keycloak_groups.ensure_initialized()
-    await nextcloud_admin.ensure_initialized()
+    await main_cloud_router.ensure_initialized()
+
+    # Phase 4: if a persisted overlay exists, apply it now so the
+    # active backend matches the cockpit admin UI's view. Non-fatal —
+    # if the overlay is broken the env-var-only path from the initial
+    # ensure_initialized() above stays in place.
+    try:
+        _persisted_overlay = await postgres_db.get_system_setting("main_cloud")
+    except Exception as _e:
+        logger.warning("Main cloud overlay read failed at startup (non-fatal): %s", _e)
+        _persisted_overlay = None
+    if _persisted_overlay:
+        _overlay_ok = await main_cloud_router.reload_from_db(_persisted_overlay)
+        if not _overlay_ok:
+            logger.warning(
+                "Main cloud overlay present in system_settings.main_cloud but "
+                "rebuild failed — active backend stays on env-var config"
+            )
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -2434,6 +2462,15 @@ async def lifespan(app: FastAPI):
     )
     pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
 
+    # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
+    # an admin PUTs a new config via /api/admin/system-settings/main_cloud.
+    async def _main_cloud_reload_callback() -> None:
+        await _reload_from_db_and_swap(postgres_db, main_cloud_router)
+
+    main_cloud_listen_task = asyncio.create_task(
+        run_listen_loop(postgres_db, _main_cloud_reload_callback, _shutdown_event)
+    )
+
     yield
 
     # Signal shutdown to background tasks
@@ -2449,6 +2486,7 @@ async def lifespan(app: FastAPI):
     await digest_task
     await delegation_timeout_task
     await pool_reconciler_task
+    await main_cloud_listen_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -8990,35 +9028,39 @@ async def create_thread(
                             e,
                         )
 
-        async def _setup_nextcloud() -> None:
-            if not nextcloud_admin.is_initialized and nextcloud_admin.is_configured:
-                await nextcloud_admin.ensure_initialized()
-            if not nextcloud_admin.is_initialized:
+        async def _setup_main_cloud() -> None:
+            backend = main_cloud_router.active
+            if not backend.is_initialized and backend.is_configured:
+                await backend.ensure_initialized()
+            if not backend.is_initialized:
                 return
             try:
-                nc_folder = f"sessions/{thread_id[:8]}"
-                folder_ok = await nextcloud_admin.create_session_folder(nc_folder)
-                if folder_ok:
-                    share_id = None
-                    nc_username = await nextcloud_admin.resolve_nc_username(
-                        user.get("email"),
-                        user.get("display_name", "").lower(),
+                session_handle = await backend.ensure_session_folder(
+                    session_id=thread_id[:8]
+                )
+                share_handle = None
+                resolved_user_id = await backend.resolve_user_identity(
+                    user.get("email"),
+                    user.get("display_name", "").lower(),
+                )
+                if resolved_user_id:
+                    share_handle = await backend.share_session_folder(
+                        session_handle, resolved_user_id
                     )
-                    if nc_username:
-                        share_id = await nextcloud_admin.share_folder_with_user(
-                            nc_folder, nc_username
-                        )
-                    await postgres_db.update_thread_nextcloud(
-                        thread_id, nc_folder, share_id
-                    )
+                await postgres_db.update_thread_main_cloud(
+                    thread_id,
+                    backend_id=backend.backend_id,
+                    session_handle=session_handle.to_db(),
+                    share_handle=share_handle.to_db() if share_handle else None,
+                )
             except Exception as e:
                 logger.warning(
-                    "Failed to provision Nextcloud session folder for thread %s: %s",
+                    "Failed to provision main-cloud session folder for thread %s: %s",
                     thread_id,
                     e,
                 )
 
-        await asyncio.gather(_setup_gitea(), _setup_nextcloud())
+        await asyncio.gather(_setup_gitea(), _setup_main_cloud())
 
         return {"thread_id": thread_id, "status": "created"}
     except HTTPException:
@@ -9104,15 +9146,23 @@ async def end_thread(
     if repo_name and gitea_client.is_initialized:
         await gitea_client.delete_repo(repo_name)
 
-    # Clean up Nextcloud session folder
-    nc_folder = thread.get("nc_session_folder")
-    if nc_folder and nextcloud_admin.is_initialized:
-        try:
-            await nextcloud_admin.delete_folder(nc_folder)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete Nextcloud session folder for thread {thread_id}: {e}"
-            )
+    # Clean up main-cloud session folder (and its share, if any)
+    session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if session_handle_str:
+        backend = main_cloud_router.for_thread(thread)
+        if backend.is_initialized:
+            try:
+                session_handle = SessionFolderHandle.from_db(
+                    session_handle_str, backend=backend.backend_id
+                )
+                await backend.delete_session_folder(session_handle)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete main-cloud session folder for "
+                    f"thread {thread_id}: {e}"
+                )
 
     if permanent:
         await postgres_db.delete_thread(thread_id)
@@ -11045,6 +11095,379 @@ async def codex_delete_credential(name: str, request: Request) -> dict[str, str]
 
 
 # =============================================================================
+# System Settings — Main Cloud (Phase 4, Admin-only)
+# =============================================================================
+# These endpoints drive the cockpit admin "Cloud Storage" panel. GETs
+# return the current effective config with secrets stripped, PUT persists
+# a new config to `system_settings.main_cloud` and triggers a reload, and
+# POST /test does a dry-run connection check with a proposed config
+# without persisting.
+#
+# Secret handling: non-secret fields (URLs, usernames, quota) are stored
+# in the `value` JSONB column. Secret fields (passwords, client secrets)
+# are referenced via `credentials_ref` — a pointer like
+# `env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET` that the loader resolves against
+# the orchestrator's own environment. This keeps secrets in Vault/ESO/.env
+# and lets the UI manage only the non-secret knobs.
+
+_MAIN_CLOUD_NONSECRET_FIELDS_BY_BACKEND: dict[str, list[str]] = {
+    "nextcloud": [
+        "base_url",
+        "public_url",
+        "admin_user",
+        "agent_user",
+    ],
+    "opencloud": [
+        "base_url",
+        "public_url",
+        "keycloak_issuer",
+        "keycloak_client_id",
+        "admin_role_claim_value",
+        "default_quota_bytes",
+    ],
+}
+
+_MAIN_CLOUD_SECRET_FIELDS_BY_BACKEND: dict[str, list[str]] = {
+    "nextcloud": ["admin_password", "agent_password", "oidc_client_secret"],
+    "opencloud": ["keycloak_client_secret"],
+}
+
+_MAIN_CLOUD_ALLOWED_BACKENDS = {"nextcloud", "opencloud"}
+
+
+def _sanitize_main_cloud_value(
+    backend_id: str, raw_value: dict[str, Any]
+) -> dict[str, Any]:
+    """Strip unknown keys + secret fields from an incoming overlay body.
+
+    Secrets are never stored in JSONB — they always come from env vars
+    resolved via `credentials_ref`. The sanitizer drops any secret-field
+    key from the incoming dict so a careless UI PUT cannot accidentally
+    persist a client secret into `system_settings.value`.
+    """
+    nonsecret = _MAIN_CLOUD_NONSECRET_FIELDS_BY_BACKEND.get(backend_id, [])
+    secret = set(_MAIN_CLOUD_SECRET_FIELDS_BY_BACKEND.get(backend_id, []))
+    clean: dict[str, Any] = {"backend_id": backend_id}
+    for key in nonsecret:
+        if key in raw_value and raw_value[key] not in (None, ""):
+            clean[key] = raw_value[key]
+    # Record which fields are secret-credential-sourced so the loader
+    # knows to resolve them via credentials_ref at read time.
+    if secret:
+        clean["__secret_fields__"] = sorted(secret)
+    return clean
+
+
+def _current_effective_config() -> dict[str, Any]:
+    """Read the active backend's current config shape for GET responses."""
+    active = main_cloud_router.active
+    backend_id = active.backend_id
+    result: dict[str, Any] = {
+        "backend_id": backend_id,
+        "is_initialized": active.is_initialized,
+        "is_configured": active.is_configured,
+    }
+
+    # Non-secret fields come directly from the backend's settings where
+    # possible. NextcloudBackend reads env vars into private attrs;
+    # OpenCloudBackend holds a full settings dataclass.
+    if backend_id == "nextcloud":
+        # Attributes follow the adapter's internal names.
+        result.update(
+            {
+                "base_url": getattr(active, "_base_url", None),
+                "public_url": getattr(active, "_public_url", None),
+                "admin_user": getattr(active, "_admin_user", None),
+                "agent_user": getattr(active, "_agent_user", None),
+            }
+        )
+    elif backend_id == "opencloud":
+        settings = getattr(active, "_settings", None)
+        if settings is not None:
+            result.update(
+                {
+                    "base_url": str(settings.base_url),
+                    "public_url": str(settings.public_url),
+                    "keycloak_issuer": str(settings.keycloak_issuer),
+                    "keycloak_client_id": settings.keycloak_client_id,
+                    "admin_role_claim_value": settings.admin_role_claim_value,
+                    "default_quota_bytes": settings.default_quota_bytes,
+                }
+            )
+    return result
+
+
+def _env_var_provenance(env_name: str) -> dict[str, Any]:
+    """Report whether a secret env var is set, without leaking its value."""
+    val = os.getenv(env_name)
+    return {
+        "env_var": env_name,
+        "set": bool(val),
+        "length": len(val) if val else 0,
+    }
+
+
+@app.get("/api/admin/system-settings/main_cloud")
+async def get_main_cloud_settings(request: Request) -> dict[str, Any]:
+    """Return the current effective main-cloud config + persisted overlay.
+
+    Admin-only. The response is safe to log: every secret field is
+    replaced with its env-var provenance (name + set/unset flag + length).
+    """
+    await _require_admin(request)
+    effective = _current_effective_config()
+    backend_id = effective["backend_id"]
+
+    try:
+        row = await postgres_db.get_system_setting("main_cloud")
+    except Exception:
+        row = None
+
+    overlay_value: dict[str, Any] = {}
+    overlay_updated_at: Optional[str] = None
+    overlay_updated_by: Optional[str] = None
+    credentials_ref: Optional[str] = None
+    if row:
+        raw = row.get("value") or {}
+        if isinstance(raw, dict):
+            overlay_value = raw
+        credentials_ref = row.get("credentials_ref")
+        ua = row.get("updated_at")
+        overlay_updated_at = ua.isoformat() if ua is not None else None
+        overlay_updated_by = row.get("updated_by")
+
+    # Secret provenance: the adapter-specific env var names.
+    secret_env_by_backend = {
+        "nextcloud": {
+            "admin_password": "NEXTCLOUD_ADMIN_PASSWORD",
+            "agent_password": "NEXTCLOUD_AGENT_PASSWORD",
+            "oidc_client_secret": "NEXTCLOUD_OIDC_CLIENT_SECRET",
+        },
+        "opencloud": {
+            "keycloak_client_secret": "OPENCLOUD_KEYCLOAK_CLIENT_SECRET",
+        },
+    }
+    secret_provenance: dict[str, dict[str, Any]] = {}
+    for field, env_name in secret_env_by_backend.get(backend_id, {}).items():
+        # credentials_ref can override the env var name per-field.
+        effective_env = env_name
+        if (
+            credentials_ref
+            and credentials_ref.startswith("env:")
+            and field in overlay_value.get("__secret_fields__", [])
+        ):
+            effective_env = credentials_ref[4:]
+        secret_provenance[field] = _env_var_provenance(effective_env)
+
+    return {
+        "effective": effective,
+        "overlay": {
+            "present": bool(row),
+            "value": overlay_value,
+            "credentials_ref": credentials_ref,
+            "updated_at": overlay_updated_at,
+            "updated_by": overlay_updated_by,
+        },
+        "secrets": secret_provenance,
+        "allowed_backends": sorted(_MAIN_CLOUD_ALLOWED_BACKENDS),
+    }
+
+
+@app.put("/api/admin/system-settings/main_cloud")
+async def put_main_cloud_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Persist a new main-cloud config and hot-reload the router.
+
+    Admin-only. The request body is ``{"value": {...}, "credentials_ref": "env:..."}``:
+
+    * ``value.backend_id`` must be one of ``allowed_backends``.
+    * Secret fields in ``value`` are silently dropped by the sanitizer —
+      never persist secrets in the DB. Rotate via the secret store.
+    * ``credentials_ref`` is an optional pointer (e.g. ``env:NEW_VAR``)
+      that the loader resolves for secret fields at read time.
+    * The handler performs a synchronous reload on the local replica
+      after persisting, so the caller gets a success/failure response
+      reflecting the actual new backend state. Other replicas pick up
+      the change via the pg_notify LISTEN task.
+    """
+    admin = await _require_admin(request)
+
+    value_in = body.get("value") or {}
+    if not isinstance(value_in, dict):
+        raise HTTPException(status_code=400, detail="`value` must be an object")
+    backend_id = value_in.get("backend_id")
+    if backend_id not in _MAIN_CLOUD_ALLOWED_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown backend_id {backend_id!r}; "
+                f"must be one of {sorted(_MAIN_CLOUD_ALLOWED_BACKENDS)}"
+            ),
+        )
+    credentials_ref = body.get("credentials_ref")
+    if credentials_ref is not None and not isinstance(credentials_ref, str):
+        raise HTTPException(
+            status_code=400, detail="`credentials_ref` must be a string or null"
+        )
+
+    clean_value = _sanitize_main_cloud_value(backend_id, value_in)
+
+    # Validate the proposed config before persisting — raises on
+    # missing required fields so we fail fast with a 422-style message.
+    from services.cloud.config import load_main_cloud_config
+
+    probe_overlay = {
+        "value": clean_value,
+        "credentials_ref": credentials_ref,
+    }
+    try:
+        load_main_cloud_config(db_overlay=probe_overlay)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"invalid main cloud config: {e}"
+        ) from e
+
+    try:
+        stored = await postgres_db.upsert_system_setting(
+            "main_cloud",
+            clean_value,
+            credentials_ref=credentials_ref,
+            updated_by=admin.get("id") or admin.get("email") or "admin",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"failed to persist main cloud setting: {e}"
+        ) from e
+
+    # Local synchronous reload so the PUT response reflects the new state.
+    reload_ok = await main_cloud_router.reload_from_db(stored)
+    if not reload_ok:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "main cloud setting persisted but the new backend failed to "
+                "initialize — check orchestrator logs. The active backend is "
+                "unchanged; rollback the setting or fix the config and retry."
+            ),
+        )
+
+    # Fan-out to other replicas via pg_notify. Best-effort.
+    await fire_reload(postgres_db)
+    return {
+        "status": "ok",
+        "backend_id": backend_id,
+        "reloaded": True,
+    }
+
+
+@app.post("/api/admin/system-settings/main_cloud/test")
+async def test_main_cloud_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Dry-run a proposed main-cloud config without persisting.
+
+    Builds a backend from the proposed overlay, calls
+    ``ensure_initialized()``, and tears it down. Returns whether the
+    probe succeeded plus a short detail string. Useful for "Test"
+    buttons in the admin UI before the operator commits to saving.
+    """
+    await _require_admin(request)
+
+    value_in = body.get("value") or {}
+    backend_id = value_in.get("backend_id")
+    if backend_id not in _MAIN_CLOUD_ALLOWED_BACKENDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown backend_id {backend_id!r}",
+        )
+    credentials_ref = body.get("credentials_ref")
+
+    clean_value = _sanitize_main_cloud_value(backend_id, value_in)
+    probe_overlay = {
+        "value": clean_value,
+        "credentials_ref": credentials_ref,
+    }
+
+    try:
+        probe_backend = build_backend(db_overlay=probe_overlay)
+    except Exception as e:
+        return {"ok": False, "detail": f"build_backend failed: {e}"}
+
+    try:
+        try:
+            ok = await probe_backend.ensure_initialized()
+        except Exception as e:
+            return {"ok": False, "detail": f"ensure_initialized raised: {e}"}
+        if not ok:
+            return {
+                "ok": False,
+                "detail": "backend reported not initialized — check config + upstream",
+            }
+        health = await probe_backend.health_check()
+        return {
+            "ok": health.ok,
+            "detail": health.detail or "",
+            "latency_ms": health.latency_ms,
+        }
+    finally:
+        try:
+            await probe_backend.close()
+        except Exception:
+            pass
+
+
+@app.post("/api/admin/system-settings/main_cloud/reload")
+async def reload_main_cloud_settings(request: Request) -> dict[str, Any]:
+    """Force a local reload from the current persisted overlay.
+
+    Admin-only. Useful when an operator has rotated a secret out-of-band
+    (new Keycloak client secret in .env) and wants this orchestrator
+    replica to pick up the new env var without a restart. Does not
+    re-broadcast — other replicas keep their current state and can be
+    reloaded individually or via a rolling restart.
+    """
+    await _require_admin(request)
+    try:
+        overlay = await postgres_db.get_system_setting("main_cloud")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"failed to read setting: {e}"
+        ) from e
+    ok = await main_cloud_router.reload_from_db(overlay)
+    if not ok:
+        raise HTTPException(
+            status_code=500,
+            detail="reload failed — new backend did not initialize",
+        )
+    return {"status": "ok", "backend_id": main_cloud_router.active.backend_id}
+
+
+@app.delete("/api/admin/system-settings/main_cloud")
+async def delete_main_cloud_settings(request: Request) -> dict[str, Any]:
+    """Remove the persisted overlay and reload from env vars only.
+
+    Admin-only. Semantically a "reset to defaults" button.
+    """
+    await _require_admin(request)
+    existed = await postgres_db.delete_system_setting("main_cloud")
+    if not existed:
+        return {"status": "noop", "existed": False}
+    ok = await main_cloud_router.reload_from_db(None)
+    if not ok:
+        raise HTTPException(
+            status_code=500,
+            detail="overlay cleared but env-var rebuild failed",
+        )
+    await fire_reload(postgres_db)
+    return {
+        "status": "ok",
+        "existed": True,
+        "backend_id": main_cloud_router.active.backend_id,
+    }
+
+
+# =============================================================================
 # User Endpoints
 # =============================================================================
 
@@ -11082,24 +11505,29 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
         await _create_gitea_repo_for_project(user, project)
 
         # Create personal WebDAV datasource for the default project
-        if nextcloud_admin.is_initialized and body.email:
+        backend = main_cloud_router.active
+        if backend.is_initialized and body.email:
             try:
-                webdav_url = nextcloud_admin.get_user_home_webdav_url(body.email)
-                ds = await postgres_db.create_datasource(
-                    name="Cloud Storage (Personal)",
-                    ds_type="webdav",
-                    connection_url=webdav_url,
-                    description="Personal Nextcloud file storage",
-                    credentials={
-                        "username": nextcloud_admin.agent_user,
-                        "password": nextcloud_admin.agent_password,
-                    },
-                )
-                await postgres_db.link_datasource_to_project(
-                    project_id=str(project["id"]),
-                    datasource_id=str(ds["id"]),
-                    read_only=False,
-                )
+                # Phase 1: the Nextcloud adapter treats the email as the
+                # username (legacy behavior — OIDC-backed setups where the NC
+                # username differs from the email are broken here, inherited
+                # bug from the pre-refactor code). Phase 2 resolves via
+                # resolve_user_identity + get_user_home().handle.
+                home = await backend.get_user_home(UserId(body.email))
+                webdav_url = home.webdav_url if home else None
+                if webdav_url:
+                    ds = await postgres_db.create_datasource(
+                        name="Cloud Storage (Personal)",
+                        ds_type="webdav",
+                        connection_url=webdav_url,
+                        description="Personal cloud storage",
+                        credentials=backend.webdav_credentials,
+                    )
+                    await postgres_db.link_datasource_to_project(
+                        project_id=str(project["id"]),
+                        datasource_id=str(ds["id"]),
+                        read_only=False,
+                    )
             except Exception as e:
                 logger.warning(
                     f"Failed to create personal cloud storage for user "
@@ -11200,35 +11628,56 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                         user["keycloak_sub"], project_id_str
                     )
 
-        # Provision Nextcloud Group Folder + WebDAV datasource
-        if nextcloud_admin.is_initialized:
+        # Provision main-cloud project folder + WebDAV datasource
+        backend = main_cloud_router.active
+        if backend.is_initialized:
             project_id_str = str(project["id"])
             group_name = f"project-{project_id_str}"
             try:
-                # Pre-create Nextcloud group (so it exists before folder assignment)
-                await nextcloud_admin.ensure_group(group_name)
+                # Pre-create the backend group (so it exists before folder assignment)
+                await backend.ensure_group(group_name)
 
-                # Create Group Folder and grant access
-                folder_id = await nextcloud_admin.create_project_folder(
+                # Add the creator to the backend group so they can see the Space.
+                if body.user_id:
+                    creator = await postgres_db.get_user(body.user_id)
+                    if creator:
+                        resolved = await backend.resolve_user_identity(
+                            creator.get("email"),
+                            creator.get("display_name", "").lower(),
+                        )
+                        if resolved:
+                            await backend.add_user_to_group(resolved, group_name)
+
+                # Create the project folder and grant access
+                folder_handle = await backend.ensure_project_folder(
                     project_name=body.name,
                     group_id=group_name,
                 )
-                if folder_id:
-                    await postgres_db.update_project(
-                        project_id_str, nextcloud_folder_id=folder_id
-                    )
+                # Persist the backend id + serialized handle; also write
+                # the legacy column for dual-read safety during the
+                # legacy-column deprecation window (§9 of the design doc).
+                legacy_folder_id: int | None = None
+                if backend.backend_id == "nextcloud":
+                    try:
+                        legacy_folder_id = int(folder_handle.native_id)
+                    except ValueError:
+                        legacy_folder_id = None
+                await postgres_db.update_project(
+                    project_id_str,
+                    main_cloud_backend=backend.backend_id,
+                    main_cloud_folder_handle=folder_handle.to_db(),
+                    nextcloud_folder_id=legacy_folder_id,
+                )
 
-                    # Create project-scoped WebDAV datasource + link to project
-                    webdav_url = nextcloud_admin.get_folder_webdav_url(body.name)
+                # Create project-scoped WebDAV datasource + link to project
+                webdav_url = backend.get_project_folder_webdav_url(folder_handle)
+                if webdav_url:
                     ds = await postgres_db.create_datasource(
                         name=f"Cloud Storage ({body.name})",
                         ds_type="webdav",
                         connection_url=webdav_url,
-                        description=f"Shared file storage for project '{body.name}'",
-                        credentials={
-                            "username": nextcloud_admin.agent_user,
-                            "password": nextcloud_admin.agent_password,
-                        },
+                        description=(f"Shared file storage for project '{body.name}'"),
+                        credentials=backend.webdav_credentials,
                     )
                     await postgres_db.link_datasource_to_project(
                         project_id=project_id_str,
@@ -11237,7 +11686,7 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                     )
             except Exception as e:
                 logger.warning(
-                    f"Failed to provision Nextcloud folder for project "
+                    f"Failed to provision main-cloud folder for project "
                     f"{project_id_str}: {e}"
                 )
 
@@ -11272,14 +11721,30 @@ async def get_project(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
     # Compute cloud_storage_url for cockpit deep-links
-    if nextcloud_admin.is_initialized and project.get("nextcloud_folder_id"):
-        project["cloud_storage_url"] = nextcloud_admin.get_folder_browser_url(
-            project["name"]
-        )
-    elif nextcloud_admin.is_initialized and project.get("is_default"):
-        project["cloud_storage_url"] = nextcloud_admin.get_user_home_browser_url()
-    else:
-        project["cloud_storage_url"] = None
+    project["cloud_storage_url"] = None
+    backend = main_cloud_router.for_project(project)
+    if backend.is_initialized:
+        handle_str = project.get("main_cloud_folder_handle")
+        legacy_folder_id = project.get("nextcloud_folder_id")
+        if handle_str or legacy_folder_id:
+            handle = ProjectFolderHandle.from_db(
+                handle_str or str(legacy_folder_id),
+                backend=project.get("main_cloud_backend") or backend.backend_id,
+            )
+            # Legacy Nextcloud handles were backfilled without vendor_meta;
+            # re-attach the mountpoint from the project name so the URL
+            # builder has what it needs.
+            if not handle.vendor_meta.get("mountpoint"):
+                handle = ProjectFolderHandle(
+                    backend=handle.backend,
+                    native_id=handle.native_id,
+                    vendor_meta={**handle.vendor_meta, "mountpoint": project["name"]},
+                )
+            project["cloud_storage_url"] = backend.get_project_folder_browser_url(
+                handle
+            )
+        elif project.get("is_default"):
+            project["cloud_storage_url"] = backend.get_default_home_browser_url()
 
     return project
 
@@ -11359,13 +11824,23 @@ async def delete_project(project_id: str) -> dict[str, str]:
     if keycloak_groups.is_initialized:
         await keycloak_groups.delete_project_group(project_id)
 
-    # Clean up Nextcloud Group Folder
-    if nextcloud_admin.is_initialized and project.get("nextcloud_folder_id"):
+    # Clean up main-cloud project folder via the row's backend dispatch
+    backend = main_cloud_router.for_project(project)
+    handle_str = project.get("main_cloud_folder_handle") or (
+        str(project["nextcloud_folder_id"])
+        if project.get("nextcloud_folder_id")
+        else None
+    )
+    if handle_str and backend.is_initialized:
         try:
-            await nextcloud_admin.delete_project_folder(project["nextcloud_folder_id"])
+            handle = ProjectFolderHandle.from_db(
+                handle_str,
+                backend=project.get("main_cloud_backend") or backend.backend_id,
+            )
+            await backend.delete_project_folder(handle)
         except Exception as e:
             logger.warning(
-                f"Failed to delete Nextcloud folder for project {project_id}: {e}"
+                f"Failed to delete main-cloud folder for project {project_id}: {e}"
             )
 
     return {"status": "deleted"}
@@ -11417,29 +11892,41 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"
                 )
 
-        # Sync to Nextcloud group (immediate access, don't wait for OIDC login)
-        if nextcloud_admin.is_initialized:
+        # Sync to the project's main-cloud backend (immediate access — do not
+        # wait for OIDC login). Uses for_project so legacy-backend rows still
+        # dispatch correctly after a deployment-wide backend switch.
+        backend = main_cloud_router.for_project(project)
+        if backend.is_initialized:
             try:
                 nc_user = await postgres_db.get_user(body.user_id)
-                nc_username = (
-                    await nextcloud_admin.resolve_nc_username(
+                resolved_user_id = (
+                    await backend.resolve_user_identity(
                         nc_user.get("email"),
                         nc_user.get("display_name", "").lower(),
                     )
                     if nc_user
                     else None
                 )
-                if nc_username:
+                if resolved_user_id:
                     group_name = f"project-{project_id}"
-                    await nextcloud_admin.add_user_to_group(nc_username, group_name)
-                    # Workaround for NC server#57445: re-grant group access
-                    if project.get("nextcloud_folder_id"):
-                        await nextcloud_admin.refresh_group_folder_access(
-                            project["nextcloud_folder_id"], group_name
+                    await backend.add_user_to_group(resolved_user_id, group_name)
+                    # Workaround for Nextcloud server#57445 — no-op on
+                    # backends that propagate group membership automatically.
+                    handle_str = project.get("main_cloud_folder_handle") or (
+                        str(project["nextcloud_folder_id"])
+                        if project.get("nextcloud_folder_id")
+                        else None
+                    )
+                    if handle_str:
+                        handle = ProjectFolderHandle.from_db(
+                            handle_str,
+                            backend=project.get("main_cloud_backend")
+                            or backend.backend_id,
                         )
+                        await backend.refresh_project_folder_access(handle, group_name)
             except Exception as e:
                 logger.warning(
-                    f"Failed to sync Nextcloud group for member {body.user_id}: {e}"
+                    f"Failed to sync main-cloud group for member {body.user_id}: {e}"
                 )
 
         return result
@@ -11501,25 +11988,29 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
-    # Remove from Nextcloud group
-    if nextcloud_admin.is_initialized:
+    # Remove from the project's main-cloud group
+    project = await postgres_db.get_project(project_id)
+    backend = (
+        main_cloud_router.for_project(project) if project else main_cloud_router.active
+    )
+    if backend.is_initialized:
         try:
             nc_user = await postgres_db.get_user(user_id)
-            nc_username = (
-                await nextcloud_admin.resolve_nc_username(
+            resolved_user_id = (
+                await backend.resolve_user_identity(
                     nc_user.get("email"),
                     nc_user.get("display_name", "").lower(),
                 )
                 if nc_user
                 else None
             )
-            if nc_username:
-                await nextcloud_admin.remove_user_from_group(
-                    nc_username, f"project-{project_id}"
+            if resolved_user_id:
+                await backend.remove_user_from_group(
+                    resolved_user_id, f"project-{project_id}"
                 )
         except Exception as e:
             logger.warning(
-                f"Failed to remove Nextcloud group membership for {user_id}: {e}"
+                f"Failed to remove main-cloud group membership for {user_id}: {e}"
             )
 
     return {"status": "removed"}

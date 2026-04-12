@@ -237,6 +237,37 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: DEFAULT_DS_WEBDAV_READ_ONLY
+            # OpenCloud — main cloud backend (replaces Nextcloud)
+            - name: MAIN_CLOUD_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MAIN_CLOUD_BACKEND
+            - name: OPENCLOUD_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: OPENCLOUD_URL
+            - name: OPENCLOUD_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: OPENCLOUD_PUBLIC_URL
+            - name: OPENCLOUD_KEYCLOAK_ISSUER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: OPENCLOUD_KEYCLOAK_ISSUER
+            - name: OPENCLOUD_KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: OPENCLOUD_KEYCLOAK_CLIENT_ID
+            - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
             # S3 / MinIO (snapshots + IDE sessions)
             - name: S3_ENDPOINT
               valueFrom:

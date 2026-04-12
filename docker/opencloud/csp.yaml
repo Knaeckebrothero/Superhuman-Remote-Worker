@@ -1,0 +1,50 @@
+## CSP override for the dev compose stack.
+##
+## OpenCloud's default connect-src only allows 'self'. When the OIDC issuer
+## (Keycloak at localhost:8180) is on a different port, the browser's
+## oidc-client library is blocked by CSP from fetching the OIDC discovery
+## document. This override adds the Keycloak origin so browser-side OIDC
+## login works in the dev environment.
+##
+## Mounted via PROXY_CSP_CONFIG_FILE_OVERRIDE_LOCATION in docker-compose.dev.yaml.
+##
+## Production deployments behind a single domain (reverse proxy) don't need
+## this — the issuer and the app share the same origin.
+
+directives:
+  child-src:
+    - "'self'"
+  connect-src:
+    - "'self'"
+    - "blob:"
+    - "https://raw.githubusercontent.com/opencloud-eu/awesome-apps/"
+    - "https://update.opencloud.eu/"
+    - "http://localhost:8180"
+  default-src:
+    - "'none'"
+  font-src:
+    - "'self'"
+  frame-ancestors:
+    - "'self'"
+  frame-src:
+    - "'self'"
+    - "blob:"
+    - "https://embed.diagrams.net/"
+  img-src:
+    - "'self'"
+    - "data:"
+    - "blob:"
+    - "https://raw.githubusercontent.com/opencloud-eu/awesome-apps/"
+  manifest-src:
+    - "'self'"
+  media-src:
+    - "'self'"
+  object-src:
+    - "'self'"
+    - "blob:"
+  script-src:
+    - "'self'"
+    - "'unsafe-inline'"
+  style-src:
+    - "'self'"
+    - "'unsafe-inline'"

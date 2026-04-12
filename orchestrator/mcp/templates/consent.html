@@ -233,6 +233,32 @@ body{
 
 .btn-deny:active{transform:translateY(1px)}
 
+/* ---- loading state ---- */
+.btn.is-loading{
+  pointer-events:none;
+  position:relative;
+  color:transparent;
+}
+
+.btn.is-loading::after{
+  content:'';
+  position:absolute;
+  top:50%;left:50%;
+  width:18px;height:18px;
+  margin:-9px 0 0 -9px;
+  border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;
+  border-radius:50%;
+  animation:spin .6s linear infinite;
+}
+
+.btn-deny.is-loading::after{
+  border-color:var(--border);
+  border-top-color:var(--text-secondary);
+}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+
 /* ---- footer ---- */
 .footer{
   padding:12px 24px;
@@ -310,10 +336,23 @@ body{
 </div>
 
 <script>
+var submitted=false;
+function lock(activeBtn){
+  submitted=true;
+  var btns=document.querySelectorAll('.btn');
+  for(var i=0;i<btns.length;i++){btns[i].disabled=true;}
+  activeBtn.classList.add('is-loading');
+}
 function submitDeny(){
+  if(submitted)return;
   document.getElementById('form-action').value='deny';
+  lock(document.querySelector('.btn-deny'));
   document.querySelector('form').submit();
 }
+document.querySelector('form').addEventListener('submit',function(e){
+  if(submitted){e.preventDefault();return;}
+  lock(document.querySelector('.btn-allow'));
+});
 // Set avatar initial from email
 (function(){
   var b=document.querySelector('.identity-badge');

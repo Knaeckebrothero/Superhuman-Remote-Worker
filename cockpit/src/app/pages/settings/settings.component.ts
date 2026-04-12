@@ -1,11 +1,15 @@
-import {Component, effect, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, effect, inject, OnInit, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {Router} from '@angular/router';
 import {environment} from '../../core/environment';
 import {McpTokenService} from '../../core/services/mcp-token.service';
 import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
-import {SettingsService} from '../../core/services/settings.service';
+import {
+  SettingsService,
+  MainCloudSettingsResponse,
+  MainCloudFormState,
+} from '../../core/services/settings.service';
 import {ModelService} from '../../core/services/model.service';
 import {
     ApiKeyProvider,
@@ -606,6 +610,203 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               }
             </div>
           </section>
+
+          <!-- Cloud Storage Section (Admin Only, Phase 4) -->
+          <section class="settings-section" style="margin-top: 24px;">
+            <h2 class="section-title">Cloud Storage (Main Cloud)</h2>
+            <p class="section-desc">
+              Configure the main-cloud backend used for user home folders, project folders, and session folders.
+              Secrets are managed via environment variables (Vault/ESO/.env) and are shown here as provenance only.
+            </p>
+
+            @if (cloudLoading()) {
+              <p class="section-desc">Loading…</p>
+            } @else if (cloudSettings(); as s) {
+              <!-- Status row -->
+              <div class="codex-status-card">
+                <span
+                  class="codex-status-dot"
+                  [class.connected]="s.effective.is_initialized"
+                ></span>
+                <span class="codex-status-text">
+                  Active: <strong>{{ s.effective.backend_id }}</strong>
+                  @if (s.effective.is_initialized) { &mdash; initialized }
+                  @else { &mdash; not initialized }
+                </span>
+                <button class="refresh-btn" (click)="loadCloudSettings()" title="Refresh">&#x21bb;</button>
+              </div>
+
+              <!-- Backend selector -->
+              <div class="form-row" style="margin-top: 16px;">
+                <label class="form-label">Backend</label>
+                <select
+                  class="form-input"
+                  [ngModel]="cloudForm().backend_id"
+                  (ngModelChange)="updateCloudForm('backend_id', $event)"
+                >
+                  @for (backend of s.allowed_backends; track backend) {
+                    <option [value]="backend">{{ backend }}</option>
+                  }
+                </select>
+              </div>
+
+              <!-- Common URL fields -->
+              <div class="form-row">
+                <label class="form-label">Base URL (internal)</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  [ngModel]="cloudForm().base_url || ''"
+                  (ngModelChange)="updateCloudForm('base_url', $event)"
+                />
+              </div>
+              <div class="form-row">
+                <label class="form-label">Public URL (browser)</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  [ngModel]="cloudForm().public_url || ''"
+                  (ngModelChange)="updateCloudForm('public_url', $event)"
+                />
+              </div>
+
+              @if (cloudForm().backend_id === 'opencloud') {
+                <div class="form-row">
+                  <label class="form-label">Keycloak issuer</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="cloudForm().keycloak_issuer || ''"
+                    (ngModelChange)="updateCloudForm('keycloak_issuer', $event)"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">Keycloak client id</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="cloudForm().keycloak_client_id || ''"
+                    (ngModelChange)="updateCloudForm('keycloak_client_id', $event)"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">Admin role / claim value</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="cloudForm().admin_role_claim_value || ''"
+                    (ngModelChange)="updateCloudForm('admin_role_claim_value', $event)"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">Default Space quota (bytes)</label>
+                  <input
+                    type="number"
+                    class="form-input"
+                    [ngModel]="cloudForm().default_quota_bytes"
+                    (ngModelChange)="updateCloudForm('default_quota_bytes', $event)"
+                  />
+                </div>
+              }
+
+              @if (cloudForm().backend_id === 'nextcloud') {
+                <div class="form-row">
+                  <label class="form-label">Admin user</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="cloudForm().admin_user || ''"
+                    (ngModelChange)="updateCloudForm('admin_user', $event)"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">Agent user</label>
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="cloudForm().agent_user || ''"
+                    (ngModelChange)="updateCloudForm('agent_user', $event)"
+                  />
+                </div>
+              }
+
+              <!-- Credentials ref -->
+              <div class="form-row">
+                <label class="form-label">Credentials ref (optional)</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  placeholder="env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET"
+                  [ngModel]="cloudCredentialsRef()"
+                  (ngModelChange)="cloudCredentialsRef.set($event)"
+                />
+              </div>
+
+              <!-- Secret provenance -->
+              @if (secretProvenanceEntries().length > 0) {
+                <div class="codex-accounts" style="margin-top: 16px;">
+                  <h3 class="form-title">Secret provenance</h3>
+                  @for (entry of secretProvenanceEntries(); track entry.field) {
+                    <div class="codex-account-row">
+                      <span class="mono">{{ entry.field }}</span>
+                      <span class="mono">{{ entry.env_var }}</span>
+                      <span
+                        class="codex-account-status"
+                        [class.connected]="entry.set"
+                      >
+                        {{ entry.set ? 'set (' + entry.length + ' chars)' : 'unset' }}
+                      </span>
+                    </div>
+                  }
+                </div>
+              }
+
+              <!-- Buttons -->
+              <div class="create-form" style="margin-top: 20px; display: flex; gap: 12px;">
+                <button
+                  class="create-btn"
+                  (click)="testCloudSettings()"
+                  [disabled]="cloudBusy()"
+                >
+                  {{ cloudTesting() ? 'Testing…' : 'Test' }}
+                </button>
+                <button
+                  class="create-btn"
+                  (click)="saveCloudSettings()"
+                  [disabled]="cloudBusy()"
+                >
+                  {{ cloudSaving() ? 'Saving…' : 'Save + Reload' }}
+                </button>
+                @if (s.overlay.present) {
+                  <button
+                    class="revoke-btn"
+                    (click)="resetCloudSettings()"
+                    [disabled]="cloudBusy()"
+                  >
+                    Reset to env defaults
+                  </button>
+                }
+              </div>
+
+              @if (cloudMessage()) {
+                <p
+                  class="section-desc"
+                  style="margin-top: 12px;"
+                  [class.codex-callback-error]="cloudMessageIsError()"
+                >
+                  {{ cloudMessage() }}
+                </p>
+              }
+
+              @if (s.overlay.present) {
+                <p class="section-desc" style="margin-top: 8px;">
+                  Persisted overlay last saved
+                  @if (s.overlay.updated_at) { {{ formatDate(s.overlay.updated_at) }} }
+                  @if (s.overlay.updated_by) { by {{ s.overlay.updated_by }} }
+                </p>
+              }
+            }
+          </section>
         }
       </div>
     </div>
@@ -1182,6 +1383,38 @@ export class SettingsComponent implements OnInit {
   readonly codexCallbackError = signal('');
   private codexPollTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Cloud storage state (admin-only, Phase 4)
+  readonly cloudSettings = signal<MainCloudSettingsResponse | null>(null);
+  readonly cloudLoading = signal(false);
+  readonly cloudSaving = signal(false);
+  readonly cloudTesting = signal(false);
+  readonly cloudMessage = signal('');
+  readonly cloudMessageIsError = signal(false);
+  readonly cloudCredentialsRef = signal('');
+  readonly cloudForm = signal<MainCloudFormState>({
+    backend_id: 'opencloud',
+    base_url: '',
+    public_url: '',
+    admin_user: '',
+    agent_user: '',
+    keycloak_issuer: '',
+    keycloak_client_id: '',
+    admin_role_claim_value: '',
+    default_quota_bytes: null,
+  });
+
+  readonly cloudBusy = computed(() => this.cloudSaving() || this.cloudTesting());
+  readonly secretProvenanceEntries = computed(() => {
+    const s = this.cloudSettings();
+    if (!s) return [];
+    return Object.entries(s.secrets).map(([field, prov]) => ({
+      field,
+      env_var: prov.env_var,
+      set: prov.set,
+      length: prov.length,
+    }));
+  });
+
   constructor() {
     // Reactively sync preference form fields when the preferences signal updates.
     effect(() => {
@@ -1232,7 +1465,24 @@ export class SettingsComponent implements OnInit {
             .subscribe((p) => this.projects.set(p));
       }
     });
+
+    // Load admin-only sections reactively — waits for currentUser on F5
+    // refresh, otherwise the panels render their headers but never fetch
+    // (currentUser() is null when ngOnInit runs after a hard reload).
+    // Guarded by `_adminLoadersFired` so subsequent user signal updates
+    // (e.g. background refresh) don't re-trigger the fetches.
+    effect(() => {
+      if (this._adminLoadersFired) return;
+      const user = this.userService.currentUser();
+      if (user?.is_admin) {
+        this._adminLoadersFired = true;
+        this.loadCodexStatus();
+        this.loadCloudSettings();
+      }
+    });
   }
+
+  private _adminLoadersFired = false;
 
   /** Only show active (non-revoked) tokens. */
   activeTokens = () =>
@@ -1243,11 +1493,9 @@ export class SettingsComponent implements OnInit {
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
-
-    // Load Codex proxy status for admins
-    if (this.userService.currentUser()?.is_admin) {
-      this.loadCodexStatus();
-    }
+    // Admin-only loaders (codex status + cloud settings) are triggered
+    // by the effect in the constructor — that path waits for currentUser()
+    // to populate, which is the only thing that works on a hard F5 reload.
   }
 
   providerLabel(provider: string): string {
@@ -1552,5 +1800,130 @@ export class SettingsComponent implements OnInit {
       clearInterval(this.codexPollTimer);
       this.codexPollTimer = null;
     }
+  }
+
+  // ── Cloud Storage (Phase 4) ────────────────────────────────
+
+  loadCloudSettings(): void {
+    this.cloudLoading.set(true);
+    this.cloudMessage.set('');
+    this.cloudMessageIsError.set(false);
+    this.settingsService.getMainCloudSettings().subscribe({
+      next: (res) => {
+        this.cloudSettings.set(res);
+        // Seed the form from the persisted overlay if present; otherwise
+        // from the effective config. Both sources are JSON-shaped, so we
+        // bracket-access them through Record<> wrappers and coerce to the
+        // typed MainCloudFormState shape.
+        const overlayValue = (res.overlay?.value as Record<string, unknown>) || {};
+        const eff = res.effective as unknown as Record<string, unknown>;
+        const pickStr = (key: string): string => {
+          const v = overlayValue[key] ?? eff[key];
+          if (v === undefined || v === null) return '';
+          return typeof v === 'string' ? v : String(v);
+        };
+        const pickQuota = (): number | null => {
+          const v = overlayValue['default_quota_bytes'] ?? eff['default_quota_bytes'];
+          if (v === undefined || v === null) return null;
+          return typeof v === 'number' ? v : Number(v);
+        };
+        this.cloudForm.set({
+          backend_id: res.effective.backend_id,
+          base_url: pickStr('base_url'),
+          public_url: pickStr('public_url'),
+          admin_user: pickStr('admin_user'),
+          agent_user: pickStr('agent_user'),
+          keycloak_issuer: pickStr('keycloak_issuer'),
+          keycloak_client_id: pickStr('keycloak_client_id'),
+          admin_role_claim_value: pickStr('admin_role_claim_value'),
+          default_quota_bytes: pickQuota(),
+        });
+        this.cloudCredentialsRef.set(res.overlay?.credentials_ref ?? '');
+        this.cloudLoading.set(false);
+      },
+      error: (err) => {
+        this.cloudLoading.set(false);
+        this.cloudMessage.set(err?.error?.detail || 'Failed to load cloud settings');
+        this.cloudMessageIsError.set(true);
+      },
+    });
+  }
+
+  updateCloudForm<K extends keyof MainCloudFormState>(
+    key: K,
+    value: MainCloudFormState[K],
+  ): void {
+    this.cloudForm.update((form) => ({ ...form, [key]: value }));
+  }
+
+  private buildCloudRequestBody() {
+    const form = this.cloudForm();
+    const credRef = this.cloudCredentialsRef().trim() || null;
+    return {
+      value: { ...form },
+      credentials_ref: credRef,
+    };
+  }
+
+  testCloudSettings(): void {
+    this.cloudTesting.set(true);
+    this.cloudMessage.set('');
+    this.cloudMessageIsError.set(false);
+    this.settingsService.testMainCloudSettings(this.buildCloudRequestBody()).subscribe({
+      next: (res) => {
+        this.cloudTesting.set(false);
+        this.cloudMessage.set(
+          res.ok
+            ? `Test OK (${res.latency_ms?.toFixed(0) ?? '?'} ms) — ${res.detail || 'healthy'}`
+            : `Test failed: ${res.detail}`,
+        );
+        this.cloudMessageIsError.set(!res.ok);
+      },
+      error: (err) => {
+        this.cloudTesting.set(false);
+        this.cloudMessage.set(err?.error?.detail || 'Test request failed');
+        this.cloudMessageIsError.set(true);
+      },
+    });
+  }
+
+  saveCloudSettings(): void {
+    this.cloudSaving.set(true);
+    this.cloudMessage.set('');
+    this.cloudMessageIsError.set(false);
+    this.settingsService.putMainCloudSettings(this.buildCloudRequestBody()).subscribe({
+      next: (res) => {
+        this.cloudSaving.set(false);
+        this.cloudMessage.set(
+          `Saved — active backend is now ${res.backend_id}${res.reloaded ? ' (reloaded)' : ''}`,
+        );
+        this.cloudMessageIsError.set(false);
+        this.loadCloudSettings();
+      },
+      error: (err) => {
+        this.cloudSaving.set(false);
+        this.cloudMessage.set(err?.error?.detail || 'Save failed');
+        this.cloudMessageIsError.set(true);
+      },
+    });
+  }
+
+  resetCloudSettings(): void {
+    this.cloudSaving.set(true);
+    this.cloudMessage.set('');
+    this.cloudMessageIsError.set(false);
+    this.settingsService.deleteMainCloudSettings().subscribe({
+      next: () => {
+        this.cloudSaving.set(false);
+        this.cloudMessage.set('Overlay cleared — active backend rebuilt from env vars');
+        this.cloudMessageIsError.set(false);
+        this.loadCloudSettings();
+      },
+      error: (err) => {
+        this.cloudSaving.set(false);
+        this.cloudMessage.set(err?.error?.detail || 'Reset failed');
+        this.cloudMessageIsError.set(true);
+      },
+    });
   }
 }

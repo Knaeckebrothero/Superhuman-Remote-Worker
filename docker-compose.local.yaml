@@ -211,7 +211,10 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Nextcloud is opt-in under COMPOSE_PROFILES=nextcloud since Phase 3.
+  # OpenCloud is the greenfield default and has its own service entry below.
   nextcloud:
+    profiles: ["nextcloud"]
     image: docker.io/library/nextcloud:31-apache
     container_name: srw-nextcloud
     environment:
@@ -229,6 +232,45 @@ services:
       - "${NEXTCLOUD_PORT:-8800}:80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # OpenCloud — greenfield main-cloud default since Phase 3.
+  opencloud:
+    image: docker.io/opencloudeu/opencloud:latest
+    container_name: srw-opencloud
+    # podman-compose splits YAML block scalars into separate argv elements,
+    # which breaks `sh -c <script>` patterns. Inline as a single string.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/usr/bin/opencloud init || true; /docker-entrypoint-hooks/setup-opencloud.sh || true; exec /usr/bin/opencloud server"
+    environment:
+      OC_URL: "${OPENCLOUD_URL:-http://localhost:9200}"
+      OC_INSECURE: "true"
+      PROXY_ENABLE_BASIC_AUTH: "false"
+      PROXY_USER_OIDC_CLAIM: "sub"
+      OC_EXCLUDE_RUN_SERVICES: "idp"
+      PROXY_AUTOPROVISION_ACCOUNTS: "true"
+      PROXY_ROLE_ASSIGNMENT_DRIVER: "oidc"
+      PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM: "groups"
+      WEB_OIDC_CLIENT_ID: "opencloud-web"
+      WEB_OIDC_METADATA_URL: "${OPENCLOUD_OIDC_DISCOVERY_URI:-http://keycloak:8080/realms/srw/.well-known/openid-configuration}"
+      OC_OIDC_ISSUER: "${OPENCLOUD_OIDC_ISSUER:-http://keycloak:8080/realms/srw}"
+      OC_OIDC_ENDPOINT_URL: "${OPENCLOUD_OIDC_ISSUER:-http://keycloak:8080/realms/srw}"
+      OC_LOG_LEVEL: "${OPENCLOUD_LOG_LEVEL:-info}"
+      OC_ADMIN_USER_ID: "${OPENCLOUD_ADMIN_USER_ID:-admin}"
+    volumes:
+      - opencloud_data:/var/lib/opencloud
+      - opencloud_config:/etc/opencloud
+      - ./docker/opencloud/setup-opencloud.sh:/docker-entrypoint-hooks/setup-opencloud.sh:ro
+    ports:
+      - "${OPENCLOUD_PORT:-9200}:9200"
+    healthcheck:
+      test: ["CMD", "curl", "-kfsS", "https://localhost:9200/status.php"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -395,9 +437,11 @@ services:
       DEFAULT_DS_NEO4J_NAME: "Default Neo4j"
       DEFAULT_DS_NEO4J_READ_ONLY: "false"
       # Default datasources — WebDAV (Nextcloud)
-      DEFAULT_DS_WEBDAV_URL: "http://nextcloud/remote.php/dav/files/admin/"
-      DEFAULT_DS_WEBDAV_USERNAME: ${NEXTCLOUD_ADMIN_USER:-admin}
-      DEFAULT_DS_WEBDAV_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-admin}
+      # Default WebDAV datasource — opt-in since Phase 3. Unset by default;
+      # the main-cloud adapter injects per-project datasources at creation time.
+      DEFAULT_DS_WEBDAV_URL: ${DEFAULT_DS_WEBDAV_URL:-}
+      DEFAULT_DS_WEBDAV_USERNAME: ${DEFAULT_DS_WEBDAV_USERNAME:-}
+      DEFAULT_DS_WEBDAV_PASSWORD: ${DEFAULT_DS_WEBDAV_PASSWORD:-}
       DEFAULT_DS_WEBDAV_NAME: "Nextcloud"
       DEFAULT_DS_WEBDAV_READ_ONLY: "false"
       # S3 / MinIO
@@ -531,9 +575,9 @@ services:
       orchestrator:
         condition: service_healthy
       vpn-cluster:
-        condition: service_healthy
+        condition: service_started
       vpn-workstation:
-        condition: service_healthy
+        condition: service_started
       ssh-keygen:
         condition: service_completed_successfully
     healthcheck:
@@ -841,6 +885,10 @@ volumes:
     name: srw_gitea_data
   nextcloud_data:
     name: srw_nextcloud_data
+  opencloud_data:
+    name: srw_opencloud_data
+  opencloud_config:
+    name: srw_opencloud_config
   minio_data:
     name: srw_minio_data
   workspace_data:

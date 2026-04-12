@@ -13,6 +13,7 @@ from src.llm.reasoning_chat import (
     _extract_responses_api_reasoning,
     _is_debug_stream,
     _get_debug_tail_chars,
+    _dump_codex_raw_response,
     ReasoningCapturingClient,
 )
 
@@ -370,3 +371,75 @@ class TestExtractReasoningFromResponse:
             }
         )
         assert _extract_reasoning_from_response(data) == "Valid part"
+
+
+# =============================================================================
+# _dump_codex_raw_response
+# =============================================================================
+
+
+class TestDumpCodexRawResponse:
+    """Tests for the codex raw-response diagnostic dumper."""
+
+    def _make_request(self, body: bytes = b'{"model": "gpt-5"}'):
+        req = MagicMock()
+        req.url = "https://srw-codex-proxy/v1/responses"
+        req.method = "POST"
+        req.content = body
+        return req
+
+    def _make_response(self, body: bytes, status: int = 200):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = {"content-type": "application/json"}
+        resp.content = body
+        return resp
+
+    def test_dumps_valid_json_response(self, tmp_path, monkeypatch):
+        """A valid JSON response is captured to disk as structured JSON."""
+        monkeypatch.setenv("CODEX_RAW_DUMP_DIR", str(tmp_path))
+        req = self._make_request()
+        resp = self._make_response(b'{"output": [{"type": "function_call"}]}')
+
+        _dump_codex_raw_response(req, resp)
+
+        files = list(tmp_path.glob("codex-raw-*.json"))
+        assert len(files) == 1
+        import json as _json
+
+        capture = _json.loads(files[0].read_text())
+        assert capture["status_code"] == 200
+        assert capture["url"] == "https://srw-codex-proxy/v1/responses"
+        assert capture["method"] == "POST"
+        assert capture["request_body"] == {"model": "gpt-5"}
+        assert capture["response_body"] == {"output": [{"type": "function_call"}]}
+        assert capture["response_body_size_bytes"] > 0
+
+    def test_dumps_non_json_response_as_text(self, tmp_path, monkeypatch):
+        """Non-JSON response bodies are stored as decoded text, not dropped."""
+        monkeypatch.setenv("CODEX_RAW_DUMP_DIR", str(tmp_path))
+        req = self._make_request(body=b"not-json-either")
+        resp = self._make_response(b"<html>oops</html>", status=502)
+
+        _dump_codex_raw_response(req, resp)
+
+        files = list(tmp_path.glob("codex-raw-*.json"))
+        assert len(files) == 1
+        import json as _json
+
+        capture = _json.loads(files[0].read_text())
+        assert capture["status_code"] == 502
+        assert capture["request_body"] == "not-json-either"
+        assert capture["response_body"] == "<html>oops</html>"
+
+    def test_failure_is_silent(self, tmp_path, monkeypatch):
+        """Errors during capture must not propagate."""
+        # Point at a path that cannot be created (a file used as a directory)
+        bad = tmp_path / "blocker"
+        bad.write_text("i am a file, not a dir")
+        monkeypatch.setenv("CODEX_RAW_DUMP_DIR", str(bad))
+
+        req = self._make_request()
+        resp = self._make_response(b"{}")
+        # Must not raise
+        _dump_codex_raw_response(req, resp)

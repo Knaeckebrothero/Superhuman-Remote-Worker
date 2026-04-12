@@ -236,9 +236,73 @@
         "email",
         "roles"
       ]
+    },
+    {
+      "clientId": "opencloud-web",
+      "name": "OpenCloud Web",
+      "description": "OpenCloud browser login — public client for user-facing OIDC flow (Phase 2)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:9200/*"
+      ],
+      "webOrigins": [
+        "http://localhost:9200"
+      ],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "groups"
+      ]
+    },
+    {
+      "clientId": "opencloud-orchestrator",
+      "name": "OpenCloud Orchestrator Service Account",
+      "description": "Service-account client for orchestrator → LibreGraph admin calls (Phase 2). Requires the opencloud-admin group to be assigned to its service-account user.",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "${env.OPENCLOUD_KEYCLOAK_CLIENT_SECRET}",
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "groups"
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "name": "opencloud-admin",
+      "path": "/opencloud-admin",
+      "attributes": {},
+      "realmRoles": [],
+      "clientRoles": {},
+      "subGroups": []
     }
   ],
   "users": [
+    {
+      "username": "service-account-opencloud-orchestrator",
+      "enabled": true,
+      "emailVerified": true,
+      "serviceAccountClientId": "opencloud-orchestrator",
+      "groups": [
+        "/opencloud-admin"
+      ]
+    },
     {
       "username": "test",
       "email": "admin@srw.dev",

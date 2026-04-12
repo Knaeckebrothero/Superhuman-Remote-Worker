@@ -271,7 +271,13 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Nextcloud is opt-in under COMPOSE_PROFILES=nextcloud since Phase 3.
+  # To run a Nextcloud-backed dev stack:
+  #   COMPOSE_PROFILES=nextcloud podman-compose -f docker-compose.dev.yaml up -d
+  # Then set MAIN_CLOUD_BACKEND=nextcloud in .env, or leave it unset and the
+  # legacy heuristic will auto-route when any NEXTCLOUD_* var is set.
   nextcloud:
+    profiles: ["nextcloud"]
     image: docker.io/library/nextcloud:31-apache
     container_name: srw-nextcloud
     environment:
@@ -290,6 +296,80 @@ services:
       - "${NEXTCLOUD_PORT:-8800}:80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # OpenCloud — greenfield main-cloud default since Phase 3. Runs by default
+  # in `podman-compose -f docker-compose.dev.yaml up -d`. The orchestrator
+  # (running on the host with hot-reload) reaches it at http://localhost:9200.
+  #
+  # First-time bootstrap: after Keycloak is healthy, seed the OpenCloud
+  # clients once with:
+  #   ./docker/keycloak/setup-opencloud-client.sh
+  # That script creates `opencloud-web` + `opencloud-orchestrator` and adds
+  # the service account to the `opencloud-admin` group. It is idempotent
+  # and safe to re-run. See docs/operations/opencloud-bootstrap.md.
+  opencloud:
+    image: docker.io/opencloudeu/opencloud:latest
+    container_name: srw-opencloud
+    # Host network mode is the only clean way to make OIDC work in the dev
+    # workflow. Reasoning: the orchestrator runs on the host and reaches
+    # Keycloak at http://localhost:8180 → tokens carry iss=localhost:8180.
+    # OpenCloud (in container) needs to (a) accept tokens with that issuer
+    # and (b) reach the same URL to fetch JWKS. The browser also needs the
+    # same URL for OIDC discovery. The only hostname that resolves to "the
+    # same Keycloak" from all three vantage points is `localhost:8180`,
+    # which requires opencloud to share the host's loopback. Production
+    # deployments don't need this — they front opencloud + keycloak with a
+    # real DNS name and the issuer is unambiguous.
+    network_mode: host
+    # podman-compose 1.x tokenizes YAML literal-block (|) command blocks
+    # into separate argv elements, which breaks `sh -c <script>` patterns.
+    # Inline the bootstrap as a single quoted string in entrypoint instead.
+    # `exec` on the final command makes opencloud the PID 1 so SIGTERM
+    # propagates cleanly on `podman stop`.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/usr/bin/opencloud init || true; exec /usr/bin/opencloud server"
+    environment:
+      OC_URL: "${OPENCLOUD_URL:-http://localhost:9200}"
+      OC_INSECURE: "true"
+      # Dev mode: bind plain HTTP on the proxy. Production should leave
+      # this unset (default) and front the proxy with a real TLS cert.
+      PROXY_TLS: "false"
+      # 127.0.0.1 keeps OpenCloud's many internal ports off the LAN. The
+      # orchestrator + browser both reach it via host loopback.
+      PROXY_HTTP_ADDR: "127.0.0.1:9200"
+      PROXY_ENABLE_BASIC_AUTH: "false"
+      # CRITICAL: sub-claim is required (see docs/operations/opencloud-bootstrap.md §4).
+      PROXY_USER_OIDC_CLAIM: "sub"
+      # External IdP (Keycloak) — disables the internal IDP.
+      OC_EXCLUDE_RUN_SERVICES: "idp"
+      PROXY_AUTOPROVISION_ACCOUNTS: "true"
+      PROXY_ROLE_ASSIGNMENT_DRIVER: "oidc"
+      PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM: "groups"
+      WEB_OIDC_CLIENT_ID: "opencloud-web"
+      # All three URLs use the same `localhost:8180` so the browser, the
+      # OpenCloud container (now on host network), and the orchestrator all
+      # talk to the SAME Keycloak instance and the iss claim matches.
+      WEB_OIDC_METADATA_URL: "${OPENCLOUD_OIDC_DISCOVERY_URI:-http://localhost:8180/realms/srw/.well-known/openid-configuration}"
+      OC_OIDC_ISSUER: "${OPENCLOUD_OIDC_ISSUER:-http://localhost:8180/realms/srw}"
+      OC_OIDC_ENDPOINT_URL: "${OPENCLOUD_OIDC_ISSUER:-http://localhost:8180/realms/srw}"
+      OC_LOG_LEVEL: "${OPENCLOUD_LOG_LEVEL:-info}"
+      OC_ADMIN_USER_ID: "${OPENCLOUD_ADMIN_USER_ID:-admin}"
+      # Dev CSP override: allow browser OIDC discovery to reach Keycloak on
+      # a different port. Not needed in production (single-domain reverse proxy).
+      PROXY_CSP_CONFIG_FILE_OVERRIDE_LOCATION: "/etc/opencloud/csp.yaml"
+    volumes:
+      - opencloud_dev_data:/var/lib/opencloud
+      - opencloud_dev_config:/etc/opencloud
+      - ./docker/opencloud/csp.yaml:/etc/opencloud/csp.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9200/status.php"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -622,6 +702,10 @@ volumes:
     name: srw_gitea_dev_data
   nextcloud_dev_data:
     name: srw_nextcloud_dev_data
+  opencloud_dev_data:
+    name: srw_opencloud_dev_data
+  opencloud_dev_config:
+    name: srw_opencloud_dev_config
   minio_dev_data:
     name: srw_minio_dev_data
   codex_proxy_auths:
