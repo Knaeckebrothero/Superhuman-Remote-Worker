@@ -1,0 +1,12 @@
+defaultNamespace: kubevirt
+helm:
+  takeOwnership: true
+dependsOn: []
+targets:
+  - clusterSelector:
+      matchLabels:
+        management.cattle.io/cluster-display-name: vms
+targetRestrictions:
+  - clusterSelector:
+      matchLabels:
+        management.cattle.io/cluster-display-name: vms

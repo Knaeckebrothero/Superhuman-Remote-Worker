@@ -1,0 +1,26 @@
+# KubeVirt CPU overcommit — Agent VM Cluster
+#
+# Agent workloads are bursty (idle between LLM calls), so physical
+# cores can safely back more virtual CPUs than a 1:1 ratio.
+#
+# cpuAllocationRatio: 4 means each vCPU requests 250m (1000m / 4)
+# from the Kubernetes scheduler. A 2-vCPU VM uses 500m instead of
+# 2000m, allowing ~3 VMs per 4-core node instead of just 1.
+#
+# Apply after KubeVirt installation (Step 2 in vm_agent_cluster_setup.md):
+#   export KUBECONFIG=~/.kube/agent-cluster.yaml
+#   kubectl apply -f deployment-vms/kubevirt/overcommit.yaml
+#
+# Verify:
+#   kubectl get kubevirt kubevirt -n kubevirt -o jsonpath='{.spec.configuration.developerConfiguration.cpuAllocationRatio}'
+#   # Should print: 4
+
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  configuration:
+    developerConfiguration:
+      cpuAllocationRatio: 4

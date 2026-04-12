@@ -18,6 +18,8 @@ aliases:
 
 # Phase Audit Protocol — In-Loop Deliverable Verification
 
+**Status**: ✅ Shipped 2026-04-11 (prompt + compactor evidence preservation). ⏳ Real-job monitoring pending.
+
 > Extend the strategic-phase system prompt so that the model audits the previous tactical phase's claimed deliverables against the workspace filesystem *before* planning the next phase — instead of treating `todo_complete` status flags as ground truth. Prompt-only change; no graph, tool, or schema modifications.
 
 ## Problem
@@ -75,24 +77,29 @@ Three parallel research passes (prompt engineering, production agent frameworks,
 
 Cemri et al. (NeurIPS 2025) MAST study of 1,600 multi-agent traces: **task-verification failures account for 21.3% of all failures even in systems that already have verification prompts**. A prompt-only change to the strategic phase is expected to reduce premature-completion failures by **~20-40%**, not eliminate them. The real ceiling is a separate verifier LLM call (Self-Taught Evaluators, Meta FAIR 2024), which we can add later as Phase 2 if the prompt-only change is insufficient. This is not a magic fix — it is the best-backed cheap intervention.
 
-## Critical prerequisite: context compaction must preserve evidence
+## Critical prerequisite: context compaction must preserve evidence ✅ Resolved
 
-**This must be verified before the prompt change ships, or the audit is theatrical.**
+**The strategic phase can only audit what it can see.** This was the first thing we verified before shipping the prompt change — otherwise the audit would be asking the model to cite evidence that compaction had already replaced with generic placeholders.
 
-The strategic phase can only audit what it can see. The agent compacts context at phase boundaries (`compact_on_archive: true` in `config/defaults.yaml`, logic in `src/core/archiver.py`). If compaction drops raw tool errors and recent `read_file`/`write_file` outputs into a narrative summary like *"attempted to process audio files"*, the strategic phase has no grounded evidence to cite, and the audit protocol collapses to narrative self-critique — which we know doesn't work.
+### Audit findings (2026-04-11)
 
-### Prerequisite work
+The compactor lives in `src/core/context.py`, not `archiver.py` (the latter is the MongoDB audit-trail writer). Two compaction paths:
 
-1. **Read `src/core/archiver.py`** and trace what gets preserved vs. summarized at phase boundaries. Focus on:
-   - Tool errors (non-zero exit codes, exceptions, "not found" results)
-   - The last N `write_file` / `edit_file` / `read_file` results per phase
-   - Any paths mentioned in the phase's todos
-2. **If evidence is lost,** change the compactor to preserve verbatim:
-   - All tool outputs with `error`, `Exception`, `ENOENT`, stack traces
-   - The last file write/read per workspace path mentioned in the completed todos
-3. **Only then** ship the prompt change. Otherwise the model is being asked to audit a phantom.
+1. **`clear_old_tool_results()` (`src/core/context.py:558`)** — runs on *every* LLM call via `prepare_messages_for_llm`. Replaces tool results older than `keep_recent_tool_results=15` with a static placeholder `"[Result processed - see workspace if needed]"`. **Was content-blind**: errors, writes, successful reads all treated identically. For a tactical phase with >15 tool calls, early errors were erased before the strategic audit could see them. This was the exact mechanism behind the BUG-3 audio-transcription failure.
+2. **LLM summarization (`src/core/context.py:743`)** — runs when tokens exceed `summarization_threshold_tokens=100000`, or unconditionally on strategic→tactical transitions (`src/graph.py:1733`, `force=is_strategic`). The prompt (`config/prompts/summarization_prompt.txt`) is actually well-designed — it explicitly tells the model to preserve "exact error messages", "failed approaches", "deliverable status with evidence", "state changes". Good enough as-is.
 
-This prerequisite alone may be higher-leverage than the prompt change. The BUG-3 failure mode (audio job) fits the hypothesis that tactical errors got summarized away before the strategic phase could see them.
+### Fix shipped
+
+**Fix A — content-aware tool-result clearing** (`src/core/context.py`):
+
+- Added two `ContextConfig` fields: `preserve_tool_names` (default: `write_file`, `edit_file`, `patch_file`, `patch_tool`) and `preserve_content_patterns` (default: `error:`, `exception`, `traceback`, `enoent`, `no such file`, `permission denied`, `not found`, `failed`, `non-zero exit`).
+- New helper `_is_evidence_tool_message()` consults both filters.
+- `clear_old_tool_results()` now skips preservation-worthy messages when clearing by recency; the replacement path also propagates the `name=` attribute on placeholders (previously dropped silently).
+- `truncate_long_tool_results()` similarly skips evidence-bearing messages when truncating by length.
+- 7 new tests in `tests/test_context_methods.py::TestEvidencePreservation` cover write-type preservation, error-content preservation, Python traceback preservation, non-evidence still-clearing (no over-preservation), `name` attribute retention on placeholders, and preservation across length truncation.
+- **Verification**: 33/33 `test_context_methods.py` pass, 580/580 broader context/graph/archive suite pass, ruff clean.
+
+**Fix B (not shipped)** — phase evidence ledger written to `archive/phase_N_evidence.jsonl` at phase-boundary. More principled (content-independent), but Fix A covered the common case (<15 tool calls per phase). Kept in reserve for Phase 2 if Fix A proves insufficient.
 
 ## Design: the prompt addition
 
@@ -180,16 +187,16 @@ Insert between the opening `<strategic_phase>` tag and the current "Review proto
 1. **Should INCONCLUSIVE trigger something special?** Current draft treats it the same as REWORK (don't archive). Alternative: bail out and surface to human via `pending_review`. Depends on how often compaction leaves the model genuinely blind.
 2. **Per-model-family tuning.** The draft is tuned for open-weights models. Claude variants may need less scaffolding; `strategic_gpt_5.txt` may need more or fewer rubric slots. Decision: ship the same text across all variants first, tune per-model only if evals show divergence.
 3. **Eval harness.** How do we measure whether this works? Candidate: replay the `f06e721e` audio-transcription job trace with the new prompt and check that the strategic phase catches the missing `transcriptions.md`. Longer-term: a "sandbagging" eval suite where tactical phases deliberately mark todos done without producing deliverables, scored on whether the strategic phase catches each one.
-4. **Context compaction fix ordering.** If `archiver.py` turns out to drop evidence, do we fix the compactor first and ship both together, or ship them as separate changes? Recommend: separate PRs, compactor first (the prerequisite), prompt second.
+4. ✅ **Context compaction fix ordering** — resolved. Compactor fix (Fix A) and prompt change shipped in the same session; compactor first as the prerequisite. See the "Critical prerequisite" section above for findings.
 
 ## Phase plan
 
-1. **Prerequisite audit** — read `src/core/archiver.py`; trace what survives phase-boundary compaction; document findings. If gaps exist, fix them.
-2. **Draft the prompt addition** — edit `config/prompts/strategic.txt` + all `strategic_*.txt` variants. Match existing XML-tag style.
-3. **Manual replay eval** — rerun the `f06e721e` trace (or a fresh synthetic sandbagging job) against the new prompt and confirm the strategic phase now catches missing deliverables.
-4. **Ship behind a config toggle** — `strategic.phase_audit_enabled: true` in `config/defaults.yaml` so we can A/B test against current behavior if regressions appear.
-5. **Monitor for 2-3 real jobs** — look for false positives (audit flags something the model actually did) and prompt over-rejection of otherwise-fine phases.
-6. **If insufficient → Phase 2**: separate verifier LLM call (Self-Taught Evaluator pattern), which the `AUDIT_VERDICT` token is already designed to feed into.
+1. ✅ **Prerequisite audit** (2026-04-11) — traced compaction path in `src/core/context.py` (not `archiver.py` as originally written — that's the MongoDB audit writer). Found `clear_old_tool_results` was recency-blind, erasing error/write evidence after 15 tool calls. Fixed via Fix A above.
+2. ✅ **Prompt addition** (2026-04-11) — added Phase Audit Protocol as step 0 across all 5 strategic variants: `config/prompts/strategic.txt` (35→63 lines), `strategic_gpt_5.txt` (42→70), `strategic_minimax.txt` (46→75), `strategic_gpt_oss.txt` (54→83), `strategic_codex_spark.txt` (42→65). 91/91 prompt-matrix/instruction-matrix/loader tests pass. Same text across all variants per the decision in open question #2.
+3. ⏳ **Manual replay eval** — deferred. Likely more informative to observe behavior on the next real job than to build a synthetic sandbagging harness now.
+4. ⏭️ **Config toggle** — skipped. A prompt change is trivially git-revertible and shipping behind a feature flag is over-engineering for this size of change.
+5. ⏳ **Monitor for 2-3 real jobs** — pending. Watch for false positives (audit flags something the model actually did) and prompt over-rejection.
+6. 🔮 **Phase 2 (conditional)** — separate verifier LLM call (Self-Taught Evaluator pattern). The `AUDIT_VERDICT` token is already designed to feed a future code-level branch in `handle_transition`. Only ship if real-job monitoring shows the prompt change is insufficient.
 
 ## References
 

@@ -187,6 +187,8 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
 
 -- Migration: Nextcloud Group Folder ID (NULL for personal/default projects)
+-- LEGACY: superseded by main_cloud_backend + main_cloud_folder_handle below.
+-- Kept for one release as a read-only fallback; dropped per §9 of the design doc.
 DO $$ BEGIN
     ALTER TABLE projects ADD COLUMN nextcloud_folder_id INTEGER;
 EXCEPTION WHEN duplicate_column THEN null;
@@ -197,6 +199,30 @@ DO $$ BEGIN
     ALTER TABLE projects ADD COLUMN cloud_storage_read_only BOOLEAN NOT NULL DEFAULT FALSE;
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
+
+-- Migration: Main cloud abstraction — pluggable backend per project
+-- (see docs/features/main_cloud_abstraction.md §4.4 and §6 for the
+-- non-destructive switching rule).
+DO $$ BEGIN
+    ALTER TABLE projects ADD COLUMN main_cloud_backend TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE projects ADD COLUMN main_cloud_folder_handle TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Backfill from the legacy column: every existing Nextcloud-backed project
+-- gets main_cloud_backend='nextcloud' + main_cloud_folder_handle set to the
+-- old integer folder id stringified. The handle's vendor_meta (mountpoint) is
+-- re-derived at read time by NextcloudBackend when the row's mountpoint is
+-- needed, so the backfill does not need to recompute it.
+UPDATE projects
+   SET main_cloud_backend = 'nextcloud',
+       main_cloud_folder_handle = nextcloud_folder_id::text
+ WHERE nextcloud_folder_id IS NOT NULL
+   AND main_cloud_folder_handle IS NULL;
 
 -- ============================================================================
 -- 0d. PROJECT MEMBERS TABLE
@@ -584,6 +610,7 @@ ALTER TABLE threads
     ADD COLUMN IF NOT EXISTS total_tokens INTEGER DEFAULT 0;
 
 -- Nextcloud session folder columns
+-- LEGACY: superseded by main_cloud_* columns below. Kept for one release.
 DO $$ BEGIN
     ALTER TABLE threads ADD COLUMN nc_session_folder TEXT;
 EXCEPTION WHEN duplicate_column THEN null;
@@ -593,6 +620,30 @@ DO $$ BEGIN
     ALTER TABLE threads ADD COLUMN nc_share_id INTEGER;
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
+
+-- Main cloud abstraction — per-thread backend dispatch for session folders.
+DO $$ BEGIN
+    ALTER TABLE threads ADD COLUMN main_cloud_backend TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE threads ADD COLUMN main_cloud_session_handle TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE threads ADD COLUMN main_cloud_share_handle TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Backfill existing Nextcloud sessions into the new columns.
+UPDATE threads
+   SET main_cloud_backend       = 'nextcloud',
+       main_cloud_session_handle = nc_session_folder,
+       main_cloud_share_handle   = nc_share_id::text
+ WHERE nc_session_folder IS NOT NULL
+   AND main_cloud_session_handle IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id);
 CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
@@ -978,6 +1029,21 @@ CREATE TABLE IF NOT EXISTS notification_queue (
 
 CREATE INDEX IF NOT EXISTS idx_notif_queue_pending
     ON notification_queue(user_id, queued_at) WHERE delivered_at IS NULL;
+
+-- ============================================================================
+-- 9d. SYSTEM SETTINGS (main cloud abstraction Phase 1)
+-- Runtime overrides for deployment-wide configuration, written by the admin
+-- settings UI in Phase 4. Credentials are never stored inline — only a
+-- credentials_ref pointer (env var name in dev, Vault path in prod).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS system_settings (
+    key             TEXT PRIMARY KEY,
+    value           JSONB NOT NULL,
+    credentials_ref TEXT,
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_by      TEXT
+);
 
 -- ============================================================================
 -- 10. VIEWS

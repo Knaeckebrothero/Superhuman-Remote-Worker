@@ -282,6 +282,35 @@ def _extract_markdown_content(content: str) -> str:
     return result.strip()
 
 
+def _check_empty_response_streak(
+    content_len: int,
+    tool_calls_count: int,
+    current_streak: int,
+    threshold: int = 3,
+) -> tuple[int, bool]:
+    """Track consecutive empty LLM responses and decide whether to fail-fast.
+
+    An "empty" response has zero content characters and zero tool calls — the
+    failure mode triggered by the codex proxy + langchain Responses API
+    non-streaming bug (#35782), where tool_calls are silently dropped during
+    AIMessage construction.
+
+    Args:
+        content_len: Length of the response's text content (post-normalization).
+        tool_calls_count: Number of tool calls extracted from the response.
+        current_streak: Current empty-response streak count.
+        threshold: Number of consecutive empties tolerated before failing.
+
+    Returns:
+        Tuple of (new_streak, should_fail). On a non-empty response the
+        streak resets to 0 and should_fail is False.
+    """
+    if content_len == 0 and tool_calls_count == 0:
+        new_streak = current_streak + 1
+        return new_streak, new_streak > threshold
+    return 0, False
+
+
 # =============================================================================
 # INITIALIZATION NODES
 # =============================================================================
@@ -495,6 +524,10 @@ def create_execute_node(
     _tool_use_failed_streak = [0]
     # Track consecutive response degeneration events
     _degeneration_streak = [0]
+    # Track consecutive empty LLM responses (no content, no tool calls).
+    # Codex proxy + langchain Responses API non-streaming path can return
+    # stub AIMessages with empty content and dropped tool_calls (#35782).
+    _empty_response_streak = [0]
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -930,6 +963,65 @@ def create_execute_node(
                 logger.info(
                     f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls"
                 )
+
+                # --- Empty response circuit breaker ---
+                # The codex proxy + langchain Responses API non-streaming path
+                # can silently return AIMessages with empty content and dropped
+                # tool_calls (#35782). Without a fail-fast, the graph would loop
+                # forever injecting "call todo_complete" reminders. Allow a few
+                # retries (the existing reminder injection at the bottom of this
+                # node provides the recovery hint), then bail.
+                empty_streak, empty_should_fail = _check_empty_response_streak(
+                    content_len=content_len,
+                    tool_calls_count=tool_calls_count,
+                    current_streak=_empty_response_streak[0],
+                )
+                _empty_response_streak[0] = empty_streak
+                if empty_streak > 0:
+                    logger.warning(
+                        f"[{job_id}] Empty LLM response (streak {empty_streak}/3): "
+                        f"no content, no tool calls"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="warning",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "empty_response",
+                                    "message": "LLM returned empty content with no tool calls",
+                                    "streak": empty_streak,
+                                    "model": phase_model,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                if empty_should_fail:
+                    logger.error(
+                        f"[{job_id}] Empty response streak exceeded "
+                        f"(streak {empty_streak}): failing job"
+                    )
+                    return {
+                        "error": {
+                            "message": (
+                                f"LLM returned empty response (no content, no tool calls) "
+                                f"for {empty_streak} consecutive iterations. Likely a "
+                                "langchain Responses API tool_call dropping bug "
+                                "(langchain-ai/langchain#35782) or a codex proxy issue. "
+                                "Inspect the codex proxy logs for the request window."
+                            ),
+                            "type": "empty_response",
+                            "recoverable": False,
+                            "streak": empty_streak,
+                            "model": phase_model,
+                        },
+                        "iteration": iteration + 1,
+                    }
 
                 # --- Response degeneration validation ---
                 rv_config = config.limits.response_validation

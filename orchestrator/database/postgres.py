@@ -2097,21 +2097,46 @@ class PostgresDB:
                 status,
             )
 
-    async def update_thread_nextcloud(
-        self, thread_id: str, nc_session_folder: str, nc_share_id: int | None = None
+    async def update_thread_main_cloud(
+        self,
+        thread_id: str,
+        *,
+        backend_id: str,
+        session_handle: str,
+        share_handle: str | None = None,
     ) -> None:
-        """Store Nextcloud session folder info on a thread."""
+        """Store main-cloud session folder info on a thread.
+
+        Writes to both the new ``main_cloud_*`` columns and the legacy
+        ``nc_session_folder`` / ``nc_share_id`` columns during Phase 1 so any
+        code paths still reading the legacy columns keep working. The legacy
+        columns are dropped one release after Phase 1 ships (see §9 of the
+        design doc).
+        """
+        legacy_nc_folder = session_handle if backend_id == "nextcloud" else None
+        legacy_share_id: int | None = None
+        if backend_id == "nextcloud" and share_handle is not None:
+            try:
+                legacy_share_id = int(share_handle)
+            except ValueError:
+                legacy_share_id = None
         async with self.acquire() as conn:
             await conn.execute(
                 """
                 UPDATE threads
-                SET nc_session_folder = $2,
-                    nc_share_id       = $3
+                SET main_cloud_backend        = $2,
+                    main_cloud_session_handle = $3,
+                    main_cloud_share_handle   = $4,
+                    nc_session_folder         = $5,
+                    nc_share_id               = $6
                 WHERE id = $1
                 """,
                 UUID(thread_id),
-                nc_session_folder,
-                nc_share_id,
+                backend_id,
+                session_handle,
+                share_handle,
+                legacy_nc_folder,
+                legacy_share_id,
             )
 
     async def mark_orphaned_threads_idle(self) -> int:
@@ -3083,6 +3108,7 @@ class PostgresDB:
                     VALUES ($1, $2, TRUE)
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
+                              main_cloud_backend, main_cloud_folder_handle,
                               created_at, updated_at
                     """,
                     f"{display_name}'s Workspace",
@@ -3698,6 +3724,7 @@ class PostgresDB:
                     RETURNING id, name, description, goal, status, is_default,
                               default_config_name, default_config_override,
                               nextcloud_folder_id, cloud_storage_read_only,
+                              main_cloud_backend, main_cloud_folder_handle,
                               created_at, updated_at
                     """,
                     f"{display_name}'s Workspace",
@@ -3933,6 +3960,7 @@ class PostgresDB:
                 RETURNING id, name, description, goal, status, is_default,
                           default_config_name, default_config_override,
                           nextcloud_folder_id, cloud_storage_read_only,
+                          main_cloud_backend, main_cloud_folder_handle,
                           created_at, updated_at
                 """,
                 name,
@@ -3967,6 +3995,7 @@ class PostgresDB:
                 SELECT id, name, description, goal, status, is_default,
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
+                       main_cloud_backend, main_cloud_folder_handle,
                        created_at, updated_at
                 FROM projects
                 WHERE id = $1
@@ -4000,6 +4029,7 @@ class PostgresDB:
                 SELECT p.id, p.name, p.description, p.goal, p.status,
                        p.is_default, p.default_config_name,
                        p.nextcloud_folder_id, p.cloud_storage_read_only,
+                       p.main_cloud_backend, p.main_cloud_folder_handle,
                        p.created_at, p.updated_at,
                        pm.role AS user_role,
                        (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id) AS job_count,
@@ -4043,6 +4073,8 @@ class PostgresDB:
             "default_config_override",
             "nextcloud_folder_id",
             "cloud_storage_read_only",
+            "main_cloud_backend",
+            "main_cloud_folder_handle",
         }
 
         updates = []
@@ -4477,6 +4509,7 @@ class PostgresDB:
                 RETURNING id, name, description, goal, status, is_default,
                           default_config_name, default_config_override,
                           nextcloud_folder_id, cloud_storage_read_only,
+                          main_cloud_backend, main_cloud_folder_handle,
                           created_at, updated_at
                 """,
                 f"{display_name}'s Workspace",
@@ -5512,6 +5545,102 @@ class PostgresDB:
                 UUID(user_id),
             )
         return count or 0
+
+    # =========================================================================
+    # SYSTEM SETTINGS (Phase 4)
+    # =========================================================================
+    # Key/value store for deploy-time configuration that operators can edit
+    # via the cockpit admin UI. Secrets never land here — the credentials_ref
+    # column carries a pointer (e.g. "env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET")
+    # that the reader resolves against its own secret store.
+
+    async def get_system_setting(self, key: str) -> Dict[str, Any] | None:
+        """Return the full system_settings row for ``key`` or None."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT key, value, credentials_ref, updated_at, updated_by
+                FROM system_settings WHERE key = $1
+                """,
+                key,
+            )
+        if row is None:
+            return None
+        d = self._row_to_dict(row) or {}
+        raw_value = d.get("value")
+        if isinstance(raw_value, str):
+            try:
+                d["value"] = json.loads(raw_value)
+            except (ValueError, TypeError):
+                d["value"] = {}
+        return d
+
+    async def upsert_system_setting(
+        self,
+        key: str,
+        value: Dict[str, Any],
+        *,
+        credentials_ref: Optional[str] = None,
+        updated_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create or replace a system_settings row.
+
+        Returns the post-write row (after the DB-side updated_at is set).
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO system_settings
+                    (key, value, credentials_ref, updated_at, updated_by)
+                VALUES ($1, $2::jsonb, $3, CURRENT_TIMESTAMP, $4)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    credentials_ref = EXCLUDED.credentials_ref,
+                    updated_at = CURRENT_TIMESTAMP,
+                    updated_by = EXCLUDED.updated_by
+                RETURNING key, value, credentials_ref, updated_at, updated_by
+                """,
+                key,
+                json.dumps(value),
+                credentials_ref,
+                updated_by,
+            )
+        d = self._row_to_dict(row) or {}
+        raw_value = d.get("value")
+        if isinstance(raw_value, str):
+            try:
+                d["value"] = json.loads(raw_value)
+            except (ValueError, TypeError):
+                d["value"] = {}
+        return d
+
+    async def delete_system_setting(self, key: str) -> bool:
+        """Remove a system_settings row. Returns True if a row was deleted."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM system_settings WHERE key = $1",
+                key,
+            )
+        return result.endswith(" 1")
+
+    async def notify_channel(self, channel: str, payload: str = "") -> None:
+        """Fire a Postgres NOTIFY on ``channel``.
+
+        Used by Phase 4 to broadcast config changes to every orchestrator
+        replica via the LISTEN task registered at startup. The payload is
+        a free-form string — callers that need structured data should
+        JSON-encode it themselves.
+
+        Uses ``SELECT pg_notify($1, $2)`` rather than the bare ``NOTIFY``
+        statement because bare NOTIFY only accepts literal payloads,
+        while ``pg_notify`` is a regular SQL function and honors
+        parameterized arguments — safe against channel-injection and
+        free-form payloads with quotes.
+        """
+        if not channel.replace("_", "").isalnum():
+            raise ValueError(f"invalid NOTIFY channel: {channel!r}")
+        async with self.acquire() as conn:
+            await conn.execute("SELECT pg_notify($1, $2)", channel, payload)
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

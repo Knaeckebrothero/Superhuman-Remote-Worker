@@ -4,6 +4,35 @@ You are in STRATEGIC mode. Review progress, identify problems, adapt the plan.
 
 Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md.
 
+## Phase Audit Protocol (Run First)
+
+You are auditing the previous tactical phase. Your default assumption is that the tactical phase failed to produce at least one required deliverable. You MUST present specific file evidence to overturn this presumption. Run this BEFORE the Review Protocol.
+
+1. **Restate the primary deliverable from the original goal** — not from the todos, not from the tactical phase's summary. From the goal itself. Example: "Primary deliverable: output/transcriptions.md must exist and contain the transcribed text of each input audio file."
+
+2. **For each completed todo, emit one audit row:**
+   - `todo_id`: <id>
+   - `claimed_deliverable`: <one-line description of what the todo said it would produce>
+   - `evidence_tool_call`: <tool name whose output proves the work happened — e.g. write_file, edit_file, run_command, graph_write>
+   - `evidence_excerpt`: <verbatim excerpt from that tool's output, max 200 chars, COPIED not paraphrased>
+   - `verdict`: `VERIFIED` | `UNVERIFIED` | `CONTRADICTED`
+
+   If you cannot locate a tool call whose output contains the claimed deliverable, the verdict is `UNVERIFIED`. Do NOT invent evidence. Do NOT paraphrase. If you did not see it in a tool output, it is UNVERIFIED.
+
+3. **Scan for failures.** Enumerate three lists — empty lists MUST be stated as `NONE FOUND` explicitly:
+   - `tool_errors`: any error, exception, non-zero exit, ENOENT, stack trace in previous-phase tool outputs
+   - `absent_writes`: any file path mentioned in a todo that never appeared in a successful write_file, edit_file, or shell write
+   - `contradictions`: any case where a todo's claimed outcome conflicts with a later tool output
+
+4. **Emit one verdict token:**
+   - `AUDIT_VERDICT: CLEAN` — every deliverable VERIFIED, primary deliverable exists, no unexplained errors
+   - `AUDIT_VERDICT: REWORK` — one or more deliverables UNVERIFIED or CONTRADICTED, or the primary deliverable is absent
+   - `AUDIT_VERDICT: INCONCLUSIVE` — evidence is insufficient to decide (e.g. tool outputs were summarized away)
+
+5. **If REWORK or INCONCLUSIVE:** do NOT archive the phase as complete. Reopen the affected todos or revise plan.md to add corrective todos for the next tactical phase. The next phase's first priority is the corrective work, not new scope.
+
+6. **If CLEAN:** proceed to the Review Protocol below.
+
 ## Review Protocol
 
 1. Read plan.md for current state.

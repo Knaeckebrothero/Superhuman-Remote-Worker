@@ -176,7 +176,22 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Nextcloud (Phase 3 — opt-in via COMPOSE_PROFILES=nextcloud)
+  # ---------------------------------------------------------------------------
+  # Legacy main-cloud backend. Phase 3 moved Nextcloud behind a profile
+  # and promoted OpenCloud to the default. Existing deployments that had
+  # NEXTCLOUD_* env vars set in their .env continue to auto-route to the
+  # Nextcloud adapter on the orchestrator side (see
+  # orchestrator/services/cloud/config.py::_detect_legacy_nextcloud_mode),
+  # so upgrading in place is non-destructive — it just requires turning
+  # the profile back on at the compose level.
+  #
+  # To run: COMPOSE_PROFILES=nextcloud podman-compose up -d nextcloud
+  # Then (if needed): MAIN_CLOUD_BACKEND=nextcloud in .env to force the
+  # orchestrator onto Nextcloud even when OpenCloud env vars are also set.
   nextcloud:
+    profiles: ["nextcloud"]
     image: docker.io/library/nextcloud:31-apache
     container_name: srw-nextcloud
     environment:
@@ -194,6 +209,57 @@ services:
       - "${NEXTCLOUD_PORT:-8800}:80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # OpenCloud (Phase 3 — default main-cloud backend)
+  # ---------------------------------------------------------------------------
+  # Phase 3 promoted OpenCloud to the bundled default. New installs get
+  # it by running the standard `podman-compose up`; no profile needed.
+  # Deployments that want to keep Nextcloud should run
+  # `COMPOSE_PROFILES=nextcloud podman-compose up` instead and set
+  # MAIN_CLOUD_BACKEND=nextcloud in .env.
+  #
+  # Depends on a Keycloak client named `opencloud-orchestrator` with
+  # serviceAccountsEnabled=true — see docker/opencloud/setup-opencloud.sh
+  # and docs/operations/opencloud-bootstrap.md.
+  opencloud:
+    image: docker.io/opencloudeu/opencloud:latest
+    container_name: srw-opencloud
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      /usr/bin/opencloud init || true
+      /docker-entrypoint-hooks/setup-opencloud.sh || true
+      /usr/bin/opencloud server
+    environment:
+      OC_URL: "${OPENCLOUD_URL:-http://localhost:9200}"
+      OC_INSECURE: "true"
+      PROXY_ENABLE_BASIC_AUTH: "false"
+      # CRITICAL: sub-claim is required (see docs/operations/opencloud-bootstrap.md §4).
+      PROXY_USER_OIDC_CLAIM: "sub"
+      # External IdP (Keycloak) — disables the internal IDP.
+      OC_EXCLUDE_RUN_SERVICES: "idp"
+      PROXY_AUTOPROVISION_ACCOUNTS: "true"
+      PROXY_ROLE_ASSIGNMENT_DRIVER: "oidc"
+      PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM: "groups"
+      WEB_OIDC_CLIENT_ID: "opencloud-web"
+      WEB_OIDC_METADATA_URL: "${OPENCLOUD_OIDC_DISCOVERY_URI:-http://keycloak:8080/realms/srw/.well-known/openid-configuration}"
+      OC_OIDC_ISSUER: "${OPENCLOUD_OIDC_ISSUER:-http://keycloak:8080/realms/srw}"
+      OC_OIDC_ENDPOINT_URL: "${OPENCLOUD_OIDC_ISSUER:-http://keycloak:8080/realms/srw}"
+      OC_LOG_LEVEL: "${OPENCLOUD_LOG_LEVEL:-info}"
+      OC_ADMIN_USER_ID: "${OPENCLOUD_ADMIN_USER_ID:-admin}"
+    volumes:
+      - opencloud_data:/var/lib/opencloud
+      - opencloud_config:/etc/opencloud
+      - ./docker/opencloud/setup-opencloud.sh:/docker-entrypoint-hooks/setup-opencloud.sh:ro
+    ports:
+      - "${OPENCLOUD_PORT:-9200}:9200"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9200/status.php"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -347,12 +413,17 @@ services:
       DEFAULT_DS_NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
       DEFAULT_DS_NEO4J_NAME: "Default Neo4j"
       DEFAULT_DS_NEO4J_READ_ONLY: "false"
-      # Default datasources — WebDAV (Nextcloud)
-      DEFAULT_DS_WEBDAV_URL: "http://nextcloud/remote.php/dav/files/admin/"
-      DEFAULT_DS_WEBDAV_USERNAME: ${NEXTCLOUD_ADMIN_USER:-admin}
-      DEFAULT_DS_WEBDAV_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-admin}
-      DEFAULT_DS_WEBDAV_NAME: "Nextcloud"
-      DEFAULT_DS_WEBDAV_READ_ONLY: "false"
+      # Default datasources — WebDAV (opt-in, Phase 3)
+      # Unset by default — the main-cloud adapter now injects per-project
+      # and per-user WebDAV datasources at project/session creation time
+      # via orchestrator/services/cloud/*. Operators who still want a
+      # shared "admin-visible" datasource pointing at their legacy
+      # Nextcloud can set these env vars in .env.
+      DEFAULT_DS_WEBDAV_URL: ${DEFAULT_DS_WEBDAV_URL:-}
+      DEFAULT_DS_WEBDAV_USERNAME: ${DEFAULT_DS_WEBDAV_USERNAME:-}
+      DEFAULT_DS_WEBDAV_PASSWORD: ${DEFAULT_DS_WEBDAV_PASSWORD:-}
+      DEFAULT_DS_WEBDAV_NAME: ${DEFAULT_DS_WEBDAV_NAME:-Default WebDAV}
+      DEFAULT_DS_WEBDAV_READ_ONLY: ${DEFAULT_DS_WEBDAV_READ_ONLY:-false}
       # S3 / MinIO
       S3_ENDPOINT: http://minio:9000
       S3_ACCESS_KEY: ${MINIO_ROOT_USER:-srw}
@@ -479,9 +550,9 @@ services:
       orchestrator:
         condition: service_healthy
       vpn-cluster:
-        condition: service_healthy
+        condition: service_started
       vpn-workstation:
-        condition: service_healthy
+        condition: service_started
       ssh-keygen:
         condition: service_completed_successfully
     healthcheck:
@@ -828,6 +899,10 @@ volumes:
     name: srw_gitea_data
   nextcloud_data:
     name: srw_nextcloud_data
+  opencloud_data:
+    name: srw_opencloud_data
+  opencloud_config:
+    name: srw_opencloud_config
   minio_data:
     name: srw_minio_data
   workspace_data:

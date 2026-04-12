@@ -19,7 +19,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.messages import (
     AIMessage,
@@ -283,6 +283,12 @@ class ContextConfig:
         model_max_context_tokens: Hard limit for model context window
         summarization_safe_limit: Max input tokens for summarization LLM
         summarization_chunk_size: Chunk size for recursive summarization
+        preserve_tool_names: Tool names whose results are kept verbatim even when
+            older than keep_recent_tool_results — evidence of side effects the
+            strategic phase audit needs to cite.
+        preserve_content_patterns: Case-insensitive substrings that, if present in
+            a tool result, protect it from recency-based clearing/truncation —
+            errors, exceptions, missing-file markers.
     """
 
     compaction_threshold_tokens: int = 80_000
@@ -299,6 +305,25 @@ class ContextConfig:
     model_max_context_tokens: int = 100_000
     summarization_safe_limit: int = 90_000
     summarization_chunk_size: int = 80_000
+    # Evidence-preservation filter: side effects and failures survive compaction
+    # so the strategic-phase audit protocol can cite verbatim tool output.
+    preserve_tool_names: Tuple[str, ...] = (
+        "write_file",
+        "edit_file",
+        "patch_file",
+        "patch_tool",
+    )
+    preserve_content_patterns: Tuple[str, ...] = (
+        "error:",
+        "exception",
+        "traceback",
+        "enoent",
+        "no such file",
+        "permission denied",
+        "not found",
+        "failed",
+        "non-zero exit",
+    )
 
 
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
@@ -536,6 +561,31 @@ class ContextManager:
 
         return False
 
+    def _is_evidence_tool_message(self, msg: ToolMessage) -> bool:
+        """Check if a tool result should survive recency-based compaction.
+
+        Tool results that carry evidence of side effects (file writes, edits)
+        or failures (errors, exceptions, missing files) are preserved so the
+        strategic phase audit protocol can cite verbatim tool output after
+        long tactical phases. See docs/features/phase_audit_protocol.md.
+
+        Args:
+            msg: The ToolMessage to inspect
+
+        Returns:
+            True if the message should be preserved regardless of recency
+        """
+        tool_name = getattr(msg, "name", None)
+        if tool_name and tool_name in self.config.preserve_tool_names:
+            return True
+
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        lowered = content.lower()
+        for pattern in self.config.preserve_content_patterns:
+            if pattern in lowered:
+                return True
+        return False
+
     def clear_old_tool_results(
         self,
         messages: List[BaseMessage],
@@ -545,6 +595,10 @@ class ContextManager:
 
         This is the "safest, lightest touch form of compaction" per Anthropic.
         The agent can always re-read files from workspace if needed.
+
+        Tool results matching the evidence filter (write-type tools, error
+        content) are preserved verbatim regardless of recency so the strategic
+        phase can audit the previous tactical phase's actual output.
 
         Args:
             messages: Message list to process
@@ -567,23 +621,31 @@ class ContextManager:
 
         result = []
         cleared_count = 0
+        preserved_count = 0
 
         for i, msg in enumerate(messages):
-            if i in indices_to_clear:
-                # Replace with placeholder
+            if i in indices_to_clear and not self._is_evidence_tool_message(msg):
+                # Replace with placeholder, preserving the tool name so the
+                # audit protocol can still see which tool produced it.
                 result.append(
                     ToolMessage(
                         content=self.config.placeholder_text,
                         tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
                     )
                 )
                 cleared_count += 1
             else:
+                if i in indices_to_clear:
+                    preserved_count += 1
                 result.append(msg)
 
         if cleared_count > 0:
             self._state.total_tool_results_cleared += cleared_count
-            logger.debug(f"Cleared {cleared_count} old tool results")
+            logger.debug(
+                f"Cleared {cleared_count} old tool results "
+                f"(preserved {preserved_count} evidence-bearing results)"
+            )
 
         return result
 
@@ -620,7 +682,9 @@ class ContextManager:
         result = []
         for i, msg in enumerate(messages):
             if isinstance(msg, ToolMessage) and i not in recent_indices:
-                if len(msg.content) > max_length:
+                if len(msg.content) > max_length and not self._is_evidence_tool_message(
+                    msg
+                ):
                     truncated = (
                         msg.content[:max_length]
                         + f"\n\n[TRUNCATED - {len(msg.content) - max_length} chars omitted, see workspace]"
@@ -629,6 +693,7 @@ class ContextManager:
                         ToolMessage(
                             content=truncated,
                             tool_call_id=msg.tool_call_id,
+                            name=getattr(msg, "name", None),
                         )
                     )
                 else:
