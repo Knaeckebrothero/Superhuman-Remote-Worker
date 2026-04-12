@@ -36,7 +36,7 @@ import {
               }
             </select>
             @if (autonomy() !== null) {
-              <button class="reset-btn" (click)="autonomy.set(null)" title="Reset to default">
+              <button type="button" class="reset-btn" (click)="autonomy.set(null)" title="Reset to default">
                 close
               </button>
             }
@@ -58,7 +58,7 @@ import {
               }
             </select>
             @if (permissionMode() !== null) {
-              <button class="reset-btn" (click)="permissionMode.set(null)" title="Reset to default">
+              <button type="button" class="reset-btn" (click)="permissionMode.set(null)" title="Reset to default">
                 close
               </button>
             }
@@ -80,7 +80,7 @@ import {
             <span>Scholar (pre-research)</span>
           </label>
           @if (scholar() !== null) {
-            <button class="reset-btn" (click)="scholar.set(null)" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="scholar.set(null)" title="Reset to default">
               close
             </button>
           }
@@ -112,7 +112,7 @@ import {
             </select>
           }
           @if (critic() !== null || criticRounds() !== null) {
-            <button class="reset-btn" (click)="resetCritic()" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="resetCritic()" title="Reset to default">
               close
             </button>
           }
@@ -132,7 +132,7 @@ import {
             <span>Project memory</span>
           </label>
           @if (projectMemory() !== null) {
-            <button class="reset-btn" (click)="projectMemory.set(null)" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="projectMemory.set(null)" title="Reset to default">
               close
             </button>
           }
