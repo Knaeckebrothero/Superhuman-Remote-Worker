@@ -32,7 +32,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
     <div class="settings-root" [class.vertical]="mode() === 'job'" [class.horizontal]="mode() === 'session'">
       <!-- Tab navigation -->
       <div class="tab-nav" [class.tab-nav-vertical]="mode() === 'job'" [class.tab-nav-horizontal]="mode() === 'session'">
-        <button
+        <button type="button"
           class="tab-btn"
           [class.active]="activeTab() === 'settings'"
           (click)="activeTab.set('settings')"
@@ -43,7 +43,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
           }
         </button>
         @if (mode() === 'job') {
-          <button
+          <button type="button"
             class="tab-btn"
             [class.active]="activeTab() === 'instructions'"
             (click)="activeTab.set('instructions')"
@@ -54,7 +54,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
             }
           </button>
         }
-        <button
+        <button type="button"
           class="tab-btn"
           [class.active]="activeTab() === 'advanced'"
           (click)="activeTab.set('advanced')"

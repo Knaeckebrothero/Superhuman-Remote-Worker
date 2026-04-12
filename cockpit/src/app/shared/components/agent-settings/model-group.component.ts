@@ -64,7 +64,7 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (strategicModel() !== null) {
-              <button class="reset-btn" (click)="onStrategicModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onStrategicModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
@@ -89,7 +89,7 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (tacticalModel() !== null) {
-              <button class="reset-btn" (click)="onTacticalModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onTacticalModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
@@ -114,7 +114,7 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (sessionModel() !== null) {
-              <button class="reset-btn" (click)="onSessionModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onSessionModelChange(null)" title="Reset to default">close</button>
             }
           </div>
         </div>
