@@ -134,6 +134,19 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: CODEX_BASE_URL
+            # Codex raw-response diagnostic (off by default; toggle in srw-config)
+            - name: DEBUG_CODEX_RAW_RESPONSE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEBUG_CODEX_RAW_RESPONSE
+                  optional: true
+            - name: CODEX_RAW_DUMP_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CODEX_RAW_DUMP_DIR
+                  optional: true
             # Vision model
             - name: VISION_API_KEY
               valueFrom:

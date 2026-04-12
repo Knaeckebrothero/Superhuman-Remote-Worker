@@ -1,7 +1,8 @@
 """Tests for graph.py error handling helper functions.
 
 Tests _extract_rate_limit_delay, _extract_tool_use_failed,
-_build_tool_use_failed_feedback, _is_tool_error, _extract_markdown_content.
+_build_tool_use_failed_feedback, _is_tool_error, _extract_markdown_content,
+_check_empty_response_streak.
 """
 
 from unittest.mock import MagicMock
@@ -12,6 +13,7 @@ from src.graph import (
     _build_tool_use_failed_feedback,
     _is_tool_error,
     _extract_markdown_content,
+    _check_empty_response_streak,
 )
 
 
@@ -262,3 +264,76 @@ class TestExtractMarkdownContent:
         content = "  \n  # Title  \n  "
         result = _extract_markdown_content(content)
         assert result == "# Title"
+
+
+# =============================================================================
+# _check_empty_response_streak
+# =============================================================================
+
+
+class TestCheckEmptyResponseStreak:
+    """Tests for the empty-response circuit-breaker helper."""
+
+    def test_non_empty_content_resets_streak(self):
+        """A response with any content resets the streak to zero."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=42, tool_calls_count=0, current_streak=2
+        )
+        assert new_streak == 0
+        assert should_fail is False
+
+    def test_tool_call_only_resets_streak(self):
+        """A response with tool calls but no content resets the streak."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=0, tool_calls_count=1, current_streak=2
+        )
+        assert new_streak == 0
+        assert should_fail is False
+
+    def test_empty_response_increments(self):
+        """An empty response increments the streak by one."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=0, tool_calls_count=0, current_streak=0
+        )
+        assert new_streak == 1
+        assert should_fail is False
+
+    def test_below_threshold_does_not_fail(self):
+        """Streaks at or below the threshold do not trigger a fail."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=0, tool_calls_count=0, current_streak=2
+        )
+        assert new_streak == 3
+        assert should_fail is False
+
+    def test_above_threshold_fails(self):
+        """Crossing the threshold triggers a fail."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=0, tool_calls_count=0, current_streak=3
+        )
+        assert new_streak == 4
+        assert should_fail is True
+
+    def test_custom_threshold(self):
+        """Threshold parameter is honored."""
+        new_streak, should_fail = _check_empty_response_streak(
+            content_len=0, tool_calls_count=0, current_streak=1, threshold=1
+        )
+        assert new_streak == 2
+        assert should_fail is True
+
+    def test_recovery_then_relapse(self):
+        """A successful response between empties restarts the count."""
+        # Two empties
+        s, _ = _check_empty_response_streak(0, 0, 0)
+        s, _ = _check_empty_response_streak(0, 0, s)
+        assert s == 2
+        # Recovery
+        s, _ = _check_empty_response_streak(
+            content_len=10, tool_calls_count=0, current_streak=s
+        )
+        assert s == 0
+        # Empty again — must start at 1, not resume from 2
+        s, fail = _check_empty_response_streak(0, 0, s)
+        assert s == 1
+        assert fail is False

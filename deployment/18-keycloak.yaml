@@ -2,12 +2,14 @@
 #
 # Secrets injected via env vars (Vault → ESO → srw-secrets):
 #   GITEA_OIDC_CLIENT_SECRET, NEXTCLOUD_OIDC_CLIENT_SECRET,
-#   PGADMIN_OIDC_CLIENT_SECRET, MCP_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
+#   OPENCLOUD_KEYCLOAK_CLIENT_SECRET, PGADMIN_OIDC_CLIENT_SECRET,
+#   MCP_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
 #
 # The realm-export.json uses ${env.VAR} placeholders — Keycloak resolves
 # them at import time from the container's environment.
 #
 # Post-deploy:
+#   - OpenCloud clients are auto-created by the postStart hook (no manual step)
 #   - Run docker/keycloak/setup-gitea-oidc.sh to configure Gitea as OIDC client
 #   - Run docker/keycloak/setup-nextcloud-oidc.sh if deploying Nextcloud
 #
@@ -555,6 +557,18 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: PGADMIN_OIDC_CLIENT_SECRET
+            - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
+                  optional: true
+            - name: OPENCLOUD_PUBLIC_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: OPENCLOUD_PUBLIC_URL
+                  optional: true
             - name: MCP_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -599,6 +613,7 @@ spec:
                     # --- Sync client secrets ---
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
+                                "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
                                 "mcp-server:$MCP_OIDC_CLIENT_SECRET"; do
                       CID="${pair%%:*}"; SEC="${pair#*:}"
@@ -607,6 +622,54 @@ spec:
                       [ -z "$ID" ] && continue
                       $KC update "clients/$ID" -r srw -s "secret=$SEC" 2>/dev/null
                     done
+                    # --- Ensure OpenCloud clients + group ---
+                    # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
+                    if [ -n "$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" ]; then
+                      OC_URL="${OPENCLOUD_PUBLIC_URL:-https://cloud.superhuman-remote-worker.com}"
+                      # opencloudAdmin group (role mapping for OpenCloud admin access)
+                      OCGRP=$($KC get groups -r srw -q search=opencloudAdmin --fields id,name 2>/dev/null \
+                        | grep -B1 '"opencloudAdmin"' | grep '"id"' | sed 's/.*"id" : "//;s/".*//' || true)
+                      [ -z "$OCGRP" ] && OCGRP=$($KC create groups -r srw -s name=opencloudAdmin -i 2>/dev/null)
+                      # opencloud-web (public client — browser OIDC login)
+                      if ! $KC get clients -r srw -q clientId=opencloud-web 2>/dev/null | grep -q '"opencloud-web"'; then
+                        $KC create clients -r srw \
+                          -s clientId=opencloud-web -s name="OpenCloud Web" \
+                          -s enabled=true -s publicClient=true -s standardFlowEnabled=true \
+                          -s "redirectUris=[\"$OC_URL/*\"]" -s "webOrigins=[\"$OC_URL\"]" \
+                          -s 'attributes={"pkce.code.challenge.method":"S256"}' 2>/dev/null
+                      fi
+                      # opencloud-orchestrator (service-account client)
+                      OCID=$($KC get clients -r srw -q clientId=opencloud-orchestrator --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      if [ -z "$OCID" ]; then
+                        OCID=$($KC create clients -r srw \
+                          -s clientId=opencloud-orchestrator -s name="OpenCloud Orchestrator" \
+                          -s enabled=true -s publicClient=false \
+                          -s standardFlowEnabled=false -s directAccessGrantsEnabled=false \
+                          -s serviceAccountsEnabled=true -s "secret=$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" -i 2>/dev/null)
+                      fi
+                      # Add service account to opencloudAdmin group + populate profile
+                      if [ -n "$OCID" ] && [ -n "$OCGRP" ]; then
+                        SAID=$($KC get "clients/$OCID/service-account-user" -r srw --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                        if [ -n "$SAID" ]; then
+                          $KC update "users/$SAID/groups/$OCGRP" -r srw \
+                            -s realm=srw -s userId="$SAID" -s groupId="$OCGRP" -n 2>/dev/null
+                          $KC update "users/$SAID" -r srw \
+                            -s firstName=OpenCloud -s lastName=Orchestrator -s email=orchestrator@srw.local 2>/dev/null
+                        fi
+                      fi
+                      # Attach default client scopes (profile, email, groups + openid for web)
+                      for CNAME in opencloud-orchestrator opencloud-web; do
+                        CCID=$($KC get clients -r srw -q "clientId=$CNAME" --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                        [ -z "$CCID" ] && continue
+                        SCOPES="profile email groups"
+                        [ "$CNAME" = "opencloud-web" ] && SCOPES="openid profile email groups"
+                        for SNAME in $SCOPES; do
+                          SID=$($KC get client-scopes -r srw --fields id,name 2>/dev/null \
+                            | grep -B1 "\"name\" : \"$SNAME\"" | grep '"id"' | head -1 | sed 's/.*"id" : "//;s/".*//' || true)
+                          [ -n "$SID" ] && $KC update "clients/$CCID/default-client-scopes/$SID" -r srw 2>/dev/null
+                        done
+                      done
+                    fi
                     # --- Ensure Gitea protocol mappers have config ---
                     # (realm import sometimes stores empty config objects)
                     GID=$($KC get clients -r srw -q clientId=gitea --fields id --format csv --noquotes 2>/dev/null | tail -1)

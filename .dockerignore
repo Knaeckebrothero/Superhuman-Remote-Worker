@@ -20,7 +20,7 @@ env/
 *.swo
 
 # Environment and secrets
-.env
+.env.txt
 .env.*
 !.env.example
 

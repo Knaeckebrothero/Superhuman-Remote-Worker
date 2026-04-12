@@ -163,7 +163,7 @@ metadata:
   name: srw-nextcloud
   namespace: superhuman-remote-worker
 spec:
-  replicas: 1
+  replicas: 0
   progressDeadlineSeconds: 900
   selector:
     matchLabels:

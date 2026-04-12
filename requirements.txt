@@ -5,7 +5,7 @@ neo4j>=5.16.0
 asyncpg>=0.29.0
 langchain>=0.1.0
 langchain-community>=0.0.16
-langchain-openai>=0.0.5
+langchain-openai>=1.1.12,<2.0  # 1.1.12 ships PR #35281 fix for langchain#34807 (merge_dicts parallel tool call corruption); also pulls newer openai SDK
 langchain-anthropic>=0.1.0
 langchain-google-genai>=1.0.0
 langchain-groq>=0.1.0
@@ -45,6 +45,13 @@ langdetect>=1.0.9
 fastapi>=0.109.0
 uvicorn>=0.27.0
 httpx>=0.26.0
+# Retry primitives for the main-cloud backend layer (transitive via
+# langchain-core today; listed explicitly so cloud/retry.py keeps working
+# if langchain drops it).
+tenacity>=8.2.0
+# OpenTelemetry API for the cloud backend instrumentation decorator.
+# Using the API package only — SDK/exporter installation is an ops choice.
+opentelemetry-api>=1.20.0
 python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0

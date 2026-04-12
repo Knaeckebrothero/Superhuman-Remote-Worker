@@ -73,6 +73,14 @@ data:
   # Codex proxy (CLIProxyAPI — ChatGPT subscription via OAuth proxy)
   CODEX_BASE_URL: "http://srw-codex-proxy:8317/v1"
 
+  # Codex raw-response diagnostic capture.
+  # Set DEBUG_CODEX_RAW_RESPONSE to "1" to dump every /v1/responses
+  # request+response pair to CODEX_RAW_DUMP_DIR. Default off — flip on
+  # only while investigating the empty-response bug, then flip back.
+  # See docs/issues/langchain_responses_api_streaming.md.
+  DEBUG_CODEX_RAW_RESPONSE: "0"
+  CODEX_RAW_DUMP_DIR: "/app/logs/codex-raw"
+
   # Instruction Builder (Cockpit AI Chat)
   BUILDER_MODEL: "gpt-5.2-pro"
   BUILDER_LLM_PROVIDER: "openai"
@@ -130,6 +138,13 @@ data:
   DEFAULT_DS_WEBDAV_URL: "http://srw-nextcloud/remote.php/dav/files/admin/"
   DEFAULT_DS_WEBDAV_NAME: "Nextcloud"
   DEFAULT_DS_WEBDAV_READ_ONLY: "false"
+
+  # OpenCloud — replaces Nextcloud as default cloud backend
+  MAIN_CLOUD_BACKEND: "opencloud"
+  OPENCLOUD_URL: "http://srw-opencloud:9200"
+  OPENCLOUD_PUBLIC_URL: "https://cloud.superhuman-remote-worker.com"
+  OPENCLOUD_KEYCLOAK_ISSUER: "http://srw-keycloak:8080/realms/srw"
+  OPENCLOUD_KEYCLOAK_CLIENT_ID: "opencloud-orchestrator"
 
   # Workstation API (via VPN sidecar)
   WORKSTATION_BASE_URL: "http://srw-vpn-workstation:8080/v1"

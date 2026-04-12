@@ -14,7 +14,7 @@
 |-----|----------|--------|
 | BUG-1: `read_file` broken on remote workspaces | Critical | ✅ Fixed |
 | BUG-2: `mark_complete` misleading docstring | High | ✅ Fixed |
-| BUG-3: `todo_complete` no deliverable validation | Medium | ⏳ Deferred (design decision) |
+| BUG-3: `todo_complete` no deliverable validation | Medium | ✅ Mitigated (prompt + compactor) |
 | BUG-4: Git pager captures shell in tmux | Medium | ✅ Fixed |
 | BUG-5: `run_command` heredoc handling | Medium | ✅ Fixed |
 | BUG-6: Audit API pagination broken | Low | ✅ Fixed |
@@ -93,6 +93,18 @@ Systematic / prompt issues (AGENT-1..4) deferred per scoping decision.
 ---
 
 ### BUG-3: `todo_complete` has no deliverable validation (Medium)
+
+**Status**: ✅ Mitigated 2026-04-11. Fixed at the audit layer, not the tool layer — `todo_complete` remains a pure bookkeeping call (intentional; see "Why not a code-level fix" in `docs/features/phase_audit_protocol.md`). Two changes:
+
+1. **Compactor evidence preservation** (`src/core/context.py`). `clear_old_tool_results` and `truncate_long_tool_results` now skip tool results that match an evidence filter: tool name in `{write_file, edit_file, patch_file, patch_tool}` or content containing error signals (`error:`, `exception`, `traceback`, `enoent`, `no such file`, `permission denied`, `not found`, `failed`, `non-zero exit`). Previously recency-blind, so after 15+ tool calls in a long tactical phase, error messages and write confirmations from early in the phase were replaced with a generic placeholder — leaving the strategic phase with nothing to audit. The replacement path also now preserves the `name=` attribute on placeholder `ToolMessage`s. 7 new tests in `tests/test_context_methods.py::TestEvidencePreservation` cover write/error preservation, traceback preservation, non-evidence still clearing, and preservation across length truncation.
+
+2. **Phase Audit Protocol in the strategic prompt** (`config/prompts/strategic.txt` + 4 model-family variants). Added a step-0 audit block that runs before the existing review protocol. Based on Chain-of-Verification (Dhuliawala et al., ACL 2024), adversarial-framing findings (CRITIC, Self-Refine), and the MAST failure analysis (Cemri et al., NeurIPS 2025). The block requires the model to: (a) restate the job's primary deliverable from the goal, (b) emit per-todo audit rows with verbatim `evidence_excerpt` ≤200 chars copied not paraphrased, (c) enumerate three mandatory failure lists (`tool_errors`, `absent_writes`, `contradictions`) with `NONE FOUND` required on empty, (d) emit an `AUDIT_VERDICT: CLEAN | REWORK | INCONCLUSIVE` token, (e) on REWORK/INCONCLUSIVE, refuse to archive and reopen affected todos. Adversarial framing ("your default assumption is that the tactical phase failed; present evidence to overturn") is preserved across all five variants.
+
+**Why "mitigated" not "fixed"**: per MAST empirical data and the Huang et al. / Stechly-Kambhampati literature on LLM self-correction, prompt-only changes realistically reduce premature-completion failures by ~20-40%, not eliminate them. True elimination would require a separate verifier LLM call (Self-Taught Evaluators, Meta FAIR 2024) — tracked as a Phase 2 option in the feature doc if real-job monitoring shows the prompt change is insufficient. The `AUDIT_VERDICT` token is designed so a future code-level branch in `handle_transition` can consume it without further prompt changes.
+
+**Pending**: real-job monitoring for false positives (audit flags something the model actually did) and over-rejection of otherwise-fine phases.
+
+**See also**: `docs/features/phase_audit_protocol.md` for the full design rationale, research summary, phase plan, and references.
 
 **Root cause**: `todo_complete` (`todo.py:159-271`) is a pure bookkeeping operation — it flips a status flag and counts remaining todos. There is no check that the work described in the todo was actually performed.
 

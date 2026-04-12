@@ -4,6 +4,29 @@ You are in STRATEGIC mode. Review progress, identify problems, adapt the plan.
 
 Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md.
 
+# Phase Audit Protocol (Run First)
+
+You are auditing the previous tactical phase. Default assumption: the tactical phase failed to produce at least one required deliverable. You must present specific file evidence to overturn this presumption. Run this before the Review Steps.
+
+1. Restate the primary deliverable from the original goal — not from the todos, not from the summary. From the goal itself.
+2. For each completed todo, emit one audit row:
+   - todo_id
+   - claimed_deliverable (one line)
+   - evidence_tool_call (write_file, edit_file, run_command, graph_write, ...)
+   - evidence_excerpt (verbatim, max 200 chars, copied not paraphrased)
+   - verdict: VERIFIED | UNVERIFIED | CONTRADICTED
+   If you cannot find a tool output that contains the claimed deliverable, verdict is UNVERIFIED. Do not invent evidence. Do not paraphrase.
+3. Scan for failures. Enumerate three lists — empty lists must be stated as NONE FOUND:
+   - tool_errors (error, exception, non-zero exit, ENOENT, traceback)
+   - absent_writes (file paths mentioned in todos that never appeared in a successful write)
+   - contradictions (todo outcome conflicts with a later tool output)
+4. Emit one verdict token:
+   - AUDIT_VERDICT: CLEAN — every deliverable VERIFIED, primary deliverable exists, no unexplained errors
+   - AUDIT_VERDICT: REWORK — one or more UNVERIFIED or CONTRADICTED, or primary deliverable absent
+   - AUDIT_VERDICT: INCONCLUSIVE — evidence insufficient to decide
+5. If REWORK or INCONCLUSIVE: do not archive the phase. Reopen affected todos or add corrective todos in plan.md. Corrective work is the next phase's first priority, not new scope.
+6. If CLEAN: proceed to Review Steps.
+
 # Review Steps
 
 1. Read plan.md for current state.

@@ -24,7 +24,7 @@ One spare x86_64 machine with:
 | Disk | 100 GB | OS + containerDisk image cache |
 | Network | 1 Gbps, reachable from main cluster | Same LAN |
 
-This leaves room for 2-3 agent VMs at 2 vCPUs / 2-4 GB RAM each.
+With the default CPU overcommit ratio of 4 (see Step 3), this supports 2-3 concurrent agent VMs (2 vCPUs / 2-4 GB RAM each).
 
 ### Network
 
@@ -101,7 +101,28 @@ kubectl get pods -n kubevirt
 # Should see virt-api, virt-controller, virt-handler pods all Running
 ```
 
-## Step 3: Install virtctl (Optional but Useful)
+## Step 3: Enable CPU Overcommit
+
+By default KubeVirt maps each guest vCPU 1:1 to a Kubernetes CPU request, so a 2-vCPU VM blocks 2 full cores on the node. Agent workloads are bursty (idle between LLM calls), so we raise the allocation ratio to pack more VMs per node.
+
+This is managed by Fleet via `deployment-vms/kubevirt/overcommit.yaml` — once the cluster is imported into Rancher and the GitRepo is synced, Fleet applies it automatically.
+
+To apply manually before Fleet is set up:
+
+```bash
+kubectl apply -f deployment-vms/kubevirt/overcommit.yaml
+```
+
+This sets `cpuAllocationRatio: 4`, meaning each vCPU requests only 250m instead of 1000m. On a 4-core node (~3.5 cores allocatable after system overhead), that allows ~3 concurrent 2-vCPU VMs instead of just 1.
+
+Verify:
+
+```bash
+kubectl get kubevirt kubevirt -n kubevirt -o jsonpath='{.spec.configuration.developerConfiguration.cpuAllocationRatio}'
+# Should print: 4
+```
+
+## Step 4: Install virtctl (Optional but Useful)
 
 `virtctl` is the KubeVirt CLI for interacting with VMs (console access, start/stop, etc.):
 
@@ -111,13 +132,13 @@ curl -L -o /usr/local/bin/virtctl "https://github.com/kubevirt/kubevirt/releases
 chmod +x /usr/local/bin/virtctl
 ```
 
-## Step 4: Create the Agent VMs Namespace
+## Step 5: Create the Agent VMs Namespace
 
 ```bash
 kubectl create namespace agent-vms
 ```
 
-## Step 5: Verify with a Test VM
+## Step 6: Verify with a Test VM
 
 ```bash
 cat <<'EOF' | kubectl apply -f -
@@ -171,7 +192,7 @@ kubectl delete vm test-vm -n agent-vms
 
 If the test VM starts and you can access the console, KubeVirt is working.
 
-## Step 6: Set Up RBAC for Orchestrator Access
+## Step 7: Set Up RBAC for Orchestrator Access
 
 The orchestrator on the main cluster needs a kubeconfig to create/delete VMs on the agent cluster. Create a service account with minimal permissions:
 

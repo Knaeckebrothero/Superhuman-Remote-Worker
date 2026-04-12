@@ -129,6 +129,9 @@ class SRWOAuthProxy(OIDCProxy):
         # In-memory store for pending authorizations (between Keycloak callback
         # and scope selection). Short-lived, single-use.
         self._pending_auths: dict[str, PendingAuth] = {}
+        # Track recently consumed session IDs so duplicate POSTs get a
+        # friendly message instead of "Session Expired".
+        self._consumed_sessions: dict[str, float] = {}  # session_id -> consumed_at
 
     # ------------------------------------------------------------------
     # Route registration — add our custom scope-select endpoint
@@ -315,6 +318,15 @@ class SRWOAuthProxy(OIDCProxy):
             # Look up pending auth
             pending = self._pending_auths.pop(session_id, None)
             if not pending or pending.expired:
+                # Check if this was already consumed (duplicate POST)
+                if session_id in self._consumed_sessions:
+                    return HTMLResponse(
+                        content=create_error_html(
+                            error_title="Already Authorized",
+                            error_message="Authorization was completed successfully. You can close this tab.",
+                        ),
+                        status_code=200,
+                    )
                 return HTMLResponse(
                     content=create_error_html(
                         error_title="Session Expired",
@@ -381,6 +393,9 @@ class SRWOAuthProxy(OIDCProxy):
             callback_params = {"code": client_code, "state": client_state}
             sep = "&" if "?" in client_redirect_uri else "?"
             callback_url = f"{client_redirect_uri}{sep}{urlencode(callback_params)}"
+
+            # Mark session as consumed so duplicate POSTs get a friendly message
+            self._consumed_sessions[session_id] = time.time()
 
             logger.info(
                 "OAuth scope selection complete: scope=%s, expiry=%dd, client=%s",
@@ -547,7 +562,12 @@ class SRWOAuthProxy(OIDCProxy):
             return None
 
     def _cleanup_pending(self) -> None:
-        """Remove expired pending authorizations."""
+        """Remove expired pending authorizations and stale consumed markers."""
         expired = [sid for sid, p in self._pending_auths.items() if p.expired]
         for sid in expired:
             del self._pending_auths[sid]
+        # Clean consumed sessions older than 2 minutes
+        cutoff = time.time() - 120
+        stale = [sid for sid, ts in self._consumed_sessions.items() if ts < cutoff]
+        for sid in stale:
+            del self._consumed_sessions[sid]

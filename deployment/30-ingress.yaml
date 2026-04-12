@@ -83,11 +83,11 @@ spec:
                 port:
                   number: 8080
 ---
-# Nextcloud (WebDAV cloud storage)
+# OpenCloud (cloud storage — replaces Nextcloud)
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: srw-nextcloud-ingress
+  name: srw-opencloud-ingress
   namespace: superhuman-remote-worker
   annotations:
     cert-manager.io/cluster-issuer: cloudflare-dns-issuer
@@ -98,7 +98,7 @@ spec:
   tls:
     - hosts:
         - cloud.superhuman-remote-worker.com
-      secretName: srw-nextcloud-tls
+      secretName: srw-opencloud-tls
   rules:
     - host: cloud.superhuman-remote-worker.com
       http:
@@ -107,9 +107,9 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: srw-nextcloud
+                name: srw-opencloud
                 port:
-                  number: 80
+                  number: 9200
 ---
 # Neo4j browser UI (Bolt goes via MetalLB LB on bolt-neo4j.superhuman-remote-worker.com)
 apiVersion: networking.k8s.io/v1

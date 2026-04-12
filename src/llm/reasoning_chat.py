@@ -53,6 +53,58 @@ def _get_debug_tail_chars() -> int:
     return int(os.environ.get("DEBUG_LLM_TAIL", "500"))
 
 
+def _dump_codex_raw_response(
+    request: "httpx.Request", response: "httpx.Response"
+) -> None:
+    """Dump a raw /v1/responses request+response pair to disk for inspection.
+
+    Diagnostic for the codex-proxy non-streaming failure mode where the
+    proxy returns real LLM output but the agent ends up with an empty
+    AIMessage. See docs/issues/langchain_responses_api_streaming.md for
+    background. Captures land in $CODEX_RAW_DUMP_DIR (default /tmp). All
+    failures are silent — this must never break the live request path.
+    """
+    try:
+        import uuid
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        out_dir = Path(os.environ.get("CODEX_RAW_DUMP_DIR", "/tmp"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        unique = uuid.uuid4().hex[:8]
+        out_path = out_dir / f"codex-raw-{ts}-{unique}.json"
+
+        try:
+            req_body = json.loads(request.content) if request.content else None
+        except (json.JSONDecodeError, ValueError):
+            req_body = (request.content or b"").decode("utf-8", errors="replace")
+
+        body_bytes = response.content
+        try:
+            resp_body = json.loads(body_bytes) if body_bytes else None
+        except (json.JSONDecodeError, ValueError):
+            resp_body = body_bytes.decode("utf-8", errors="replace")
+
+        capture = {
+            "captured_at": ts,
+            "url": str(request.url),
+            "method": request.method,
+            "request_body": req_body,
+            "status_code": response.status_code,
+            "response_headers": dict(response.headers),
+            "response_body": resp_body,
+            "response_body_size_bytes": len(body_bytes) if body_bytes else 0,
+        }
+        out_path.write_text(json.dumps(capture, indent=2, default=str))
+        logger.info(
+            f"Codex raw response captured: {out_path} "
+            f"({capture['response_body_size_bytes']} bytes)"
+        )
+    except Exception as exc:
+        logger.warning(f"Codex raw capture failed (non-fatal): {exc}")
+
+
 def count_request_tokens(body: dict, model: str = "gpt-4") -> int:
     """Count tokens in OpenAI API request body.
 
@@ -515,6 +567,21 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
                 self._last_reasoning_content = _extract_reasoning_from_response(data)
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
+
+        # Diagnostic: dump raw /v1/responses payloads when DEBUG_CODEX_RAW_RESPONSE=1.
+        # The codex proxy + openai SDK Pydantic deserialization path can produce
+        # empty AIMessages from non-empty proxy responses (see
+        # docs/issues/langchain_responses_api_streaming.md "Non-streaming failure
+        # mode"). This capture lets us inspect what the proxy is actually
+        # returning vs. what langchain ends up with. Non-streaming only —
+        # accessing response.content on a streamed response would raise.
+        if (
+            is_responses
+            and not kwargs.get("stream", False)
+            and os.environ.get("DEBUG_CODEX_RAW_RESPONSE", "").strip()
+            in ("1", "true", "yes")
+        ):
+            _dump_codex_raw_response(request, response)
 
         return response
 
