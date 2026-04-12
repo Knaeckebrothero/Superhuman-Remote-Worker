@@ -165,8 +165,8 @@ data:
   WORKSPACE_NAMESPACE: "superhuman-remote-worker"
 
   # Agent pods (on-demand via AgentProvisioner, same image as worker agents)
-  AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-9307f16"
-  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-9307f16"
+  AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-02c1ede"
+  PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-02c1ede"
 
   # Agent pool sizing (AgentProvisioner — K8s dynamic provisioning)
   MAX_AGENTS: "10"
