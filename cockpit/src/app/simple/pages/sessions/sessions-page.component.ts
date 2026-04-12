@@ -175,7 +175,7 @@ interface Project {
                 </div>
               </div>
               <div class="session-actions">
-                @if (thread.nc_session_folder) {
+                @if (thread.cloud_session_url || thread.nc_session_folder) {
                   <button class="icon-btn" title="Session Files" (click)="openSessionFiles(thread)">
                     <span class="icon">cloud</span>
                   </button>
@@ -680,6 +680,12 @@ export class SessionsPageComponent implements OnInit {
     }
 
     openSessionFiles(thread: Thread): void {
+        // Prefer the backend-computed URL (works for all backends).
+        if (thread.cloud_session_url) {
+            window.open(thread.cloud_session_url, '_blank');
+            return;
+        }
+        // Legacy fallback for Nextcloud sessions without a computed URL.
         if (!thread.nc_session_folder || !environment.cloudUrl) return;
         const folderName = thread.nc_session_folder.split('/').pop();
         window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
