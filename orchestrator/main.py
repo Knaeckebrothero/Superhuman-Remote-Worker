@@ -9249,9 +9249,7 @@ async def resume_thread(
             if not backend.is_initialized:
                 return
             try:
-                session_handle = await backend.ensure_session_folder(
-                    session_id=tid[:8]
-                )
+                session_handle = await backend.ensure_session_folder(session_id=tid[:8])
                 share_handle = None
                 resolved_user_id = await backend.resolve_user_identity(
                     usr.get("email"),
