@@ -391,6 +391,47 @@ import {getReasoningOptions} from './reasoning-options';
         </button>
         @if (expanded().has('workspace')) {
           <div class="accordion-body">
+            <div class="field-row" [class.modified]="workspaceBackend() !== null">
+              <label class="field-label">Backend</label>
+              <div class="field-control">
+                <select class="form-input"
+                  [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
+                  (ngModelChange)="workspaceBackend.set($event); emitChange()"
+                  [disabled]="disabled()">
+                  <option value="container">Container</option>
+                  <option value="remote">VM (QEMU)</option>
+                </select>
+                @if (workspaceBackend() !== null) {
+                  <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()">close</button>
+                }
+              </div>
+            </div>
+            @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'remote') {
+              <div class="field-row" [class.modified]="vmCpuCores() !== null">
+                <label class="field-label">VM CPU cores</label>
+                <div class="field-control">
+                  <input type="number" class="form-input compact-input" min="1" max="16" step="1"
+                    [ngModel]="vmCpuCores() ?? resolvedVmCpuCores()"
+                    (ngModelChange)="vmCpuCores.set($event); emitChange()"
+                    [disabled]="disabled()">
+                  @if (vmCpuCores() !== null) {
+                    <button type="button" class="reset-btn" (click)="vmCpuCores.set(null); emitChange()">close</button>
+                  }
+                </div>
+              </div>
+              <div class="field-row" [class.modified]="vmMemory() !== null">
+                <label class="field-label">VM memory</label>
+                <div class="field-control">
+                  <input type="text" class="form-input compact-input" placeholder="4Gi"
+                    [ngModel]="vmMemory() ?? resolvedVmMemory()"
+                    (ngModelChange)="vmMemory.set($event); emitChange()"
+                    [disabled]="disabled()">
+                  @if (vmMemory() !== null) {
+                    <button type="button" class="reset-btn" (click)="vmMemory.set(null); emitChange()">close</button>
+                  }
+                </div>
+              </div>
+            }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
               <label class="field-label">Max read words</label>
               <div class="field-control">
@@ -895,6 +936,9 @@ export class AdvancedAccordionComponent {
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
+  readonly workspaceBackend = signal<string | null>(null);
+  readonly vmCpuCores = signal<number | null>(null);
+  readonly vmMemory = signal<string | null>(null);
   readonly maxReadWords = signal<number | null>(null);
   readonly maxWriteWords = signal<number | null>(null);
   readonly gitVersioning = signal<boolean | null>(null);
@@ -981,6 +1025,9 @@ export class AdvancedAccordionComponent {
   readonly resolvedKeepRecentToolResults = computed(() => (this.r('context_management.keep_recent_tool_results') ?? 150) as number);
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
+  readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'container') as string);
+  readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 2) as number);
+  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '4Gi') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
@@ -1136,6 +1183,13 @@ export class AdvancedAccordionComponent {
 
     // Workspace
     const ws: Record<string, unknown> = {};
+    if (this.workspaceBackend() !== null) ws['backend'] = this.workspaceBackend();
+    if (this.workspaceBackend() === 'remote') {
+      const vm: Record<string, unknown> = {};
+      if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
+      if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
+      if (Object.keys(vm).length) ws['vm'] = vm;
+    }
     if (this.maxReadWords() !== null) ws['max_read_words'] = this.maxReadWords();
     if (this.maxWriteWords() !== null) ws['max_write_words'] = this.maxWriteWords();
     if (this.gitVersioning() !== null) ws['git_versioning'] = this.gitVersioning();
@@ -1211,6 +1265,9 @@ export class AdvancedAccordionComponent {
     this.compactOnArchive.set(null);
     this.keepRecentToolResults.set(null);
     this.keepRecentMessages.set(null);
+    this.workspaceBackend.set(null);
+    this.vmCpuCores.set(null);
+    this.vmMemory.set(null);
     this.maxReadWords.set(null);
     this.maxWriteWords.set(null);
     this.gitVersioning.set(null);

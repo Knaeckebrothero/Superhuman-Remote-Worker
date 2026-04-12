@@ -153,6 +153,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               @if (jobs().length === 0) {
                 <div class="empty-inline">No jobs in this project</div>
               } @else {
+                <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
@@ -187,6 +188,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     }
                   </tbody>
                 </table>
+                </div>
               }
             </div>
           }
@@ -372,6 +374,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               @if (projectDatasources().length === 0) {
                 <div class="empty-inline">No datasources linked to this project</div>
               } @else {
+                <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
@@ -417,6 +420,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     }
                   </tbody>
                 </table>
+                </div>
               }
             </div>
           }
@@ -467,6 +471,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               @if (repos().length === 0) {
                 <div class="empty-inline">No repositories attached</div>
               } @else {
+                <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
@@ -499,6 +504,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     }
                   </tbody>
                 </table>
+                </div>
               }
             </div>
           }
@@ -576,6 +582,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               @if (members().length === 0) {
                 <div class="empty-inline">No members</div>
               } @else {
+                <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
@@ -622,6 +629,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     }
                   </tbody>
                 </table>
+                </div>
               }
             </div>
           }
@@ -750,12 +758,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     </div>
   `,
   styles: [`
-    :host { display: block; height: 100%; overflow: auto; }
+    :host { display: block; height: 100%; overflow: auto; overflow-x: hidden; }
 
     .page-container {
       padding: 24px;
       max-width: 1200px;
       margin: 0 auto;
+      overflow-x: hidden;
     }
 
     /* Header */
@@ -790,7 +799,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       gap: 2px;
       border-bottom: 1px solid var(--border-color, #313244);
       margin-bottom: 20px;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
     }
+
+    .tab-bar::-webkit-scrollbar { display: none; }
 
     .tab-btn {
       padding: 10px 20px;
@@ -802,6 +816,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       font-family: inherit;
       cursor: pointer;
       transition: all 0.15s ease;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
 
     .tab-btn:hover { color: var(--text-primary, #cdd6f4); }
@@ -1474,13 +1490,44 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 
     .kb-rel-link:hover { opacity: 0.8; }
 
+    .table-scroll {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
     @media (max-width: 768px) {
       .page-container { padding: 12px; }
+
+      .page-header { flex-wrap: wrap; gap: 8px; }
+      .page-title { font-size: 18px; }
+      .header-info { gap: 8px; }
+
+      .tab-bar {
+        position: relative;
+        mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+        -webkit-mask-image: linear-gradient(to right, black calc(100% - 24px), transparent);
+      }
+
+      .tab-btn { padding: 10px 14px; font-size: 12px; }
+
       .detail-grid { grid-template-columns: 1fr; }
-      .stats-row { flex-direction: column; }
+
+      .stats-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .stat-card { padding: 12px; }
+      .stat-value { font-size: 22px; }
+
+      .data-table { min-width: 500px; }
+
       .inline-form { flex-direction: column; align-items: stretch; }
       .kb-stats-row { flex-direction: column; }
-      .kb-toolbar { flex-direction: column; }
+      .kb-toolbar { flex-direction: column; gap: 8px; }
+      .kb-toolbar .btn,
+      .kb-toolbar .inline-select,
+      .kb-toolbar .kb-search { width: 100%; box-sizing: border-box; }
     }
   `],
 })

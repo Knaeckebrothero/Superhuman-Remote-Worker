@@ -17,6 +17,7 @@ interface Project {
     name: string;
     status: string;
     description?: string;
+    is_default?: boolean;
 }
 
 @Component({
@@ -535,6 +536,31 @@ interface Project {
       color: var(--text-muted, #6c7086);
       font-size: 13px;
     }
+
+    @media (max-width: 768px) {
+      .sessions-page {
+        max-width: 100%;
+        padding: 12px;
+      }
+
+      .sessions-header {
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .filter-tabs {
+        flex-wrap: wrap;
+      }
+
+      .session-card {
+        padding: 10px;
+      }
+
+      .session-actions button {
+        min-height: 36px;
+        font-size: 11px;
+      }
+    }
   `],
 })
 export class SessionsPageComponent implements OnInit {
@@ -594,6 +620,10 @@ export class SessionsPageComponent implements OnInit {
                 this.http.get<Project[]>(`${environment.apiUrl}/projects${params}`)
             );
             this.projects.set(data || []);
+            const defaultProject = (data || []).find(p => p.is_default);
+            if (defaultProject) {
+                this.selectedProjectIds.set([defaultProject.id]);
+            }
         } catch (e) {
             // Silent — projects not available
         }
