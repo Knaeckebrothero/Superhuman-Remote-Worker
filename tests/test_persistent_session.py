@@ -369,14 +369,14 @@ class TestSetupWorkspace:
         cfg = _make_config()
         session = _make_session(config=cfg)
 
-        with pytest.raises(RuntimeError, match="No remote workspace configured"):
+        with pytest.raises(RuntimeError, match="No workspace configured"):
             await session._setup_workspace()
 
     @pytest.mark.asyncio
     async def test_remote_backend_creation(self):
-        """Remote backend created and connected when config says 'remote'."""
+        """Remote backend created and connected when config says 'sandbox'."""
         cfg = _make_config(
-            ws_backend="remote",
+            ws_backend="sandbox",
             ws_remote={"host": "10.0.0.1", "port": 22, "key_path": "/key"},
         )
         cfg.extra = {"shell": {"default_timeout": 60, "max_tabs": 5}}
@@ -408,7 +408,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_succeeds_after_failures(self):
         """Retry loop recovers when connect fails then succeeds."""
         cfg = _make_config(
-            ws_backend="remote",
+            ws_backend="sandbox",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -437,7 +437,7 @@ class TestSetupWorkspace:
     async def test_remote_retry_raises_after_timeout(self):
         """Retry loop raises WorkspaceUnavailableError after max duration."""
         cfg = _make_config(
-            ws_backend="remote",
+            ws_backend="sandbox",
             ws_remote={"host": "10.0.0.1"},
         )
         session = _make_session(config=cfg)
@@ -474,7 +474,7 @@ class TestSetupWorkspace:
         session = _make_session(config=cfg)
 
         override = {
-            "backend": "remote",
+            "backend": "sandbox",
             "remote": {"host": "override-host"},
         }
 

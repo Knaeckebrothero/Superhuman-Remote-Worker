@@ -203,10 +203,10 @@ class PersistentSession:
         effective_backend = (workspace_override or {}).get("backend") or ws_data.backend
         remote_cfg = (workspace_override or {}).get("remote") or ws_data.remote
 
-        if not (effective_backend == "remote" and remote_cfg):
+        if not (effective_backend in ("sandbox", "vm", "remote") and remote_cfg):
             raise RuntimeError(
-                "No remote workspace configured. Persistent sessions require "
-                "an isolated workspace container or VM."
+                "No workspace configured. Persistent sessions require "
+                "an isolated workspace (sandbox or vm) with SSH credentials."
             )
 
         from ..core.backends.remote import RemoteBackend
@@ -232,6 +232,7 @@ class PersistentSession:
                     job_id=self.thread_id,
                     default_timeout=shell_config.get("default_timeout", 120),
                     max_tabs=shell_config.get("max_tabs", 15),
+                    sudo_action=shell_config.get("sudo_action", "freeze"),
                 )
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, workspace_backend.connect)

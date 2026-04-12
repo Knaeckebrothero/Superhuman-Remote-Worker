@@ -436,13 +436,14 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
-        if self._use_backend:
-            return self._backend.shell_send(name, text, enter=enter)
         # Check blocked commands when actually executing (enter=True)
+        # Must run before backend delegation so sudo intercept always fires.
         if enter:
             blocked = self._check_blocked(text)
             if blocked:
                 return blocked
+        if self._use_backend:
+            return self._backend.shell_send(name, text, enter=enter)
         tab = self._get_tab(name)
         tab.pane.send_keys(text, enter=enter)
         tab.last_activity = datetime.now(timezone.utc)
@@ -636,6 +637,12 @@ class ShellManager:
             KeyError: If tab does not exist
             TimeoutError: If command exceeds timeout
         """
+        # Safety check — must run before backend delegation so sudo
+        # intercept and blocked-command checks always fire.
+        blocked = self._check_blocked(command)
+        if blocked:
+            return blocked
+
         if self._use_backend:
             if timeout is None:
                 timeout = self.default_timeout
@@ -645,10 +652,6 @@ class ShellManager:
                 tab_name=tab_name,
                 working_dir=working_dir,
             )
-        # Safety check
-        blocked = self._check_blocked(command)
-        if blocked:
-            return blocked
 
         if timeout is None:
             timeout = self.default_timeout

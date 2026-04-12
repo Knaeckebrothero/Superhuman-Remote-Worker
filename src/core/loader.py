@@ -751,19 +751,24 @@ class LLMConfig:
 class WorkspaceConfig:
     """Workspace configuration."""
 
-    _VALID_BACKENDS = ("remote", "container")
+    _VALID_BACKENDS = ("sandbox", "vm")
+    _LEGACY_BACKEND_MAP = {"remote": "sandbox", "container": "sandbox"}
 
     structure: List[str] = field(default_factory=list)
     instructions_template: str = ""
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    backend: str = "remote"  # "remote" (SSH workspace container/VM) or "container" (orchestrator-provisioned)
+    backend: str = "sandbox"  # "sandbox" (SSH workspace container) or "vm" (KubeVirt VM with sudo gate)
     remote: Optional[Dict[str, Any]] = (
         None  # {host, port, username, key_path, workspace_path}
     )
 
     def __post_init__(self) -> None:
+        # Backward compatibility: translate legacy backend names
+        if self.backend in self._LEGACY_BACKEND_MAP:
+            self.backend = self._LEGACY_BACKEND_MAP[self.backend]
+
         if self.backend not in self._VALID_BACKENDS:
             raise ValueError(
                 f"Invalid workspace.backend={self.backend!r}. "
@@ -1217,7 +1222,7 @@ def load_agent_config(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        backend=workspace_data.get("backend", "remote"),
+        backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
     )
 
@@ -1406,7 +1411,7 @@ def load_agent_config_from_dict(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        backend=workspace_data.get("backend", "remote"),
+        backend=workspace_data.get("backend", "sandbox"),
         remote=workspace_data.get("remote"),
     )
 

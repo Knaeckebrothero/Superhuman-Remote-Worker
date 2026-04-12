@@ -32,7 +32,7 @@ workspace:
   max_read_words: 25000
   max_write_words: 10000
   git_versioning: false
-  backend: remote
+  backend: sandbox
 
 tools:
   workspace:
