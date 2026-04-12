@@ -129,7 +129,7 @@ spec:
           image: docker.io/opencloudeu/opencloud:latest
           command: ["/bin/sh", "-c"]
           args:
-            - "/usr/bin/opencloud init || true; /opt/opencloud-hooks/setup-opencloud.sh || true; exec /usr/bin/opencloud server"
+            - "echo no | /usr/bin/opencloud init || true; /opt/opencloud-hooks/setup-opencloud.sh || true; exec /usr/bin/opencloud server"
           ports:
             - containerPort: 9200
           env:
