@@ -1632,7 +1632,7 @@ async def _poll_workspace_ready(
         vm_status = ws.get("vm_status")
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
-                "backend": "remote",
+                "backend": "vm",
                 "remote": {
                     "host": ws["vm_ssh_host"],
                     "port": ws.get("vm_ssh_port", 22),
@@ -1650,7 +1650,7 @@ async def _poll_workspace_ready(
 
         if status == "ready" and ws.get("pod_ip"):
             return {
-                "backend": "remote",
+                "backend": "sandbox",
                 "remote": {
                     "host": ws["pod_ip"],
                     "port": ws.get("pod_port") or 22,
@@ -1722,6 +1722,7 @@ async def _handle_vm_upgrade(ws: WebSocket) -> None:
             job_id=_thread_id,
             default_timeout=shell_config.get("default_timeout", 120),
             max_tabs=shell_config.get("max_tabs", 15),
+            sudo_action="allow",  # VM has its own sudo gate
         )
 
         # 4. Hot-swap backend on session

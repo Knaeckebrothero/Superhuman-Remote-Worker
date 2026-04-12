@@ -1035,25 +1035,27 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
         # Create workspace backend. The agent never operates on its own
-        # filesystem — backend must be "remote" with SSH credentials provided
-        # by the orchestrator at dispatch time.
-        if self.config.workspace.backend != "remote":
+        # filesystem — backend must be "sandbox" or "vm" with SSH credentials
+        # provided by the orchestrator at dispatch time.
+        if self.config.workspace.backend not in ("sandbox", "vm"):
             raise RuntimeError(
                 f"Unsupported workspace.backend={self.config.workspace.backend!r}. "
-                f"The agent requires backend='remote' with SSH credentials "
-                f"injected by the orchestrator."
+                f"The agent requires backend='sandbox' or 'vm' with SSH "
+                f"credentials injected by the orchestrator."
             )
         if not self.config.workspace.remote:
             raise RuntimeError(
-                "workspace.backend='remote' but no workspace.remote config was "
-                "provided. The orchestrator must inject SSH credentials pointing "
-                "at a provisioned workspace container or VM."
+                f"workspace.backend={self.config.workspace.backend!r} but no "
+                f"workspace.remote config was provided. The orchestrator must "
+                f"inject SSH credentials pointing at a provisioned workspace "
+                f"container or VM."
             )
 
         try:
             from .core.backends.remote import RemoteBackend
 
             remote_cfg = self.config.workspace.remote
+            shell_config = self.config.extra.get("shell", {})
             workspace_backend = RemoteBackend(
                 host=remote_cfg["host"],
                 port=remote_cfg.get("port", 22),
@@ -1063,16 +1065,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     "workspace_path", "/home/agent-host/workspace"
                 ),
                 job_id=job_id,
-                scrollback_limit=self.config.extra.get("shell", {}).get(
-                    "scrollback_limit", 5000
-                ),
-                default_timeout=self.config.extra.get("shell", {}).get(
-                    "default_timeout", 120
-                ),
-                max_tabs=self.config.extra.get("shell", {}).get("max_tabs", 15),
-                blocked_commands=self.config.extra.get("shell", {}).get(
-                    "blocked_commands"
-                ),
+                scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                default_timeout=shell_config.get("default_timeout", 120),
+                max_tabs=shell_config.get("max_tabs", 15),
+                blocked_commands=shell_config.get("blocked_commands"),
+                sudo_action=shell_config.get("sudo_action", "freeze"),
             )
             workspace_backend.connect()
             logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
@@ -1650,11 +1647,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 from src.tools.shell.shell_manager import ShellManager
 
                 shell_config = self.config.extra.get("shell", {})
-                # VM-backed agents get sudo_action=allow (sudo goes through
-                # the VM's approval gate, not the container intercept)
+                # sudo_action comes from config (default "freeze").
+                # The orchestrator injects "allow" for VM workspaces
+                # (where the sudo gate handles approval via NATS).
                 sudo_action = shell_config.get("sudo_action", "freeze")
-                if use_remote_shell:
-                    sudo_action = "allow"
 
                 shell_manager = ShellManager(
                     job_id=self._current_job_id,

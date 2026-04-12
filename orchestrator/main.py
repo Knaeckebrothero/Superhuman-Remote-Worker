@@ -749,13 +749,15 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "remote"
+            ws["backend"] = "vm"
             remote = ws.setdefault("remote", {})
             remote.setdefault("host", vm_ctx["ssh_host"])
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
             remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
+            # VM has its own sudo gate — allow sudo through
+            config_override.setdefault("shell", {})["sudo_action"] = "allow"
             logger.info(
                 f"Dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
@@ -767,7 +769,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         if container_ctx.get("status") == "ready" and container_host:
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "remote"
+            ws["backend"] = "sandbox"
             remote = ws.setdefault("remote", {})
             remote.setdefault("host", container_host)
             remote.setdefault("port", container_ctx.get("port", 22))
@@ -784,6 +786,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             else:
                 remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
+            # Sandbox uses sudo freeze mechanism (VM upgrade prompt)
+            config_override.setdefault("shell", {}).setdefault(
+                "sudo_action", "freeze"
+            )
             logger.info(
                 f"Dispatch: injected workspace container config for job {job_id} "
                 f"(host={container_host}:{container_ctx.get('port', 22)}, "
@@ -1022,13 +1028,15 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
             config_override = config_override or {}
             ws = config_override.setdefault("workspace", {})
-            ws["backend"] = "remote"
+            ws["backend"] = "vm"
             remote = ws.setdefault("remote", {})
             remote.setdefault("host", vm_ctx["ssh_host"])
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
             remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
+            # VM has its own sudo gate — allow sudo through
+            config_override.setdefault("shell", {})["sudo_action"] = "allow"
             logger.info(
                 f"Resume dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
@@ -1288,14 +1296,15 @@ def _job_needs_vm(job: dict) -> bool:
     vm_ctx = ctx.get("vm", {})
     if vm_ctx.get("requested"):
         return True
-    # Config override specifies remote workspace
+    # Config override specifies VM workspace
     co = job.get("config_override") or {}
     if isinstance(co, str):
         try:
             co = json.loads(co)
         except (json.JSONDecodeError, TypeError):
             co = {}
-    return co.get("workspace", {}).get("backend") == "remote"
+    backend = co.get("workspace", {}).get("backend")
+    return backend in ("vm", "remote")  # "remote" is legacy for VM
 
 
 def _get_vm_context(job: dict) -> dict:
@@ -1309,12 +1318,12 @@ def _get_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
-def _job_needs_container(job: dict) -> bool:
-    """Check if a job needs a workspace container.
+def _job_needs_sandbox(job: dict) -> bool:
+    """Check if a job needs a sandbox workspace container.
 
     Returns True if:
-    - config_override.workspace.backend == "container", OR
-    - backend is not explicitly set to "remote" AND a workspace
+    - config_override.workspace.backend == "sandbox" (or legacy "container"), OR
+    - backend is not explicitly set to "vm" AND a workspace
       provisioner is available (k8s ContainerProvisioner OR DockerProvisioner).
 
     Returns False if the job already has a ready VM or container inherited
@@ -1339,11 +1348,11 @@ def _job_needs_container(job: dict) -> bool:
         except (json.JSONDecodeError, TypeError):
             co = {}
     backend = co.get("workspace", {}).get("backend")
-    if backend == "container":
+    if backend in ("sandbox", "container"):  # "container" is legacy
         return True
-    if backend == "remote":
+    if backend in ("vm", "remote"):  # "remote" is legacy for VM
         return False
-    # No explicit backend — default to container if any provisioner is available
+    # No explicit backend — default to sandbox if any provisioner is available
     return container_provisioner.is_available or docker_provisioner.is_available
 
 
@@ -1552,7 +1561,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         continue
                     # else: VM is ready, proceed with dispatch
                     logger.info("Dispatcher: job %s using VM workspace", job_id)
-                elif _job_needs_container(job):
+                elif _job_needs_sandbox(job):
                     container_ctx = _get_container_context(job)
                     container_status = container_ctx.get("status")
                     if not container_status:

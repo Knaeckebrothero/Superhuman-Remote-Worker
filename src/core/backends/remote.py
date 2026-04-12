@@ -26,7 +26,7 @@ try:
 except ImportError:
     paramiko = None  # Deferred — only needed when backend: remote is used
 
-from ...tools.shell.shell_manager import build_sentinel_command
+from ...tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, build_sentinel_command
 from ..workspace_backend import WorkspaceBackend, WorkspaceUnavailableError
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ class _RemoteTab:
 
 
 class RemoteBackend(WorkspaceBackend):
-    """Workspace on a remote VM, accessed via SSH/SFTP.
+    """Workspace on a remote host (sandbox container or VM), accessed via SSH/SFTP.
 
     File operations use SFTP. Shell operations manage a remote tmux session
     via SSH exec_command. Uses the same sentinel-based completion detection
@@ -117,6 +117,7 @@ class RemoteBackend(WorkspaceBackend):
         sandbox_cwd: Optional[str] = None,
         connect_timeout: int = 30,
         max_retries: int = 5,
+        sudo_action: str = "freeze",
     ):
         if paramiko is None:
             raise ImportError(
@@ -135,6 +136,7 @@ class RemoteBackend(WorkspaceBackend):
         self._max_tabs = max_tabs
         self._connect_timeout = connect_timeout
         self._max_retries = max_retries
+        self._sudo_action = sudo_action
 
         if blocked_commands is None:
             self._blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -668,11 +670,30 @@ class RemoteBackend(WorkspaceBackend):
         return lines
 
     def _check_blocked(self, command: str) -> Optional[str]:
-        """Return error message if command is blocked, else None."""
-        if not self._blocked_commands:
-            return None
+        """Return error message if command is blocked, else None.
+
+        Returns SUDO_FREEZE_SENTINEL when sudo_action is "freeze" and the
+        command starts with sudo. The tool layer detects this sentinel and
+        triggers a job freeze (VM upgrade prompt).
+        """
         first_word = command.strip().split()[0] if command.strip() else ""
-        if first_word in self._blocked_commands:
+        if not first_word:
+            return None
+
+        # Sudo intercept (separate from blocked_commands)
+        if first_word == "sudo":
+            if self._sudo_action == "allow":
+                return None  # VM-backed workspace: pass through to sudo gate
+            elif self._sudo_action == "freeze":
+                return SUDO_FREEZE_SENTINEL
+            else:  # "block"
+                return (
+                    "Command blocked: 'sudo' is not available in this workspace. "
+                    "System package installation requires a VM runtime."
+                )
+
+        # Standard blocked commands
+        if self._blocked_commands and first_word in self._blocked_commands:
             return (
                 f"Command blocked: '{first_word}' is not allowed. "
                 f"Blocked commands: {', '.join(sorted(self._blocked_commands))}"

@@ -31,12 +31,12 @@ workspace:
   max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
-  # Workspace backend: "remote" (SSH container/VM) or "container"
-  # (orchestrator-provisioned per job). The agent never operates on its own
+  # Workspace backend: "sandbox" (SSH workspace container) or "vm"
+  # (KubeVirt VM with sudo gate). The agent never operates on its own
   # filesystem — every workspace lives in an isolated SSH-accessible
   # container or VM. The orchestrator injects the connection details at
   # dispatch time.
-  backend: remote
+  backend: sandbox
   # Remote backend settings (injected by orchestrator at dispatch time)
   # remote:
   #   host: ""                                        # VM/container hostname or IP

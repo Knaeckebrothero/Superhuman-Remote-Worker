@@ -499,6 +499,104 @@ class TestBlockedCommandSend:
             assert "blocked" in result.lower(), f"{cmd} was not blocked by send()"
 
 
+class TestRunSyncSudoFreeze:
+    """Tests for sudo freeze interception in run_sync()."""
+
+    def test_run_sync_freezes_sudo_by_default(self, manager):
+        """run_sync() returns freeze sentinel for sudo (default sudo_action=freeze)."""
+        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
+
+        result = manager.run_sync("sudo apt-get install -y libxml2-dev")
+        assert result == SUDO_FREEZE_SENTINEL
+
+    def test_run_sync_allows_sudo_when_action_allow(self, manager):
+        """run_sync() allows sudo when sudo_action='allow' (VM-backed agents)."""
+        manager.sudo_action = "allow"
+        result = manager.run_sync("sudo true")
+        # Should execute (or fail naturally), not return sentinel
+        assert "SUDO_FREEZE" not in result
+        manager.sudo_action = "freeze"
+
+    def test_run_sync_blocks_sudo_when_action_block(self, manager):
+        """run_sync() hard-blocks sudo when sudo_action='block'."""
+        manager.sudo_action = "block"
+        result = manager.run_sync("sudo ls")
+        assert "blocked" in result.lower()
+        manager.sudo_action = "freeze"
+
+
+class TestSudoFreezeWithBackend:
+    """Tests that sudo freeze works even when a backend is active.
+
+    This validates the fix for the early-return bypass: _check_blocked()
+    must run before backend delegation in both run_sync() and send().
+    """
+
+    def test_run_sync_freezes_sudo_before_backend(self):
+        """run_sync() returns freeze sentinel without calling backend.shell_run()."""
+        from unittest.mock import MagicMock
+
+        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, ShellManager
+
+        job_id = str(uuid.uuid4())
+        mock_backend = MagicMock()
+        mock_backend.supports_shell = True
+
+        sm = ShellManager(
+            job_id=job_id,
+            backend=mock_backend,
+            sudo_action="freeze",
+        )
+
+        result = sm.run_sync("sudo apt install foo")
+        assert result == SUDO_FREEZE_SENTINEL
+        mock_backend.shell_run.assert_not_called()
+        sm.cleanup()
+
+    def test_send_freezes_sudo_before_backend(self):
+        """send() returns freeze sentinel without calling backend.shell_send()."""
+        from unittest.mock import MagicMock
+
+        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL, ShellManager
+
+        job_id = str(uuid.uuid4())
+        mock_backend = MagicMock()
+        mock_backend.supports_shell = True
+
+        sm = ShellManager(
+            job_id=job_id,
+            backend=mock_backend,
+            sudo_action="freeze",
+        )
+
+        result = sm.send("default", "sudo ls", enter=True)
+        assert result == SUDO_FREEZE_SENTINEL
+        mock_backend.shell_send.assert_not_called()
+        sm.cleanup()
+
+    def test_non_sudo_delegates_to_backend(self):
+        """Non-sudo commands still delegate to the backend normally."""
+        from unittest.mock import MagicMock
+
+        from src.tools.shell.shell_manager import ShellManager
+
+        job_id = str(uuid.uuid4())
+        mock_backend = MagicMock()
+        mock_backend.supports_shell = True
+        mock_backend.shell_run.return_value = "Exit code: 0\n--- stdout ---\nhello"
+
+        sm = ShellManager(
+            job_id=job_id,
+            backend=mock_backend,
+            sudo_action="freeze",
+        )
+
+        result = sm.run_sync("echo hello")
+        assert "hello" in result
+        mock_backend.shell_run.assert_called_once()
+        sm.cleanup()
+
+
 class TestApplyTailTerminalState:
     """Tests for _apply_tail handling terminal state format."""
 

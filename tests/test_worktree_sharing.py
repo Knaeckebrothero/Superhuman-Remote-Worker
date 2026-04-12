@@ -41,7 +41,7 @@ def _job_needs_container_logic(job: dict, provisioner_available: bool = False) -
     backend = co.get("workspace", {}).get("backend")
     if backend == "container":
         return True
-    if backend == "remote":
+    if backend in ("vm", "remote"):
         return False
     return provisioner_available
 
@@ -290,7 +290,7 @@ class TestDispatchWorktreePath:
         """worktree_path overrides remote.workspace_path in config_override."""
         config_override = {
             "workspace": {
-                "backend": "remote",
+                "backend": "vm",
                 "remote": {
                     "host": "100.64.0.1",
                     "port": 22,
@@ -566,7 +566,7 @@ def _job_needs_vm_logic(job: dict) -> bool:
             co = json.loads(co)
         except (json.JSONDecodeError, TypeError):
             co = {}
-    return co.get("workspace", {}).get("backend") == "remote"
+    return co.get("workspace", {}).get("backend") in ("vm", "remote")
 
 
 class TestJobNeedsVmInherited:
@@ -594,11 +594,11 @@ class TestJobNeedsVmInherited:
         }
         assert _job_needs_vm_logic(job) is True
 
-    def test_remote_backend_config_returns_true(self):
-        """Explicit remote backend in config_override returns True."""
+    def test_vm_backend_config_returns_true(self):
+        """Explicit vm backend in config_override returns True."""
         job = {
             "context": {},
-            "config_override": {"workspace": {"backend": "remote"}},
+            "config_override": {"workspace": {"backend": "vm"}},
         }
         assert _job_needs_vm_logic(job) is True
 
@@ -612,8 +612,8 @@ class TestJobNeedsVmInherited:
         }
         assert _job_needs_vm_logic(job) is False
 
-    def test_no_vm_no_remote_backend(self):
-        """Job with neither VM context nor remote backend returns False."""
+    def test_no_vm_no_vm_backend(self):
+        """Job with neither VM context nor vm backend returns False."""
         job = {"context": {}, "config_override": {}}
         assert _job_needs_vm_logic(job) is False
 
@@ -690,7 +690,7 @@ class TestDispatchParentJobUnaffected:
         """Parent job's workspace_path stays /home/agent-host/workspace."""
         config_override = {
             "workspace": {
-                "backend": "remote",
+                "backend": "vm",
                 "remote": {
                     "host": "100.64.0.1",
                     "workspace_path": "/home/agent-host/workspace",
