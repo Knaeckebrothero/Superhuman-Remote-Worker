@@ -122,6 +122,8 @@ spec:
       labels:
         app: srw-opencloud
     spec:
+      securityContext:
+        fsGroup: 1000
       initContainers:
         - name: wait-for-keycloak
           image: busybox:1.36
