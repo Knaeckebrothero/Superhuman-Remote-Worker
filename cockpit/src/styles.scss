@@ -119,13 +119,42 @@ textarea:focus-visible {
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Only enforce touch-target size on primary/nav buttons, not inline action buttons */
-  .mobile-tab-bar button,
+  /* Enforce touch-target sizes on interactive elements */
   .send-btn,
   .stop-btn,
   button.btn-primary,
-  .btn {
+  .btn,
+  .filter-chip,
+  .tab-button {
     min-height: 44px;
     min-width: 44px;
+  }
+}
+
+/* Route transition animations (progressive enhancement via withViewTransitions) */
+::view-transition-old(root) {
+  animation: 150ms ease-out forwards vt-fade-out;
+}
+::view-transition-new(root) {
+  animation: 150ms ease-in forwards vt-fade-in;
+}
+@keyframes vt-fade-out { to { opacity: 0; } }
+@keyframes vt-fade-in { from { opacity: 0; } }
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Disable hover effects on touch devices */
+@media (hover: none) {
+  .interactive:hover {
+    background: transparent;
   }
 }

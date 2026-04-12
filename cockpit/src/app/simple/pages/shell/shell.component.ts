@@ -1,11 +1,9 @@
 import {Component, ElementRef, HostListener, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {DatePipe} from '@angular/common';
-import {ViewportService} from '../../../core/services/viewport.service';
 import {JobArtifactService} from '../../../core/services/job-artifact.service';
 import {ModelService} from '../../../core/services/model.service';
 import {UserService} from '../../../core/services/user.service';
 import {BuilderSession, BuilderStreamService} from '../../../core/services/builder-stream.service';
-import {MobileShellComponent} from '../../layout/mobile-shell/mobile-shell.component';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {
     InstructionBuilderComponent
@@ -14,11 +12,8 @@ import {
 @Component({
   selector: 'app-shell-page',
   standalone: true,
-  imports: [MobileShellComponent, SidebarToggleComponent, InstructionBuilderComponent, DatePipe],
+  imports: [SidebarToggleComponent, InstructionBuilderComponent, DatePipe],
   template: `
-    @if (viewport.isMobile()) {
-      <app-mobile-shell />
-    } @else {
       <div class="page">
         <header class="page-header">
           <app-sidebar-toggle />
@@ -86,7 +81,6 @@ import {
           <app-instruction-builder />
         </main>
       </div>
-    }
   `,
   styles: [
     `
@@ -335,12 +329,42 @@ import {
         flex: 1;
         overflow: hidden;
       }
+
+      @media (max-width: 768px) {
+        .page-header {
+          gap: 4px;
+          padding: 0 8px;
+          height: 44px;
+        }
+
+        .session-title-btn,
+        .model-title-btn {
+          font-size: 11px;
+          padding: 4px 8px;
+          min-height: 32px;
+        }
+
+        .session-title-btn {
+          max-width: 140px;
+        }
+
+        .model-title-btn {
+          max-width: 120px;
+        }
+
+        .session-dropdown,
+        .model-dropdown {
+          min-width: unset;
+          width: calc(100vw - 16px);
+          max-height: 50vh;
+          border-radius: 10px;
+        }
+      }
     `,
   ],
 })
 export class ShellPageComponent implements OnInit {
   private readonly el = inject(ElementRef);
-  readonly viewport = inject(ViewportService);
   readonly artifacts = inject(JobArtifactService);
   private readonly modelService = inject(ModelService);
   private readonly userService = inject(UserService);

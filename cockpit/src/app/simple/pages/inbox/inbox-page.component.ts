@@ -14,10 +14,12 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {JsonPipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
+import {ViewportService} from '../../../core/services/viewport.service';
 import {ActionCenterService} from '../../../core/services/action-center.service';
 import {SudoRequest, SudoService} from '../../../core/services/sudo.service';
 import {ApiService} from '../../../core/services/api.service';
 import {ActionItem, ActionItemType, ThreadDetail,} from '../../../core/models/action.model';
+import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -60,12 +62,13 @@ function relativeTime(iso: string): string {
 @Component({
   selector: 'app-inbox-page',
   standalone: true,
-  imports: [FormsModule, JsonPipe, MarkdownComponent],
+  imports: [FormsModule, JsonPipe, MarkdownComponent, SidebarToggleComponent],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
       <!-- Header -->
       <header class="inbox-header">
         <div class="header-left">
+          <app-sidebar-toggle />
           @if (isMobileDetail()) {
             <button class="back-btn" (click)="deselect()">
               <span class="icon">arrow_back</span>
@@ -1740,7 +1743,8 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     return items.filter((i) => i.type === filter);
   });
 
-  readonly isMobile = signal(window.innerWidth <= 768);
+  private readonly viewport = inject(ViewportService);
+  readonly isMobile = this.viewport.isMobile;
   readonly isMobileDetail = computed(() => {
     return !!this.selectedItem() && this.isMobile();
   });

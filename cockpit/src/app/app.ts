@@ -1,4 +1,4 @@
-import {Component, computed, inject, OnInit} from '@angular/core';
+import {Component, computed, effect, inject, OnInit} from '@angular/core';
 import {RouterOutlet} from '@angular/router';
 import {SidebarComponent} from './layout/sidebar/sidebar.component';
 import {ToastComponent} from './core/components/toast/toast.component';
@@ -37,6 +37,9 @@ import {ConfigEditorComponent} from './shared/components/config-editor/config-ed
     <div class="app-container">
       @if (showSidebar()) {
         <app-sidebar [class.collapsed]="sidebar.collapsed()" />
+      }
+      @if (showMobileBackdrop()) {
+        <div class="sidebar-backdrop" (click)="sidebar.collapse()"></div>
       }
       <div class="content-area">
         @if (pendingApproval()) {
@@ -134,6 +137,38 @@ import {ConfigEditorComponent} from './shared/components/config-editor/config-ed
         color: var(--text-primary, #cdd6f4);
       }
 
+      .sidebar-backdrop {
+        display: none;
+      }
+
+      @media (max-width: 768px) {
+        /* Sidebar overlay on mobile */
+        app-sidebar {
+          position: fixed;
+          top: 0;
+          left: 0;
+          z-index: 1000;
+          height: 100dvh;
+          transform: translateX(-100%);
+          transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+          will-change: transform;
+        }
+
+        app-sidebar:not(.collapsed) {
+          transform: translateX(0);
+        }
+
+        .sidebar-backdrop {
+          display: block;
+          position: fixed;
+          inset: 0;
+          background: rgba(17, 17, 27, 0.6);
+          backdrop-filter: blur(4px);
+          z-index: 999;
+          transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+      }
     `,
   ],
 })
@@ -144,13 +179,28 @@ export class App implements OnInit {
   readonly sidebar = inject(SidebarService);
 
   readonly showSidebar = computed(
-    () => !this.viewport.isMobile() && this.userService.isAuthenticated() && this.userService.isApproved(),
+    () => this.userService.isAuthenticated() && this.userService.isApproved(),
+  );
+
+  readonly showMobileBackdrop = computed(
+    () => this.viewport.isMobile() && !this.sidebar.collapsed() && this.showSidebar(),
   );
 
   /** Show the pending-approval screen when authenticated but not yet approved. */
   readonly pendingApproval = computed(
     () => this.userService.isAuthenticated() && !this.userService.isApproved(),
   );
+
+  constructor() {
+    // Lock body scroll when mobile sidebar is open
+    effect(() => {
+      if (this.viewport.isMobile() && !this.sidebar.collapsed()) {
+        document.body.style.overflow = 'hidden';
+      } else {
+        document.body.style.overflow = '';
+      }
+    });
+  }
 
   ngOnInit(): void {
     this.registerComponents();
