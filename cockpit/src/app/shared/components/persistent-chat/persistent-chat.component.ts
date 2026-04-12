@@ -168,7 +168,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
           @if (chat.isConnected()) {
             @if (chat.ncSessionFolder()) {
-              <button class="ide-btn" (click)="openSessionFiles()" title="Open session files in Nextcloud">
+              <button class="ide-btn" (click)="openSessionFiles()" title="Open session files in Cloud">
                 <span class="ide-icon">cloud</span>
                 Files
               </button>
@@ -2112,9 +2112,9 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     openSessionFiles(): void {
         const folder = this.chat.ncSessionFolder();
-        if (!folder || !environment.nextcloudUrl) return;
+        if (!folder || !environment.cloudUrl) return;
         const folderName = folder.split('/').pop();
-        window.open(`${environment.nextcloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
+        window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     async resumeSession(): Promise<void> {

@@ -710,7 +710,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </p>
                 } @else {
                   <p class="text-muted" style="font-size: 12px;">
-                    Cloud storage unavailable — Nextcloud not configured.
+                    Cloud storage unavailable — not configured.
                   </p>
                 }
               </div>
