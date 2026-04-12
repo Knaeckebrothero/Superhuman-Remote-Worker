@@ -1009,6 +1009,38 @@ class TestRemoteBackendCheckBlocked:
         assert backend._check_blocked("ls -la") is None
         assert backend._check_blocked("reboot") is None  # not in custom list
 
+    def test_sudo_freeze_returns_sentinel(self):
+        """sudo_action='freeze' (default) returns SUDO_FREEZE_SENTINEL."""
+        from src.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
+
+        backend = RemoteBackend(
+            host="host", workspace_path="/ws", sudo_action="freeze"
+        )
+        result = backend._check_blocked("sudo apt-get install -y libxml2-dev")
+        assert result == SUDO_FREEZE_SENTINEL
+
+    def test_sudo_allow_passes_through(self):
+        """sudo_action='allow' returns None (VM-backed agents)."""
+        backend = RemoteBackend(
+            host="host", workspace_path="/ws", sudo_action="allow"
+        )
+        result = backend._check_blocked("sudo apt-get install -y libxml2-dev")
+        assert result is None
+
+    def test_sudo_block_returns_error(self):
+        """sudo_action='block' returns an error message."""
+        backend = RemoteBackend(
+            host="host", workspace_path="/ws", sudo_action="block"
+        )
+        result = backend._check_blocked("sudo ls")
+        assert result is not None
+        assert "blocked" in result.lower()
+
+    def test_sudo_freeze_is_default(self):
+        """Default sudo_action is 'freeze'."""
+        backend = RemoteBackend(host="host", workspace_path="/ws")
+        assert backend._sudo_action == "freeze"
+
 
 class TestRemoteBackendInteractiveDetection:
     """Tests for RemoteBackend._detect_interactive_prompt()."""

@@ -374,7 +374,7 @@ class TestPollWorkspaceReady:
         result = await _poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
-        assert result["backend"] == "remote"
+        assert result["backend"] == "vm"
         assert result["remote"]["host"] == "10.0.0.5"
         assert result["remote"]["port"] == 2222
 
@@ -391,7 +391,7 @@ class TestPollWorkspaceReady:
         result = await _poll_workspace_ready(client, "tid", timeout=5)
 
         assert result is not None
-        assert result["backend"] == "remote"
+        assert result["backend"] == "sandbox"
         assert result["remote"]["host"] == "172.16.0.10"
         assert result["remote"]["port"] == 22
 

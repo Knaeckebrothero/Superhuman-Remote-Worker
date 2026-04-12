@@ -816,14 +816,14 @@ class TestDispatchHelpers:
         }
         assert self._get_backend(job) == "container"
 
-    def test_job_needs_container_explicit_remote(self):
-        """Job with backend: remote is detected."""
+    def test_job_needs_container_explicit_sandbox(self):
+        """Job with backend: sandbox is detected."""
         import json
 
         job = {
-            "config_override": json.dumps({"workspace": {"backend": "remote"}}),
+            "config_override": json.dumps({"workspace": {"backend": "sandbox"}}),
         }
-        assert self._get_backend(job) == "remote"
+        assert self._get_backend(job) == "sandbox"
 
     def test_job_no_explicit_backend(self):
         """Job with no backend returns None (default behavior)."""

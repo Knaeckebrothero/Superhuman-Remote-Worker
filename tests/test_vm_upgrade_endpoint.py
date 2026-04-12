@@ -88,7 +88,7 @@ def _job_needs_vm(job: dict) -> bool:
             co = json.loads(co)
         except (json.JSONDecodeError, TypeError):
             co = {}
-    return co.get("workspace", {}).get("backend") == "remote"
+    return co.get("workspace", {}).get("backend") in ("vm", "remote")
 
 
 def _simulate_approve(job: dict, workspace_base: Path) -> tuple[dict, str | None]:
@@ -390,11 +390,11 @@ class TestDispatchDetectsUpgrade:
         )
         assert _job_needs_vm(job) is False
 
-    def test_job_needs_vm_with_remote_backend(self):
-        """_job_needs_vm returns True for explicit remote backend."""
+    def test_job_needs_vm_with_vm_backend(self):
+        """_job_needs_vm returns True for explicit vm backend."""
         job = make_job(
             status="paused",
-            config_override={"workspace": {"backend": "remote"}},
+            config_override={"workspace": {"backend": "vm"}},
         )
         assert _job_needs_vm(job) is True
 
