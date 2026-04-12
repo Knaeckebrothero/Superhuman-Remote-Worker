@@ -398,15 +398,15 @@ import {getReasoningOptions} from './reasoning-options';
                   [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
                   (ngModelChange)="workspaceBackend.set($event); emitChange()"
                   [disabled]="disabled()">
-                  <option value="container">Container</option>
-                  <option value="remote">VM (QEMU)</option>
+                  <option value="sandbox">Container</option>
+                  <option value="vm">VM (QEMU)</option>
                 </select>
                 @if (workspaceBackend() !== null) {
                   <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()">close</button>
                 }
               </div>
             </div>
-            @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'remote') {
+            @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
                 <label class="field-label">VM CPU cores</label>
                 <div class="field-control">
@@ -1025,7 +1025,7 @@ export class AdvancedAccordionComponent {
   readonly resolvedKeepRecentToolResults = computed(() => (this.r('context_management.keep_recent_tool_results') ?? 150) as number);
   readonly resolvedKeepRecentMessages = computed(() => (this.r('context_management.keep_recent_messages') ?? 10) as number);
 
-  readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'container') as string);
+  readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
   readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 2) as number);
   readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '4Gi') as string);
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
@@ -1184,7 +1184,7 @@ export class AdvancedAccordionComponent {
     // Workspace
     const ws: Record<string, unknown> = {};
     if (this.workspaceBackend() !== null) ws['backend'] = this.workspaceBackend();
-    if (this.workspaceBackend() === 'remote') {
+    if (this.workspaceBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
       if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
