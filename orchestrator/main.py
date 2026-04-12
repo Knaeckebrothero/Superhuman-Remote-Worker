@@ -70,7 +70,7 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
 
 from pydantic import BaseModel, Field  # noqa: E402
 
@@ -6492,6 +6492,17 @@ _PROXY_HOP_HEADERS = frozenset(
 )
 async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     """Reverse proxy HTTP requests to code-server in a workspace pod."""
+    # Neuter code-server's service worker — it caches aggressively behind the
+    # reverse proxy and breaks subsequent visits (infinite loading screen).
+    # Return a no-op worker so the browser doesn't intercept fetches.
+    if path.endswith("serviceWorker.js") or path.endswith("service-worker.js"):
+        return Response(
+            content="self.addEventListener('install',()=>self.skipWaiting());"
+            "self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));",
+            media_type="application/javascript",
+            headers={"cache-control": "no-store"},
+        )
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
@@ -9090,11 +9101,31 @@ async def list_threads(
             project_id=project_id,
             status=status,
         )
+        for t in threads:
+            t["cloud_session_url"] = _resolve_cloud_session_url(t)
         return {"threads": threads}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
+    """Compute a backend-agnostic browser URL for a thread's cloud folder."""
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not handle_str:
+        return None
+    backend_id = thread.get("main_cloud_backend") or None
+    backend = main_cloud_router.for_backend(backend_id)
+    if not backend.is_initialized:
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        return backend.get_session_folder_browser_url(handle)
+    except Exception:
+        return None
 
 
 @app.get("/api/persistent/threads/{thread_id}")
@@ -9106,7 +9137,9 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Thread not found")
     if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
-    return dict(thread)
+    result = dict(thread)
+    result["cloud_session_url"] = _resolve_cloud_session_url(thread)
+    return result
 
 
 @app.delete("/api/persistent/threads/{thread_id}")
@@ -9202,6 +9235,45 @@ async def resume_thread(
         )
 
     await postgres_db.resume_thread(thread_id)
+
+    # Provision cloud session folder if missing (e.g. session was created
+    # before the cloud backend was initialized).
+    if not thread.get("main_cloud_session_handle") and not thread.get(
+        "nc_session_folder"
+    ):
+
+        async def _late_cloud_setup(tid: str, usr: dict) -> None:
+            backend = main_cloud_router.active
+            if not backend.is_initialized and backend.is_configured:
+                await backend.ensure_initialized()
+            if not backend.is_initialized:
+                return
+            try:
+                session_handle = await backend.ensure_session_folder(
+                    session_id=tid[:8]
+                )
+                share_handle = None
+                resolved_user_id = await backend.resolve_user_identity(
+                    usr.get("email"),
+                    usr.get("display_name", "").lower(),
+                )
+                if resolved_user_id:
+                    share_handle = await backend.share_session_folder(
+                        session_handle, resolved_user_id
+                    )
+                await postgres_db.update_thread_main_cloud(
+                    tid,
+                    backend_id=backend.backend_id,
+                    session_handle=session_handle.to_db(),
+                    share_handle=share_handle.to_db() if share_handle else None,
+                )
+                logger.info("Thread %s: late-provisioned cloud session folder", tid)
+            except Exception as e:
+                logger.warning(
+                    "Thread %s: late cloud folder provisioning failed: %s", tid, e
+                )
+
+        asyncio.create_task(_late_cloud_setup(thread_id, user))
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:

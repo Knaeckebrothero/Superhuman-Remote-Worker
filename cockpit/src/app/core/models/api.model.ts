@@ -481,6 +481,7 @@ export interface Thread {
   total_tokens: number;
   nc_session_folder?: string | null;
   nc_share_id?: number | null;
+  cloud_session_url?: string | null;
   metadata?: Record<string, unknown>;
 }
 

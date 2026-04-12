@@ -167,7 +167,7 @@ const CATEGORY_LABELS: Record<string, string> = {
           }
 
           @if (chat.isConnected()) {
-            @if (chat.ncSessionFolder()) {
+            @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
               <button class="ide-btn" (click)="openSessionFiles()" title="Open session files in Cloud">
                 <span class="ide-icon">cloud</span>
                 Files
@@ -555,6 +555,7 @@ const CATEGORY_LABELS: Record<string, string> = {
             class="chat-input"
             [(ngModel)]="inputText"
             (ngModelChange)="onInputChange($event)"
+            (input)="autoResizeInput()"
             (keydown)="onKeydown($event)"
             (focus)="inputFocused.set(true)"
             (blur)="inputFocused.set(false)"
@@ -1534,8 +1535,9 @@ const CATEGORY_LABELS: Record<string, string> = {
         font-family: inherit;
         resize: none;
         min-height: 24px;
-        max-height: 120px;
+        max-height: 180px;
         line-height: 1.5;
+        overflow-y: auto;
       }
 
       .chat-input:focus,
@@ -1998,6 +2000,13 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.stopIdePolling();
     }
 
+    autoResizeInput(): void {
+        const el = this.inputEl?.nativeElement;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = el.scrollHeight + 'px';
+    }
+
     send(): void {
         const text = this.inputText.trim();
         if (!text) return;
@@ -2111,6 +2120,13 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     openSessionFiles(): void {
+        // Prefer the backend-computed URL (works for all backends).
+        const cloudUrl = this.chat.cloudSessionUrl();
+        if (cloudUrl) {
+            window.open(cloudUrl, '_blank');
+            return;
+        }
+        // Legacy fallback for Nextcloud sessions without a computed URL.
         const folder = this.chat.ncSessionFolder();
         if (!folder || !environment.cloudUrl) return;
         const folderName = folder.split('/').pop();

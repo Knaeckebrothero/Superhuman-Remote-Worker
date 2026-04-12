@@ -88,6 +88,7 @@ export class PersistentChatService {
     readonly temperature = signal<number>(0);
     readonly turnCount = signal<number>(0);
     readonly ncSessionFolder = signal<string | null>(null);
+    readonly cloudSessionUrl = signal<string | null>(null);
 
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
@@ -135,6 +136,7 @@ export class PersistentChatService {
         this.temperature.set(0);
         this.turnCount.set(0);
         this.ncSessionFolder.set(null);
+        this.cloudSessionUrl.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
         this.isSessionPaused.set(false);
@@ -225,6 +227,7 @@ export class PersistentChatService {
             }
             this.turnCount.set(thread.total_turns || 0);
             this.ncSessionFolder.set(thread.nc_session_folder || null);
+            this.cloudSessionUrl.set(thread.cloud_session_url || null);
         } catch {
             // Non-fatal — UI will show fallback values
         }
@@ -286,6 +289,7 @@ export class PersistentChatService {
         this.temperature.set(0);
         this.turnCount.set(0);
         this.ncSessionFolder.set(null);
+        this.cloudSessionUrl.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
         this.isSessionPaused.set(false);
