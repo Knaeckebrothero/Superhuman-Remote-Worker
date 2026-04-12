@@ -680,9 +680,9 @@ export class SessionsPageComponent implements OnInit {
     }
 
     openSessionFiles(thread: Thread): void {
-        if (!thread.nc_session_folder || !environment.nextcloudUrl) return;
+        if (!thread.nc_session_folder || !environment.cloudUrl) return;
         const folderName = thread.nc_session_folder.split('/').pop();
-        window.open(`${environment.nextcloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
+        window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
     }
 
     async endSession(thread: Thread): Promise<void> {
