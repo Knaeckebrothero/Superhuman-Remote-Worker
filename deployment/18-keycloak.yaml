@@ -632,6 +632,23 @@ spec:
                       OCGRP=$($KC get groups -r srw -q search=opencloudAdmin --fields id,name 2>/dev/null \
                         | grep -B1 '"opencloudAdmin"' | grep '"id"' | sed 's/.*"id" : "//;s/".*//' || true)
                       [ -z "$OCGRP" ] && OCGRP=$($KC create groups -r srw -s name=opencloudAdmin -i 2>/dev/null)
+                      # opencloudUser group (default role for all SSO users)
+                      OCUGRP=$($KC get groups -r srw -q search=opencloudUser --fields id,name 2>/dev/null \
+                        | grep -B1 '"opencloudUser"' | grep '"id"' | sed 's/.*"id" : "//;s/".*//' || true)
+                      [ -z "$OCUGRP" ] && OCUGRP=$($KC create groups -r srw -s name=opencloudUser -i 2>/dev/null)
+                      # Make opencloudUser a realm default group — auto-assigned to new users
+                      [ -n "$OCUGRP" ] && $KC update "realms/srw/default-groups/$OCUGRP" -r srw 2>/dev/null
+                      # Add existing realm users (non-service-accounts) to opencloudUser
+                      for UID in $($KC get users -r srw --fields id --format csv --noquotes 2>/dev/null); do
+                        [ -z "$UID" ] && continue
+                        $KC update "users/$UID/groups/$OCUGRP" -r srw \
+                          -s realm=srw -s userId="$UID" -s groupId="$OCUGRP" -n 2>/dev/null || true
+                      done
+                      # Add realm admin to opencloudAdmin
+                      ADMIN_UID=$($KC get users -r srw -q username=test --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      [ -n "$ADMIN_UID" ] && [ -n "$OCGRP" ] && \
+                        $KC update "users/$ADMIN_UID/groups/$OCGRP" -r srw \
+                          -s realm=srw -s userId="$ADMIN_UID" -s groupId="$OCGRP" -n 2>/dev/null
                       # opencloud-web (public client — browser OIDC login)
                       if ! $KC get clients -r srw -q clientId=opencloud-web 2>/dev/null | grep -q '"opencloud-web"'; then
                         $KC create clients -r srw \
