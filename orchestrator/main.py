@@ -787,9 +787,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-host/workspace")
             # Sandbox uses sudo freeze mechanism (VM upgrade prompt)
-            config_override.setdefault("shell", {}).setdefault(
-                "sudo_action", "freeze"
-            )
+            config_override.setdefault("shell", {}).setdefault("sudo_action", "freeze")
             logger.info(
                 f"Dispatch: injected workspace container config for job {job_id} "
                 f"(host={container_host}:{container_ctx.get('port', 22)}, "
