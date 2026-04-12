@@ -1,9 +1,10 @@
 import {Component, computed, inject, signal} from '@angular/core';
 import {NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
-import {toSignal} from '@angular/core/rxjs-interop';
+import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
 import {filter, map} from 'rxjs';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
+import {ViewportService} from '../../core/services/viewport.service';
 import {LayoutService} from '../../debug/services/layout.service';
 import {LayoutPickerComponent} from '../../debug/components/layout-picker/layout-picker.component';
 import {NotificationBellComponent} from '../../shared/components/notification-bell/notification-bell.component';
@@ -75,14 +76,16 @@ import {environment} from '../../core/environment';
             <span class="nav-icon">add_circle</span>
             Create
           </a>
-          <a
-            class="nav-link"
-            routerLink="/debug"
-            routerLinkActive="active"
-          >
-            <span class="nav-icon">bug_report</span>
-            Debug
-          </a>
+          @if (!viewport.isMobile()) {
+            <a
+              class="nav-link"
+              routerLink="/debug"
+              routerLinkActive="active"
+            >
+              <span class="nav-icon">bug_report</span>
+              Debug
+            </a>
+          }
         </div>
 
         @if (isDebugRoute()) {
@@ -428,10 +431,23 @@ export class SidebarComponent {
   readonly sidebar = inject(SidebarService);
   readonly layoutService = inject(LayoutService);
   private readonly router = inject(Router);
-    private readonly chatService = inject(PersistentChatService);
+  private readonly chatService = inject(PersistentChatService);
+  readonly viewport = inject(ViewportService);
 
-    /** Sessions link — always goes to the session list. */
-    readonly sessionsLink = computed(() => '/sessions');
+  /** Sessions link — always goes to the session list. */
+  readonly sessionsLink = computed(() => '/sessions');
+
+  constructor() {
+    // Auto-collapse sidebar on mobile after navigation
+    this.router.events.pipe(
+      filter(e => e instanceof NavigationEnd),
+      takeUntilDestroyed(),
+    ).subscribe(() => {
+      if (this.viewport.isMobile()) {
+        this.sidebar.collapse();
+      }
+    });
+  }
 
   private readonly currentUrl = toSignal(
     this.router.events.pipe(

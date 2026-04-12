@@ -8,6 +8,7 @@ import {UserService} from '../../../core/services/user.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {AgentSettingsComponent} from '../../../shared/components/agent-settings/agent-settings.component';
 import {ModelService} from '../../../core/services/model.service';
+import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 
 interface Project {
   id: string;
@@ -40,10 +41,11 @@ interface ExpertDetail extends Expert {
 @Component({
   selector: 'app-session-create',
   standalone: true,
-  imports: [FormsModule, AgentSettingsComponent],
+  imports: [FormsModule, AgentSettingsComponent, SidebarToggleComponent],
   template: `
     <div class="session-create-page">
       <div class="page-header">
+        <app-sidebar-toggle />
         <h2>New Session</h2>
         <button class="btn btn-secondary" (click)="cancel()">Cancel</button>
       </div>
@@ -342,6 +344,29 @@ interface ExpertDetail extends Expert {
       background-position: right 12px center;
       padding-right: 32px;
     }
+
+    @media (max-width: 768px) {
+      .form-container {
+        max-width: 100%;
+        padding: 12px;
+      }
+
+      .page-header {
+        padding: 8px 12px;
+      }
+
+      .expert-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .form-actions {
+        flex-direction: column;
+      }
+
+      .form-actions button {
+        width: 100%;
+      }
+    }
   `],
 })
 export class SessionCreateComponent implements OnInit {
@@ -388,7 +413,13 @@ export class SessionCreateComponent implements OnInit {
 
   private loadProjects(userId: string): void {
     this.http.get<Project[]>(`${environment.apiUrl}/projects?user_id=${userId}`).subscribe({
-      next: (projects) => this.projects.set(projects),
+      next: (projects) => {
+        this.projects.set(projects);
+        const defaultProject = projects.find(p => p.is_default);
+        if (defaultProject) {
+          this.selectedProjectIds.set(new Set([defaultProject.id]));
+        }
+      },
     });
   }
 

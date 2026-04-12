@@ -772,13 +772,13 @@ interface ChatMessage {
         }
 
         :host ::ng-deep .markdown-body pre {
-          max-width: calc(100vw - 80px);
+          max-width: min(95vw, calc(100% - 20px));
         }
 
         :host ::ng-deep .markdown-body table {
           display: block;
           overflow-x: auto;
-          max-width: calc(100vw - 80px);
+          max-width: min(95vw, calc(100% - 20px));
         }
       }
 
@@ -970,20 +970,6 @@ interface ChatMessage {
         white-space: normal;
       }
 
-      /* Mobile adjustments */
-      @media (max-width: 768px) {
-        .message {
-          max-width: 95%;
-        }
-
-        .input-area {
-          padding-bottom: env(safe-area-inset-bottom, 0px);
-        }
-
-        .chat-input {
-          font-size: 16px;
-        }
-      }
     `,
   ],
 })

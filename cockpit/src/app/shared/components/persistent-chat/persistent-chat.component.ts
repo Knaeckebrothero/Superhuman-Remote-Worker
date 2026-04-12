@@ -17,6 +17,7 @@ import {PersistentChatService, ToolCallInfo,} from '../../../core/services/persi
 import {ApiService, IdeSessionStatus} from '../../../core/services/api.service';
 import {ModelService} from '../../../core/services/model.service';
 import {environment} from '../../../core/environment';
+import {SidebarToggleComponent} from '../../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 
 interface SlashCommand {
     command: string;
@@ -142,12 +143,13 @@ const CATEGORY_LABELS: Record<string, string> = {
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
-    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent],
+    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent, SidebarToggleComponent],
     template: `
     <div class="chat-container">
       <!-- Header -->
       <div class="chat-header">
         <div class="header-left">
+          <app-sidebar-toggle />
           <a class="back-link" routerLink="/sessions">
             <span class="back-icon">arrow_back</span>
           </a>
@@ -1841,6 +1843,39 @@ const CATEGORY_LABELS: Record<string, string> = {
         font-style: italic;
         cursor: help;
         border-bottom: 1px dashed #89b4fa;
+      }
+
+      @media (max-width: 768px) {
+        .chat-header {
+          flex-wrap: wrap;
+          gap: 4px;
+          padding: 6px 8px;
+        }
+
+        .settings-select {
+          max-width: 140px;
+        }
+
+        .messages {
+          padding: 10px;
+        }
+
+        .message {
+          max-width: 98%;
+        }
+
+        .permission-request {
+          width: 95%;
+        }
+
+        .chat-input {
+          font-size: 16px;
+        }
+
+        .input-area {
+          padding: 8px;
+          padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+        }
       }
     `,
     ],

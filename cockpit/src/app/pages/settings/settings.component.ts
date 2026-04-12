@@ -18,6 +18,7 @@ import {
     McpTokenCreateResponse,
     Project
 } from '../../core/models/api.model';
+import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -33,11 +34,14 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 @Component({
   selector: 'app-settings',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, SidebarToggleComponent],
   template: `
     <div class="settings-page">
       <div class="settings-container">
-        <h1 class="page-title">Settings</h1>
+        <div class="page-header">
+          <app-sidebar-toggle />
+          <h1 class="page-title">Settings</h1>
+        </div>
 
         <!-- API Keys Section -->
         <section class="settings-section">
@@ -819,10 +823,17 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       color: var(--text-primary, #cdd6f4);
     }
 
+    .page-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 32px;
+    }
+
     .page-title {
       font-size: 24px;
       font-weight: 700;
-      margin-bottom: 32px;
+      margin: 0;
       color: var(--text-primary, #cdd6f4);
     }
 
