@@ -127,10 +127,10 @@ interface ChatMessage {
                   }
                 </div>
                 <div class="proposal-actions">
-                  <button class="proposal-btn apply-btn" (click)="applyWorkspaceEdit(edit)">
+                  <button type="button" class="proposal-btn apply-btn" (click)="applyWorkspaceEdit(edit)">
                     <span class="btn-icon">check</span> Apply
                   </button>
-                  <button class="proposal-btn dismiss-btn-ws" (click)="dismissWorkspaceEdit(edit)">
+                  <button type="button" class="proposal-btn dismiss-btn-ws" (click)="dismissWorkspaceEdit(edit)">
                     <span class="btn-icon">close</span> Dismiss
                   </button>
                 </div>
@@ -160,9 +160,9 @@ interface ChatMessage {
             <span class="error-text">{{ error() }}</span>
             <div class="error-actions">
               @if (lastFailedMessage()) {
-                <button class="retry-btn" (click)="retryLastMessage()">Retry</button>
+                <button type="button" class="retry-btn" (click)="retryLastMessage()">Retry</button>
               }
-              <button class="dismiss-btn" (click)="dismissError()">close</button>
+              <button type="button" class="dismiss-btn" (click)="dismissError()">close</button>
             </div>
           </div>
         }
@@ -178,7 +178,7 @@ interface ChatMessage {
             rows="1"
           ></textarea>
           @if (artifacts.streaming()) {
-            <button
+            <button type="button"
               class="stop-btn"
               (click)="stopStreaming()"
               title="Stop generation"
@@ -186,7 +186,7 @@ interface ChatMessage {
               stop
             </button>
           } @else {
-            <button
+            <button type="button"
               class="send-btn"
               (click)="sendMessage()"
               [disabled]="!inputText.trim() || isCreatingSession()"

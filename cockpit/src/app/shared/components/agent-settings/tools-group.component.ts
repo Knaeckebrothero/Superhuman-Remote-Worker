@@ -59,7 +59,7 @@ import {
                   <option [ngValue]="3">3</option>
                 </select>
                 @if (delegationMaxDepth() !== null) {
-                  <button class="reset-btn" (click)="delegationMaxDepth.set(null); change.emit()">close</button>
+                  <button type="button" class="reset-btn" (click)="delegationMaxDepth.set(null); change.emit()">close</button>
                 }
               </div>
               <div class="inline-field" [class.modified]="delegationTimeout() !== null">
@@ -69,7 +69,7 @@ import {
                   (ngModelChange)="onDelegationTimeoutChange($event)"
                   [disabled]="disabled()">
                 @if (delegationTimeout() !== null) {
-                  <button class="reset-btn" (click)="delegationTimeout.set(null); change.emit()">close</button>
+                  <button type="button" class="reset-btn" (click)="delegationTimeout.set(null); change.emit()">close</button>
                 }
               </div>
             </div>
