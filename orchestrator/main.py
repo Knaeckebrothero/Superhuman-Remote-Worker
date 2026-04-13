@@ -4486,12 +4486,17 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 async def list_sudo_requests(
     job_id: str | None = Query(None, description="Filter by job ID"),
     status: str | None = Query(None, description="Filter by status"),
-    request_type: str | None = Query(None, description="Filter by type (sudo_command, vm_upgrade)"),
+    request_type: str | None = Query(
+        None, description="Filter by type (sudo_command, vm_upgrade)"
+    ),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[dict]:
     """List sudo approval requests."""
     return await sudo_gate.list_requests(
-        job_id=job_id, status=status, request_type=request_type, limit=limit,
+        job_id=job_id,
+        status=status,
+        request_type=request_type,
+        limit=limit,
     )
 
 
@@ -6246,13 +6251,11 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 # so the operator can approve/deny from the Cockpit Sudo tab.
                 if ft == "vm_upgrade_required":
                     try:
-                        sudo_request_id = (
-                            await sudo_gate.insert_vm_upgrade_request(
-                                job_id=job_id,
-                                command=fd.get("command", "unknown"),
-                                reason=fd.get("reason", ""),
-                                config_name=job.get("config_name", ""),
-                            )
+                        sudo_request_id = await sudo_gate.insert_vm_upgrade_request(
+                            job_id=job_id,
+                            command=fd.get("command", "unknown"),
+                            reason=fd.get("reason", ""),
+                            config_name=job.get("config_name", ""),
                         )
                         if sudo_request_id:
                             actions.append(
@@ -6265,7 +6268,10 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
                 try:
                     await _notify_operator_freeze(
-                        job, job_id, ft, fd,
+                        job,
+                        job_id,
+                        ft,
+                        fd,
                         sudo_request_id=sudo_request_id,
                     )
                     actions.append(f"notification sent ({ft})")
