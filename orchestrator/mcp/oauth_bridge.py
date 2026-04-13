@@ -467,9 +467,7 @@ class SRWOAuthProxy(OIDCProxy):
             if not raw:
                 continue
             try:
-                user_info = pyjwt.decode(
-                    raw, options={"verify_signature": False}
-                )
+                user_info = pyjwt.decode(raw, options={"verify_signature": False})
                 break
             except Exception as exc:
                 logger.warning(
