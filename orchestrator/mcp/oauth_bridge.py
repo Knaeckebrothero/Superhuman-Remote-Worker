@@ -251,6 +251,19 @@ class SRWOAuthProxy(OIDCProxy):
             except Exception:
                 user_claims = {}
 
+            # Fallback: if ID token lacks email, try the access token
+            # (Keycloak access tokens are JWTs with user claims too)
+            if "email" not in user_claims:
+                access_token_str = idp_tokens.get("access_token", "")
+                try:
+                    at_claims = pyjwt.decode(
+                        access_token_str, options={"verify_signature": False}
+                    )
+                    if "email" in at_claims:
+                        user_claims["email"] = at_claims["email"]
+                except Exception:
+                    pass
+
             # Get client name from DCR registration
             dcr_client = await self.get_client(transaction["client_id"])
             client_name = (
