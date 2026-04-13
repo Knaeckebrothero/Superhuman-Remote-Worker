@@ -34,7 +34,7 @@ spec:
           command: ["sh", "-c", "until nc -z srw-keycloak 8080; do sleep 2; done"]
       containers:
         - name: orchestrator
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:sha-a395866
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:sha-518d49a
           imagePullPolicy: Always
           ports:
             - containerPort: 8085
