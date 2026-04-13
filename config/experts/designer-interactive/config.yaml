@@ -75,7 +75,7 @@ tools:
 
 interactive:
   permission_mode: supervised
-  idle_timeout_minutes: 120
+  idle_timeout_minutes: 30
 
 memory:
   enabled: true

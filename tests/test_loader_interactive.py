@@ -43,9 +43,9 @@ class TestInteractiveConfigDefaults:
         ic = InteractiveConfig()
         assert ic.permission_mode == "supervised"
 
-    def test_idle_timeout_defaults_to_60(self):
+    def test_idle_timeout_defaults_to_30(self):
         ic = InteractiveConfig()
-        assert ic.idle_timeout_minutes == 60
+        assert ic.idle_timeout_minutes == 30
 
     def test_greeting_default(self):
         ic = InteractiveConfig()
@@ -80,7 +80,7 @@ class TestInteractiveConfigParsing:
         data = _minimal_config_data()
         config = load_agent_config_from_dict(data)
         assert config.interactive.permission_mode == "supervised"
-        assert config.interactive.idle_timeout_minutes == 60
+        assert config.interactive.idle_timeout_minutes == 30
 
     def test_explicit_permission_mode_overrides_default(self):
         data = _minimal_config_data(interactive={"permission_mode": "autonomous"})
@@ -97,14 +97,14 @@ class TestInteractiveConfigParsing:
         data = _minimal_config_data(interactive={"permission_mode": "auto_accept"})
         config = load_agent_config_from_dict(data)
         assert config.interactive.permission_mode == "auto_accept"
-        assert config.interactive.idle_timeout_minutes == 60
+        assert config.interactive.idle_timeout_minutes == 30
 
     def test_empty_interactive_section_uses_defaults(self):
         """Empty interactive dict is the same as missing."""
         data = _minimal_config_data(interactive={})
         config = load_agent_config_from_dict(data)
         assert config.interactive.permission_mode == "supervised"
-        assert config.interactive.idle_timeout_minutes == 60
+        assert config.interactive.idle_timeout_minutes == 30
 
     def test_interactive_config_is_correct_type(self):
         data = _minimal_config_data(interactive={"permission_mode": "supervised"})

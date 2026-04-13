@@ -60,6 +60,7 @@ if _transport == "http":
             # via config_url for OIDC discovery)
             mcp_verifier=_token_verifier,
             verify_id_token=True,  # Keycloak access tokens may be opaque
+            extra_authorize_params={"scope": "openid email profile"},
         )
     else:
         _auth = _token_verifier

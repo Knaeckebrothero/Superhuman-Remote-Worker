@@ -655,7 +655,7 @@
         },
         "idle_timeout_minutes": {
           "type": "integer",
-          "default": 60,
+          "default": 30,
           "minimum": 0,
           "description": "Auto-end session after idle period in minutes (0 = disabled)"
         }
