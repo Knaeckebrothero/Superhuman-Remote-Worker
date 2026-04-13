@@ -50,6 +50,24 @@ _max_sessions_per_process: int = int(
     os.environ.get("MAX_SESSIONS_PER_PROCESS", "0")
 )  # 0 = unlimited
 
+# Pod exit scheduling
+_pending_exit_task: Optional[asyncio.Task] = None
+
+
+def _schedule_exit(delay: float = 1.0) -> None:
+    """Schedule process exit after a short delay (allows final I/O to flush)."""
+    global _pending_exit_task
+
+    if _pending_exit_task and not _pending_exit_task.done():
+        _pending_exit_task.cancel()
+
+    async def _exit():
+        await asyncio.sleep(delay)
+        logger.info("Session complete — exiting process")
+        os._exit(0)
+
+    _pending_exit_task = asyncio.create_task(_exit())
+
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     """Collect metrics for heartbeat."""
@@ -1139,7 +1157,16 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             if idle_timed_out:
                 await _handle_idle_archive()
 
+            # Always detach session on disconnect (idle timeout or not).
+            # Sets thread status to 'idle' and cleans up session state.
+            await _detach_session()
+
             logger.info(f"WebSocket session ended: thread={_thread_id}")
+
+            # Exit process so the pod terminates cleanly.
+            # In K8s (restartPolicy: Never) this lets the stale agent
+            # detector mark the agent offline as a safety net.
+            _schedule_exit(delay=2.0)
 
     return app
 

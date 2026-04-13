@@ -28,7 +28,7 @@ def _make_config(**overrides):
     cfg = MagicMock()
     cfg.interactive.permission_mode = overrides.get("permission_mode", "supervised")
     cfg.interactive.greeting = overrides.get("greeting", "Hello")
-    cfg.interactive.idle_timeout_minutes = overrides.get("idle_timeout", 60)
+    cfg.interactive.idle_timeout_minutes = overrides.get("idle_timeout", 30)
     cfg.workspace.backend = overrides.get("ws_backend", None)
     cfg.workspace.remote = overrides.get("ws_remote", None)
     cfg.workspace.structure = {}

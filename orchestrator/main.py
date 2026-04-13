@@ -10629,11 +10629,70 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
     return {"status": "deleted"}
 
 
+def _resolve_preference_defaults() -> dict[str, Any]:
+    """Compute resolved default values for all user preference fields.
+
+    Reads framework defaults from defaults.yaml / persistent_defaults.yaml
+    and env-var defaults for helper models. This lets the UI show the actual
+    effective value instead of "Not set" / "Server default".
+    """
+    config_dir = _get_config_dir()
+
+    # Worker defaults (defaults.yaml)
+    defaults_path = config_dir / "defaults.yaml"
+    if defaults_path.exists():
+        with open(defaults_path) as f:
+            worker_cfg = yaml.safe_load(f) or {}
+    else:
+        worker_cfg = {}
+
+    # Persistent defaults (persistent_defaults.yaml)
+    persistent_path = config_dir / "persistent_defaults.yaml"
+    if persistent_path.exists():
+        with open(persistent_path) as f:
+            persistent_cfg = yaml.safe_load(f) or {}
+    else:
+        persistent_cfg = {}
+
+    llm = worker_cfg.get("llm", {})
+    aux = worker_cfg.get("auxiliary", {})
+    p_llm = persistent_cfg.get("llm", {})
+
+    return {
+        "default_model": llm.get("model"),
+        "default_autonomy": worker_cfg.get("autonomy"),
+        "default_reasoning_level": llm.get("reasoning_level"),
+        "default_auxiliary_model": aux.get("model") or llm.get("model"),
+        # Helper-model defaults match the env-var fallbacks in the agent code
+        # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
+        "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
+        "default_whisper_model": os.environ.get("WHISPER_MODEL", "whisper-1"),
+        "default_embedding_model": os.environ.get(
+            "EMBEDDING_MODEL", "qwen3-embedding-8b"
+        ),
+        "embedding_provider": os.environ.get("EMBEDDING_PROVIDER", "local"),
+        "persistent_agent": {
+            "model": p_llm.get("model"),
+            "permission_mode": "supervised",
+            "idle_timeout_minutes": 30,
+            "config_name": "",
+        },
+    }
+
+
 @app.get("/api/settings/preferences")
 async def get_user_preferences(request: Request) -> dict[str, Any]:
-    """Get the current user's preference settings."""
+    """Get the current user's preference settings.
+
+    The response includes a ``_resolved`` key containing the effective
+    default for every preference field (derived from framework YAML configs
+    and environment variables). The UI uses this to display the actual
+    value behind "Server default" / "Not set".
+    """
     user = await require_approved_user(request, postgres_db)
-    return await postgres_db.get_user_settings(str(user["id"]))
+    prefs = await postgres_db.get_user_settings(str(user["id"]))
+    prefs["_resolved"] = _resolve_preference_defaults()
+    return prefs
 
 
 @app.patch("/api/settings/preferences")

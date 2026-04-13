@@ -124,12 +124,16 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Default Model</label>
-                <select class="form-input" [(ngModel)]="prefModel">
-                  <option value="">Not set (use expert default)</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefModel()"
+                  [ngModel]="prefModel() ?? resolved().default_model ?? ''"
+                  (ngModelChange)="prefModel.set($event === resolved().default_model ? null : $event)"
+                >
                   @for (group of modelService.models(); track group.group) {
                     <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
                       @for (model of group.models; track model) {
-                        <option [value]="model">{{ model }}</option>
+                        <option [value]="model">{{ model }}{{ !prefModel() && model === resolved().default_model ? ' (default)' : '' }}</option>
                       }
                     </optgroup>
                   }
@@ -137,10 +141,14 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               </div>
               <div>
                 <label class="field-label">Auxiliary Model</label>
-                <select class="form-input" [(ngModel)]="prefAuxModel">
-                  <option value="">Not set (use default)</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefAuxModel()"
+                  [ngModel]="prefAuxModel() ?? resolved().default_auxiliary_model ?? ''"
+                  (ngModelChange)="prefAuxModel.set($event === resolved().default_auxiliary_model ? null : $event)"
+                >
                   @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefAuxModel() && m.id === resolved().default_auxiliary_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
               </div>
@@ -148,22 +156,30 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Default Autonomy</label>
-                <select class="form-input" [(ngModel)]="prefAutonomy">
-                  <option value="">Not set</option>
-                  <option value="full">Full</option>
-                  <option value="review">Review</option>
-                  <option value="partial">Partial</option>
-                  <option value="guided">Guided</option>
-                  <option value="dependent">Dependent</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefAutonomy()"
+                  [ngModel]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
+                  (ngModelChange)="prefAutonomy.set($event === resolved().default_autonomy ? null : $event)"
+                >
+                  <option value="full">Full{{ !prefAutonomy() && resolved().default_autonomy === 'full' ? ' (default)' : '' }}</option>
+                  <option value="review">Review{{ !prefAutonomy() && resolved().default_autonomy === 'review' ? ' (default)' : '' }}</option>
+                  <option value="partial">Partial{{ !prefAutonomy() && resolved().default_autonomy === 'partial' ? ' (default)' : '' }}</option>
+                  <option value="guided">Guided{{ !prefAutonomy() && resolved().default_autonomy === 'guided' ? ' (default)' : '' }}</option>
+                  <option value="dependent">Dependent{{ !prefAutonomy() && resolved().default_autonomy === 'dependent' ? ' (default)' : '' }}</option>
                 </select>
               </div>
               <div>
                 <label class="field-label">Default Reasoning Level</label>
-                <select class="form-input" [(ngModel)]="prefReasoning">
-                  <option value="">Not set</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefReasoning()"
+                  [ngModel]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
+                  (ngModelChange)="prefReasoning.set($event === resolved().default_reasoning_level ? null : $event)"
+                >
+                  <option value="low">Low{{ !prefReasoning() && resolved().default_reasoning_level === 'low' ? ' (default)' : '' }}</option>
+                  <option value="medium">Medium{{ !prefReasoning() && resolved().default_reasoning_level === 'medium' ? ' (default)' : '' }}</option>
+                  <option value="high">High{{ !prefReasoning() && resolved().default_reasoning_level === 'high' ? ' (default)' : '' }}</option>
                 </select>
               </div>
             </div>
@@ -172,20 +188,28 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Vision Model</label>
-                <select class="form-input" [(ngModel)]="prefVisionModel">
-                  <option value="">Server default</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefVisionModel()"
+                  [ngModel]="prefVisionModel() ?? resolved().default_vision_model ?? ''"
+                  (ngModelChange)="prefVisionModel.set($event === resolved().default_vision_model ? null : $event)"
+                >
                   @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefVisionModel() && m.id === resolved().default_vision_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Multimodal model for describing images when primary model is text-only</span>
               </div>
               <div>
                 <label class="field-label">Whisper Model</label>
-                <select class="form-input" [(ngModel)]="prefWhisperModel">
-                  <option value="">Server default</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefWhisperModel()"
+                  [ngModel]="prefWhisperModel() ?? resolved().default_whisper_model ?? ''"
+                  (ngModelChange)="prefWhisperModel.set($event === resolved().default_whisper_model ? null : $event)"
+                >
                   @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefWhisperModel() && m.id === resolved().default_whisper_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Speech-to-text for audio files in workspaces</span>
@@ -194,20 +218,28 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Embedding Model</label>
-                <select class="form-input" [(ngModel)]="prefEmbeddingModel">
-                  <option value="">Server default</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefEmbeddingModel()"
+                  [ngModel]="prefEmbeddingModel() ?? resolved().default_embedding_model ?? ''"
+                  (ngModelChange)="prefEmbeddingModel.set($event === resolved().default_embedding_model ? null : $event)"
+                >
                   @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ !prefEmbeddingModel() && m.id === resolved().default_embedding_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
                   }
                 </select>
                 <span class="field-hint">Vector embeddings for memory, knowledge, and citation search</span>
               </div>
               <div>
                 <label class="field-label">Embedding Provider</label>
-                <select class="form-input" [(ngModel)]="prefEmbeddingProvider">
-                  <option value="">Server default</option>
-                  <option value="local">Local</option>
-                  <option value="openrouter">OpenRouter</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!prefEmbeddingProvider()"
+                  [ngModel]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
+                  (ngModelChange)="prefEmbeddingProvider.set($event === resolved().embedding_provider ? null : $event)"
+                >
+                  <option value="local">Local{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'local' ? ' (default)' : '' }}</option>
+                  <option value="openrouter">OpenRouter{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter' ? ' (default)' : '' }}</option>
                 </select>
                 <span class="field-hint">Where embedding requests are routed</span>
               </div>
@@ -239,18 +271,27 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               <input
                 type="text"
                 class="form-input"
-                placeholder="e.g. claude-sonnet-4-6"
-                [(ngModel)]="paModel"
+                [class.is-default]="!paModel()"
+                [placeholder]="resolved().persistent_agent?.model ?? 'e.g. claude-sonnet-4-6'"
+                [ngModel]="paModel() ?? ''"
+                (ngModelChange)="paModel.set($event?.trim() || null)"
               />
+              @if (!paModel() && resolved().persistent_agent?.model) {
+                <span class="field-hint">Default: {{ resolved().persistent_agent?.model }}</span>
+              }
             </div>
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Permission Mode</label>
-                <select class="form-input" [(ngModel)]="paPermissionMode">
-                  <option value="">Not set</option>
-                  <option value="supervised">Supervised</option>
-                  <option value="auto_accept">Auto-accept</option>
-                  <option value="autonomous">Autonomous</option>
+                <select
+                  class="form-input"
+                  [class.is-default]="!paPermissionMode()"
+                  [ngModel]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
+                  (ngModelChange)="paPermissionMode.set($event === resolved().persistent_agent?.permission_mode ? null : $event)"
+                >
+                  <option value="supervised">Supervised{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (default)' : '' }}</option>
+                  <option value="auto_accept">Auto-accept{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (default)' : '' }}</option>
+                  <option value="autonomous">Autonomous{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (default)' : '' }}</option>
                 </select>
               </div>
               <div>
@@ -277,8 +318,10 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <input
                   type="number"
                   class="form-input"
-                  placeholder="120"
-                  [(ngModel)]="paIdleTimeout"
+                  [class.is-default]="!paIdleTimeout()"
+                  [placeholder]="resolved().persistent_agent?.idle_timeout_minutes ?? 30"
+                  [ngModel]="paIdleTimeout()"
+                  (ngModelChange)="paIdleTimeout.set($event || null)"
                 />
               </div>
               <div>
@@ -1319,6 +1362,15 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       border-radius: 4px;
       font-size: 11px;
     }
+
+    /* Default value indication — dimmed text when showing a resolved default */
+    select.is-default,
+    input.is-default {
+      color: var(--text-muted, #6c7086);
+    }
+    select.is-default option {
+      color: var(--text-primary, #cdd6f4);
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
@@ -1349,24 +1401,27 @@ export class SettingsComponent implements OnInit {
   keyLabel = '';
   readonly settingKey = signal(false);
 
-  // Preferences form state
-  prefModel = '';
-  prefAuxModel = '';
-  prefAutonomy = '';
-  prefReasoning = '';
-  prefVisionModel = '';
-  prefWhisperModel = '';
-  prefEmbeddingModel = '';
-  prefEmbeddingProvider = '';
+  // Preferences form state — null = user hasn't overridden, use resolved default
+  readonly prefModel = signal<string | null>(null);
+  readonly prefAuxModel = signal<string | null>(null);
+  readonly prefAutonomy = signal<string | null>(null);
+  readonly prefReasoning = signal<string | null>(null);
+  readonly prefVisionModel = signal<string | null>(null);
+  readonly prefWhisperModel = signal<string | null>(null);
+  readonly prefEmbeddingModel = signal<string | null>(null);
+  readonly prefEmbeddingProvider = signal<string | null>(null);
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
-  // Persistent Agent form state
-  paModel = '';
-  paPermissionMode = '';
+  /** Resolved defaults shortcut for template use. */
+  readonly resolved = this.settingsService.resolvedDefaults;
+
+  // Persistent Agent form state — null = use resolved default
+  readonly paModel = signal<string | null>(null);
+  readonly paPermissionMode = signal<string | null>(null);
   paConfigName = '';
   paGreeting = '';
-  paIdleTimeout: number | null = null;
+  readonly paIdleTimeout = signal<number | null>(null);
   paCommandAllowlist = '';
   readonly savingPA = signal(false);
   readonly paSaved = signal(false);
@@ -1428,26 +1483,27 @@ export class SettingsComponent implements OnInit {
 
   constructor() {
     // Reactively sync preference form fields when the preferences signal updates.
+    // null = user hasn't overridden this field (show resolved default).
     effect(() => {
       const prefs = this.settingsService.preferences();
       if (Object.keys(prefs).length > 0) {
-        this.prefModel = prefs.default_model || '';
-        this.prefAuxModel = prefs.default_auxiliary_model || '';
-        this.prefAutonomy = prefs.default_autonomy || '';
-        this.prefReasoning = prefs.default_reasoning_level || '';
-        this.prefVisionModel = prefs.default_vision_model || '';
-        this.prefWhisperModel = prefs.default_whisper_model || '';
-        this.prefEmbeddingModel = prefs.default_embedding_model || '';
-        this.prefEmbeddingProvider = prefs.embedding_provider || '';
+        this.prefModel.set(prefs.default_model ?? null);
+        this.prefAuxModel.set(prefs.default_auxiliary_model ?? null);
+        this.prefAutonomy.set(prefs.default_autonomy ?? null);
+        this.prefReasoning.set(prefs.default_reasoning_level ?? null);
+        this.prefVisionModel.set(prefs.default_vision_model ?? null);
+        this.prefWhisperModel.set(prefs.default_whisper_model ?? null);
+        this.prefEmbeddingModel.set(prefs.default_embedding_model ?? null);
+        this.prefEmbeddingProvider.set(prefs.embedding_provider ?? null);
 
         // Sync persistent agent preferences
         const pa = prefs.persistent_agent;
         if (pa) {
-          this.paModel = pa.model || '';
-          this.paPermissionMode = pa.permission_mode || '';
+          this.paModel.set(pa.model ?? null);
+          this.paPermissionMode.set(pa.permission_mode ?? null);
           this.paConfigName = pa.config_name || '';
           this.paGreeting = pa.greeting || '';
-          this.paIdleTimeout = pa.idle_timeout_minutes || null;
+          this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paCommandAllowlist = (pa.command_allowlist || []).join(', ');
         }
 
@@ -1611,14 +1667,14 @@ export class SettingsComponent implements OnInit {
     this.prefsSaved.set(false);
 
     const settings: Record<string, string | null> = {};
-    settings['default_model'] = this.prefModel.trim() || null;
-    settings['default_auxiliary_model'] = this.prefAuxModel.trim() || null;
-    settings['default_autonomy'] = this.prefAutonomy || null;
-    settings['default_reasoning_level'] = this.prefReasoning || null;
-    settings['default_vision_model'] = this.prefVisionModel || null;
-    settings['default_whisper_model'] = this.prefWhisperModel || null;
-    settings['default_embedding_model'] = this.prefEmbeddingModel || null;
-    settings['embedding_provider'] = this.prefEmbeddingProvider || null;
+    settings['default_model'] = this.prefModel()?.trim() || null;
+    settings['default_auxiliary_model'] = this.prefAuxModel()?.trim() || null;
+    settings['default_autonomy'] = this.prefAutonomy() || null;
+    settings['default_reasoning_level'] = this.prefReasoning() || null;
+    settings['default_vision_model'] = this.prefVisionModel() || null;
+    settings['default_whisper_model'] = this.prefWhisperModel() || null;
+    settings['default_embedding_model'] = this.prefEmbeddingModel() || null;
+    settings['embedding_provider'] = this.prefEmbeddingProvider() || null;
 
     this.settingsService.updatePreferences(settings).subscribe({
       next: () => {
@@ -1642,11 +1698,11 @@ export class SettingsComponent implements OnInit {
 
     const settings: Record<string, unknown> = {
       persistent_agent: {
-        model: this.paModel.trim() || null,
-        permission_mode: this.paPermissionMode || null,
+        model: this.paModel()?.trim() || null,
+        permission_mode: this.paPermissionMode() || null,
         config_name: this.paConfigName || null,
         greeting: this.paGreeting.trim() || null,
-        idle_timeout_minutes: this.paIdleTimeout || null,
+        idle_timeout_minutes: this.paIdleTimeout() || null,
         command_allowlist: allowlist,
       },
     };
