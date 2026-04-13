@@ -323,5 +323,5 @@ shell:
 interactive:
   permission_mode: supervised   # supervised | auto_accept | autonomous
   narration_mode: auto          # silent | verbose | auto
-  idle_timeout_minutes: 15      # Auto-pause session after idle period (0 = disabled)
+  idle_timeout_minutes: 30      # Auto-pause session after idle period (0 = disabled)
 

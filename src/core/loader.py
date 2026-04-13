@@ -938,7 +938,7 @@ class InteractiveConfig:
 
     permission_mode: str = "supervised"  # supervised | auto_accept | autonomous
     narration_mode: str = "auto"  # silent | verbose | auto
-    idle_timeout_minutes: int = 60  # 0 = disabled
+    idle_timeout_minutes: int = 30  # 0 = disabled
     greeting: str = "Hello! I'm ready to help. What would you like to work on?"
 
 
@@ -1344,7 +1344,7 @@ def load_agent_config(
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
-        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 
     return AgentConfig(
@@ -1533,7 +1533,7 @@ def load_agent_config_from_dict(
     interactive_data = data.get("interactive", {})
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
-        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 60),
+        idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
     )
 
     return AgentConfig(

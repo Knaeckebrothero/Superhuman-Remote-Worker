@@ -185,6 +185,27 @@ export interface ApiKeySetRequest {
 }
 
 /**
+ * Resolved default values for every user preference field.
+ * Returned by the backend in the `_resolved` key of GET /api/settings/preferences.
+ */
+export interface ResolvedDefaults {
+  default_model?: string;
+  default_autonomy?: string;
+  default_reasoning_level?: string;
+  default_auxiliary_model?: string;
+  default_vision_model?: string;
+  default_whisper_model?: string;
+  default_embedding_model?: string;
+  embedding_provider?: string;
+  persistent_agent?: {
+    model?: string;
+    permission_mode?: string;
+    idle_timeout_minutes?: number;
+    config_name?: string;
+  };
+}
+
+/**
  * User preference settings.
  */
 export interface UserSettings {
@@ -202,6 +223,7 @@ export interface UserSettings {
   embedding_provider?: string | null;
   communication?: CommunicationSettings | null;
   persistent_agent?: PersistentAgentSettings | null;
+  _resolved?: ResolvedDefaults;
 }
 
 /**

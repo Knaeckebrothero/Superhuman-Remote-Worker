@@ -1,7 +1,7 @@
 import {inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
-import {ApiKeyEntry, ApiKeySetRequest, CodexStatus, UserSettings} from '../models/api.model';
+import {ApiKeyEntry, ApiKeySetRequest, CodexStatus, ResolvedDefaults, UserSettings} from '../models/api.model';
 import {environment} from '../environment';
 
 @Injectable({ providedIn: 'root' })
@@ -12,8 +12,11 @@ export class SettingsService {
   /** Current user's API keys (prefix only, no full keys). */
   readonly apiKeys = signal<ApiKeyEntry[]>([]);
 
-  /** Current user's preference settings. */
+  /** Current user's preference settings (user overrides only). */
   readonly preferences = signal<UserSettings>({});
+
+  /** Resolved framework/env defaults for every preference field. */
+  readonly resolvedDefaults = signal<ResolvedDefaults>({});
 
   // ── User API Keys ──────────────────────────────────────────────────
 
@@ -41,8 +44,13 @@ export class SettingsService {
   loadPreferences(): void {
     this.http
       .get<UserSettings>(`${this.baseUrl}/settings/preferences`)
-      .pipe(catchError(() => of({})))
-      .subscribe((prefs) => this.preferences.set(prefs));
+      .pipe(catchError(() => of({} as UserSettings)))
+      .subscribe((prefs) => {
+        const resolved = prefs._resolved ?? {};
+        delete prefs._resolved;
+        this.resolvedDefaults.set(resolved);
+        this.preferences.set(prefs);
+      });
   }
 
   updatePreferences(settings: Partial<UserSettings>): Observable<{ status: string }> {
