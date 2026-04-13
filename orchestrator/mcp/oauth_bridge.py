@@ -459,13 +459,32 @@ class SRWOAuthProxy(OIDCProxy):
             elif s in ("user", "all") or s.startswith("project:"):
                 scope = s
 
-        # Decode Keycloak ID token for user identity
-        id_token_str = code_model.idp_tokens.get("id_token", "")
-        try:
-            user_info = pyjwt.decode(id_token_str, options={"verify_signature": False})
-        except Exception:
-            logger.error("Failed to decode Keycloak ID token")
-            raise TokenError("server_error", "Failed to decode identity token")
+        # Decode Keycloak tokens for user identity (try ID token, fall
+        # back to access token — Keycloak access tokens are also JWTs)
+        user_info: dict[str, Any] = {}
+        for token_key in ("id_token", "access_token"):
+            raw = code_model.idp_tokens.get(token_key, "")
+            if not raw:
+                continue
+            try:
+                user_info = pyjwt.decode(
+                    raw, options={"verify_signature": False}
+                )
+                break
+            except Exception as exc:
+                logger.warning(
+                    "Could not decode Keycloak %s (len=%d): %s",
+                    token_key,
+                    len(raw),
+                    exc,
+                )
+
+        if not user_info.get("sub"):
+            logger.error(
+                "No user identity in Keycloak tokens (keys=%s)",
+                list(code_model.idp_tokens.keys()),
+            )
+            raise TokenError("invalid_grant", "Failed to extract user identity")
 
         # Get client name
         client_name = "unknown"
@@ -481,7 +500,7 @@ class SRWOAuthProxy(OIDCProxy):
             expiry_days=expiry_days,
         )
         if not srw_data:
-            raise TokenError("server_error", "Failed to create access token")
+            raise TokenError("invalid_grant", "Failed to create access token")
 
         # Create refresh token if Keycloak provided one
         refresh_token_str = None
