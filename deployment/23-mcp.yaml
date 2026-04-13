@@ -21,7 +21,7 @@ spec:
           command: ["sh", "-c", "until nc -z srw-orchestrator 8085; do sleep 2; done"]
       containers:
         - name: mcp
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:sha-58ff4f0
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:sha-a6b87ff
           imagePullPolicy: Always
           ports:
             - containerPort: 8000
