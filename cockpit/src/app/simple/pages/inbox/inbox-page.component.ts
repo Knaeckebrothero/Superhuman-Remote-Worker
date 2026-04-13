@@ -232,13 +232,17 @@ function relativeTime(iso: string): string {
             <div class="detail-content sudo-detail">
               <div class="detail-header">
                 <span class="detail-type-badge sudo">
-                  <span class="icon">admin_panel_settings</span>
-                  Sudo Request
+                  <span class="icon">
+                    {{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'cloud_upload' : 'admin_panel_settings' }}
+                  </span>
+                  {{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'VM Upgrade Request' : 'Sudo Request' }}
                 </span>
-                <span class="risk-badge" [class]="'risk-' + getRisk(selectedItem()!.sudo!)">
-                  {{ getRisk(selectedItem()!.sudo!) }}
-                </span>
-                @if (selectedItem()!.sudo!.status === 'pending') {
+                @if (selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
+                  <span class="risk-badge" [class]="'risk-' + getRisk(selectedItem()!.sudo!)">
+                    {{ getRisk(selectedItem()!.sudo!) }}
+                  </span>
+                }
+                @if (selectedItem()!.sudo!.status === 'pending' && selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
                   <span class="detail-countdown" [class]="'ttl-' + ttlColor(selectedItem()!.sudo!)">
                     {{ getSecondsLeft(selectedItem()!.sudo!) }}s remaining
                   </span>
@@ -253,14 +257,21 @@ function relativeTime(iso: string): string {
               </div>
 
               <div class="meta-grid">
-                <div class="meta-row">
-                  <span class="meta-label">User</span>
-                  <span class="meta-value">{{ selectedItem()!.sudo!.requesting_user }} → {{ selectedItem()!.sudo!.target_user }}</span>
-                </div>
-                <div class="meta-row">
-                  <span class="meta-label">VM</span>
-                  <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
-                </div>
+                @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
+                  <div class="meta-row">
+                    <span class="meta-label">Workspace</span>
+                    <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
+                  </div>
+                } @else {
+                  <div class="meta-row">
+                    <span class="meta-label">User</span>
+                    <span class="meta-value">{{ selectedItem()!.sudo!.requesting_user }} → {{ selectedItem()!.sudo!.target_user }}</span>
+                  </div>
+                  <div class="meta-row">
+                    <span class="meta-label">VM</span>
+                    <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
+                  </div>
+                }
                 @if (selectedItem()!.sudo!.working_directory) {
                   <div class="meta-row">
                     <span class="meta-label">CWD</span>
@@ -270,16 +281,36 @@ function relativeTime(iso: string): string {
               </div>
 
               @if (selectedItem()!.sudo!.status === 'pending') {
-                <div class="action-bar">
-                  <button class="btn btn-approve" (click)="approveSudo()">
-                    <span class="icon">check</span> Approve
-                    <kbd>a</kbd>
-                  </button>
-                  <button class="btn btn-deny" (click)="startDenySudo()">
-                    <span class="icon">close</span> Deny
-                    <kbd>d</kbd>
-                  </button>
-                </div>
+                @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
+                  <div class="upgrade-hint">
+                    Agent attempted sudo in a container workspace. Upgrade to a VM for full sudo access,
+                    or resume the job without a VM.
+                  </div>
+                  <div class="action-bar">
+                    <button class="btn btn-upgrade" (click)="approveVmUpgrade()">
+                      <span class="icon">cloud_upload</span> Upgrade to VM
+                      <kbd>u</kbd>
+                    </button>
+                    <button class="btn btn-resume" (click)="resumeWithoutVmSudo()">
+                      <span class="icon">play_arrow</span> Resume without VM
+                    </button>
+                    <button class="btn btn-deny" (click)="startDenySudo()">
+                      <span class="icon">close</span> Deny
+                      <kbd>d</kbd>
+                    </button>
+                  </div>
+                } @else {
+                  <div class="action-bar">
+                    <button class="btn btn-approve" (click)="approveSudo()">
+                      <span class="icon">check</span> Approve
+                      <kbd>a</kbd>
+                    </button>
+                    <button class="btn btn-deny" (click)="startDenySudo()">
+                      <span class="icon">close</span> Deny
+                      <kbd>d</kbd>
+                    </button>
+                  </div>
+                }
               }
 
               @if (selectedItem()!.sudo!.decision_reason) {
@@ -1517,6 +1548,17 @@ function relativeTime(iso: string): string {
 
     /* ===== SHARED: BUTTONS & INPUTS ===== */
 
+    .upgrade-hint {
+      font-size: 12px;
+      color: #a6adc8;
+      padding: 8px 12px;
+      background: rgba(249, 226, 175, 0.06);
+      border-left: 2px solid #f9e2af;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      line-height: 1.5;
+    }
+
     .action-bar {
       display: flex;
       gap: 8px;
@@ -1944,6 +1986,18 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     this.sudo.approve(item.sudo.id);
   }
 
+  approveVmUpgrade(): void {
+    const item = this.selectedItem();
+    if (!item?.sudo) return;
+    this.sudo.approveVmUpgrade(item.sudo.id);
+  }
+
+  resumeWithoutVmSudo(): void {
+    const item = this.selectedItem();
+    if (!item?.sudo) return;
+    this.sudo.resumeWithoutVm(item.sudo.id);
+  }
+
   startDenySudo(): void {
     const item = this.selectedItem();
     if (!item?.sudo) return;
@@ -2055,10 +2109,17 @@ export class InboxPageComponent implements OnInit, OnDestroy {
         }
         break;
       case 'a':
-        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending') {
+        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending'
+            && this.selectedItem()?.sudo?.request_type !== 'vm_upgrade') {
           this.approveSudo();
         } else if (this.selectedItem()?.type === 'review') {
           this.approveReview();
+        }
+        break;
+      case 'u':
+        if (this.selectedItem()?.type === 'sudo' && this.selectedItem()?.sudo?.status === 'pending'
+            && this.selectedItem()?.sudo?.request_type === 'vm_upgrade') {
+          this.approveVmUpgrade();
         }
         break;
       case 'd':

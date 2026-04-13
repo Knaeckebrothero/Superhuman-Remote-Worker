@@ -3751,6 +3751,7 @@ async def _notify_operator_freeze(
     job_id: str,
     freeze_type: str,
     freeze_data: dict[str, Any],
+    sudo_request_id: str | None = None,
 ) -> None:
     """Send operator notification when a job freezes for human action."""
     user_id = str(job["user_id"]) if job.get("user_id") else None
@@ -3785,6 +3786,7 @@ async def _notify_operator_freeze(
         config_name=config_name,
         recipient_email=recipient_email,
         recipient_name=recipient_name,
+        sudo_request_id=sudo_request_id,
     )
     logger.info(f"Freeze notification sent for job {job_id} ({freeze_type})")
 
@@ -4484,10 +4486,13 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 async def list_sudo_requests(
     job_id: str | None = Query(None, description="Filter by job ID"),
     status: str | None = Query(None, description="Filter by status"),
+    request_type: str | None = Query(None, description="Filter by type (sudo_command, vm_upgrade)"),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[dict]:
     """List sudo approval requests."""
-    return await sudo_gate.list_requests(job_id=job_id, status=status, limit=limit)
+    return await sudo_gate.list_requests(
+        job_id=job_id, status=status, request_type=request_type, limit=limit,
+    )
 
 
 @app.get("/api/sudo/requests/{request_id}")
@@ -4528,6 +4533,44 @@ async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+@app.post("/api/sudo/requests/{request_id}/approve-upgrade")
+async def approve_sudo_vm_upgrade(
+    request_id: str, body: SudoApproveRequest | None = None
+) -> dict:
+    """Approve a vm_upgrade sudo request — provisions a VM and resumes the job."""
+    reason = body.reason if body else "VM upgrade approved"
+    result = await sudo_gate.approve_request(request_id, reason=reason)
+    if not result:
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    job_id = result.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No job_id in sudo request")
+    return await upgrade_job_to_vm(str(job_id))
+
+
+@app.post("/api/sudo/requests/{request_id}/resume-without-vm")
+async def resume_sudo_without_vm(
+    request_id: str, body: SudoApproveRequest | None = None
+) -> dict:
+    """Approve a vm_upgrade request but resume without provisioning a VM."""
+    reason = body.reason if body else "Resume without VM"
+    result = await sudo_gate.approve_request(request_id, reason=reason)
+    if not result:
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    job_id = result.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="No job_id in sudo request")
+    return await approve_job(str(job_id))
 
 
 @app.get("/api/sudo/rules")
@@ -6197,8 +6240,34 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 fd = json.loads(fd)
             ft = fd.get("freeze_type")
             if ft in _NOTIFIABLE_FREEZE_TYPES:
+                sudo_request_id = None
+
+                # For vm_upgrade freezes, create a sudo_approval_requests record
+                # so the operator can approve/deny from the Cockpit Sudo tab.
+                if ft == "vm_upgrade_required":
+                    try:
+                        sudo_request_id = (
+                            await sudo_gate.insert_vm_upgrade_request(
+                                job_id=job_id,
+                                command=fd.get("command", "unknown"),
+                                reason=fd.get("reason", ""),
+                                config_name=job.get("config_name", ""),
+                            )
+                        )
+                        if sudo_request_id:
+                            actions.append(
+                                f"sudo request created ({sudo_request_id[:8]})"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to create sudo request for {job_id}: {e}"
+                        )
+
                 try:
-                    await _notify_operator_freeze(job, job_id, ft, fd)
+                    await _notify_operator_freeze(
+                        job, job_id, ft, fd,
+                        sudo_request_id=sudo_request_id,
+                    )
                     actions.append(f"notification sent ({ft})")
                 except Exception as e:
                     logger.warning(
