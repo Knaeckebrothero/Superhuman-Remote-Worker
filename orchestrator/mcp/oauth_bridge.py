@@ -384,6 +384,12 @@ class SRWOAuthProxy(OIDCProxy):
             client_code = secrets.token_urlsafe(32)
             code_expires_at = int(time.time() + DEFAULT_AUTH_CODE_EXPIRY_SECONDS)
 
+            # Carry the user claims we already extracted in
+            # _handle_idp_callback so exchange_authorization_code
+            # doesn't need to re-decode the (possibly opaque) tokens.
+            stored_tokens = dict(pending.idp_tokens)
+            stored_tokens["_srw_user_claims"] = pending.user_claims
+
             await self._code_store.put(
                 key=client_code,
                 value=ClientCode(
@@ -393,7 +399,7 @@ class SRWOAuthProxy(OIDCProxy):
                     code_challenge=transaction["code_challenge"],
                     code_challenge_method=transaction["code_challenge_method"],
                     scopes=code_scopes,
-                    idp_tokens=pending.idp_tokens,
+                    idp_tokens=stored_tokens,
                     expires_at=code_expires_at,
                     created_at=time.time(),
                 ),
@@ -459,25 +465,30 @@ class SRWOAuthProxy(OIDCProxy):
             elif s in ("user", "all") or s.startswith("project:"):
                 scope = s
 
-        # Decode Keycloak tokens for user identity (try ID token, fall
-        # back to access token — Keycloak access tokens are also JWTs)
-        user_info: dict[str, Any] = {}
-        for token_key in ("id_token", "access_token"):
-            raw = code_model.idp_tokens.get(token_key, "")
-            if not raw:
-                continue
-            try:
-                user_info = pyjwt.decode(raw, options={"verify_signature": False})
-                break
-            except Exception as exc:
-                logger.warning(
-                    "Could not decode Keycloak %s (len=%d): %s",
-                    token_key,
-                    len(raw),
-                    exc,
-                )
+        # Use pre-extracted user claims (injected by _handle_scope_select)
+        # to avoid re-decoding tokens that may be opaque or missing id_token.
+        user_info: dict[str, Any] = code_model.idp_tokens.get("_srw_user_claims", {})
+        if not isinstance(user_info, dict):
+            user_info = {}
 
+        # Fallback: try decoding JWT tokens directly
         if not user_info.get("sub"):
+            for token_key in ("id_token", "access_token"):
+                raw = code_model.idp_tokens.get(token_key, "")
+                if not raw or not isinstance(raw, str):
+                    continue
+                try:
+                    user_info = pyjwt.decode(raw, options={"verify_signature": False})
+                    break
+                except Exception as exc:
+                    logger.warning(
+                        "Could not decode Keycloak %s (len=%d): %s",
+                        token_key,
+                        len(raw),
+                        exc,
+                    )
+
+        if not user_info.get("sub") and not user_info.get("email"):
             logger.error(
                 "No user identity in Keycloak tokens (keys=%s)",
                 list(code_model.idp_tokens.keys()),
