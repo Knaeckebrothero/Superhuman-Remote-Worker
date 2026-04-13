@@ -154,17 +154,29 @@ export class ActionCenterService {
 
   private mapSudo(req: SudoRequest): ActionItem {
     const isPending = req.status === 'pending';
-    const secondsLeft = isPending && req.expires_at
-      ? Math.max(0, Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000))
-      : 0;
+    const isVmUpgrade = req.request_type === 'vm_upgrade';
 
     let urgency: number;
-    if (!isPending) urgency = 0;
-    else if (secondsLeft < 30) urgency = 90;
-    else if (secondsLeft < 120) urgency = 70;
-    else urgency = 50;
+    if (!isPending) {
+      urgency = 0;
+    } else if (isVmUpgrade) {
+      urgency = 60; // Important but not TTL-critical
+    } else {
+      const secondsLeft = req.expires_at
+        ? Math.max(0, Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000))
+        : 0;
+      if (secondsLeft < 30) urgency = 90;
+      else if (secondsLeft < 120) urgency = 70;
+      else urgency = 50;
+    }
 
     const command = req.arguments?.join(' ') || req.command;
+    const title = isVmUpgrade ? `VM Upgrade: ${command}` : command;
+    const subtitle = isVmUpgrade
+      ? [req.vm_name, 'sudo in container'].filter(Boolean).join(' \u00B7 ')
+      : [req.vm_name, `${req.requesting_user} \u2192 ${req.target_user}`]
+          .filter(Boolean)
+          .join(' \u00B7 ');
 
     return {
       id: `sudo:${req.id}`,
@@ -172,10 +184,8 @@ export class ActionCenterService {
       status: isPending ? 'pending' : 'resolved',
       urgency,
       timestamp: req.requested_at,
-      title: command,
-      subtitle: [req.vm_name, `${req.requesting_user} \u2192 ${req.target_user}`]
-        .filter(Boolean)
-        .join(' \u00B7 '),
+      title,
+      subtitle,
       jobId: req.job_id,
       sudo: req,
     };

@@ -2174,3 +2174,170 @@ class TestEndToEndFlows:
         conn.fetch.return_value = []
         result = await svc._evaluate_auto_rules("apt-get install vim")
         assert result is None
+
+
+# =============================================================================
+# VM Upgrade Request Tests
+# =============================================================================
+
+
+class TestInsertVmUpgradeRequest:
+    """Tests for insert_vm_upgrade_request() — creates sudo records for freeze-based VM upgrades."""
+
+    @pytest.mark.asyncio
+    async def test_creates_record_with_correct_type(self):
+        """Verify that insert_vm_upgrade_request creates a record with request_type='vm_upgrade'."""
+        db, conn = make_db_pool(fetchrow_return={"id": "req-vm-001"})
+        svc = SudoGateService()
+        svc.connect(db=db, nc=None)
+
+        result = await svc.insert_vm_upgrade_request(
+            job_id="job-123",
+            command="sudo apt install nodejs",
+            reason="Agent needs nodejs",
+            config_name="developer",
+        )
+
+        assert result == "req-vm-001"
+        # Verify the INSERT was called
+        call_args = conn.fetchrow.call_args
+        sql = call_args[0][0]
+        assert "vm_upgrade" in sql
+        assert "86400" in sql
+        # Verify positional args: job_id, config_name, command, metadata_json
+        args = call_args[0][1:]
+        assert args[0] == "job-123"
+        assert args[1] == "developer"
+        assert args[2] == "sudo apt install nodejs"
+
+    @pytest.mark.asyncio
+    async def test_broadcasts_sse_with_request_type(self):
+        """Verify that SSE broadcast includes request_type: 'vm_upgrade'."""
+        db, _ = make_db_pool(fetchrow_return={"id": "req-vm-002"})
+        svc = SudoGateService()
+        svc.connect(db=db, nc=None)
+
+        queue = svc.subscribe_sse()
+        await svc.insert_vm_upgrade_request(
+            job_id="job-456",
+            command="sudo systemctl restart nginx",
+        )
+
+        event_type, event_data = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event_type == "new_request"
+        assert event_data["request_type"] == "vm_upgrade"
+        assert event_data["job_id"] == "job-456"
+        assert event_data["command"] == "sudo systemctl restart nginx"
+        assert event_data["vm_name"] == "container"  # default when no config_name
+        svc.unsubscribe_sse(queue)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_db_unavailable(self):
+        """Verify graceful failure when DB is not connected."""
+        svc = SudoGateService()  # No connect() call
+
+        result = await svc.insert_vm_upgrade_request(
+            job_id="job-789", command="sudo whoami"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_uses_config_name_as_vm_name(self):
+        """Verify that config_name is used for vm_name field."""
+        db, conn = make_db_pool(fetchrow_return={"id": "req-vm-003"})
+        svc = SudoGateService()
+        svc.connect(db=db, nc=None)
+
+        await svc.insert_vm_upgrade_request(
+            job_id="job-aaa", command="sudo ls", config_name="scholar"
+        )
+        args = conn.fetchrow.call_args[0][1:]
+        assert args[1] == "scholar"  # vm_name = config_name
+
+
+class TestApproveVmUpgradeFlow:
+    """Tests that existing approve_request/deny_request work correctly for vm_upgrade requests."""
+
+    @pytest.mark.asyncio
+    async def test_approve_works_with_null_nats_reply(self):
+        """Verify approve_request handles NULL nats_reply_subject gracefully."""
+        row = make_request_row(
+            request_id="req-vm-010",
+            nats_reply_subject=None,
+        )
+        db, conn = make_db_pool(fetchrow_return=row)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+
+        svc = SudoGateService()
+        svc.connect(db=db, nc=nc)
+
+        queue = svc.subscribe_sse()
+        result = await svc.approve_request("req-vm-010", reason="Approved for VM")
+
+        assert result is not None
+        assert result["status"] == "approved"
+        assert result["job_id"] == "job-aaa"
+        # NATS publish should NOT be called (reply_subject is None)
+        nc.publish.assert_not_called()
+
+        # SSE should still broadcast
+        event_type, event_data = await asyncio.wait_for(queue.get(), timeout=1.0)
+        assert event_type == "request_decided"
+        assert event_data["status"] == "approved"
+        svc.unsubscribe_sse(queue)
+
+    @pytest.mark.asyncio
+    async def test_deny_works_with_null_nats_reply(self):
+        """Verify deny_request handles NULL nats_reply_subject gracefully."""
+        row = make_request_row(
+            request_id="req-vm-011",
+            nats_reply_subject=None,
+        )
+        db, conn = make_db_pool(fetchrow_return=row)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+
+        svc = SudoGateService()
+        svc.connect(db=db, nc=nc)
+
+        result = await svc.deny_request("req-vm-011", reason="Not needed")
+
+        assert result is not None
+        assert result["status"] == "denied"
+        assert result["job_id"] == "job-aaa"
+        nc.publish.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_approve_returns_job_id(self):
+        """Verify approve_request includes job_id in return dict."""
+        row = make_request_row(request_id="req-100")
+        db, _ = make_db_pool(fetchrow_return=row)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+
+        svc = SudoGateService()
+        svc.connect(db=db, nc=nc)
+
+        result = await svc.approve_request("req-100")
+        assert "job_id" in result
+        assert result["job_id"] == "job-aaa"
+
+    @pytest.mark.asyncio
+    async def test_deny_returns_job_id(self):
+        """Verify deny_request includes job_id in return dict."""
+        row = make_request_row(request_id="req-101")
+        db, _ = make_db_pool(fetchrow_return=row)
+        nc = MagicMock()
+        nc.publish = AsyncMock()
+        nc.flush = AsyncMock()
+
+        svc = SudoGateService()
+        svc.connect(db=db, nc=nc)
+
+        result = await svc.deny_request("req-101", reason="denied")
+        assert "job_id" in result
+        assert result["job_id"] == "job-aaa"

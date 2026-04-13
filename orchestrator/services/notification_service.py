@@ -102,6 +102,7 @@ class NotificationService:
         phase_number: int | None = None,
         recipient_email: str | None = None,
         recipient_name: str | None = None,
+        sudo_request_id: str | None = None,
     ) -> dict[str, Any]:
         """Dispatch notification to all enabled channels.
 
@@ -154,8 +155,10 @@ class NotificationService:
         # Build cockpit deep link (into action center inbox)
         if thread_id:
             cockpit_link = f"{self._cockpit_url}/inbox?job={job_id}&thread={thread_id}"
+        elif sudo_request_id:
+            cockpit_link = f"{self._cockpit_url}/inbox?sudo={sudo_request_id}"
         else:
-            cockpit_link = f"{self._cockpit_url}/jobs/{job_id}"
+            cockpit_link = f"{self._cockpit_url}/inbox?job={job_id}&review=1"
 
         # Dispatch to email
         if user_channels.get("email", True) and self._email_service:
@@ -170,6 +173,7 @@ class NotificationService:
                     config_name=config_name,
                     phase_number=phase_number,
                     thread_id=thread_id,
+                    sudo_request_id=sudo_request_id,
                 )
                 results["email"] = email_sent
                 if email_msg_id:

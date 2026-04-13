@@ -202,7 +202,11 @@ class SudoGateService:
             },
         )
 
-        return {"id": str(request_id), "status": "approved"}
+        return {
+            "id": str(request_id),
+            "status": "approved",
+            "job_id": str(row["job_id"]),
+        }
 
     async def deny_request(
         self, request_id: str, reason: str = "", decided_by: str = "operator"
@@ -244,7 +248,11 @@ class SudoGateService:
             },
         )
 
-        return {"id": str(request_id), "status": "denied"}
+        return {
+            "id": str(request_id),
+            "status": "denied",
+            "job_id": str(row["job_id"]),
+        }
 
     # =========================================================================
     # Expiration sweeper
@@ -417,6 +425,7 @@ class SudoGateService:
         self,
         job_id: Optional[str] = None,
         status: Optional[str] = None,
+        request_type: Optional[str] = None,
         limit: int = 50,
     ) -> list[dict]:
         """List sudo approval requests with optional filters."""
@@ -435,6 +444,10 @@ class SudoGateService:
             conditions.append(f"status = ${idx}")
             params.append(status)
             idx += 1
+        if request_type:
+            conditions.append(f"request_type = ${idx}")
+            params.append(request_type)
+            idx += 1
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -445,7 +458,8 @@ class SudoGateService:
                     SELECT id, job_id, vm_name, command, arguments,
                            working_directory, requesting_user, target_user,
                            status, requested_at, decided_at, decided_by,
-                           decision_reason, ttl_seconds, expires_at, metadata
+                           decision_reason, ttl_seconds, expires_at, metadata,
+                           request_type
                     FROM sudo_approval_requests
                     {where}
                     ORDER BY requested_at DESC
@@ -539,6 +553,65 @@ class SudoGateService:
             return str(row["id"]) if row else None
         except Exception as e:
             logger.error("Failed to insert sudo request: %s", e)
+            return None
+
+    async def insert_vm_upgrade_request(
+        self,
+        job_id: str,
+        command: str,
+        reason: str = "",
+        config_name: str = "",
+    ) -> Optional[str]:
+        """Insert a vm_upgrade request into sudo_approval_requests.
+
+        Called when a job freezes with freeze_type='vm_upgrade_required'.
+        Unlike NATS sudo requests, these have no reply subject and use
+        a long TTL (24h — operator decides in their own time).
+
+        Returns the request ID, or None on failure.
+        """
+        if not self._db:
+            return None
+        try:
+            async with self._db.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO sudo_approval_requests
+                        (job_id, vm_name, command, arguments, working_directory,
+                         requesting_user, target_user, nats_reply_subject, metadata,
+                         request_type, ttl_seconds, expires_at)
+                    VALUES ($1, $2, $3, '{}', '', 'agent', 'root', NULL, $4,
+                            'vm_upgrade', 86400,
+                            NOW() + INTERVAL '86400 seconds')
+                    RETURNING id
+                    """,
+                    job_id,
+                    config_name or "container",
+                    command,
+                    json.dumps({
+                        "freeze_type": "vm_upgrade_required",
+                        "reason": reason,
+                    }),
+                )
+            request_id = str(row["id"]) if row else None
+
+            if request_id:
+                event = {
+                    "id": request_id,
+                    "job_id": job_id,
+                    "vm_name": config_name or "container",
+                    "command": command,
+                    "arguments": [],
+                    "requesting_user": "agent",
+                    "target_user": "root",
+                    "request_type": "vm_upgrade",
+                    "requested_at": datetime.now(timezone.utc).isoformat(),
+                }
+                await self._broadcast_sse("new_request", event)
+
+            return request_id
+        except Exception as e:
+            logger.error("Failed to insert vm_upgrade request: %s", e)
             return None
 
     async def _get_request(self, request_id: str):

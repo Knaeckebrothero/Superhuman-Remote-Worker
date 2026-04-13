@@ -924,6 +924,14 @@ CREATE TABLE IF NOT EXISTS sudo_approval_requests (
     metadata            JSONB DEFAULT '{}'
 );
 
+-- Discriminates between VM-gate sudo requests ('sudo_command') and
+-- container-level freeze requests ('vm_upgrade').
+DO $$ BEGIN
+    ALTER TABLE sudo_approval_requests
+        ADD COLUMN request_type VARCHAR(20) NOT NULL DEFAULT 'sudo_command';
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Hot path: UI polling and SSE push for pending requests
 CREATE INDEX IF NOT EXISTS idx_sudo_pending
     ON sudo_approval_requests (status, requested_at DESC)

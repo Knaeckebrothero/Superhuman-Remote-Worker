@@ -145,6 +145,7 @@ class EmailService:
         config_name: str,
         phase_number: int | None = None,
         thread_id: str | None = None,
+        sudo_request_id: str | None = None,
     ) -> tuple[bool, str | None]:
         """Send an agent message email to a human.
 
@@ -183,8 +184,10 @@ class EmailService:
         # Build cockpit link (deep-link into action center inbox)
         if thread_id:
             cockpit_link = f"{self.cockpit_url}/inbox?job={job_id}&thread={thread_id}"
+        elif sudo_request_id:
+            cockpit_link = f"{self.cockpit_url}/inbox?sudo={sudo_request_id}"
         else:
-            cockpit_link = f"{self.cockpit_url}/jobs/{job_id}"
+            cockpit_link = f"{self.cockpit_url}/inbox?job={job_id}&review=1"
 
         phase_str = f"Phase {phase_number}" if phase_number is not None else "—"
 
