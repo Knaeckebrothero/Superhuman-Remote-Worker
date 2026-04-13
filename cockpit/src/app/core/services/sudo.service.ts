@@ -19,6 +19,7 @@ export interface SudoRequest {
   ttl_seconds: number;
   expires_at: string;
   metadata: Record<string, unknown>;
+  request_type: 'sudo_command' | 'vm_upgrade';
 }
 
 export interface SudoRule {
@@ -103,6 +104,24 @@ export class SudoService {
       });
   }
 
+  /** Approve a VM upgrade request (provision VM and resume job). */
+  approveVmUpgrade(requestId: string): void {
+    this.http
+      .post(`${this.baseUrl}/sudo/requests/${requestId}/approve-upgrade`, {})
+      .subscribe({
+        next: () => this.updateRequestStatus(requestId, 'approved'),
+      });
+  }
+
+  /** Resume a VM upgrade request without provisioning a VM. */
+  resumeWithoutVm(requestId: string): void {
+    this.http
+      .post(`${this.baseUrl}/sudo/requests/${requestId}/resume-without-vm`, {})
+      .subscribe({
+        next: () => this.updateRequestStatus(requestId, 'approved'),
+      });
+  }
+
   /** Create an auto-approval rule. */
   createRule(
     pattern: string,
@@ -139,7 +158,17 @@ export class SudoService {
       this.zone.run(() => {
         const data = JSON.parse(e.data) as SudoRequest;
         this.requests.update((reqs) => [
-          { ...data, status: 'pending', decided_at: null, decided_by: null, decision_reason: null, ttl_seconds: 300, expires_at: '', metadata: {} },
+          {
+            ...data,
+            status: 'pending',
+            decided_at: null,
+            decided_by: null,
+            decision_reason: null,
+            ttl_seconds: data.ttl_seconds ?? 300,
+            expires_at: data.expires_at ?? '',
+            metadata: data.metadata ?? {},
+            request_type: data.request_type ?? 'sudo_command',
+          },
           ...reqs,
         ]);
       });
