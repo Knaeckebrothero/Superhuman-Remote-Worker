@@ -588,10 +588,12 @@ class SudoGateService:
                     job_id,
                     config_name or "container",
                     command,
-                    json.dumps({
-                        "freeze_type": "vm_upgrade_required",
-                        "reason": reason,
-                    }),
+                    json.dumps(
+                        {
+                            "freeze_type": "vm_upgrade_required",
+                            "reason": reason,
+                        }
+                    ),
                 )
             request_id = str(row["id"]) if row else None
 
