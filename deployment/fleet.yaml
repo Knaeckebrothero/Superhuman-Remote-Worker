@@ -1,13 +1,22 @@
 defaultNamespace: superhuman-remote-worker
+
+# Render the Helm chart that lives in the source repo. CI updates the image
+# tags in values-experimental.yaml on every push to `develop`; Fleet picks the
+# change up and rolls out. Cluster-specific config (domain, Vault paths, etc.)
+# stays in values-experimental.yaml so the chart itself remains generic.
 helm:
+  chart: ../helm
+  valuesFiles:
+    - values-experimental.yaml
+  # Adopt resources created by the previous raw-manifest bundle so the switch
+  # is in-place (no recreate / downtime).
   takeOwnership: true
-dependsOn: []
+
 ignorePaths:
-  - "**/*secret*"
-  - "*secret*"
-  - "**/*secrets*"
-  - "*secrets*"
+  - "legacy/**"
+  - "nats/**"
   - "README.md"
   - "deploy.sh"
   - "fleet-gitrepo.yaml"
-  - "nats/**"
+  - "**/*secret*"
+  - "**/*secrets*"
