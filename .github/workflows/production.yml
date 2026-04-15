@@ -42,10 +42,14 @@ jobs:
   # ---------------------------------------------------------------------------
   # CodeQL — static analysis for security vulnerabilities
   # Results appear in the GitHub Security tab
+  # NOTE: CodeQL upload requires GitHub Advanced Security on private repos.
+  # `continue-on-error` keeps the pipeline green until the repo is public again
+  # or we migrate to a self-hosted SAST (e.g. Semgrep on Gitea).
   # ---------------------------------------------------------------------------
   codeql:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    continue-on-error: true
     permissions:
       security-events: write
       contents: read
@@ -957,14 +961,13 @@ jobs:
   # Fleet detects the git change and rolls out updated pods automatically
   # ---------------------------------------------------------------------------
   deploy:
-    needs: [lint, codeql, dependency-audit, test-python, test-cockpit, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-workspace, build-vm-controller, build-agent-vm-base]
+    needs: [lint, dependency-audit, test-python, test-cockpit, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-workspace, build-vm-controller, build-agent-vm-base]
     if: >-
       always() && !cancelled() && github.event_name != 'pull_request' &&
       needs.lint.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure') &&
-      needs.dependency-audit.result == 'success' &&
-      !contains(needs.codeql.result, 'failure')
+      needs.dependency-audit.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
