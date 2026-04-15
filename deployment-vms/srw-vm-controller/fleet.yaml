@@ -2,9 +2,8 @@ defaultNamespace: agent-vms
 helm:
   takeOwnership: true
 dependsOn: []
-# Restrict to the VMs cluster only. The named target is defined in the
-# SRW GitRepo CR (HomeLab/rancher_cluster/fleet-gitrepo-srw.yaml).
-# targetRestrictions filters by NAME, not by clusterSelector — using a
-# clusterSelector here is a no-op and lets the bundle leak onto main.
-targetRestrictions:
-  - name: vms
+# Cluster targeting handled by the dedicated GitRepo
+# (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
+# pins to the vms cluster. Two GitRepos is the canonical Fleet pattern
+# for per-cluster monorepo dispatch — targetRestrictions in fleet.yaml
+# is additive with GitRepo targets and cannot narrow them.
