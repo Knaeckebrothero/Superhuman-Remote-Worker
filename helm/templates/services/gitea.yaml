@@ -1,0 +1,165 @@
+{{- if and .Values.gitea.enabled .Values.gitea.internal }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-gitea-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.gitea.storageClass }}
+  storageClassName: {{ .Values.gitea.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.gitea.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-gitea
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-gitea
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-keycloak
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+      containers:
+        - name: gitea
+          image: {{ .Values.gitea.image }}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GITEA__database__DB_TYPE
+              value: "sqlite3"
+            - name: GITEA__database__PATH
+              value: "/var/lib/gitea/data/gitea.db"
+            - name: GITEA__server__ROOT_URL
+              value: {{ include "srw.gitUrl" . | quote }}
+            - name: GITEA__server__HTTP_PORT
+              value: "3000"
+            - name: GITEA__security__INSTALL_LOCK
+              value: "true"
+            - name: GITEA__server__DISABLE_SSH
+              value: "true"
+            - name: GITEA__service__DISABLE_REGISTRATION
+              value: "false"
+            - name: GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION
+              value: "true"
+            - name: GITEA__service__SHOW_REGISTRATION_BUTTON
+              value: "false"
+            - name: GITEA__service__REQUIRE_SIGNIN_VIEW
+              value: "false"
+            - name: GITEA__service__ENABLE_CAPTCHA
+              value: "false"
+            - name: GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION
+              value: "true"
+            - name: GITEA__oauth2_client__USERNAME
+              value: "preferred_username"
+            - name: GITEA__oauth2_client__UPDATE_EXISTING
+              value: "true"
+            - name: GITEA__repository__DEFAULT_PRIVATE
+              value: "private"
+            - name: GITEA__repository__ENABLE_PUSH_CREATE_USER
+              value: "true"
+            # Bootstrap env vars (used by postStart hook)
+            - name: GITEA_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_ADMIN_USER
+            - name: GITEA_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_ADMIN_PASSWORD
+            - name: GITEA_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GITEA_OIDC_CLIENT_SECRET
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    # Wait for Gitea to be ready (runs concurrently with server start)
+                    until wget -qO- http://localhost:3000/api/v1/version >/dev/null 2>&1; do sleep 2; done
+                    # Create admin user (idempotent — || true handles "already exists")
+                    gitea admin user create --admin \
+                      --username "$GITEA_ADMIN_USER" \
+                      --password "$GITEA_ADMIN_PASSWORD" \
+                      --email "${GITEA_ADMIN_USER}@srw.local" \
+                      --must-change-password=false 2>/dev/null || true
+                    # Register Keycloak OIDC if not already present
+                    if ! gitea admin auth list 2>/dev/null | grep -q "Keycloak"; then
+                      KI="http://{{ include "srw.fullname" . }}-keycloak:8080"
+                      KP="{{ include "srw.authUrl" . }}"
+                      R="{{ .Values.keycloak.realm }}"
+                      gitea admin auth add-oauth \
+                        --name "Keycloak" --provider "openidConnect" \
+                        --key "gitea" --secret "$GITEA_OIDC_CLIENT_SECRET" \
+                        --auto-discover-url "${KI}/realms/${R}/.well-known/openid-configuration" \
+                        --use-custom-urls \
+                        --custom-auth-url "${KP}/realms/${R}/protocol/openid-connect/auth" \
+                        --custom-token-url "${KI}/realms/${R}/protocol/openid-connect/token" \
+                        --custom-profile-url "${KI}/realms/${R}/protocol/openid-connect/userinfo" \
+                        --group-claim-name "groups" --admin-group "admin" \
+                        --skip-local-2fa 2>/dev/null || true
+                    fi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/gitea
+          livenessProbe:
+            httpGet:
+              path: /api/v1/version
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/v1/version
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.gitea.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-gitea-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-gitea
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+{{- end }}

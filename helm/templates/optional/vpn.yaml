@@ -1,0 +1,331 @@
+{{/*
+VPN deployments — three independent FortiClient SOCKS/forward proxies.
+Each is gated by its own .Values.vpn.<variant>.enabled flag.
+*/}}
+
+{{/* ======================================================================
+     VPN Cluster — forward proxy + SOCKS for cluster-internal traffic
+     ====================================================================== */}}
+{{- if .Values.vpn.cluster.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-cluster
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-cluster") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-cluster") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-cluster") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vpn-cluster
+          image: {{ .Values.image.vpn.repository }}:{{ .Values.image.vpn.tag }}
+          imagePullPolicy: {{ .Values.image.vpn.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          ports:
+            - containerPort: 8080
+              name: http-forward
+            - containerPort: 1080
+              name: socks
+          env:
+            - name: SOCKS_PORT
+              value: "1080"
+            - name: FORWARD_PORT
+              value: "8080"
+            - name: FORWARD_TARGET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_CLUSTER_FORWARD_TARGET
+            - name: VPN_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_HOST
+            - name: VPN_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VPN_CLUSTER_PORT
+            - name: VPN_REALM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_REALM
+            - name: VPN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_USER
+            - name: VPN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_PASS
+            - name: VPN_TRUSTED_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_TRUSTED_CERT
+          volumeMounts:
+            - name: dev-ppp
+              mountPath: /dev/ppp
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+      volumes:
+        - name: dev-ppp
+          hostPath:
+            path: /dev/ppp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-cluster
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-cluster") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http-forward
+    - port: 1080
+      targetPort: 1080
+      name: socks
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-cluster") | nindent 4 }}
+{{- end }}
+
+{{/* ======================================================================
+     VPN Research — SOCKS-only proxy for research traffic
+     ====================================================================== */}}
+{{- if .Values.vpn.research.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-research
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-research") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-research") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-research") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vpn-research
+          image: {{ .Values.image.vpn.repository }}:{{ .Values.image.vpn.tag }}
+          imagePullPolicy: {{ .Values.image.vpn.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          ports:
+            - containerPort: 1080
+              name: socks
+          env:
+            - name: SOCKS_PORT
+              value: "1080"
+            - name: VPN_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_HOST
+            - name: VPN_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VPN_RESEARCH_PORT
+            - name: VPN_REALM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_REALM
+            - name: VPN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_USER
+            - name: VPN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_PASS
+            - name: VPN_TRUSTED_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_TRUSTED_CERT
+          volumeMounts:
+            - name: dev-ppp
+              mountPath: /dev/ppp
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+      volumes:
+        - name: dev-ppp
+          hostPath:
+            path: /dev/ppp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-research
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-research") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 1080
+      targetPort: 1080
+      name: socks
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-research") | nindent 4 }}
+{{- end }}
+
+{{/* ======================================================================
+     VPN Workstation — forward proxy + SOCKS for workstation access
+     Shares research VPN credentials but uses its own realm/user.
+     ====================================================================== */}}
+{{- if .Values.vpn.workstation.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-workstation
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-workstation") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-workstation") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-workstation") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vpn-workstation
+          image: {{ .Values.image.vpn.repository }}:{{ .Values.image.vpn.tag }}
+          imagePullPolicy: {{ .Values.image.vpn.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          ports:
+            - containerPort: 8080
+              name: http-forward
+            - containerPort: 1080
+              name: socks
+          env:
+            - name: SOCKS_PORT
+              value: "1080"
+            - name: FORWARD_PORT
+              value: "8080"
+            - name: FORWARD_TARGET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_WORKSTATION_ENDPOINT
+            - name: VPN_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_HOST
+            - name: VPN_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VPN_WORKSTATION_PORT
+            - name: VPN_REALM
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_WORKSTATION_REALM
+            - name: VPN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_WORKSTATION_USER
+            - name: VPN_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_PASS
+            - name: VPN_TRUSTED_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VPN_RESEARCH_TRUSTED_CERT
+          volumeMounts:
+            - name: dev-ppp
+              mountPath: /dev/ppp
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+      volumes:
+        - name: dev-ppp
+          hostPath:
+            path: /dev/ppp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-vpn-workstation
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vpn-workstation") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http-forward
+    - port: 1080
+      targetPort: 1080
+      name: socks
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vpn-workstation") | nindent 4 }}
+{{- end }}

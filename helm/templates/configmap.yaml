@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.configMapName" . }}
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+data:
+  # PostgreSQL (App DB) — non-secret config only
+  # DATABASE_URL (with credentials) is in the Secret
+  POSTGRES_DB: {{ "srw" | quote }}
+
+  # Vector DB — non-secret config only
+  # VECTOR_DB_URL (with credentials) is in the Secret
+  VECTOR_POSTGRES_DB: {{ "srw_vector" | quote }}
+
+  # MongoDB
+  MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
+
+  # Gitea
+  GITEA_URL: {{ include "srw.gitUrl" . | quote }}
+  GITEA_INTERNAL_URL: {{ include "srw.giteaInternalUrl" . | quote }}
+
+  # Orchestrator
+  ORCHESTRATOR_URL: {{ printf "http://%s:8085" (include "srw.serviceName" (dict "context" . "component" "orchestrator")) | quote }}
+
+  # Workspace
+  WORKSPACE_PATH: {{ "/workspace" | quote }}
+  WORKSPACE_STORAGE_CLASS: {{ .Values.workspace.ephemeralStorageClass | default "longhorn-ephemeral" | quote }}
+
+  # Agent
+  AGENT_CONFIG: {{ .Values.agent.config | quote }}
+  AGENT_PORT: {{ .Values.agent.port | quote }}
+  PERSISTENT_AGENT_CONFIG: {{ .Values.agent.persistentConfig | quote }}
+
+  # OIDC / SSO — works with internal Keycloak or external OIDC provider
+  KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}
+  KEYCLOAK_ISSUER_URL: {{ include "srw.authUrl" . | quote }}
+  KEYCLOAK_REALM: {{ .Values.keycloak.realm | quote }}
+  {{- if .Values.keycloak.adminApiDisabled }}
+  KEYCLOAK_ADMIN_API_DISABLED: {{ "true" | quote }}
+  {{- end }}
+
+  # CORS (orchestrator reads this for additional allowed origins)
+  CORS_ORIGINS: {{ include "srw.cockpitUrl" . | quote }}
+
+  # Cockpit external URL (for deep links in emails/notifications)
+  COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}
+
+  # LLM routing
+  LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
+  KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
+
+  # Vision model
+  VISION_MODEL: {{ .Values.llm.visionModel | quote }}
+
+  # Browser automation
+  BROWSER_LLM_MODEL: {{ .Values.llm.browserModel | quote }}
+  BROWSER_LLM_BASE_URL: {{ .Values.llm.browserBaseUrl | quote }}
+
+  # Research proxy (via VPN sidecar SOCKS5)
+  RESEARCH_PROXY_TYPE: {{ .Values.research.proxyType | quote }}
+  RESEARCH_PROXY_HOST: {{ .Values.research.proxyHost | quote }}
+  RESEARCH_PROXY_PORT: {{ .Values.research.proxyPort | quote }}
+
+  # Citation Engine
+  # CITATION_DB_URL (with credentials) is in the Secret
+  CITATION_LLM_URL: {{ .Values.citation.llmUrl | quote }}
+  CITATION_LLM_MODEL: {{ .Values.citation.llmModel | quote }}
+  CITATION_REASONING_LEVEL: {{ .Values.citation.reasoningLevel | quote }}
+  CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
+  CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
+
+  # Embedding model (memories + knowledge index)
+  EMBEDDING_MODEL: {{ .Values.llm.embeddingModel | quote }}
+  EMBEDDING_BASE_URL: {{ .Values.llm.embeddingBaseUrl | quote }}
+
+  # Codex proxy (CLIProxyAPI)
+  CODEX_BASE_URL: {{ .Values.llm.codexBaseUrl | quote }}
+
+  # Codex raw-response diagnostic capture
+  DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}
+  CODEX_RAW_DUMP_DIR: {{ "/app/logs/codex-raw" | quote }}
+
+  # Instruction Builder (Cockpit AI Chat)
+  BUILDER_MODEL: {{ .Values.llm.builderModel | quote }}
+  BUILDER_LLM_PROVIDER: {{ .Values.llm.builderProvider | quote }}
+
+  # Orchestrator settings
+  AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
+
+  # Neo4j
+  {{- if .Values.databases.neo4j.enabled }}
+  NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
+  DEFAULT_DS_NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
+  DEFAULT_DS_NEO4J_NAME: {{ "Default Neo4j" | quote }}
+  DEFAULT_DS_NEO4J_READ_ONLY: {{ "false" | quote }}
+  {{- end }}
+
+  # S3 / Object Storage
+  S3_ENDPOINT: {{ .Values.s3.endpoint | quote }}
+  S3_BUCKET: {{ .Values.s3.bucket | quote }}
+  S3_REGION: {{ .Values.s3.region | quote }}
+  SNAPSHOT_MAX_SIZE_GB: {{ .Values.s3.snapshotMaxSizeGb | quote }}
+  SNAPSHOT_RETENTION_DAYS: {{ .Values.s3.snapshotRetentionDays | quote }}
+
+  # IDE sessions
+  IDE_SESSION_IDLE_TIMEOUT: {{ .Values.ide.sessionIdleTimeout | quote }}
+  IDE_SESSION_MAX_LIFETIME: {{ .Values.ide.sessionMaxLifetime | quote }}
+  IDE_MAX_CONCURRENT_PER_USER: {{ .Values.ide.maxConcurrentPerUser | quote }}
+  CODE_SERVER_IMAGE: {{ .Values.ide.codeServerImage | quote }}
+  IDE_PROXY_BASE_URL: {{ include "srw.apiUrl" . | quote }}
+
+  # Notification — SMTP
+  SMTP_HOST: {{ .Values.email.smtp.host | quote }}
+  SMTP_PORT: {{ .Values.email.smtp.port | quote }}
+  SMTP_USE_TLS: {{ .Values.email.smtp.useTls | quote }}
+  SMTP_TRUST_SELF_SIGNED: {{ .Values.email.smtp.trustSelfSigned | quote }}
+  SMTP_FROM: {{ .Values.email.smtp.from | quote }}
+
+  # Notification — IMAP
+  IMAP_HOST: {{ .Values.email.imap.host | quote }}
+  IMAP_PORT: {{ .Values.email.imap.port | quote }}
+  IMAP_USE_SSL: {{ .Values.email.imap.useSsl | quote }}
+  IMAP_TRUST_SELF_SIGNED: {{ .Values.email.imap.trustSelfSigned | quote }}
+  IMAP_POLL_INTERVAL: {{ .Values.email.imap.pollInterval | quote }}
+  AGENT_EMAIL: {{ .Values.email.agentEmail | quote }}
+  MAIL_DOMAIN: {{ .Values.email.domain | quote }}
+
+  # Notification — Ntfy (optional)
+  NTFY_URL: {{ .Values.notifications.ntfy.url | quote }}
+  NTFY_TOPIC: {{ .Values.notifications.ntfy.topic | quote }}
+
+  # Nextcloud — internal + public URLs
+  {{- if .Values.nextcloud.enabled }}
+  NEXTCLOUD_URL: {{ printf "http://%s" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}
+  NEXTCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
+  NEXTCLOUD_ADMIN_USER: {{ "admin" | quote }}
+  NEXTCLOUD_AGENT_USER: {{ "agent-service" | quote }}
+
+  # Nextcloud / WebDAV datasource (optional)
+  DEFAULT_DS_WEBDAV_URL: {{ printf "http://%s/remote.php/dav/files/admin/" (include "srw.serviceName" (dict "context" . "component" "nextcloud")) | quote }}
+  DEFAULT_DS_WEBDAV_NAME: {{ "Nextcloud" | quote }}
+  DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
+  {{- end }}
+
+  # Cloud backend — opencloud (bundled), nextcloud (bundled), external, or unset
+  {{- if .Values.opencloud.enabled }}
+  MAIN_CLOUD_BACKEND: {{ "opencloud" | quote }}
+  OPENCLOUD_URL: {{ printf "http://%s:9200" (include "srw.serviceName" (dict "context" . "component" "opencloud")) | quote }}
+  OPENCLOUD_PUBLIC_URL: {{ include "srw.cloudUrl" . | quote }}
+  OPENCLOUD_KEYCLOAK_ISSUER: {{ printf "%s/realms/%s" (include "srw.keycloakInternalUrl" .) .Values.keycloak.realm | quote }}
+  OPENCLOUD_KEYCLOAK_CLIENT_ID: {{ "opencloud-orchestrator" | quote }}
+  {{- else if .Values.nextcloud.enabled }}
+  MAIN_CLOUD_BACKEND: {{ "nextcloud" | quote }}
+  {{- else if .Values.cloud.externalBackend }}
+  MAIN_CLOUD_BACKEND: {{ .Values.cloud.externalBackend | quote }}
+  {{- if eq .Values.cloud.externalBackend "nextcloud" }}
+  NEXTCLOUD_URL: {{ include "srw.cloudServiceUrl" . | quote }}
+  NEXTCLOUD_PUBLIC_URL: {{ required "cloud.externalUrl is required when cloud.externalBackend is set" .Values.cloud.externalUrl | quote }}
+  {{- else if eq .Values.cloud.externalBackend "opencloud" }}
+  OPENCLOUD_URL: {{ include "srw.cloudServiceUrl" . | quote }}
+  OPENCLOUD_PUBLIC_URL: {{ required "cloud.externalUrl is required when cloud.externalBackend is set" .Values.cloud.externalUrl | quote }}
+  {{- else if eq .Values.cloud.externalBackend "webdav" }}
+  DEFAULT_DS_WEBDAV_URL: {{ include "srw.cloudServiceUrl" . | quote }}
+  DEFAULT_DS_WEBDAV_NAME: {{ "External WebDAV" | quote }}
+  DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
+  {{- end }}
+  {{- end }}
+
+  # Workstation API
+  {{- if .Values.vpn.workstation.enabled }}
+  WORKSTATION_BASE_URL: {{ printf "http://%s:%s/v1" (include "srw.serviceName" (dict "context" . "component" "vpn-workstation")) .Values.vpn.workstation.port | quote }}
+  {{- else }}
+  WORKSTATION_BASE_URL: {{ "" | quote }}
+  {{- end }}
+
+  # VPN — non-secret config (ports only)
+  VPN_CLUSTER_PORT: {{ .Values.vpn.cluster.port | quote }}
+  VPN_RESEARCH_PORT: {{ .Values.vpn.research.port | quote }}
+  VPN_WORKSTATION_PORT: {{ .Values.vpn.workstation.port | quote }}
+
+  # NATS
+  NATS_URL: {{ .Values.nats.url | quote }}
+
+  # Headscale (mesh VPN coordination server)
+  HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
+
+  # Workspace containers (per-job sandboxed execution environments)
+  WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+  WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
+
+  # Agent pods (on-demand via AgentProvisioner)
+  AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+  PERSISTENT_AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+
+  # Agent pool sizing (AgentProvisioner)
+  MAX_AGENTS: {{ .Values.agent.pool.maxAgents | quote }}
+  MIN_AGENTS: {{ .Values.agent.pool.minAgents | quote }}
+  AGENT_BUFFER: {{ .Values.agent.pool.buffer | quote }}
+  RESERVED_SESSION_SLOTS: {{ .Values.agent.pool.reservedSessionSlots | quote }}
+  RESERVED_JOB_SLOTS: {{ .Values.agent.pool.reservedJobSlots | quote }}
+
+  # Logging
+  LOG_LEVEL: {{ .Values.logLevel | quote }}
+
+  # License acceptance (enforced at runtime by orchestrator)
+  LICENSE_TERMS_ACCEPTED: {{ .Values.license.acceptTerms | quote }}

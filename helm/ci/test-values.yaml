@@ -1,0 +1,84 @@
+# Minimal test values for CI validation
+license:
+  acceptTerms: true
+
+global:
+  domain: "test.example.com"
+
+externalSecrets:
+  enabled: true
+  vaultPath: "test/secrets"
+  vmSshKeyVaultPath: "test/vm-ssh-key"
+
+vpn:
+  cluster:
+    enabled: true
+  research:
+    enabled: true
+  workstation:
+    enabled: true
+
+headscale:
+  enabled: true
+
+pgadmin:
+  enabled: true
+
+mongoExpress:
+  enabled: true
+
+dozzle:
+  enabled: true
+
+codexProxy:
+  enabled: true
+
+agent:
+  tailscale:
+    enabled: true
+
+databases:
+  neo4j:
+    boltTls:
+      enabled: true
+      issuerName: test-issuer
+    loadBalancer:
+      enabled: true
+
+ingress:
+  tls:
+    issuerName: test-issuer
+
+keycloak:
+  bridgeCert:
+    enabled: true
+    smtpHost: "smtp.test.local"
+
+email:
+  enabled: true
+  smtp:
+    host: "smtp.test.local"
+    from: "noreply@test.example.com"
+  imap:
+    host: "imap.test.local"
+  agentEmail: "agent@test.example.com"
+  domain: "test.example.com"
+
+llm:
+  baseUrl: "http://llm-server:8080/v1"
+  browserBaseUrl: "http://llm-server:8080/v1"
+  embeddingBaseUrl: "http://embedding-server:8080/v1"
+  codexBaseUrl: "http://codex-proxy:8317/v1"
+
+citation:
+  llmUrl: "http://llm-server:8080/v1"
+  embeddingUrl: "http://embedding-server:8080/v1"
+
+research:
+  proxyHost: "vpn-research"
+
+s3:
+  endpoint: "http://minio:9000"
+
+nats:
+  url: "nats://nats:4222"

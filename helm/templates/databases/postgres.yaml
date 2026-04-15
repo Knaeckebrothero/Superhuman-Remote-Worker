@@ -1,0 +1,136 @@
+{{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.postgres.storageClass }}
+  storageClassName: {{ .Values.databases.postgres.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.postgres.storageSize }}
+---
+# ConfigMap for SSO database initialization script.
+# Only runs on first postgres start (docker-entrypoint-initdb.d/).
+# For existing deployments, ensure_sso_databases() in orchestrator/init.py
+# handles creating the keycloak database idempotently.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-init
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+data:
+  init_sso_dbs.sh: |
+    #!/bin/bash
+    set -e
+    echo "Creating SSO databases..."
+
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" \
+         -v kc_pass="$KC_DB_PASSWORD" <<-EOSQL
+        DO \$\$
+        BEGIN
+            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'keycloak') THEN
+                CREATE ROLE keycloak WITH LOGIN PASSWORD :'kc_pass';
+            END IF;
+        END\$\$;
+        SELECT 'CREATE DATABASE keycloak OWNER keycloak'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'keycloak')
+        \gexec
+    EOSQL
+    echo "  keycloak: ok"
+    echo "SSO databases ready."
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          image: {{ .Values.databases.postgres.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_DB
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: KC_DB_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d/init_sso_dbs.sh
+              subPath: init_sso_dbs.sh
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.postgres.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-postgres-data
+        - name: init-scripts
+          configMap:
+            name: {{ include "srw.fullname" . }}-postgres-init
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+{{- end }}

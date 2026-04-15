@@ -1,0 +1,408 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "srw.fullname" . -}}
+{{- $domain := .Values.global.domain -}}
+# Cockpit web UI
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-cockpit-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "cockpit") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $domain }}
+      secretName: {{ $fullName }}-cockpit-tls
+  {{- end }}
+  rules:
+    - host: {{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-cockpit
+                port:
+                  number: 4000
+---
+# Orchestrator API (browser calls from cockpit)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- if .Values.ingress.cors.enabled }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-cors@kubernetescrd
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - api.{{ $domain }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: api.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
+---
+# Keycloak SSO (browser must reach this for login flow). Skipped when using external OIDC.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-keycloak-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloak") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - auth.{{ $domain }}
+      secretName: {{ $fullName }}-keycloak-tls
+  {{- end }}
+  rules:
+    - host: auth.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-keycloak
+                port:
+                  number: 8080
+{{- end }}
+---
+{{- if .Values.opencloud.enabled }}
+# OpenCloud (cloud storage)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-opencloud-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "opencloud") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - cloud.{{ $domain }}
+      secretName: {{ $fullName }}-opencloud-tls
+  {{- end }}
+  rules:
+    - host: cloud.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-opencloud
+                port:
+                  number: 9200
+---
+{{- end }}
+{{- if .Values.databases.neo4j.enabled }}
+# Neo4j browser UI
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-neo4j-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - neo4j.{{ $domain }}
+      secretName: {{ $fullName }}-neo4j-tls
+  {{- end }}
+  rules:
+    - host: neo4j.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-neo4j
+                port:
+                  number: 7474
+---
+{{- end }}
+{{- if and .Values.gitea.enabled .Values.gitea.internal }}
+# Gitea workspace browser (skipped when using external git server)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-gitea-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - git.{{ $domain }}
+      secretName: {{ $fullName }}-gitea-tls
+  {{- end }}
+  rules:
+    - host: git.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-gitea
+                port:
+                  number: 3000
+---
+{{- end }}
+{{- if .Values.pgadmin.enabled }}
+# pgAdmin (PostgreSQL admin UI)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-pgadmin-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - pgadmin.{{ $domain }}
+      secretName: {{ $fullName }}-pgadmin-tls
+  {{- end }}
+  rules:
+    - host: pgadmin.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-pgadmin
+                port:
+                  number: 5050
+---
+{{- end }}
+{{- if .Values.mongoExpress.enabled }}
+# Mongo Express (MongoDB admin UI)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-mongo-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - mongo.{{ $domain }}
+      secretName: {{ $fullName }}-mongo-tls
+  {{- end }}
+  rules:
+    - host: mongo.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-mongo-express
+                port:
+                  number: 8081
+---
+{{- end }}
+{{- if .Values.mcp.enabled }}
+# MCP Server (Claude Code integration)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-mcp-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mcp") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - mcp.{{ $domain }}
+      secretName: {{ $fullName }}-mcp-tls
+  {{- end }}
+  rules:
+    - host: mcp.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-mcp
+                port:
+                  number: 8055
+---
+{{- end }}
+{{- if .Values.dozzle.enabled }}
+# Dozzle (container log viewer)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-dozzle-ingress
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "dozzle") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - dozzle.{{ $domain }}
+      secretName: {{ $fullName }}-dozzle-tls
+  {{- end }}
+  rules:
+    - host: dozzle.{{ $domain }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-dozzle
+                port:
+                  number: 9999
+---
+{{- end }}
+{{- if .Values.ingress.cors.enabled }}
+# CORS middleware for cross-origin API access (cockpit -> API)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-cors
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  headers:
+    accessControlAllowCredentials: true
+    accessControlAllowMethods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "PATCH"
+      - "OPTIONS"
+    accessControlAllowHeaders:
+      - "Content-Type"
+      - "Authorization"
+    accessControlAllowOriginList:
+      - {{ include "srw.cockpitUrl" . | quote }}
+    accessControlMaxAge: 86400
+{{- end }}
+{{- end }}

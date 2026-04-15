@@ -1,0 +1,13 @@
+{{- if .Values.agent.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "srw.fullname" . }}-agent-pdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.agent.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 6 }}
+{{- end }}

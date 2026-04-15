@@ -1,0 +1,97 @@
+{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
+# Vector Database (pgvector) — Citations, Embeddings, Memories, Knowledge Index
+#
+# Separate PostgreSQL instance with pgvector extension for all vector operations.
+# Schema is applied by the orchestrator on startup (vector_schema.sql), not by initdb.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-vector-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.vector.storageClass }}
+  storageClassName: {{ .Values.databases.vector.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.vector.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-vector
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.fullname" . }}-postgres-vector
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres-vector
+          image: {{ .Values.databases.vector.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_DB
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.vector.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-postgres-vector-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres-vector
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+{{- end }}

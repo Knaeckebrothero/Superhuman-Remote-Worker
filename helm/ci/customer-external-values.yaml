@@ -1,0 +1,96 @@
+# Customer deployment example: bring-your-own everything
+# - External Azure AD (or Google Workspace, Okta, etc.) for OIDC
+# - External managed PostgreSQL, MongoDB, Neo4j
+# - External git server (e.g., GitHub Enterprise, customer's own Gitea)
+# - No VPN sidecars, no headscale, no admin UIs
+# - Customer manages secrets themselves
+
+license:
+  acceptTerms: true
+
+global:
+  domain: "ai.customer-company.com"
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+
+# Use customer-managed secret
+secrets:
+  existingSecret: srw-secrets
+
+# External OIDC (e.g. Azure AD)
+keycloak:
+  enabled: true
+  internal: false
+  externalIssuerUrl: "https://login.microsoftonline.com/abc-tenant-id/v2.0"
+  cockpitClientId: "srw-cockpit-app"
+  adminApiDisabled: true
+
+# External git server
+gitea:
+  enabled: true
+  internal: false
+  internalUrl: "https://gitea.customer-internal.local"
+  externalUrl: "https://gitea.customer-internal.local"
+
+# External databases
+databases:
+  postgres:
+    enabled: true
+    internal: false
+    externalUrl: "postgres://app:pw@managed-pg.customer.local:5432/srw"
+  vector:
+    enabled: true
+    internal: false
+    externalUrl: "postgresql://app:pw@managed-pg.customer.local:5432/srw_vector"
+  mongodb:
+    enabled: true
+    internal: false
+    externalUrl: "mongodb://managed-mongo.customer.local:27017/srw_logs"
+  neo4j:
+    enabled: false
+
+# Skip bundled cloud storage — point at customer's existing Nextcloud
+opencloud:
+  enabled: false
+nextcloud:
+  enabled: false
+cloud:
+  externalBackend: "nextcloud"
+  externalUrl: "https://cloud.customer-internal.local"
+  externalServiceUrl: "https://cloud.customer-internal.local"
+  # CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD live in srw-secrets
+
+# Customer's own S3 (or AWS S3, etc.)
+s3:
+  endpoint: "https://s3.customer-region.amazonaws.com"
+  bucket: "customer-srw-snapshots"
+  region: "eu-central-1"
+
+# No VPN, no headscale, no admin UIs
+vpn:
+  cluster:
+    enabled: false
+  research:
+    enabled: false
+  workstation:
+    enabled: false
+headscale:
+  enabled: false
+pgadmin:
+  enabled: false
+mongoExpress:
+  enabled: false
+dozzle:
+  enabled: false
+codexProxy:
+  enabled: false
+
+# Public LLM endpoints (provider keys in the existing secret)
+llm:
+  baseUrl: "https://api.openai.com/v1"
+
+ingress:
+  className: nginx
+  tls:
+    enabled: true
+    issuerName: letsencrypt-prod

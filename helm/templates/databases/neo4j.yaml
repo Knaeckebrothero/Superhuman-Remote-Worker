@@ -1,0 +1,177 @@
+{{- if and .Values.databases.neo4j.enabled .Values.databases.neo4j.internal }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- if .Values.databases.neo4j.storageClass }}
+  storageClassName: {{ .Values.databases.neo4j.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.databases.neo4j.storageSize }}
+---
+{{- if .Values.databases.neo4j.boltTls.enabled }}
+# TLS certificate for Neo4j Bolt (cert-manager)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j-bolt-tls
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  secretName: {{ include "srw.fullname" . }}-neo4j-bolt-tls
+  issuerRef:
+    name: {{ .Values.databases.neo4j.boltTls.issuerName }}
+    kind: ClusterIssuer
+  dnsNames:
+    - {{ include "srw.neo4jBoltHost" . }}
+  duration: 2160h    # 90 days
+  renewBefore: 720h  # Renew 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: neo4j
+          image: {{ .Values.databases.neo4j.image }}
+          ports:
+            - containerPort: 7474
+              name: http
+            - containerPort: 7688
+              name: bolt
+          env:
+            - name: NEO4J_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_AUTH
+            - name: NEO4J_PLUGINS
+              value: '["apoc"]'
+            - name: NEO4J_dbms_security_procedures_unrestricted
+              value: "apoc.*"
+            - name: NEO4J_dbms_security_procedures_allowlist
+              value: "apoc.*"
+            - name: NEO4J_server_bolt_listen__address
+              value: ":7688"
+            - name: NEO4J_server_bolt_advertised__address
+              value: "{{ include "srw.neo4jBoltHost" . }}:7688"
+            {{- if .Values.databases.neo4j.boltTls.enabled }}
+            # TLS for Bolt — OPTIONAL allows both encrypted (browser) and unencrypted (internal)
+            - name: NEO4J_server_bolt_tls__level
+              value: "OPTIONAL"
+            - name: NEO4J_dbms_ssl_policy_bolt_enabled
+              value: "true"
+            - name: NEO4J_dbms_ssl_policy_bolt_base__directory
+              value: "/ssl/bolt"
+            - name: NEO4J_dbms_ssl_policy_bolt_private__key
+              value: "tls.key"
+            - name: NEO4J_dbms_ssl_policy_bolt_public__certificate
+              value: "tls.crt"
+            - name: NEO4J_dbms_ssl_policy_bolt_client__auth
+              value: "NONE"
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.databases.neo4j.boltTls.enabled }}
+            - name: bolt-tls
+              mountPath: /ssl/bolt
+              readOnly: true
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 7474
+            initialDelaySeconds: 30
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.databases.neo4j.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-neo4j-data
+        {{- if .Values.databases.neo4j.boltTls.enabled }}
+        - name: bolt-tls
+          secret:
+            secretName: {{ include "srw.fullname" . }}-neo4j-bolt-tls
+        {{- end }}
+---
+# ClusterIP for internal access (orchestrator, agents)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 7474
+      targetPort: 7474
+    - name: bolt
+      port: 7688
+      targetPort: 7688
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+{{- if .Values.databases.neo4j.loadBalancer.enabled }}
+---
+# LoadBalancer for direct Bolt access
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j-lb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  type: LoadBalancer
+  ports:
+    - name: bolt
+      port: 7688
+      targetPort: 7688
+      protocol: TCP
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,82 @@
+{{- if .Values.mcp.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-mcp
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mcp") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ .Values.mcp.replicas }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mcp") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mcp") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
+      containers:
+        - name: mcp
+          image: "{{ .Values.image.mcp.repository }}:{{ .Values.image.mcp.tag }}"
+          imagePullPolicy: {{ .Values.image.mcp.pullPolicy }}
+          ports:
+            - containerPort: 8000
+          env:
+            - name: COCKPIT_API_URL
+              value: "http://{{ include "srw.fullname" . }}-orchestrator:8085"
+            - name: XDG_DATA_HOME
+              value: "/tmp/.local/share"
+            - name: MCP_TRANSPORT
+              value: "http"
+            - name: MCP_HOST
+              value: "0.0.0.0"
+            - name: MCP_PORT
+              value: "8000"
+            - name: MCP_INTERNAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_INTERNAL_KEY
+            {{- if .Values.mcp.oauth.enabled }}
+            - name: MCP_OAUTH_ENABLED
+              value: "true"
+            - name: MCP_OIDC_CLIENT_ID
+              value: {{ .Values.mcp.oauth.clientId | quote }}
+            - name: MCP_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_OIDC_CLIENT_SECRET
+                  optional: true
+            - name: MCP_OIDC_CONFIG_URL
+              value: "http://{{ include "srw.fullname" . }}-keycloak:8080/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
+            {{- end }}
+            - name: MCP_BASE_URL
+              value: {{ include "srw.mcpUrl" . | quote }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.mcp.resources | nindent 12 }}
+{{- end }}
