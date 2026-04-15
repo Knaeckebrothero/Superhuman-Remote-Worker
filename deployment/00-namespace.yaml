@@ -1,6 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: superhuman-remote-worker
-  labels:
-    app.kubernetes.io/name: superhuman-remote-worker

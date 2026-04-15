@@ -1,15 +1,30 @@
 name: Production
 
+# Branch model:
+#   develop -> CI builds :sha-xxx + :experimental images, updates
+#              deployment/values-experimental.yaml, Fleet rolls out to the
+#              homelab cluster.
+#   main    -> CI auto patch-bumps the last v-tag, builds ALL components with
+#              :vX.Y.Z + :latest, packages the Helm chart at that version,
+#              pushes chart to OCI, creates the git tag.
+#   PRs     -> lint + tests only.
+
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
+      - develop
   pull_request:
     branches:
       - main
+      - develop
   workflow_dispatch:
+
+# One pipeline per branch — prevents two back-to-back main pushes from racing
+# on the auto-version bump.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -249,9 +264,17 @@ jobs:
       - name: Detect changes against last deployed SHA per component
         id: check
         run: |
-          # Extract the deployed image SHA for a component from its manifest.
-          # Returns the 7-char commit hash or empty string if not found.
+          # Extract the deployed image SHA for a component from the Helm values
+          # file. Returns the 7-char commit hash, or empty if tag is `latest`
+          # or the key is missing — both of which force a rebuild.
           extract_sha() {
+            local component="$1"
+            grep -A1 "^  ${component}:" deployment/values-experimental.yaml 2>/dev/null \
+              | grep -oP 'tag:\s*sha-\K[0-9a-f]{7}' | head -1 || echo ""
+          }
+
+          # VM-side images still live in raw manifests (separate bundle).
+          extract_sha_raw() {
             local file="$1" component="$2"
             grep -oP "superhuman-remote-worker-${component}:sha-\K[0-9a-f]{7}" "$file" 2>/dev/null | head -1 || echo ""
           }
@@ -285,15 +308,17 @@ jobs:
             echo "false"
           }
 
-          # --- Extract last-deployed SHAs from deployment manifests -----------
-          SHA_AGENT=$(extract_sha deployment/21-agent.yaml agent)
-          SHA_ORCHESTRATOR=$(extract_sha deployment/20-orchestrator.yaml orchestrator)
-          SHA_COCKPIT=$(extract_sha deployment/22-cockpit.yaml cockpit)
-          SHA_MCP=$(extract_sha deployment/23-mcp.yaml mcp)
-          SHA_VPN=$(extract_sha deployment/15-vpn.yaml vpn)
-          SHA_WORKSPACE=$(extract_sha deployment/02-configmap.yaml workspace)
-          SHA_VM_CONTROLLER=$(extract_sha deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
-          SHA_VM_BASE=$(extract_sha deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
+          # --- Extract last-deployed SHAs ----------------------------------
+          # Chart components live in deployment/values-experimental.yaml.
+          SHA_AGENT=$(extract_sha agent)
+          SHA_ORCHESTRATOR=$(extract_sha orchestrator)
+          SHA_COCKPIT=$(extract_sha cockpit)
+          SHA_MCP=$(extract_sha mcp)
+          SHA_VPN=$(extract_sha vpn)
+          SHA_WORKSPACE=$(extract_sha workspace)
+          # VM-side images live in raw manifests (separate bundle).
+          SHA_VM_CONTROLLER=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
+          SHA_VM_BASE=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
 
           echo "Deployed SHAs:"
           echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
@@ -349,16 +374,57 @@ jobs:
             echo "sudo-gate=$SUDO_GATE"
           } >> "$GITHUB_OUTPUT"
 
-  build-agent:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+  # ---------------------------------------------------------------------------
+  # Auto patch-bump on main pushes. Reads the last v-tag and outputs the next
+  # patch version (v0.1.1 -> v0.1.2). The git tag itself is NOT pushed here —
+  # release-chart creates it at the end, after the chart publishes successfully,
+  # so failed builds don't leave half-baked tags in the repo.
+  # ---------------------------------------------------------------------------
+  resolve-version:
+    needs: [lint, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute next patch version
+        id: bump
+        run: |
+          git fetch --tags --force
+          LAST=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$LAST" ]; then
+            LAST="v0.0.0"
+          fi
+          MAJOR=$(echo "${LAST#v}" | cut -d. -f1)
+          MINOR=$(echo "${LAST#v}" | cut -d. -f2)
+          PATCH=$(echo "${LAST#v}" | cut -d. -f3)
+          NEW="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          echo "version=$NEW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
+          echo "Last tag: $LAST -> next: v$NEW"
+
+  build-agent:
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.agent == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -397,8 +463,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Compute short SHA for build arg
         id: short_sha
@@ -421,19 +489,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-orchestrator:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.orchestrator == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -464,8 +533,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Orchestrator image
         uses: docker/build-push-action@v5
@@ -482,19 +553,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-cockpit:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.cockpit == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -525,8 +597,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Cockpit image
         uses: docker/build-push-action@v5
@@ -543,19 +617,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-mcp:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.mcp == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -586,8 +661,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push MCP Server image
         uses: docker/build-push-action@v5
@@ -604,19 +681,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-vpn:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vpn == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -647,8 +725,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push VPN Sidecar image
         uses: docker/build-push-action@v5
@@ -665,19 +745,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-workspace:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.workspace == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.workspace == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -708,8 +789,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Workspace image
         uses: docker/build-push-action@v5
@@ -726,19 +809,20 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   build-sudo-gate:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -779,14 +863,16 @@ jobs:
           retention-days: 7
 
   build-agent-vm-base:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version]
     # Rebuild when vm-base OR sudo-gate changes (sudo gate binaries are baked into the image)
     if: >-
       always() && github.event_name != 'pull_request' && (
         needs.changes.outputs.vm-base == 'true' ||
         needs.changes.outputs.sudo-gate == 'true' ||
+        github.ref == 'refs/heads/main' ||
         github.event_name == 'workflow_dispatch'
-      )
+      ) &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -890,21 +976,30 @@ jobs:
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
-          docker build -t "${IMAGE}:latest" -t "${IMAGE}:sha-${GITHUB_SHA::7}" -f Dockerfile.containerDisk .
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
-          echo "Pushed ${IMAGE}:latest"
+          # Base tag: SHA (always). Extras depend on branch.
+          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}")
+          if [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            TAGS+=("${IMAGE}:experimental")
+          elif [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            TAGS+=("${IMAGE}:latest" "${IMAGE}:${{ needs.resolve-version.outputs.tag }}")
+          fi
+          BUILD_ARGS=()
+          for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
+          for T in "${TAGS[@]}"; do docker push "$T"; done
+          printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
 
   build-vm-controller:
-    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
       github.event_name != 'pull_request' &&
-      (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-controller == 'true' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
       needs.lint.result == 'success' &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
+      !contains(needs.test-cockpit.result, 'failure') &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -935,8 +1030,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
-            type=raw,value=latest
             type=sha,format=short,prefix=sha-
+            type=raw,value=experimental,enable=${{ github.ref == 'refs/heads/develop' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push VM Controller image
         uses: docker/build-push-action@v5
@@ -953,17 +1050,19 @@ jobs:
       - name: Inspect pushed image
         if: success()
         run: |
-          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller:latest" | tr '[:upper:]' '[:lower:]')
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller:sha-${GITHUB_SHA::7}" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
   # ---------------------------------------------------------------------------
-  # Update deployment manifests with new image SHA tags
-  # Fleet detects the git change and rolls out updated pods automatically
+  # Develop-only: update image tags in deployment/values-experimental.yaml so
+  # Fleet renders the chart with the newly built images and rolls them out to
+  # the homelab cluster.
   # ---------------------------------------------------------------------------
-  deploy:
+  update-experimental-deployment:
     needs: [lint, dependency-audit, test-python, test-cockpit, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-workspace, build-vm-controller, build-agent-vm-base]
     if: >-
-      always() && !cancelled() && github.event_name != 'pull_request' &&
+      always() && !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/develop' &&
       needs.lint.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure') &&
@@ -972,122 +1071,107 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
-    concurrency:
-      group: deploy-manifests
-      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: develop
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
 
       - name: Compute image tag
         id: tag
         run: echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Update orchestrator image tag
+      - name: Update orchestrator tag
         if: needs.build-orchestrator.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-orchestrator:[a-zA-Z0-9_.-]*|superhuman-remote-worker-orchestrator:${{ steps.tag.outputs.sha }}|g' \
-            deployment/20-orchestrator.yaml
+        run: yq -i '.image.orchestrator.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
-      - name: Update agent image tag
+      - name: Update agent tag
         if: needs.build-agent.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}|g' \
-            deployment/21-agent.yaml
+        run: yq -i '.image.agent.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
-      - name: Update agent images in ConfigMap
-        if: needs.build-agent.result == 'success'
-        run: |
-          sed -i 's|AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*"|AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}"|g' \
-            deployment/02-configmap.yaml
-          sed -i 's|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*"|PERSISTENT_AGENT_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}"|g' \
-            deployment/02-configmap.yaml
-
-      - name: Update cockpit image tag
+      - name: Update cockpit tag
         if: needs.build-cockpit.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-cockpit:[a-zA-Z0-9_.-]*|superhuman-remote-worker-cockpit:${{ steps.tag.outputs.sha }}|g' \
-            deployment/22-cockpit.yaml
+        run: yq -i '.image.cockpit.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
-      - name: Update MCP image tag
+      - name: Update MCP tag
         if: needs.build-mcp.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-mcp:[a-zA-Z0-9_.-]*|superhuman-remote-worker-mcp:${{ steps.tag.outputs.sha }}|g' \
-            deployment/23-mcp.yaml
+        run: yq -i '.image.mcp.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
-      - name: Update VPN image tag
+      - name: Update VPN tag
         if: needs.build-vpn.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-vpn:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vpn:${{ steps.tag.outputs.sha }}|g' \
-            deployment/15-vpn.yaml
+        run: yq -i '.image.vpn.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
-      - name: Update VM controller image tag
+      - name: Update workspace tag
+        if: needs.build-workspace.result == 'success'
+        run: yq -i '.image.workspace.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update VM controller image tag (separate bundle, still SHA-pinned)
         if: needs.build-vm-controller.result == 'success'
         run: |
           sed -i 's|superhuman-remote-worker-vm-controller:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vm-controller:${{ steps.tag.outputs.sha }}|g' \
             deployment-vms/srw-vm-controller/vm-controller.yaml
 
-      - name: Update workspace image tag
-        if: needs.build-workspace.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-workspace:[a-zA-Z0-9_.-]*|superhuman-remote-worker-workspace:${{ steps.tag.outputs.sha }}|g' \
-            deployment/02-configmap.yaml
-
-      - name: Update agent VM base image tag
+      - name: Update agent VM base image tag (separate bundle)
         if: needs.build-agent-vm-base.result == 'success'
         run: |
           sed -i 's|superhuman-remote-worker-agent-vm-base:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}|g' \
             deployment-vms/srw-vm-controller/vm-controller.yaml
 
-      - name: Commit and push updated manifests
+      - name: Commit and push
         run: |
-          git diff --quiet && { echo "No manifest changes to commit"; exit 0; }
+          git diff --quiet && { echo "No changes to commit"; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deployment/ deployment-vms/
-          git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
+          git add deployment/values-experimental.yaml deployment-vms/ || true
+          git commit -m "deploy(experimental): update image tags to ${{ steps.tag.outputs.sha }}"
           git push
 
   # ---------------------------------------------------------------------------
-  # Package and publish the Helm chart on version tags (v*)
-  # Chart version is derived from the tag (v0.1.0 -> 0.1.0) and pushed to
-  # oci://ghcr.io/knaeckebrothero/charts/srw. The GHCR package must be set
-  # to public visibility once manually after the first push.
+  # Main-only: package the Helm chart at the auto-bumped version, push to OCI,
+  # then push the git tag. The git tag goes LAST so a failed chart push doesn't
+  # leave dangling tags.
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [lint, test-python, test-cockpit]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-workspace, build-vm-controller]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.resolve-version.result == 'success' &&
+      needs.build-agent.result == 'success' &&
+      needs.build-orchestrator.result == 'success' &&
+      needs.build-cockpit.result == 'success' &&
+      needs.build-mcp.result == 'success' &&
+      !contains(needs.build-vpn.result, 'failure') &&
+      !contains(needs.build-workspace.result, 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
 
-      - name: Derive chart version from tag
-        id: version
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Chart version: $VERSION"
-
       - name: Package chart
         run: |
           mkdir -p dist
           helm package helm/ \
-            --version "${{ steps.version.outputs.version }}" \
-            --app-version "${{ steps.version.outputs.version }}" \
+            --version "${{ needs.resolve-version.outputs.version }}" \
+            --app-version "${{ needs.resolve-version.outputs.version }}" \
             --destination ./dist
 
       - name: Log in to GHCR
@@ -1099,5 +1183,15 @@ jobs:
 
       - name: Push chart to OCI registry
         run: |
-          helm push ./dist/superhuman-remote-worker-${{ steps.version.outputs.version }}.tgz \
+          helm push ./dist/superhuman-remote-worker-${{ needs.resolve-version.outputs.version }}.tgz \
             oci://ghcr.io/knaeckebrothero/charts
+
+      # Tag pushed LAST so a failed chart push doesn't leave a dangling git tag.
+      - name: Push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ needs.resolve-version.outputs.tag }}" \
+            -m "Release ${{ needs.resolve-version.outputs.tag }}"
+          git push origin "${{ needs.resolve-version.outputs.tag }}"
+
