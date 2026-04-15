@@ -1,0 +1,58 @@
+{{/*
+Mongo Express — optional web UI for MongoDB administration.
+*/}}
+{{- if .Values.mongoExpress.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-mongo-express
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongo-express") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongo-express") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-mongodb
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - "until nc -z {{ include "srw.fullname" . }}-mongodb 27017; do sleep 2; done"
+      containers:
+        - name: mongo-express
+          image: {{ .Values.mongoExpress.image }}
+          ports:
+            - containerPort: 8081
+          env:
+            - name: ME_CONFIG_MONGODB_SERVER
+              value: {{ include "srw.fullname" . }}-mongodb
+            - name: ME_CONFIG_BASICAUTH
+              value: "false"
+          resources:
+            {{- toYaml .Values.mongoExpress.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-mongo-express
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8081
+      targetPort: 8081
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongo-express") | nindent 4 }}
+{{- end }}

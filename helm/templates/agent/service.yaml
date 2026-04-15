@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-agent
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.agent.port | int }}
+      targetPort: {{ .Values.agent.port | int }}
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 4 }}

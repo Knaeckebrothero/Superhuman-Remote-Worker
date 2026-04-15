@@ -1,0 +1,63 @@
+{{/*
+pgAdmin 4 — optional web UI for PostgreSQL administration.
+*/}}
+{{- if .Values.pgadmin.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-pgadmin
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"
+      containers:
+        - name: pgadmin
+          image: {{ .Values.pgadmin.image }}
+          ports:
+            - containerPort: 80
+          env:
+            - name: PGADMIN_DEFAULT_EMAIL
+              value: "admin@srw.dev"
+            - name: PGADMIN_DEFAULT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: PGADMIN_CONFIG_SERVER_MODE
+              value: "False"
+          resources:
+            {{- toYaml .Values.pgadmin.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-pgadmin
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5050
+      targetPort: 80
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 4 }}
+{{- end }}

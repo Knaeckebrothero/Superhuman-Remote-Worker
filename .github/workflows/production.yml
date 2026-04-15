@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -28,6 +30,14 @@ jobs:
         run: ruff check src/ orchestrator/ tests/
       - name: Ruff format check
         run: ruff format --check src/ orchestrator/ tests/
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+      - name: Helm lint (home cluster scenario)
+        run: helm lint helm/ -f helm/ci/test-values.yaml
+      - name: Helm lint (customer external-services scenario)
+        run: helm lint helm/ -f helm/ci/customer-external-values.yaml
 
   # ---------------------------------------------------------------------------
   # CodeQL — static analysis for security vulnerabilities
@@ -1037,3 +1047,54 @@ jobs:
           git add deployment/ deployment-vms/
           git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
           git push
+
+  # ---------------------------------------------------------------------------
+  # Package and publish the Helm chart on version tags (v*)
+  # Chart version is derived from the tag (v0.1.0 -> 0.1.0) and pushed to
+  # oci://ghcr.io/knaeckebrothero/charts/srw. The GHCR package must be set
+  # to public visibility once manually after the first push.
+  # ---------------------------------------------------------------------------
+  release-chart:
+    name: Package and publish Helm chart
+    needs: [lint, test-python, test-cockpit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Derive chart version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Chart version: $VERSION"
+
+      - name: Package chart
+        run: |
+          mkdir -p dist
+          helm package helm/ \
+            --version "${{ steps.version.outputs.version }}" \
+            --app-version "${{ steps.version.outputs.version }}" \
+            --destination ./dist
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push chart to OCI registry
+        run: |
+          helm push ./dist/superhuman-remote-worker-${{ steps.version.outputs.version }}.tgz \
+            oci://ghcr.io/knaeckebrothero/charts

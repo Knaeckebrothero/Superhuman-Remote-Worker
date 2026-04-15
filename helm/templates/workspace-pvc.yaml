@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-workspace
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteMany
+  {{- if .Values.workspace.storageClass }}
+  storageClassName: {{ .Values.workspace.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.workspace.storageSize }}
