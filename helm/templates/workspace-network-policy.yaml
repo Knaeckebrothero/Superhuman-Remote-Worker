@@ -1,0 +1,102 @@
+{{- if .Values.workspace.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-workspace-policy
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: srw-workspace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # SSH + CDP from agent pods (RemoteBackend + browser automation)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "persistent-agent") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 22
+        - protocol: TCP
+          port: 9222
+    # code-server from orchestrator (IDE session proxying)
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+    # code-server via Traefik ingress (direct IDE access)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTP/HTTPS for browser automation (agent-controlled browsing via CDP)
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+    # Gitea (workspace git repos)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3000
+    # PostgreSQL (App DB — for datasource shell tools like psql)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # PostgreSQL (Vector DB)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Neo4j (for datasource shell tools)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 7688
+    # MongoDB (for datasource shell tools)
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongodb") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 27017
+    # No external internet — workspace containers are sandboxed
+{{- end }}

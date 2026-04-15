@@ -1,0 +1,409 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-agent
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "agent") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ .Values.agent.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 180
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
+      containers:
+        - name: agent
+          image: "{{ .Values.image.agent.repository }}:{{ .Values.image.agent.tag }}"
+          imagePullPolicy: {{ .Values.image.agent.pullPolicy }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          ports:
+            - containerPort: {{ .Values.agent.port | int }}
+          env:
+            # Core config
+            - name: AGENT_CONFIG
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AGENT_CONFIG
+            - name: AGENT_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AGENT_PORT
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: DATABASE_URL
+            - name: VECTOR_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_DB_URL
+            - name: MONGODB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: MONGODB_URL
+            - name: ORCHESTRATOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: ORCHESTRATOR_URL
+            - name: WORKSPACE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_PATH
+            # LLM routing (via VPN sidecar)
+            - name: LLM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LLM_BASE_URL
+            - name: KEY_COOLDOWN_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: KEY_COOLDOWN_SECONDS
+            # LLM provider keys
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: OPENAI_API_KEY
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: ANTHROPIC_API_KEY
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GROQ_API_KEY
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: OPENROUTER_API_KEY
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: GOOGLE_API_KEY
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: TAVILY_API_KEY
+            - name: SEMANTIC_SCHOLAR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: SEMANTIC_SCHOLAR_API_KEY
+            # Codex proxy (CLIProxyAPI)
+            - name: CODEX_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CODEX_BASE_URL
+            # Codex raw-response diagnostic (off by default)
+            - name: DEBUG_CODEX_RAW_RESPONSE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: DEBUG_CODEX_RAW_RESPONSE
+                  optional: true
+            - name: CODEX_RAW_DUMP_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CODEX_RAW_DUMP_DIR
+                  optional: true
+            # Vision model
+            - name: VISION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VISION_API_KEY
+            - name: VISION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VISION_MODEL
+            # Whisper
+            - name: WHISPER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: WHISPER_API_KEY
+            # Browser automation (via VPN sidecar)
+            - name: BROWSER_LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: BROWSER_LLM_MODEL
+            - name: BROWSER_LLM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: BROWSER_LLM_BASE_URL
+            # Research proxy (via VPN sidecar SOCKS5)
+            - name: RESEARCH_PROXY_TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: RESEARCH_PROXY_TYPE
+            - name: RESEARCH_PROXY_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: RESEARCH_PROXY_HOST
+            - name: RESEARCH_PROXY_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: RESEARCH_PROXY_PORT
+            # Citation Engine (via VPN sidecar)
+            - name: CITATION_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CITATION_DB_URL
+            - name: CITATION_LLM_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_LLM_URL
+            - name: CITATION_LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_LLM_MODEL
+            - name: CITATION_REASONING_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_REASONING_LEVEL
+            - name: CITATION_EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_EMBEDDING_MODEL
+            - name: CITATION_EMBEDDING_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_EMBEDDING_URL
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: EMBEDDING_MODEL
+            - name: EMBEDDING_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: EMBEDDING_BASE_URL
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: EMBEDDING_API_KEY
+            - name: CITATION_EMBEDDING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CITATION_EMBEDDING_KEY
+            # Research
+            - name: UNPAYWALL_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: UNPAYWALL_EMAIL
+            # Neo4j (optional — only set when databases.neo4j.enabled)
+            - name: NEO4J_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEO4J_URL
+                  optional: true
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_USERNAME
+                  optional: true
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: NEO4J_PASSWORD
+                  optional: true
+            # Claude Code CLI auth
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CLAUDE_CODE_OAUTH_TOKEN
+            # Workstation API (embeddings, vision)
+            - name: WORKSTATION_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSTATION_BASE_URL
+            # Gitea (for workspace git operations)
+            - name: GITEA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: GITEA_URL
+            # Logging
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LOG_LEVEL
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run
+            - name: home-srw
+              mountPath: /home/srw
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.agent.port | int }}
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: {{ .Values.agent.port | int }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.agent.port | int }}
+            failureThreshold: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+        {{- if .Values.agent.tailscale.enabled }}
+        # Tailscale sidecar — mesh VPN for SSH access to KubeVirt VMs
+        - name: tailscale
+          image: {{ .Values.agent.tailscale.image }}
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              mkdir -p /dev/net
+              [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+              tailscaled --state=mem: --tun=tailscale0 --no-logs-no-support &
+              TSPID=$!
+              for i in $(seq 1 30); do
+                [ -S /var/run/tailscale/tailscaled.sock ] && break
+                sleep 1
+              done
+              while true; do
+                if tailscale up \
+                  --auth-key="${TS_AUTHKEY}" \
+                  --login-server={{ include "srw.headscaleUrl" . }} \
+                  --hostname="${POD_NAME}" \
+                  --accept-dns=false \
+                  --timeout=60s 2>&1; then
+                  echo "Tailscale authenticated"
+                  break
+                fi
+                echo "Auth retry in 15s..."
+                sleep 15
+              done
+              wait $TSPID
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: TAILSCALE_AUTH_KEY
+                  optional: true
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: tailscale-state
+              mountPath: /var/lib/tailscale
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+        {{- end }}
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-workspace
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.vmSshKeySecretName" . }}
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: home-srw
+          emptyDir:
+            sizeLimit: 512Mi
+        {{- if .Values.agent.tailscale.enabled }}
+        - name: tailscale-state
+          emptyDir:
+            sizeLimit: 16Mi
+        {{- end }}

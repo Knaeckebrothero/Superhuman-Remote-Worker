@@ -1,0 +1,70 @@
+{{/*
+Stakater Reloader — watches ConfigMap/Secret changes and triggers
+rolling restarts of annotated Deployments/StatefulSets/DaemonSets.
+*/}}
+{{- if .Values.reloader.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "srw.fullname" . }}-reloader
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "reloader") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.fullname" . }}-reloader
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "reloader") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["list", "get", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["list", "get", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-reloader
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "reloader") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.fullname" . }}-reloader
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "srw.fullname" . }}-reloader
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-reloader
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "reloader") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "reloader") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "reloader") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "srw.fullname" . }}-reloader
+      containers:
+        - name: reloader
+          image: {{ .Values.reloader.image }}
+          args:
+            - --reload-strategy=annotations
+          resources:
+            {{- toYaml .Values.reloader.resources | nindent 12 }}
+{{- end }}

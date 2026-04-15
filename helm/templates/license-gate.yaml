@@ -1,0 +1,3 @@
+{{- if not .Values.license.acceptTerms }}
+{{- fail "\n\n========================================================================\nLICENSE TERMS NOT ACCEPTED\n========================================================================\n\nYou must accept the Superhuman Remote Worker license terms to install this\nchart. Set the following in your values file:\n\n  license:\n    acceptTerms: true\n\nOr pass --set license.acceptTerms=true on the command line.\n\nSee the LICENSE file in the source repository for the full terms:\n  https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE\n\n========================================================================\n" }}
+{{- end }}

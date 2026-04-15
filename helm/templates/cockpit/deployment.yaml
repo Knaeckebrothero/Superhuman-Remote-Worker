@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-cockpit-env
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "cockpit") | nindent 4 }}
+data:
+  env.js: |
+    (function(window) {
+      window['env'] = window['env'] || {};
+      window['env']['apiUrl'] = '{{ include "srw.apiUrl" . }}/api';
+      window['env']['giteaUrl'] = '{{ include "srw.gitUrl" . }}/srw';
+      window['env']['dozzleUrl'] = 'https://dozzle.{{ .Values.global.domain }}';
+      window['env']['minioConsoleUrl'] = 'https://minio.{{ .Values.global.domain }}';
+      window['env']['neo4jUrl'] = 'https://neo4j.{{ .Values.global.domain }}';
+      window['env']['pgadminUrl'] = 'https://pgadmin.{{ .Values.global.domain }}';
+      window['env']['mongoExpressUrl'] = 'https://mongo.{{ .Values.global.domain }}';
+      window['env']['mcpUrl'] = '{{ include "srw.mcpUrl" . }}/mcp';
+      window['env']['cloudUrl'] = '{{ include "srw.cloudUrl" . }}';
+
+      // OIDC SSO (works with Keycloak or any OIDC-compliant provider)
+      window['env']['keycloakUrl'] = '{{ include "srw.authUrl" . }}';
+      window['env']['keycloakRealm'] = '{{ .Values.keycloak.realm }}';
+      window['env']['keycloakClientId'] = '{{ .Values.keycloak.cockpitClientId }}';
+
+      // Available models (fallback — primary source is GET /api/models)
+      window['env']['models'] = [
+        {{- range $i, $group := .Values.cockpit.models }}
+        {{ if $i }},{{ end }}{ group: '{{ $group.group }}', models: [{{ range $j, $m := $group.models }}{{ if $j }}, {{ end }}'{{ $m }}'{{ end }}] }
+        {{- end }}
+      ];
+
+      // Quick-select presets for strategic + tactical model combinations
+      window['env']['modelPresets'] = [
+        {{- range $i, $preset := .Values.cockpit.modelPresets }}
+        {{ if $i }},{{ end }}{ label: '{{ $preset.label }}', strategic: '{{ $preset.strategic }}', tactical: '{{ $preset.tactical }}' }
+        {{- end }}
+      ];
+
+      // Models available in the instruction builder chat
+      window['env']['builderModels'] = [
+        {{- range $i, $model := .Values.cockpit.builderModels }}
+        {{ if $i }},{{ end }}{ label: '{{ $model.label }}', id: '{{ $model.id }}' }
+        {{- end }}
+      ];
+    })(this);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-cockpit
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "cockpit") | nindent 4 }}
+  {{- if .Values.reloader.enabled }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+  {{- end }}
+spec:
+  replicas: {{ .Values.cockpit.replicas }}
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "cockpit") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "cockpit") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-orchestrator 8085; do sleep 2; done"]
+      containers:
+        - name: cockpit
+          image: "{{ .Values.image.cockpit.repository }}:{{ .Values.image.cockpit.tag }}"
+          imagePullPolicy: {{ .Values.image.cockpit.pullPolicy }}
+          ports:
+            - containerPort: 4000
+          volumeMounts:
+            - name: env-js
+              mountPath: /usr/share/nginx/html/assets/env.js
+              subPath: env.js
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 4000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.cockpit.resources | nindent 12 }}
+      volumes:
+        - name: env-js
+          configMap:
+            name: {{ include "srw.fullname" . }}-cockpit-env

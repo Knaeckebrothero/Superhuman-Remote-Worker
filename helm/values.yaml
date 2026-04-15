@@ -1,0 +1,565 @@
+# Superhuman Remote Worker — Helm Chart Values
+# See docs/helm_migration.md for architecture overview.
+
+# -- Override chart name in resource names
+nameOverride: ""
+# -- Override full resource name prefix
+fullnameOverride: ""
+
+# =============================================================================
+# License Acceptance
+# =============================================================================
+# The Superhuman Remote Worker source is publicly available under the terms in
+# the LICENSE file of the source repository. You must explicitly accept those
+# terms to install and run the application.
+#
+#   See: https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE
+#
+# The chart refuses to render when license.acceptTerms is false, and the
+# orchestrator refuses to start (enforced at runtime via LICENSE_TERMS_ACCEPTED).
+license:
+  # -- REQUIRED: set to true to accept the license terms.
+  acceptTerms: false
+
+global:
+  # -- REQUIRED: Base domain (e.g. "example.com"). All subdomains are derived automatically.
+  domain: ""
+  # -- Pull secrets for private container registries (e.g. GHCR)
+  imagePullSecrets: []
+  #   - name: ghcr-pull-secret
+
+# =============================================================================
+# Container Images
+# =============================================================================
+image:
+  orchestrator:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator
+    tag: latest
+    pullPolicy: Always
+  agent:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent
+    tag: latest
+    pullPolicy: Always
+  cockpit:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit
+    tag: latest
+    pullPolicy: Always
+  mcp:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp
+    tag: latest
+    pullPolicy: Always
+  workspace:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
+    tag: latest
+    pullPolicy: Always
+  vpn:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn
+    tag: latest
+    pullPolicy: Always
+
+# =============================================================================
+# Orchestrator
+# =============================================================================
+orchestrator:
+  replicas: 1
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+  # -- Auto-assign jobs to idle agents
+  autoAssignEnabled: "true"
+
+# =============================================================================
+# Agent
+# =============================================================================
+agent:
+  # -- Static replica count (0 = dynamic provisioning via AgentProvisioner)
+  replicas: 0
+  config: "defaults"
+  port: "8001"
+  persistentConfig: "interactive"
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+  # -- Tailscale sidecar for mesh VPN to KubeVirt VMs
+  tailscale:
+    enabled: false
+    image: ghcr.io/tailscale/tailscale:v1.82.5
+  # -- Pod Disruption Budget
+  pdb:
+    enabled: true
+    minAvailable: 0
+  # -- Agent pool sizing (AgentProvisioner)
+  pool:
+    maxAgents: "10"
+    minAgents: "2"
+    buffer: "1"
+    reservedSessionSlots: "2"
+    reservedJobSlots: "2"
+
+# =============================================================================
+# Cockpit (Angular frontend)
+# =============================================================================
+cockpit:
+  replicas: 1
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "512Mi"
+      cpu: "250m"
+  # -- Model groups shown in the cockpit UI (fallback — primary source is GET /api/models)
+  models:
+    - group: Local
+      models: ["openai/gpt-oss-120b"]
+    - group: OpenAI
+      models: ["gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
+    - group: Anthropic
+      models: ["claude-sonnet-4-5-20250929", "claude-opus-4-6"]
+    - group: Google
+      models: ["gemini-2.5-pro", "gemini-2.5-flash"]
+    - group: Groq
+      models: ["groq/moonshotai/kimi-k2-instruct-0905", "groq/gpt-oss-120b"]
+    - group: OpenRouter
+      models: ["openrouter/minimax/minimax-m2.7"]
+  # -- Strategic + tactical model presets
+  modelPresets:
+    - label: "Opus + Sonnet"
+      strategic: "claude-opus-4-6"
+      tactical: "claude-sonnet-4-5-20250929"
+    - label: "Codex + Spark"
+      strategic: "codex/gpt-5.3-codex"
+      tactical: "codex/gpt-5.3-codex-spark"
+    - label: "Gemini Pro + Flash"
+      strategic: "gemini-2.5-pro"
+      tactical: "gemini-2.5-flash"
+  # -- Models available in instruction builder chat
+  builderModels:
+    - label: "GPT OSS 120B (Local)"
+      id: "openai/gpt-oss-120b"
+    - label: "GPT-5.4"
+      id: "gpt-5.4"
+    - label: "Claude Opus 4.6"
+      id: "claude-opus-4-6"
+
+# =============================================================================
+# MCP Server (Claude Code / AI platform integration)
+# =============================================================================
+mcp:
+  enabled: true
+  replicas: 1
+  oauth:
+    enabled: true
+    clientId: "mcp-server"
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# =============================================================================
+# Ingress
+# =============================================================================
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    # -- cert-manager ClusterIssuer name
+    issuerName: ""
+  # -- Extra annotations for all Ingress resources
+  annotations: {}
+  # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
+  cors:
+    enabled: true
+
+# =============================================================================
+# Secrets — three modes (pick one)
+# =============================================================================
+secrets:
+  # -- Mode 3: Reference a pre-existing K8s Secret by name
+  existingSecret: ""
+  # -- Mode 2: Chart creates a Secret from the values below (dev/testing only)
+  create: false
+  values: {}
+  # -- Separate existing secret for VM SSH key (optional)
+  existingVmSshKeySecret: ""
+
+# -- Mode 1: External Secrets Operator (Vault-backed)
+externalSecrets:
+  enabled: false
+  refreshInterval: "1h"
+  secretStoreRef: "vault-backend"
+  secretStoreKind: "ClusterSecretStore"
+  vaultPath: ""
+  vmSshKeyVaultPath: ""
+
+# =============================================================================
+# VPN Sidecars (optional)
+# =============================================================================
+vpn:
+  cluster:
+    enabled: false
+    port: "443"
+  research:
+    enabled: false
+    port: "443"
+  workstation:
+    enabled: false
+    port: "443"
+
+# =============================================================================
+# Headscale — self-hosted Tailscale coordination (optional)
+# =============================================================================
+headscale:
+  enabled: false
+  image: headscale/headscale:0.28.0
+  storageClass: ""
+  storageSize: "1Gi"
+  stun:
+    # -- NodePort for STUN/UDP (cannot go through HTTP ingress)
+    enabled: true
+
+# =============================================================================
+# Databases
+# =============================================================================
+databases:
+  postgres:
+    enabled: true
+    # -- Deploy StatefulSet within chart (false = external database — set externalUrl)
+    internal: true
+    # -- Full database URL for external mode. Required when internal=false.
+    # When internal=true, DATABASE_URL is read from secrets.
+    # Example: "postgres://user:pass@my-pg.db.svc:5432/srw"
+    externalUrl: ""
+    image: pgvector/pgvector:pg15
+    storageClass: ""
+    storageSize: "10Gi"
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  vector:
+    enabled: true
+    internal: true
+    # -- Full vector DB URL for external mode. Example: "postgresql://user:pass@vector-pg:5432/srw_vector"
+    externalUrl: ""
+    image: pgvector/pgvector:pg15
+    storageClass: ""
+    storageSize: "10Gi"
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  mongodb:
+    enabled: true
+    internal: true
+    # -- Full MongoDB URL for external mode. Example: "mongodb://my-mongo.db.svc:27017/srw_logs"
+    externalUrl: ""
+    image: mongo:7
+    storageClass: ""
+    storageSize: "5Gi"
+    resources:
+      requests:
+        memory: "256Mi"
+        cpu: "100m"
+      limits:
+        memory: "1Gi"
+        cpu: "500m"
+  neo4j:
+    enabled: true
+    internal: true
+    # -- Full Neo4j Bolt URL for external mode. Example: "bolt://my-neo4j.db.svc:7687"
+    externalUrl: ""
+    image: neo4j:5-community
+    storageClass: ""
+    storageSize: "10Gi"
+    # -- Bolt TLS certificate via cert-manager (optional, internal-only)
+    boltTls:
+      enabled: false
+      issuerName: ""
+    # -- LoadBalancer for direct Bolt access (optional, internal-only)
+    loadBalancer:
+      enabled: false
+    resources:
+      requests:
+        memory: "512Mi"
+        cpu: "250m"
+      limits:
+        memory: "2Gi"
+        cpu: "1000m"
+
+# =============================================================================
+# Supporting Services
+# =============================================================================
+gitea:
+  enabled: true
+  # -- Deploy Gitea StatefulSet within the chart. Set false to use external git server.
+  internal: true
+  # -- Internal cluster URL (when internal=false, set to your existing git server's internal URL)
+  internalUrl: ""
+  # -- Public URL (when internal=false, set to your existing git server's public URL).
+  # When internal=true, defaults to https://git.{global.domain}.
+  externalUrl: ""
+  image: gitea/gitea:1.22-rootless
+  storageClass: ""
+  storageSize: "5Gi"
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "512Mi"
+      cpu: "250m"
+
+keycloak:
+  # -- Whether the system uses Keycloak/OIDC at all. Set false only for unauthenticated dev.
+  enabled: true
+  # -- Deploy Keycloak StatefulSet within the chart. Set false to use external OIDC provider.
+  # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
+  internal: true
+  image: quay.io/keycloak/keycloak:26.2
+  realm: "srw"
+  # -- Public OIDC issuer URL (when internal=false, e.g. "https://login.microsoftonline.com/{tenant}/v2.0"
+  # for Azure AD, or "https://accounts.google.com" for Google Workspace).
+  # When internal=true, defaults to https://auth.{global.domain}.
+  externalIssuerUrl: ""
+  # -- Internal cluster URL for backend-to-OIDC traffic (when internal=false). Often same as
+  # externalIssuerUrl if the IdP is reachable by both browser and cluster. When internal=true,
+  # defaults to the internal Keycloak service.
+  externalInternalUrl: ""
+  # -- Cockpit OIDC client ID (the public SPA client). Default "cockpit" matches the bundled realm.
+  cockpitClientId: "cockpit"
+  # -- Disable the Keycloak admin group sync. When using external OIDC, set true so the
+  # orchestrator doesn't try to call Keycloak admin APIs (project membership stays in Postgres).
+  adminApiDisabled: false
+  # -- ProtonMail Bridge cert extraction for SMTP STARTTLS (optional)
+  bridgeCert:
+    enabled: false
+    smtpHost: ""
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+
+nextcloud:
+  enabled: false
+  internal: true
+  image: docker.io/library/nextcloud:31-apache
+  replicas: 0
+  storageClass: ""
+  storageSize: "10Gi"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+opencloud:
+  enabled: true
+  image: docker.io/opencloudeu/opencloud:latest
+  storageClass: ""
+  dataStorageSize: "10Gi"
+  configStorageSize: "1Gi"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# -- External cloud storage (used when both opencloud.enabled and nextcloud.enabled are false).
+# Agent authenticates with a single service account (credentials in the secret as
+# CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD). Per-user OAuth/linking is configured
+# in-app as datasources, not by the chart.
+cloud:
+  # -- Backend type: "nextcloud" | "opencloud" | "webdav" | "" (disables external cloud)
+  externalBackend: ""
+  # -- Public URL (browser-visible). Used for deep-links from cockpit.
+  externalUrl: ""
+  # -- Internal URL the agent calls server-to-server. Defaults to externalUrl when empty.
+  externalServiceUrl: ""
+
+# =============================================================================
+# Workspace
+# =============================================================================
+workspace:
+  storageClass: ""
+  storageSize: "20Gi"
+  # -- Storage class for ephemeral per-job workspace PVCs
+  ephemeralStorageClass: ""
+  # -- NetworkPolicy restricting workspace pod traffic
+  networkPolicy:
+    enabled: true
+
+# =============================================================================
+# Optional Admin UIs
+# =============================================================================
+pgadmin:
+  enabled: false
+  image: dpage/pgadmin4:latest
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "512Mi"
+      cpu: "250m"
+
+mongoExpress:
+  enabled: false
+  image: mongo-express:latest
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "250m"
+
+dozzle:
+  enabled: false
+  image: amir20/dozzle:latest
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "256Mi"
+
+codexProxy:
+  enabled: false
+  image: docker.io/eceasy/cli-proxy-api:latest
+  storageSize: "1Gi"
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# =============================================================================
+# Reloader (watches ConfigMap/Secret changes and triggers rolling restarts)
+# =============================================================================
+reloader:
+  enabled: true
+  image: stakater/reloader:v1.3.0
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "25m"
+    limits:
+      memory: "256Mi"
+      cpu: "100m"
+
+# =============================================================================
+# LLM Configuration (configmap values)
+# =============================================================================
+llm:
+  baseUrl: ""
+  keyCooldownSeconds: "3600"
+  visionModel: "gpt-4o-mini"
+  browserModel: "gpt-oss-120b"
+  browserBaseUrl: ""
+  embeddingModel: "qwen3-embedding-8b"
+  embeddingBaseUrl: ""
+  codexBaseUrl: ""
+  builderModel: "gpt-5.2-pro"
+  builderProvider: "openai"
+
+# =============================================================================
+# Citation Engine
+# =============================================================================
+citation:
+  llmUrl: ""
+  llmModel: "gpt-oss-120b"
+  reasoningLevel: "high"
+  embeddingModel: "qwen3-embedding-8b"
+  embeddingUrl: ""
+
+# =============================================================================
+# Research Proxy (SOCKS5 via VPN sidecar)
+# =============================================================================
+research:
+  proxyType: "socks5"
+  proxyHost: ""
+  proxyPort: "1080"
+
+# =============================================================================
+# Email / Notifications
+# =============================================================================
+email:
+  enabled: false
+  smtp:
+    host: ""
+    port: "1025"
+    useTls: "true"
+    trustSelfSigned: "true"
+    from: ""
+  imap:
+    host: ""
+    port: "1143"
+    useSsl: "false"
+    trustSelfSigned: "true"
+    pollInterval: "30"
+  agentEmail: ""
+  domain: ""
+
+notifications:
+  ntfy:
+    url: ""
+    topic: ""
+
+# =============================================================================
+# S3 / Object Storage
+# =============================================================================
+s3:
+  endpoint: ""
+  bucket: "srw-snapshots"
+  region: "us-east-1"
+  snapshotMaxSizeGb: "10"
+  snapshotRetentionDays: "90"
+
+# =============================================================================
+# IDE Sessions
+# =============================================================================
+ide:
+  sessionIdleTimeout: "30"
+  sessionMaxLifetime: "240"
+  maxConcurrentPerUser: "2"
+  codeServerImage: "codercom/code-server:latest"
+
+# =============================================================================
+# NATS Messaging (optional)
+# =============================================================================
+nats:
+  url: ""
+
+# =============================================================================
+# Logging
+# =============================================================================
+logLevel: "DEBUG"

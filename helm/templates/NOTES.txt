@@ -1,0 +1,30 @@
+Superhuman Remote Worker has been deployed.
+
+Domain:    {{ .Values.global.domain }}
+Namespace: {{ .Release.Namespace }}
+License:   accepted ({{ include "srw.fullname" . }} will start)
+
+Services:
+  Cockpit:       {{ include "srw.cockpitUrl" . }}
+  API:           {{ include "srw.apiUrl" . }}
+  Auth:          {{ include "srw.authUrl" . }}
+  Git:           {{ include "srw.gitUrl" . }}
+{{- if .Values.opencloud.enabled }}
+  Cloud:         {{ include "srw.cloudUrl" . }}
+{{- end }}
+{{- if .Values.mcp.enabled }}
+  MCP:           {{ include "srw.mcpUrl" . }}
+{{- end }}
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if not .Values.externalSecrets.enabled }}
+{{- if not .Values.secrets.create }}
+
+WARNING: No secret management configured.
+Set one of:
+  - secrets.existingSecret (reference a pre-created K8s Secret)
+  - externalSecrets.enabled (use External Secrets Operator)
+  - secrets.create (chart creates a Secret from values — dev only)
+{{- end }}
+{{- end }}
+{{- end }}

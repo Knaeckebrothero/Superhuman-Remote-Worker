@@ -1,0 +1,102 @@
+{{/*
+Codex Proxy (CLIProxyAPI) — reverse proxy for Codex/OpenAI-compatible LLM APIs.
+Uses Recreate strategy because the auth PVC is ReadWriteOnce.
+*/}}
+{{- if .Values.codexProxy.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-codex-proxy-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+data:
+  config.yaml: |
+    port: 8317
+    auth-dir: /data/auth
+    remote-management: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.fullname" . }}-codex-proxy-auth
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.codexProxy.storageSize }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.fullname" . }}-codex-proxy
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "codex-proxy") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "codex-proxy") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: codex-proxy
+          image: {{ .Values.codexProxy.image }}
+          ports:
+            - containerPort: 8317
+              name: api
+            - containerPort: 1455
+              name: oauth-callback
+          env:
+            - name: MANAGEMENT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CODEX_MANAGEMENT_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: auth
+              mountPath: /data/auth
+          resources:
+            {{- toYaml .Values.codexProxy.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "srw.fullname" . }}-codex-proxy-config
+        - name: auth
+          persistentVolumeClaim:
+            claimName: {{ include "srw.fullname" . }}-codex-proxy-auth
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.fullname" . }}-codex-proxy
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8317
+      targetPort: 8317
+      name: api
+    - port: 1455
+      targetPort: 1455
+      name: oauth-callback
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+{{- end }}

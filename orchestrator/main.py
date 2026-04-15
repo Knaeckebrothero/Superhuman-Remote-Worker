@@ -22,6 +22,12 @@ from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
 
+if os.environ.get("LICENSE_TERMS_ACCEPTED", "").strip().lower() != "true":
+    raise SystemExit(
+        "License terms not accepted. Set LICENSE_TERMS_ACCEPTED=true to run. "
+        "See https://github.com/knaeckebrothero/Superhuman-Remote-Worker/blob/main/LICENSE"
+    )
+
 # Configure application-level logging (Uvicorn only configures its own loggers)
 # When DEBUG, only app loggers get DEBUG; third-party stays at INFO.
 # Set DEBUG_ALL=1 to include third-party debug output.
