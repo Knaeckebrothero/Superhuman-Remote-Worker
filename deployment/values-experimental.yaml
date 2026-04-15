@@ -1,0 +1,122 @@
+# =============================================================================
+# Experimental cluster values (develop branch -> Fleet -> home cluster)
+# =============================================================================
+# CI updates the image tags on every push to `develop`. Fleet then rolls
+# out the chart to the homelab cluster. This file is the single source of
+# truth for cluster-specific config; the chart itself stays generic.
+#
+# To install manually (e.g. for local testing):
+#   helm install srw ./helm -f ./deployment/values-experimental.yaml
+#
+# =============================================================================
+
+license:
+  acceptTerms: true
+
+global:
+  domain: "superhuman-remote-worker.com"
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+
+# -----------------------------------------------------------------------------
+# Image tags — updated by CI on every push to develop
+# -----------------------------------------------------------------------------
+image:
+  orchestrator:
+    tag: latest
+  agent:
+    tag: latest
+  cockpit:
+    tag: latest
+  mcp:
+    tag: latest
+  workspace:
+    tag: latest
+  vpn:
+    tag: latest
+
+# -----------------------------------------------------------------------------
+# Secrets — External Secrets Operator (Vault-backed)
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: true
+  refreshInterval: "1h"
+  secretStoreRef: "vault-backend"
+  secretStoreKind: "ClusterSecretStore"
+  vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
+  vmSshKeyVaultPath: "homelab/superhuman-remote-worker/vm-ssh-key"
+
+# -----------------------------------------------------------------------------
+# Ingress
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    issuerName: cloudflare-dns-issuer
+
+# -----------------------------------------------------------------------------
+# VPN sidecars
+# -----------------------------------------------------------------------------
+vpn:
+  cluster:
+    enabled: true
+    port: "443"
+
+# -----------------------------------------------------------------------------
+# Admin UIs
+# -----------------------------------------------------------------------------
+pgadmin:
+  enabled: true
+
+mongoExpress:
+  enabled: true
+
+dozzle:
+  enabled: true
+
+codexProxy:
+  enabled: true
+
+# -----------------------------------------------------------------------------
+# Cloud storage — OpenCloud bundled (chart default)
+# -----------------------------------------------------------------------------
+opencloud:
+  enabled: true
+
+nextcloud:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Databases — all internal (chart defaults), override here if you externalize
+# -----------------------------------------------------------------------------
+# databases:
+#   postgres:
+#     externalUrl: ""
+#   vector:
+#     externalUrl: ""
+#   mongodb:
+#     externalUrl: ""
+#   neo4j:
+#     externalUrl: ""
+
+# -----------------------------------------------------------------------------
+# Headscale — NOT managed by the chart on this cluster.
+# Lives in its own `headscale` namespace, deployed out of band. Leave disabled
+# here so Fleet doesn't try to create a duplicate in the srw namespace.
+# -----------------------------------------------------------------------------
+headscale:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# LLM config — actual keys are in the Vault-backed secret (srw-secrets).
+# Only non-secret base URLs go here.
+# -----------------------------------------------------------------------------
+llm:
+  baseUrl: ""
+  browserBaseUrl: ""
+  embeddingBaseUrl: ""
+  codexBaseUrl: ""
+
+logLevel: "INFO"
