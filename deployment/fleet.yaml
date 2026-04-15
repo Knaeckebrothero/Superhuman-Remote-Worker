@@ -20,3 +20,8 @@ ignorePaths:
   - "fleet-gitrepo.yaml"
   - "**/*secret*"
   - "**/*secrets*"
+
+# Restrict to the main cluster only. The named target is defined in the
+# SRW GitRepo CR (HomeLab/rancher_cluster/fleet-gitrepo-srw.yaml).
+targetRestrictions:
+  - name: main
