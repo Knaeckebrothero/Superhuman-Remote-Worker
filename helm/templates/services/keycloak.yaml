@@ -418,9 +418,8 @@ data:
 ---
 # Keycloak SSO — Deployment
 #
-# The 'keycloak' database must exist on the postgres instance. This is handled
-# automatically by ensure_sso_databases() in orchestrator/init.py,
-# or by init_sso_dbs.sh on fresh postgres starts.
+# The 'keycloak' database is created by the postgres container's postStart
+# lifecycle hook on every start (idempotent).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
