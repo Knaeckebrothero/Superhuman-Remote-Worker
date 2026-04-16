@@ -663,6 +663,36 @@ spec:
                           -s "redirectUris=[\"$OC_URL/*\"]" -s "webOrigins=[\"$OC_URL\"]" \
                           -s 'attributes={"pkce.code.challenge.method":"S256"}' 2>/dev/null
                       fi
+                      # OpenCloud Desktop sync client (public, localhost OAuth redirect)
+                      if ! $KC get clients -r {{ .Values.keycloak.realm }} -q clientId=OpenCloudDesktop 2>/dev/null | grep -q '"OpenCloudDesktop"'; then
+                        $KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s clientId=OpenCloudDesktop -s name="OpenCloud Desktop" \
+                          -s enabled=true -s publicClient=true -s standardFlowEnabled=true \
+                          -s 'redirectUris=["http://localhost:*","http://127.0.0.1:*"]' 2>/dev/null
+                      fi
+                      # Legacy ownCloud-branded desktop client
+                      if ! $KC get clients -r {{ .Values.keycloak.realm }} -q clientId=xdXOt13JKxym1B1QcEncf2XDkLAexMBFwiT9j6EfhhHFJhs2KM9jbjTmf8JBXE69 2>/dev/null \
+                           | grep -q '"xdXOt13JKxym1B1QcEncf2XDkLAexMBFwiT9j6EfhhHFJhs2KM9jbjTmf8JBXE69"'; then
+                        $KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s clientId=xdXOt13JKxym1B1QcEncf2XDkLAexMBFwiT9j6EfhhHFJhs2KM9jbjTmf8JBXE69 \
+                          -s 'name=ownCloud Desktop (legacy)' \
+                          -s enabled=true -s publicClient=true -s standardFlowEnabled=true \
+                          -s 'redirectUris=["http://localhost:*","http://127.0.0.1:*"]' 2>/dev/null
+                      fi
+                      # OpenCloud Android app (custom scheme redirect)
+                      if ! $KC get clients -r {{ .Values.keycloak.realm }} -q clientId=OpenCloudAndroid 2>/dev/null | grep -q '"OpenCloudAndroid"'; then
+                        $KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s clientId=OpenCloudAndroid -s name="OpenCloud Android" \
+                          -s enabled=true -s publicClient=true -s standardFlowEnabled=true \
+                          -s 'redirectUris=["oc://android.opencloud.eu"]' 2>/dev/null
+                      fi
+                      # OpenCloud iOS app (custom scheme redirect)
+                      if ! $KC get clients -r {{ .Values.keycloak.realm }} -q clientId=OpenCloudIOS 2>/dev/null | grep -q '"OpenCloudIOS"'; then
+                        $KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s clientId=OpenCloudIOS -s name="OpenCloud iOS" \
+                          -s enabled=true -s publicClient=true -s standardFlowEnabled=true \
+                          -s 'redirectUris=["oc://ios.opencloud.eu"]' 2>/dev/null
+                      fi
                       # opencloud-orchestrator (service-account client)
                       OCID=$($KC get clients -r {{ .Values.keycloak.realm }} -q clientId=opencloud-orchestrator --fields id --format csv --noquotes 2>/dev/null | tail -1)
                       if [ -z "$OCID" ]; then
@@ -683,11 +713,13 @@ spec:
                         fi
                       fi
                       # Attach default client scopes (profile, email, groups + openid for web)
-                      for CNAME in opencloud-orchestrator opencloud-web; do
+                      for CNAME in opencloud-orchestrator opencloud-web OpenCloudDesktop \
+                          "xdXOt13JKxym1B1QcEncf2XDkLAexMBFwiT9j6EfhhHFJhs2KM9jbjTmf8JBXE69" \
+                          OpenCloudAndroid OpenCloudIOS; do
                         CCID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$CNAME" --fields id --format csv --noquotes 2>/dev/null | tail -1)
                         [ -z "$CCID" ] && continue
-                        SCOPES="profile email groups"
-                        [ "$CNAME" = "opencloud-web" ] && SCOPES="openid profile email groups"
+                        SCOPES="openid profile email groups"
+                        [ "$CNAME" = "opencloud-orchestrator" ] && SCOPES="profile email groups"
                         for SNAME in $SCOPES; do
                           SID=$($KC get client-scopes -r {{ .Values.keycloak.realm }} --fields id,name 2>/dev/null \
                             | grep -B1 "\"name\" : \"$SNAME\"" | grep '"id"' | head -1 | sed 's/.*"id" : "//;s/".*//' || true)
