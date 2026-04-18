@@ -12,6 +12,10 @@
 
 license:
   acceptTerms: true
+# Pin the chart fullname so service/resource names stay short (`srw-*`)
+# regardless of how Fleet derives the Helm release name. Keeps DNS names
+# under the 63-char label limit and matches the hostnames assumed in Vault.
+fullnameOverride: srw
 global:
   domain: "superhuman-remote-worker.com"
   imagePullSecrets:
