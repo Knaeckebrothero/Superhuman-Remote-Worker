@@ -1,5 +1,4 @@
 defaultNamespace: superhuman-remote-worker
-
 # Render the Helm chart from the OCI registry. CI on the develop branch
 # publishes chart updates as "srw-dev" and updates the version below.
 # Fleet fetches the chart from GHCR and applies values-experimental.yaml.
@@ -9,12 +8,11 @@ defaultNamespace: superhuman-remote-worker
 helm:
   chart: srw-dev
   repo: oci://ghcr.io/knaeckebrothero/charts
-  version: "0.0.0-dev"
+  version: "0.0.0-dev.sha.c079b9e"
   valuesFiles:
     - values-experimental.yaml
   # secretName: ghcr-helm-auth
   takeOwnership: true
-
 ignorePaths:
   - "legacy/**"
   - "nats/**"
