@@ -13,7 +13,6 @@ data:
   config.yaml: |
     port: 8317
     auth-dir: /data/auth
-    remote-management: true
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
