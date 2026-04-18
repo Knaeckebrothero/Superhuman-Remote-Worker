@@ -25,7 +25,7 @@ image:
   agent:
     tag: sha-5788dfd
   cockpit:
-    tag: sha-5788dfd
+    tag: sha-c079b9e
   mcp:
     tag: sha-5788dfd
   workspace:
