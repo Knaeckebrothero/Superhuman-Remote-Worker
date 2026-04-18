@@ -1,4 +1,4 @@
-name: Production
+name: main
 
 # Full CI/CD pipeline for the main branch.
 #
