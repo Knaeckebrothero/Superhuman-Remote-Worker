@@ -68,7 +68,7 @@ spec:
                   key: CODEX_MANAGEMENT_KEY
           volumeMounts:
             - name: config
-              mountPath: /app/config.yaml
+              mountPath: /CLIProxyAPI/config.yaml
               subPath: config.yaml
             - name: auth
               mountPath: /data/auth

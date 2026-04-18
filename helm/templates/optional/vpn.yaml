@@ -50,12 +50,12 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_CLUSTER_FORWARD_TARGET
+                  key: VPN_CLUSTER_LLM_ENDPOINT
             - name: VPN_HOST
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_HOST
+                  key: VPN_CLUSTER_HOST
             - name: VPN_PORT
               valueFrom:
                 configMapKeyRef:
@@ -65,22 +65,22 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_REALM
+                  key: VPN_CLUSTER_REALM
             - name: VPN_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_USER
+                  key: VPN_CLUSTER_USER
             - name: VPN_PASS
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_PASS
+                  key: VPN_CLUSTER_PASS
             - name: VPN_TRUSTED_CERT
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VPN_TRUSTED_CERT
+                  key: VPN_CLUSTER_TRUSTED_CERT
           volumeMounts:
             - name: dev-ppp
               mountPath: /dev/ppp
