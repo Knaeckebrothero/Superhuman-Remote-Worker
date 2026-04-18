@@ -1,4 +1,0 @@
-# Prevent Fleet from treating this as a standalone bundle.
-# The chart is rendered by deployment/fleet.yaml via `chart: ../helm`.
-# An empty targets list means this directory is bundled but never deployed.
-targets: []
