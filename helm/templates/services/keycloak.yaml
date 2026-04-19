@@ -630,6 +630,21 @@ spec:
                       [ -z "$ID" ] && continue
                       $KC update "clients/$ID" -r {{ .Values.keycloak.realm }} -s "secret=$SEC" 2>/dev/null
                     done
+                    # --- Sync SMTP config ---
+                    # Realm import stores ${env.SMTP_*} literally on re-imports; force-update every start.
+                    if [ -n "$SMTP_HOST" ]; then
+                      $KC update "realms/{{ .Values.keycloak.realm }}" \
+                        -s "smtpServer.host=$SMTP_HOST" \
+                        -s "smtpServer.port=1025" \
+                        -s "smtpServer.from=noreply@{{ .Values.global.domain }}" \
+                        -s "smtpServer.fromDisplayName=Superhuman Remote Worker" \
+                        -s "smtpServer.envelopeFrom=noreply@{{ .Values.global.domain }}" \
+                        -s "smtpServer.ssl=false" \
+                        -s "smtpServer.starttls=true" \
+                        -s "smtpServer.auth=true" \
+                        -s "smtpServer.user=$SMTP_USER" \
+                        -s "smtpServer.password=$SMTP_PASSWORD" 2>/dev/null
+                    fi
                     # --- Ensure OpenCloud clients + group ---
                     # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
                     if [ -n "$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" ]; then
