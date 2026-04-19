@@ -530,7 +530,7 @@ spec:
                   key: WORKSPACE_NAMESPACE
                   optional: true
             - name: WORKSPACE_SSH_SECRET
-              value: "vm-ssh-key"
+              value: {{ include "srw.vmSshKeySecretName" . | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
             # Persistent agent pods (on-demand provisioning)
