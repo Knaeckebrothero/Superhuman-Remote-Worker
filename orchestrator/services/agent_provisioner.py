@@ -48,6 +48,9 @@ class AgentProvisioner:
         )
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
         self._secret_name: str = os.environ.get("AGENT_SECRET", "srw-secrets")
+        self._ssh_secret_name: str = os.environ.get(
+            "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
         self._max_agents: int = int(os.environ.get("MAX_AGENTS", "10"))
         self._min_agents: int = int(os.environ.get("MIN_AGENTS", "0"))
         self._agent_buffer: int = int(os.environ.get("AGENT_BUFFER", "0"))
@@ -899,7 +902,7 @@ class AgentProvisioner:
                     {
                         "name": "vm-ssh-key",
                         "secret": {
-                            "secretName": "vm-ssh-key",
+                            "secretName": self._ssh_secret_name,
                             "defaultMode": 0o444,
                         },
                     },
