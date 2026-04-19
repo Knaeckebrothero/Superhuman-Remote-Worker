@@ -101,6 +101,25 @@ nextcloud:
 headscale:
   enabled: false
 # -----------------------------------------------------------------------------
+# Email — routed through the shared ProtonMail Bridge in `protonmail-bridge` ns.
+# SMTP_USER / SMTP_PASSWORD come from Vault (srw-secrets). The bridgeCert init
+# container extracts the bridge's self-signed cert and adds it to Keycloak's
+# JVM truststore so Jakarta Mail accepts the STARTTLS handshake.
+# -----------------------------------------------------------------------------
+email:
+  enabled: true
+  smtp:
+    host: "protonmail-bridge.protonmail-bridge.svc"
+    port: "1025"
+    useTls: "true"
+    trustSelfSigned: "true"
+    from: "noreply@superhuman-remote-worker.com"
+  domain: "superhuman-remote-worker.com"
+keycloak:
+  bridgeCert:
+    enabled: true
+    smtpHost: "protonmail-bridge.protonmail-bridge.svc"
+# -----------------------------------------------------------------------------
 # LLM config — actual keys are in the Vault-backed secret (srw-secrets).
 # Only non-secret base URLs go here.
 # -----------------------------------------------------------------------------
