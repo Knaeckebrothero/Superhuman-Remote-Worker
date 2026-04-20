@@ -80,7 +80,6 @@ class KeycloakGroupSync:
             username=self._admin_user,
             password=self._admin_password,
             realm_name=self._realm,
-            auto_refresh_token=["get", "post", "put", "delete"],
         )
         # Verify connectivity by listing realm roles
         self._admin.get_realm_roles()
