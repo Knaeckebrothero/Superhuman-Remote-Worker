@@ -11858,92 +11858,113 @@ async def _ensure_project_cloud_resources(
     project: dict[str, Any],
 ) -> dict[str, Any]:
     """Ensure a project has its Keycloak group, main-cloud Space and WebDAV
-    datasource — and that all current members are in both groups.
+    datasource — and that every current member is in both groups.
 
-    Idempotent: no-op when the project already has a folder handle. When the
-    handle is missing (project was created before the fix, or the Space was
-    deleted out-of-band) the Space is recreated and existing members are
-    re-synced into the Keycloak + LibreGraph groups.
+    Two conditional steps:
+
+    * **Folder creation** runs only when `main_cloud_folder_handle` is missing
+      (protected by a per-project lock because `ensure_project_folder` is not
+      idempotent — each call creates a new Space).
+    * **Member sync** runs unconditionally (the Keycloak and LibreGraph adds
+      are idempotent). This repairs the common case where the Space already
+      exists but the user was never added to the groups — e.g. project created
+      while Keycloak admin auth was broken, or a Space adopted out-of-band.
 
     Returns the (possibly updated) project dict.
     """
     project_id_str = str(project["id"])
+    project_name = project["name"]
+    group_name = f"project-{project_id_str}"
+    backend = main_cloud_router.for_project(project)
 
     handle_str = project.get("main_cloud_folder_handle")
     legacy_folder_id = project.get("nextcloud_folder_id")
-    if handle_str or legacy_folder_id:
-        return project  # already provisioned
+    needs_folder = not (handle_str or legacy_folder_id)
 
-    backend = main_cloud_router.for_project(project)
-    if not backend.is_initialized:
-        return project
-
-    lock = _project_heal_locks.setdefault(project_id_str, asyncio.Lock())
-    async with lock:
-        # Another request may have healed while we waited.
-        fresh = await postgres_db.get_project(project_id_str)
-        if fresh:
-            project = fresh
-            if project.get("main_cloud_folder_handle") or project.get(
-                "nextcloud_folder_id"
+    if needs_folder and backend.is_initialized:
+        lock = _project_heal_locks.setdefault(project_id_str, asyncio.Lock())
+        async with lock:
+            fresh = await postgres_db.get_project(project_id_str)
+            if fresh:
+                project = fresh
+            if not (
+                project.get("main_cloud_folder_handle")
+                or project.get("nextcloud_folder_id")
             ):
-                return project
+                try:
+                    if keycloak_groups.is_initialized:
+                        await keycloak_groups.ensure_project_group(
+                            project_id_str, project_name
+                        )
+                    await backend.ensure_group(group_name)
+                    folder_handle = await backend.ensure_project_folder(
+                        project_name=project_name,
+                        group_id=group_name,
+                    )
+                    legacy_id: int | None = None
+                    if backend.backend_id == "nextcloud":
+                        try:
+                            legacy_id = int(folder_handle.native_id)
+                        except ValueError:
+                            legacy_id = None
+                    await postgres_db.update_project(
+                        project_id_str,
+                        main_cloud_backend=backend.backend_id,
+                        main_cloud_folder_handle=folder_handle.to_db(),
+                        nextcloud_folder_id=legacy_id,
+                    )
+                    project["main_cloud_backend"] = backend.backend_id
+                    project["main_cloud_folder_handle"] = folder_handle.to_db()
+                    project["nextcloud_folder_id"] = legacy_id
 
-        project_name = project["name"]
-        group_name = f"project-{project_id_str}"
+                    webdav_url = backend.get_project_folder_webdav_url(folder_handle)
+                    if webdav_url:
+                        ds = await postgres_db.create_datasource(
+                            name=f"Cloud Storage ({project_name})",
+                            ds_type="webdav",
+                            connection_url=webdav_url,
+                            description=(
+                                f"Shared file storage for project '{project_name}'"
+                            ),
+                            credentials=backend.webdav_credentials,
+                        )
+                        await postgres_db.link_datasource_to_project(
+                            project_id=project_id_str,
+                            datasource_id=str(ds["id"]),
+                            read_only=False,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create cloud resources for project "
+                        f"{project_id_str}: {e}"
+                    )
+
+    # Member sync — always runs. Idempotent add in both Keycloak and the
+    # backend; cheap enough to include in every GET and essential for
+    # self-healing projects whose Space exists but whose members were never
+    # added to the groups.
+    if keycloak_groups.is_initialized or backend.is_initialized:
         try:
             if keycloak_groups.is_initialized:
                 await keycloak_groups.ensure_project_group(project_id_str, project_name)
-
-            await backend.ensure_group(group_name)
-            folder_handle = await backend.ensure_project_folder(
-                project_name=project_name,
-                group_id=group_name,
-            )
-            legacy_id: int | None = None
-            if backend.backend_id == "nextcloud":
-                try:
-                    legacy_id = int(folder_handle.native_id)
-                except ValueError:
-                    legacy_id = None
-            await postgres_db.update_project(
-                project_id_str,
-                main_cloud_backend=backend.backend_id,
-                main_cloud_folder_handle=folder_handle.to_db(),
-                nextcloud_folder_id=legacy_id,
-            )
-            project["main_cloud_backend"] = backend.backend_id
-            project["main_cloud_folder_handle"] = folder_handle.to_db()
-            project["nextcloud_folder_id"] = legacy_id
-
-            webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-            if webdav_url:
-                ds = await postgres_db.create_datasource(
-                    name=f"Cloud Storage ({project_name})",
-                    ds_type="webdav",
-                    connection_url=webdav_url,
-                    description=f"Shared file storage for project '{project_name}'",
-                    credentials=backend.webdav_credentials,
-                )
-                await postgres_db.link_datasource_to_project(
-                    project_id=project_id_str,
-                    datasource_id=str(ds["id"]),
-                    read_only=False,
-                )
-
-            # Re-sync all current members into both groups so a repaired
-            # project is immediately usable.
             members = await postgres_db.get_project_members(project_id_str)
-            for member in members:
-                user = await postgres_db.get_user(str(member["user_id"]))
-                if user:
-                    await _sync_project_member_to_groups(
-                        project_id_str, group_name, user, backend
-                    )
+            if members:
+                users = await asyncio.gather(
+                    *[postgres_db.get_user(str(m["user_id"])) for m in members],
+                    return_exceptions=False,
+                )
+                await asyncio.gather(
+                    *[
+                        _sync_project_member_to_groups(
+                            project_id_str, group_name, u, backend
+                        )
+                        for u in users
+                        if u
+                    ],
+                    return_exceptions=True,
+                )
         except Exception as e:
-            logger.warning(
-                f"Failed to heal cloud resources for project {project_id_str}: {e}"
-            )
+            logger.debug(f"Member sync failed for project {project_id_str}: {e}")
 
     return project
 
