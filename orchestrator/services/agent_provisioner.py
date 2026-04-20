@@ -28,14 +28,16 @@ logger = logging.getLogger(__name__)
 # All reflect bad configuration or missing dependencies that the kubelet will
 # retry forever without making progress — deleting the pod lets the scaler
 # recreate it with the current config.
-_TERMINAL_WAITING_REASONS: frozenset[str] = frozenset({
-    "CreateContainerConfigError",
-    "CreateContainerError",
-    "ImagePullBackOff",
-    "ErrImagePull",
-    "InvalidImageName",
-    "RunContainerError",
-})
+_TERMINAL_WAITING_REASONS: frozenset[str] = frozenset(
+    {
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "InvalidImageName",
+        "RunContainerError",
+    }
+)
 
 
 class AgentProvisioner:
@@ -527,10 +529,7 @@ class AgentProvisioner:
 
     @staticmethod
     def _is_stale_running(pod, offline_hostnames: set[str]) -> bool:
-        return (
-            pod.status.phase == "Running"
-            and pod.metadata.name in offline_hostnames
-        )
+        return pod.status.phase == "Running" and pod.metadata.name in offline_hostnames
 
     @staticmethod
     def _is_unstartable(pod, grace_seconds: int) -> bool:
