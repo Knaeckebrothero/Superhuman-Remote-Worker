@@ -696,6 +696,8 @@ Every endpoint that currently calls `nextcloud_admin` is rewritten to call `main
 
 **The routing rule:** for **create** operations, always use `router.active`. For **read / update / delete** operations on existing rows, look up the row's `main_cloud_backend` and use `router.for_project(row)`. This is what makes switching non-destructive — see §6.
 
+**OpenCloud group-membership rule (post-2026-04-20).** OpenCloud's proxy reconciles a user's LibreGraph group memberships to exactly match the `groups` claim in their Keycloak token on every login. A direct `backend.add_user_to_group(...)` for project access therefore gets **deleted** on the user's next auth — which is every time a new OpenCloud tab is opened. Project membership must flow through the Keycloak project group (`KeycloakGroupSync.ensure_project_group` / `add_user_to_project_group` / `remove_user_from_project_group`), which shares the same flat name (`project-{uuid}`) as the LibreGraph group. The orchestrator still calls `backend.ensure_group(group_name)` + `backend.ensure_project_folder(group_id=group_name)` at project creation so the LibreGraph group exists and is invited to the Space; the OpenCloud reconciler then populates membership from the token claim on each login. The cockpit triggers a Keycloak token refresh (`KeycloakService.forceRefreshToken`) after a successful `POST /api/projects` so the creator sees the new Space without having to log out. `backend.add_user_to_group` remains available for realm-level groups such as `opencloudAdmin`, where the group *is* in the Keycloak token.
+
 Pseudo-code for a delete site:
 
 ```python
