@@ -129,6 +129,26 @@ class FakeMainCloudBackend:
                 return UserId(uid)
         return None
 
+    async def ensure_user(
+        self,
+        *,
+        sub: str,
+        issuer: str,
+        email: Optional[str],
+        display_name: Optional[str],
+        preferred_username: Optional[str] = None,
+    ) -> Optional[UserId]:
+        self._ensure_ready()
+        self._fail_if_configured()
+        existing = await self.resolve_user_identity(email, display_name)
+        if existing:
+            return existing
+        if not email and not display_name:
+            return None
+        uid = sub
+        self._users[uid] = {"email": email or "", "display_name": display_name or ""}
+        return UserId(uid)
+
     async def get_user_home(self, user_id: UserId) -> Optional[UserHome]:
         if not self._initialized:
             return None

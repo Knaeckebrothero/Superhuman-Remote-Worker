@@ -262,6 +262,84 @@ class OpenCloudBackend:
             raise self._map_http_error(e) from e
         return None
 
+    @instrument_backend_op("ensure_user")
+    async def ensure_user(
+        self,
+        *,
+        sub: str,
+        issuer: str,
+        email: Optional[str],
+        display_name: Optional[str],
+        preferred_username: Optional[str] = None,
+    ) -> Optional[UserId]:
+        """Create the OpenCloud user record for an SSO identity if missing.
+
+        Without this, OpenCloud only provisions a user on their first
+        browser login, which races session-folder sharing for new threads.
+
+        Looks up by (issuer, sub) first — that's the stable identity — then
+        falls back to email/displayName resolution. POSTs a LibreGraph user
+        with ``identities[]`` carrying the Keycloak ``sub`` so the existing
+        autoprovision path still reconciles on login.
+        """
+        self._ensure_ready()
+        existing = await self._find_user_by_sub(issuer, sub)
+        if existing:
+            return existing
+        fallback = await self.resolve_user_identity(email, display_name)
+        if fallback:
+            return fallback
+        if not email or not display_name:
+            return None
+        body: dict[str, Any] = {
+            "accountEnabled": True,
+            "displayName": display_name,
+            "mail": email,
+            "userType": "Member",
+            "identities": [
+                {"issuer": issuer, "issuerAssignedId": sub},
+            ],
+        }
+        if preferred_username:
+            body["onPremisesSamAccountName"] = preferred_username
+        try:
+            resp = await self._graph_post("/graph/v1.0/users", json=body)
+            if resp.status_code == 409:
+                return await self._find_user_by_sub(
+                    issuer, sub
+                ) or await self.resolve_user_identity(email, display_name)
+            resp.raise_for_status()
+            user_id = resp.json().get("id")
+            if user_id:
+                logger.info(
+                    "Provisioned OpenCloud user %s (sub=%s, email=%s)",
+                    user_id,
+                    sub,
+                    email,
+                )
+                return UserId(str(user_id))
+            return None
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    async def _find_user_by_sub(self, issuer: str, sub: str) -> Optional[UserId]:
+        """Locate an existing LibreGraph user by (issuer, sub) identity tuple."""
+        try:
+            resp = await self._graph_get(
+                "/graph/v1.0/users",
+                params={"$search": f'"{sub}"'},
+            )
+            for user in resp.json().get("value", []):
+                for identity in user.get("identities") or []:
+                    if (
+                        identity.get("issuer") == issuer
+                        and identity.get("issuerAssignedId") == sub
+                    ):
+                        return UserId(str(user["id"]))
+        except httpx.HTTPError:
+            return None
+        return None
+
     def get_default_home_browser_url(self) -> Optional[str]:
         """Generic OpenCloud Files app URL (user-agnostic)."""
         return f"{self._public_url}/files/"
