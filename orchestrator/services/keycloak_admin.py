@@ -80,6 +80,7 @@ class KeycloakGroupSync:
             username=self._admin_user,
             password=self._admin_password,
             realm_name=self._realm,
+            user_realm_name="master",
         )
         # Verify connectivity by listing realm roles
         self._admin.get_realm_roles()
