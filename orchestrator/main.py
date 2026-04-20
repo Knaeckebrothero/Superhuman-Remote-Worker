@@ -397,15 +397,14 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
 
     Runs every 60 seconds:
     - Ensures MIN_AGENTS warm pods exist (instant dispatch)
-    - Cleans up Succeeded/Failed pods from completed tasks
+    - Reaps completed / stale / unstartable agent pods (single dispatcher)
     """
     logger.info("Agent pool reconciler started")
     while not shutdown_event.is_set():
         try:
             if agent_provisioner.is_available:
                 await agent_provisioner.ensure_warm_pool()
-                await agent_provisioner.cleanup_completed_pods()
-                await agent_provisioner.reap_stale_pods()
+                await agent_provisioner.reap_pods()
                 await agent_provisioner.scale_down_idle()
                 # Drain idle agents running stale images so new pods
                 # with the current image can be provisioned.

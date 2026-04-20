@@ -533,6 +533,8 @@ spec:
               value: {{ include "srw.vmSshKeySecretName" . | quote }}
             - name: AGENT_SECRET
               value: {{ include "srw.secretName" . | quote }}
+            - name: AGENT_CONFIGMAP
+              value: {{ include "srw.configMapName" . | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
             # Persistent agent pods (on-demand provisioning)
