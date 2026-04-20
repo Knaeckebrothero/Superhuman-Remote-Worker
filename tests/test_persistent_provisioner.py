@@ -275,7 +275,7 @@ class TestPodManifest:
         configmap_ref = env_from[0]["configMapRef"]["name"]
         secret_ref = env_from[1]["secretRef"]["name"]
         assert configmap_ref == "srw-config"
-        assert secret_ref == "srw-secrets"
+        assert secret_ref == "srw"
 
     def test_env_overrides(self):
         m = self._build(config_name="scholar")
