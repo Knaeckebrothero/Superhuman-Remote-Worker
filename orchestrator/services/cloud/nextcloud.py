@@ -261,6 +261,23 @@ class NextcloudBackend:
             raise self._map_http_error(e) from e
         return None
 
+    async def ensure_user(
+        self,
+        *,
+        sub: str,
+        issuer: str,
+        email: Optional[str],
+        display_name: Optional[str],
+        preferred_username: Optional[str] = None,
+    ) -> Optional[UserId]:
+        """Nextcloud's user_oidc app provisions on first login; no admin API.
+
+        We don't forge a local account from the service side because
+        Nextcloud's OIDC-linked accounts only materialise via the login
+        flow. Callers fall back to ``resolve_user_identity`` at share time.
+        """
+        return await self.resolve_user_identity(email, display_name)
+
     def get_default_home_browser_url(self) -> Optional[str]:
         """Generic Nextcloud Files app URL (user-agnostic)."""
         return f"{self._public_url}/apps/files/"

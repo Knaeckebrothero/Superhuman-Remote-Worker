@@ -191,12 +191,6 @@ async def run_persistent_loop(
     )
 
     while True:
-        # Refresh tools if the session swapped them (e.g. plan mode toggle)
-        if get_current_tools:
-            new_llm, new_tools = get_current_tools()
-            llm_with_tools = new_llm
-            tool_map = {tool.name: tool for tool in new_tools}
-
         # --- Wait for user input ---
         try:
             user_input = await callbacks.get_user_input()
@@ -209,6 +203,15 @@ async def run_persistent_loop(
 
         if user_input == INTERRUPT_SENTINEL:
             continue
+
+        # Refresh after receiving input so config changes made during the wait
+        # (e.g. model hot-swap via config.update, plan mode toggle) are picked
+        # up before the turn executes. Refreshing before the wait captures a
+        # stale LLM reference when the user changes models while idle.
+        if get_current_tools:
+            new_llm, new_tools = get_current_tools()
+            llm_with_tools = new_llm
+            tool_map = {tool.name: tool for tool in new_tools}
 
         turn_count += 1
         turn_id = turn_count
