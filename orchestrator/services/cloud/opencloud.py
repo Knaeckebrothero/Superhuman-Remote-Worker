@@ -106,6 +106,7 @@ class OpenCloudBackend:
         # Populated by ensure_initialized once the agent-home Space exists.
         self._agent_home_drive_id: Optional[str] = None
         self._agent_home_webdav_base: Optional[str] = None
+        self._agent_home_web_url: Optional[str] = None
 
     # --------------------------------------------------------------- Properties
 
@@ -181,7 +182,10 @@ class OpenCloudBackend:
 
             # Ensure the agent-home Space exists — this is where session
             # folders live. Cache its drive id for the process lifetime.
-            self._agent_home_drive_id = await self._ensure_agent_home_space()
+            (
+                self._agent_home_drive_id,
+                self._agent_home_web_url,
+            ) = await self._ensure_agent_home_space()
             self._agent_home_webdav_base = (
                 f"{self._base_url}/dav/spaces/{self._agent_home_drive_id}"
             )
@@ -583,7 +587,17 @@ class OpenCloudBackend:
     def get_project_folder_browser_url(
         self, handle: ProjectFolderHandle
     ) -> Optional[str]:
-        """Browser deep-link to a Space in the OpenCloud Web UI."""
+        """Browser deep-link to a Space in the OpenCloud Web UI.
+
+        Prefers the ``webUrl`` captured from the drive-creation response
+        (persisted as ``vendor_meta.web_url``) because OpenCloud Web routes
+        Spaces by drive *alias* (e.g. ``project/<uuid>``), not by the raw
+        composite drive id. Falling back to ``/files/spaces/<drive_id>``
+        silently resolves to the user's personal space on real OpenCloud.
+        """
+        web_url = handle.vendor_meta.get("web_url")
+        if web_url:
+            return str(web_url)
         drive_id = handle.native_id
         if not drive_id:
             return None
@@ -795,12 +809,21 @@ class OpenCloudBackend:
     def get_session_folder_browser_url(
         self, handle: SessionFolderHandle
     ) -> Optional[str]:
-        """Best-effort browser link into the session folder."""
+        """Best-effort browser link into the session folder.
+
+        Prefers the agent-home Space's authoritative ``webUrl`` (captured
+        at init) as the base, for the same reason as
+        :meth:`get_project_folder_browser_url` — OpenCloud Web routes by
+        drive alias, so the raw ``/files/spaces/<drive_id>/...`` pattern
+        silently drops the user on their personal space.
+        """
+        safe_path = quote(handle.native_id, safe="/")
+        if self._agent_home_web_url:
+            return f"{self._agent_home_web_url}/{safe_path}"
         drive_id = handle.vendor_meta.get("drive_id") or self._agent_home_drive_id
         if not drive_id:
             return None
         safe_id = quote(str(drive_id), safe="")
-        safe_path = quote(handle.native_id, safe="/")
         return f"{self._public_url}/files/spaces/{safe_id}/{safe_path}"
 
     def get_session_folder_webdav_url(
@@ -1095,12 +1118,17 @@ class OpenCloudBackend:
 
     # ---------------------------------------------------------------- Agent home
 
-    async def _ensure_agent_home_space(self) -> str:
-        """Create or fetch the agent-home Space; return its drive id.
+    async def _ensure_agent_home_space(self) -> tuple[str, Optional[str]]:
+        """Create or fetch the agent-home Space; return (drive_id, web_url).
 
         Session folders live under this Space — it is analogous to the
         ``agent-service`` user home in the Nextcloud backend. Searched by
         the fixed display name ``srw-agent-home``; created if missing.
+
+        ``web_url`` is the authoritative browser deep-link from the drive
+        response; callers should prefer it over constructing
+        ``/files/spaces/{drive_id}`` themselves (OpenCloud Web routes by
+        drive alias, not raw id).
         """
         # Look up an existing space first. ``/graph/v1.0/drives`` lists
         # every drive the caller can see, which for the service account
@@ -1111,7 +1139,8 @@ class OpenCloudBackend:
         )
         for drive in resp.json().get("value", []):
             if drive.get("name") == _AGENT_HOME_SPACE_NAME:
-                return str(drive["id"])
+                web_url = (drive.get("webUrl") or "").rstrip("/") or None
+                return str(drive["id"]), web_url
 
         # Not found — create it.
         resp = await self._graph_post(
@@ -1128,8 +1157,9 @@ class OpenCloudBackend:
                 backend=self.backend_id,
                 raw=drive,
             )
+        web_url = (drive.get("webUrl") or "").rstrip("/") or None
         logger.info("Created OpenCloud agent-home Space drive_id=%s", drive_id)
-        return str(drive_id)
+        return str(drive_id), web_url
 
     # ---------------------------------------------------------------- Item lookup
 
