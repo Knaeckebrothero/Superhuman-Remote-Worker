@@ -9317,19 +9317,38 @@ async def resume_thread(
     await postgres_db.resume_thread(thread_id)
 
     # Provision cloud session folder if missing (e.g. session was created
-    # before the cloud backend was initialized).
-    if not thread.get("main_cloud_session_handle") and not thread.get(
+    # before the cloud backend was initialized), or retry the share alone
+    # if the folder exists but no share_handle was recorded — this unstucks
+    # threads where folder creation raced the user's first browser login.
+    existing_session_handle = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
-    ):
+    )
+    needs_share_only = bool(existing_session_handle) and not thread.get(
+        "main_cloud_share_handle"
+    )
+    needs_full_provision = not existing_session_handle and not thread.get(
+        "nc_session_folder"
+    )
 
-        async def _late_cloud_setup(tid: str, usr: dict) -> None:
+    if needs_full_provision or needs_share_only:
+
+        async def _late_cloud_setup(
+            tid: str, usr: dict, existing_handle: str | None
+        ) -> None:
             backend = main_cloud_router.active
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
                 return
             try:
-                session_handle = await backend.ensure_session_folder(session_id=tid[:8])
+                if existing_handle:
+                    session_handle = SessionFolderHandle.from_db(
+                        existing_handle, backend=backend.backend_id
+                    )
+                else:
+                    session_handle = await backend.ensure_session_folder(
+                        session_id=tid[:8]
+                    )
                 share_handle = None
                 resolved_user_id = await backend.resolve_user_identity(
                     usr.get("email"),
@@ -9339,19 +9358,30 @@ async def resume_thread(
                     share_handle = await backend.share_session_folder(
                         session_handle, resolved_user_id
                     )
+                if not share_handle and existing_handle:
+                    # Share still failed (user hasn't signed into cloud yet).
+                    # Don't persist — leaving share_handle NULL lets the next
+                    # resume retry once autoprovision has materialised them.
+                    return
                 await postgres_db.update_thread_main_cloud(
                     tid,
                     backend_id=backend.backend_id,
                     session_handle=session_handle.to_db(),
                     share_handle=share_handle.to_db() if share_handle else None,
                 )
-                logger.info("Thread %s: late-provisioned cloud session folder", tid)
+                logger.info(
+                    "Thread %s: %s cloud session folder",
+                    tid,
+                    "shared previously-unshared"
+                    if existing_handle
+                    else "late-provisioned",
+                )
             except Exception as e:
                 logger.warning(
                     "Thread %s: late cloud folder provisioning failed: %s", tid, e
                 )
 
-        asyncio.create_task(_late_cloud_setup(thread_id, user))
+        asyncio.create_task(_late_cloud_setup(thread_id, user, existing_session_handle))
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:

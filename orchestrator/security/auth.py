@@ -102,9 +102,52 @@ async def get_current_user(request: Request, db) -> dict:
         is_admin,
         is_approved,
     )
+    # Seed the main-cloud user record so the first session folder share
+    # doesn't race the user's first browser login to the cloud. Fire-and-
+    # forget: cloud reachability must not gate SSO, and the share path
+    # still falls back to lazy resolution if this misses.
+    asyncio.create_task(
+        _ensure_cloud_user(
+            sub=sub,
+            issuer=claims.get("iss", ""),
+            email=email,
+            display_name=display_name,
+            preferred_username=claims.get("preferred_username"),
+        )
+    )
     # Attach transient approval flag (not stored in DB)
     user["is_approved"] = is_approved
     return user
+
+
+async def _ensure_cloud_user(
+    *,
+    sub: str,
+    issuer: str,
+    email: str,
+    display_name: str,
+    preferred_username: str | None,
+) -> None:
+    """Background call to the active main-cloud backend's ensure_user.
+
+    Imported lazily to avoid a circular import between ``main`` and this
+    module (``main`` imports ``get_current_user`` from here).
+    """
+    try:
+        from main import main_cloud_router  # noqa: PLC0415
+
+        backend = main_cloud_router.active
+        if not backend.is_initialized:
+            return
+        await backend.ensure_user(
+            sub=sub,
+            issuer=issuer,
+            email=email,
+            display_name=display_name,
+            preferred_username=preferred_username,
+        )
+    except Exception as e:
+        logger.warning("Main-cloud ensure_user failed for sub=%s: %s", sub, e)
 
 
 async def _get_user_from_mcp_headers(request: Request, db) -> dict:

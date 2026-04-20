@@ -85,6 +85,25 @@ class MainCloudBackend(Protocol):
         self, email: Optional[str], display_name: Optional[str]
     ) -> Optional[UserId]: ...
 
+    async def ensure_user(
+        self,
+        *,
+        sub: str,
+        issuer: str,
+        email: Optional[str],
+        display_name: Optional[str],
+        preferred_username: Optional[str] = None,
+    ) -> Optional[UserId]:
+        """Proactively create the backend-side user record for an SSO identity.
+
+        Runs at SRW first-login so session-folder sharing doesn't race the
+        user's first browser login to the cloud. Idempotent — if the user
+        already exists the existing ``UserId`` is returned. Backends that
+        don't support admin user creation return ``None``; callers fall back
+        to ``resolve_user_identity`` at share time.
+        """
+        ...
+
     async def get_user_home(self, user_id: UserId) -> Optional[UserHome]: ...
 
     def get_default_home_browser_url(self) -> Optional[str]:
