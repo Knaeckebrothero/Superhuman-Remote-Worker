@@ -11817,6 +11817,137 @@ async def delete_user(user_id: str, request: Request) -> dict[str, str]:
 # =============================================================================
 
 
+# Per-project locks prevent concurrent heal attempts from creating duplicate
+# Spaces (ensure_project_folder is not idempotent — each call makes a new drive).
+_project_heal_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _sync_project_member_to_groups(
+    project_id_str: str,
+    group_name: str,
+    user: dict[str, Any],
+    backend: Any,
+) -> None:
+    """Add one member to the Keycloak group and the LibreGraph group.
+
+    Both writes are needed: Keycloak carries the `groups` token claim (durable
+    across OpenCloud re-logins), the direct backend add makes the Space visible
+    in the user's currently-active OpenCloud session without waiting for them
+    to re-authenticate.
+    """
+    if keycloak_groups.is_initialized and user.get("keycloak_sub"):
+        await keycloak_groups.add_user_to_project_group(
+            user["keycloak_sub"], project_id_str
+        )
+    if backend.is_initialized:
+        try:
+            resolved = await backend.resolve_user_identity(
+                user.get("email"),
+                (user.get("display_name") or "").lower(),
+            )
+            if resolved:
+                await backend.add_user_to_group(resolved, group_name)
+        except Exception as e:
+            logger.debug(
+                f"Failed to add user {user.get('id')} to backend group "
+                f"{group_name}: {e}"
+            )
+
+
+async def _ensure_project_cloud_resources(
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    """Ensure a project has its Keycloak group, main-cloud Space and WebDAV
+    datasource — and that all current members are in both groups.
+
+    Idempotent: no-op when the project already has a folder handle. When the
+    handle is missing (project was created before the fix, or the Space was
+    deleted out-of-band) the Space is recreated and existing members are
+    re-synced into the Keycloak + LibreGraph groups.
+
+    Returns the (possibly updated) project dict.
+    """
+    project_id_str = str(project["id"])
+
+    handle_str = project.get("main_cloud_folder_handle")
+    legacy_folder_id = project.get("nextcloud_folder_id")
+    if handle_str or legacy_folder_id:
+        return project  # already provisioned
+
+    backend = main_cloud_router.for_project(project)
+    if not backend.is_initialized:
+        return project
+
+    lock = _project_heal_locks.setdefault(project_id_str, asyncio.Lock())
+    async with lock:
+        # Another request may have healed while we waited.
+        fresh = await postgres_db.get_project(project_id_str)
+        if fresh:
+            project = fresh
+            if project.get("main_cloud_folder_handle") or project.get(
+                "nextcloud_folder_id"
+            ):
+                return project
+
+        project_name = project["name"]
+        group_name = f"project-{project_id_str}"
+        try:
+            if keycloak_groups.is_initialized:
+                await keycloak_groups.ensure_project_group(project_id_str, project_name)
+
+            await backend.ensure_group(group_name)
+            folder_handle = await backend.ensure_project_folder(
+                project_name=project_name,
+                group_id=group_name,
+            )
+            legacy_id: int | None = None
+            if backend.backend_id == "nextcloud":
+                try:
+                    legacy_id = int(folder_handle.native_id)
+                except ValueError:
+                    legacy_id = None
+            await postgres_db.update_project(
+                project_id_str,
+                main_cloud_backend=backend.backend_id,
+                main_cloud_folder_handle=folder_handle.to_db(),
+                nextcloud_folder_id=legacy_id,
+            )
+            project["main_cloud_backend"] = backend.backend_id
+            project["main_cloud_folder_handle"] = folder_handle.to_db()
+            project["nextcloud_folder_id"] = legacy_id
+
+            webdav_url = backend.get_project_folder_webdav_url(folder_handle)
+            if webdav_url:
+                ds = await postgres_db.create_datasource(
+                    name=f"Cloud Storage ({project_name})",
+                    ds_type="webdav",
+                    connection_url=webdav_url,
+                    description=f"Shared file storage for project '{project_name}'",
+                    credentials=backend.webdav_credentials,
+                )
+                await postgres_db.link_datasource_to_project(
+                    project_id=project_id_str,
+                    datasource_id=str(ds["id"]),
+                    read_only=False,
+                )
+
+            # Re-sync all current members into both groups so a repaired
+            # project is immediately usable.
+            members = await postgres_db.get_project_members(project_id_str)
+            for member in members:
+                user = await postgres_db.get_user(str(member["user_id"]))
+                if user:
+                    await _sync_project_member_to_groups(
+                        project_id_str, group_name, user, backend
+                    )
+        except Exception as e:
+            logger.warning(
+                f"Failed to heal cloud resources for project {project_id_str}: {e}"
+            )
+
+    return project
+
+
 @app.post("/api/projects")
 async def create_project(body: ProjectCreate) -> dict[str, Any]:
     """Create a new project with the requesting user as owner."""
@@ -11861,75 +11992,14 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                             f"Failed to grant Gitea access for project creator: {e}"
                         )
 
-        # Create Keycloak group and add creator
-        if keycloak_groups.is_initialized:
-            project_id_str = str(project["id"])
-            group_id = await keycloak_groups.ensure_project_group(
-                project_id_str, body.name
-            )
-            if group_id and body.user_id:
-                user = await postgres_db.get_user(body.user_id)
-                if user and user.get("keycloak_sub"):
-                    await keycloak_groups.add_user_to_project_group(
-                        user["keycloak_sub"], project_id_str
-                    )
-
-        # Provision main-cloud project folder + WebDAV datasource
-        backend = main_cloud_router.active
-        if backend.is_initialized:
-            project_id_str = str(project["id"])
-            group_name = f"project-{project_id_str}"
-            try:
-                # Pre-create the backend group so the folder invite has a target.
-                # Membership is NOT populated here — it's driven by the Keycloak
-                # project group via the OIDC `groups` claim. OpenCloud's proxy
-                # reconciles LibreGraph group memberships to match the token on
-                # every login, so a direct backend.add_user_to_group would get
-                # wiped on the creator's next auth. The Keycloak-side add runs
-                # at line ~11873.
-                await backend.ensure_group(group_name)
-
-                # Create the project folder and grant access
-                folder_handle = await backend.ensure_project_folder(
-                    project_name=body.name,
-                    group_id=group_name,
-                )
-                # Persist the backend id + serialized handle; also write
-                # the legacy column for dual-read safety during the
-                # legacy-column deprecation window (§9 of the design doc).
-                legacy_folder_id: int | None = None
-                if backend.backend_id == "nextcloud":
-                    try:
-                        legacy_folder_id = int(folder_handle.native_id)
-                    except ValueError:
-                        legacy_folder_id = None
-                await postgres_db.update_project(
-                    project_id_str,
-                    main_cloud_backend=backend.backend_id,
-                    main_cloud_folder_handle=folder_handle.to_db(),
-                    nextcloud_folder_id=legacy_folder_id,
-                )
-
-                # Create project-scoped WebDAV datasource + link to project
-                webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-                if webdav_url:
-                    ds = await postgres_db.create_datasource(
-                        name=f"Cloud Storage ({body.name})",
-                        ds_type="webdav",
-                        connection_url=webdav_url,
-                        description=(f"Shared file storage for project '{body.name}'"),
-                        credentials=backend.webdav_credentials,
-                    )
-                    await postgres_db.link_datasource_to_project(
-                        project_id=project_id_str,
-                        datasource_id=str(ds["id"]),
-                        read_only=False,
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to provision main-cloud folder for project "
-                    f"{project_id_str}: {e}"
-                )
+        # Provision Keycloak group + main-cloud Space + WebDAV datasource,
+        # then sync the creator into both the Keycloak and LibreGraph groups.
+        # The dual group write is intentional: Keycloak carries the `groups`
+        # token claim (durable — OpenCloud's proxy reconciles LibreGraph
+        # memberships from it on every login), while the direct backend add
+        # makes the Space visible in the creator's currently-active OpenCloud
+        # session without waiting for them to re-authenticate.
+        project = await _ensure_project_cloud_resources(project)
 
         return project
     except Exception as e:
@@ -11960,6 +12030,10 @@ async def get_project(project_id: str) -> dict[str, Any]:
     project = await postgres_db.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    # Lazy-heal: projects created before the cloud-resource fix have no
+    # folder handle. The helper is a no-op if the Space already exists.
+    project = await _ensure_project_cloud_resources(project)
 
     # Compute cloud_storage_url for cockpit deep-links
     project["cloud_storage_url"] = None
@@ -12109,36 +12183,29 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
             role=body.role,
         )
 
-        # Sync to Keycloak group
-        if keycloak_groups.is_initialized:
-            user = await postgres_db.get_user(body.user_id)
-            if user and user.get("keycloak_sub"):
-                await keycloak_groups.add_user_to_project_group(
-                    user["keycloak_sub"], project_id
-                )
+        # Sync to Keycloak project group AND the main-cloud LibreGraph group.
+        # Both writes are load-bearing — see _sync_project_member_to_groups.
+        user = await postgres_db.get_user(body.user_id)
+        if user:
+            backend = main_cloud_router.for_project(project)
+            await _sync_project_member_to_groups(
+                project_id, f"project-{project_id}", user, backend
+            )
 
         # Grant Gitea access to all managed project repos
         if gitea_client.is_initialized:
             try:
-                member_user = await postgres_db.get_user(body.user_id)
-                if member_user and member_user.get("email"):
+                if user and user.get("email"):
                     repos = await postgres_db.get_project_repositories(project_id)
                     for repo in repos:
                         if repo.get("is_managed"):
                             await gitea_client.grant_user_repo_access(
-                                member_user["email"], repo["name"]
+                                user["email"], repo["name"]
                             )
             except Exception as e:
                 logger.warning(
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"
                 )
-
-        # Main-cloud membership is driven by the Keycloak project group via the
-        # OIDC `groups` claim — OpenCloud reconciles LibreGraph memberships to
-        # match the token on every login. A direct backend.add_user_to_group
-        # here would be wiped at the user's next auth, so we rely on the
-        # Keycloak-side add above. Users need a token refresh to see the Space
-        # appear (cockpit triggers this after the POST succeeds).
 
         return result
     except Exception as e:
