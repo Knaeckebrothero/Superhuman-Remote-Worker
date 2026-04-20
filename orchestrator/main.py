@@ -11880,19 +11880,14 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
             project_id_str = str(project["id"])
             group_name = f"project-{project_id_str}"
             try:
-                # Pre-create the backend group (so it exists before folder assignment)
+                # Pre-create the backend group so the folder invite has a target.
+                # Membership is NOT populated here — it's driven by the Keycloak
+                # project group via the OIDC `groups` claim. OpenCloud's proxy
+                # reconciles LibreGraph group memberships to match the token on
+                # every login, so a direct backend.add_user_to_group would get
+                # wiped on the creator's next auth. The Keycloak-side add runs
+                # at line ~11873.
                 await backend.ensure_group(group_name)
-
-                # Add the creator to the backend group so they can see the Space.
-                if body.user_id:
-                    creator = await postgres_db.get_user(body.user_id)
-                    if creator:
-                        resolved = await backend.resolve_user_identity(
-                            creator.get("email"),
-                            creator.get("display_name", "").lower(),
-                        )
-                        if resolved:
-                            await backend.add_user_to_group(resolved, group_name)
 
                 # Create the project folder and grant access
                 folder_handle = await backend.ensure_project_folder(
@@ -12138,42 +12133,12 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"
                 )
 
-        # Sync to the project's main-cloud backend (immediate access — do not
-        # wait for OIDC login). Uses for_project so legacy-backend rows still
-        # dispatch correctly after a deployment-wide backend switch.
-        backend = main_cloud_router.for_project(project)
-        if backend.is_initialized:
-            try:
-                nc_user = await postgres_db.get_user(body.user_id)
-                resolved_user_id = (
-                    await backend.resolve_user_identity(
-                        nc_user.get("email"),
-                        nc_user.get("display_name", "").lower(),
-                    )
-                    if nc_user
-                    else None
-                )
-                if resolved_user_id:
-                    group_name = f"project-{project_id}"
-                    await backend.add_user_to_group(resolved_user_id, group_name)
-                    # Workaround for Nextcloud server#57445 — no-op on
-                    # backends that propagate group membership automatically.
-                    handle_str = project.get("main_cloud_folder_handle") or (
-                        str(project["nextcloud_folder_id"])
-                        if project.get("nextcloud_folder_id")
-                        else None
-                    )
-                    if handle_str:
-                        handle = ProjectFolderHandle.from_db(
-                            handle_str,
-                            backend=project.get("main_cloud_backend")
-                            or backend.backend_id,
-                        )
-                        await backend.refresh_project_folder_access(handle, group_name)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to sync main-cloud group for member {body.user_id}: {e}"
-                )
+        # Main-cloud membership is driven by the Keycloak project group via the
+        # OIDC `groups` claim — OpenCloud reconciles LibreGraph memberships to
+        # match the token on every login. A direct backend.add_user_to_group
+        # here would be wiped at the user's next auth, so we rely on the
+        # Keycloak-side add above. Users need a token refresh to see the Space
+        # appear (cockpit triggers this after the POST succeeds).
 
         return result
     except Exception as e:
@@ -12234,30 +12199,10 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
-    # Remove from the project's main-cloud group
-    project = await postgres_db.get_project(project_id)
-    backend = (
-        main_cloud_router.for_project(project) if project else main_cloud_router.active
-    )
-    if backend.is_initialized:
-        try:
-            nc_user = await postgres_db.get_user(user_id)
-            resolved_user_id = (
-                await backend.resolve_user_identity(
-                    nc_user.get("email"),
-                    nc_user.get("display_name", "").lower(),
-                )
-                if nc_user
-                else None
-            )
-            if resolved_user_id:
-                await backend.remove_user_from_group(
-                    resolved_user_id, f"project-{project_id}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to remove main-cloud group membership for {user_id}: {e}"
-            )
+    # Main-cloud group removal flows through Keycloak — OpenCloud reconciles
+    # LibreGraph memberships from the OIDC `groups` claim on login, so the
+    # Keycloak-side remove above is sufficient. No direct backend.remove call
+    # needed.
 
     return {"status": "removed"}
 

@@ -2,6 +2,7 @@ import {Component, effect, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
+import {KeycloakService} from '../../core/services/keycloak.service';
 import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 
@@ -293,6 +294,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
 export class ProjectListPageComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
+  private readonly keycloak = inject(KeycloakService);
   private readonly router = inject(Router);
 
   readonly projects = signal<Project[]>([]);
@@ -353,6 +355,10 @@ export class ProjectListPageComponent implements OnInit {
         this.formName.set('');
         this.formDescription.set('');
         this.formGoal.set('');
+        // Refresh the Keycloak token so the new `project-{id}` group claim
+        // reaches OpenCloud on the next request — otherwise the Space stays
+        // invisible until the session expires.
+        this.keycloak.forceRefreshToken();
         this.refresh();
       }
     });

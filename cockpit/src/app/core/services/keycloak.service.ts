@@ -80,4 +80,22 @@ export class KeycloakService {
       return null;
     }
   }
+
+  /**
+   * Force-refresh the access token regardless of remaining lifetime.
+   *
+   * Needed after server-side changes to the user's Keycloak groups (e.g.
+   * project membership). OpenCloud reconciles its LibreGraph group memberships
+   * from the OIDC `groups` claim on every login, so the next OpenCloud request
+   * must carry a fresh token or the new membership won't take effect.
+   */
+  async forceRefreshToken(): Promise<void> {
+    if (!this._authenticated) return;
+    try {
+      await this.keycloak.updateToken(-1);
+    } catch {
+      // Non-fatal — the user will pick up the new membership on their next
+      // natural token refresh or login.
+    }
+  }
 }
