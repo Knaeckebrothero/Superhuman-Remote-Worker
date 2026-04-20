@@ -397,6 +397,67 @@ data:
               }
             }
           ]
+        },
+        {
+          "name": "profile",
+          "protocol": "openid-connect",
+          "description": "OpenID Connect built-in scope: profile",
+          "attributes": {
+            "include.in.token.scope": "true",
+            "display.on.consent.screen": "true",
+            "consent.screen.text": "User profile information"
+          },
+          "protocolMappers": [
+            {
+              "name": "full name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-full-name-mapper",
+              "config": {
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true"
+              }
+            },
+            {
+              "name": "given name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "firstName",
+                "claim.name": "given_name",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "family name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "lastName",
+                "claim.name": "family_name",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "username",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "username",
+                "claim.name": "preferred_username",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            }
+          ]
         }
       ],
       "smtpServer": {
@@ -725,6 +786,28 @@ spec:
                             -s realm={{ .Values.keycloak.realm }} -s userId="$SAID" -s groupId="$OCGRP" -n 2>/dev/null
                           $KC update "users/$SAID" -r {{ .Values.keycloak.realm }} \
                             -s firstName=OpenCloud -s lastName=Orchestrator -s email=orchestrator@srw.local 2>/dev/null
+                        fi
+                      fi
+                      # Ensure `profile` client scope exists — realm-import only creates
+                      # it on first boot, and the explicit clientScopes array in the
+                      # realm JSON replaces Keycloak's built-in defaults. Without this,
+                      # orchestrator service-account tokens lack the `name` claim and
+                      # OpenCloud rejects autoprovisioning with 500 on /roleDefinitions.
+                      PID=$($KC get client-scopes -r {{ .Values.keycloak.realm }} --fields id,name 2>/dev/null \
+                        | grep -B1 '"name" : "profile"' | grep '"id"' | head -1 | sed 's/.*"id" : "//;s/".*//' || true)
+                      if [ -z "$PID" ]; then
+                        PID=$($KC create client-scopes -r {{ .Values.keycloak.realm }} \
+                          -s name=profile -s protocol=openid-connect \
+                          -s 'attributes={"include.in.token.scope":"true","display.on.consent.screen":"true"}' -i 2>/dev/null || true)
+                        if [ -n "$PID" ]; then
+                          printf '%s' '{"name":"full name","protocol":"openid-connect","protocolMapper":"oidc-full-name-mapper","config":{"id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true"}}' \
+                            | $KC create "client-scopes/$PID/protocol-mappers/models" -r {{ .Values.keycloak.realm }} -f - 2>/dev/null
+                          printf '%s' '{"name":"given name","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"firstName","claim.name":"given_name","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","jsonType.label":"String"}}' \
+                            | $KC create "client-scopes/$PID/protocol-mappers/models" -r {{ .Values.keycloak.realm }} -f - 2>/dev/null
+                          printf '%s' '{"name":"family name","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"lastName","claim.name":"family_name","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","jsonType.label":"String"}}' \
+                            | $KC create "client-scopes/$PID/protocol-mappers/models" -r {{ .Values.keycloak.realm }} -f - 2>/dev/null
+                          printf '%s' '{"name":"username","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"username","claim.name":"preferred_username","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","jsonType.label":"String"}}' \
+                            | $KC create "client-scopes/$PID/protocol-mappers/models" -r {{ .Values.keycloak.realm }} -f - 2>/dev/null
                         fi
                       fi
                       # Attach default client scopes (profile, email, groups + openid for web)
