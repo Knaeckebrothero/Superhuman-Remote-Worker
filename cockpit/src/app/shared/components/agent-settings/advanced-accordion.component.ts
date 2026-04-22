@@ -616,7 +616,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [ngModel]="auxModel() ?? resolvedAuxModel()"
                     (ngModelChange)="auxModel.set($event); emitChange()"
                     [disabled]="disabled()"
-                    placeholder="openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic">
+                    placeholder="RedHatAI/gemma-4-31B-it-FP8-Dynamic">
                   @if (auxModel() !== null) {
                     <button type="button" class="reset-btn" (click)="auxModel.set(null); emitChange()">close</button>
                   }
@@ -1046,7 +1046,7 @@ export class AdvancedAccordionComponent {
   readonly resolvedBrowserVision = computed(() => (this.r('browser.use_vision') ?? false) as boolean);
 
   readonly resolvedAuxEnabled = computed(() => (this.r('auxiliary.enabled') ?? true) as boolean);
-  readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') ?? 'openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic') as string);
+  readonly resolvedAuxModel = computed(() => (this.r('auxiliary.model') ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic') as string);
   readonly resolvedAuxTemperature = computed(() => (this.r('auxiliary.temperature') ?? 0) as number);
 
   readonly resolvedIdleTimeout = computed(() => (this.r('interactive.idle_timeout_minutes') ?? 30) as number);

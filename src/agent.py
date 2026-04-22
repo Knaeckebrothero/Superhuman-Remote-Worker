@@ -749,14 +749,15 @@ class UniversalAgent:
         Returns:
             Template content for workspace.md
         """
-        from .core.loader import InstructionMatrixResolver, detect_model_family
+        from .core.loader import InstructionMatrixResolver
+        from .core.model_registry import family_of
 
         # Check for pre-resolved content
         resolved = self.config.extra.get("_resolved_instructions", {})
         if resolved.get("workspace_template"):
             return resolved["workspace_template"]
 
-        model_family = detect_model_family(self.config.llm.model)
+        model_family = family_of(self.config.llm.model)
         resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
         return resolver.load("workspace_template")
 
@@ -1838,10 +1839,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         from .core.loader import (
             InstructionMatrixResolver,
             FileResolver,
-            detect_model_family,
             render_instruction_content,
             load_instructions,
         )
+        from .core.model_registry import family_of
 
         # instructions.md — only deploy template if not already present (upload/inline)
         instructions_path = self._workspace_manager.get_path("instructions.md")
@@ -1852,7 +1853,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.debug("Deployed template-based instructions.md to workspace")
 
         # todo_guide.md — via instruction matrix
-        model_family = detect_model_family(self.config.llm.model)
+        model_family = family_of(self.config.llm.model)
         instr_resolver = InstructionMatrixResolver(
             self.config._deployment_dir, model_family
         )

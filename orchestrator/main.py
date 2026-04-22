@@ -112,9 +112,15 @@ from services.builder_tools import (  # noqa: E402
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
-from services.builder_config import (  # noqa: E402
-    resolve_builder_settings,
-    detect_model_family as _detect_model_family,
+from services.builder_config import resolve_builder_settings  # noqa: E402
+
+# Registry helpers live in src/ and stay there — the orchestrator imports
+# them here so callers don't each do lazy imports.
+from src.core.model_registry import (  # noqa: E402
+    UnknownModelError,
+    family_of as _model_family,
+    resolve_builtin,
+    resolve_model as _resolve_model,
 )
 from langchain_core.messages import (  # noqa: E402
     AIMessage,
@@ -810,20 +816,52 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: using worktree path {worktree_path} for job {job_id}"
                 )
 
-        # Resolve user/project API keys (user > project > env var fallback)
+        # Resolve user/project API keys (user > project > env var fallback).
+        user_id_str = str(job["user_id"]) if job.get("user_id") else None
         resolved_keys = await postgres_db.resolve_api_keys_for_job(
-            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            user_id=user_id_str,
             project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
+
+        # Resolve the main LLM through the registry. Custom endpoints carry
+        # their own inline base_url + api_key (from the user_llm_endpoints
+        # row); built-ins look up their api_key via resolved_keys.
+        config_override = config_override or {}
+        llm_over = config_override.setdefault("llm", {})
+        model_id = llm_over.get("model")
+        meta = None
+        if model_id:
+            try:
+                meta = await _resolve_model(model_id, user_id=user_id_str)
+            except UnknownModelError:
+                meta = None
+
+        if meta is not None and meta.origin == "custom" and meta.endpoint_id:
+            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+            if endpoint_row:
+                if endpoint_row.get("base_url"):
+                    llm_over.setdefault("base_url", endpoint_row["base_url"])
+                if endpoint_row.get("api_key"):
+                    llm_over.setdefault("api_key", endpoint_row["api_key"])
+                logger.info(
+                    f"Dispatch: routed {model_id} to custom endpoint "
+                    f"{endpoint_row.get('label') or meta.endpoint_id}"
+                )
+        elif resolved_keys:
+            # Built-in (or unknown): inject the right named-provider key.
+            if meta is not None and meta.api_key_ref:
+                provider_for_key: str | None = meta.api_key_ref
+            else:
+                provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
+            if (
+                provider_for_key
+                and provider_for_key in resolved_keys
+                and "api_key" not in llm_over
+            ):
+                llm_over["api_key"] = resolved_keys[provider_for_key]
+
+        # Non-LLM tool keys (tavily, vision) always travel as env_keys.
         if resolved_keys:
-            config_override = config_override or {}
-            # Detect main LLM provider and inject key
-            llm_provider = _detect_llm_provider_for_dispatch(job, config_override)
-            if llm_provider and llm_provider in resolved_keys:
-                config_override.setdefault("llm", {})["api_key"] = resolved_keys[
-                    llm_provider
-                ]
-            # Inject non-LLM tool keys as env_keys
             _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
             env_keys = {
                 _ENV_KEY_MAP[p]: resolved_keys[p]
@@ -846,12 +884,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 aux_override = config_override.setdefault("auxiliary", {})
                 if "model" not in aux_override:
                     aux_override["model"] = aux_model
-                    aux_provider = _detect_provider_from_model(aux_model)
-                    if resolved_keys and aux_provider in resolved_keys:
-                        aux_override["api_key"] = resolved_keys[aux_provider]
+                    await _inject_model_credentials(
+                        section=aux_override,
+                        model_id=aux_model,
+                        user_id=user_id_str,
+                        resolved_keys=resolved_keys,
+                    )
                     logger.info(
-                        f"Dispatch: injected auxiliary model override: "
-                        f"{aux_model} (provider={aux_provider})"
+                        f"Dispatch: injected auxiliary model override: {aux_model}"
                     )
 
             default_model = user_settings.get("default_model")
@@ -860,13 +900,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 llm_override = config_override.setdefault("llm", {})
                 if "model" not in llm_override:
                     llm_override["model"] = default_model
-                    model_provider = _detect_provider_from_model(default_model)
-                    if (
-                        resolved_keys
-                        and model_provider in resolved_keys
-                        and "api_key" not in llm_override
-                    ):
-                        llm_override["api_key"] = resolved_keys[model_provider]
+                    await _inject_model_credentials(
+                        section=llm_override,
+                        model_id=default_model,
+                        user_id=user_id_str,
+                        resolved_keys=resolved_keys,
+                    )
                     logger.info(
                         f"Dispatch: injected user default_model: {default_model}"
                     )
@@ -890,14 +929,16 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                     )
 
-            # Vision model override (injected as env var)
+            # Vision model override (injected as env var). Vision stays
+            # env-var-driven for v1 per the custom_llm_endpoints design;
+            # custom-endpoint support lands in a follow-up.
             vision_model = user_settings.get("default_vision_model")
             if vision_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
                 if "VISION_MODEL" not in env_keys_block:
                     env_keys_block["VISION_MODEL"] = vision_model
-                    vision_provider = _detect_provider_from_model(vision_model)
+                    vision_provider = _provider_of_model(vision_model) or "openai"
                     if resolved_keys and vision_provider in resolved_keys:
                         env_keys_block["VISION_API_KEY"] = resolved_keys[
                             vision_provider
@@ -1447,42 +1488,86 @@ async def _archive_and_cleanup_workspace(
     return actions
 
 
-def _detect_provider_from_model(model: str) -> str:
-    """Detect LLM provider from a model name string.
+def _provider_of_model(model: str) -> str | None:
+    """Registry-backed provider lookup. Returns None for unknown IDs.
 
-    Must stay in sync with src/core/loader.py:_detect_provider().
+    Used at dispatch for the legacy code paths that need only the factory
+    name (aux-model key injection, vision-model key lookup). Custom
+    endpoints resolve to ``openai`` here (the factory name); their inline
+    api_key travels via a separate code path that consults the endpoint row.
     """
-    model_lower = model.lower()
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if model_lower.startswith("groq/"):
-        return "groq"
-    if model_lower.startswith("codex/"):
-        return "codex"
-    if model_lower.startswith("claude"):
-        return "anthropic"
-    if model_lower.startswith("gemini"):
-        return "google"
-    return "openai"
+    meta = resolve_builtin(model)
+    return meta.provider if meta is not None else None
 
 
-def _detect_llm_provider_for_dispatch(
+async def _inject_model_credentials(
+    *,
+    section: dict,
+    model_id: str,
+    user_id: str | None,
+    resolved_keys: dict[str, str] | None,
+) -> None:
+    """Populate a config-override section with the right base_url + api_key
+    for a given model ID.
+
+    For custom endpoints (``origin == 'custom'``): looks up the endpoint
+    row and inlines its ``base_url`` + ``api_key``.
+
+    For built-ins: injects the named provider's key from ``resolved_keys``
+    (the user > project > env resolution chain). No base_url injection —
+    the agent's own registry handles env-driven base URLs for local models.
+
+    Never overwrites fields that are already set; this helper is always
+    additive so caller-supplied overrides win.
+    """
+    if "base_url" in section and "api_key" in section:
+        return
+
+    meta = None
+    try:
+        meta = await _resolve_model(model_id, user_id=user_id)
+    except UnknownModelError:
+        meta = None
+
+    if meta is not None and meta.origin == "custom" and meta.endpoint_id:
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                section.setdefault("base_url", endpoint_row["base_url"])
+            if endpoint_row.get("api_key"):
+                section.setdefault("api_key", endpoint_row["api_key"])
+        return
+
+    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    if (
+        provider
+        and resolved_keys
+        and provider in resolved_keys
+        and "api_key" not in section
+    ):
+        section["api_key"] = resolved_keys[provider]
+
+
+def _dispatch_llm_provider_fallback(
     job: dict, config_override: dict | None
 ) -> str | None:
-    """Detect the LLM provider for a job from its config override or config name.
+    """Legacy dispatcher provider detection, used only when the model ID
+    can't be resolved through the registry.
 
-    Uses _detect_provider_from_model() for consistent prefix matching.
+    Mirrors the pre-registry behavior: explicit ``llm.provider`` wins,
+    then the known built-in model catalog, then a config-name heuristic
+    (only ``anthropic`` today), finally ``openai``.
     """
-    # Check config_override for explicit provider or model
     if config_override:
         llm = config_override.get("llm", {})
         if llm.get("provider"):
             return llm["provider"].lower()
         model = llm.get("model")
         if model:
-            return _detect_provider_from_model(model)
+            prov = _provider_of_model(model)
+            if prov is not None:
+                return prov
 
-    # Fall back to config_name heuristic (most configs use openai-compatible default)
     config_name = job.get("config_name", "default")
     if config_name and "anthropic" in config_name.lower():
         return "anthropic"
@@ -2149,6 +2234,69 @@ class ApiKeySet(BaseModel):
     )
 
 
+class LlmEndpointCreate(BaseModel):
+    """Request body for registering a new LLM endpoint.
+
+    The endpoint must be OpenAI-compatible (vLLM, Ollama, private gateway).
+    ``base_url`` should be the full OpenAI path prefix, e.g.
+    ``https://my-vllm.example/v1``. ``api_key`` is optional — some local
+    servers don't require auth.
+    """
+
+    label: str = Field(..., min_length=1, max_length=200)
+    base_url: str = Field(..., min_length=1)
+    api_key: str | None = None
+    allow_insecure: bool = Field(
+        False,
+        description=(
+            "Opt-in for http:// URLs. Default rejects non-HTTPS to guard "
+            "against copy-paste accidents."
+        ),
+    )
+
+
+class LlmEndpointUpdate(BaseModel):
+    """Partial update — only non-None fields are applied.
+
+    ``clear_api_key=True`` nulls the stored key (for endpoints that
+    transition from authenticated to anonymous). Ignored when ``api_key``
+    is also set.
+    """
+
+    label: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_api_key: bool = False
+    allow_insecure: bool = False
+
+
+class LlmEndpointModelCreate(BaseModel):
+    """Request body for attaching a model row to an endpoint."""
+
+    model_id: str = Field(..., min_length=1, max_length=500)
+    display_name: str = Field(..., min_length=1, max_length=200)
+    family: str | None = Field(
+        None,
+        description=(
+            "Optional family override for settings_matrix lookup "
+            "(e.g. 'gpt-oss', 'deepseek'). Omit for 'default'."
+        ),
+    )
+    context_window: int | None = Field(None, ge=1000)
+    reasoning_level: str | None = None
+    enabled: bool = True
+
+
+class LlmEndpointModelUpdate(BaseModel):
+    """Partial model-row update — only non-None fields are applied."""
+
+    display_name: str | None = None
+    family: str | None = None
+    context_window: int | None = Field(None, ge=1000)
+    reasoning_level: str | None = None
+    enabled: bool | None = None
+
+
 class UserSettingsUpdate(BaseModel):
     """Request body for updating user preferences. Null values remove the key."""
 
@@ -2324,6 +2472,13 @@ async def lifespan(app: FastAPI):
     _vector_schema = _Path(__file__).parent / "database" / "vector_schema.sql"
     await vector_db.ensure_schema(schema_file=_vector_schema)
     logger.info("Database schemas verified")
+
+    # Wire the model registry's custom-endpoint lookup to the DB. The
+    # registry lives in src/core/ and must not import orchestrator/, so
+    # the hook is injected here (and unset on shutdown below).
+    from src.core.model_registry import register_custom_lookup
+
+    register_custom_lookup(postgres_db.resolve_user_llm_model)
 
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
@@ -2504,6 +2659,12 @@ async def lifespan(app: FastAPI):
     await nats_bridge.disconnect()
     await gitea_client.close()
 
+    # Unregister the registry's DB hook before disconnecting the pool so
+    # any stragglers don't hit a closed connection.
+    from src.core.model_registry import register_custom_lookup
+
+    register_custom_lookup(None)
+
     # Disconnect from databases
     await mongodb.disconnect()
     await vector_db.disconnect()
@@ -2532,6 +2693,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(UnknownModelError)
+async def _unknown_model_handler(
+    request: Request, exc: UnknownModelError
+) -> JSONResponse:
+    """Translate registry misses into a helpful 400 instead of a 500.
+
+    Fires whenever a request references a model ID that isn't in the
+    built-in catalog or any of the user's custom endpoints. Points users
+    at the settings UI where they can register the model.
+    """
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": str(exc),
+            "model_id": exc.model_id,
+            "hint": (
+                "Register this model under a custom endpoint at "
+                "/api/settings/llm-endpoints, or pick an ID from /api/models."
+            ),
+        },
+    )
+
 
 # Request logging middleware — replaces uvicorn's shallow access log with
 # app-level logging that includes response timing and error tracebacks.
@@ -8859,7 +9044,7 @@ class ThreadCreateRequest(BaseModel):
     title: str = Field("Untitled Session", description="Session title")
     model: str | None = Field(
         None,
-        description="LLM model override (e.g. openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
+        description="LLM model override (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
     )
     temperature: float | None = Field(None, description="Temperature override")
 
@@ -10193,7 +10378,7 @@ def _apply_settings_matrix_to_config(
 
     llm_data = merged.get("llm", {})
     model = llm_data.get("model", "gpt-4o")
-    family = _detect_model_family(model)
+    family = _model_family(model)
 
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
@@ -10740,6 +10925,249 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
     return {"status": "deleted"}
 
 
+# =============================================================================
+# User-defined LLM Endpoints
+# OpenAI-compatible endpoints a user has registered (vLLM, Ollama, private
+# gateways). Models served by these endpoints appear in every model picker
+# and are routed to via dispatcher injection of base_url + api_key.
+# =============================================================================
+
+
+def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
+    """Basic URL sanity check. Raises HTTPException(400) on malformed input.
+
+    Rejects non-http(s) schemes (file://, javascript:), empty hosts, and
+    http:// URLs unless the caller explicitly opts in via allow_insecure.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(base_url.strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed base_url")
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"base_url scheme must be http or https, got {parsed.scheme!r}",
+        )
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="base_url must include a host")
+    if parsed.scheme == "http" and not allow_insecure:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "base_url uses http:// — set allow_insecure=true to override "
+                "(not recommended outside local development)."
+            ),
+        )
+    return parsed.geturl()
+
+
+def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape an endpoint row for the API response (key_prefix only, no full key)."""
+    return {
+        "id": str(row["id"]),
+        "label": row["label"],
+        "base_url": row["base_url"],
+        "key_prefix": row.get("key_prefix"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        "models": [_serialize_endpoint_model(m) for m in row.get("models", [])],
+    }
+
+
+def _serialize_endpoint_model(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(row["id"]),
+        "endpoint_id": str(row["endpoint_id"]),
+        "model_id": row["model_id"],
+        "display_name": row["display_name"],
+        "family": row.get("family"),
+        "context_window": row.get("context_window"),
+        "reasoning_level": row.get("reasoning_level"),
+        "enabled": row.get("enabled", True),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+    }
+
+
+@app.get("/api/settings/llm-endpoints")
+async def list_llm_endpoints(request: Request) -> list[dict[str, Any]]:
+    """List the user's registered LLM endpoints with their model rows."""
+    user = await require_approved_user(request, postgres_db)
+    rows = await postgres_db.list_user_llm_endpoints(str(user["id"]))
+    return [_serialize_endpoint(r) for r in rows]
+
+
+@app.post("/api/settings/llm-endpoints")
+async def create_llm_endpoint(
+    request: Request, body: LlmEndpointCreate
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+    try:
+        row = await postgres_db.create_user_llm_endpoint(
+            user_id=str(user["id"]),
+            label=body.label,
+            base_url=base_url,
+            api_key=body.api_key,
+            key_prefix=key_prefix,
+        )
+    except Exception as e:
+        # UniqueViolation on (user_id, label) — mirror the 409 style elsewhere
+        if "uq_user_llm_endpoint_label" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=f"An endpoint labeled {body.label!r} already exists.",
+            )
+        raise
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.patch("/api/settings/llm-endpoints/{endpoint_id}")
+async def update_llm_endpoint(
+    request: Request, endpoint_id: str, body: LlmEndpointUpdate
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    base_url = None
+    if body.base_url is not None:
+        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+
+    row = await postgres_db.update_user_llm_endpoint(
+        endpoint_id=endpoint_id,
+        user_id=str(user["id"]),
+        label=body.label,
+        base_url=base_url,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        clear_api_key=body.clear_api_key and body.api_key is None,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.delete("/api/settings/llm-endpoints/{endpoint_id}")
+async def delete_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, str]:
+    user = await require_approved_user(request, postgres_db)
+    deleted = await postgres_db.delete_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/models")
+async def create_llm_endpoint_model(
+    request: Request, endpoint_id: str, body: LlmEndpointModelCreate
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    try:
+        row = await postgres_db.create_user_llm_endpoint_model(
+            endpoint_id=endpoint_id,
+            user_id=str(user["id"]),
+            model_id=body.model_id,
+            display_name=body.display_name,
+            family=body.family,
+            context_window=body.context_window,
+            reasoning_level=body.reasoning_level,
+            enabled=body.enabled,
+        )
+    except Exception as e:
+        if "uq_endpoint_model" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Model {body.model_id!r} is already attached to this endpoint.",
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    return _serialize_endpoint_model(row)
+
+
+@app.patch("/api/settings/llm-endpoints/{endpoint_id}/models/{model_id:path}")
+async def update_llm_endpoint_model(
+    request: Request,
+    endpoint_id: str,
+    model_id: str,
+    body: LlmEndpointModelUpdate,
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    row = await postgres_db.update_user_llm_endpoint_model(
+        endpoint_id=endpoint_id,
+        model_id=model_id,
+        user_id=str(user["id"]),
+        display_name=body.display_name,
+        family=body.family,
+        context_window=body.context_window,
+        reasoning_level=body.reasoning_level,
+        enabled=body.enabled,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Endpoint model not found")
+    return _serialize_endpoint_model(row)
+
+
+@app.delete("/api/settings/llm-endpoints/{endpoint_id}/models/{model_id:path}")
+async def delete_llm_endpoint_model(
+    request: Request, endpoint_id: str, model_id: str
+) -> dict[str, str]:
+    user = await require_approved_user(request, postgres_db)
+    deleted = await postgres_db.delete_user_llm_endpoint_model(
+        endpoint_id=endpoint_id,
+        model_id=model_id,
+        user_id=str(user["id"]),
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Endpoint model not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/test")
+async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any]:
+    """Probe an endpoint by calling ``GET {base_url}/models`` server-side.
+
+    Runs from the orchestrator pod (not the browser) so the api_key is
+    never exposed to the client. Returns the HTTP status plus the first
+    error message if the probe fails.
+    """
+    user = await require_approved_user(request, postgres_db)
+    endpoint = await postgres_db.get_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    probe_url = endpoint["base_url"].rstrip("/") + "/models"
+    headers = {}
+    if endpoint.get("api_key"):
+        headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(probe_url, headers=headers)
+    except httpx.HTTPError as e:
+        return {
+            "ok": False,
+            "status": None,
+            "error": f"{type(e).__name__}: {e}",
+            "probe_url": probe_url,
+        }
+
+    body_preview = resp.text[:500] if resp.text else ""
+    return {
+        "ok": 200 <= resp.status_code < 300,
+        "status": resp.status_code,
+        "error": None if resp.is_success else body_preview,
+        "probe_url": probe_url,
+    }
+
+
 def _resolve_preference_defaults() -> dict[str, Any]:
     """Compute resolved default values for all user preference fields.
 
@@ -11128,6 +11556,37 @@ async def list_available_models(
                         hm["id"] = overrides[hm["id"]]
                         hm["configured"] = True
 
+    # Merge the user's custom LLM endpoints as "Custom: <label>" groups.
+    # Custom models are always configured (their api_key lives on the endpoint
+    # row, not in resolved_keys) and are treated as OpenAI-compatible.
+    user_endpoints = await postgres_db.list_user_llm_endpoints(user_id)
+    for endpoint in user_endpoints:
+        enabled_models = [
+            m for m in endpoint.get("models", []) if m.get("enabled", True)
+        ]
+        if not enabled_models:
+            continue
+        group_name = f"Custom: {endpoint['label']}"
+        group_models = [m["model_id"] for m in enabled_models]
+        groups.append(
+            {
+                "group": group_name,
+                "provider": "custom",
+                "endpoint_id": str(endpoint["id"]),
+                "configured": True,
+                "models": group_models,
+            }
+        )
+        # Custom models are available in the builder too.
+        builder_models.extend(
+            {
+                "label": f"{m['display_name']} ({endpoint['label']})",
+                "id": m["model_id"],
+                "configured": True,
+            }
+            for m in enabled_models
+        )
+
     return {
         "groups": groups,
         "presets": presets,
@@ -11147,6 +11606,11 @@ async def reload_model_catalog(request: Request) -> dict[str, str]:
     global _model_catalog_cache
     _model_catalog_cache = None
     _load_model_catalog()
+    # Also reload the in-memory model registry so new YAML entries / removed
+    # entries / updated families are picked up without restarting.
+    from src.core.model_registry import reload_registry as _reload_registry
+
+    _reload_registry()
     return {"status": "reloaded"}
 
 

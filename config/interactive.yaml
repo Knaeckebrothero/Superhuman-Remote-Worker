@@ -5,7 +5,7 @@ agent_id: interactive
 display_name: Interactive Assistant
 
 llm:
-  model: openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
   temperature: 0.3
   reasoning_level: null
 

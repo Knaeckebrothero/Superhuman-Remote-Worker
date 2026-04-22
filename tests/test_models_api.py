@@ -18,11 +18,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "orchestrator"))
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 from main import (
-    _detect_provider_from_model,
     _get_system_providers,
     _load_model_catalog,
     _PROVIDER_ENV_KEYS,
 )
+from src.core.model_registry import resolve_builtin
 
 
 # ---------------------------------------------------------------------------
@@ -46,63 +46,6 @@ def catalog():
     catalog_path = Path(__file__).parent.parent / "config" / "models.yaml"
     with open(catalog_path) as f:
         return yaml.safe_load(f)
-
-
-# =============================================================================
-# _detect_provider_from_model — consistency with loader
-# =============================================================================
-
-
-class TestDetectProviderFromModel:
-    """Provider detection must match src/core/loader.py:_detect_provider()."""
-
-    def test_openrouter_prefix(self):
-        assert (
-            _detect_provider_from_model("openrouter/minimax/minimax-m2.7")
-            == "openrouter"
-        )
-
-    def test_groq_prefix(self):
-        assert (
-            _detect_provider_from_model("groq/moonshotai/kimi-k2-instruct-0905")
-            == "groq"
-        )
-
-    def test_codex_prefix(self):
-        assert _detect_provider_from_model("codex/gpt-5.3-codex") == "codex"
-
-    def test_codex_spark(self):
-        assert _detect_provider_from_model("codex/gpt-5.3-codex-spark") == "codex"
-
-    def test_claude_anthropic(self):
-        assert _detect_provider_from_model("claude-opus-4-6") == "anthropic"
-
-    def test_claude_sonnet(self):
-        assert _detect_provider_from_model("claude-sonnet-4-5-20250929") == "anthropic"
-
-    def test_gemini_google(self):
-        assert _detect_provider_from_model("gemini-2.5-pro") == "google"
-
-    def test_gemini_flash(self):
-        assert _detect_provider_from_model("gemini-2.5-flash") == "google"
-
-    def test_gpt_openai(self):
-        assert _detect_provider_from_model("gpt-5.4") == "openai"
-
-    def test_gpt4o_openai(self):
-        assert _detect_provider_from_model("gpt-4o") == "openai"
-
-    def test_local_openai_prefix(self):
-        """openai/ prefix models fall through to openai provider."""
-        assert _detect_provider_from_model("openai/gpt-oss-120b") == "openai"
-
-    def test_case_insensitive(self):
-        assert _detect_provider_from_model("CODEX/GPT-5.3-codex") == "codex"
-        assert _detect_provider_from_model("Claude-Opus-4-6") == "anthropic"
-        assert _detect_provider_from_model("Gemini-2.5-Pro") == "google"
-
-    def test_unknown_defaults_to_openai(self):
-        assert _detect_provider_from_model("some-unknown-model") == "openai"
 
 
 # =============================================================================
@@ -368,42 +311,38 @@ class TestProviderFiltering:
     def test_auxiliary_models_filtered(self, catalog):
         result = self._filter(catalog, {"local"})
         aux_ids = [m["id"] for m in result["auxiliary_models"]]
-        assert "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic" in aux_ids  # local provider
+        assert "RedHatAI/gemma-4-31B-it-FP8-Dynamic" in aux_ids  # local provider
         assert "gpt-4o-mini" not in aux_ids  # openai provider
 
     def test_builder_models_filtered(self, catalog):
         result = self._filter(catalog, {"local", "codex"})
         builder_ids = [m["id"] for m in result["builder_models"]]
-        assert "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic" in builder_ids  # local
+        assert "RedHatAI/gemma-4-31B-it-FP8-Dynamic" in builder_ids  # local
         assert "codex/gpt-5.4" in builder_ids  # codex
         assert "claude-opus-4-6" not in builder_ids  # anthropic — not available
 
 
 # =============================================================================
-# _detect_provider_from_model vs loader._detect_provider consistency
+# Registry ↔ catalog provider consistency
 # =============================================================================
 
 
-class TestProviderDetectionConsistency:
-    """Verify orchestrator and agent loader agree on provider for every cataloged model."""
+class TestProviderRegistryConsistency:
+    """Every cataloged model resolves through the registry to the expected
+    factory provider. The 'local' group maps to the 'openai' factory (vLLM,
+    Ollama, etc. are OpenAI-compatible)."""
 
-    def test_all_catalog_models_consistent(self, catalog):
-        """For every model in the catalog, the detected provider must match
-        the catalog's declared provider (or 'openai' for 'local' models
-        that use the openai/ prefix)."""
+    def test_all_catalog_models_resolve_correctly(self, catalog):
         for group in catalog["groups"]:
             declared_provider = group["provider"]
+            expected_factory = (
+                "openai" if declared_provider == "local" else declared_provider
+            )
             for model in group["models"]:
-                detected = _detect_provider_from_model(model["id"])
-                # Local models with openai/ prefix detect as "openai" — that's expected
-                if declared_provider == "local" and model["id"].startswith("openai/"):
-                    assert detected == "openai", (
-                        f"Model {model['id']}: expected 'openai' for local/openai-prefix, got '{detected}'"
-                    )
-                elif declared_provider == "local":
-                    pass  # Non-prefixed local models — detection varies
-                else:
-                    assert detected == declared_provider, (
-                        f"Model {model['id']}: catalog says '{declared_provider}', "
-                        f"detected '{detected}'"
-                    )
+                meta = resolve_builtin(model["id"])
+                assert meta is not None, f"Model {model['id']} not registered"
+                assert meta.provider == expected_factory, (
+                    f"Model {model['id']}: catalog group '{declared_provider}' "
+                    f"→ expected factory '{expected_factory}', registry says "
+                    f"'{meta.provider}'"
+                )

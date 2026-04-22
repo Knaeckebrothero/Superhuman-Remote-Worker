@@ -193,7 +193,7 @@ export class JobArtifactService {
   }
 
   private loadBuilderModel(): string {
-    return this.loadBuilderModelFromStorage() ?? environment.builderModels[0]?.id ?? 'openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic';
+    return this.loadBuilderModelFromStorage() ?? environment.builderModels[0]?.id ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic';
   }
 
   private loadBuilderModelFromStorage(): string | null {
