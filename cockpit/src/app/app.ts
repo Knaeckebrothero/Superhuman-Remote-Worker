@@ -29,10 +29,11 @@ import {ProjectListPageComponent} from './shared/pages/project-list.component';
 import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel.component';
 import {InboxPageComponent} from './simple/pages/inbox/inbox-page.component';
 import {ConfigEditorComponent} from './shared/components/config-editor/config-editor.component';
+import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-banner/empty-catalog-banner.component';
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet, SidebarComponent, ToastComponent],
+  imports: [RouterOutlet, SidebarComponent, ToastComponent, EmptyCatalogBannerComponent],
   template: `
     <div class="app-container">
       @if (showSidebar()) {
@@ -53,6 +54,7 @@ import {ConfigEditorComponent} from './shared/components/config-editor/config-ed
             </div>
           </div>
         } @else {
+          <app-empty-catalog-banner />
           <router-outlet />
         }
       </div>

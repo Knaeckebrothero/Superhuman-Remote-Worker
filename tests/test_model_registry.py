@@ -16,6 +16,7 @@ from src.core.model_registry import (
     _factory_provider,
     list_builtin_models,
     register_custom_lookup,
+    register_system_lookup,
     reload_registry,
     resolve_model,
 )
@@ -301,6 +302,140 @@ class TestCustomEndpointLookup:
 
         with pytest.raises(UnknownModelError):
             await resolve_model("nothing-anywhere", user_id="user-1")
+
+
+class TestSystemEndpointLookup:
+    """resolve_model() consults the system-scope hook after the user hook
+    and before the built-in catalog. System rows are visible to all users.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_hooks(self):
+        register_custom_lookup(None)
+        register_system_lookup(None)
+        yield
+        register_custom_lookup(None)
+        register_system_lookup(None)
+
+    @pytest.mark.asyncio
+    async def test_system_lookup_wins_over_builtin(self):
+        """A seeded system endpoint for 'gpt-4o' should route there, not OpenAI."""
+
+        async def fake_sys(model_id):
+            return {
+                "endpoint_id": "00000000-0000-0000-0000-0000000000aa",
+                "base_url": "http://vllm.ai.svc.cluster.local:8000/v1",
+                "model_id": model_id,
+                "display_name": "Shared vLLM",
+                "family": "gpt-4o",
+                "context_window": 128000,
+                "reasoning_level": None,
+            }
+
+        register_system_lookup(fake_sys)
+        meta = await resolve_model("gpt-4o")
+        assert meta.origin == "system"
+        assert meta.provider == "openai"
+        assert meta.base_url == "http://vllm.ai.svc.cluster.local:8000/v1"
+        assert meta.endpoint_id == "00000000-0000-0000-0000-0000000000aa"
+        assert meta.api_key_ref is None
+
+    @pytest.mark.asyncio
+    async def test_user_custom_beats_system(self):
+        """User-scoped endpoint takes precedence over system."""
+        custom_calls = []
+        system_calls = []
+
+        async def fake_custom(user_id, model_id):
+            custom_calls.append((user_id, model_id))
+            return {
+                "endpoint_id": "11111111-1111-1111-1111-111111111111",
+                "base_url": "https://user.example/v1",
+                "model_id": model_id,
+                "display_name": "User's override",
+                "family": None,
+                "context_window": None,
+                "reasoning_level": None,
+            }
+
+        async def fake_sys(model_id):
+            system_calls.append(model_id)
+            return None
+
+        register_custom_lookup(fake_custom)
+        register_system_lookup(fake_sys)
+
+        meta = await resolve_model("gpt-4o", user_id="user-1")
+        assert meta.origin == "custom"
+        assert meta.base_url == "https://user.example/v1"
+        # system lookup must not run if custom hit
+        assert system_calls == []
+        assert custom_calls == [("user-1", "gpt-4o")]
+
+    @pytest.mark.asyncio
+    async def test_system_lookup_runs_without_user_id(self):
+        """System lookup is queried even when user_id is None."""
+        called_with = []
+
+        async def fake_sys(model_id):
+            called_with.append(model_id)
+            return {
+                "endpoint_id": "22222222-2222-2222-2222-222222222222",
+                "base_url": "http://shared/v1",
+                "model_id": model_id,
+                "display_name": "Shared",
+                "family": None,
+                "context_window": None,
+                "reasoning_level": None,
+            }
+
+        register_system_lookup(fake_sys)
+        meta = await resolve_model("gpt-4o", user_id=None)
+        assert meta.origin == "system"
+        assert called_with == ["gpt-4o"]
+
+    @pytest.mark.asyncio
+    async def test_system_miss_falls_back_to_builtin(self):
+        async def fake_sys(model_id):
+            return None
+
+        register_system_lookup(fake_sys)
+        meta = await resolve_model("gpt-4o")
+        assert meta.origin == "builtin"
+
+    @pytest.mark.asyncio
+    async def test_unknown_still_raises_with_system_hook(self):
+        async def fake_sys(model_id):
+            return None
+
+        register_system_lookup(fake_sys)
+        with pytest.raises(UnknownModelError):
+            await resolve_model("nothing-anywhere")
+
+    @pytest.mark.asyncio
+    async def test_custom_miss_falls_through_to_system(self):
+        """When user hook returns None, system hook still runs."""
+
+        async def fake_custom(user_id, model_id):
+            return None
+
+        async def fake_sys(model_id):
+            return {
+                "endpoint_id": "33333333-3333-3333-3333-333333333333",
+                "base_url": "http://sys/v1",
+                "model_id": model_id,
+                "display_name": "System fallback",
+                "family": None,
+                "context_window": None,
+                "reasoning_level": None,
+            }
+
+        register_custom_lookup(fake_custom)
+        register_system_lookup(fake_sys)
+
+        meta = await resolve_model("gpt-4o", user_id="user-1")
+        assert meta.origin == "system"
+        assert meta.base_url == "http://sys/v1"
 
 
 class TestModelMetaShape:

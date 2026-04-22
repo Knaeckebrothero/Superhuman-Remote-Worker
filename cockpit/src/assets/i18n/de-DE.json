@@ -225,6 +225,76 @@
       "uploading": "Wird hochgeladen..."
     }
   },
+  "admin": {
+    "providers": {
+      "title": "Anbieter",
+      "desc": "Systemweite LLM-Anbieter, eigene Endpunkte und Standardmodelle. Änderungen gelten für alle Nutzer.",
+      "keys": {
+        "title": "Anbieter-API-Keys",
+        "desc": "Systemweite API-Keys, die verwendet werden, wenn Nutzer keinen eigenen Key hinterlegt haben. Verschlüsselt gespeichert.",
+        "empty": "Keine Systemkeys konfiguriert. Unten hinzufügen oder über helm.llm.seed.systemApiKeys einspielen.",
+        "colProvider": "Anbieter",
+        "colKey": "Key",
+        "colLabel": "Label",
+        "colSource": "Quelle",
+        "colUpdated": "Aktualisiert",
+        "seededBadge": "Seed",
+        "manualBadge": "Manuell",
+        "addTitle": "Key hinzufügen / aktualisieren",
+        "labelPlaceholder": "Label (optional)",
+        "keyPlaceholder": "API-Key (z.B. sk-...)",
+        "saveButton": "Key speichern",
+        "confirmDelete": "Systemweiten Key entfernen? Nutzer ohne eigenen Key für diesen Anbieter verlieren den Zugriff."
+      },
+      "endpoints": {
+        "title": "System-Endpunkte",
+        "desc": "Geteilte OpenAI-kompatible Endpunkte (vLLM, Ollama, Gateways), sichtbar für alle Nutzer.",
+        "empty": "Keine System-Endpunkte. Unten hinzufügen oder über helm.llm.seed.systemEndpoints einspielen.",
+        "noKey": "kein Key",
+        "noModels": "Keine Modelle angehängt. Unten eines hinzufügen.",
+        "addTitle": "Endpunkt hinzufügen",
+        "createButton": "Endpunkt erstellen",
+        "labelPlaceholder": "Label (z.B. Lokales Gemma)",
+        "baseUrlPlaceholder": "Basis-URL (z.B. https://vllm.example/v1)",
+        "apiKeyPlaceholder": "API-Key (optional)",
+        "allowInsecure": "http:// erlauben (außerhalb lokaler Entwicklung nicht empfohlen)",
+        "confirmDelete": "Diesen System-Endpunkt samt aller Modelle löschen?",
+        "confirmDeleteModel": "Dieses Modell vom Endpunkt entfernen?",
+        "testButton": "Test",
+        "testing": "Teste...",
+        "testOk": "OK ({{status}})",
+        "testFail": "Fehlgeschlagen ({{status}}): {{error}}",
+        "colModelId": "Modell-ID",
+        "colDisplayName": "Anzeigename",
+        "colFamily": "Familie",
+        "colContext": "Kontext",
+        "modelIdPlaceholder": "Modell-ID (z.B. my-org/my-model)",
+        "displayNamePlaceholder": "Anzeigename",
+        "familyPlaceholder": "Familie (optional)",
+        "contextPlaceholder": "Kontextfenster (Tokens)",
+        "addModelButton": "Modell hinzufügen",
+        "errorUrlScheme": "Basis-URL muss mit http:// oder https:// beginnen",
+        "errorHttpNeedsOptIn": "http://-URLs erfordern die Checkbox 'http:// erlauben'."
+      },
+      "defaults": {
+        "title": "Standardmodelle",
+        "desc": "Welches Modell verwendet wird, wenn ein Job oder Tool keines vorgibt. Jeder Typ trifft andere Workloads.",
+        "unset": "— nicht gesetzt —",
+        "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
+        "kind": {
+          "builder": "Builder (Auftrags-Autor / UI-Helfer)",
+          "browser": "Browser (Recherche-Subagent)",
+          "citation": "Zitationsengine"
+        }
+      }
+    }
+  },
+  "emptyCatalog": {
+    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → API-Keys einen Key hinzu oder registriere ein eigenes LLM.",
+    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Anbieter einen Anbieter, um die App zu nutzen.",
+    "pickerCta": "Konfiguriere einen Anbieter, um diese Auswahl zu aktivieren.",
+    "dismiss": "Schließen"
+  },
   "settings": {
     "title": "Einstellungen",
     "language": {

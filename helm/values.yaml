@@ -116,39 +116,12 @@ cockpit:
     limits:
       memory: "512Mi"
       cpu: "250m"
-  # -- Model groups shown in the cockpit UI (fallback — primary source is GET /api/models)
-  models:
-    - group: Local
-      models: ["openai/gpt-oss-120b"]
-    - group: OpenAI
-      models: ["gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
-    - group: Anthropic
-      models: ["claude-sonnet-4-5-20250929", "claude-opus-4-6"]
-    - group: Google
-      models: ["gemini-2.5-pro", "gemini-2.5-flash"]
-    - group: Groq
-      models: ["groq/moonshotai/kimi-k2-instruct-0905", "groq/gpt-oss-120b"]
-    - group: OpenRouter
-      models: ["openrouter/minimax/minimax-m2.7"]
-  # -- Strategic + tactical model presets
-  modelPresets:
-    - label: "Opus + Sonnet"
-      strategic: "claude-opus-4-6"
-      tactical: "claude-sonnet-4-5-20250929"
-    - label: "Codex + Spark"
-      strategic: "codex/gpt-5.3-codex"
-      tactical: "codex/gpt-5.3-codex-spark"
-    - label: "Gemini Pro + Flash"
-      strategic: "gemini-2.5-pro"
-      tactical: "gemini-2.5-flash"
-  # -- Models available in instruction builder chat
-  builderModels:
-    - label: "GPT OSS 120B (Local)"
-      id: "openai/gpt-oss-120b"
-    - label: "GPT-5.4"
-      id: "gpt-5.4"
-    - label: "Claude Opus 4.6"
-      id: "claude-opus-4-6"
+  # NOTE: Model groups, presets, and builder model lists were removed in the
+  # DB-backed LLM config migration. Cockpit now reads the catalog from
+  # `GET /api/models`, which is the authoritative source (system endpoints
+  # seeded via `llm.seed.systemEndpoints` + user endpoints). Empty catalogs
+  # render a role-aware empty-state banner pointing operators to
+  # Admin → Providers. See docs/features/db_backed_llm_config.md.
 
 # =============================================================================
 # MCP Server (Claude Code / AI platform integration)
@@ -480,24 +453,78 @@ reloader:
 # LLM Configuration (configmap values)
 # =============================================================================
 llm:
-  baseUrl: ""
+  # NOTE: builder/browser/citation model IDs and base URLs moved to the
+  # `system_api_keys` + `user_llm_endpoints` tables via the seed block below.
+  # The orchestrator resolves them at runtime through the model registry;
+  # they are no longer read from env at startup. See
+  # docs/features/db_backed_llm_config.md for the migration rationale.
   keyCooldownSeconds: "3600"
   visionModel: "gpt-4o-mini"
-  browserModel: "gpt-oss-120b"
-  browserBaseUrl: ""
   embeddingModel: "qwen3-embedding-8b"
   embeddingBaseUrl: ""
   codexBaseUrl: ""
-  builderModel: "gpt-5.2-pro"
   builderProvider: "openai"
+
+  # ---------------------------------------------------------------------------
+  # One-shot seed for system-scoped provider keys and LLM endpoints. Applied
+  # by a post-install / post-upgrade Job. Insert-only: existing rows in
+  # system_api_keys and user_llm_endpoints (user_id IS NULL) are NEVER
+  # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
+  # to bring the stack up empty and configure providers via Admin → Providers.
+  # ---------------------------------------------------------------------------
+  seed:
+    # -- Enable the seed Job. Missing/false leaves system tables untouched.
+    enabled: false
+
+    # -- Optional: system API keys keyed by provider. Each entry references
+    # an existing Secret in the release namespace — plaintext keys must never
+    # appear in values.yaml. In ESO mode the referenced Secret is populated by
+    # Vault; in non-ESO mode the operator creates it by hand.
+    #
+    # systemApiKeys:
+    #   openai:
+    #     secretName: "srw-llm-seed"
+    #     key: "openai_api_key"
+    #   anthropic:
+    #     secretName: "srw-llm-seed"
+    #     key: "anthropic_api_key"
+    systemApiKeys: {}
+
+    # -- Optional: system-scoped OpenAI-compatible endpoints (vLLM, Ollama,
+    # local gateways). Visible to every user. `apiKeyRef` is optional — omit
+    # for keyless endpoints like in-cluster vLLM.
+    #
+    # systemEndpoints:
+    #   - label: "Local Gemma"
+    #     baseUrl: "http://vllm.ai.svc.cluster.local:8000/v1"
+    #     apiKeyRef:
+    #       secretName: "srw-llm-seed"
+    #       key: "gemma_api_key"
+    #     models:
+    #       - id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+    #         displayName: "Gemma 4 31B"
+    #         family: "gemma"
+    #         contextWindow: 128000
+    #         reasoningLevel: null
+    systemEndpoints: []
+
+    # -- Resource requests for the short-lived seed Job pod.
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
 
 # =============================================================================
 # Citation Engine
 # =============================================================================
+# NOTE: `llmUrl` / `llmModel` / `reasoningLevel` moved to the DB-backed LLM
+# config. The orchestrator passes resolved values through job
+# `config_override` at dispatch; the agent no longer reads CITATION_LLM_MODEL
+# / CITATION_LLM_URL from env. Embedding model/URL stay here for now.
 citation:
-  llmUrl: ""
-  llmModel: "gpt-oss-120b"
-  reasoningLevel: "high"
   embeddingModel: "qwen3-embedding-8b"
   embeddingUrl: ""
 

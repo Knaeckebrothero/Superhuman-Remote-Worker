@@ -28,3 +28,36 @@ Set one of:
 {{- end }}
 {{- end }}
 {{- end }}
+
+Encryption key
+==============
+API keys and LLM endpoint credentials (user_api_keys, system_api_keys,
+user_llm_endpoints.api_key) are encrypted at rest using APP_ENCRYPTION_KEY
+in Secret `{{ include "srw.secretName" . }}`. If this key is lost, all
+stored credentials become unrecoverable.
+
+Back it up now:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "srw.secretName" . }} \
+    -o jsonpath='{.data.APP_ENCRYPTION_KEY}' | base64 -d
+
+{{- if .Values.externalSecrets.enabled }}
+
+External Secrets Operator is enabled. Ensure `app_encryption_key` exists
+in the Vault path `{{ .Values.externalSecrets.vaultPath }}` — the
+orchestrator will refuse to start without it.
+{{- end }}
+
+{{- if .Values.llm.seed.enabled }}
+
+LLM seed
+========
+Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
+post-install and post-upgrade. It inserts rows into system_api_keys and
+user_llm_endpoints only when they are absent — existing rows, whether
+previously seeded or created via Admin → Providers, are never overwritten.
+
+Inspect the run:
+
+  kubectl -n {{ .Release.Namespace }} logs job/{{ include "srw.fullname" . }}-llm-seed
+{{- end }}

@@ -68,6 +68,10 @@ libtmux>=0.50.0
 Jinja2>=3.1
 # Remote workspace backend (SSH/SFTP to VM)
 paramiko>=3.4.0
+# AES-GCM encryption at rest for stored credentials (user/system API keys,
+# custom LLM endpoint keys). Already a transitive dep via paramiko; listed
+# explicitly so crypto.py keeps working if that changes.
+cryptography>=42.0
 # Optional: NATS for cross-cluster VM lifecycle management
 nats-py>=2.9.0
 # Citation engine (separate repo):
