@@ -4,9 +4,11 @@ import {HttpClient} from '@angular/common/http';
 import {Router} from '@angular/router';
 import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
+import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
+import {ErrorMessageService} from '../../../core/services/error-message.service';
 import {UserService} from '../../../core/services/user.service';
 
 /**
@@ -56,8 +58,10 @@ function createComponent() {
             {provide: Router, useValue: mockRouter},
             {provide: PersistentChatService, useValue: mockChat},
             {provide: ToastService, useValue: mockToast},
+            {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
             {provide: UserService, useValue: mockUserService},
             {provide: SettingsService, useValue: mockSettings},
+            {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
         ],
     });
 

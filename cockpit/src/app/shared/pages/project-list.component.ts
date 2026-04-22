@@ -5,23 +5,24 @@ import {UserService} from '../../core/services/user.service';
 import {KeycloakService} from '../../core/services/keycloak.service';
 import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
-  imports: [SidebarToggleComponent],
+  imports: [SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="page-container">
       <!-- Header -->
       <div class="page-header">
         <app-sidebar-toggle />
-        <h1 class="page-title">Projects</h1>
+        <h1 class="page-title">{{ 'projects.title' | transloco }}</h1>
         <div class="header-actions">
           <button class="btn btn-primary" (click)="showCreateForm.set(!showCreateForm())">
-            {{ showCreateForm() ? 'Cancel' : 'New Project' }}
+            {{ (showCreateForm() ? 'projects.cancel' : 'projects.newProject') | transloco }}
           </button>
           <button class="btn btn-ghost" (click)="refresh()" [disabled]="isLoading()">
-            Refresh
+            {{ 'projects.refresh' | transloco }}
           </button>
         </div>
       </div>
@@ -32,7 +33,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
           <div class="form-row">
             <input
               class="form-input"
-              placeholder="Project name (required)"
+              [placeholder]="'projects.namePlaceholder' | transloco"
               [value]="formName()"
               (input)="formName.set(asInputValue($event))"
             />
@@ -40,7 +41,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
           <div class="form-row">
             <input
               class="form-input"
-              placeholder="Description (optional)"
+              [placeholder]="'projects.descriptionPlaceholder' | transloco"
               [value]="formDescription()"
               (input)="formDescription.set(asInputValue($event))"
             />
@@ -48,7 +49,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
           <div class="form-row">
             <input
               class="form-input"
-              placeholder="Goal (optional)"
+              [placeholder]="'projects.goalPlaceholder' | transloco"
               [value]="formGoal()"
               (input)="formGoal.set(asInputValue($event))"
             />
@@ -59,7 +60,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
               [disabled]="isCreating() || !formName().trim()"
               (click)="createProject()"
             >
-              {{ isCreating() ? 'Creating...' : 'Create Project' }}
+              {{ (isCreating() ? 'projects.creating' : 'projects.createProject') | transloco }}
             </button>
           </div>
         </div>
@@ -69,7 +70,7 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
       @if (isLoading() && projects().length === 0) {
         <div class="loading-state">
           <div class="spinner"></div>
-          <span>Loading projects...</span>
+          <span>{{ 'projects.loading' | transloco }}</span>
         </div>
       }
 
@@ -77,8 +78,8 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
       @if (!isLoading() && projects().length === 0) {
         <div class="empty-state">
           <span class="empty-icon material-symbols-outlined">folder_off</span>
-          <span>No projects yet</span>
-          <span class="empty-hint">Create a new project to get started</span>
+          <span>{{ 'projects.empty' | transloco }}</span>
+          <span class="empty-hint">{{ 'projects.emptyHint' | transloco }}</span>
         </div>
       }
 
@@ -91,10 +92,10 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
                 <span class="card-name">{{ project.name }}</span>
                 <div class="card-badges">
                   @if (project.is_default) {
-                    <span class="badge badge-personal">Personal</span>
+                    <span class="badge badge-personal">{{ 'projects.badgePersonal' | transloco }}</span>
                   }
                   <span class="badge" [class]="'badge-' + project.status">
-                    {{ project.status }}
+                    {{ 'projects.status.' + project.status | transloco }}
                   </span>
                 </div>
               </div>
@@ -102,9 +103,9 @@ import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar
                 <p class="card-desc">{{ truncate(project.description, 120) }}</p>
               }
               <div class="card-footer">
-                <span class="chip">{{ project.job_count ?? 0 }} jobs</span>
-                <span class="chip">{{ project.repo_count ?? 0 }} repos</span>
-                <span class="chip">{{ project.member_count ?? 0 }} members</span>
+                <span class="chip">{{ 'projects.jobsCount' | transloco:{ count: project.job_count ?? 0 } }}</span>
+                <span class="chip">{{ 'projects.reposCount' | transloco:{ count: project.repo_count ?? 0 } }}</span>
+                <span class="chip">{{ 'projects.membersCount' | transloco:{ count: project.member_count ?? 0 } }}</span>
               </div>
             </div>
           }

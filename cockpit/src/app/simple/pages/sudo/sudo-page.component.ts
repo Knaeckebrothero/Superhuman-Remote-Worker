@@ -7,6 +7,7 @@ import {
   OnDestroy,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { TranslocoPipe } from '@jsverse/transloco';
 import { SudoService, SudoRequest } from '../../../core/services/sudo.service';
 
 /** Risk level for visual badging. */
@@ -28,19 +29,19 @@ function secondsLeft(req: SudoRequest): number {
 @Component({
   selector: 'app-sudo-page',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="sudo-page">
       <div class="page-header">
-        <h2>Sudo Approvals</h2>
+        <h2>{{ 'sudo.title' | transloco }}</h2>
         <div class="header-controls">
           <span class="status-dot" [class.connected]="sudo.isConnected()"></span>
           <select class="filter-select" (change)="setFilter($any($event.target).value)">
-            <option value="all">All</option>
-            <option value="pending">Pending</option>
-            <option value="approved">Approved</option>
-            <option value="denied">Denied</option>
-            <option value="expired">Expired</option>
+            <option value="all">{{ 'sudo.filter.all' | transloco }}</option>
+            <option value="pending">{{ 'sudo.filter.pending' | transloco }}</option>
+            <option value="approved">{{ 'sudo.filter.approved' | transloco }}</option>
+            <option value="denied">{{ 'sudo.filter.denied' | transloco }}</option>
+            <option value="expired">{{ 'sudo.filter.expired' | transloco }}</option>
           </select>
           <button class="btn-refresh" (click)="refresh()">
             <span class="icon">refresh</span>
@@ -52,29 +53,29 @@ function secondsLeft(req: SudoRequest): number {
         <!-- Pending requests panel -->
         <div class="panel requests-panel">
           <div class="panel-header">
-            Requests
+            {{ 'sudo.panels.requests' | transloco }}
             @if (sudo.pendingCount() > 0) {
               <span class="badge">{{ sudo.pendingCount() }}</span>
             }
           </div>
 
           @if (sudo.isLoading()) {
-            <div class="loading">Loading...</div>
+            <div class="loading">{{ 'sudo.loading' | transloco }}</div>
           } @else if (filteredRequests().length === 0) {
-            <div class="empty">No requests</div>
+            <div class="empty">{{ 'sudo.emptyRequests' | transloco }}</div>
           } @else {
             <div class="request-list">
               @for (req of filteredRequests(); track req.id) {
                 <div class="request-card" [class]="'risk-' + getRisk(req)">
                   <div class="card-header">
                     <span class="risk-badge" [class]="'risk-' + getRisk(req)">
-                      {{ getRisk(req) }}
+                      {{ 'sudo.risk.' + getRisk(req) | transloco }}
                     </span>
                     <span class="status-badge" [class]="'status-' + req.status">
-                      {{ req.status }}
+                      {{ 'sudo.status.' + req.status | transloco }}
                     </span>
                     @if (req.status === 'pending') {
-                      <span class="countdown">{{ getSecondsLeft(req) }}s</span>
+                      <span class="countdown">{{ 'sudo.secondsLeft' | transloco: {n: getSecondsLeft(req)} }}</span>
                     }
                   </div>
 
@@ -96,13 +97,13 @@ function secondsLeft(req: SudoRequest): number {
                         class="btn-approve"
                         (click)="approve(req)"
                       >
-                        Approve
+                        {{ 'sudo.actions.approve' | transloco }}
                       </button>
                       <button
                         class="btn-deny"
                         (click)="startDeny(req)"
                       >
-                        Deny
+                        {{ 'sudo.actions.deny' | transloco }}
                       </button>
                     </div>
                   }
@@ -118,26 +119,26 @@ function secondsLeft(req: SudoRequest): number {
 
         <!-- Rules panel -->
         <div class="panel rules-panel">
-          <div class="panel-header">Auto-Approval Rules</div>
+          <div class="panel-header">{{ 'sudo.panels.rules' | transloco }}</div>
 
           <div class="rule-form">
             <input
               class="input"
-              placeholder="Pattern (e.g. apt-get install *)"
+              [placeholder]="'sudo.rule.patternPlaceholder' | transloco"
               [(ngModel)]="newRulePattern"
             />
             <select class="filter-select" [(ngModel)]="newRuleAction">
-              <option value="approve">Approve</option>
-              <option value="deny">Deny</option>
-              <option value="review">Review</option>
+              <option value="approve">{{ 'sudo.rule.actionApprove' | transloco }}</option>
+              <option value="deny">{{ 'sudo.rule.actionDeny' | transloco }}</option>
+              <option value="review">{{ 'sudo.rule.actionReview' | transloco }}</option>
             </select>
-            <button class="btn-add" (click)="addRule()">Add</button>
+            <button class="btn-add" (click)="addRule()">{{ 'sudo.rule.add' | transloco }}</button>
           </div>
 
           @for (rule of sudo.rules(); track rule.id) {
             <div class="rule-row">
               <span class="rule-action" [class]="'action-' + rule.action">
-                {{ rule.action }}
+                {{ 'sudo.rule.badge.' + rule.action | transloco }}
               </span>
               <code class="rule-pattern">{{ rule.pattern }}</code>
               @if (rule.description) {
@@ -150,7 +151,7 @@ function secondsLeft(req: SudoRequest): number {
           }
 
           @if (sudo.rules().length === 0) {
-            <div class="empty">No rules configured</div>
+            <div class="empty">{{ 'sudo.emptyRules' | transloco }}</div>
           }
         </div>
       </div>
@@ -160,21 +161,21 @@ function secondsLeft(req: SudoRequest): number {
     @if (denyTarget()) {
       <div class="dialog-overlay" (click)="cancelDeny()">
         <div class="dialog" (click)="$event.stopPropagation()">
-          <div class="dialog-title">Deny: {{ denyTarget()!.command }}</div>
+          <div class="dialog-title">{{ 'sudo.denyDialog.title' | transloco: {command: denyTarget()!.command} }}</div>
           <textarea
             class="input reason-input"
-            placeholder="Reason for denial (required)"
+            [placeholder]="'sudo.denyDialog.reasonPlaceholder' | transloco"
             [(ngModel)]="denyReason"
             rows="3"
           ></textarea>
           <div class="dialog-actions">
-            <button class="btn-cancel" (click)="cancelDeny()">Cancel</button>
+            <button class="btn-cancel" (click)="cancelDeny()">{{ 'sudo.denyDialog.cancel' | transloco }}</button>
             <button
               class="btn-deny"
               [disabled]="!denyReason.trim()"
               (click)="confirmDeny()"
             >
-              Deny
+              {{ 'sudo.denyDialog.confirm' | transloco }}
             </button>
           </div>
         </div>

@@ -1,4 +1,5 @@
 import { Component, inject, computed, effect, signal, ElementRef, viewChild } from '@angular/core';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { DataService } from '../../../core/services/data.service';
 import { RequestService } from '../../../debug/services/request.service';
 import { ChatEntry } from '../../../core/models/chat.model';
@@ -22,14 +23,15 @@ interface ShellPane {
 @Component({
   selector: 'app-chat-history',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="chat-container">
       <!-- Header -->
       <div class="chat-header">
-        <span class="header-title">Chat History</span>
+        <span class="header-title">{{ 'chatHistory.title' | transloco }}</span>
         @if (data.currentJobId()) {
           <span class="entry-count">{{ entryCount() }}</span>
-          <button class="refresh-btn" (click)="data.refresh()" title="Refresh">
+          <button class="refresh-btn" (click)="data.refresh()" [title]="'chatHistory.refresh' | transloco">
             &#x21BB;
           </button>
         }
@@ -46,7 +48,7 @@ interface ShellPane {
       @if (data.error()) {
         <div class="error-state">
           <span>{{ data.error() }}</span>
-          <button (click)="data.refresh()">Retry</button>
+          <button (click)="data.refresh()">{{ 'chatHistory.retry' | transloco }}</button>
         </div>
       }
 
@@ -54,8 +56,8 @@ interface ShellPane {
       @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4AC;</span>
-          <span>No chat history for this job</span>
-          <span class="empty-hint">Chat entries are created when the agent runs</span>
+          <span>{{ 'chatHistory.empty.noHistory' | transloco }}</span>
+          <span class="empty-hint">{{ 'chatHistory.empty.noHistoryHint' | transloco }}</span>
         </div>
       }
 
@@ -63,8 +65,8 @@ interface ShellPane {
       @if (!data.currentJobId() && !data.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
-          <span>Select a job to view chat history</span>
-          <span class="empty-hint">Use the job dropdown at the top to select a job</span>
+          <span>{{ 'chatHistory.empty.noJob' | transloco }}</span>
+          <span class="empty-hint">{{ 'chatHistory.empty.noJobHint' | transloco }}</span>
         </div>
       }
 
@@ -77,9 +79,9 @@ interface ShellPane {
               <div class="turn-header">
                 <span class="turn-number">#{{ idx + 1 }}</span>
                 <span class="phase-badge" [class.strategic]="entry.phase === 'strategic'" [class.tactical]="entry.phase === 'tactical'">
-                  {{ entry.phase || 'unknown' }}
+                  {{ entry.phase || ('chatHistory.phaseUnknown' | transloco) }}
                 </span>
-                <span class="iteration">iter {{ entry.iteration }}</span>
+                <span class="iteration">{{ 'chatHistory.iter' | transloco: {n: entry.iteration} }}</span>
                 @if (entry.latency_ms) {
                   <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
                 }
@@ -91,7 +93,7 @@ interface ShellPane {
                 @if (input.type === 'human') {
                   <div class="message input-message">
                     <div class="message-header">
-                      <span class="message-type human">&#x1F464; Human</span>
+                      <span class="message-type human">&#x1F464; {{ 'chatHistory.human' | transloco }}</span>
                     </div>
                     <div class="message-content">{{ input.content_preview || input.content }}</div>
                   </div>
@@ -103,7 +105,7 @@ interface ShellPane {
                 <details class="reasoning-section">
                   <summary class="reasoning-header">
                     <span class="reasoning-icon">&#x1F9E0;</span>
-                    <span>Reasoning</span>
+                    <span>{{ 'chatHistory.reasoning' | transloco }}</span>
                   </summary>
                   <div class="reasoning-content">{{ entry.reasoning.content_preview || entry.reasoning.content }}</div>
                 </details>
@@ -116,8 +118,8 @@ interface ShellPane {
                   <details class="shell-state-section">
                     <summary class="shell-state-header">
                       <span class="shell-icon">&#x1F4BB;</span>
-                      <span>Shell State</span>
-                      <span class="shell-pane-count">{{ panes.length }} pane{{ panes.length !== 1 ? 's' : '' }}</span>
+                      <span>{{ 'chatHistory.shellState' | transloco }}</span>
+                      <span class="shell-pane-count">{{ (panes.length === 1 ? 'chatHistory.paneSingle' : 'chatHistory.panePlural') | transloco: {n: panes.length} }}</span>
                     </summary>
                     <div class="shell-widget">
                       @let activeTab = getSelectedTab(entry._id, panes[0].name);
@@ -133,10 +135,10 @@ interface ShellPane {
                             <span class="tab-type-badge" [attr.data-type]="pane.type">{{ pane.type }}</span>
                             <span class="tab-name">{{ pane.name }}</span>
                             @if (pane.hasNewOutput) {
-                              <span class="new-output-badge">NEW</span>
+                              <span class="new-output-badge">{{ 'chatHistory.newOutput' | transloco }}</span>
                             }
                             @if (pane.isIdle) {
-                              <span class="idle-badge">idle</span>
+                              <span class="idle-badge">{{ 'chatHistory.idle' | transloco }}</span>
                             }
                           </button>
                         }
@@ -144,7 +146,7 @@ interface ShellPane {
                       <div class="shell-terminal-pane">
                         @for (pane of panes; track pane.name) {
                           @if (activeTab === pane.name) {
-                            <pre class="terminal-content">{{ pane.content || '(empty)' }}</pre>
+                            <pre class="terminal-content">{{ pane.content || ('chatHistory.emptyPane' | transloco) }}</pre>
                           }
                         }
                       </div>
@@ -157,12 +159,12 @@ interface ShellPane {
               @if (entry.response.content_preview || entry.response.content || (entry.response.tool_calls && entry.response.tool_calls.length > 0)) {
                 <div class="message response-message">
                   <div class="message-header">
-                    <span class="message-type assistant">&#x1F916; Assistant</span>
+                    <span class="message-type assistant">&#x1F916; {{ 'chatHistory.assistant' | transloco }}</span>
                     @if (entry.request_id) {
                       <span
                         class="request-link"
                         (click)="onRequestIdClick(entry.request_id)"
-                        title="View full request"
+                        [title]="'chatHistory.viewRequest' | transloco"
                       >
                         {{ entry.request_id.slice(0, 8) }}...
                       </span>
@@ -186,7 +188,7 @@ interface ShellPane {
                             @if (getToolResult(idx, tc.id); as result) {
                               {{ result }}
                             } @else {
-                              <span class="no-result">Result pending or not available</span>
+                              <span class="no-result">{{ 'chatHistory.resultPending' | transloco }}</span>
                             }
                           </div>
                         </details>
@@ -204,7 +206,7 @@ interface ShellPane {
       @if (entries().length > 0) {
         <div class="position-bar">
           <span class="position-info">
-            Showing {{ entries().length }} chat turns
+            {{ 'chatHistory.showingTurns' | transloco: {n: entries().length} }}
           </span>
         </div>
       }
@@ -750,6 +752,7 @@ interface ShellPane {
 export class ChatHistoryComponent {
   readonly data = inject(DataService);
   private readonly requestService = inject(RequestService);
+  private readonly transloco = inject(TranslocoService);
 
   // Reference to the chat list container for auto-scrolling
   private readonly chatListRef = viewChild<ElementRef<HTMLDivElement>>('chatList');
@@ -768,7 +771,7 @@ export class ChatHistoryComponent {
 
   // Entry count display
   readonly entryCount = computed(() => {
-    return `${this.entries().length} turns`;
+    return this.transloco.translate('chatHistory.turnsCount', {n: this.entries().length});
   });
 
   constructor() {
@@ -800,7 +803,7 @@ export class ChatHistoryComponent {
 
   formatTime(timestamp: string): string {
     const date = new Date(timestamp);
-    return date.toLocaleTimeString(undefined, {
+    return date.toLocaleTimeString(this.transloco.getActiveLang(), {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',

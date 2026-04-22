@@ -1,5 +1,5 @@
 import {Component, ElementRef, HostListener, inject, OnInit, signal, ViewChild} from '@angular/core';
-import {DatePipe} from '@angular/common';
+import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {JobArtifactService} from '../../../core/services/job-artifact.service';
 import {ModelService} from '../../../core/services/model.service';
 import {UserService} from '../../../core/services/user.service';
@@ -8,11 +8,12 @@ import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle
 import {
     InstructionBuilderComponent
 } from '../../../shared/components/instruction-builder/instruction-builder.component';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 @Component({
   selector: 'app-shell-page',
   standalone: true,
-  imports: [SidebarToggleComponent, InstructionBuilderComponent, DatePipe],
+  imports: [SidebarToggleComponent, InstructionBuilderComponent, TranslocoDatePipe, TranslocoPipe],
   template: `
       <div class="page">
         <header class="page-header">
@@ -20,7 +21,7 @@ import {
 
           <div class="session-controls">
             <button class="session-title-btn" (click)="toggleSessionDropdown()">
-              <span class="session-title-text">{{ artifacts.sessionTitle() || 'New session' }}</span>
+              <span class="session-title-text">{{ artifacts.sessionTitle() || ('shell.newSession' | transloco) }}</span>
               <span class="dropdown-arrow">expand_more</span>
             </button>
 
@@ -28,7 +29,7 @@ import {
               <div class="session-dropdown">
                 <button class="session-option new-option" (click)="startNewSession()">
                   <span class="new-icon">add</span>
-                  <span>New session</span>
+                  <span>{{ 'shell.newSession' | transloco }}</span>
                 </button>
                 @for (s of sessions(); track s.id) {
                   <button
@@ -36,8 +37,8 @@ import {
                     [class.active]="s.id === artifacts.sessionId()"
                     (click)="switchSession(s.id, s.title)"
                   >
-                    <span class="session-option-title">{{ s.title || 'Untitled' }}</span>
-                    <span class="session-option-date">{{ s.updated_at | date:'short' }}</span>
+                    <span class="session-option-title">{{ s.title || ('shell.untitledSession' | transloco) }}</span>
+                    <span class="session-option-date">{{ s.updated_at | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
                   </button>
                 }
               </div>
@@ -48,7 +49,7 @@ import {
 
           <div class="model-controls">
             <button class="model-title-btn" (click)="toggleModelDropdown()">
-              <span class="model-title-text">{{ artifacts.builderModel() || 'Select model' }}</span>
+              <span class="model-title-text">{{ artifacts.builderModel() || ('shell.selectModel' | transloco) }}</span>
               <span class="dropdown-arrow">expand_more</span>
             </button>
 
@@ -56,7 +57,7 @@ import {
               <div class="model-dropdown">
                 @for (group of modelGroups(); track group.group) {
                   <div class="model-group-header" [class.unconfigured]="!group.configured">
-                    {{ group.configured ? group.group : group.group + ' (no key)' }}
+                    {{ group.configured ? group.group : group.group + ' ' + ('shell.noKey' | transloco) }}
                   </div>
                   @for (model of group.models; track model) {
                     <button

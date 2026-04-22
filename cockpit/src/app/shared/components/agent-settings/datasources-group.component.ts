@@ -1,4 +1,5 @@
 import {Component, computed, input, output, signal} from '@angular/core';
+import {TranslocoPipe} from '@jsverse/transloco';
 import {Datasource, DatasourceType} from '../../../core/models/api.model';
 
 /**
@@ -7,11 +8,11 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
 @Component({
   selector: 'app-datasources-group',
   standalone: true,
-  imports: [],
+  imports: [TranslocoPipe],
   template: `
     @if (!loading() && datasources().length > 0) {
       <div class="settings-group">
-        <div class="group-label">Data Sources</div>
+        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
         <div class="ds-picker">
           @for (ds of datasources(); track ds.id) {
             <label
@@ -40,10 +41,10 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
       </div>
     } @else if (loading()) {
       <div class="settings-group">
-        <div class="group-label">Data Sources</div>
+        <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
         <div class="ds-loading">
           <span class="spinner-small"></span>
-          Loading datasources...
+          {{ 'agentSettings.datasources.loading' | transloco }}
         </div>
       </div>
     }

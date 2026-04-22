@@ -11,6 +11,7 @@ import {
   MainCloudFormState,
 } from '../../core/services/settings.service';
 import {ModelService} from '../../core/services/model.service';
+import {I18nService, SupportedLang} from '../../core/services/i18n.service';
 import {
     ApiKeyProvider,
     CodexStatus,
@@ -19,6 +20,7 @@ import {
     Project
 } from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -34,31 +36,49 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 @Component({
   selector: 'app-settings',
   standalone: true,
-  imports: [FormsModule, SidebarToggleComponent],
+  imports: [FormsModule, SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="settings-page">
       <div class="settings-container">
         <div class="page-header">
           <app-sidebar-toggle />
-          <h1 class="page-title">Settings</h1>
+          <h1 class="page-title">{{ 'settings.title' | transloco }}</h1>
         </div>
+
+        <!-- Language Section -->
+        <section class="settings-section">
+          <h2 class="section-title">{{ 'settings.language.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.language.desc' | transloco }}</p>
+          <div class="create-form" style="border-top: none; padding-top: 0;">
+            <div class="form-row">
+              <div>
+                <label class="field-label">{{ 'settings.language.label' | transloco }}</label>
+                <select
+                  class="form-input"
+                  [ngModel]="i18n.activeLang()"
+                  (ngModelChange)="onLanguageChange($event)"
+                >
+                  <option value="en">English</option>
+                  <option value="de-DE">Deutsch</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <!-- API Keys Section -->
         <section class="settings-section">
-          <h2 class="section-title">API Keys</h2>
-          <p class="section-desc">
-            Set your own API keys for LLM providers and tools. These take priority over
-            system-wide keys when running jobs.
-          </p>
+          <h2 class="section-title">{{ 'settings.apiKeys.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.apiKeys.desc' | transloco }}</p>
 
           <!-- Key List -->
           @if (settingsService.apiKeys().length > 0) {
             <div class="key-table">
               <div class="key-header">
-                <span class="col-provider">Provider</span>
-                <span class="col-prefix">Key</span>
-                <span class="col-label">Label</span>
-                <span class="col-updated">Updated</span>
+                <span class="col-provider">{{ 'settings.apiKeys.colProvider' | transloco }}</span>
+                <span class="col-prefix">{{ 'settings.apiKeys.colKey' | transloco }}</span>
+                <span class="col-label">{{ 'settings.apiKeys.colLabel' | transloco }}</span>
+                <span class="col-updated">{{ 'settings.apiKeys.colUpdated' | transloco }}</span>
                 <span class="col-action"></span>
               </div>
               @for (key of settingsService.apiKeys(); track key.id) {
@@ -68,18 +88,18 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   <span class="col-label">{{ key.label || '-' }}</span>
                   <span class="col-updated">{{ formatDate(key.updated_at) }}</span>
                   <span class="col-action">
-                    <button class="revoke-btn" (click)="deleteApiKey(key.provider)">Delete</button>
+                    <button class="revoke-btn" (click)="deleteApiKey(key.provider)">{{ 'common.delete' | transloco }}</button>
                   </span>
                 </div>
               }
             </div>
           } @else {
-            <p class="empty-state">No API keys configured. Add one to use your own provider keys.</p>
+            <p class="empty-state">{{ 'settings.apiKeys.empty' | transloco }}</p>
           }
 
           <!-- Set Key Form -->
           <div class="create-form">
-            <h3 class="form-title">Add / Update Key</h3>
+            <h3 class="form-title">{{ 'settings.apiKeys.addTitle' | transloco }}</h3>
             <div class="form-row two-col">
               <select class="form-input" [(ngModel)]="keyProvider" [disabled]="settingKey()">
                 @for (p of providers; track p.value) {
@@ -89,7 +109,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               <input
                 type="text"
                 class="form-input"
-                placeholder="Label (optional)"
+                [placeholder]="'settings.apiKeys.labelPlaceholder' | transloco"
                 [(ngModel)]="keyLabel"
                 [disabled]="settingKey()"
               />
@@ -98,7 +118,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               <input
                 type="password"
                 class="form-input"
-                placeholder="API key (e.g. sk-...)"
+                [placeholder]="'settings.apiKeys.keyPlaceholder' | transloco"
                 [(ngModel)]="keyValue"
                 [disabled]="settingKey()"
               />
@@ -108,22 +128,20 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               (click)="saveApiKey()"
               [disabled]="settingKey() || !keyValue.trim()"
             >
-              {{ settingKey() ? 'Saving...' : 'Save Key' }}
+              {{ settingKey() ? ('common.saving' | transloco) : ('settings.apiKeys.saveButton' | transloco) }}
             </button>
           </div>
         </section>
 
         <!-- Preferences Section -->
         <section class="settings-section" style="margin-top: 24px;">
-          <h2 class="section-title">Preferences</h2>
-          <p class="section-desc">
-            Default settings applied when creating new jobs. Can be overridden per-job.
-          </p>
+          <h2 class="section-title">{{ 'settings.preferences.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.preferences.desc' | transloco }}</p>
 
           <div class="create-form" style="border-top: none; padding-top: 0;">
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Default Model</label>
+                <label class="field-label">{{ 'settings.preferences.defaultModel' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefModel()"
@@ -131,16 +149,16 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (ngModelChange)="prefModel.set($event === resolved().default_model ? null : $event)"
                 >
                   @for (group of modelService.models(); track group.group) {
-                    <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
+                    <optgroup [label]="group.configured ? group.group : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)">
                       @for (model of group.models; track model) {
-                        <option [value]="model">{{ model }}{{ !prefModel() && model === resolved().default_model ? ' (default)' : '' }}</option>
+                        <option [value]="model">{{ model }}{{ !prefModel() && model === resolved().default_model ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                       }
                     </optgroup>
                   }
                 </select>
               </div>
               <div>
-                <label class="field-label">Auxiliary Model</label>
+                <label class="field-label">{{ 'settings.preferences.auxModel' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefAuxModel()"
@@ -148,46 +166,46 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (ngModelChange)="prefAuxModel.set($event === resolved().default_auxiliary_model ? null : $event)"
                 >
                   @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefAuxModel() && m.id === resolved().default_auxiliary_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefAuxModel() && m.id === resolved().default_auxiliary_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
                   }
                 </select>
               </div>
             </div>
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Default Autonomy</label>
+                <label class="field-label">{{ 'settings.preferences.autonomy' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefAutonomy()"
                   [ngModel]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
                   (ngModelChange)="prefAutonomy.set($event === resolved().default_autonomy ? null : $event)"
                 >
-                  <option value="full">Full{{ !prefAutonomy() && resolved().default_autonomy === 'full' ? ' (default)' : '' }}</option>
-                  <option value="review">Review{{ !prefAutonomy() && resolved().default_autonomy === 'review' ? ' (default)' : '' }}</option>
-                  <option value="partial">Partial{{ !prefAutonomy() && resolved().default_autonomy === 'partial' ? ' (default)' : '' }}</option>
-                  <option value="guided">Guided{{ !prefAutonomy() && resolved().default_autonomy === 'guided' ? ' (default)' : '' }}</option>
-                  <option value="dependent">Dependent{{ !prefAutonomy() && resolved().default_autonomy === 'dependent' ? ' (default)' : '' }}</option>
+                  <option value="full">{{ 'settings.preferences.autonomyFull' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'full' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="review">{{ 'settings.preferences.autonomyReview' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'review' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="partial">{{ 'settings.preferences.autonomyPartial' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'partial' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="guided">{{ 'settings.preferences.autonomyGuided' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'guided' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="dependent">{{ 'settings.preferences.autonomyDependent' | transloco }}{{ !prefAutonomy() && resolved().default_autonomy === 'dependent' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                 </select>
               </div>
               <div>
-                <label class="field-label">Default Reasoning Level</label>
+                <label class="field-label">{{ 'settings.preferences.reasoning' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefReasoning()"
                   [ngModel]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
                   (ngModelChange)="prefReasoning.set($event === resolved().default_reasoning_level ? null : $event)"
                 >
-                  <option value="low">Low{{ !prefReasoning() && resolved().default_reasoning_level === 'low' ? ' (default)' : '' }}</option>
-                  <option value="medium">Medium{{ !prefReasoning() && resolved().default_reasoning_level === 'medium' ? ' (default)' : '' }}</option>
-                  <option value="high">High{{ !prefReasoning() && resolved().default_reasoning_level === 'high' ? ' (default)' : '' }}</option>
+                  <option value="low">{{ 'settings.preferences.reasoningLow' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'low' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="medium">{{ 'settings.preferences.reasoningMedium' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'medium' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="high">{{ 'settings.preferences.reasoningHigh' | transloco }}{{ !prefReasoning() && resolved().default_reasoning_level === 'high' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                 </select>
               </div>
             </div>
 
-            <h3 class="subsection-title">Helper Models</h3>
+            <h3 class="subsection-title">{{ 'settings.preferences.helperModels' | transloco }}</h3>
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Vision Model</label>
+                <label class="field-label">{{ 'settings.preferences.visionModel' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefVisionModel()"
@@ -195,13 +213,13 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (ngModelChange)="prefVisionModel.set($event === resolved().default_vision_model ? null : $event)"
                 >
                   @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefVisionModel() && m.id === resolved().default_vision_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefVisionModel() && m.id === resolved().default_vision_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
                   }
                 </select>
-                <span class="field-hint">Multimodal model for describing images when primary model is text-only</span>
+                <span class="field-hint">{{ 'settings.preferences.visionHint' | transloco }}</span>
               </div>
               <div>
-                <label class="field-label">Whisper Model</label>
+                <label class="field-label">{{ 'settings.preferences.whisperModel' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefWhisperModel()"
@@ -209,15 +227,15 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (ngModelChange)="prefWhisperModel.set($event === resolved().default_whisper_model ? null : $event)"
                 >
                   @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ !prefWhisperModel() && m.id === resolved().default_whisper_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ !prefWhisperModel() && m.id === resolved().default_whisper_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
                   }
                 </select>
-                <span class="field-hint">Speech-to-text for audio files in workspaces</span>
+                <span class="field-hint">{{ 'settings.preferences.whisperHint' | transloco }}</span>
               </div>
             </div>
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Embedding Model</label>
+                <label class="field-label">{{ 'settings.preferences.embeddingModel' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefEmbeddingModel()"
@@ -225,23 +243,23 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (ngModelChange)="prefEmbeddingModel.set($event === resolved().default_embedding_model ? null : $event)"
                 >
                   @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ !prefEmbeddingModel() && m.id === resolved().default_embedding_model ? ' (default)' : '' }}{{ m.configured ? '' : ' (no key)' }}</option>
+                    <option [value]="m.id">{{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : '' }}{{ !prefEmbeddingModel() && m.id === resolved().default_embedding_model ? ' (' + ('common.default' | transloco) + ')' : '' }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}</option>
                   }
                 </select>
-                <span class="field-hint">Vector embeddings for memory, knowledge, and citation search</span>
+                <span class="field-hint">{{ 'settings.preferences.embeddingHint' | transloco }}</span>
               </div>
               <div>
-                <label class="field-label">Embedding Provider</label>
+                <label class="field-label">{{ 'settings.preferences.embeddingProvider' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!prefEmbeddingProvider()"
                   [ngModel]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
                   (ngModelChange)="prefEmbeddingProvider.set($event === resolved().embedding_provider ? null : $event)"
                 >
-                  <option value="local">Local{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'local' ? ' (default)' : '' }}</option>
-                  <option value="openrouter">OpenRouter{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter' ? ' (default)' : '' }}</option>
+                  <option value="local">{{ 'settings.preferences.providerLocal' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'local' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="openrouter">{{ 'settings.preferences.providerOpenrouter' | transloco }}{{ !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                 </select>
-                <span class="field-hint">Where embedding requests are routed</span>
+                <span class="field-hint">{{ 'settings.preferences.embeddingProviderHint' | transloco }}</span>
               </div>
             </div>
 
@@ -250,71 +268,69 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               (click)="savePreferences()"
               [disabled]="savingPrefs()"
             >
-              {{ savingPrefs() ? 'Saving...' : 'Save Preferences' }}
+              {{ savingPrefs() ? ('common.saving' | transloco) : ('settings.preferences.save' | transloco) }}
             </button>
             @if (prefsSaved()) {
-              <span class="save-feedback">Saved</span>
+              <span class="save-feedback">{{ 'common.saved' | transloco }}</span>
             }
           </div>
         </section>
 
         <!-- Persistent Agent Section -->
         <section class="settings-section" style="margin-top: 24px;">
-          <h2 class="section-title">Persistent Agent</h2>
-          <p class="section-desc">
-            Default settings for interactive persistent agent sessions. Can be overridden per-session.
-          </p>
+          <h2 class="section-title">{{ 'settings.persistent.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.persistent.desc' | transloco }}</p>
 
           <div class="create-form" style="border-top: none; padding-top: 0;">
             <div class="form-row">
-              <label class="field-label">Model</label>
+              <label class="field-label">{{ 'settings.persistent.model' | transloco }}</label>
               <input
                 type="text"
                 class="form-input"
                 [class.is-default]="!paModel()"
-                [placeholder]="resolved().persistent_agent?.model ?? 'e.g. claude-sonnet-4-6'"
+                [placeholder]="resolved().persistent_agent?.model ?? ('settings.persistent.modelPlaceholder' | transloco)"
                 [ngModel]="paModel() ?? ''"
                 (ngModelChange)="paModel.set($event?.trim() || null)"
               />
               @if (!paModel() && resolved().persistent_agent?.model) {
-                <span class="field-hint">Default: {{ resolved().persistent_agent?.model }}</span>
+                <span class="field-hint">{{ 'settings.persistent.defaultPrefix' | transloco }} {{ resolved().persistent_agent?.model }}</span>
               }
             </div>
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Permission Mode</label>
+                <label class="field-label">{{ 'settings.persistent.permissionMode' | transloco }}</label>
                 <select
                   class="form-input"
                   [class.is-default]="!paPermissionMode()"
                   [ngModel]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
                   (ngModelChange)="paPermissionMode.set($event === resolved().persistent_agent?.permission_mode ? null : $event)"
                 >
-                  <option value="supervised">Supervised{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (default)' : '' }}</option>
-                  <option value="auto_accept">Auto-accept{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (default)' : '' }}</option>
-                  <option value="autonomous">Autonomous{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (default)' : '' }}</option>
+                  <option value="supervised">{{ 'settings.persistent.permissionSupervised' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'supervised' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="auto_accept">{{ 'settings.persistent.permissionAutoAccept' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'auto_accept' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
+                  <option value="autonomous">{{ 'settings.persistent.permissionAutonomous' | transloco }}{{ !paPermissionMode() && resolved().persistent_agent?.permission_mode === 'autonomous' ? ' (' + ('common.default' | transloco) + ')' : '' }}</option>
                 </select>
               </div>
               <div>
-                <label class="field-label">Config</label>
+                <label class="field-label">{{ 'settings.persistent.config' | transloco }}</label>
                 <select class="form-input" [(ngModel)]="paConfigName">
-                  <option value="">Default</option>
-                  <option value="developer">Developer</option>
-                  <option value="scholar">Scholar</option>
+                  <option value="">{{ 'settings.persistent.configDefault' | transloco }}</option>
+                  <option value="developer">{{ 'settings.persistent.configDeveloper' | transloco }}</option>
+                  <option value="scholar">{{ 'settings.persistent.configScholar' | transloco }}</option>
                 </select>
               </div>
             </div>
             <div class="form-row">
-              <label class="field-label">Greeting</label>
+              <label class="field-label">{{ 'settings.persistent.greeting' | transloco }}</label>
               <input
                 type="text"
                 class="form-input"
-                placeholder="Hello! I'm ready to help."
+                [placeholder]="'settings.persistent.greetingPlaceholder' | transloco"
                 [(ngModel)]="paGreeting"
               />
             </div>
             <div class="form-row two-col">
               <div>
-                <label class="field-label">Idle Timeout (minutes)</label>
+                <label class="field-label">{{ 'settings.persistent.idleTimeout' | transloco }}</label>
                 <input
                   type="number"
                   class="form-input"
@@ -325,11 +341,11 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 />
               </div>
               <div>
-                <label class="field-label">Command Allowlist</label>
+                <label class="field-label">{{ 'settings.persistent.commandAllowlist' | transloco }}</label>
                 <input
                   type="text"
                   class="form-input"
-                  placeholder="pytest*, npm test, git status"
+                  [placeholder]="'settings.persistent.commandAllowlistPlaceholder' | transloco"
                   [(ngModel)]="paCommandAllowlist"
                 />
               </div>
@@ -339,33 +355,31 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               (click)="savePersistentAgent()"
               [disabled]="savingPA()"
             >
-              {{ savingPA() ? 'Saving...' : 'Save Persistent Agent Settings' }}
+              {{ savingPA() ? ('common.saving' | transloco) : ('settings.persistent.save' | transloco) }}
             </button>
             @if (paSaved()) {
-              <span class="save-feedback">Saved</span>
+              <span class="save-feedback">{{ 'common.saved' | transloco }}</span>
             }
           </div>
         </section>
 
         <!-- Communication Preferences Section -->
         <section class="settings-section" style="margin-top: 24px;">
-          <h2 class="section-title">Communication</h2>
-          <p class="section-desc">
-            Configure how agent messages are delivered and when to suppress notifications.
-          </p>
+          <h2 class="section-title">{{ 'settings.communication.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.communication.desc' | transloco }}</p>
 
           <div class="create-form" style="border-top: none; padding-top: 0;">
             <div class="form-row">
-              <label class="field-label">Reply Delivery</label>
+              <label class="field-label">{{ 'settings.communication.replyDelivery' | transloco }}</label>
               <select class="form-input" [(ngModel)]="commDelivery">
-                <option value="next_strategic_phase">Next strategic phase (default)</option>
-                <option value="immediate_interrupt">Immediate interrupt</option>
-                <option value="llm_triage">LLM triage (auto-decide)</option>
+                <option value="next_strategic_phase">{{ 'settings.communication.deliveryNextStrategic' | transloco }}</option>
+                <option value="immediate_interrupt">{{ 'settings.communication.deliveryImmediate' | transloco }}</option>
+                <option value="llm_triage">{{ 'settings.communication.deliveryLlmTriage' | transloco }}</option>
               </select>
             </div>
 
             <div class="form-row">
-              <label class="field-label">Notification Channels</label>
+              <label class="field-label">{{ 'settings.communication.channels' | transloco }}</label>
               <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px;">
                 <label class="checkbox-label">
                   <input type="checkbox" [(ngModel)]="commChannelEmail" /> Email
@@ -385,26 +399,26 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <div class="form-row">
               <label class="field-label">
                 <input type="checkbox" [(ngModel)]="commQuietEnabled" style="margin-right: 6px;" />
-                Quiet Hours
+                {{ 'settings.communication.quietHours' | transloco }}
               </label>
             </div>
             @if (commQuietEnabled) {
               <div class="form-row two-col">
                 <div>
-                  <label class="field-label">Start</label>
+                  <label class="field-label">{{ 'settings.communication.start' | transloco }}</label>
                   <input type="time" class="form-input" [(ngModel)]="commQuietStart" />
                 </div>
                 <div>
-                  <label class="field-label">End</label>
+                  <label class="field-label">{{ 'settings.communication.end' | transloco }}</label>
                   <input type="time" class="form-input" [(ngModel)]="commQuietEnd" />
                 </div>
               </div>
               <div class="form-row">
-                <label class="field-label">Timezone</label>
+                <label class="field-label">{{ 'settings.communication.timezone' | transloco }}</label>
                 <input
                   type="text"
                   class="form-input"
-                  placeholder="e.g. Europe/Berlin"
+                  [placeholder]="'settings.communication.timezonePlaceholder' | transloco"
                   [(ngModel)]="commQuietTimezone"
                 />
               </div>
@@ -415,31 +429,29 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               (click)="saveCommunication()"
               [disabled]="savingComm()"
             >
-              {{ savingComm() ? 'Saving...' : 'Save Communication Settings' }}
+              {{ savingComm() ? ('common.saving' | transloco) : ('settings.communication.save' | transloco) }}
             </button>
             @if (commSaved()) {
-              <span class="save-feedback">Saved</span>
+              <span class="save-feedback">{{ 'common.saved' | transloco }}</span>
             }
           </div>
         </section>
 
         <!-- MCP Tokens Section -->
         <section class="settings-section" style="margin-top: 24px;">
-          <h2 class="section-title">MCP Tokens</h2>
-          <p class="section-desc">
-            Generate API tokens for Claude Code or other MCP clients to access the orchestrator.
-          </p>
+          <h2 class="section-title">{{ 'settings.mcp.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.mcp.desc' | transloco }}</p>
 
           <!-- Token List -->
           @if (tokenService.tokens().length > 0) {
             <div class="token-table">
               <div class="token-header">
-                <span class="col-name">Name</span>
-                <span class="col-prefix">Token</span>
-                <span class="col-scope">Scope</span>
-                <span class="col-origin">Origin</span>
-                <span class="col-used">Last Used</span>
-                <span class="col-expires">Expires</span>
+                <span class="col-name">{{ 'settings.mcp.colName' | transloco }}</span>
+                <span class="col-prefix">{{ 'settings.mcp.colToken' | transloco }}</span>
+                <span class="col-scope">{{ 'settings.mcp.colScope' | transloco }}</span>
+                <span class="col-origin">{{ 'settings.mcp.colOrigin' | transloco }}</span>
+                <span class="col-used">{{ 'settings.mcp.colLastUsed' | transloco }}</span>
+                <span class="col-expires">{{ 'settings.mcp.colExpires' | transloco }}</span>
                 <span class="col-action"></span>
               </div>
               @for (token of activeTokens(); track token.id) {
@@ -448,22 +460,22 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   <span class="col-prefix mono">{{ token.token_prefix }}...</span>
                   <span class="col-scope">{{ formatScope(token.scope) }}</span>
                   <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
-                  <span class="col-used">{{ token.last_used_at ? formatDate(token.last_used_at) : 'Never' }}</span>
-                  <span class="col-expires">{{ token.expires_at ? formatDate(token.expires_at) : 'Never' }}</span>
+                  <span class="col-used">{{ token.last_used_at ? formatDate(token.last_used_at) : ('common.never' | transloco) }}</span>
+                  <span class="col-expires">{{ token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco) }}</span>
                   <span class="col-action">
-                    <button class="revoke-btn" (click)="revokeToken(token.id)">Revoke</button>
+                    <button class="revoke-btn" (click)="revokeToken(token.id)">{{ 'settings.mcp.revoke' | transloco }}</button>
                   </span>
                 </div>
               }
             </div>
           } @else {
-            <p class="empty-state">No tokens yet. Create one to connect your MCP client.</p>
+            <p class="empty-state">{{ 'settings.mcp.empty' | transloco }}</p>
           }
 
           <!-- Newly Created Token -->
           @if (newToken()) {
             <div class="new-token-banner">
-              <p class="new-token-warning">Copy this token now — it won't be shown again.</p>
+              <p class="new-token-warning">{{ 'settings.mcp.copyWarning' | transloco }}</p>
               <div class="new-token-row">
                 <input
                   type="text"
@@ -473,7 +485,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   #tokenInput
                 />
                 <button class="copy-btn" (click)="copyToken(tokenInput)">
-                  {{ copied() ? 'Copied' : 'Copy' }}
+                  {{ copied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
                 </button>
               </div>
             </div>
@@ -481,31 +493,31 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
           <!-- Create Token Form -->
           <div class="create-form">
-            <h3 class="form-title">Create New Token</h3>
+            <h3 class="form-title">{{ 'settings.mcp.createTitle' | transloco }}</h3>
             <div class="form-row">
               <input
                 type="text"
                 class="form-input"
-                placeholder="Token name (e.g. Claude Code - laptop)"
+                [placeholder]="'settings.mcp.namePlaceholder' | transloco"
                 [(ngModel)]="newName"
                 [disabled]="creating()"
               />
             </div>
             <div class="form-row two-col">
               <select class="form-input" [(ngModel)]="newScope" [disabled]="creating()">
-                <option value="user">My Data Only</option>
+                <option value="user">{{ 'settings.mcp.scopeUser' | transloco }}</option>
                 @for (p of projects(); track p.id) {
-                  <option [value]="'project:' + p.id">Project: {{ p.name }}</option>
+                  <option [value]="'project:' + p.id">{{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}</option>
                 }
                 @if (userService.currentUser()?.is_admin) {
-                  <option value="all">Full Access</option>
+                  <option value="all">{{ 'settings.mcp.scopeAll' | transloco }}</option>
                 }
               </select>
               <select class="form-input" [(ngModel)]="newExpiry" [disabled]="creating()">
-                <option [ngValue]="null">Never expires</option>
-                <option [ngValue]="30">30 days</option>
-                <option [ngValue]="90">90 days</option>
-                <option [ngValue]="365">1 year</option>
+                <option [ngValue]="null">{{ 'settings.mcp.expiryNever' | transloco }}</option>
+                <option [ngValue]="30">{{ 'settings.mcp.expiry30' | transloco }}</option>
+                <option [ngValue]="90">{{ 'settings.mcp.expiry90' | transloco }}</option>
+                <option [ngValue]="365">{{ 'settings.mcp.expiry365' | transloco }}</option>
               </select>
             </div>
             <button
@@ -513,21 +525,19 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               (click)="createToken()"
               [disabled]="creating() || !newName.trim()"
             >
-              {{ creating() ? 'Creating...' : 'Create Token' }}
+              {{ creating() ? ('settings.mcp.creating' | transloco) : ('settings.mcp.create' | transloco) }}
             </button>
           </div>
 
           <!-- Connection Instructions (shown after token creation) -->
           @if (newToken()) {
             <div class="instructions">
-              <h3 class="form-title">Claude Code / CLI</h3>
-              <p class="section-desc">
-                Add this to your <code>.mcp.json</code> file:
-              </p>
+              <h3 class="form-title">{{ 'settings.mcp.claudeCodeTitle' | transloco }}</h3>
+              <p class="section-desc" [innerHTML]="'settings.mcp.claudeCodeDesc' | transloco"></p>
               <div class="code-block-wrapper">
                 <pre class="code-block">{{mcpJsonSnippet()}}</pre>
                 <button class="code-copy-btn" (click)="copyText(mcpJsonSnippet())">
-                  {{ snippetCopied() ? 'Copied' : 'Copy' }}
+                  {{ snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
                 </button>
               </div>
             </div>
@@ -535,10 +545,8 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
           <!-- Web UI Connector Instructions -->
           <div class="instructions">
-            <h3 class="form-title">Claude.ai / ChatGPT / Web Connectors</h3>
-            <p class="section-desc">
-              Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.
-            </p>
+            <h3 class="form-title">{{ 'settings.mcp.webConnectorTitle' | transloco }}</h3>
+            <p class="section-desc">{{ 'settings.mcp.webConnectorDesc' | transloco }}</p>
             <div class="connector-url-row">
               <input
                 type="text"
@@ -548,38 +556,35 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 #mcpUrlInput
               />
               <button class="copy-btn" (click)="copyText(mcpUrlInput.value, 'connector')">
-                {{ connectorCopied() ? 'Copied' : 'Copy' }}
+                {{ connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
               </button>
             </div>
-            <p class="section-hint">
-              Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE).
-              Leave the Client ID and Client Secret fields empty — the server handles registration automatically.
-            </p>
+            <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
           </div>
         </section>
 
         <!-- Codex Proxy Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
           <section class="settings-section" style="margin-top: 24px;">
-            <h2 class="section-title">Codex Proxy</h2>
+            <h2 class="section-title">{{ 'settings.codex.title' | transloco }}</h2>
             <p class="section-desc">
-              Manage the Codex OAuth proxy for ChatGPT subscription-backed models
+              {{ 'settings.codex.desc' | transloco }}
               (<code>codex/*</code>).
             </p>
 
             <!-- Status -->
             <div class="codex-status-card">
               @if (codexLoading()) {
-                <span class="codex-status-text">Checking proxy...</span>
+                <span class="codex-status-text">{{ 'settings.codex.checking' | transloco }}</span>
               } @else {
                 <span class="codex-status-dot" [class.connected]="codexStatus().connected"></span>
                 <span class="codex-status-text">
-                  {{ codexStatus().connected ? 'Connected' : 'Not connected' }}
+                  {{ (codexStatus().connected ? 'settings.codex.connected' : 'settings.codex.notConnected') | transloco }}
                   @if (codexStatus().model_count > 0) {
                     &mdash; {{ codexStatus().model_count }} model(s) available
                   }
                 </span>
-                <button class="refresh-btn" (click)="loadCodexStatus()" title="Refresh status">&#x21bb;</button>
+                <button class="refresh-btn" (click)="loadCodexStatus()" [title]="'settings.codex.refreshStatus' | transloco">&#x21bb;</button>
               }
             </div>
 
@@ -594,7 +599,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                       class="revoke-btn"
                       (click)="disconnectCodexAccount(acct.name)"
                     >
-                      Disconnect
+                      {{ 'settings.codex.disconnect' | transloco }}
                     </button>
                   </div>
                 }
@@ -604,7 +609,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <!-- Models -->
             @if (codexModels().length > 0) {
               <div class="codex-models">
-                <h3 class="form-title">Available Models</h3>
+                <h3 class="form-title">{{ 'settings.codex.availableModels' | transloco }}</h3>
                 <div class="codex-model-chips">
                   @for (m of codexModels(); track m) {
                     <span class="codex-model-chip">{{ m }}</span>
@@ -620,22 +625,22 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 (click)="connectCodexAccount()"
                 [disabled]="codexConnecting()"
               >
-                {{ codexConnecting() ? 'Waiting for OAuth...' : 'Connect ChatGPT Account' }}
+                {{ (codexConnecting() ? 'settings.codex.waiting' : 'settings.codex.connectAccount') | transloco }}
               </button>
               @if (codexConnecting()) {
                 <div class="codex-callback-help">
-                  <p class="codex-callback-title">Complete sign-in</p>
+                  <p class="codex-callback-title">{{ 'settings.codex.completeSignIn' | transloco }}</p>
                   <ol class="codex-callback-steps">
-                    <li>Sign in with your OpenAI account in the tab that just opened.</li>
-                    <li>After sign-in, the browser will try to redirect to <code>localhost</code> and show an error &mdash; this is expected.</li>
-                    <li>Copy the <strong>full URL</strong> from your browser's address bar.</li>
-                    <li>Paste it below and click <strong>Complete Login</strong>.</li>
+                    <li>{{ 'settings.codex.step1' | transloco }}</li>
+                    <li>{{ 'settings.codex.step2' | transloco }}</li>
+                    <li>{{ 'settings.codex.step3' | transloco }}</li>
+                    <li>{{ 'settings.codex.step4' | transloco }}</li>
                   </ol>
                   <div class="codex-callback-input-row">
                     <input
                       type="text"
                       class="form-input"
-                      placeholder="Paste callback URL here..."
+                      [placeholder]="'settings.codex.callbackPlaceholder' | transloco"
                       [ngModel]="codexCallbackUrl()"
                       (ngModelChange)="codexCallbackUrl.set($event)"
                     />
@@ -644,14 +649,14 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                       (click)="submitCodexCallback()"
                       [disabled]="codexCallbackSubmitting()"
                     >
-                      {{ codexCallbackSubmitting() ? 'Submitting...' : 'Complete Login' }}
+                      {{ (codexCallbackSubmitting() ? 'settings.codex.submitting' : 'settings.codex.completeLogin') | transloco }}
                     </button>
                   </div>
                   @if (codexCallbackError()) {
                     <p class="codex-callback-error">{{ codexCallbackError() }}</p>
                   }
                   <p class="codex-callback-hint">
-                    If you have <code>kubectl port-forward</code> active, login will complete automatically.
+                    {{ 'settings.codex.portForwardHint' | transloco }}
                   </p>
                 </div>
               }
@@ -660,14 +665,13 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
           <!-- Cloud Storage Section (Admin Only, Phase 4) -->
           <section class="settings-section" style="margin-top: 24px;">
-            <h2 class="section-title">Cloud Storage (Main Cloud)</h2>
+            <h2 class="section-title">{{ 'settings.cloud.title' | transloco }}</h2>
             <p class="section-desc">
-              Configure the main-cloud backend used for user home folders, project folders, and session folders.
-              Secrets are managed via environment variables (Vault/ESO/.env) and are shown here as provenance only.
+              {{ 'settings.cloud.desc' | transloco }}
             </p>
 
             @if (cloudLoading()) {
-              <p class="section-desc">Loading…</p>
+              <p class="section-desc">{{ 'settings.cloud.loading' | transloco }}</p>
             } @else if (cloudSettings(); as s) {
               <!-- Status row -->
               <div class="codex-status-card">
@@ -676,16 +680,16 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   [class.connected]="s.effective.is_initialized"
                 ></span>
                 <span class="codex-status-text">
-                  Active: <strong>{{ s.effective.backend_id }}</strong>
-                  @if (s.effective.is_initialized) { &mdash; initialized }
-                  @else { &mdash; not initialized }
+                  {{ 'settings.cloud.active' | transloco }} <strong>{{ s.effective.backend_id }}</strong>
+                  @if (s.effective.is_initialized) { &mdash; {{ 'settings.cloud.initialized' | transloco }} }
+                  @else { &mdash; {{ 'settings.cloud.notInitialized' | transloco }} }
                 </span>
-                <button class="refresh-btn" (click)="loadCloudSettings()" title="Refresh">&#x21bb;</button>
+                <button class="refresh-btn" (click)="loadCloudSettings()" [title]="'settings.cloud.refresh' | transloco">&#x21bb;</button>
               </div>
 
               <!-- Backend selector -->
               <div class="form-row" style="margin-top: 16px;">
-                <label class="form-label">Backend</label>
+                <label class="form-label">{{ 'settings.cloud.backend' | transloco }}</label>
                 <select
                   class="form-input"
                   [ngModel]="cloudForm().backend_id"
@@ -699,7 +703,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
               <!-- Common URL fields -->
               <div class="form-row">
-                <label class="form-label">Base URL (internal)</label>
+                <label class="form-label">{{ 'settings.cloud.baseUrl' | transloco }}</label>
                 <input
                   type="text"
                   class="form-input"
@@ -708,7 +712,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 />
               </div>
               <div class="form-row">
-                <label class="form-label">Public URL (browser)</label>
+                <label class="form-label">{{ 'settings.cloud.publicUrl' | transloco }}</label>
                 <input
                   type="text"
                   class="form-input"
@@ -719,7 +723,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
               @if (cloudForm().backend_id === 'opencloud') {
                 <div class="form-row">
-                  <label class="form-label">Keycloak issuer</label>
+                  <label class="form-label">{{ 'settings.cloud.keycloakIssuer' | transloco }}</label>
                   <input
                     type="text"
                     class="form-input"
@@ -728,7 +732,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   />
                 </div>
                 <div class="form-row">
-                  <label class="form-label">Keycloak client id</label>
+                  <label class="form-label">{{ 'settings.cloud.keycloakClientId' | transloco }}</label>
                   <input
                     type="text"
                     class="form-input"
@@ -737,7 +741,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   />
                 </div>
                 <div class="form-row">
-                  <label class="form-label">Admin role / claim value</label>
+                  <label class="form-label">{{ 'settings.cloud.adminRole' | transloco }}</label>
                   <input
                     type="text"
                     class="form-input"
@@ -746,7 +750,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   />
                 </div>
                 <div class="form-row">
-                  <label class="form-label">Default Space quota (bytes)</label>
+                  <label class="form-label">{{ 'settings.cloud.spaceQuota' | transloco }}</label>
                   <input
                     type="number"
                     class="form-input"
@@ -758,7 +762,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
               @if (cloudForm().backend_id === 'nextcloud') {
                 <div class="form-row">
-                  <label class="form-label">Admin user</label>
+                  <label class="form-label">{{ 'settings.cloud.adminUser' | transloco }}</label>
                   <input
                     type="text"
                     class="form-input"
@@ -767,7 +771,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   />
                 </div>
                 <div class="form-row">
-                  <label class="form-label">Agent user</label>
+                  <label class="form-label">{{ 'settings.cloud.agentUser' | transloco }}</label>
                   <input
                     type="text"
                     class="form-input"
@@ -779,7 +783,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
               <!-- Credentials ref -->
               <div class="form-row">
-                <label class="form-label">Credentials ref (optional)</label>
+                <label class="form-label">{{ 'settings.cloud.credentialsRef' | transloco }}</label>
                 <input
                   type="text"
                   class="form-input"
@@ -792,7 +796,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               <!-- Secret provenance -->
               @if (secretProvenanceEntries().length > 0) {
                 <div class="codex-accounts" style="margin-top: 16px;">
-                  <h3 class="form-title">Secret provenance</h3>
+                  <h3 class="form-title">{{ 'settings.cloud.secretProvenance' | transloco }}</h3>
                   @for (entry of secretProvenanceEntries(); track entry.field) {
                     <div class="codex-account-row">
                       <span class="mono">{{ entry.field }}</span>
@@ -801,7 +805,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                         class="codex-account-status"
                         [class.connected]="entry.set"
                       >
-                        {{ entry.set ? 'set (' + entry.length + ' chars)' : 'unset' }}
+                        {{ entry.set ? ('settings.cloud.secretSet' | transloco: {chars: entry.length}) : ('settings.cloud.secretUnset' | transloco) }}
                       </span>
                     </div>
                   }
@@ -815,14 +819,14 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   (click)="testCloudSettings()"
                   [disabled]="cloudBusy()"
                 >
-                  {{ cloudTesting() ? 'Testing…' : 'Test' }}
+                  {{ (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco }}
                 </button>
                 <button
                   class="create-btn"
                   (click)="saveCloudSettings()"
                   [disabled]="cloudBusy()"
                 >
-                  {{ cloudSaving() ? 'Saving…' : 'Save + Reload' }}
+                  {{ (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload') | transloco }}
                 </button>
                 @if (s.overlay.present) {
                   <button
@@ -830,7 +834,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                     (click)="resetCloudSettings()"
                     [disabled]="cloudBusy()"
                   >
-                    Reset to env defaults
+                    {{ 'settings.cloud.resetEnv' | transloco }}
                   </button>
                 }
               </div>
@@ -847,7 +851,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
               @if (s.overlay.present) {
                 <p class="section-desc" style="margin-top: 8px;">
-                  Persisted overlay last saved
+                  {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
                   @if (s.overlay.updated_at) { {{ formatDate(s.overlay.updated_at) }} }
                   @if (s.overlay.updated_by) { by {{ s.overlay.updated_by }} }
                 </p>
@@ -1378,8 +1382,10 @@ export class SettingsComponent implements OnInit {
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
   readonly modelService = inject(ModelService);
+  readonly i18n = inject(I18nService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
+  private readonly transloco = inject(TranslocoService);
 
   // Provider list for dropdown
   readonly providers = PROVIDERS;
@@ -1570,8 +1576,8 @@ export class SettingsComponent implements OnInit {
   }
 
   formatScope(scope: string): string {
-    if (scope === 'user') return 'My Data';
-    if (scope === 'all') return 'Full Access';
+    if (scope === 'user') return this.transloco.translate('settings.helpers.scopeMyData');
+    if (scope === 'all') return this.transloco.translate('settings.helpers.scopeFullAccess');
     if (scope.startsWith('project:')) {
       const pid = scope.split(':', 2)[1];
       const p = this.projects().find((pr) => pr.id === pid);
@@ -1581,7 +1587,7 @@ export class SettingsComponent implements OnInit {
   }
 
   formatOrigin(origin: string | null): string {
-    if (!origin) return 'Manual';
+    if (!origin) return this.transloco.translate('settings.helpers.originManual');
     if (origin.startsWith('oauth:')) {
       const name = origin.slice(6).replace(/:refresh$/, '');
       return name.charAt(0).toUpperCase() + name.slice(1);
@@ -1593,10 +1599,10 @@ export class SettingsComponent implements OnInit {
     const d = new Date(iso);
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
-    if (diffMs < 60_000) return 'Just now';
-    if (diffMs < 3600_000) return `${Math.floor(diffMs / 60_000)}m ago`;
-    if (diffMs < 86400_000) return `${Math.floor(diffMs / 3600_000)}h ago`;
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    if (diffMs < 60_000) return this.transloco.translate('settings.helpers.timeJustNow');
+    if (diffMs < 3600_000) return this.transloco.translate('settings.helpers.timeMinutesAgo', {n: Math.floor(diffMs / 60_000)});
+    if (diffMs < 86400_000) return this.transloco.translate('settings.helpers.timeHoursAgo', {n: Math.floor(diffMs / 3600_000)});
+    return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
   }
 
   mcpJsonSnippet = () => {
@@ -1684,6 +1690,10 @@ export class SettingsComponent implements OnInit {
       },
       error: () => this.savingPrefs.set(false),
     });
+  }
+
+  onLanguageChange(lang: SupportedLang): void {
+    this.i18n.setLanguage(lang).subscribe();
   }
 
   // ── Persistent Agent Settings ──────────────────────────────────
@@ -1827,13 +1837,11 @@ export class SettingsComponent implements OnInit {
     try {
       const parsed = new URL(url);
       if (!parsed.searchParams.get('code') || !parsed.searchParams.get('state')) {
-        this.codexCallbackError.set(
-          'URL is missing required parameters. Please paste the complete URL from your browser address bar.'
-        );
+        this.codexCallbackError.set(this.transloco.translate('settings.codex.errors.urlMissingParams'));
         return;
       }
     } catch {
-      this.codexCallbackError.set('Invalid URL. Please paste the complete URL from your browser address bar.');
+      this.codexCallbackError.set(this.transloco.translate('settings.codex.errors.invalidUrl'));
       return;
     }
 
@@ -1850,7 +1858,7 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.codexCallbackSubmitting.set(false);
-        const detail = err?.error?.detail || 'Failed to complete login. Please try again.';
+        const detail = err?.error?.detail || this.transloco.translate('settings.codex.errors.completeFailed');
         this.codexCallbackError.set(detail);
       },
     });
@@ -1910,7 +1918,7 @@ export class SettingsComponent implements OnInit {
       },
       error: (err) => {
         this.cloudLoading.set(false);
-        this.cloudMessage.set(err?.error?.detail || 'Failed to load cloud settings');
+        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.loadFailed'));
         this.cloudMessageIsError.set(true);
       },
     });
@@ -1941,14 +1949,14 @@ export class SettingsComponent implements OnInit {
         this.cloudTesting.set(false);
         this.cloudMessage.set(
           res.ok
-            ? `Test OK (${res.latency_ms?.toFixed(0) ?? '?'} ms) — ${res.detail || 'healthy'}`
-            : `Test failed: ${res.detail}`,
+            ? this.transloco.translate('settings.cloud.messages.testOk', {ms: res.latency_ms?.toFixed(0) ?? '?'})
+            : this.transloco.translate('settings.cloud.messages.testFailed', {error: res.detail}),
         );
         this.cloudMessageIsError.set(!res.ok);
       },
       error: (err) => {
         this.cloudTesting.set(false);
-        this.cloudMessage.set(err?.error?.detail || 'Test request failed');
+        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.testRequestFailed'));
         this.cloudMessageIsError.set(true);
       },
     });
@@ -1962,14 +1970,17 @@ export class SettingsComponent implements OnInit {
       next: (res) => {
         this.cloudSaving.set(false);
         this.cloudMessage.set(
-          `Saved — active backend is now ${res.backend_id}${res.reloaded ? ' (reloaded)' : ''}`,
+          this.transloco.translate(
+            res.reloaded ? 'settings.cloud.messages.savedReloaded' : 'settings.cloud.messages.saved',
+            {backend: res.backend_id},
+          ),
         );
         this.cloudMessageIsError.set(false);
         this.loadCloudSettings();
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || 'Save failed');
+        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.saveFailed'));
         this.cloudMessageIsError.set(true);
       },
     });
@@ -1982,13 +1993,13 @@ export class SettingsComponent implements OnInit {
     this.settingsService.deleteMainCloudSettings().subscribe({
       next: () => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set('Overlay cleared — active backend rebuilt from env vars');
+        this.cloudMessage.set(this.transloco.translate('settings.cloud.messages.overlayCleared'));
         this.cloudMessageIsError.set(false);
         this.loadCloudSettings();
       },
       error: (err) => {
         this.cloudSaving.set(false);
-        this.cloudMessage.set(err?.error?.detail || 'Reset failed');
+        this.cloudMessage.set(err?.error?.detail || this.transloco.translate('settings.cloud.messages.resetFailed'));
         this.cloudMessageIsError.set(true);
       },
     });

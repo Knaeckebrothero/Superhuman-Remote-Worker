@@ -1,0 +1,1483 @@
+{
+  "common": {
+    "save": "Speichern",
+    "saving": "Wird gespeichert...",
+    "saved": "Gespeichert",
+    "delete": "Löschen",
+    "cancel": "Abbrechen",
+    "copy": "Kopieren",
+    "copied": "Kopiert",
+    "never": "Nie",
+    "default": "Standard",
+    "noKey": "(kein Schlüssel)"
+  },
+  "nav": {
+    "cockpit": "Cockpit",
+    "builder": "Builder",
+    "sessions": "Sitzungen",
+    "jobs": "Aufträge",
+    "projects": "Projekte",
+    "datasources": "Datenquellen",
+    "create": "Erstellen",
+    "debug": "Debug",
+    "settings": "Einstellungen",
+    "logout": "Abmelden",
+    "admin": "Admin",
+    "collapseSidebar": "Seitenleiste einklappen",
+    "openSidebar": "Seitenleiste öffnen"
+  },
+  "shell": {
+    "newSession": "Neue Sitzung",
+    "untitledSession": "Unbenannt",
+    "selectModel": "Modell auswählen",
+    "noKey": "(kein Schlüssel)"
+  },
+  "projects": {
+    "title": "Projekte",
+    "newProject": "Neues Projekt",
+    "cancel": "Abbrechen",
+    "refresh": "Aktualisieren",
+    "loading": "Projekte werden geladen...",
+    "empty": "Noch keine Projekte",
+    "emptyHint": "Erstellen Sie ein neues Projekt, um zu beginnen",
+    "createProject": "Projekt erstellen",
+    "creating": "Wird erstellt...",
+    "namePlaceholder": "Projektname (erforderlich)",
+    "descriptionPlaceholder": "Beschreibung (optional)",
+    "goalPlaceholder": "Ziel (optional)",
+    "badgePersonal": "Persönlich",
+    "jobsCount": "{{count}} Aufträge",
+    "reposCount": "{{count}} Repos",
+    "membersCount": "{{count}} Mitglieder",
+    "status": {
+      "active": "aktiv",
+      "archived": "archiviert",
+      "deleted": "gelöscht"
+    }
+  },
+  "sessions": {
+    "title": "Sitzungen",
+    "newSession": "Neue Sitzung",
+    "activeBanner": "Aktive Sitzung läuft",
+    "returnToChat": "Zurück zum Chat",
+    "loading": "Sitzungen werden geladen...",
+    "empty": "Noch keine Sitzungen. Erstellen Sie eine, um zu beginnen.",
+    "emptyFilterActive": "Keine aktiven Sitzungen.",
+    "emptyFilterEnded": "Keine beendeten Sitzungen.",
+    "untitledSession": "Unbenannte Sitzung",
+    "confirmEnd": "Diese Sitzung beenden? Die Arbeit wird gespeichert, aber der Agent stoppt.",
+    "confirmDelete": "Diese Sitzung dauerhaft löschen?",
+    "turnsOne": "Zug",
+    "turnsMany": "Züge",
+    "filter": {
+      "all": "Alle ({{count}})",
+      "active": "Aktiv ({{count}})",
+      "ended": "Beendet ({{count}})"
+    },
+    "tooltip": {
+      "sessionFiles": "Sitzungsdateien",
+      "resume": "Fortsetzen",
+      "end": "Beenden",
+      "delete": "Löschen"
+    },
+    "create": {
+      "title": "Neue Sitzung",
+      "hint": "Erstellt einen Thread über den Orchestrator und verbindet sich über dessen WebSocket-Proxy. Erfordert einen registrierten persistenten Agent-Pod, der an den Thread gebunden ist.",
+      "titleLabel": "Titel",
+      "titlePlaceholder": "Unbenannte Sitzung",
+      "configLabel": "Konfiguration",
+      "configDefault": "Standard",
+      "configDeveloper": "Entwickler",
+      "configScholar": "Forscher",
+      "modelLabel": "Modell",
+      "modelConfigDefault": "Konfigurations-Standard",
+      "projectsLabel": "Projekte",
+      "projectsEmpty": "Keine Projekte verfügbar",
+      "projectsHint": "Projekte für gemeinsamen Wissenszugriff auswählen",
+      "permissionLabel": "Berechtigungsmodus",
+      "permissionSupervised": "Beaufsichtigt",
+      "permissionAutoAccept": "Auto-akzeptieren",
+      "permissionAutonomous": "Autonom",
+      "creating": "Wird erstellt...",
+      "create": "Erstellen",
+      "cancel": "Abbrechen",
+      "expertLabel": "Experte",
+      "expertLoading": "Experten werden geladen...",
+      "createSession": "Sitzung erstellen"
+    }
+  },
+  "jobs": {
+    "title": "Aufträge",
+    "loading": "Aufträge werden geladen...",
+    "refresh": "Aktualisieren",
+    "noJobsFound": "Keine Aufträge gefunden",
+    "noJobsHintFilter": "Versuchen Sie einen anderen Filter",
+    "noJobsHintEmpty": "Erstellen Sie einen neuen Auftrag, um zu beginnen",
+    "snapshotsSummary": "{{count}} Snapshots · {{size}}",
+    "count": "Zeige {{filtered}} von {{total}} Aufträgen",
+    "colJob": "Auftrag",
+    "colStatus": "Status",
+    "colCreated": "Erstellt",
+    "colActions": "Aktionen",
+    "filter": {
+      "all": "Alle",
+      "mine": "Meine",
+      "pending_review": "Prüfung",
+      "reviewing": "In Prüfung",
+      "waiting": "Wartend",
+      "created": "Erstellt",
+      "processing": "In Bearbeitung",
+      "completed": "Abgeschlossen",
+      "paused": "Pausiert",
+      "failed": "Fehlgeschlagen",
+      "cancelled": "Abgebrochen"
+    },
+    "status": {
+      "pending_review": "Prüfung ausstehend",
+      "reviewing": "In Prüfung",
+      "waiting": "Wartend",
+      "created": "Erstellt",
+      "processing": "In Bearbeitung",
+      "completed": "Abgeschlossen",
+      "paused": "Pausiert",
+      "failed": "Fehlgeschlagen",
+      "cancelled": "Abgebrochen"
+    },
+    "action": {
+      "view": "Ansehen",
+      "workspace": "Arbeitsbereich",
+      "ide": "IDE",
+      "starting": "Startet",
+      "pause": "Pausieren",
+      "cancel": "Abbrechen",
+      "canceling": "Wird abgebrochen",
+      "sure": "Sicher?",
+      "resume": "Fortsetzen",
+      "review": "Prüfen",
+      "delete": "Löschen",
+      "confirmDelete": "Bestätigen?",
+      "promote": "Heraufstufen",
+      "createProject": "Projekt erstellen"
+    },
+    "tooltip": {
+      "collapse": "Unteraufträge einklappen",
+      "expand": "Unteraufträge ausklappen",
+      "view": "In Debug-Ansicht öffnen",
+      "workspace": "Arbeitsbereich in Gitea öffnen",
+      "ideSnapshot": "Arbeitsbereich in Web-IDE öffnen (aus Snapshot)",
+      "ideCode": "Arbeitsbereich in Web-IDE öffnen (nur Code)",
+      "ideStarting": "IDE-Sitzung wird gestartet...",
+      "pauseJob": "Auftrag pausieren",
+      "cancelJob": "Auftrag abbrechen",
+      "canceling": "Auftrag wird abgebrochen...",
+      "confirmCancel": "Erneut klicken, um Abbruch zu bestätigen",
+      "reviewJob": "Prüfen und genehmigen/fortsetzen",
+      "resumeJob": "Vom Checkpoint fortsetzen",
+      "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
+      "deleteJob": "Auftrag löschen",
+      "promoteJob": "Zu Projekt heraufstufen",
+      "snapshotStats": "S3-Snapshot-Speicher",
+      "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
+      "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
+      "delegationChild": "Delegations-Unterauftrag (Erstellungsreihenfolge {{order}})"
+    },
+    "delegationChildren": "{{count}} Unteraufträge",
+    "promote": {
+      "namePlaceholder": "Projektname (erforderlich)",
+      "descriptionPlaceholder": "Beschreibung",
+      "goalPlaceholder": "Ziel"
+    },
+    "create": {
+      "title": "Neuen Auftrag erstellen",
+      "dismiss": "Schließen",
+      "projectLabel": "Projekt",
+      "projectNone": "Kein Projekt",
+      "projectPersonal": "(Persönlich)",
+      "projectHint": "Wählen Sie das Projekt, zu dem dieser Auftrag gehört",
+      "descriptionLabel": "Beschreibung",
+      "descriptionPlaceholder": "Beschreiben Sie, was der Agent erreichen soll...",
+      "descriptionHint": "Beschreiben Sie, was der Agent tun soll",
+      "kickoffLabel": "Startnachricht",
+      "kickoffPlaceholder": "Sagen Sie dem Agenten etwas... (z. B. „Beginne mit der Durchsicht der Dokumentstruktur“)",
+      "kickoffHint": "Optionale Startnachricht — gibt dem Agenten eine erste Richtung",
+      "expertLabel": "Agent-Experte",
+      "expertLoading": "Experten werden geladen...",
+      "expertSelectedPrefix": "Ausgewählt:",
+      "expertHintUnselected": "Wählen Sie ein Expertenprofil oder lassen Sie die Auswahl leer für den Standard-Agenten",
+      "documentsLabel": "Dokumente",
+      "dropHint": "Dateien hierher ziehen oder klicken, um zu durchsuchen",
+      "maxHint": "Max. {{maxFiles}} Dateien, je {{maxSizeMb}} MB",
+      "addMore": "+ Weitere Dateien hinzufügen",
+      "documentsOptional": "Optional: Dokumente für den Agenten hochladen",
+      "priorityLabel": "Priorität",
+      "priorityHint": "Aufträge mit höherer Priorität laufen zuerst und können Aufträge mit niedriger Priorität unterbrechen",
+      "priorityLow": "Niedrig (Backfill)",
+      "priorityNormal": "Normal (Standard)",
+      "priorityHigh": "Hoch (unterbricht niedrigere)",
+      "cloudStorageLabel": "Cloud-Speicher-Zugriff",
+      "cloudStorageInherit": "Vom Projekt erben",
+      "cloudStorageReadonly": "Nur lesen",
+      "cloudStorageReadwrite": "Lesen & Schreiben",
+      "cloudStorageHint": "Überschreibt den Standard-Cloud-Speicher-Zugriffsmodus des Projekts für diesen Auftrag",
+      "reset": "Zurücksetzen",
+      "submit": "Auftrag erstellen",
+      "creating": "Wird erstellt...",
+      "uploading": "Wird hochgeladen..."
+    }
+  },
+  "settings": {
+    "title": "Einstellungen",
+    "language": {
+      "title": "Sprache",
+      "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",
+      "label": "Oberflächensprache"
+    },
+    "apiKeys": {
+      "title": "API-Schlüssel",
+      "desc": "Legen Sie eigene API-Schlüssel für LLM-Anbieter und Werkzeuge fest. Diese haben bei der Ausführung von Aufträgen Vorrang vor systemweiten Schlüsseln.",
+      "empty": "Keine API-Schlüssel konfiguriert. Fügen Sie einen hinzu, um eigene Anbieterschlüssel zu verwenden.",
+      "colProvider": "Anbieter",
+      "colKey": "Schlüssel",
+      "colLabel": "Bezeichnung",
+      "colUpdated": "Aktualisiert",
+      "addTitle": "Schlüssel hinzufügen / aktualisieren",
+      "labelPlaceholder": "Bezeichnung (optional)",
+      "keyPlaceholder": "API-Schlüssel (z. B. sk-...)",
+      "saveButton": "Schlüssel speichern"
+    },
+    "preferences": {
+      "title": "Voreinstellungen",
+      "desc": "Standardwerte für neue Aufträge. Können pro Auftrag überschrieben werden.",
+      "helperModels": "Hilfsmodelle",
+      "defaultModel": "Standardmodell",
+      "auxModel": "Hilfsmodell",
+      "autonomy": "Standard-Autonomie",
+      "reasoning": "Standard-Reasoning-Level",
+      "visionModel": "Vision-Modell",
+      "visionHint": "Multimodales Modell zum Beschreiben von Bildern, wenn das Hauptmodell nur Text unterstützt",
+      "whisperModel": "Whisper-Modell",
+      "whisperHint": "Spracherkennung für Audiodateien in Arbeitsbereichen",
+      "embeddingModel": "Embedding-Modell",
+      "embeddingHint": "Vektor-Embeddings für Gedächtnis, Wissen und Zitatsuche",
+      "embeddingProvider": "Embedding-Anbieter",
+      "embeddingProviderHint": "Wohin Embedding-Anfragen geroutet werden",
+      "noApiKey": "(kein API-Schlüssel)",
+      "autonomyFull": "Voll",
+      "autonomyReview": "Prüfung",
+      "autonomyPartial": "Teilweise",
+      "autonomyGuided": "Geführt",
+      "autonomyDependent": "Abhängig",
+      "reasoningLow": "Niedrig",
+      "reasoningMedium": "Mittel",
+      "reasoningHigh": "Hoch",
+      "providerLocal": "Lokal",
+      "providerOpenrouter": "OpenRouter",
+      "save": "Voreinstellungen speichern"
+    },
+    "persistent": {
+      "title": "Persistenter Agent",
+      "desc": "Standardwerte für interaktive persistente Agent-Sitzungen. Können pro Sitzung überschrieben werden.",
+      "model": "Modell",
+      "modelPlaceholder": "z. B. claude-sonnet-4-6",
+      "defaultPrefix": "Standard:",
+      "permissionMode": "Berechtigungsmodus",
+      "config": "Konfiguration",
+      "greeting": "Begrüßung",
+      "greetingPlaceholder": "Hallo! Ich bin bereit zu helfen.",
+      "idleTimeout": "Leerlauf-Timeout (Minuten)",
+      "commandAllowlist": "Befehls-Allowlist",
+      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
+      "permissionSupervised": "Beaufsichtigt",
+      "permissionAutoAccept": "Auto-akzeptieren",
+      "permissionAutonomous": "Autonom",
+      "configDefault": "Standard",
+      "configDeveloper": "Entwickler",
+      "configScholar": "Forscher",
+      "save": "Einstellungen für persistenten Agent speichern"
+    },
+    "communication": {
+      "title": "Kommunikation",
+      "desc": "Konfigurieren Sie, wie Agent-Nachrichten zugestellt werden und wann Benachrichtigungen unterdrückt werden.",
+      "replyDelivery": "Antwort-Zustellung",
+      "deliveryNextStrategic": "Nächste strategische Phase (Standard)",
+      "deliveryImmediate": "Sofortige Unterbrechung",
+      "deliveryLlmTriage": "LLM-Triage (automatisch entscheiden)",
+      "channels": "Benachrichtigungskanäle",
+      "quietHours": "Ruhezeiten",
+      "start": "Start",
+      "end": "Ende",
+      "timezone": "Zeitzone",
+      "timezonePlaceholder": "z. B. Europe/Berlin",
+      "save": "Kommunikationseinstellungen speichern"
+    },
+    "mcp": {
+      "title": "MCP-Tokens",
+      "desc": "Erstellen Sie API-Tokens für Claude Code oder andere MCP-Clients, um auf den Orchestrator zuzugreifen.",
+      "colName": "Name",
+      "colToken": "Token",
+      "colScope": "Geltungsbereich",
+      "colOrigin": "Herkunft",
+      "colLastUsed": "Zuletzt verwendet",
+      "colExpires": "Läuft ab",
+      "revoke": "Widerrufen",
+      "empty": "Noch keine Tokens. Erstellen Sie einen, um Ihren MCP-Client zu verbinden.",
+      "copyWarning": "Kopieren Sie dieses Token jetzt — es wird nicht erneut angezeigt.",
+      "createTitle": "Neues Token erstellen",
+      "namePlaceholder": "Token-Name (z. B. Claude Code - Laptop)",
+      "scopeUser": "Nur meine Daten",
+      "scopeProjectPrefix": "Projekt:",
+      "scopeAll": "Vollzugriff",
+      "expiryNever": "Läuft nie ab",
+      "expiry30": "30 Tage",
+      "expiry90": "90 Tage",
+      "expiry365": "1 Jahr",
+      "create": "Token erstellen",
+      "creating": "Wird erstellt...",
+      "claudeCodeTitle": "Claude Code / CLI",
+      "claudeCodeDesc": "Fügen Sie dies zu Ihrer <code>.mcp.json</code>-Datei hinzu:",
+      "webConnectorTitle": "Claude.ai / ChatGPT / Web-Konnektoren",
+      "webConnectorDesc": "Fügen Sie diese URL als benutzerdefinierten MCP-Konnektor hinzu. OAuth-Anmeldung wird automatisch durchgeführt — kein Token oder Anmeldeinformationen erforderlich.",
+      "webConnectorHint": "Funktioniert mit jedem MCP-Client, der OAuth 2.1 (Authorization Code + PKCE) unterstützt. Lassen Sie die Felder Client-ID und Client-Secret leer — der Server übernimmt die Registrierung automatisch."
+    },
+    "codex": {
+      "title": "Codex-Proxy",
+      "desc": "Verwalten Sie den Codex-OAuth-Proxy für ChatGPT-Abo-basierte Modelle",
+      "checking": "Proxy wird geprüft…",
+      "connected": "Verbunden",
+      "notConnected": "Nicht verbunden",
+      "refreshStatus": "Status aktualisieren",
+      "disconnect": "Trennen",
+      "availableModels": "Verfügbare Modelle",
+      "waiting": "Warte auf OAuth…",
+      "connectAccount": "ChatGPT-Konto verbinden",
+      "completeSignIn": "Anmeldung abschließen",
+      "step1": "Melden Sie sich mit Ihrem OpenAI-Konto im gerade geöffneten Tab an.",
+      "step2": "Nach der Anmeldung versucht der Browser, auf localhost umzuleiten, und zeigt einen Fehler — das ist erwartet.",
+      "step3": "Kopieren Sie die vollständige URL aus der Adressleiste Ihres Browsers.",
+      "step4": "Fügen Sie sie unten ein und klicken Sie auf „Anmeldung abschließen“.",
+      "callbackPlaceholder": "Callback-URL hier einfügen…",
+      "submitting": "Wird gesendet…",
+      "completeLogin": "Anmeldung abschließen",
+      "portForwardHint": "Wenn kubectl port-forward aktiv ist, wird die Anmeldung automatisch abgeschlossen.",
+      "errors": {
+        "urlMissingParams": "Der URL fehlen erforderliche Parameter. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
+        "invalidUrl": "Ungültige URL. Bitte fügen Sie die vollständige URL aus der Adressleiste Ihres Browsers ein.",
+        "completeFailed": "Anmeldung konnte nicht abgeschlossen werden. Bitte erneut versuchen."
+      }
+    },
+    "cloud": {
+      "title": "Cloud-Speicher (Hauptcloud)",
+      "desc": "Konfigurieren Sie das Hauptcloud-Backend, das für Benutzer-Home-Ordner, Projekt-Ordner und Sitzungs-Ordner verwendet wird. Secrets werden über Umgebungsvariablen (Vault/ESO/.env) verwaltet und hier nur zur Provenienz angezeigt.",
+      "loading": "Wird geladen…",
+      "active": "Aktiv:",
+      "initialized": "initialisiert",
+      "notInitialized": "nicht initialisiert",
+      "refresh": "Aktualisieren",
+      "backend": "Backend",
+      "baseUrl": "Basis-URL (intern)",
+      "publicUrl": "Öffentliche URL (Browser)",
+      "keycloakIssuer": "Keycloak-Issuer",
+      "keycloakClientId": "Keycloak-Client-ID",
+      "adminRole": "Admin-Rolle / Claim-Wert",
+      "spaceQuota": "Standard-Space-Kontingent (Bytes)",
+      "adminUser": "Admin-Benutzer",
+      "agentUser": "Agent-Benutzer",
+      "credentialsRef": "Credentials-Referenz (optional)",
+      "secretProvenance": "Secret-Provenienz",
+      "secretSet": "gesetzt ({{chars}} Zeichen)",
+      "secretUnset": "nicht gesetzt",
+      "testing": "Wird getestet…",
+      "test": "Testen",
+      "saving": "Wird gespeichert…",
+      "saveReload": "Speichern + neu laden",
+      "resetEnv": "Auf Env-Standards zurücksetzen",
+      "persistedOverlayLastSaved": "Persistierte Überlagerung zuletzt gespeichert",
+      "messages": {
+        "loadFailed": "Cloud-Einstellungen konnten nicht geladen werden",
+        "testOk": "Test OK ({{ms}} ms) — fehlerfrei",
+        "testFailed": "Test fehlgeschlagen: {{error}}",
+        "testRequestFailed": "Test-Anfrage fehlgeschlagen",
+        "saved": "Gespeichert — aktives Backend ist jetzt {{backend}}",
+        "savedReloaded": "Gespeichert — aktives Backend ist jetzt {{backend}} (neu geladen)",
+        "saveFailed": "Speichern fehlgeschlagen",
+        "overlayCleared": "Überlagerung entfernt — aktives Backend wurde aus Env-Variablen neu aufgebaut",
+        "resetFailed": "Zurücksetzen fehlgeschlagen"
+      }
+    },
+    "helpers": {
+      "scopeMyData": "Meine Daten",
+      "scopeFullAccess": "Vollzugriff",
+      "originManual": "Manuell",
+      "timeJustNow": "Gerade eben",
+      "timeMinutesAgo": "vor {{n}} Min.",
+      "timeHoursAgo": "vor {{n}} Std."
+    }
+  },
+  "projectDetail": {
+    "loading": "Projekt wird geladen...",
+    "badgePersonal": "Persönlich",
+    "tabs": {
+      "overview": "Übersicht",
+      "jobs": "Aufträge",
+      "knowledge": "Wissen",
+      "datasources": "Datenquellen",
+      "repos": "Repos",
+      "experts": "Experten",
+      "members": "Mitglieder",
+      "settings": "Einstellungen"
+    },
+    "overview": {
+      "description": "Beschreibung",
+      "goal": "Ziel",
+      "noDescription": "Keine Beschreibung",
+      "noGoal": "Kein Ziel festgelegt",
+      "statsJobs": "Aufträge",
+      "statsDatasources": "Datenquellen",
+      "statsRepos": "Repos",
+      "statsMembers": "Mitglieder",
+      "defaultConfig": "Standard-Konfiguration",
+      "created": "Erstellt",
+      "edit": "Bearbeiten",
+      "openFolder": "Projektordner öffnen",
+      "save": "Speichern",
+      "cancel": "Abbrechen"
+    },
+    "jobs": {
+      "new": "+ Neuer Auftrag",
+      "empty": "Keine Aufträge in diesem Projekt",
+      "colStatus": "Status",
+      "colDescription": "Beschreibung",
+      "colConfig": "Konfiguration",
+      "colBranch": "Branch",
+      "colMerge": "Merge"
+    },
+    "knowledge": {
+      "totalLabel": "Gesamt",
+      "searchPlaceholder": "Wissen durchsuchen...",
+      "search": "Suchen",
+      "filterAllTypes": "Alle Typen",
+      "filterAllStatuses": "Alle Status",
+      "typeDecision": "Entscheidung",
+      "typeLearning": "Erkenntnis",
+      "typeGoal": "Ziel",
+      "typePlan": "Plan",
+      "typeCode": "Code",
+      "typeQuestion": "Frage",
+      "typeState": "Zustand",
+      "typeSource": "Quelle",
+      "typeRetrospective": "Rückblick",
+      "statusActive": "Aktiv",
+      "statusResolved": "Gelöst",
+      "statusSuperseded": "Überholt",
+      "statusArchived": "Archiviert",
+      "clear": "Zurücksetzen",
+      "export": "Exportieren",
+      "back": "Zurück",
+      "delete": "Löschen",
+      "phaseLabel": "Phase {{phase}}",
+      "relationships": "Beziehungen",
+      "loading": "Notizen werden geladen...",
+      "empty": "Keine Wissensnotizen gefunden",
+      "loadMore": "Mehr laden",
+      "pagination": "{{current}} von {{total}} Notizen",
+      "deleteConfirm": "Notiz „{{noteId}}“ dauerhaft löschen? Dies kann nicht rückgängig gemacht werden.",
+      "exportedAlert": "{{count}} Notizen exportiert nach:\n{{path}}"
+    },
+    "datasources": {
+      "selectPlaceholder": "Datenquelle auswählen...",
+      "link": "Verknüpfen",
+      "empty": "Keine Datenquellen mit diesem Projekt verknüpft",
+      "colName": "Name",
+      "colType": "Typ",
+      "colDescription": "Projekt-Beschreibung",
+      "colAccess": "Zugriff",
+      "colActions": "Aktionen",
+      "descriptionPlaceholder": "Nutzungskontext für dieses Projekt...",
+      "accessDefault": "Standard (Lesen/Schreiben)",
+      "accessReadOnly": "Nur lesen",
+      "accessReadWrite": "Lesen/Schreiben",
+      "unlink": "Trennen"
+    },
+    "repos": {
+      "namePlaceholder": "Repo-Name",
+      "urlPlaceholder": "Repo-URL",
+      "roleJobs": "jobs",
+      "roleSource": "source",
+      "roleReference": "reference",
+      "readOnlyLabel": "Nur lesen",
+      "managedLabel": "Verwaltet",
+      "add": "Hinzufügen",
+      "empty": "Keine Repositorys verknüpft",
+      "colRole": "Rolle",
+      "colName": "Name",
+      "colUrl": "URL",
+      "colReadOnly": "Nur lesen",
+      "colManaged": "Verwaltet",
+      "colActions": "Aktionen",
+      "yes": "Ja",
+      "no": "Nein",
+      "remove": "Entfernen"
+    },
+    "experts": {
+      "loading": "Experten werden geladen...",
+      "emptyPrefix": "Noch keine Projekt-Experten. Fügen Sie Experten-Konfigurationen im",
+      "emptySuffix": "Verzeichnis des Jobs-Repos hinzu."
+    },
+    "members": {
+      "selectUser": "Benutzer auswählen...",
+      "roleEditor": "Bearbeiter",
+      "roleViewer": "Betrachter",
+      "roleOwner": "Eigentümer",
+      "roleEditorLower": "bearbeiter",
+      "roleViewerLower": "betrachter",
+      "roleOwnerLower": "eigentümer",
+      "add": "Hinzufügen",
+      "empty": "Keine Mitglieder",
+      "colUser": "Benutzer",
+      "colRole": "Rolle",
+      "colJoined": "Beigetreten",
+      "colActions": "Aktionen",
+      "remove": "Entfernen"
+    },
+    "settings": {
+      "general": "Allgemein",
+      "projectName": "Projektname",
+      "defaultConfig": "Standard-Konfiguration",
+      "configPlaceholder": "z. B. developer, scholar",
+      "save": "Änderungen speichern",
+      "memory": "Gedächtnis",
+      "shareMemories": "Erinnerungen zwischen Aufträgen teilen",
+      "shareMemoriesDesc": "Wenn aktiviert, sind automatische Erinnerungen aus beliebigen Aufträgen dieses Projekts für alle anderen Aufträge sichtbar.",
+      "cloudStorage": "Cloud-Speicher",
+      "folder": "Ordner",
+      "readOnlyAgent": "Nur-Lese-Zugriff für Agenten",
+      "readOnlyAgentDesc": "Wenn aktiviert, können Agenten Dateien durchsuchen und herunterladen, aber nicht hochladen, ändern oder löschen.",
+      "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
+      "dangerZone": "Gefahrenzone",
+      "defaultProjectWarning": "Dies ist Ihr persönliches Standardprojekt und kann nicht archiviert oder gelöscht werden.",
+      "archiveTitle": "Projekt archivieren",
+      "archiveDesc": "Dieses Projekt als archiviert markieren. Es können keine neuen Aufträge erstellt werden.",
+      "archive": "Archivieren",
+      "archiveConfirm": "Sind Sie sicher, dass Sie dieses Projekt archivieren möchten?",
+      "deleteTitle": "Projekt löschen",
+      "deleteDesc": "Dieses Projekt und seine verwalteten Repositorys dauerhaft löschen.",
+      "delete": "Löschen",
+      "deleteConfirm": "Sind Sie sicher, dass Sie dieses Projekt dauerhaft löschen möchten? Dies kann nicht rückgängig gemacht werden."
+    }
+  },
+  "chat": {
+    "defaultTitle": "Persistenter Agent",
+    "connection": {
+      "connected": "Verbunden",
+      "connecting": "Verbinde...",
+      "error": "Fehler",
+      "disconnected": "Getrennt"
+    },
+    "header": {
+      "settingsTooltip": "Sitzungseinstellungen",
+      "filesButton": "Dateien",
+      "filesTooltip": "Sitzungsdateien in der Cloud öffnen",
+      "gitButton": "Git",
+      "gitTooltip": "Arbeitsbereich in Gitea anzeigen",
+      "ideButton": "IDE",
+      "ideActiveTooltip": "Arbeitsbereich in der IDE öffnen",
+      "ideLoadingTooltip": "Arbeitsbereich wird gestartet...",
+      "disconnect": "Trennen"
+    },
+    "status": {
+      "temp": "Temp. {{value}}",
+      "turn": "Zug {{count}}"
+    },
+    "settings": {
+      "mode": "Modus",
+      "narration": "Erzählung",
+      "model": "Modell",
+      "temperature": "Temperatur: {{value}}",
+      "modeSupervised": "Beaufsichtigt",
+      "modeAutoAccept": "Auto-akzeptieren",
+      "modeAutonomous": "Autonom",
+      "narrationAuto": "Automatisch",
+      "narrationVerbose": "Ausführlich",
+      "narrationSilent": "Still"
+    },
+    "tasks": {
+      "header": "Aufgaben {{done}}/{{total}}",
+      "allCompleted": "Alle Aufgaben erledigt"
+    },
+    "system": {
+      "sessionResumed": "Sitzung fortgesetzt",
+      "emptyPrompt": "Beginnen Sie eine Unterhaltung...",
+      "resumeSession": "Sitzung fortsetzen",
+      "resuming": "Wird fortgesetzt...",
+      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
+    },
+    "startup": {
+      "creating": "Sitzung wird erstellt...",
+      "provisioning": "Agent wird bereitgestellt...",
+      "booting": "Agent startet...",
+      "connecting": "Verbinde mit Agent...",
+      "starting": "Sitzung startet...",
+      "reconnecting": "Agent wird erneut verbunden...",
+      "connectingFallback": "Verbinde..."
+    },
+    "thinking": {
+      "past": "Hat einen Moment nachgedacht",
+      "now": "Denkt nach..."
+    },
+    "tools": {
+      "usedOne": "1 Werkzeug verwendet:",
+      "usedMany": "{{count}} Werkzeuge verwendet:",
+      "statusCompleted": "abgeschlossen",
+      "statusRunning": "läuft",
+      "statusDenied": "abgelehnt",
+      "statusPending": "ausstehend"
+    },
+    "permission": {
+      "title": "Berechtigung erforderlich",
+      "approve": "Genehmigen",
+      "autoAccept": "Auto-akzeptieren",
+      "deny": "Ablehnen"
+    },
+    "error": {
+      "dismiss": "Schließen"
+    },
+    "input": {
+      "connect": "Verbinden, um zu chatten...",
+      "sessionStarting": "Schreiben Sie Ihre Nachricht, während die Sitzung startet...",
+      "stopping": "Wird gestoppt...",
+      "working": "Agent arbeitet...",
+      "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
+    },
+    "code": {
+      "expandHint": "Klicken zum Ausklappen",
+      "copyTooltip": "In die Zwischenablage kopieren"
+    },
+    "slash": {
+      "compact": "Unterhaltungsverlauf komprimieren, um Kontext freizugeben",
+      "done": "Sitzung beenden — Erinnerungen extrahieren und archivieren",
+      "undo": "Dateiänderungen des letzten Zugs rückgängig machen",
+      "auto": "Zu Auto-Akzeptieren wechseln (alles außer Shell genehmigen)",
+      "supervised": "Zu Beaufsichtigt wechseln (alle Schreibvorgänge genehmigen)",
+      "autonomous": "Zu Autonom wechseln (nichts genehmigen)",
+      "silent": "Reasoning ausblenden und Werkzeug-Details minimieren",
+      "verbose": "Vollständiges Reasoning und Werkzeug-Details anzeigen"
+    },
+    "toolLabels": {
+      "read_file": "Liest",
+      "write_file": "Schreibt",
+      "edit_file": "Bearbeitet",
+      "list_files": "Durchsucht Dateien",
+      "file_exists": "Prüft Datei",
+      "delete_file": "Löscht Datei",
+      "search_files": "Sucht in Dateien",
+      "move_file": "Verschiebt Datei",
+      "rename_file": "Benennt Datei um",
+      "copy_file": "Kopiert Datei",
+      "create_directory": "Erstellt Verzeichnis",
+      "delete_directory": "Löscht Verzeichnis",
+      "get_document_info": "Untersucht Dokument",
+      "run_command": "Führt Befehl aus",
+      "shell_execute": "Führt Befehl aus",
+      "shell_read": "Liest Ausgabe",
+      "git_log": "Zeigt Git-Historie",
+      "git_show": "Zeigt Commit",
+      "git_diff": "Vergleicht Änderungen",
+      "git_status": "Prüft Git-Status",
+      "git_tags": "Listet Tags",
+      "git_merge_squash": "Führt Änderungen zusammen",
+      "git_worktree_cleanup": "Räumt Worktree auf",
+      "web_search": "Sucht im Web",
+      "extract_webpage": "Extrahiert Seiteninhalt",
+      "crawl_website": "Crawlt Website",
+      "map_website": "Kartiert Website",
+      "browse_website": "Durchsucht Website",
+      "download_from_website": "Lädt aus dem Web herunter",
+      "research_topic": "Recherchiert Thema",
+      "search_papers": "Sucht Paper",
+      "download_paper": "Lädt Paper herunter",
+      "get_paper_info": "Ruft Paper-Infos ab",
+      "browser_navigate": "Navigiert zu Seite",
+      "browser_snapshot": "Erfasst Seite",
+      "browser_click": "Klickt Element",
+      "browser_type": "Tippt im Browser",
+      "browser_select": "Wählt Option",
+      "browser_scroll": "Scrollt Seite",
+      "browser_screenshot": "Macht Screenshot",
+      "browser_back": "Geht zurück",
+      "browser_close": "Schließt Browser",
+      "task_add": "Fügt Aufgabe hinzu",
+      "task_complete": "Schließt Aufgabe ab",
+      "task_list": "Listet Aufgaben",
+      "next_phase_todos": "Plant nächste Phase",
+      "todo_complete": "Schließt Todo ab",
+      "todo_list": "Listet Todos",
+      "todo_rewind": "Spult Todo zurück",
+      "kb_write": "Schreibt in Wissensdatenbank",
+      "kb_update": "Aktualisiert Wissen",
+      "kb_read": "Liest Wissen",
+      "kb_list": "Listet Wissen",
+      "kb_search": "Sucht in Wissen",
+      "kb_related": "Findet verwandtes Wissen",
+      "cite_document": "Zitiert Dokument",
+      "cite_web": "Zitiert Web-Quelle",
+      "list_sources": "Listet Quellen",
+      "search_library": "Sucht in Bibliothek",
+      "send_message": "Sendet Nachricht",
+      "delegate_work": "Delegiert Arbeit",
+      "mark_complete": "Markiert als abgeschlossen",
+      "job_complete": "Schließt Auftrag ab"
+    },
+    "toolCategories": {
+      "workspace": "Arbeit mit Dateien",
+      "git": "Versionskontrolle",
+      "shell": "Befehle ausführen",
+      "research": "Recherche & Browsen",
+      "browser_direct": "Browsen",
+      "core": "Aufgabenverwaltung",
+      "session_task": "Aufgabenverwaltung",
+      "knowledge": "Wissensdatenbank",
+      "citation": "Zitate & Quellen",
+      "sql": "Datenbankabfragen",
+      "mongodb": "Datenbankabfragen",
+      "graph": "Wissensgraph",
+      "cloud": "Cloud-Speicher",
+      "communication": "Kommunikation",
+      "delegation": "Arbeit delegieren",
+      "orchestrator": "Orchestrator",
+      "evaluation": "Auswertung"
+    },
+    "toolContext": {
+      "searchFor": "nach \"{{term}}\"",
+      "commandDash": "— {{cmd}}"
+    }
+  },
+  "datasources": {
+    "title": "Datenquellen",
+    "new": "Neu",
+    "dismiss": "Schließen",
+    "filter": {
+      "all": "Alle",
+      "generic": "Generisch",
+      "repository": "Repository",
+      "postgresql": "PostgreSQL",
+      "neo4j": "Neo4j",
+      "mongodb": "MongoDB",
+      "webdav": "WebDAV"
+    },
+    "form": {
+      "editTitle": "Datenquelle bearbeiten",
+      "newTitle": "Neue Datenquelle",
+      "nameLabel": "Name",
+      "namePlaceholder": "z. B. Production Analytics DB",
+      "typeLabel": "Typ",
+      "typeGroupCli": "CLI-basiert",
+      "typeGroupManaged": "Verwaltet",
+      "optGeneric": "Generisch",
+      "optRepository": "Repository",
+      "optPostgresql": "PostgreSQL",
+      "optNeo4j": "Neo4j",
+      "optMongodb": "MongoDB",
+      "optWebdav": "WebDAV",
+      "connectionUrlLabel": "Verbindungs-URL",
+      "repoUrlLabel": "Repository-URL",
+      "optional": "(optional)",
+      "genericUrlPlaceholder": "z. B. postgresql://host:5432/db oder https://api.example.com",
+      "descriptionLabel": "Beschreibung",
+      "descriptionPlaceholderGeneric": "Beschreiben Sie diese Ressource für die KI — was sie ist, wie man sie verwendet, welche Daten sie enthält",
+      "descriptionPlaceholderManaged": "Was diese Datenquelle enthält (wird in den Agenten-Kontext aufgenommen)",
+      "cliHintLabel": "CLI-Hinweis",
+      "cliHintPlaceholder": "z. B. psql $DATABASE_URL",
+      "envVarsLabel": "Umgebungsvariablen",
+      "envKeyPlaceholder": "ENV_VAR_NAME",
+      "envValuePlaceholder": "Wert",
+      "envRemoveTooltip": "Entfernen",
+      "envAdd": "Variable hinzufügen",
+      "envHint": "Anmeldeinformationen werden als Umgebungsvariablen in den Agenten-Arbeitsbereich injiziert. Nur-Lese-Zugriff kann nicht erzwungen werden — verwenden Sie bei Bedarf ein Datenbank-Konto mit eingeschränkten Berechtigungen.",
+      "defaultBranchLabel": "Standard-Branch",
+      "defaultBranchPlaceholder": "main",
+      "authMethodLabel": "Authentifizierungsmethode",
+      "authToken": "HTTPS-Token",
+      "authSsh": "SSH-Schlüssel",
+      "tokenLabel": "Access Token",
+      "tokenPlaceholder": "ghp_xxxx oder Personal Access Token",
+      "sshKeyLabel": "Privater SSH-Schlüssel",
+      "repoHint": "Das Repository wird in den Arbeitsbereich geklont und Git-Anmeldeinformationen werden automatisch konfiguriert. Der Agent verwendet standardmäßige Git-Befehle — keine Einrichtung der Anmeldeinformationen erforderlich.",
+      "usernameLabel": "Benutzername",
+      "usernamePlaceholder": "neo4j",
+      "passwordLabel": "Passwort",
+      "passwordPlaceholder": "Passwort",
+      "testing": "Wird getestet...",
+      "test": "Testen",
+      "cancel": "Abbrechen",
+      "saving": "Wird gespeichert...",
+      "update": "Aktualisieren",
+      "create": "Erstellen"
+    },
+    "table": {
+      "loading": "Datenquellen werden geladen...",
+      "empty": "Keine Datenquellen gefunden",
+      "emptyHint": "Erstellen Sie eine Datenquelle, um Agenten mit externen Datenbanken zu verbinden",
+      "colType": "Typ",
+      "colName": "Name",
+      "colUrl": "URL",
+      "colScope": "Geltungsbereich",
+      "colActions": "Aktionen",
+      "scopeJob": "Auftrag",
+      "scopeGlobal": "Global",
+      "testTooltip": "Verbindung testen",
+      "editTooltip": "Bearbeiten",
+      "deleteTooltip": "Löschen"
+    },
+    "messages": {
+      "repoNoAuthConfirm": "Keine Anmeldeinformationen angegeben.\n\nDieses Repository wird nur lesend geklont — der Agent kann den Code durchsuchen und lesen, aber keine Änderungen pushen.\n\nFortfahren?",
+      "updated": "Datenquelle aktualisiert",
+      "updateFailed": "Aktualisierung der Datenquelle fehlgeschlagen",
+      "updateError": "Fehler beim Aktualisieren der Datenquelle",
+      "created": "Datenquelle „{{name}}“ erstellt",
+      "createFailed": "Erstellung der Datenquelle fehlgeschlagen",
+      "createError": "Fehler beim Erstellen der Datenquelle",
+      "createForTestFailed": "Erstellung der Datenquelle zum Testen fehlgeschlagen",
+      "deleted": "Datenquelle „{{name}}“ gelöscht",
+      "deleteFailed": "Löschen der Datenquelle fehlgeschlagen",
+      "deleteError": "Fehler beim Löschen der Datenquelle",
+      "testFailed": "Anfrage fehlgeschlagen",
+      "testRequestFailed": "Testanfrage fehlgeschlagen"
+    }
+  },
+  "inbox": {
+    "title": "Aktionszentrum",
+    "backBtn": "Zurück",
+    "sseConnected": "SSE verbunden",
+    "sseDisconnected": "SSE getrennt",
+    "refresh": "Aktualisieren",
+    "listAriaLabel": "Einträge im Aktionszentrum",
+    "filters": {
+      "all": "Alle",
+      "messages": "Nachrichten",
+      "sudo": "Sudo",
+      "reviews": "Reviews",
+      "sessions": "Sitzungen"
+    },
+    "list": {
+      "empty": {
+        "message": "Keine Nachrichten",
+        "sudo": "Keine Sudo-Anfragen",
+        "review": "Keine Reviews",
+        "session": "Keine Sitzungen"
+      },
+      "emptyAll": "Alles erledigt — keine Einträge erfordern Ihre Aufmerksamkeit",
+      "resolved": "erledigt",
+      "modeBlocking": "blockierend",
+      "modeAsync": "asynchron"
+    },
+    "time": {
+      "now": "jetzt"
+    },
+    "detail": {
+      "emptyText": "Wählen Sie einen Eintrag, um Details anzuzeigen",
+      "hintUse": "Mit",
+      "hintToNavigate": "navigieren,",
+      "hintToSelect": "zum Auswählen"
+    },
+    "sudoDetail": {
+      "vmUpgradeRequest": "VM-Upgrade-Anfrage",
+      "sudoRequest": "Sudo-Anfrage",
+      "secondsRemaining": "{{seconds}}s verbleibend",
+      "user": "Benutzer",
+      "vm": "VM",
+      "cwd": "CWD",
+      "workspace": "Arbeitsbereich",
+      "upgradeHint": "Der Agent hat Sudo in einem Container-Arbeitsbereich versucht. Für vollen Sudo-Zugriff zu einer VM upgraden oder den Job ohne VM fortsetzen.",
+      "upgradeToVm": "Auf VM upgraden",
+      "resumeWithoutVm": "Ohne VM fortsetzen",
+      "approve": "Genehmigen",
+      "deny": "Verweigern",
+      "reason": "Begründung",
+      "rulesToggle": "Auto-Genehmigungsregeln ({{count}})",
+      "rulePatternPlaceholder": "Muster (z. B. apt-get install *)",
+      "ruleActionApprove": "Genehmigen",
+      "ruleActionDeny": "Verweigern",
+      "ruleAdd": "Hinzufügen"
+    },
+    "messageDetail": {
+      "messageLabel": "Nachricht",
+      "modeBlocking": "blockierend",
+      "modeAsync": "asynchron",
+      "defaultAgent": "Agent",
+      "jobPrefix": "Job",
+      "threadLoading": "Thread wird geladen …",
+      "noMessagesLoaded": "Keine Nachrichten geladen",
+      "senderAgent": "Agent",
+      "senderYou": "Sie",
+      "replyPlaceholder": "Antwort eingeben …",
+      "markUrgent": "Als dringend markieren",
+      "send": "Senden"
+    },
+    "reviewDetail": {
+      "jobReview": "Job-Review",
+      "freezePhase": "Phasengrenze",
+      "freezeUpgrade": "Sudo erforderlich",
+      "freezeComplete": "Job abgeschlossen",
+      "defaultAgent": "Agent",
+      "idPrefix": "ID:",
+      "phase": "Phase {{number}}",
+      "loadingFrozen": "Eingefrorene Daten werden geladen …",
+      "summary": "Zusammenfassung",
+      "confidence": "Konfidenz",
+      "deliverables": "Ergebnisse",
+      "upgradeHint": "Für Sudo-Zugriff zu einer VM upgraden oder ohne VM fortsetzen.",
+      "upgradeToVm": "Auf VM upgraden",
+      "resumeWithoutVm": "Ohne VM fortsetzen",
+      "notesPlaceholder": "Optionale Notizen …",
+      "approve": "Genehmigen",
+      "feedbackPlaceholder": "Feedback für die nächste Phase …",
+      "resumeWithFeedback": "Mit Feedback fortsetzen"
+    },
+    "sessionDetail": {
+      "agentSession": "Agent-Sitzung",
+      "needsAttention": "erfordert Aufmerksamkeit",
+      "tool": "Tool",
+      "arguments": "Argumente",
+      "command": "Befehl",
+      "reason": "Grund",
+      "goToSession": "Zur Sitzung"
+    },
+    "denyDialog": {
+      "titlePrefix": "Verweigern:",
+      "reasonPlaceholder": "Begründung für Verweigerung (erforderlich)",
+      "cancel": "Abbrechen",
+      "deny": "Verweigern"
+    },
+    "shortcuts": {
+      "title": "Tastaturkürzel",
+      "nextItem": "Nächster Eintrag",
+      "prevItem": "Vorheriger Eintrag",
+      "selectItem": "Eintrag auswählen",
+      "deselect": "Abwählen / schließen",
+      "approveSudoReview": "Genehmigen (Sudo / Review)",
+      "denySudo": "Verweigern (Sudo)",
+      "focusReply": "Antwort fokussieren (Nachricht)",
+      "sendReply": "Antwort senden",
+      "filterMessages": "Filter: Nachrichten",
+      "filterSudo": "Filter: Sudo",
+      "filterReviews": "Filter: Reviews",
+      "clearFilter": "Filter zurücksetzen",
+      "toggleOverlay": "Dieses Overlay umschalten",
+      "close": "Schließen"
+    }
+  },
+  "builder": {
+    "empty": {
+      "title": "KI-Instruktions-Builder",
+      "desc": "Beschreiben Sie, was der Agent tun soll, und ich helfe Ihnen, die Anweisungen zu schreiben, Einstellungen zu konfigurieren und den Job einzurichten.",
+      "hint": "Beginnen Sie unten zu tippen, um ein Gespräch zu starten."
+    },
+    "proposal": {
+      "write": "Schreiben",
+      "edit": "Bearbeiten",
+      "diffRemove": "Entfernen",
+      "diffInsert": "Einfügen",
+      "currentContent": "Aktueller Inhalt ({{length}} Zeichen)",
+      "newContent": "Neuer Inhalt ({{length}} Zeichen)",
+      "apply": "Anwenden",
+      "dismiss": "Verwerfen"
+    },
+    "session": {
+      "starting": "Sitzung wird gestartet …",
+      "restoring": "Unterhaltung wird wiederhergestellt …",
+      "createFailed": "Builder-Sitzung konnte nicht erstellt werden"
+    },
+    "input": {
+      "placeholder": "Beschreiben Sie, was der Agent tun soll …",
+      "retry": "Wiederholen",
+      "stopTitle": "Generierung stoppen"
+    },
+    "stream": {
+      "appliedChanges": "(Änderungen angewendet)",
+      "searching": "Suche: {{query}}",
+      "running": "Läuft: {{tool}}",
+      "result": "Ergebnis: {{tool}}"
+    },
+    "errors": {
+      "writeFailed": "Schreiben von {{path}} fehlgeschlagen"
+    }
+  },
+  "advanced": {
+    "sections": {
+      "inference": "Inferenzparameter",
+      "limits": "Limits & Sicherheit",
+      "memory": "Memory-Tuning",
+      "context": "Kontextverwaltung",
+      "workspace": "Arbeitsbereich",
+      "shell": "Shell",
+      "research": "Recherche & Browser",
+      "auxiliary": "Hilfs-LLM",
+      "session": "Sitzung",
+      "viewResolvedConfig": "Aufgelöste Konfiguration anzeigen (JSON)"
+    },
+    "phases": {
+      "strategic": "Strategisch",
+      "tactical": "Taktisch"
+    },
+    "labels": {
+      "reasoning": "Reasoning",
+      "temperature": "Temperatur: {{value}}",
+      "multimodal": "Multimodal (Bilder)",
+      "topP": "Top-p",
+      "topK": "Top-k",
+      "maxOutputTokens": "Max. Ausgabe-Tokens",
+      "parallelToolCalls": "Parallele Tool-Aufrufe",
+      "messageCountThreshold": "Nachrichten-Schwellwert",
+      "toolRetryCount": "Tool-Wiederholungen",
+      "progressStallThreshold": "Stillstand-Schwellwert",
+      "maxToolCallsPerPhase": "Max. Tool-Aufrufe pro Phase",
+      "memoryEnabled": "Memory aktiviert",
+      "budgetTokens": "Budget-Tokens",
+      "compactOnArchive": "Beim Archivieren komprimieren",
+      "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
+      "keepRecentMessages": "Letzte Nachrichten behalten",
+      "backend": "Backend",
+      "vmCpuCores": "VM-CPU-Kerne",
+      "vmMemory": "VM-Arbeitsspeicher",
+      "maxReadWords": "Max. Lese-Wörter",
+      "maxWriteWords": "Max. Schreib-Wörter",
+      "gitVersioning": "Git-Versionierung",
+      "mode": "Modus",
+      "sandbox": "Sandbox",
+      "defaultTimeout": "Standard-Timeout (Sekunden)",
+      "sudoAction": "Sudo-Aktion",
+      "proxyEnabled": "Proxy aktiviert",
+      "browserHeadless": "Browser headless",
+      "browserVision": "Browser verwendet Vision",
+      "auxEnabled": "Hilfs-LLM aktiviert",
+      "model": "Modell",
+      "idleTimeout": "Leerlauf-Timeout (Minuten)",
+      "greeting": "Begrüßung"
+    },
+    "options": {
+      "container": "Container",
+      "vmQemu": "VM (QEMU)",
+      "stateless": "Zustandslos",
+      "persistent": "Persistent",
+      "sudoFreeze": "Einfrieren (Benutzer fragen)",
+      "sudoBlock": "Blockieren (ablehnen)",
+      "sudoAllow": "Erlauben"
+    },
+    "hints": {
+      "idleDisabled": "0 = deaktiviert",
+      "autoPlaceholder": "auto"
+    }
+  },
+  "jobReview": {
+    "title": "Job-Review",
+    "empty": {
+      "selectJob": "Wählen Sie einen Job zur Prüfung aus",
+      "notFound": "Job nicht gefunden",
+      "notPending": "Dieser Job wartet nicht auf eine Prüfung."
+    },
+    "loading": "Wird geladen …",
+    "sections": {
+      "job": "Job",
+      "summary": "Zusammenfassung",
+      "confidence": "Konfidenz",
+      "deliverables": "Ergebnisse",
+      "agentNotes": "Agent-Notizen"
+    },
+    "meta": {
+      "id": "ID: {{id}} …",
+      "created": "Erstellt: {{date}}"
+    },
+    "summaryEmpty": "Keine Zusammenfassung vorhanden",
+    "noFrozenData": "Keine eingefrorenen Job-Daten verfügbar",
+    "links": {
+      "browseWorkspace": "Arbeitsbereich in Gitea öffnen",
+      "startingIde": "IDE wird gestartet …",
+      "openIde": "Im Web-IDE öffnen"
+    },
+    "vmUpgrade": {
+      "title": "Sudo erforderlich",
+      "reason": "Der Agent hat einen privilegierten Befehl in einem gehärteten Container versucht:",
+      "hint": "Für vollen Sudo-Zugriff (über das Genehmigungssystem) auf eine VM upgraden oder ohne VM fortsetzen (der Agent passt sich an).",
+      "upgrading": "Upgrade läuft …",
+      "upgradeToVm": "Auf VM upgraden",
+      "resuming": "Wird fortgesetzt …",
+      "resumeWithoutVm": "Ohne VM fortsetzen"
+    },
+    "actions": {
+      "continuing": "Wird fortgesetzt …",
+      "continue": "Fortsetzen",
+      "confirmApprove": "Genehmigen bestätigen?",
+      "approving": "Wird genehmigt …",
+      "approve": "Genehmigen",
+      "orContinueFeedback": "oder mit Feedback fortsetzen",
+      "feedbackPlaceholder": "Feedback oder zusätzliche Anweisungen für den Agenten eingeben …",
+      "resuming": "Wird fortgesetzt …",
+      "continueWithFeedback": "Mit Feedback fortsetzen"
+    },
+    "messages": {
+      "approved": "Job erfolgreich genehmigt.",
+      "approveFailed": "Job konnte nicht genehmigt werden. Details in der Konsole.",
+      "upgradeInitiated": "VM-Upgrade eingeleitet. Der Job wird fortgesetzt, sobald die VM bereit ist.",
+      "upgradeFailed": "VM-Upgrade fehlgeschlagen. Details in der Konsole.",
+      "continuing": "Job wird fortgesetzt. Der Agent nimmt die Ausführung wieder auf.",
+      "continueFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole.",
+      "resumedWithFeedback": "Job mit Feedback fortgesetzt. Der Agent arbeitet weiter.",
+      "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole."
+    }
+  },
+  "chatHistory": {
+    "title": "Chatverlauf",
+    "refresh": "Aktualisieren",
+    "retry": "Wiederholen",
+    "empty": {
+      "noHistory": "Kein Chatverlauf für diesen Job",
+      "noHistoryHint": "Chat-Einträge werden erstellt, wenn der Agent läuft",
+      "noJob": "Wählen Sie einen Job, um den Chatverlauf anzuzeigen",
+      "noJobHint": "Nutzen Sie das Job-Auswahlmenü oben, um einen Job auszuwählen"
+    },
+    "phaseUnknown": "unbekannt",
+    "iter": "Iter. {{n}}",
+    "human": "Benutzer",
+    "assistant": "Assistent",
+    "reasoning": "Reasoning",
+    "shellState": "Shell-Status",
+    "paneSingle": "{{n}} Bereich",
+    "panePlural": "{{n}} Bereiche",
+    "emptyPane": "(leer)",
+    "resultPending": "Ergebnis ausstehend oder nicht verfügbar",
+    "viewRequest": "Vollständige Anfrage anzeigen",
+    "showingTurns": "{{n}} Chat-Runden angezeigt",
+    "newOutput": "NEU",
+    "idle": "leerlaufend",
+    "turnsCount": "{{n}} Runden"
+  },
+  "configEditor": {
+    "loading": "Schema wird geladen …",
+    "modeVisual": "Visuell",
+    "modeJson": "JSON",
+    "overrideSingle": "{{n}} Überschreibung",
+    "overridePlural": "{{n}} Überschreibungen",
+    "nullable": "nullable",
+    "defaultOption": "Standard",
+    "defaultAutoDetect": "Standard (Auto-Erkennung)",
+    "arrayHint": "Komma-getrennte Werte",
+    "jsonHint": "Vollständig aufgelöste Konfiguration (Experten-Standards + Ihre Überschreibungen). Bearbeiten Sie beliebige Werte — nur Änderungen werden als Überschreibungen gesendet.",
+    "resetToDefault": "Auf Standard zurücksetzen",
+    "errors": {
+      "rootMustBeObject": "Wurzel muss ein Objekt sein",
+      "invalidJson": "Ungültiges JSON"
+    }
+  },
+  "agentSettings": {
+    "common": {
+      "resetToDefault": "Auf Standard zurücksetzen",
+      "noApiKey": "kein API-Schlüssel"
+    },
+    "datasources": {
+      "group": "Datenquellen",
+      "loading": "Datenquellen werden geladen…"
+    },
+    "execution": {
+      "group": "Ausführung",
+      "autonomy": "Autonomie",
+      "permissionMode": "Berechtigungsmodus",
+      "scholar": "Scholar (Vorrecherche)",
+      "critic": "Critic (Verifikation)",
+      "projectMemory": "Projektgedächtnis",
+      "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert"
+    },
+    "autonomy": {
+      "full": {
+        "label": "Vollständig",
+        "description": "Läuft ohne Unterbrechung bis zum Abschluss"
+      },
+      "review": {
+        "label": "Review",
+        "description": "Stoppt beim Job-Abschluss zur manuellen Prüfung"
+      },
+      "partial": {
+        "label": "Partiell",
+        "description": "Stoppt an Phasengrenzen und beim Job-Abschluss"
+      },
+      "guided": {
+        "label": "Geführt",
+        "description": "Stoppt nach jeder taktischen Phase"
+      },
+      "dependent": {
+        "label": "Abhängig",
+        "description": "Stoppt nach jeder Phase (strategisch und taktisch)"
+      }
+    },
+    "permissionModes": {
+      "supervised": {
+        "label": "Beaufsichtigt",
+        "description": "Agent fragt vor jedem Befehl um Freigabe"
+      },
+      "auto_accept": {
+        "label": "Automatisch",
+        "description": "Die meisten Aktionen werden automatisch freigegeben, riskante markiert"
+      },
+      "autonomous": {
+        "label": "Autonom",
+        "description": "Agent führt Aktionen ohne Rückfrage aus"
+      }
+    },
+    "criticRounds": {
+      "1": "1 Runde",
+      "3": "3 Runden",
+      "5": "5 Runden (Standard)",
+      "10": "10 Runden",
+      "0": "Unbegrenzt"
+    },
+    "tools": {
+      "group": "Werkzeuge",
+      "maxDepth": "Max. Tiefe",
+      "timeout": "Timeout (Sek.)"
+    },
+    "toolCategories": {
+      "research": {
+        "label": "Recherche",
+        "description": "Kann das Web durchsuchen, wissenschaftliche Quellen finden und Websites besuchen"
+      },
+      "browser_direct": {
+        "label": "Browser",
+        "description": "Direkte Browser-Steuerung — navigieren, klicken, tippen, Screenshots erstellen und Seiten visuell verifizieren"
+      },
+      "citation": {
+        "label": "Zitation",
+        "description": "Kann Quellen verfolgen, Zitate verwalten und Literaturverzeichnisse erstellen"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Kann Shell-Befehle in einem isolierten Terminal ausführen"
+      },
+      "communication": {
+        "label": "Kommunikation",
+        "description": "Kann E-Mails an Sie oder Ihr Team versenden"
+      },
+      "delegation": {
+        "label": "Delegation",
+        "description": "Kann Subagenten starten, die parallel arbeiten"
+      },
+      "knowledge": {
+        "label": "Wissen",
+        "description": "Kann die Projekt-Wissensbasis lesen und beschreiben"
+      },
+      "git": {
+        "label": "Git",
+        "description": "Kann den Versionsverlauf des Workspaces einsehen"
+      }
+    },
+    "model": {
+      "group": "Modell",
+      "preset": "Voreinstellung",
+      "strategic": "Strategisch",
+      "tactical": "Taktisch",
+      "single": "Modell",
+      "default": "Standard",
+      "presetUnconfigured": "Mindestens einem Modell fehlt ein API-Schlüssel",
+      "providerNoKey": "{{provider}} (kein API-Schlüssel)"
+    }
+  },
+  "agentList": {
+    "title": "Registrierte Agenten",
+    "count": "{{n}} Agenten",
+    "refresh": "Aktualisieren",
+    "loading": "Wird geladen…",
+    "loadingAgents": "Agenten werden geladen…",
+    "empty": "Keine Agenten registriert",
+    "emptyHint": "Agenten erscheinen hier, sobald sie sich mit dem Orchestrator verbinden",
+    "table": {
+      "status": "Status",
+      "config": "Konfiguration",
+      "hostname": "Hostname",
+      "currentJob": "Aktueller Job",
+      "lastHeartbeat": "Letzter Heartbeat",
+      "actions": "Aktionen"
+    },
+    "status": {
+      "booting": "Startet",
+      "ready": "Bereit",
+      "working": "Arbeitet",
+      "session": "Sitzung",
+      "draining": "Leert",
+      "completed": "Abgeschlossen",
+      "failed": "Fehlgeschlagen",
+      "offline": "Offline"
+    },
+    "actions": {
+      "assign": "Job zuweisen",
+      "assignTitle": "Diesem Agenten einen Job zuweisen",
+      "remove": "Entfernen"
+    },
+    "assign": {
+      "title": "Job einem Agenten zuweisen",
+      "cancel": "Abbrechen",
+      "assigning": "Wird zugewiesen…",
+      "confirm": "Job zuweisen",
+      "noJobs": "Keine zuweisbaren Jobs verfügbar",
+      "noJobsHint": "Erstellen Sie zuerst einen Job oder warten Sie auf Jobs mit dem Status „created“"
+    },
+    "footer": {
+      "autoRefreshOn": "Automatische Aktualisierung: EIN (30s)",
+      "autoRefreshOff": "Automatische Aktualisierung: AUS",
+      "disable": "Deaktivieren",
+      "enable": "Aktivieren"
+    },
+    "messages": {
+      "assigned": "Job erfolgreich zugewiesen!",
+      "assignFailed": "Zuweisung fehlgeschlagen",
+      "assignError": "Fehler bei der Zuweisung"
+    },
+    "time": {
+      "secondsAgo": "vor {{n}}s",
+      "minutesAgo": "vor {{n}} Min.",
+      "hoursAgo": "vor {{n}} Std."
+    }
+  },
+  "sudo": {
+    "title": "Sudo-Freigaben",
+    "filter": {
+      "all": "Alle",
+      "pending": "Ausstehend",
+      "approved": "Genehmigt",
+      "denied": "Abgelehnt",
+      "expired": "Abgelaufen"
+    },
+    "panels": {
+      "requests": "Anfragen",
+      "rules": "Automatische Freigaberegeln"
+    },
+    "loading": "Wird geladen…",
+    "emptyRequests": "Keine Anfragen",
+    "emptyRules": "Keine Regeln konfiguriert",
+    "secondsLeft": "{{n}}s",
+    "risk": {
+      "low": "niedrig",
+      "medium": "mittel",
+      "high": "hoch",
+      "critical": "kritisch"
+    },
+    "status": {
+      "pending": "ausstehend",
+      "approved": "genehmigt",
+      "auto_approved": "auto-genehmigt",
+      "denied": "abgelehnt",
+      "auto_denied": "auto-abgelehnt",
+      "expired": "abgelaufen"
+    },
+    "actions": {
+      "approve": "Genehmigen",
+      "deny": "Ablehnen"
+    },
+    "rule": {
+      "patternPlaceholder": "Muster (z. B. apt-get install *)",
+      "actionApprove": "Genehmigen",
+      "actionDeny": "Ablehnen",
+      "actionReview": "Prüfen",
+      "add": "Hinzufügen",
+      "badge": {
+        "approve": "genehmigen",
+        "deny": "ablehnen",
+        "review": "prüfen"
+      }
+    },
+    "denyDialog": {
+      "title": "Ablehnen: {{command}}",
+      "reasonPlaceholder": "Begründung für die Ablehnung (erforderlich)",
+      "cancel": "Abbrechen",
+      "confirm": "Ablehnen"
+    }
+  },
+  "notificationBell": {
+    "title": "Aktionszentrum",
+    "messagesSingle": "{{n}} Nachricht",
+    "messagesPlural": "{{n}} Nachrichten",
+    "sudo": "{{n}} Sudo",
+    "reviewsSingle": "{{n}} Review",
+    "reviewsPlural": "{{n}} Reviews",
+    "sessionsSingle": "{{n}} Sitzung",
+    "sessionsPlural": "{{n}} Sitzungen"
+  },
+  "todoList": {
+    "phaseSelector": {
+      "current": "Aktuelle Phase",
+      "currentCount": "({{n}} Aufgaben)",
+      "archivedPhases": "Archivierte Phasen",
+      "unnamedPhase": "Unbenannte Phase"
+    },
+    "refreshTitle": "Aufgaben aktualisieren",
+    "retry": "Erneut versuchen",
+    "empty": {
+      "noWorkspace": "Kein Workspace gefunden",
+      "noWorkspaceHint": "Der Job-Workspace existiert möglicherweise noch nicht",
+      "noJob": "Wählen Sie einen Job aus der Zeitleiste",
+      "noJobHint": "Aufgaben erscheinen hier",
+      "noTodos": "Keine Aufgaben in dieser Phase",
+      "planningHint": "Der Agent befindet sich möglicherweise in der strategischen Planung",
+      "archiveHint": "Für dieses Archiv sind keine Aufgaben erfasst"
+    },
+    "priorityHigh": "HOCH",
+    "summary": {
+      "total": "Gesamt: {{n}}",
+      "completed": "Erledigt: {{n}}",
+      "remaining": "Offen: {{n}}"
+    }
+  },
+  "errors": {
+    "unknown": "Etwas ist schiefgelaufen.",
+    "http": {
+      "network": "Server nicht erreichbar. Bitte Verbindung prüfen und erneut versuchen.",
+      "401": "Du bist abgemeldet. Bitte anmelden und erneut versuchen.",
+      "403": "Dafür fehlt dir die Berechtigung.",
+      "404": "Nicht gefunden.",
+      "409": "Diese Aktion steht im Konflikt mit dem aktuellen Zustand.",
+      "429": "Zu viele Anfragen. Bitte kurz warten und erneut versuchen.",
+      "timeout": "Der Server hat zu lange gebraucht.",
+      "4xx": "Die Anfrage konnte nicht ausgeführt werden.",
+      "5xx": "Der Server hatte einen Fehler. Bitte erneut versuchen."
+    },
+    "code": {
+      "job.not_found": "Dieser Job existiert nicht mehr.",
+      "agent.unavailable": "Derzeit sind keine Agenten verfügbar.",
+      "agent.offline": "Der zugewiesene Agent ist offline.",
+      "project.not_found": "Dieses Projekt existiert nicht mehr.",
+      "permission.denied": "Dafür fehlt dir die Berechtigung."
+    },
+    "jobs": {
+      "createFailed": "Job konnte nicht erstellt werden.",
+      "deleteFailed": "Job konnte nicht gelöscht werden.",
+      "cancelFailed": "Job konnte nicht abgebrochen werden.",
+      "pauseFailed": "Job konnte nicht pausiert werden.",
+      "resumeFailed": "Job konnte nicht fortgesetzt werden.",
+      "approveFailed": "Job konnte nicht freigegeben werden.",
+      "upgradeVmFailed": "Upgrade auf VM-Workspace fehlgeschlagen.",
+      "replyFailed": "Antwort konnte nicht gesendet werden."
+    },
+    "ide": {
+      "startFailed": "IDE-Sitzung konnte nicht gestartet werden.",
+      "stopFailed": "IDE-Sitzung konnte nicht beendet werden."
+    },
+    "sessions": {
+      "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
+      "endFailed": "Sitzung konnte nicht beendet werden.",
+      "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
+      "createFailed": "Sitzung konnte nicht erstellt werden."
+    }
+  },
+  "toasts": {
+    "jobs": {
+      "created": "Job erstellt",
+      "deleted": "Job gelöscht",
+      "cancelled": "Job abgebrochen",
+      "paused": "Job pausiert",
+      "resumed": "Job fortgesetzt",
+      "approved": "Job freigegeben",
+      "vmUpgradeStarted": "VM-Upgrade gestartet",
+      "replySent": "Antwort gesendet"
+    },
+    "ide": {
+      "stopped": "IDE-Sitzung beendet"
+    }
+  }
+}

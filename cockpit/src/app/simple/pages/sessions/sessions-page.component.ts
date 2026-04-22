@@ -2,15 +2,18 @@ import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {FormsModule} from '@angular/forms';
 import {HttpClient} from '@angular/common/http';
-import {DatePipe, TitleCasePipe} from '@angular/common';
+import {TitleCasePipe} from '@angular/common';
+import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
+import {ErrorMessageService} from '../../../core/services/error-message.service';
 import {UserService} from '../../../core/services/user.service';
 import {Thread} from '../../../core/models/api.model';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 
 interface Project {
     id: string;
@@ -23,17 +26,17 @@ interface Project {
 @Component({
     selector: 'app-sessions-page',
     standalone: true,
-    imports: [FormsModule, DatePipe, TitleCasePipe, SidebarToggleComponent],
+    imports: [FormsModule, TranslocoDatePipe, TitleCasePipe, SidebarToggleComponent, TranslocoPipe],
     template: `
     <div class="page-toggle">
       <app-sidebar-toggle />
     </div>
     <div class="sessions-page">
       <div class="page-header">
-        <h2>Sessions</h2>
+        <h2>{{ 'sessions.title' | transloco }}</h2>
         <div class="header-actions">
           <button class="btn btn-primary" (click)="goToCreate()">
-            <span class="icon">add</span> New Session
+            <span class="icon">add</span> {{ 'sessions.newSession' | transloco }}
           </button>
         </div>
       </div>
@@ -42,32 +45,32 @@ interface Project {
       @if (chat.isConnected() && statusFilter() !== 'ended') {
         <div class="active-banner" (click)="returnToActive()">
           <span class="active-dot"></span>
-          <span>Active session in progress</span>
-          <span class="active-action">Return to chat</span>
+          <span>{{ 'sessions.activeBanner' | transloco }}</span>
+          <span class="active-action">{{ 'sessions.returnToChat' | transloco }}</span>
         </div>
       }
 
       <!-- Create dialog -->
       @if (showCreate) {
         <div class="create-dialog">
-          <h3>New Session</h3>
-          <p class="dialog-hint">Creates a thread via the orchestrator and connects through its WebSocket proxy. Requires a persistent agent pod to be registered and bound to the thread.</p>
+          <h3>{{ 'sessions.create.title' | transloco }}</h3>
+          <p class="dialog-hint">{{ 'sessions.create.hint' | transloco }}</p>
           <div class="form-group">
-            <label>Title</label>
-            <input type="text" [(ngModel)]="newTitle" placeholder="Untitled Session" />
+            <label>{{ 'sessions.create.titleLabel' | transloco }}</label>
+            <input type="text" [(ngModel)]="newTitle" [placeholder]="'sessions.create.titlePlaceholder' | transloco" />
           </div>
           <div class="form-group">
-            <label>Config</label>
+            <label>{{ 'sessions.create.configLabel' | transloco }}</label>
             <select [(ngModel)]="newConfig">
-              <option value="persistent_defaults">Default</option>
-              <option value="developer">Developer</option>
-              <option value="scholar">Scholar</option>
+              <option value="persistent_defaults">{{ 'sessions.create.configDefault' | transloco }}</option>
+              <option value="developer">{{ 'sessions.create.configDeveloper' | transloco }}</option>
+              <option value="scholar">{{ 'sessions.create.configScholar' | transloco }}</option>
             </select>
           </div>
           <div class="form-group">
-            <label>Model</label>
+            <label>{{ 'sessions.create.modelLabel' | transloco }}</label>
             <select [(ngModel)]="newModel">
-              <option value="">Config default</option>
+              <option value="">{{ 'sessions.create.modelConfigDefault' | transloco }}</option>
               <optgroup label="Local">
                 <option value="openai/gpt-oss-120b">GPT-OSS 120B (local)</option>
               </optgroup>
@@ -85,10 +88,10 @@ interface Project {
             </select>
           </div>
           <div class="form-group">
-            <label>Projects</label>
+            <label>{{ 'sessions.create.projectsLabel' | transloco }}</label>
             <div class="project-chips">
               @if (projects().length === 0) {
-                <span class="chip-hint">No projects available</span>
+                <span class="chip-hint">{{ 'sessions.create.projectsEmpty' | transloco }}</span>
               } @else {
                 @for (project of projects(); track project.id) {
                   <button
@@ -101,21 +104,21 @@ interface Project {
                 }
               }
             </div>
-            <span class="chip-hint">Select projects for shared knowledge access</span>
+            <span class="chip-hint">{{ 'sessions.create.projectsHint' | transloco }}</span>
           </div>
           <div class="form-group">
-            <label>Permission Mode</label>
+            <label>{{ 'sessions.create.permissionLabel' | transloco }}</label>
             <select [(ngModel)]="newPermission">
-              <option value="supervised">Supervised</option>
-              <option value="auto_accept">Auto-accept</option>
-              <option value="autonomous">Autonomous</option>
+              <option value="supervised">{{ 'sessions.create.permissionSupervised' | transloco }}</option>
+              <option value="auto_accept">{{ 'sessions.create.permissionAutoAccept' | transloco }}</option>
+              <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
             </select>
           </div>
           <div class="dialog-actions">
             <button class="btn btn-primary" (click)="createSession()" [disabled]="creating()">
-              {{ creating() ? 'Creating...' : 'Create' }}
+              {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.create' | transloco) }}
             </button>
-            <button class="btn btn-secondary" (click)="showCreate = false">Cancel</button>
+            <button class="btn btn-secondary" (click)="showCreate = false">{{ 'sessions.create.cancel' | transloco }}</button>
           </div>
         </div>
       }
@@ -123,11 +126,11 @@ interface Project {
       <!-- Session list -->
       <div class="session-list">
         @if (loading()) {
-          <div class="loading">Loading sessions...</div>
+          <div class="loading">{{ 'sessions.loading' | transloco }}</div>
         } @else if (threads().length === 0) {
           <div class="empty-state">
             <span class="empty-icon">chat_bubble_outline</span>
-            <p>No sessions yet. Create one to get started.</p>
+            <p>{{ 'sessions.empty' | transloco }}</p>
           </div>
         } @else {
           <!-- Filter tabs -->
@@ -136,27 +139,27 @@ interface Project {
               class="filter-tab"
               [class.active]="statusFilter() === null"
               (click)="statusFilter.set(null)"
-            >All ({{ threads().length }})</button>
+            >{{ 'sessions.filter.all' | transloco:{ count: threads().length } }}</button>
             <button
               class="filter-tab"
               [class.active]="statusFilter() === 'active'"
               (click)="statusFilter.set('active')"
-            >Active ({{ activeCount() }})</button>
+            >{{ 'sessions.filter.active' | transloco:{ count: activeCount() } }}</button>
             <button
               class="filter-tab"
               [class.active]="statusFilter() === 'ended'"
               (click)="statusFilter.set('ended')"
-            >Ended ({{ endedCount() }})</button>
+            >{{ 'sessions.filter.ended' | transloco:{ count: endedCount() } }}</button>
           </div>
 
           @if (filteredThreads().length === 0) {
             <div class="filter-empty">
               @if (statusFilter() === 'active') {
                 <span class="empty-icon">check_circle</span>
-                <p>No active sessions.</p>
+                <p>{{ 'sessions.emptyFilterActive' | transloco }}</p>
               } @else if (statusFilter() === 'ended') {
                 <span class="empty-icon">history</span>
-                <p>No ended sessions.</p>
+                <p>{{ 'sessions.emptyFilterEnded' | transloco }}</p>
               }
             </div>
           }
@@ -166,29 +169,29 @@ interface Project {
               <div class="session-main" (click)="resumeSession(thread)">
                 <div class="session-info">
                   <span class="session-status-dot" [class]="thread.status"></span>
-                  <span class="session-title">{{ thread.title || 'Untitled Session' }}</span>
+                  <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
                   <span class="session-config">{{ thread.config_name | titlecase }}</span>
                 </div>
                 <div class="session-meta">
-                  <span class="meta-item">{{ thread.total_turns || 0 }} {{ (thread.total_turns || 0) === 1 ? 'turn' : 'turns' }}</span>
-                  <span class="meta-item">{{ thread.last_activity | date:'short' }}</span>
+                  <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
+                  <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
                 </div>
               </div>
               <div class="session-actions">
                 @if (thread.cloud_session_url || thread.nc_session_folder) {
-                  <button class="icon-btn" title="Session Files" (click)="openSessionFiles(thread)">
+                  <button class="icon-btn" [title]="'sessions.tooltip.sessionFiles' | transloco" (click)="openSessionFiles(thread)">
                     <span class="icon">cloud</span>
                   </button>
                 }
-                <button class="icon-btn" title="Resume" (click)="resumeSession(thread)">
+                <button class="icon-btn" [title]="'sessions.tooltip.resume' | transloco" (click)="resumeSession(thread)">
                   <span class="icon">play_arrow</span>
                 </button>
                 @if (thread.status !== 'ended') {
-                  <button class="icon-btn" title="End" (click)="endSession(thread)">
+                  <button class="icon-btn" [title]="'sessions.tooltip.end' | transloco" (click)="endSession(thread)">
                     <span class="icon">stop</span>
                   </button>
                 }
-                <button class="icon-btn danger" title="Delete" (click)="deleteSession(thread)">
+                <button class="icon-btn danger" [title]="'sessions.tooltip.delete' | transloco" (click)="deleteSession(thread)">
                   <span class="icon">delete</span>
                 </button>
               </div>
@@ -567,9 +570,11 @@ export class SessionsPageComponent implements OnInit {
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
     private readonly toast = inject(ToastService);
+    private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
     private readonly settingsService = inject(SettingsService);
     readonly chat = inject(PersistentChatService);
+    private readonly transloco = inject(TranslocoService);
 
     threads = signal<Thread[]>([]);
     projects = signal<Project[]>([]);
@@ -672,7 +677,7 @@ export class SessionsPageComponent implements OnInit {
                 );
                 thread.status = 'created';
             } catch (e: any) {
-                this.toast.error(e?.error?.detail || 'Failed to resume session');
+                this.toast.error(this.errors.translate(e, 'errors.sessions.resumeFailed'));
                 return;
             }
         }
@@ -692,26 +697,26 @@ export class SessionsPageComponent implements OnInit {
     }
 
     async endSession(thread: Thread): Promise<void> {
-        if (!confirm('End this session? Work will be saved but the agent will stop.')) return;
+        if (!confirm(this.transloco.translate('sessions.confirmEnd'))) return;
         try {
             await firstValueFrom(
                 this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}`)
             );
             this.loadThreads();
         } catch (e: any) {
-            this.toast.error(e?.error?.detail || 'Failed to end session');
+            this.toast.error(this.errors.translate(e, 'errors.sessions.endFailed'));
         }
     }
 
     async deleteSession(thread: Thread): Promise<void> {
-        if (!confirm('Delete this session permanently?')) return;
+        if (!confirm(this.transloco.translate('sessions.confirmDelete'))) return;
         try {
             await firstValueFrom(
                 this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true`)
             );
             this.loadThreads();
         } catch (e: any) {
-            this.toast.error(e?.error?.detail || 'Failed to delete session');
+            this.toast.error(this.errors.translate(e, 'errors.sessions.deleteFailed'));
         }
     }
 

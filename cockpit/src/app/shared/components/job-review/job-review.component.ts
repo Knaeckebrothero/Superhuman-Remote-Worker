@@ -1,5 +1,6 @@
 import {Component, effect, inject, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {DataService} from '../../../core/services/data.service';
 import {Job} from '../../../core/models/api.model';
@@ -29,11 +30,11 @@ interface FrozenJobData {
 @Component({
   selector: 'app-job-review',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="review-container">
       <div class="header">
-        <span class="title">Job Review</span>
+        <span class="title">{{ 'jobReview.title' | transloco }}</span>
         <button class="refresh-btn" (click)="loadJob()" [disabled]="isLoading()">
           &#x21bb;
         </button>
@@ -41,16 +42,16 @@ interface FrozenJobData {
 
       @if (!currentJobId()) {
         <div class="empty-state">
-          <span class="empty-hint">Select a job to review</span>
+          <span class="empty-hint">{{ 'jobReview.empty.selectJob' | transloco }}</span>
         </div>
       } @else if (isLoading()) {
         <div class="loading-state">
           <div class="spinner"></div>
-          <span>Loading...</span>
+          <span>{{ 'jobReview.loading' | transloco }}</span>
         </div>
       } @else if (!job()) {
         <div class="empty-state">
-          <span class="empty-hint">Job not found</span>
+          <span class="empty-hint">{{ 'jobReview.empty.notFound' | transloco }}</span>
         </div>
       } @else if (job()!.status !== 'pending_review') {
         <div class="not-review-state">
@@ -60,7 +61,7 @@ interface FrozenJobData {
             </span>
           </div>
           <span class="status-message">
-            This job is not awaiting review.
+            {{ 'jobReview.empty.notPending' | transloco }}
           </span>
           <span class="job-desc">{{ job()!.description }}</span>
         </div>
@@ -69,25 +70,25 @@ interface FrozenJobData {
         <div class="review-content">
           <!-- Job Info -->
           <div class="section">
-            <div class="section-header">Job</div>
+            <div class="section-header">{{ 'jobReview.sections.job' | transloco }}</div>
             <div class="job-description">{{ job()!.description }}</div>
             <div class="job-meta">
-              <span class="meta-item">ID: {{ job()!.id.slice(0, 8) }}...</span>
-              <span class="meta-item">Created: {{ formatDate(job()!.created_at) }}</span>
+              <span class="meta-item">{{ 'jobReview.meta.id' | transloco: {id: job()!.id.slice(0, 8)} }}</span>
+              <span class="meta-item">{{ 'jobReview.meta.created' | transloco: {date: formatDate(job()!.created_at)} }}</span>
             </div>
           </div>
 
           <!-- Frozen Job Summary -->
           @if (frozenData()) {
             <div class="section">
-              <div class="section-header">Summary</div>
-              <div class="summary-text">{{ frozenData()!.summary || 'No summary provided' }}</div>
+              <div class="section-header">{{ 'jobReview.sections.summary' | transloco }}</div>
+              <div class="summary-text">{{ frozenData()!.summary || ('jobReview.summaryEmpty' | transloco) }}</div>
             </div>
 
             <!-- Confidence -->
             @if (frozenData()!.confidence !== undefined) {
               <div class="section">
-                <div class="section-header">Confidence</div>
+                <div class="section-header">{{ 'jobReview.sections.confidence' | transloco }}</div>
                 <div class="confidence-bar">
                   <div
                     class="confidence-fill"
@@ -104,7 +105,7 @@ interface FrozenJobData {
             <!-- Deliverables -->
             @if (frozenData()!.deliverables && frozenData()!.deliverables!.length > 0) {
               <div class="section">
-                <div class="section-header">Deliverables</div>
+                <div class="section-header">{{ 'jobReview.sections.deliverables' | transloco }}</div>
                 <ul class="deliverables-list">
                   @for (d of frozenData()!.deliverables!; track d) {
                     <li class="deliverable-item">{{ d }}</li>
@@ -116,14 +117,14 @@ interface FrozenJobData {
             <!-- Agent Notes -->
             @if (frozenData()!.notes) {
               <div class="section">
-                <div class="section-header">Agent Notes</div>
+                <div class="section-header">{{ 'jobReview.sections.agentNotes' | transloco }}</div>
                 <div class="notes-text">{{ frozenData()!.notes }}</div>
               </div>
             }
           } @else {
             <div class="section">
-              <div class="section-header">Summary</div>
-              <div class="summary-text muted">No frozen job data available</div>
+              <div class="section-header">{{ 'jobReview.sections.summary' | transloco }}</div>
+              <div class="summary-text muted">{{ 'jobReview.noFrozenData' | transloco }}</div>
             </div>
           }
 
@@ -132,18 +133,18 @@ interface FrozenJobData {
             <div class="section workspace-links">
               @if (getWorkspaceUrl()) {
                 <button class="workspace-link" (click)="openWorkspace()">
-                  Browse workspace in Gitea
+                  {{ 'jobReview.links.browseWorkspace' | transloco }}
                 </button>
               }
               @if (hasSnapshot()) {
                 @if (ideLoading()) {
                   <button class="workspace-link ide-link loading" disabled>
                     <span class="ide-spinner"></span>
-                    Starting IDE...
+                    {{ 'jobReview.links.startingIde' | transloco }}
                   </button>
                 } @else {
                   <button class="workspace-link ide-link" (click)="openIde()">
-                    Open in Web IDE
+                    {{ 'jobReview.links.openIde' | transloco }}
                   </button>
                 }
               }
@@ -156,16 +157,15 @@ interface FrozenJobData {
               <!-- VM Upgrade Required -->
               <div class="vm-upgrade-section">
                 <div class="upgrade-info">
-                  <div class="upgrade-title">Sudo Required</div>
+                  <div class="upgrade-title">{{ 'jobReview.vmUpgrade.title' | transloco }}</div>
                   <div class="upgrade-reason">
-                    The agent attempted a privileged command in a hardened container:
+                    {{ 'jobReview.vmUpgrade.reason' | transloco }}
                   </div>
                   @if (frozenData()!.command) {
                     <code class="upgrade-command">{{ frozenData()!.command }}</code>
                   }
                   <div class="upgrade-hint">
-                    Upgrade to a VM for full sudo access (gated by the approval system),
-                    or resume without a VM (the agent will adapt).
+                    {{ 'jobReview.vmUpgrade.hint' | transloco }}
                   </div>
                 </div>
                 <div class="action-group">
@@ -174,14 +174,14 @@ interface FrozenJobData {
                     (click)="upgradeToVm()"
                     [disabled]="isUpgrading()"
                   >
-                    @if (isUpgrading()) { Upgrading... } @else { Upgrade to VM }
+                    @if (isUpgrading()) { {{ 'jobReview.vmUpgrade.upgrading' | transloco }} } @else { {{ 'jobReview.vmUpgrade.upgradeToVm' | transloco }} }
                   </button>
                   <button
                     class="btn continue-btn"
                     (click)="continueJob()"
                     [disabled]="isResuming()"
                   >
-                    @if (isResuming()) { Resuming... } @else { Resume without VM }
+                    @if (isResuming()) { {{ 'jobReview.vmUpgrade.resuming' | transloco }} } @else { {{ 'jobReview.vmUpgrade.resumeWithoutVm' | transloco }} }
                   </button>
                 </div>
               </div>
@@ -195,9 +195,9 @@ interface FrozenJobData {
                     [disabled]="isResuming()"
                   >
                     @if (isResuming()) {
-                      Continuing...
+                      {{ 'jobReview.actions.continuing' | transloco }}
                     } @else {
-                      Continue
+                      {{ 'jobReview.actions.continue' | transloco }}
                     }
                   </button>
                 } @else {
@@ -207,7 +207,7 @@ interface FrozenJobData {
                       (click)="approveJob()"
                       [disabled]="isApproving()"
                     >
-                      Confirm Approve?
+                      {{ 'jobReview.actions.confirmApprove' | transloco }}
                     </button>
                   } @else {
                     <button
@@ -216,9 +216,9 @@ interface FrozenJobData {
                       [disabled]="isApproving()"
                     >
                       @if (isApproving()) {
-                        Approving...
+                        {{ 'jobReview.actions.approving' | transloco }}
                       } @else {
-                        Approve
+                        {{ 'jobReview.actions.approve' | transloco }}
                       }
                     </button>
                   }
@@ -228,7 +228,7 @@ interface FrozenJobData {
 
             <!-- Divider -->
             <div class="divider">
-              <span class="divider-text">or continue with feedback</span>
+              <span class="divider-text">{{ 'jobReview.actions.orContinueFeedback' | transloco }}</span>
             </div>
 
             <!-- Feedback + Continue -->
@@ -236,7 +236,7 @@ interface FrozenJobData {
               <textarea
                 class="feedback-input"
                 [(ngModel)]="feedbackText"
-                placeholder="Write feedback or additional instructions for the agent..."
+                [placeholder]="'jobReview.actions.feedbackPlaceholder' | transloco"
                 rows="4"
               ></textarea>
               <button
@@ -245,9 +245,9 @@ interface FrozenJobData {
                 [disabled]="isResuming() || !feedbackText.trim()"
               >
                 @if (isResuming()) {
-                  Resuming...
+                  {{ 'jobReview.actions.resuming' | transloco }}
                 } @else {
-                  Continue with Feedback
+                  {{ 'jobReview.actions.continueWithFeedback' | transloco }}
                 }
               </button>
             </div>
@@ -702,6 +702,7 @@ interface FrozenJobData {
 export class JobReviewComponent {
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
@@ -878,12 +879,12 @@ export class JobReviewComponent {
     this.api.approveJob(jobId).subscribe((result) => {
       this.isApproving.set(false);
       if (result) {
-        this.resultMessage.set('Job approved successfully.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.approved'));
         this.resultIsError.set(false);
         // Reload to reflect new status
         this.loadJob();
       } else {
-        this.resultMessage.set('Failed to approve job. Check console for details.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.approveFailed'));
         this.resultIsError.set(true);
       }
     });
@@ -899,11 +900,11 @@ export class JobReviewComponent {
     this.api.upgradeJobToVm(jobId).subscribe((result) => {
       this.isUpgrading.set(false);
       if (result) {
-        this.resultMessage.set('VM upgrade initiated. The job will resume once the VM is ready.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.upgradeInitiated'));
         this.resultIsError.set(false);
         this.loadJob();
       } else {
-        this.resultMessage.set('Failed to upgrade to VM. Check console for details.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.upgradeFailed'));
         this.resultIsError.set(true);
       }
     });
@@ -919,11 +920,11 @@ export class JobReviewComponent {
     this.api.resumeJob(jobId).subscribe((result) => {
       this.isResuming.set(false);
       if (result) {
-        this.resultMessage.set('Job continuing. Agent will resume execution.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.continuing'));
         this.resultIsError.set(false);
         this.loadJob();
       } else {
-        this.resultMessage.set('Failed to continue job. Check console for details.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.continueFailed'));
         this.resultIsError.set(true);
       }
     });
@@ -939,13 +940,13 @@ export class JobReviewComponent {
     this.api.resumeJob(jobId, this.feedbackText.trim()).subscribe((result) => {
       this.isResuming.set(false);
       if (result) {
-        this.resultMessage.set('Job resumed with feedback. Agent will continue working.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.resumedWithFeedback'));
         this.resultIsError.set(false);
         this.feedbackText = '';
         // Reload to reflect new status
         this.loadJob();
       } else {
-        this.resultMessage.set('Failed to resume job. Check console for details.');
+        this.resultMessage.set(this.transloco.translate('jobReview.messages.resumeFailed'));
         this.resultIsError.set(true);
       }
     });
@@ -953,7 +954,7 @@ export class JobReviewComponent {
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString(undefined, {
+    return date.toLocaleDateString(this.transloco.getActiveLang(), {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',

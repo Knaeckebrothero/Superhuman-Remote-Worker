@@ -9,6 +9,7 @@ import {ToastService} from '../../../core/services/toast.service';
 import {AgentSettingsComponent} from '../../../shared/components/agent-settings/agent-settings.component';
 import {ModelService} from '../../../core/services/model.service';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 interface Project {
   id: string;
@@ -41,24 +42,24 @@ interface ExpertDetail extends Expert {
 @Component({
   selector: 'app-session-create',
   standalone: true,
-  imports: [FormsModule, AgentSettingsComponent, SidebarToggleComponent],
+  imports: [FormsModule, AgentSettingsComponent, SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="session-create-page">
       <div class="page-header">
         <app-sidebar-toggle />
-        <h2>New Session</h2>
-        <button class="btn btn-secondary" (click)="cancel()">Cancel</button>
+        <h2>{{ 'sessions.create.title' | transloco }}</h2>
+        <button class="btn btn-secondary" (click)="cancel()">{{ 'sessions.create.cancel' | transloco }}</button>
       </div>
 
       <div class="form-container">
         <!-- Title -->
         <div class="form-group">
-          <label class="form-label">Title</label>
+          <label class="form-label">{{ 'sessions.create.titleLabel' | transloco }}</label>
           <input
             type="text"
             class="form-input"
             [(ngModel)]="title"
-            placeholder="Untitled Session"
+            [placeholder]="'sessions.create.titlePlaceholder' | transloco"
             [disabled]="creating()"
           >
         </div>
@@ -66,7 +67,7 @@ interface ExpertDetail extends Expert {
         <!-- Projects (multi-select chips) -->
         @if (projects().length > 0) {
           <div class="form-group">
-            <label class="form-label">Projects</label>
+            <label class="form-label">{{ 'sessions.create.projectsLabel' | transloco }}</label>
             <div class="project-chips">
               @for (project of projects(); track project.id) {
                 <button
@@ -79,15 +80,15 @@ interface ExpertDetail extends Expert {
                 >{{ project.name }}</button>
               }
             </div>
-            <span class="field-hint">Select projects for shared knowledge access</span>
+            <span class="field-hint">{{ 'sessions.create.projectsHint' | transloco }}</span>
           </div>
         }
 
         <!-- Expert selector -->
         <div class="form-group">
-          <label class="form-label">Expert</label>
+          <label class="form-label">{{ 'sessions.create.expertLabel' | transloco }}</label>
           @if (loadingExperts()) {
-            <div class="loading-hint">Loading experts...</div>
+            <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
           } @else if (experts().length > 0) {
             <div class="expert-grid">
               @for (expert of experts(); track expert.id) {
@@ -126,10 +127,10 @@ interface ExpertDetail extends Expert {
         <!-- Footer -->
         <div class="form-actions">
           <button class="btn btn-secondary" (click)="cancel()" [disabled]="creating()">
-            Cancel
+            {{ 'sessions.create.cancel' | transloco }}
           </button>
           <button class="btn btn-primary" (click)="createSession()" [disabled]="creating()">
-            {{ creating() ? 'Creating...' : 'Create Session' }}
+            {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
           </button>
         </div>
       </div>

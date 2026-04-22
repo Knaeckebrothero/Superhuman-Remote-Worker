@@ -1,4 +1,5 @@
 import { Component, inject, effect, OnInit } from '@angular/core';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { TodoService } from '../../../core/services/todo.service';
 import { DataService } from '../../../core/services/data.service';
 import { TodoItem } from '../../../core/models/todo.model';
@@ -10,6 +11,7 @@ import { TodoItem } from '../../../core/models/todo.model';
 @Component({
   selector: 'app-todo-list',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="todo-container">
       <!-- Header with phase selector -->
@@ -20,16 +22,16 @@ import { TodoItem } from '../../../core/models/todo.model';
           (change)="onPhaseSelect($event)"
         >
           <option value="current" [disabled]="!todo.currentTodos()">
-            Current Phase
+            {{ 'todoList.phaseSelector.current' | transloco }}
             @if (todo.currentTodos()) {
-              ({{ todo.currentTodos()!.todos.length }} todos)
+              {{ 'todoList.phaseSelector.currentCount' | transloco: {n: todo.currentTodos()!.todos.length} }}
             }
           </option>
           @if (todo.archives().length > 0) {
-            <optgroup label="Archived Phases">
+            <optgroup [label]="'todoList.phaseSelector.archivedPhases' | transloco">
               @for (archive of todo.archives(); track archive.filename) {
                 <option [value]="archive.filename">
-                  {{ archive.phase_name || 'Unnamed Phase' }}
+                  {{ archive.phase_name || ('todoList.phaseSelector.unnamedPhase' | transloco) }}
                   @if (archive.timestamp) {
                     - {{ formatArchiveDate(archive.timestamp) }}
                   }
@@ -42,7 +44,7 @@ import { TodoItem } from '../../../core/models/todo.model';
           class="refresh-btn"
           (click)="todo.refresh()"
           [disabled]="todo.isLoading()"
-          title="Refresh todos"
+          [title]="'todoList.refreshTitle' | transloco"
         >
           &#x21bb;
         </button>
@@ -83,7 +85,7 @@ import { TodoItem } from '../../../core/models/todo.model';
       @if (todo.error()) {
         <div class="error-state">
           <span>{{ todo.error() }}</span>
-          <button (click)="todo.refresh()">Retry</button>
+          <button (click)="todo.refresh()">{{ 'todoList.retry' | transloco }}</button>
         </div>
       }
 
@@ -91,8 +93,8 @@ import { TodoItem } from '../../../core/models/todo.model';
       @if (!todo.hasWorkspace() && !todo.isLoading() && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C1;</span>
-          <span>No workspace found</span>
-          <span class="empty-hint">Job workspace may not exist yet</span>
+          <span>{{ 'todoList.empty.noWorkspace' | transloco }}</span>
+          <span class="empty-hint">{{ 'todoList.empty.noWorkspaceHint' | transloco }}</span>
         </div>
       }
 
@@ -100,8 +102,8 @@ import { TodoItem } from '../../../core/models/todo.model';
       @if (!data.currentJobId() && !todo.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
-          <span>Select a job from the timeline bar</span>
-          <span class="empty-hint">Todos will appear here</span>
+          <span>{{ 'todoList.empty.noJob' | transloco }}</span>
+          <span class="empty-hint">{{ 'todoList.empty.noJobHint' | transloco }}</span>
         </div>
       }
 
@@ -115,13 +117,9 @@ import { TodoItem } from '../../../core/models/todo.model';
       ) {
         <div class="empty-state">
           <span class="empty-icon">&#x2705;</span>
-          <span>No todos in this phase</span>
+          <span>{{ 'todoList.empty.noTodos' | transloco }}</span>
           <span class="empty-hint">
-            @if (todo.isShowingCurrent()) {
-              The agent may be in strategic planning
-            } @else {
-              This archive has no recorded todos
-            }
+            {{ (todo.isShowingCurrent() ? 'todoList.empty.planningHint' : 'todoList.empty.archiveHint') | transloco }}
           </span>
         </div>
       }
@@ -155,7 +153,7 @@ import { TodoItem } from '../../../core/models/todo.model';
                 }
               </div>
               @if (item.priority === 'high') {
-                <span class="priority-badge">HIGH</span>
+                <span class="priority-badge">{{ 'todoList.priorityHigh' | transloco }}</span>
               }
             </div>
           }
@@ -166,13 +164,13 @@ import { TodoItem } from '../../../core/models/todo.model';
       @if (todo.selectedArchiveData()?.summary; as summary) {
         <div class="summary-bar">
           <span class="summary-item">
-            Total: {{ summary.total || todo.displayTodos().length }}
+            {{ 'todoList.summary.total' | transloco: {n: summary.total || todo.displayTodos().length} }}
           </span>
           <span class="summary-item completed">
-            Completed: {{ summary.completed || 0 }}
+            {{ 'todoList.summary.completed' | transloco: {n: summary.completed || 0} }}
           </span>
           <span class="summary-item pending">
-            Remaining: {{ summary.not_completed || 0 }}
+            {{ 'todoList.summary.remaining' | transloco: {n: summary.not_completed || 0} }}
           </span>
         </div>
       }
@@ -494,6 +492,7 @@ import { TodoItem } from '../../../core/models/todo.model';
 export class TodoListComponent implements OnInit {
   readonly todo = inject(TodoService);
   readonly data = inject(DataService);
+  private readonly transloco = inject(TranslocoService);
 
   constructor() {
     // Load todos when selected job changes
@@ -526,7 +525,7 @@ export class TodoListComponent implements OnInit {
   formatArchiveDate(timestamp: string): string {
     try {
       const date = new Date(timestamp);
-      return date.toLocaleDateString(undefined, {
+      return date.toLocaleDateString(this.transloco.getActiveLang(), {
         month: 'short',
         day: 'numeric',
         hour: '2-digit',

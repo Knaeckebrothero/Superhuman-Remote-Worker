@@ -2,6 +2,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
+import {TranslocoService} from '@jsverse/transloco';
 import {ModelGroupComponent} from './model-group.component';
 import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
@@ -44,11 +45,18 @@ function createComponent(overrides?: {
     updatePreferences: vi.fn().mockReturnValue(of({status: 'ok'})),
   };
 
+  const mockTransloco = {
+    translate: (key: string) => key,
+    langChanges$: of('en'),
+    getActiveLang: () => 'en',
+  };
+
   const injector = Injector.create({
     providers: [
       {provide: ModelService, useValue: mockModelService},
       {provide: HttpClient, useValue: mockHttp},
       {provide: SettingsService, useValue: mockSettings},
+      {provide: TranslocoService, useValue: mockTransloco},
     ],
   });
 

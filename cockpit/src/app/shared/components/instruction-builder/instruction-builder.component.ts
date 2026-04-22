@@ -1,6 +1,7 @@
 import {AfterViewChecked, Component, computed, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AgentStepsComponent, AgentStepType, IAgentStep} from '../agent-steps/agent-steps.component';
 import {JobArtifactService, PendingWorkspaceEdit} from '../../../core/services/job-artifact.service';
 import {BuilderSession, BuilderStreamService} from '../../../core/services/builder-stream.service';
@@ -24,19 +25,18 @@ interface ChatMessage {
 @Component({
   selector: 'app-instruction-builder',
   standalone: true,
-  imports: [FormsModule, MarkdownComponent, AgentStepsComponent],
+  imports: [FormsModule, MarkdownComponent, AgentStepsComponent, TranslocoPipe],
   template: `
     <div class="builder-container">
       @if (!artifacts.sessionId()) {
         <div class="empty-state">
           <span class="empty-icon">smart_toy</span>
-          <span class="empty-title">AI Instruction Builder</span>
+          <span class="empty-title">{{ 'builder.empty.title' | transloco }}</span>
           <span class="empty-desc">
-            Describe what you want the agent to do, and I'll help you write
-            the instructions, configure settings, and set up the job.
+            {{ 'builder.empty.desc' | transloco }}
           </span>
           <span class="empty-hint">
-            Start typing below to begin a conversation.
+            {{ 'builder.empty.hint' | transloco }}
           </span>
         </div>
       } @else {
@@ -97,7 +97,7 @@ interface ChatMessage {
               <div class="proposal-header">
                 <span class="proposal-icon">edit_note</span>
                 <span class="proposal-title">
-                  {{ edit.proposal.operation === 'write' ? 'Write' : 'Edit' }}:
+                  {{ (edit.proposal.operation === 'write' ? 'builder.proposal.write' : 'builder.proposal.edit') | transloco }}:
                   <code>{{ edit.proposal.path }}</code>
                 </span>
                 <span class="proposal-badge" [class]="'badge-' + edit.status">{{ edit.status }}</span>
@@ -106,32 +106,32 @@ interface ChatMessage {
                 <div class="proposal-diff">
                   @if (edit.proposal.operation === 'edit') {
                     <div class="diff-section diff-remove">
-                      <span class="diff-label">Remove</span>
+                      <span class="diff-label">{{ 'builder.proposal.diffRemove' | transloco }}</span>
                       <pre class="diff-content">{{ edit.proposal.old_text }}</pre>
                     </div>
                     <div class="diff-section diff-add">
-                      <span class="diff-label">Insert</span>
+                      <span class="diff-label">{{ 'builder.proposal.diffInsert' | transloco }}</span>
                       <pre class="diff-content">{{ edit.proposal.new_text }}</pre>
                     </div>
                   } @else {
                     @if (edit.proposal.current_content) {
                       <details class="diff-details">
-                        <summary class="diff-details-summary">Current content ({{ edit.proposal.current_content!.length }} chars)</summary>
+                        <summary class="diff-details-summary">{{ 'builder.proposal.currentContent' | transloco: {length: edit.proposal.current_content!.length} }}</summary>
                         <pre class="diff-content diff-current">{{ edit.proposal.current_content }}</pre>
                       </details>
                     }
                     <details class="diff-details" open>
-                      <summary class="diff-details-summary">New content ({{ edit.proposal.content!.length }} chars)</summary>
+                      <summary class="diff-details-summary">{{ 'builder.proposal.newContent' | transloco: {length: edit.proposal.content!.length} }}</summary>
                       <pre class="diff-content diff-new">{{ edit.proposal.content }}</pre>
                     </details>
                   }
                 </div>
                 <div class="proposal-actions">
                   <button type="button" class="proposal-btn apply-btn" (click)="applyWorkspaceEdit(edit)">
-                    <span class="btn-icon">check</span> Apply
+                    <span class="btn-icon">check</span> {{ 'builder.proposal.apply' | transloco }}
                   </button>
                   <button type="button" class="proposal-btn dismiss-btn-ws" (click)="dismissWorkspaceEdit(edit)">
-                    <span class="btn-icon">close</span> Dismiss
+                    <span class="btn-icon">close</span> {{ 'builder.proposal.dismiss' | transloco }}
                   </button>
                 </div>
               }
@@ -143,14 +143,14 @@ interface ChatMessage {
       @if (isCreatingSession()) {
         <div class="session-loading">
           <span class="spinner-small"></span>
-          Starting session...
+          {{ 'builder.session.starting' | transloco }}
         </div>
       }
 
       @if (isRestoringSession()) {
         <div class="session-loading">
           <span class="spinner-small"></span>
-          Restoring conversation...
+          {{ 'builder.session.restoring' | transloco }}
         </div>
       }
 
@@ -160,7 +160,7 @@ interface ChatMessage {
             <span class="error-text">{{ error() }}</span>
             <div class="error-actions">
               @if (lastFailedMessage()) {
-                <button type="button" class="retry-btn" (click)="retryLastMessage()">Retry</button>
+                <button type="button" class="retry-btn" (click)="retryLastMessage()">{{ 'builder.input.retry' | transloco }}</button>
               }
               <button type="button" class="dismiss-btn" (click)="dismissError()">close</button>
             </div>
@@ -173,7 +173,7 @@ interface ChatMessage {
             [(ngModel)]="inputText"
             (keydown)="onKeyDown($event)"
             (input)="autoResizeTextarea()"
-            placeholder="Describe what the agent should do..."
+            [placeholder]="'builder.input.placeholder' | transloco"
             [disabled]="artifacts.streaming() || isCreatingSession() || isRestoringSession()"
             rows="1"
           ></textarea>
@@ -181,7 +181,7 @@ interface ChatMessage {
             <button type="button"
               class="stop-btn"
               (click)="stopStreaming()"
-              title="Stop generation"
+              [title]="'builder.input.stopTitle' | transloco"
             >
               stop
             </button>
@@ -978,6 +978,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
   private readonly stream = inject(BuilderStreamService);
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly sessions = signal<BuilderSession[]>([]);
   readonly showSessionDropdown = signal(false);
@@ -1028,7 +1029,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
         if (msgs.length > 0) {
           const restored: ChatMessage[] = msgs.map((m) => ({
             role: m.role,
-            content: m.content || '(applied changes)',
+            content: m.content || this.transloco.translate('builder.stream.appliedChanges'),
             toolCalls: m.tool_calls?.map((tc) => ({ tool: tc.tool, args: tc.args })),
             steps: m.steps?.map((s, i) => ({
               id: `restored-${m.id}-${i}`,
@@ -1133,8 +1134,8 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
         // Complete any active thought step and show executing tool
         this.completeActiveSteps();
         const title = tool === 'web_search'
-          ? `Searching: ${(args as Record<string, string>)['query']}`
-          : `Running: ${this.formatToolName(tool)}`;
+          ? this.transloco.translate('builder.stream.searching', {query: (args as Record<string, string>)['query']})
+          : this.transloco.translate('builder.stream.running', {tool: this.formatToolName(tool)});
         this.addStep('tool_call', title, JSON.stringify(args, null, 2), 'active');
         this.shouldScrollToBottom = true;
       },
@@ -1145,13 +1146,13 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
           // Rich inspection result
           this.addStep('inspection_result', `${this.formatToolName(tool)}`, content, 'complete');
         } else {
-          this.addStep('tool_result', `Result: ${this.formatToolName(tool)}`, '', 'complete');
+          this.addStep('tool_result', this.transloco.translate('builder.stream.result', {tool: this.formatToolName(tool)}), '', 'complete');
         }
         this.shouldScrollToBottom = true;
       },
       onWorkspaceProposal: (proposal) => {
         this.completeActiveSteps();
-        const label = proposal.operation === 'write' ? 'Write' : 'Edit';
+        const label = this.transloco.translate(proposal.operation === 'write' ? 'builder.proposal.write' : 'builder.proposal.edit');
         this.addStep('workspace_proposal', `${label}: ${proposal.path}`, '', 'complete');
         this.artifacts.addWorkspaceProposal(proposal);
         this.shouldScrollToBottom = true;
@@ -1167,7 +1168,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
           ...msgs,
           {
             role: 'assistant',
-            content: content || '(applied changes)',
+            content: content || this.transloco.translate('builder.stream.appliedChanges'),
             toolCalls: toolCalls.length > 0 ? [...toolCalls] : undefined,
             steps: finalSteps.length > 0 ? finalSteps : undefined,
           },
@@ -1238,7 +1239,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
         if (result) {
           this.artifacts.resolveWorkspaceEdit(edit.id, 'approved');
         } else {
-          this.error.set(`Failed to write ${p.path}`);
+          this.error.set(this.transloco.translate('builder.errors.writeFailed', {path: p.path}));
         }
       },
       error: () => {
@@ -1359,7 +1360,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
             this.artifacts.persistSessionId(session.id);
             resolve(session.id);
           } else {
-            this.error.set('Failed to create builder session');
+            this.error.set(this.transloco.translate('builder.session.createFailed'));
             resolve(null);
           }
         },

@@ -1,4 +1,5 @@
 import {Component, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {Agent, AgentStatus} from '../../../core/models/api.model';
 import {JobSummary} from '../../../core/models/audit.model';
@@ -11,14 +12,15 @@ import {JobSummary} from '../../../core/models/audit.model';
 @Component({
   selector: 'app-agent-list',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="agent-list-container">
       <!-- Header -->
       <div class="header-bar">
-        <span class="title">Registered Agents</span>
-        <span class="agent-count">{{ agents().length }} agents</span>
+        <span class="title">{{ 'agentList.title' | transloco }}</span>
+        <span class="agent-count">{{ 'agentList.count' | transloco: {n: agents().length} }}</span>
         <button class="refresh-btn" (click)="refresh()" [disabled]="isLoading()">
-          {{ isLoading() ? 'Loading...' : 'Refresh' }}
+          {{ (isLoading() ? 'agentList.loading' : 'agentList.refresh') | transloco }}
         </button>
       </div>
 
@@ -27,14 +29,14 @@ import {JobSummary} from '../../../core/models/audit.model';
         <div class="dialog-overlay" (click)="closeAssignDialog()">
           <div class="dialog-content" (click)="$event.stopPropagation()">
             <div class="dialog-header">
-              <span class="dialog-title">Assign Job to Agent</span>
+              <span class="dialog-title">{{ 'agentList.assign.title' | transloco }}</span>
               <button class="close-btn" (click)="closeAssignDialog()">&times;</button>
             </div>
             <div class="dialog-body">
               @if (availableJobs().length === 0) {
                 <div class="no-jobs">
-                  <span>No jobs available for assignment</span>
-                  <span class="hint">Create a job first or wait for jobs with "created" status</span>
+                  <span>{{ 'agentList.assign.noJobs' | transloco }}</span>
+                  <span class="hint">{{ 'agentList.assign.noJobsHint' | transloco }}</span>
                 </div>
               } @else {
                 <div class="job-select-list">
@@ -52,17 +54,13 @@ import {JobSummary} from '../../../core/models/audit.model';
               }
             </div>
             <div class="dialog-footer">
-              <button class="btn btn-secondary" (click)="closeAssignDialog()">Cancel</button>
+              <button class="btn btn-secondary" (click)="closeAssignDialog()">{{ 'agentList.assign.cancel' | transloco }}</button>
               <button
                 class="btn btn-primary"
                 [disabled]="!selectedJobId() || isAssigning()"
                 (click)="confirmAssignment()"
               >
-                @if (isAssigning()) {
-                  Assigning...
-                } @else {
-                  Assign Job
-                }
+                {{ (isAssigning() ? 'agentList.assign.assigning' : 'agentList.assign.confirm') | transloco }}
               </button>
             </div>
           </div>
@@ -73,7 +71,7 @@ import {JobSummary} from '../../../core/models/audit.model';
       @if (isLoading() && agents().length === 0) {
         <div class="loading-state">
           <div class="spinner"></div>
-          <span>Loading agents...</span>
+          <span>{{ 'agentList.loadingAgents' | transloco }}</span>
         </div>
       }
 
@@ -81,8 +79,8 @@ import {JobSummary} from '../../../core/models/audit.model';
       @if (!isLoading() && agents().length === 0) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F916;</span>
-          <span>No agents registered</span>
-          <span class="empty-hint">Agents will appear here when they connect to the orchestrator</span>
+          <span>{{ 'agentList.empty' | transloco }}</span>
+          <span class="empty-hint">{{ 'agentList.emptyHint' | transloco }}</span>
         </div>
       }
 
@@ -92,12 +90,12 @@ import {JobSummary} from '../../../core/models/audit.model';
           <table class="agent-table">
             <thead>
               <tr>
-                <th>Status</th>
-                <th>Config</th>
-                <th>Hostname</th>
-                <th>Current Job</th>
-                <th>Last Heartbeat</th>
-                <th>Actions</th>
+                <th>{{ 'agentList.table.status' | transloco }}</th>
+                <th>{{ 'agentList.table.config' | transloco }}</th>
+                <th>{{ 'agentList.table.hostname' | transloco }}</th>
+                <th>{{ 'agentList.table.currentJob' | transloco }}</th>
+                <th>{{ 'agentList.table.lastHeartbeat' | transloco }}</th>
+                <th>{{ 'agentList.table.actions' | transloco }}</th>
               </tr>
             </thead>
             <tbody>
@@ -105,7 +103,7 @@ import {JobSummary} from '../../../core/models/audit.model';
                 <tr [class]="'status-' + agent.status">
                   <td>
                     <span class="status-badge" [class]="'status-' + agent.status">
-                      {{ getStatusIcon(agent.status) }} {{ agent.status }}
+                      {{ getStatusIcon(agent.status) }} {{ 'agentList.status.' + agent.status | transloco }}
                     </span>
                   </td>
                   <td class="config-name">{{ agent.config_name }}</td>
@@ -125,14 +123,14 @@ import {JobSummary} from '../../../core/models/audit.model';
                       <button
                         class="action-btn assign"
                         (click)="openAssignDialog(agent.id)"
-                        title="Assign a job to this agent"
+                        [title]="'agentList.actions.assignTitle' | transloco"
                       >
-                        Assign Job
+                        {{ 'agentList.actions.assign' | transloco }}
                       </button>
                     }
                     @if (agent.status === 'offline' || agent.status === 'failed') {
                       <button class="action-btn remove" (click)="removeAgent(agent.id)">
-                        Remove
+                        {{ 'agentList.actions.remove' | transloco }}
                       </button>
                     }
                   </td>
@@ -151,11 +149,11 @@ import {JobSummary} from '../../../core/models/audit.model';
           </span>
         } @else {
           <span class="auto-refresh">
-            Auto-refresh: {{ autoRefreshEnabled() ? 'ON (30s)' : 'OFF' }}
+            {{ (autoRefreshEnabled() ? 'agentList.footer.autoRefreshOn' : 'agentList.footer.autoRefreshOff') | transloco }}
           </span>
         }
         <button class="toggle-btn" (click)="toggleAutoRefresh()">
-          {{ autoRefreshEnabled() ? 'Disable' : 'Enable' }}
+          {{ (autoRefreshEnabled() ? 'agentList.footer.disable' : 'agentList.footer.enable') | transloco }}
         </button>
       </div>
     </div>
@@ -606,6 +604,7 @@ import {JobSummary} from '../../../core/models/audit.model';
 })
 export class AgentListComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly agents = signal<Agent[]>([]);
   readonly availableJobs = signal<JobSummary[]>([]);
@@ -685,15 +684,15 @@ export class AgentListComponent implements OnInit, OnDestroy {
         this.closeAssignDialog();
 
         if (result) {
-          this.showStatus('Job assigned successfully!', false);
+          this.showStatus(this.transloco.translate('agentList.messages.assigned'), false);
           this.refresh();
         } else {
-          this.showStatus('Failed to assign job', true);
+          this.showStatus(this.transloco.translate('agentList.messages.assignFailed'), true);
         }
       },
       error: () => {
         this.isAssigning.set(false);
-        this.showStatus('Error assigning job', true);
+        this.showStatus(this.transloco.translate('agentList.messages.assignError'), true);
       },
     });
   }
@@ -766,15 +765,15 @@ export class AgentListComponent implements OnInit, OnDestroy {
     const diffSec = Math.floor(diffMs / 1000);
 
     if (diffSec < 60) {
-      return `${diffSec}s ago`;
+      return this.transloco.translate('agentList.time.secondsAgo', {n: diffSec});
     }
     if (diffSec < 3600) {
-      return `${Math.floor(diffSec / 60)}m ago`;
+      return this.transloco.translate('agentList.time.minutesAgo', {n: Math.floor(diffSec / 60)});
     }
     if (diffSec < 86400) {
-      return `${Math.floor(diffSec / 3600)}h ago`;
+      return this.transloco.translate('agentList.time.hoursAgo', {n: Math.floor(diffSec / 3600)});
     }
-    return date.toLocaleDateString();
+    return date.toLocaleDateString(this.transloco.getActiveLang());
   }
 
   truncatePrompt(prompt: string | undefined, maxLength: number = 60): string {
@@ -789,7 +788,7 @@ export class AgentListComponent implements OnInit, OnDestroy {
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString(undefined, {
+    return date.toLocaleDateString(this.transloco.getActiveLang(), {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',
