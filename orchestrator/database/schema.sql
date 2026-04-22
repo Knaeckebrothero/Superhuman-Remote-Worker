@@ -165,6 +165,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_keys_provider ON user_api_keys(use
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
 
 -- ============================================================================
+-- 0i. USER LLM ENDPOINTS
+-- Per-user OpenAI-compatible LLM endpoints (vLLM, Ollama, private gateways)
+-- and the model IDs they serve. Replaces the single-LLM_BASE_URL mechanism.
+-- Custom-endpoint keys travel inline on the endpoint row — they are not
+-- merged into resolve_api_keys_for_job() which only covers named providers.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS user_llm_endpoints (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT,
+    key_prefix VARCHAR(12),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_user_llm_endpoint_label UNIQUE (user_id, label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_llm_endpoints_user ON user_llm_endpoints(user_id);
+
+CREATE TABLE IF NOT EXISTS user_llm_endpoint_models (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    endpoint_id UUID NOT NULL REFERENCES user_llm_endpoints(id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    family TEXT,
+    context_window INT,
+    reasoning_level TEXT,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_endpoint_model UNIQUE (endpoint_id, model_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_endpoint ON user_llm_endpoint_models(endpoint_id);
+CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_id ON user_llm_endpoint_models(model_id);
+
+-- ============================================================================
 -- 0c. PROJECTS TABLE
 -- Resource hub grouping jobs, repositories, datasources, and members.
 -- ============================================================================

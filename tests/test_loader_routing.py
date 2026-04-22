@@ -6,41 +6,14 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from src.core.loader import (
-    _detect_provider,
-    _needs_custom_base_url,
     _should_use_reasoning_summary,
     _clamp_reasoning_level,
     _OPENAI_REASONING_LEVELS,
     _create_openai_llm,
     _create_openrouter_llm,
     _create_codex_llm,
-    detect_model_family,
 )
-
-
-class TestNeedsCustomBaseUrl:
-    """Unit tests for the _needs_custom_base_url helper."""
-
-    def test_openai_prefix_needs_custom_url(self):
-        assert _needs_custom_base_url("openai/gpt-oss-120b") is True
-
-    def test_openai_prefix_case_insensitive(self):
-        assert _needs_custom_base_url("OpenAI/my-model") is True
-        assert _needs_custom_base_url("OPENAI/my-model") is True
-
-    def test_native_gpt_does_not_need_custom_url(self):
-        assert _needs_custom_base_url("gpt-5.2-pro") is False
-        assert _needs_custom_base_url("gpt-4o") is False
-        assert _needs_custom_base_url("gpt-4o-mini") is False
-
-    def test_native_o_series_does_not_need_custom_url(self):
-        assert _needs_custom_base_url("o1-preview") is False
-        assert _needs_custom_base_url("o3-mini") is False
-        assert _needs_custom_base_url("o4-mini") is False
-
-    def test_other_models_do_not_need_custom_url(self):
-        assert _needs_custom_base_url("claude-3-opus") is False
-        assert _needs_custom_base_url("gemini-pro") is False
+from src.core.model_registry import reload_registry
 
 
 def _make_config(**overrides):
@@ -68,19 +41,37 @@ _common_patches = [
 
 
 class TestOpenAILLMRouting:
-    """Integration tests for base_url routing in _create_openai_llm."""
+    """Integration tests for base_url routing in _create_openai_llm.
 
-    @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
-    @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_openai_prefix_uses_llm_base_url(self, mock_chat):
-        """openai/ prefixed model should use LLM_BASE_URL."""
-        mock_chat.return_value = MagicMock()
-        config = _make_config(model="openai/gpt-oss-120b")
+    After the registry refactor, base_url resolution is:
+      1. Explicit config.base_url always wins (dispatcher-injected for
+         custom endpoints).
+      2. Registry meta.base_url for known built-ins. The registry picks
+         up LLM_BASE_URL at load time for entries in the "Local" group.
+      3. None otherwise (native providers route to their canonical URL).
+    """
 
-        _create_openai_llm(config, limits=None)
+    _LOCAL_MODEL = "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
-        call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["base_url"] == "http://localhost:8080/v1"
+    def test_local_model_uses_llm_base_url(self):
+        """Built-in Local-group model picks up LLM_BASE_URL via the registry."""
+        env = os.environ.copy()
+        env["LLM_BASE_URL"] = "http://localhost:8080/v1"
+        with patch.dict(os.environ, env, clear=True):
+            reload_registry()  # re-read LLM_BASE_URL into Local-group entries
+            with patch("src.core.loader.ReasoningChatOpenAI") as mock_chat:
+                mock_chat.return_value = MagicMock()
+                config = _make_config(model=self._LOCAL_MODEL)
+                _create_openai_llm(config, limits=None)
+
+                call_kwargs = mock_chat.call_args[1]
+                assert call_kwargs["base_url"] == "http://localhost:8080/v1"
+                # Regression: the original bug was that the openai/ prefix
+                # leaked into the wire name and vLLM 404'd. The bare ID must
+                # reach the SDK untouched.
+                assert call_kwargs["model"] == self._LOCAL_MODEL
+                assert not call_kwargs["model"].startswith("openai/")
+        reload_registry()  # restore normal env state for downstream tests
 
     @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
@@ -97,7 +88,7 @@ class TestOpenAILLMRouting:
     @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_gpt4o_ignores_llm_base_url(self, mock_chat):
-        """gpt-4o should NOT use LLM_BASE_URL."""
+        """gpt-4o (native, not Local-group) should NOT use LLM_BASE_URL."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-4o")
 
@@ -109,7 +100,7 @@ class TestOpenAILLMRouting:
     @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_explicit_base_url_always_wins(self, mock_chat):
-        """Explicit config.base_url overrides everything, even for native models."""
+        """Explicit config.base_url overrides registry metadata entirely."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-4o", base_url="http://custom-proxy:9000/v1")
 
@@ -118,20 +109,20 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "http://custom-proxy:9000/v1"
 
-    @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_no_base_url_env_set(self, mock_chat):
-        """When LLM_BASE_URL is not set, even openai/ models get no base_url."""
-        mock_chat.return_value = MagicMock()
-        # Ensure LLM_BASE_URL is not set
+    def test_no_base_url_env_set(self):
+        """Without LLM_BASE_URL, Local-group models get no base_url."""
         env = os.environ.copy()
         env.pop("LLM_BASE_URL", None)
-
         with patch.dict(os.environ, env, clear=True):
-            config = _make_config(model="openai/gpt-oss-120b")
-            _create_openai_llm(config, limits=None)
+            reload_registry()
+            with patch("src.core.loader.ReasoningChatOpenAI") as mock_chat:
+                mock_chat.return_value = MagicMock()
+                config = _make_config(model=self._LOCAL_MODEL)
+                _create_openai_llm(config, limits=None)
 
-        call_kwargs = mock_chat.call_args[1]
-        assert "base_url" not in call_kwargs
+                call_kwargs = mock_chat.call_args[1]
+                assert "base_url" not in call_kwargs
+        reload_registry()
 
 
 class TestShouldUseReasoningSummary:
@@ -233,36 +224,6 @@ class TestReasoningSummaryRouting:
         call_kwargs = mock_chat.call_args[1]
         assert "reasoning" not in call_kwargs
         assert "model_kwargs" not in call_kwargs
-
-
-class TestDetectProviderOpenRouter:
-    """Unit tests for openrouter/ prefix detection in _detect_provider."""
-
-    def test_openrouter_prefix(self):
-        assert _detect_provider("openrouter/anthropic/claude-opus-4") == "openrouter"
-
-    def test_openrouter_prefix_case_insensitive(self):
-        assert _detect_provider("OpenRouter/openai/gpt-4o") == "openrouter"
-        assert _detect_provider("OPENROUTER/meta-llama/llama-3") == "openrouter"
-
-    def test_openrouter_various_models(self):
-        assert _detect_provider("openrouter/deepseek/deepseek-r1") == "openrouter"
-        assert _detect_provider("openrouter/openai/gpt-4o-mini") == "openrouter"
-        assert (
-            _detect_provider("openrouter/meta-llama/llama-3.3-70b-instruct")
-            == "openrouter"
-        )
-
-    def test_explicit_provider_overrides_prefix(self):
-        """Explicit provider should always win over prefix detection."""
-        assert _detect_provider("openrouter/some-model", "openai") == "openai"
-
-    def test_other_providers_unchanged(self):
-        """Ensure openrouter detection doesn't break existing providers."""
-        assert _detect_provider("claude-sonnet-4-20250514") == "anthropic"
-        assert _detect_provider("gemini-2.0-flash") == "google"
-        assert _detect_provider("groq/llama-3") == "groq"
-        assert _detect_provider("gpt-4o") == "openai"
 
 
 class TestOpenRouterLLMCreation:
@@ -440,55 +401,6 @@ class TestOpenRouterReasoningFormat:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "minimal"}
-
-
-class TestDetectProviderCodex:
-    """Unit tests for codex/ prefix detection in _detect_provider."""
-
-    def test_codex_prefix(self):
-        assert _detect_provider("codex/gpt-5.4-pro") == "codex"
-
-    def test_codex_prefix_case_insensitive(self):
-        assert _detect_provider("Codex/o3-pro") == "codex"
-        assert _detect_provider("CODEX/gpt-4o") == "codex"
-
-    def test_codex_various_models(self):
-        assert _detect_provider("codex/gpt-4o") == "codex"
-        assert _detect_provider("codex/o3-pro") == "codex"
-        assert _detect_provider("codex/gpt-5.4-pro") == "codex"
-        assert _detect_provider("codex/o4-mini") == "codex"
-
-    def test_explicit_provider_overrides_codex_prefix(self):
-        """Explicit provider should always win over prefix detection."""
-        assert _detect_provider("codex/some-model", "openai") == "openai"
-
-    def test_other_providers_unchanged(self):
-        """Ensure codex detection doesn't break existing providers."""
-        assert _detect_provider("claude-sonnet-4-20250514") == "anthropic"
-        assert _detect_provider("gemini-2.0-flash") == "google"
-        assert _detect_provider("groq/llama-3") == "groq"
-        assert _detect_provider("openrouter/openai/gpt-4o") == "openrouter"
-        assert _detect_provider("gpt-4o") == "openai"
-
-
-class TestCodexModelFamilyDetection:
-    """Verify detect_model_family strips codex/ prefix correctly."""
-
-    def test_codex_gpt5_family(self):
-        assert detect_model_family("codex/gpt-5.4-pro") == "gpt-5"
-
-    def test_codex_o_series_family(self):
-        assert detect_model_family("codex/o3-pro") == "o-series"
-        assert detect_model_family("codex/o4-mini") == "o-series"
-
-    def test_codex_gpt4o_family(self):
-        assert detect_model_family("codex/gpt-4o") == "gpt-4o"
-
-    def test_codex_does_not_affect_other_prefixes(self):
-        """Existing prefix stripping should still work."""
-        assert detect_model_family("openrouter/openai/gpt-4o") == "gpt-4o"
-        assert detect_model_family("groq/llama-3.3-70b") == "llama"
-        assert detect_model_family("openai/gpt-oss-120b") == "gpt-oss"
 
 
 class TestCodexLLMCreation:

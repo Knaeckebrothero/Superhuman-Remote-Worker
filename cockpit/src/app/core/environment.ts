@@ -43,7 +43,7 @@ export const environment = {
   models: getEnvArray<{ group: string; models: string[] }>('models'),
   modelPresets: getEnvArray<{ label: string; strategic: string; tactical: string }>('modelPresets'),
   builderModels: getEnvArray<{ label: string; id: string }>('builderModels', [
-    { label: 'Gemma 4 31B (Local)', id: 'openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic' },
+    { label: 'Gemma 4 31B (Local)', id: 'RedHatAI/gemma-4-31B-it-FP8-Dynamic' },
     { label: 'MiniMax M2.7', id: 'openrouter/minimax/minimax-m2.7' },
     { label: 'GPT-5.4', id: 'gpt-5.4' },
     { label: 'Codex (coding)', id: 'codex/gpt-5.3-codex' },

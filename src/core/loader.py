@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 from langchain_core.language_models import BaseChatModel
 
+from src.core.model_registry import family_of, resolve_builtin
 from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
@@ -209,7 +210,7 @@ def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, 
     Returns:
         Dict of inference params (temperature, top_p, top_k, model_max_context_tokens, etc.)
     """
-    family = detect_model_family(model)
+    family = family_of(model)
     matrix = _load_settings_matrix(deployment_dir)
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
@@ -241,7 +242,7 @@ def _apply_settings_matrix(
     """
     llm_data = data.get("llm", {})
     model = llm_data.get("model", "gpt-4o")
-    family = detect_model_family(model)
+    family = family_of(model)
 
     matrix = _load_settings_matrix(deployment_dir)
     default_settings = matrix.get("default", {})
@@ -1612,102 +1613,6 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     return merged
 
 
-def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str:
-    """Detect LLM provider from model name or explicit setting.
-
-    Args:
-        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o",
-               "openrouter/anthropic/claude-opus-4")
-        explicit_provider: Explicit provider override ("openai", "anthropic", "google",
-                          "groq", "openrouter")
-
-    Returns:
-        Provider name: "openai", "anthropic", "google", "groq", or "openrouter"
-
-    Note:
-        Groq requires explicit provider setting since it hosts open models
-        (Llama, Mixtral, etc.) that could also be served via other providers.
-    """
-    if explicit_provider:
-        return explicit_provider.lower()
-
-    model_lower = model.lower()
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if model_lower.startswith("groq/"):
-        return "groq"
-    if model_lower.startswith("codex/"):
-        return "codex"
-    if model_lower.startswith("claude"):
-        return "anthropic"
-    if model_lower.startswith("gemini"):
-        return "google"
-    # Default to openai (covers gpt-*, openai/*, local models)
-    return "openai"
-
-
-def detect_model_family(model: str) -> str:
-    """Detect model family from model name for prompt matrix resolution.
-
-    Strips provider prefixes (openrouter/, groq/, openai/) and pattern-matches
-    the model name to a family string. Returns "default" as fallback.
-
-    Args:
-        model: Model name (e.g., "claude-opus-4-6", "openrouter/deepseek/deepseek-r1")
-
-    Returns:
-        Family string (e.g., "claude-opus", "deepseek", "default")
-    """
-    name = model.lower()
-
-    # Strip provider prefixes to get the actual model name
-    for prefix in ("openrouter/", "groq/", "codex/"):
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-            # Strip second-level provider prefix (e.g., "anthropic/" in "openrouter/anthropic/claude-opus-4")
-            if "/" in name:
-                name = name.split("/", 1)[1]
-            break
-
-    # Strip openai/ prefix for self-hosted models
-    if name.startswith("openai/"):
-        name = name[len("openai/") :]
-
-    # Pattern match model name to family
-    if name.startswith("claude-opus"):
-        return "claude-opus"
-    if name.startswith("claude-sonnet"):
-        return "claude-sonnet"
-    if name.startswith("claude-haiku"):
-        return "claude-haiku"
-    if "codex-spark" in name:
-        return "codex-spark"
-    if "codex" in name and name.startswith("gpt-5"):
-        return "codex"
-    if name.startswith("gpt-5"):
-        return "gpt-5"
-    if name.startswith("gpt-4o"):
-        return "gpt-4o"
-    if name.startswith(("o1", "o3", "o4")):
-        return "o-series"
-    if "deepseek" in name:
-        return "deepseek"
-    if "qwen" in name or "qwq" in name:
-        return "qwen"
-    if "llama" in name:
-        return "llama"
-    if name.startswith("gemini"):
-        return "gemini"
-    if name.startswith("gpt-oss"):
-        return "gpt-oss"
-    if "gemma" in name:
-        return "gemma"
-    if "minimax" in name:
-        return "minimax"
-
-    return "default"
-
-
 def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -> str:
     """Determine how reasoning level is delivered to the model.
 
@@ -1725,7 +1630,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
     if explicit_method:
         return explicit_method
 
-    family = detect_model_family(model)
+    family = family_of(model)
 
     if family == "gpt-oss":
         return "prompt"
@@ -1740,16 +1645,6 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
         return "none"
     # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
     return "api"
-
-
-def _needs_custom_base_url(model: str) -> bool:
-    """Check if model requires a custom base URL (OpenAI-compatible endpoint).
-
-    Models with 'openai/' prefix are served via OpenAI-compatible endpoints
-    (vLLM, llama.cpp, sglang) and need LLM_BASE_URL. Native OpenAI models
-    (gpt-*, o1-*, o3-*, o4-*) go directly to api.openai.com.
-    """
-    return model.lower().startswith("openai/")
 
 
 def _should_use_reasoning_summary(model: str) -> bool:
@@ -1809,7 +1704,15 @@ def create_llm(
     Returns:
         Configured LLM instance (ChatOpenAI, ChatAnthropic, ChatGoogleGenerativeAI, or ChatGroq)
     """
-    provider = _detect_provider(config.model, config.provider)
+    # Resolution order: explicit config override > registry > openai fallback.
+    # The registry is the source of truth for built-ins; custom endpoints
+    # land in config.base_url via dispatcher injection (they always route
+    # through the openai factory).
+    if config.provider:
+        provider = config.provider.lower()
+    else:
+        meta = resolve_builtin(config.model)
+        provider = meta.provider if meta is not None else "openai"
 
     if provider == "anthropic":
         return _create_anthropic_llm(config, limits)
@@ -1855,14 +1758,15 @@ def _create_openai_llm(
     # SDK gets the first key; KeyRing overrides the header in send()
     api_key = keys[0]
 
-    # Get base URL: explicit config wins, then LLM_BASE_URL for openai/ models only.
-    # Native OpenAI models (gpt-*, o1-*, etc.) go directly to api.openai.com.
+    # Get base URL: explicit config wins (dispatcher-injected for custom
+    # endpoints), then the registry (which pre-resolves LLM_BASE_URL for
+    # built-in Local-group entries at startup). Native OpenAI models have
+    # no base_url and go straight to api.openai.com.
     if config.base_url:
         base_url = config.base_url
-    elif _needs_custom_base_url(config.model):
-        base_url = os.getenv("LLM_BASE_URL")
     else:
-        base_url = None
+        meta = resolve_builtin(config.model)
+        base_url = meta.base_url if meta is not None else None
 
     # Build model kwargs
     model_kwargs = {}
@@ -2421,7 +2325,7 @@ def get_phase_system_prompt(
     # Check for pre-resolved prompt content (from resolved_config JSONB)
     resolved_prompts = config.extra.get("_resolved_prompts", {})
 
-    model_family = detect_model_family(model) if model else "default"
+    model_family = family_of(model) if model else "default"
     resolver = PromptMatrixResolver(config._deployment_dir, model_family)
 
     # Interactive mode: single self-contained prompt, no phase component injection
@@ -2528,7 +2432,7 @@ def load_instructions(config: AgentConfig, model: str = "") -> str:
     if resolved.get("instructions"):
         return resolved["instructions"]
 
-    model_family = detect_model_family(model) if model else "default"
+    model_family = family_of(model) if model else "default"
     resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
     try:
         return resolver.load("instructions")
@@ -2585,7 +2489,7 @@ def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     template = resolved.get("summarization") or ""
 
     if not template:
-        model_family = detect_model_family(model) if model else "default"
+        model_family = family_of(model) if model else "default"
         resolver = PromptMatrixResolver(config._deployment_dir, model_family)
         try:
             template = resolver.load("summarization")
@@ -2646,7 +2550,7 @@ def load_auxiliary_prompt(
     template = resolved.get(prompt_type) or ""
 
     if not template:
-        model_family = detect_model_family(model) if model else "default"
+        model_family = family_of(model) if model else "default"
         resolver = PromptMatrixResolver(config._deployment_dir, model_family)
         template = resolver.load(prompt_type)
 
@@ -3002,7 +2906,7 @@ def load_strategic_todos_template(
         return _parse_strategic_todos_yaml_from_string(resolved_content)
 
     # Use InstructionMatrixResolver for 4-level fallback
-    model_family = detect_model_family(model) if model else "default"
+    model_family = family_of(model) if model else "default"
     resolver = InstructionMatrixResolver(deployment_dir, model_family)
 
     # Strip .yaml extension for instruction type key
@@ -3206,7 +3110,7 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     import dataclasses
     from datetime import datetime, timezone
 
-    model_family = detect_model_family(model) if model else "default"
+    model_family = family_of(model) if model else "default"
 
     # Agent config as dict (strip internal fields and secrets)
     agent_dict = dataclasses.asdict(config)
