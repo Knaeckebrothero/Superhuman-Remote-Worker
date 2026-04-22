@@ -72,7 +72,7 @@ interface Project {
             <select [(ngModel)]="newModel">
               <option value="">{{ 'sessions.create.modelConfigDefault' | transloco }}</option>
               <optgroup label="Local">
-                <option value="openai/gpt-oss-120b">GPT-OSS 120B (local)</option>
+                <option value="openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic">Gemma 4 31B (local)</option>
               </optgroup>
               <optgroup label="OpenAI">
                 <option value="gpt-5.4">GPT-5.4</option>

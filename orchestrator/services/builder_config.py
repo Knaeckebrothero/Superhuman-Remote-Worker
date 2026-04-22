@@ -83,6 +83,8 @@ def detect_model_family(model: str) -> str:
         return "gemini"
     if name.startswith("gpt-oss"):
         return "gpt-oss"
+    if "gemma" in name:
+        return "gemma"
     if "minimax" in name:
         return "minimax"
 

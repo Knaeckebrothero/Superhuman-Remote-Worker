@@ -8858,7 +8858,8 @@ class ThreadCreateRequest(BaseModel):
     permission_mode: str = Field("supervised", description="Initial permission mode")
     title: str = Field("Untitled Session", description="Session title")
     model: str | None = Field(
-        None, description="LLM model override (e.g. openai/gpt-oss-120b)"
+        None,
+        description="LLM model override (e.g. openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
     )
     temperature: float | None = Field(None, description="Temperature override")
 

@@ -110,6 +110,7 @@ export function detectModelFamily(model: string): string {
   if (name.includes('llama')) return 'llama';
   if (name.startsWith('gemini')) return 'gemini';
   if (name.startsWith('gpt-oss')) return 'gpt-oss';
+  if (name.includes('gemma')) return 'gemma';
   if (name.includes('minimax')) return 'minimax';
 
   return 'default';

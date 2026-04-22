@@ -2636,7 +2636,7 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 
 def get_builder_model() -> str:
     """Get the model name for the builder LLM."""
-    return os.getenv("BUILDER_MODEL", "openai/gpt-oss-120b")
+    return os.getenv("BUILDER_MODEL", "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic")
 
 
 def get_builder_base_url() -> str | None:
