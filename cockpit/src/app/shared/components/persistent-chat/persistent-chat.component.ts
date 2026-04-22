@@ -13,26 +13,28 @@ import {JsonPipe, TitleCasePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService, ToolCallInfo,} from '../../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../../core/services/api.service';
 import {ModelService} from '../../../core/services/model.service';
+import {I18nService} from '../../../core/services/i18n.service';
 import {environment} from '../../../core/environment';
 import {SidebarToggleComponent} from '../../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 
 interface SlashCommand {
     command: string;
-    description: string;
+    descriptionKey: string;
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
-    {command: '/compact', description: 'Compress conversation history to free up context'},
-    {command: '/done', description: 'End session — extract memories and archive'},
-    {command: '/undo', description: 'Undo file changes from the last turn'},
-    {command: '/auto', description: 'Switch to auto-accept mode (approve all except shell)'},
-    {command: '/supervised', description: 'Switch to supervised mode (approve all writes)'},
-    {command: '/autonomous', description: 'Switch to autonomous mode (approve nothing)'},
-    {command: '/silent', description: 'Hide reasoning and minimize tool detail'},
-    {command: '/verbose', description: 'Show full reasoning and tool detail'},
+    {command: '/compact', descriptionKey: 'chat.slash.compact'},
+    {command: '/done', descriptionKey: 'chat.slash.done'},
+    {command: '/undo', descriptionKey: 'chat.slash.undo'},
+    {command: '/auto', descriptionKey: 'chat.slash.auto'},
+    {command: '/supervised', descriptionKey: 'chat.slash.supervised'},
+    {command: '/autonomous', descriptionKey: 'chat.slash.autonomous'},
+    {command: '/silent', descriptionKey: 'chat.slash.silent'},
+    {command: '/verbose', descriptionKey: 'chat.slash.verbose'},
 ];
 
 const TOOL_LABELS: Record<string, string> = {
@@ -143,7 +145,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
-    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent, SidebarToggleComponent],
+    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent, SidebarToggleComponent, TranslocoPipe],
     template: `
     <div class="chat-container">
       <!-- Header -->
@@ -154,46 +156,46 @@ const CATEGORY_LABELS: Record<string, string> = {
             <span class="back-icon">arrow_back</span>
           </a>
           <span class="header-icon">smart_toy</span>
-          <span class="header-title">{{ chat.sessionTitle() || 'Persistent Agent' }}</span>
+          <span class="header-title">{{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}</span>
           <span class="status-dot" [class]="connectionClass()"></span>
           <span class="status-label">{{ connectionLabel() }}</span>
         </div>
         <div class="header-right">
           @if (chat.isConnected()) {
             <button class="settings-btn" (click)="showSettings.update(v => !v)"
-                    [class.active]="showSettings()" title="Session settings">
+                    [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
               <span class="settings-icon">tune</span>
             </button>
           }
 
           @if (chat.isConnected()) {
             @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
-              <button class="ide-btn" (click)="openSessionFiles()" title="Open session files in Cloud">
+              <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
                 <span class="ide-icon">cloud</span>
-                Files
+                {{ 'chat.header.filesButton' | transloco }}
               </button>
             }
             @if (ideStatus(); as ide) {
               @if (ide.gitea_url) {
-                <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" title="View workspace in Gitea">
+                <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
                   <span class="ide-icon">history</span>
-                  Git
+                  {{ 'chat.header.gitButton' | transloco }}
                 </button>
               }
               @if (ide.status === 'active' && ide.code_server_url) {
-                <button class="ide-btn" (click)="openIde(ide.code_server_url!)" title="Open workspace in IDE">
+                <button class="ide-btn" (click)="openIde(ide.code_server_url!)" [title]="'chat.header.ideActiveTooltip' | transloco">
                   <span class="ide-icon">code</span>
-                  IDE
+                  {{ 'chat.header.ideButton' | transloco }}
                 </button>
               } @else if (ide.status === 'restoring') {
-                <button class="ide-btn ide-loading" disabled title="Workspace starting...">
+                <button class="ide-btn ide-loading" disabled [title]="'chat.header.ideLoadingTooltip' | transloco">
                   <span class="ide-spinner"></span>
-                  IDE
+                  {{ 'chat.header.ideButton' | transloco }}
                 </button>
               }
             }
             <button class="disconnect-btn" (click)="chat.disconnect()">
-              Disconnect
+              {{ 'chat.header.disconnect' | transloco }}
             </button>
           }
         </div>
@@ -206,9 +208,9 @@ const CATEGORY_LABELS: Record<string, string> = {
             <span class="status-chip model-chip">{{ chat.modelName() }}</span>
           }
           @if (chat.temperature()) {
-            <span class="status-chip">temp {{ chat.temperature() }}</span>
+            <span class="status-chip">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</span>
           }
-          <span class="status-chip turn-chip">Turn {{ chat.turnCount() }}</span>
+          <span class="status-chip turn-chip">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</span>
           <span class="status-chip mode-chip">{{ chat.permissionMode() | titlecase }}</span>
         </div>
       }
@@ -217,27 +219,27 @@ const CATEGORY_LABELS: Record<string, string> = {
       @if (showSettings()) {
         <div class="settings-panel">
           <div class="settings-row">
-            <label class="settings-label">Mode</label>
+            <label class="settings-label">{{ 'chat.settings.mode' | transloco }}</label>
             <select class="settings-select"
                     [value]="chat.permissionMode()"
                     (change)="onModeChange($event)">
-              <option value="supervised">Supervised</option>
-              <option value="auto_accept">Auto-accept</option>
-              <option value="autonomous">Autonomous</option>
+              <option value="supervised">{{ 'chat.settings.modeSupervised' | transloco }}</option>
+              <option value="auto_accept">{{ 'chat.settings.modeAutoAccept' | transloco }}</option>
+              <option value="autonomous">{{ 'chat.settings.modeAutonomous' | transloco }}</option>
             </select>
           </div>
           <div class="settings-row">
-            <label class="settings-label">Narration</label>
+            <label class="settings-label">{{ 'chat.settings.narration' | transloco }}</label>
             <select class="settings-select"
                     [value]="chat.narrationMode()"
                     (change)="onNarrationModeChange($event)">
-              <option value="auto">Auto</option>
-              <option value="verbose">Verbose</option>
-              <option value="silent">Silent</option>
+              <option value="auto">{{ 'chat.settings.narrationAuto' | transloco }}</option>
+              <option value="verbose">{{ 'chat.settings.narrationVerbose' | transloco }}</option>
+              <option value="silent">{{ 'chat.settings.narrationSilent' | transloco }}</option>
             </select>
           </div>
           <div class="settings-row">
-            <label class="settings-label">Model</label>
+            <label class="settings-label">{{ 'chat.settings.model' | transloco }}</label>
             <select class="settings-select"
                     [ngModel]="chat.modelName()"
                     (ngModelChange)="onModelChange($event)">
@@ -254,7 +256,7 @@ const CATEGORY_LABELS: Record<string, string> = {
             </select>
           </div>
           <div class="settings-row">
-            <label class="settings-label">Temperature: {{ chat.temperature() }}</label>
+            <label class="settings-label">{{ 'chat.settings.temperature' | transloco:{ value: chat.temperature() } }}</label>
             <input type="range" class="settings-slider" min="0" max="2" step="0.1"
                    [ngModel]="chat.temperature()"
                    (ngModelChange)="onTemperatureChange($event)">
@@ -269,7 +271,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                [class.task-header-clickable]="chat.tasks().length > 1"
                (click)="chat.tasks().length > 1 ? toggleTasksCollapsed() : null">
             <span class="task-header-icon">checklist</span>
-            Tasks {{ completedTaskCount() }}/{{ chat.tasks().length }}
+            {{ 'chat.tasks.header' | transloco:{ done: completedTaskCount(), total: chat.tasks().length } }}
             @if (chat.tasks().length > 1) {
               <span class="task-chevron" [class.task-chevron-open]="!tasksCollapsed()">expand_more</span>
             }
@@ -291,7 +293,7 @@ const CATEGORY_LABELS: Record<string, string> = {
               } @else {
                 <div class="task-item task-completed">
                   <span class="task-check" style="color: #a6e3a1">check_circle</span>
-                  <span class="task-desc">All tasks completed</span>
+                  <span class="task-desc">{{ 'chat.tasks.allCompleted' | transloco }}</span>
                 </div>
               }
             }
@@ -314,10 +316,10 @@ const CATEGORY_LABELS: Record<string, string> = {
                 <button class="resume-btn" (click)="resumeSession()" [disabled]="isResuming()">
                   @if (isResuming()) {
                     <span class="resume-btn-spinner"></span>
-                    Resuming...
+                    {{ 'chat.system.resuming' | transloco }}
                   } @else {
                     <span class="resume-icon">play_arrow</span>
-                    Resume Session
+                    {{ 'chat.system.resumeSession' | transloco }}
                   }
                 </button>
               }
@@ -342,7 +344,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                     <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="thinking-header">
                         <span class="thinking-icon">psychology</span>
-                        <span class="thinking-label">Thought for a moment</span>
+                        <span class="thinking-label">{{ 'chat.thinking.past' | transloco }}</span>
                       </summary>
                       <div class="thinking-content">{{ msg.thinking }}</div>
                     </details>
@@ -355,7 +357,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                       <summary class="tool-summary-line">
                         <span class="tool-summary-chevron">chevron_right</span>
                         <span class="tool-summary-text">
-                          Used {{ msg.toolCalls!.length }} tool{{ msg.toolCalls!.length !== 1 ? 's' : '' }}:
+                          {{ (msg.toolCalls!.length === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: msg.toolCalls!.length } }}
                           {{ toolSummaryLabel(msg.toolCalls!) }}
                         </span>
                         <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
@@ -367,7 +369,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                               <span class="tool-icon">{{ toolIcon(tc.tool) }}</span>
                               <span class="tool-detail-name">{{ tc.tool }}</span>
                               <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                              <span class="tool-detail-status" [class]="'status-' + tc.status">{{ tc.status }}</span>
+                              <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
                             </summary>
                             @if (tc.result) {
                               <div class="tool-preview">{{ previewResult(tc.result) }}</div>
@@ -385,7 +387,7 @@ const CATEGORY_LABELS: Record<string, string> = {
           @if (msg.historical && chat.messages()[$index + 1] && !chat.messages()[$index + 1].historical) {
             <div class="session-divider">
               <span class="divider-line"></span>
-              <span class="divider-text">Session resumed</span>
+              <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
               <span class="divider-line"></span>
             </div>
           }
@@ -393,22 +395,22 @@ const CATEGORY_LABELS: Record<string, string> = {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
               @if (chat.sessionReady()) {
-                <span class="empty-state-text">Start a conversation...</span>
+                <span class="empty-state-text">{{ 'chat.system.emptyPrompt' | transloco }}</span>
               } @else {
                 <div class="startup-spinner-container">
                   <div class="startup-spinner"></div>
                   <span class="startup-label">
                     @if (chat.isCreating()) {
-                      Creating session...
+                      {{ 'chat.startup.creating' | transloco }}
                     } @else if (chat.isConnected()) {
                       @switch (chat.startupPhase()) {
-                        @case ('provisioning') { Provisioning agent... }
-                        @case ('booting') { Agent starting... }
-                        @case ('connecting') { Connecting to agent... }
-                        @default { Session starting... }
+                        @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
+                        @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
+                        @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
+                        @default { {{ 'chat.startup.starting' | transloco }} }
                       }
                     } @else {
-                      Connecting...
+                      {{ 'chat.startup.connectingFallback' | transloco }}
                     }
                   </span>
                 </div>
@@ -423,16 +425,16 @@ const CATEGORY_LABELS: Record<string, string> = {
             <div class="startup-spinner"></div>
             <span class="startup-label">
               @if (chat.isCreating()) {
-                Creating session...
+                {{ 'chat.startup.creating' | transloco }}
               } @else if (chat.isConnected()) {
                 @switch (chat.startupPhase()) {
-                  @case ('provisioning') { Provisioning agent... }
-                  @case ('booting') { Agent starting... }
-                  @case ('connecting') { Connecting to agent... }
-                  @default { Reconnecting agent... }
+                  @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
+                  @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
+                  @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
+                  @default { {{ 'chat.startup.reconnecting' | transloco }} }
                 }
               } @else {
-                Connecting...
+                {{ 'chat.startup.connectingFallback' | transloco }}
               }
             </span>
           </div>
@@ -449,7 +451,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                 <details class="thinking-block" open>
                   <summary class="thinking-header">
                     <span class="thinking-icon">psychology</span>
-                    <span class="thinking-label">Thinking...</span>
+                    <span class="thinking-label">{{ 'chat.thinking.now' | transloco }}</span>
                   </summary>
                   <div class="thinking-content">{{ chat.streamingThinking() }}</div>
                 </details>
@@ -469,7 +471,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                     <summary class="tool-summary-line">
                       <span class="tool-summary-chevron">chevron_right</span>
                       <span class="tool-summary-text">
-                        Used {{ completedToolCount(chat.currentToolCalls()) }} tool{{ completedToolCount(chat.currentToolCalls()) !== 1 ? 's' : '' }}:
+                        {{ (completedToolCount(chat.currentToolCalls()) === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: completedToolCount(chat.currentToolCalls()) } }}
                         {{ toolSummaryLabel(completedOnly(chat.currentToolCalls())) }}
                       </span>
                       <span class="tool-summary-dot completed"></span>
@@ -480,7 +482,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                           <summary class="tool-detail-header">
                             <span class="tool-detail-name">{{ tc.tool }}</span>
                             <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                            <span class="tool-detail-status status-completed">completed</span>
+                            <span class="tool-detail-status status-completed">{{ 'chat.tools.statusCompleted' | transloco }}</span>
                           </summary>
                           @if (tc.result) {
                             <pre class="tool-detail-result">{{ tc.result }}</pre>
@@ -507,16 +509,16 @@ const CATEGORY_LABELS: Record<string, string> = {
           <div class="permission-request">
             <div class="perm-header">
               <span class="perm-icon">shield</span>
-              Permission required
+              {{ 'chat.permission.title' | transloco }}
             </div>
             <div class="perm-body">
               <strong>{{ perm.tool }}</strong>
               <pre class="perm-args">{{ perm.args | json }}</pre>
             </div>
             <div class="perm-actions">
-              <button class="perm-btn approve" (click)="chat.approve()">Approve</button>
-              <button class="perm-btn auto-accept" (click)="approveAndAutoAccept()">Auto-accept</button>
-              <button class="perm-btn deny" (click)="chat.deny()">Deny</button>
+              <button class="perm-btn approve" (click)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</button>
+              <button class="perm-btn auto-accept" (click)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</button>
+              <button class="perm-btn deny" (click)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</button>
             </div>
           </div>
         }
@@ -527,7 +529,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         <div class="error-banner">
           <span class="error-icon">error</span>
           {{ err }}
-          <button class="error-dismiss" (click)="chat.error.set(null)">dismiss</button>
+          <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
         </div>
       }
 
@@ -545,7 +547,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                   (mouseenter)="slashSelectedIndex.set($index)"
                 >
                   <span class="slash-cmd">{{ cmd.command }}</span>
-                  <span class="slash-desc">{{ cmd.description }}</span>
+                  <span class="slash-desc">{{ cmd.descriptionKey | transloco }}</span>
                 </div>
               }
             </div>
@@ -1886,6 +1888,8 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly api = inject(ApiService);
     readonly modelService = inject(ModelService);
+    private readonly transloco = inject(TranslocoService);
+    private readonly i18n = inject(I18nService);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
@@ -1958,24 +1962,25 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     readonly connectionClass = computed(() => this.chat.connectionState());
     readonly connectionLabel = computed(() => {
-        switch (this.chat.connectionState()) {
-            case 'connected':
-                return 'Connected';
-            case 'connecting':
-                return 'Connecting...';
-            case 'error':
-                return 'Error';
-            default:
-                return 'Disconnected';
-        }
+        // Track language changes so the label re-translates when i18n switches.
+        this.i18n.activeLang();
+        const state = this.chat.connectionState();
+        const key =
+            state === 'connected' ? 'chat.connection.connected'
+                : state === 'connecting' ? 'chat.connection.connecting'
+                    : state === 'error' ? 'chat.connection.error'
+                        : 'chat.connection.disconnected';
+        return this.transloco.translate(key);
     });
 
     readonly inputPlaceholder = computed(() => {
-        if (!this.chat.isConnected()) return 'Connect to start chatting...';
-        if (this.chat.isConnected() && !this.chat.sessionReady()) return 'Type your message while the session starts...';
-        if (this.chat.isInterrupting()) return 'Stopping...';
-        if (this.chat.isStreaming()) return 'Agent is working...';
-        return 'Type a message... (Enter to send, Shift+Enter for newline)';
+        // Track language changes so placeholder re-translates when i18n switches.
+        this.i18n.activeLang();
+        if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
+        if (this.chat.isConnected() && !this.chat.sessionReady()) return this.transloco.translate('chat.input.sessionStarting');
+        if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
+        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        return this.transloco.translate('chat.input.default');
     });
 
     /** True when there is a pending message waiting for the session to become ready. */
@@ -2138,7 +2143,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         try {
             await this.chat.resumeSession();
         } catch (e: any) {
-            this.chat.error.set(e?.error?.detail || 'Failed to resume session');
+            this.chat.error.set(e?.error?.detail || this.transloco.translate('chat.system.resumeFailed'));
         } finally {
             this.isResuming.set(false);
         }
@@ -2192,9 +2197,10 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             wrapper.className = 'code-collapse';
             const summary = document.createElement('summary');
             summary.className = 'code-collapse-summary';
+            const expandHint = this.transloco.translate('chat.code.expandHint');
             summary.innerHTML = `<span class="code-collapse-icon">code</span>`
                 + `<span class="code-collapse-label">${lang || 'code'}</span>`
-                + `<span class="code-collapse-hint">Click to expand</span>`;
+                + `<span class="code-collapse-hint">${expandHint}</span>`;
             wrapper.appendChild(summary);
             pre.parentNode!.insertBefore(wrapper, pre);
             wrapper.appendChild(pre);
@@ -2213,7 +2219,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             const btn = document.createElement('button');
             btn.className = 'code-copy-btn';
             btn.innerHTML = '<span class="code-copy-icon">content_copy</span>';
-            btn.title = 'Copy to clipboard';
+            btn.title = this.transloco.translate('chat.code.copyTooltip');
             btn.addEventListener('click', () => {
                 const code = pre.querySelector('code')?.textContent || pre.textContent || '';
                 navigator.clipboard.writeText(code).then(() => {
@@ -2231,7 +2237,11 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     // Tool call display helpers
 
     toolLabel(tc: ToolCallInfo): string {
-        const base = TOOL_LABELS[tc.tool];
+        // Reference activeLang so Angular re-renders when the language changes.
+        this.i18n.activeLang();
+        const translatedKey = `chat.toolLabels.${tc.tool}`;
+        const translated = this.transloco.translate(translatedKey);
+        const base = translated !== translatedKey ? translated : TOOL_LABELS[tc.tool];
         if (base) {
             const context = this.toolLabelContext(tc.tool, tc.args);
             return context ? `${base} ${context}` : base;
@@ -2257,7 +2267,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             const pattern = (args['pattern'] || args['query'] || '') as string;
             if (pattern) {
                 const display = pattern.length > 30 ? pattern.substring(0, 30) + '...' : pattern;
-                return `for "${display}"`;
+                return this.transloco.translate('chat.toolContext.searchFor', {term: display});
             }
         }
 
@@ -2266,7 +2276,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             const cmd = (args['command'] || args['description'] || '') as string;
             if (cmd) {
                 const display = cmd.length > 40 ? cmd.substring(0, 40) + '...' : cmd;
-                return `\u2014 ${display}`;
+                return this.transloco.translate('chat.toolContext.commandDash', {cmd: display});
             }
         }
 
@@ -2315,14 +2325,26 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     groupToolCallsByIntent(calls: ToolCallInfo[]): string {
+        this.i18n.activeLang();
         const groups = new Map<string, number>();
         for (const tc of calls) {
-            const label = CATEGORY_LABELS[tc.category || ''] || this.toolLabel(tc);
+            const cat = tc.category || '';
+            const catKey = cat ? `chat.toolCategories.${cat}` : '';
+            const translated = catKey ? this.transloco.translate(catKey) : '';
+            const fromI18n = translated && translated !== catKey ? translated : '';
+            const label = fromI18n || CATEGORY_LABELS[cat] || this.toolLabel(tc);
             groups.set(label, (groups.get(label) || 0) + 1);
         }
         return Array.from(groups.entries())
             .map(([label, count]) => count > 1 ? `${label} x${count}` : label)
             .join(', ');
+    }
+
+    translateStatus(status: string): string {
+        this.i18n.activeLang();
+        const key = `chat.tools.status${status.charAt(0).toUpperCase()}${status.slice(1)}`;
+        const translated = this.transloco.translate(key);
+        return translated !== key ? translated : status;
     }
 
     toolSummaryLabel(calls: ToolCallInfo[]): string {

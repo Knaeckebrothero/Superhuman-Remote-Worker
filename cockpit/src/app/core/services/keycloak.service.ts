@@ -1,5 +1,6 @@
 import { inject, Injectable, PLATFORM_ID } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
+import { TranslocoService } from '@jsverse/transloco';
 import Keycloak from 'keycloak-js';
 import { environment } from '../environment';
 
@@ -12,6 +13,7 @@ import { environment } from '../environment';
 @Injectable({ providedIn: 'root' })
 export class KeycloakService {
   private readonly platformId = inject(PLATFORM_ID);
+  private readonly transloco = inject(TranslocoService);
   private keycloak!: Keycloak;
   private _authenticated = false;
 
@@ -57,13 +59,28 @@ export class KeycloakService {
 
   /** Redirect to Keycloak login page. */
   login(): void {
-    this.keycloak.login({ redirectUri: window.location.href });
+    this.keycloak.login({
+      redirectUri: window.location.href,
+      locale: this.keycloakLocale(),
+    });
   }
 
   /** Redirect to Keycloak logout endpoint. */
   logout(): void {
     this._authenticated = false;
-    this.keycloak.logout({ redirectUri: window.location.origin });
+    this.keycloak.logout({
+      redirectUri: window.location.origin,
+    });
+  }
+
+  /**
+   * Map the cockpit's active language to the ui_locales value Keycloak expects.
+   * Keycloak ships DE out of the box under the short tag; everything else falls
+   * back to EN.
+   */
+  private keycloakLocale(): string {
+    const lang = this.transloco.getActiveLang();
+    return lang === 'de-DE' || lang === 'de' ? 'de' : 'en';
   }
 
   /**

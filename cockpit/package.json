@@ -8,6 +8,9 @@
     "watch": "ng build --watch --configuration development",
     "test": "vitest run",
     "test:watch": "vitest",
+    "i18n:check": "node scripts/check-i18n-parity.mjs && node scripts/check-i18n-hardcoded.mjs",
+    "i18n:check:parity": "node scripts/check-i18n-parity.mjs",
+    "i18n:check:hardcoded": "node scripts/check-i18n-hardcoded.mjs",
     "serve:ssr:cockpit": "node dist/cockpit/server/server.mjs"
   },
   "prettier": {
@@ -33,6 +36,8 @@
     "@angular/platform-server": "^21.2.9",
     "@angular/router": "^21.2.9",
     "@angular/ssr": "^21.2.7",
+    "@jsverse/transloco": "^8.3.0",
+    "@jsverse/transloco-locale": "^8.3.0",
     "angular-split": "^20.0.0",
     "clipboard": "^2.0.11",
     "cytoscape": "^3.33.1",

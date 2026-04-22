@@ -1,5 +1,6 @@
 import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
 import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
@@ -24,13 +25,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
 @Component({
   selector: 'app-project-detail-page',
   standalone: true,
-  imports: [SidebarToggleComponent],
+  imports: [SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="page-container">
       @if (isLoading() && !project()) {
         <div class="loading-state">
           <div class="spinner"></div>
-          <span>Loading project...</span>
+          <span>{{ 'projectDetail.loading' | transloco }}</span>
         </div>
       }
 
@@ -45,7 +46,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <h1 class="page-title">{{ proj.name }}</h1>
             <div class="header-badges">
               @if (proj.is_default) {
-                <span class="badge badge-personal">Personal</span>
+                <span class="badge badge-personal">{{ 'projectDetail.badgePersonal' | transloco }}</span>
               }
               <span class="badge" [class]="'badge-' + proj.status">{{ proj.status }}</span>
             </div>
@@ -60,7 +61,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               [class.active]="activeTab() === t.id"
               (click)="activeTab.set(t.id)"
             >
-              {{ t.label }}
+              {{ t.labelKey | transloco }}
             </button>
           }
         </div>
@@ -72,7 +73,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <div class="overview-section">
               <div class="detail-grid">
                 <div class="detail-card">
-                  <label>Description</label>
+                  <label>{{ 'projectDetail.overview.description' | transloco }}</label>
                   @if (isEditingOverview()) {
                     <textarea
                       class="form-input"
@@ -81,11 +82,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       (input)="editDescription.set(asTextareaValue($event))"
                     ></textarea>
                   } @else {
-                    <p class="detail-value">{{ proj.description || 'No description' }}</p>
+                    <p class="detail-value">{{ proj.description || ('projectDetail.overview.noDescription' | transloco) }}</p>
                   }
                 </div>
                 <div class="detail-card">
-                  <label>Goal</label>
+                  <label>{{ 'projectDetail.overview.goal' | transloco }}</label>
                   @if (isEditingOverview()) {
                     <textarea
                       class="form-input"
@@ -94,47 +95,47 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       (input)="editGoal.set(asTextareaValue($event))"
                     ></textarea>
                   } @else {
-                    <p class="detail-value">{{ proj.goal || 'No goal set' }}</p>
+                    <p class="detail-value">{{ proj.goal || ('projectDetail.overview.noGoal' | transloco) }}</p>
                   }
                 </div>
               </div>
               <div class="stats-row">
                 <div class="stat-card">
                   <span class="stat-value">{{ jobs().length }}</span>
-                  <span class="stat-label">Jobs</span>
+                  <span class="stat-label">{{ 'projectDetail.overview.statsJobs' | transloco }}</span>
                 </div>
                 <div class="stat-card">
                   <span class="stat-value">{{ projectDatasources().length }}</span>
-                  <span class="stat-label">Data Sources</span>
+                  <span class="stat-label">{{ 'projectDetail.overview.statsDatasources' | transloco }}</span>
                 </div>
                 <div class="stat-card">
                   <span class="stat-value">{{ repos().length }}</span>
-                  <span class="stat-label">Repos</span>
+                  <span class="stat-label">{{ 'projectDetail.overview.statsRepos' | transloco }}</span>
                 </div>
                 <div class="stat-card">
                   <span class="stat-value">{{ members().length }}</span>
-                  <span class="stat-label">Members</span>
+                  <span class="stat-label">{{ 'projectDetail.overview.statsMembers' | transloco }}</span>
                 </div>
               </div>
               @if (proj.default_config_name) {
                 <div class="detail-card">
-                  <label>Default Config</label>
+                  <label>{{ 'projectDetail.overview.defaultConfig' | transloco }}</label>
                   <p class="detail-value mono">{{ proj.default_config_name }}</p>
                 </div>
               }
               <div class="detail-card">
-                <label>Created</label>
+                <label>{{ 'projectDetail.overview.created' | transloco }}</label>
                 <p class="detail-value mono">{{ formatDate(proj.created_at) }}</p>
               </div>
               <div class="overview-actions">
                 @if (isEditingOverview()) {
-                  <button class="btn btn-primary" (click)="saveOverview()">Save</button>
-                  <button class="btn btn-ghost" (click)="cancelEditOverview()">Cancel</button>
+                  <button class="btn btn-primary" (click)="saveOverview()">{{ 'projectDetail.overview.save' | transloco }}</button>
+                  <button class="btn btn-ghost" (click)="cancelEditOverview()">{{ 'projectDetail.overview.cancel' | transloco }}</button>
                 } @else {
-                  <button class="btn btn-ghost" (click)="startEditOverview()">Edit</button>
+                  <button class="btn btn-ghost" (click)="startEditOverview()">{{ 'projectDetail.overview.edit' | transloco }}</button>
                   @if (proj.cloud_storage_url) {
                     <a class="btn btn-ghost" [href]="proj.cloud_storage_url" target="_blank" rel="noopener">
-                      Open Project Folder
+                      {{ 'projectDetail.overview.openFolder' | transloco }}
                     </a>
                   }
                 }
@@ -147,21 +148,21 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <div class="table-section">
               <div class="tab-toolbar">
                 <button class="btn btn-primary btn-sm" (click)="createJobInProject()">
-                  + New Job
+                  {{ 'projectDetail.jobs.new' | transloco }}
                 </button>
               </div>
               @if (jobs().length === 0) {
-                <div class="empty-inline">No jobs in this project</div>
+                <div class="empty-inline">{{ 'projectDetail.jobs.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Status</th>
-                      <th>Description</th>
-                      <th>Config</th>
-                      <th>Branch</th>
-                      <th>Merge</th>
+                      <th>{{ 'projectDetail.jobs.colStatus' | transloco }}</th>
+                      <th>{{ 'projectDetail.jobs.colDescription' | transloco }}</th>
+                      <th>{{ 'projectDetail.jobs.colConfig' | transloco }}</th>
+                      <th>{{ 'projectDetail.jobs.colBranch' | transloco }}</th>
+                      <th>{{ 'projectDetail.jobs.colMerge' | transloco }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -201,7 +202,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="kb-stats-row">
                   <div class="kb-stat">
                     <span class="kb-stat-value">{{ summary.total }}</span>
-                    <span class="kb-stat-label">Total</span>
+                    <span class="kb-stat-label">{{ 'projectDetail.knowledge.totalLabel' | transloco }}</span>
                   </div>
                   @for (entry of kbTypeEntries(summary); track entry[0]) {
                     <div class="kb-stat">
@@ -216,36 +217,36 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               <div class="kb-toolbar">
                 <input
                   class="form-input-sm kb-search"
-                  placeholder="Search knowledge..."
+                  [placeholder]="'projectDetail.knowledge.searchPlaceholder' | transloco"
                   [value]="kbSearchQuery()"
                   (input)="kbSearchQuery.set(asInputValue($event))"
                   (keydown.enter)="searchKB()"
                 />
                 <button class="btn btn-primary btn-sm" (click)="searchKB()" [disabled]="!kbSearchQuery()">
-                  Search
+                  {{ 'projectDetail.knowledge.search' | transloco }}
                 </button>
                 <select class="inline-select" [value]="kbFilterType()" (change)="kbFilterType.set(asSelectValue($event)); loadKBNotes()">
-                  <option value="">All types</option>
-                  <option value="decision">Decision</option>
-                  <option value="learning">Learning</option>
-                  <option value="goal">Goal</option>
-                  <option value="plan">Plan</option>
-                  <option value="code">Code</option>
-                  <option value="question">Question</option>
-                  <option value="state">State</option>
-                  <option value="source">Source</option>
-                  <option value="retrospective">Retrospective</option>
+                  <option value="">{{ 'projectDetail.knowledge.filterAllTypes' | transloco }}</option>
+                  <option value="decision">{{ 'projectDetail.knowledge.typeDecision' | transloco }}</option>
+                  <option value="learning">{{ 'projectDetail.knowledge.typeLearning' | transloco }}</option>
+                  <option value="goal">{{ 'projectDetail.knowledge.typeGoal' | transloco }}</option>
+                  <option value="plan">{{ 'projectDetail.knowledge.typePlan' | transloco }}</option>
+                  <option value="code">{{ 'projectDetail.knowledge.typeCode' | transloco }}</option>
+                  <option value="question">{{ 'projectDetail.knowledge.typeQuestion' | transloco }}</option>
+                  <option value="state">{{ 'projectDetail.knowledge.typeState' | transloco }}</option>
+                  <option value="source">{{ 'projectDetail.knowledge.typeSource' | transloco }}</option>
+                  <option value="retrospective">{{ 'projectDetail.knowledge.typeRetrospective' | transloco }}</option>
                 </select>
                 <select class="inline-select" [value]="kbFilterStatus()" (change)="kbFilterStatus.set(asSelectValue($event)); loadKBNotes()">
-                  <option value="">All statuses</option>
-                  <option value="active">Active</option>
-                  <option value="resolved">Resolved</option>
-                  <option value="superseded">Superseded</option>
-                  <option value="archived">Archived</option>
+                  <option value="">{{ 'projectDetail.knowledge.filterAllStatuses' | transloco }}</option>
+                  <option value="active">{{ 'projectDetail.knowledge.statusActive' | transloco }}</option>
+                  <option value="resolved">{{ 'projectDetail.knowledge.statusResolved' | transloco }}</option>
+                  <option value="superseded">{{ 'projectDetail.knowledge.statusSuperseded' | transloco }}</option>
+                  <option value="archived">{{ 'projectDetail.knowledge.statusArchived' | transloco }}</option>
                 </select>
-                <button class="btn btn-ghost btn-sm" (click)="clearKBFilters()">Clear</button>
+                <button class="btn btn-ghost btn-sm" (click)="clearKBFilters()">{{ 'projectDetail.knowledge.clear' | transloco }}</button>
                 <div style="flex:1"></div>
-                <button class="btn btn-ghost btn-sm" (click)="exportKB()">Export</button>
+                <button class="btn btn-ghost btn-sm" (click)="exportKB()">{{ 'projectDetail.knowledge.export' | transloco }}</button>
               </div>
 
               <!-- Note Detail View -->
@@ -253,7 +254,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                 <div class="kb-detail">
                   <div class="kb-detail-header">
                     <button class="btn btn-ghost btn-sm" (click)="kbSelectedNote.set(null)">
-                      <span class="material-symbols-outlined" style="font-size:16px">arrow_back</span> Back
+                      <span class="material-symbols-outlined" style="font-size:16px">arrow_back</span> {{ 'projectDetail.knowledge.back' | transloco }}
                     </button>
                     <div style="flex:1"></div>
                     <select
@@ -261,12 +262,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       [value]="note.status"
                       (change)="updateNoteStatus(note.note_id, asSelectValue($event))"
                     >
-                      <option value="active">Active</option>
-                      <option value="resolved">Resolved</option>
-                      <option value="superseded">Superseded</option>
-                      <option value="archived">Archived</option>
+                      <option value="active">{{ 'projectDetail.knowledge.statusActive' | transloco }}</option>
+                      <option value="resolved">{{ 'projectDetail.knowledge.statusResolved' | transloco }}</option>
+                      <option value="superseded">{{ 'projectDetail.knowledge.statusSuperseded' | transloco }}</option>
+                      <option value="archived">{{ 'projectDetail.knowledge.statusArchived' | transloco }}</option>
                     </select>
-                    <button class="action-btn delete" (click)="deleteNote(note.note_id)">Delete</button>
+                    <button class="action-btn delete" (click)="deleteNote(note.note_id)">{{ 'projectDetail.knowledge.delete' | transloco }}</button>
                   </div>
                   <div class="kb-detail-meta">
                     <span class="kb-type-badge" [attr.data-type]="note.note_type">{{ note.note_type }}</span>
@@ -274,7 +275,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       <span class="kb-confidence">{{ note.confidence }}</span>
                     }
                     @if (note.phase) {
-                      <span class="text-muted">Phase {{ note.phase }}</span>
+                      <span class="text-muted">{{ 'projectDetail.knowledge.phaseLabel' | transloco:{ phase: note.phase } }}</span>
                     }
                     <span class="text-muted">{{ formatDate(note.modified_at) }}</span>
                   </div>
@@ -289,7 +290,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <div class="kb-detail-content">{{ note.content }}</div>
                   @if (note.relationships && note.relationships.length > 0) {
                     <div class="kb-relationships">
-                      <h4>Relationships</h4>
+                      <h4>{{ 'projectDetail.knowledge.relationships' | transloco }}</h4>
                       @for (rel of note.relationships; track rel.target_id) {
                         <div class="kb-rel-item">
                           <span class="kb-rel-type">{{ rel.type }}</span>
@@ -304,9 +305,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               } @else {
                 <!-- Note List -->
                 @if (kbIsLoading()) {
-                  <div class="loading-state"><div class="spinner"></div><span>Loading notes...</span></div>
+                  <div class="loading-state"><div class="spinner"></div><span>{{ 'projectDetail.knowledge.loading' | transloco }}</span></div>
                 } @else if (kbNotes().length === 0) {
-                  <div class="empty-inline">No knowledge notes found</div>
+                  <div class="empty-inline">{{ 'projectDetail.knowledge.empty' | transloco }}</div>
                 } @else {
                   <div class="kb-note-list">
                     @for (note of kbNotes(); track note.note_id) {
@@ -338,8 +339,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   </div>
                   @if (kbTotal() > kbNotes().length) {
                     <div class="kb-pagination">
-                      <span class="text-muted">{{ kbNotes().length }} of {{ kbTotal() }} notes</span>
-                      <button class="btn btn-ghost btn-sm" (click)="loadMoreKBNotes()">Load more</button>
+                      <span class="text-muted">{{ 'projectDetail.knowledge.pagination' | transloco:{ current: kbNotes().length, total: kbTotal() } }}</span>
+                      <button class="btn btn-ghost btn-sm" (click)="loadMoreKBNotes()">{{ 'projectDetail.knowledge.loadMore' | transloco }}</button>
                     </div>
                   }
                 }
@@ -357,7 +358,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="dsLinkId()"
                   (change)="dsLinkId.set(asInputValue($event))"
                 >
-                  <option value="">Select a datasource...</option>
+                  <option value="">{{ 'projectDetail.datasources.selectPlaceholder' | transloco }}</option>
                   @for (ds of availableDatasources(); track ds.id) {
                     <option [value]="ds.id">{{ ds.name }} ({{ ds.type }})</option>
                   }
@@ -367,22 +368,22 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [disabled]="!dsLinkId()"
                   (click)="linkDatasource()"
                 >
-                  Link
+                  {{ 'projectDetail.datasources.link' | transloco }}
                 </button>
               </div>
 
               @if (projectDatasources().length === 0) {
-                <div class="empty-inline">No datasources linked to this project</div>
+                <div class="empty-inline">{{ 'projectDetail.datasources.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Name</th>
-                      <th>Type</th>
-                      <th>Project Description</th>
-                      <th>Access</th>
-                      <th>Actions</th>
+                      <th>{{ 'projectDetail.datasources.colName' | transloco }}</th>
+                      <th>{{ 'projectDetail.datasources.colType' | transloco }}</th>
+                      <th>{{ 'projectDetail.datasources.colDescription' | transloco }}</th>
+                      <th>{{ 'projectDetail.datasources.colAccess' | transloco }}</th>
+                      <th>{{ 'projectDetail.datasources.colActions' | transloco }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -396,7 +397,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                           <input
                             class="form-input-sm"
                             [value]="ds.project_description || ds.description || ''"
-                            placeholder="Usage context for this project..."
+                            [placeholder]="'projectDetail.datasources.descriptionPlaceholder' | transloco"
                             (change)="updateDatasourceDescription(ds.id, asInputValue($event))"
                           />
                         </td>
@@ -406,14 +407,14 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             [value]="ds.project_read_only != null ? ds.project_read_only : ''"
                             (change)="updateDatasourceReadOnly(ds.id, asInputValue($event))"
                           >
-                            <option value="">Default (Read-write)</option>
-                            <option value="true">Read-only</option>
-                            <option value="false">Read-write</option>
+                            <option value="">{{ 'projectDetail.datasources.accessDefault' | transloco }}</option>
+                            <option value="true">{{ 'projectDetail.datasources.accessReadOnly' | transloco }}</option>
+                            <option value="false">{{ 'projectDetail.datasources.accessReadWrite' | transloco }}</option>
                           </select>
                         </td>
                         <td>
                           <button class="action-btn delete" (click)="unlinkDatasource(ds.id)">
-                            Unlink
+                            {{ 'projectDetail.datasources.unlink' | transloco }}
                           </button>
                         </td>
                       </tr>
@@ -432,13 +433,13 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               <div class="inline-form">
                 <input
                   class="form-input-sm"
-                  placeholder="Repo name"
+                  [placeholder]="'projectDetail.repos.namePlaceholder' | transloco"
                   [value]="repoName()"
                   (input)="repoName.set(asInputValue($event))"
                 />
                 <input
                   class="form-input-sm"
-                  placeholder="Repo URL"
+                  [placeholder]="'projectDetail.repos.urlPlaceholder' | transloco"
                   [value]="repoUrl()"
                   (input)="repoUrl.set(asInputValue($event))"
                 />
@@ -447,40 +448,40 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="repoRole()"
                   (change)="setRepoRole($event)"
                 >
-                  <option value="jobs">jobs</option>
-                  <option value="source">source</option>
-                  <option value="reference">reference</option>
+                  <option value="jobs">{{ 'projectDetail.repos.roleJobs' | transloco }}</option>
+                  <option value="source">{{ 'projectDetail.repos.roleSource' | transloco }}</option>
+                  <option value="reference">{{ 'projectDetail.repos.roleReference' | transloco }}</option>
                 </select>
                 <label class="inline-checkbox">
                   <input type="checkbox" [checked]="repoReadOnly()" (change)="repoReadOnly.set(asChecked($event))" />
-                  Read-only
+                  {{ 'projectDetail.repos.readOnlyLabel' | transloco }}
                 </label>
                 <label class="inline-checkbox">
                   <input type="checkbox" [checked]="repoCreateManaged()" (change)="repoCreateManaged.set(asChecked($event))" />
-                  Managed
+                  {{ 'projectDetail.repos.managedLabel' | transloco }}
                 </label>
                 <button
                   class="btn btn-primary btn-sm"
                   [disabled]="!repoName().trim()"
                   (click)="addRepo()"
                 >
-                  Add
+                  {{ 'projectDetail.repos.add' | transloco }}
                 </button>
               </div>
 
               @if (repos().length === 0) {
-                <div class="empty-inline">No repositories attached</div>
+                <div class="empty-inline">{{ 'projectDetail.repos.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>Role</th>
-                      <th>Name</th>
-                      <th>URL</th>
-                      <th>Read Only</th>
-                      <th>Managed</th>
-                      <th>Actions</th>
+                      <th>{{ 'projectDetail.repos.colRole' | transloco }}</th>
+                      <th>{{ 'projectDetail.repos.colName' | transloco }}</th>
+                      <th>{{ 'projectDetail.repos.colUrl' | transloco }}</th>
+                      <th>{{ 'projectDetail.repos.colReadOnly' | transloco }}</th>
+                      <th>{{ 'projectDetail.repos.colManaged' | transloco }}</th>
+                      <th>{{ 'projectDetail.repos.colActions' | transloco }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -493,11 +494,11 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                         </td>
                         <td>{{ repo.name }}</td>
                         <td class="mono url-cell">{{ repo.repo_url || '-' }}</td>
-                        <td>{{ repo.read_only ? 'Yes' : 'No' }}</td>
-                        <td>{{ repo.is_managed ? 'Yes' : 'No' }}</td>
+                        <td>{{ (repo.read_only ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
+                        <td>{{ (repo.is_managed ? 'projectDetail.repos.yes' : 'projectDetail.repos.no') | transloco }}</td>
                         <td>
                           <button class="action-btn delete" (click)="removeRepo(repo.id)">
-                            Remove
+                            {{ 'projectDetail.repos.remove' | transloco }}
                           </button>
                         </td>
                       </tr>
@@ -515,12 +516,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
               @if (isLoadingExperts()) {
                 <div class="empty-inline">
                   <div class="spinner-sm"></div>
-                  Loading experts...
+                  {{ 'projectDetail.experts.loading' | transloco }}
                 </div>
               } @else if (projectExperts().length === 0) {
                 <div class="empty-inline">
-                  No project experts yet. Add expert configs to the
-                  <code>experts/</code> directory in the jobs repo.
+                  {{ 'projectDetail.experts.emptyPrefix' | transloco }}
+                  <code>experts/</code> {{ 'projectDetail.experts.emptySuffix' | transloco }}
                 </div>
               } @else {
                 <div class="expert-grid">
@@ -556,7 +557,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="memberUserId()"
                   (change)="memberUserId.set(asSelectValue($event))"
                 >
-                  <option value="">Select user...</option>
+                  <option value="">{{ 'projectDetail.members.selectUser' | transloco }}</option>
                   @for (user of availableUsers(); track user.id) {
                     <option [value]="user.id">{{ user.display_name }}</option>
                   }
@@ -566,30 +567,30 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   [value]="memberRole()"
                   (change)="setMemberRole($event)"
                 >
-                  <option value="editor">Editor</option>
-                  <option value="viewer">Viewer</option>
-                  <option value="owner">Owner</option>
+                  <option value="editor">{{ 'projectDetail.members.roleEditor' | transloco }}</option>
+                  <option value="viewer">{{ 'projectDetail.members.roleViewer' | transloco }}</option>
+                  <option value="owner">{{ 'projectDetail.members.roleOwner' | transloco }}</option>
                 </select>
                 <button
                   class="btn btn-primary btn-sm"
                   [disabled]="!memberUserId()"
                   (click)="addMember()"
                 >
-                  Add
+                  {{ 'projectDetail.members.add' | transloco }}
                 </button>
               </div>
 
               @if (members().length === 0) {
-                <div class="empty-inline">No members</div>
+                <div class="empty-inline">{{ 'projectDetail.members.empty' | transloco }}</div>
               } @else {
                 <div class="table-scroll">
                 <table class="data-table">
                   <thead>
                     <tr>
-                      <th>User</th>
-                      <th>Role</th>
-                      <th>Joined</th>
-                      <th>Actions</th>
+                      <th>{{ 'projectDetail.members.colUser' | transloco }}</th>
+                      <th>{{ 'projectDetail.members.colRole' | transloco }}</th>
+                      <th>{{ 'projectDetail.members.colJoined' | transloco }}</th>
+                      <th>{{ 'projectDetail.members.colActions' | transloco }}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -610,9 +611,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             [value]="member.role"
                             (change)="onMemberRoleChange(member.user_id, $event)"
                           >
-                            <option value="owner">owner</option>
-                            <option value="editor">editor</option>
-                            <option value="viewer">viewer</option>
+                            <option value="owner">{{ 'projectDetail.members.roleOwnerLower' | transloco }}</option>
+                            <option value="editor">{{ 'projectDetail.members.roleEditorLower' | transloco }}</option>
+                            <option value="viewer">{{ 'projectDetail.members.roleViewerLower' | transloco }}</option>
                           </select>
                         </td>
                         <td class="mono">{{ formatDate(member.joined_at) }}</td>
@@ -622,7 +623,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                             [disabled]="member.role === 'owner' && ownerCount() <= 1"
                             (click)="removeMember(member.user_id)"
                           >
-                            Remove
+                            {{ 'projectDetail.members.remove' | transloco }}
                           </button>
                         </td>
                       </tr>
@@ -639,9 +640,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
             <div class="settings-section">
               <!-- General -->
               <div class="settings-group">
-                <h3 class="settings-heading">General</h3>
+                <h3 class="settings-heading">{{ 'projectDetail.settings.general' | transloco }}</h3>
                 <div class="form-row">
-                  <label class="form-label-sm">Project Name</label>
+                  <label class="form-label-sm">{{ 'projectDetail.settings.projectName' | transloco }}</label>
                   <input
                     class="form-input"
                     [value]="settingsName()"
@@ -650,10 +651,10 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   />
                 </div>
                 <div class="form-row">
-                  <label class="form-label-sm">Default Config</label>
+                  <label class="form-label-sm">{{ 'projectDetail.settings.defaultConfig' | transloco }}</label>
                   <input
                     class="form-input"
-                    placeholder="e.g. developer, scholar"
+                    [placeholder]="'projectDetail.settings.configPlaceholder' | transloco"
                     [value]="settingsConfigName()"
                     (input)="settingsConfigName.set(asInputValue($event))"
                   />
@@ -664,33 +665,33 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                     [disabled]="isSavingSettings()"
                     (click)="saveSettings()"
                   >
-                    Save Changes
+                    {{ 'projectDetail.settings.save' | transloco }}
                   </button>
                 </div>
               </div>
 
               <!-- Memory -->
               <div class="settings-group">
-                <h3 class="settings-heading">Memory</h3>
+                <h3 class="settings-heading">{{ 'projectDetail.settings.memory' | transloco }}</h3>
                 <label class="toggle-row">
                   <input
                     type="checkbox"
                     [checked]="projectMemoryShared()"
                     (change)="toggleProjectMemory($event)"
                   />
-                  <span class="toggle-label">Share memories across jobs</span>
+                  <span class="toggle-label">{{ 'projectDetail.settings.shareMemories' | transloco }}</span>
                 </label>
                 <p class="text-muted" style="font-size: 12px; margin-top: 4px;">
-                  When enabled, automatic memories from any job in this project are visible to all other jobs.
+                  {{ 'projectDetail.settings.shareMemoriesDesc' | transloco }}
                 </p>
               </div>
 
               <!-- Cloud Storage -->
               <div class="settings-group">
-                <h3 class="settings-heading">Cloud Storage</h3>
+                <h3 class="settings-heading">{{ 'projectDetail.settings.cloudStorage' | transloco }}</h3>
                 @if (proj.cloud_storage_url) {
                   <div class="form-row" style="align-items: center;">
-                    <label class="form-label-sm">Folder</label>
+                    <label class="form-label-sm">{{ 'projectDetail.settings.folder' | transloco }}</label>
                     <a [href]="proj.cloud_storage_url" target="_blank" rel="noopener"
                        style="color: var(--accent); text-decoration: none; display: inline-flex; align-items: center; gap: 4px;">
                       {{ proj.name }}
@@ -703,49 +704,49 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                       [checked]="settingsCloudReadOnly()"
                       (change)="toggleCloudReadOnly($event)"
                     />
-                    <span class="toggle-label">Read-only agent access</span>
+                    <span class="toggle-label">{{ 'projectDetail.settings.readOnlyAgent' | transloco }}</span>
                   </label>
                   <p class="text-muted" style="font-size: 12px; margin-top: 4px;">
-                    When enabled, agents can browse and download files but cannot upload, modify, or delete.
+                    {{ 'projectDetail.settings.readOnlyAgentDesc' | transloco }}
                   </p>
                 } @else {
                   <p class="text-muted" style="font-size: 12px;">
-                    Cloud storage unavailable — not configured.
+                    {{ 'projectDetail.settings.cloudUnavailable' | transloco }}
                   </p>
                 }
               </div>
 
               <!-- Danger Zone -->
               <div class="settings-group danger-zone">
-                <h3 class="settings-heading danger-heading">Danger Zone</h3>
+                <h3 class="settings-heading danger-heading">{{ 'projectDetail.settings.dangerZone' | transloco }}</h3>
                 @if (proj.is_default) {
                   <p class="text-muted" style="font-size: 12px;">
-                    This is your default personal project and cannot be archived or deleted.
+                    {{ 'projectDetail.settings.defaultProjectWarning' | transloco }}
                   </p>
                 } @else {
                   <div class="danger-actions">
                     @if (proj.status === 'active') {
                       <div class="danger-row">
                         <div class="danger-info">
-                          <span class="danger-title">Archive Project</span>
+                          <span class="danger-title">{{ 'projectDetail.settings.archiveTitle' | transloco }}</span>
                           <span class="danger-desc">
-                            Mark this project as archived. Jobs will no longer be created.
+                            {{ 'projectDetail.settings.archiveDesc' | transloco }}
                           </span>
                         </div>
                         <button class="btn btn-danger-outline" (click)="archiveProject()">
-                          Archive
+                          {{ 'projectDetail.settings.archive' | transloco }}
                         </button>
                       </div>
                     }
                     <div class="danger-row">
                       <div class="danger-info">
-                        <span class="danger-title">Delete Project</span>
+                        <span class="danger-title">{{ 'projectDetail.settings.deleteTitle' | transloco }}</span>
                         <span class="danger-desc">
-                          Permanently delete this project and its managed repositories.
+                          {{ 'projectDetail.settings.deleteDesc' | transloco }}
                         </span>
                       </div>
                       <button class="btn btn-danger" (click)="deleteProject()">
-                        Delete
+                        {{ 'projectDetail.settings.delete' | transloco }}
                       </button>
                     </div>
                   </div>
@@ -1536,6 +1537,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   private readonly router = inject(Router);
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly project = signal<Project | null>(null);
   readonly jobs = signal<Job[]>([]);
@@ -1611,15 +1613,15 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly kbFilterType = signal('');
   readonly kbFilterStatus = signal('');
 
-  readonly tabList: { id: Tab; label: string }[] = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'jobs', label: 'Jobs' },
-    { id: 'knowledge', label: 'Knowledge' },
-    { id: 'datasources', label: 'Data Sources' },
-    { id: 'repos', label: 'Repos' },
-    { id: 'experts', label: 'Experts' },
-    { id: 'members', label: 'Members' },
-    { id: 'settings', label: 'Settings' },
+  readonly tabList: { id: Tab; labelKey: string }[] = [
+    { id: 'overview', labelKey: 'projectDetail.tabs.overview' },
+    { id: 'jobs', labelKey: 'projectDetail.tabs.jobs' },
+    { id: 'knowledge', labelKey: 'projectDetail.tabs.knowledge' },
+    { id: 'datasources', labelKey: 'projectDetail.tabs.datasources' },
+    { id: 'repos', labelKey: 'projectDetail.tabs.repos' },
+    { id: 'experts', labelKey: 'projectDetail.tabs.experts' },
+    { id: 'members', labelKey: 'projectDetail.tabs.members' },
+    { id: 'settings', labelKey: 'projectDetail.tabs.settings' },
   ];
 
   private projectId = '';
@@ -1868,14 +1870,14 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   archiveProject(): void {
-    if (!confirm('Are you sure you want to archive this project?')) return;
+    if (!confirm(this.transloco.translate('projectDetail.settings.archiveConfirm'))) return;
     this.api.updateProject(this.projectId, { status: 'archived' }).subscribe((res) => {
       if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
     });
   }
 
   deleteProject(): void {
-    if (!confirm('Are you sure you want to permanently delete this project? This cannot be undone.')) return;
+    if (!confirm(this.transloco.translate('projectDetail.settings.deleteConfirm'))) return;
     this.api.deleteProject(this.projectId).subscribe((res) => {
       if (res) this.router.navigate(['/projects']);
     });
@@ -1959,7 +1961,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   }
 
   deleteNote(noteId: string): void {
-    if (!confirm(`Delete note "${noteId}" permanently? This cannot be undone.`)) return;
+    if (!confirm(this.transloco.translate('projectDetail.knowledge.deleteConfirm', {noteId}))) return;
     this.api.deleteKnowledgeNote(this.projectId, noteId).subscribe((res) => {
       if (res) {
         this.kbSelectedNote.set(null);
@@ -1971,7 +1973,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   exportKB(): void {
     this.api.exportKnowledge(this.projectId).subscribe((res) => {
-      if (res) alert(`Exported ${res.note_count} notes to:\n${res.path}`);
+      if (res) alert(this.transloco.translate('projectDetail.knowledge.exportedAlert', {count: res.note_count, path: res.path}));
     });
   }
 
@@ -1991,7 +1993,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString(undefined, {
+    return date.toLocaleDateString(this.transloco.getActiveLang(), {
       day: '2-digit',
       month: 'short',
       year: 'numeric',

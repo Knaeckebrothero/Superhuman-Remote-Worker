@@ -5,6 +5,7 @@ import {UserService} from '../../../core/services/user.service';
 import {environment} from '../../../core/environment';
 import {JobStatus} from '../../../core/models/api.model';
 import {JobSummary} from '../../../core/models/audit.model';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 
 type StatusFilter = 'all' | 'mine' | JobStatus;
 
@@ -22,11 +23,12 @@ interface JobRow {
 @Component({
   selector: 'app-job-list',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
-        <span class="title">Jobs</span>
+        <span class="title">{{ 'jobs.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of statusFilters; track filter.value) {
             <button
@@ -34,7 +36,7 @@ interface JobRow {
               [class.active]="activeFilter() === filter.value"
               (click)="setFilter(filter.value)"
             >
-              {{ filter.label }}
+              {{ filter.labelKey | transloco }}
               @if (filter.value !== 'all' && filter.value !== 'mine') {
                 <span class="count">({{ getStatusCount(filter.value) }})</span>
               }
@@ -42,11 +44,11 @@ interface JobRow {
           }
         </div>
         <button class="refresh-btn" (click)="refresh()" [disabled]="isLoading()">
-          Refresh
+          {{ 'jobs.refresh' | transloco }}
         </button>
         @if (snapshotStats()?.available) {
-          <span class="snapshot-stats" title="S3 snapshot storage">
-            {{ snapshotStats()!.total_snapshots }} snapshots &middot; {{ formatBytes(snapshotStats()!.total_size_bytes) }}
+          <span class="snapshot-stats" [title]="'jobs.tooltip.snapshotStats' | transloco">
+            {{ 'jobs.snapshotsSummary' | transloco:{ count: snapshotStats()!.total_snapshots, size: formatBytes(snapshotStats()!.total_size_bytes) } }}
           </span>
         }
       </div>
@@ -55,7 +57,7 @@ interface JobRow {
       @if (isLoading() && jobs().length === 0) {
         <div class="loading-state">
           <div class="spinner"></div>
-          <span>Loading jobs...</span>
+          <span>{{ 'jobs.loading' | transloco }}</span>
         </div>
       }
 
@@ -63,11 +65,11 @@ interface JobRow {
       @if (!isLoading() && displayRows().length === 0) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4CB;</span>
-          <span>No jobs found</span>
+          <span>{{ 'jobs.noJobsFound' | transloco }}</span>
           @if (activeFilter() !== 'all') {
-            <span class="empty-hint">Try selecting a different filter</span>
+            <span class="empty-hint">{{ 'jobs.noJobsHintFilter' | transloco }}</span>
           } @else {
-            <span class="empty-hint">Create a new job to get started</span>
+            <span class="empty-hint">{{ 'jobs.noJobsHintEmpty' | transloco }}</span>
           }
         </div>
       }
@@ -78,10 +80,10 @@ interface JobRow {
           <table class="job-table">
             <thead>
               <tr>
-                <th class="col-prompt">Job</th>
-                <th class="col-status">Status</th>
-                <th class="col-created">Created</th>
-                <th class="col-actions">Actions</th>
+                <th class="col-prompt">{{ 'jobs.colJob' | transloco }}</th>
+                <th class="col-status">{{ 'jobs.colStatus' | transloco }}</th>
+                <th class="col-created">{{ 'jobs.colCreated' | transloco }}</th>
+                <th class="col-actions">{{ 'jobs.colActions' | transloco }}</th>
               </tr>
             </thead>
             <tbody>
@@ -98,7 +100,7 @@ interface JobRow {
                           class="expand-btn"
                           [class.expanded]="isExpanded(row.job.id)"
                           (click)="toggleExpand(row.job.id); $event.stopPropagation()"
-                          [title]="isExpanded(row.job.id) ? 'Collapse sub-jobs' : 'Expand sub-jobs'"
+                          [title]="(isExpanded(row.job.id) ? 'jobs.tooltip.collapse' : 'jobs.tooltip.expand') | transloco"
                         >
                           <span class="expand-chevron">&#9206;</span>
                         </button>
@@ -127,20 +129,20 @@ interface JobRow {
                   <td>
                     <div class="status-cell-inner">
                       <span class="status-badge" [class]="'status-' + row.job.status">
-                        {{ formatStatus(row.job.status) }}
+                        {{ 'jobs.status.' + row.job.status | transloco }}
                       </span>
                       @if (row.job.status === 'waiting' && row.hasChildren) {
-                        <span class="delegation-badge" title="Waiting for delegation children to complete">
-                          {{ getChildCount(row.job.id) }} children
+                        <span class="delegation-badge" [title]="'jobs.tooltip.delegationWaiting' | transloco">
+                          {{ 'jobs.delegationChildren' | transloco:{ count: getChildCount(row.job.id) } }}
                         </span>
                       }
                       @if (row.isChild && row.job.creation_order != null) {
-                        <span class="delegation-badge" title="Delegation child (creation order {{ row.job.creation_order }})">
+                        <span class="delegation-badge" [title]="'jobs.tooltip.delegationChild' | transloco:{ order: row.job.creation_order }">
                           #{{ row.job.creation_order }}
                         </span>
                       }
                       @if (row.job.snapshot_status === 'available') {
-                        <span class="snapshot-badge" title="Environment snapshot available">S</span>
+                        <span class="snapshot-badge" [title]="'jobs.tooltip.snapshotAvailable' | transloco">S</span>
                       }
                     </div>
                   </td>
@@ -151,17 +153,17 @@ interface JobRow {
                     <button
                       class="action-btn view"
                       (click)="viewJob(row.job.id); $event.stopPropagation()"
-                      title="View in debug panels"
+                      [title]="'jobs.tooltip.view' | transloco"
                     >
-                      View
+                      {{ 'jobs.action.view' | transloco }}
                     </button>
                     @if (getWorkspaceUrl(row.job)) {
                       <button
                         class="action-btn workspace"
                         (click)="openWorkspace(row.job); $event.stopPropagation()"
-                        title="Browse workspace in Gitea"
+                        [title]="'jobs.tooltip.workspace' | transloco"
                       >
-                        Workspace
+                        {{ 'jobs.action.workspace' | transloco }}
                       </button>
                     }
                     @if (canOpenIde(row.job)) {
@@ -170,19 +172,19 @@ interface JobRow {
                           class="action-btn ide loading"
                           disabled
                           (click)="$event.stopPropagation()"
-                          title="Starting IDE session..."
+                          [title]="'jobs.tooltip.ideStarting' | transloco"
                         >
                           <span class="btn-spinner"></span>
-                          Starting
+                          {{ 'jobs.action.starting' | transloco }}
                         </button>
                       } @else {
                         <button
                           class="action-btn ide"
                           [class.gitea-only]="!row.job.snapshot_status && !hasLiveVm(row.job)"
                           (click)="openIde(row.job.id); $event.stopPropagation()"
-                          [title]="row.job.snapshot_status === 'available' ? 'Open workspace in Web IDE (from snapshot)' : 'Open workspace in Web IDE (code only)'"
+                          [title]="(row.job.snapshot_status === 'available' ? 'jobs.tooltip.ideSnapshot' : 'jobs.tooltip.ideCode') | transloco"
                         >
-                          IDE
+                          {{ 'jobs.action.ide' | transloco }}
                         </button>
                       }
                     }
@@ -191,34 +193,34 @@ interface JobRow {
                         <button
                           class="action-btn canceling"
                           disabled
-                          title="Canceling job..."
+                          [title]="'jobs.tooltip.canceling' | transloco"
                         >
                           <span class="btn-spinner"></span>
-                          Canceling
+                          {{ 'jobs.action.canceling' | transloco }}
                         </button>
                       } @else {
                         <button
                           class="action-btn pause"
                           (click)="pauseJob(row.job.id); $event.stopPropagation()"
-                          title="Pause job"
+                          [title]="'jobs.tooltip.pauseJob' | transloco"
                         >
-                          Pause
+                          {{ 'jobs.action.pause' | transloco }}
                         </button>
                         @if (confirmingCancelId() === row.job.id) {
                           <button
                             class="action-btn cancel confirming"
                             (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                            title="Click again to confirm cancellation"
+                            [title]="'jobs.tooltip.confirmCancel' | transloco"
                           >
-                            Sure?
+                            {{ 'jobs.action.sure' | transloco }}
                           </button>
                         } @else {
                           <button
                             class="action-btn cancel"
                             (click)="confirmCancel(row.job.id); $event.stopPropagation()"
-                            title="Cancel job"
+                            [title]="'jobs.tooltip.cancelJob' | transloco"
                           >
-                            Cancel
+                            {{ 'jobs.action.cancel' | transloco }}
                           </button>
                         }
                       }
@@ -227,18 +229,18 @@ interface JobRow {
                       <button
                         class="action-btn review"
                         (click)="reviewJob(row.job.id); $event.stopPropagation()"
-                        title="Review and approve/continue"
+                        [title]="'jobs.tooltip.reviewJob' | transloco"
                       >
-                        Review
+                        {{ 'jobs.action.review' | transloco }}
                       </button>
                     }
                     @if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
                       <button
                         class="action-btn resume"
                         (click)="resumeJob(row.job.id); $event.stopPropagation()"
-                        title="Resume from checkpoint"
+                        [title]="'jobs.tooltip.resumeJob' | transloco"
                       >
-                        Resume
+                        {{ 'jobs.action.resume' | transloco }}
                       </button>
                     }
                     @if (row.job.status !== 'processing' && row.job.status !== 'completed' && row.job.status !== 'cancelled') {
@@ -246,26 +248,26 @@ interface JobRow {
                         <button
                           class="action-btn canceling"
                           disabled
-                          title="Canceling job..."
+                          [title]="'jobs.tooltip.canceling' | transloco"
                         >
                           <span class="btn-spinner"></span>
-                          Canceling
+                          {{ 'jobs.action.canceling' | transloco }}
                         </button>
                       } @else if (confirmingCancelId() === row.job.id) {
                         <button
                           class="action-btn cancel confirming"
                           (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                          title="Click again to confirm cancellation"
+                          [title]="'jobs.tooltip.confirmCancel' | transloco"
                         >
-                          Sure?
+                          {{ 'jobs.action.sure' | transloco }}
                         </button>
                       } @else {
                         <button
                           class="action-btn cancel"
                           (click)="confirmCancel(row.job.id); $event.stopPropagation()"
-                          title="Cancel job"
+                          [title]="'jobs.tooltip.cancelJob' | transloco"
                         >
-                          Cancel
+                          {{ 'jobs.action.cancel' | transloco }}
                         </button>
                       }
                     }
@@ -273,9 +275,9 @@ interface JobRow {
                       <button
                         class="action-btn promote"
                         (click)="togglePromote(row.job.id); $event.stopPropagation()"
-                        title="Promote to project"
+                        [title]="'jobs.tooltip.promoteJob' | transloco"
                       >
-                        Promote
+                        {{ 'jobs.action.promote' | transloco }}
                       </button>
                     }
                     @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
@@ -283,17 +285,17 @@ interface JobRow {
                         <button
                           class="action-btn delete confirming"
                           (click)="deleteJob(row.job.id); $event.stopPropagation()"
-                          title="Click again to confirm deletion"
+                          [title]="'jobs.tooltip.confirmDelete' | transloco"
                         >
-                          Confirm?
+                          {{ 'jobs.action.confirmDelete' | transloco }}
                         </button>
                       } @else {
                         <button
                           class="action-btn delete"
                           (click)="confirmDelete(row.job.id); $event.stopPropagation()"
-                          title="Delete job"
+                          [title]="'jobs.tooltip.deleteJob' | transloco"
                         >
-                          Delete
+                          {{ 'jobs.action.delete' | transloco }}
                         </button>
                       }
                     }
@@ -305,19 +307,19 @@ interface JobRow {
                       <div class="promote-form">
                         <input
                           class="promote-input"
-                          placeholder="Project name (required)"
+                          [placeholder]="'jobs.promote.namePlaceholder' | transloco"
                           [value]="promoteName()"
                           (input)="promoteName.set(asInputValue($event))"
                         />
                         <input
                           class="promote-input"
-                          placeholder="Description"
+                          [placeholder]="'jobs.promote.descriptionPlaceholder' | transloco"
                           [value]="promoteDescription()"
                           (input)="promoteDescription.set(asInputValue($event))"
                         />
                         <input
                           class="promote-input"
-                          placeholder="Goal"
+                          [placeholder]="'jobs.promote.goalPlaceholder' | transloco"
                           [value]="promoteGoal()"
                           (input)="promoteGoal.set(asInputValue($event))"
                         />
@@ -326,13 +328,13 @@ interface JobRow {
                           [disabled]="!promoteName().trim()"
                           (click)="submitPromote(row.job.id)"
                         >
-                          Create Project
+                          {{ 'jobs.action.createProject' | transloco }}
                         </button>
                         <button
                           class="action-btn cancel"
                           (click)="promoteJobId.set(null)"
                         >
-                          Cancel
+                          {{ 'jobs.action.cancel' | transloco }}
                         </button>
                       </div>
                     </td>
@@ -347,7 +349,7 @@ interface JobRow {
       <!-- Footer -->
       <div class="footer-bar">
         <span class="job-count">
-          Showing {{ filteredJobs().length }} of {{ jobs().length }} jobs
+          {{ 'jobs.count' | transloco:{ filtered: filteredJobs().length, total: jobs().length } }}
         </span>
       </div>
     </div>
@@ -988,6 +990,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
+  private readonly transloco = inject(TranslocoService);
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
@@ -1016,18 +1019,18 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
-  readonly statusFilters: { label: string; value: StatusFilter }[] = [
-    { label: 'All', value: 'all' },
-    { label: 'Mine', value: 'mine' },
-    { label: 'Review', value: 'pending_review' },
-    { label: 'Reviewing', value: 'reviewing' },
-    { label: 'Waiting', value: 'waiting' },
-    { label: 'Created', value: 'created' },
-    { label: 'Processing', value: 'processing' },
-    { label: 'Completed', value: 'completed' },
-    { label: 'Paused', value: 'paused' },
-    { label: 'Failed', value: 'failed' },
-    { label: 'Cancelled', value: 'cancelled' },
+  readonly statusFilters: { labelKey: string; value: StatusFilter }[] = [
+    { labelKey: 'jobs.filter.all', value: 'all' },
+    { labelKey: 'jobs.filter.mine', value: 'mine' },
+    { labelKey: 'jobs.filter.pending_review', value: 'pending_review' },
+    { labelKey: 'jobs.filter.reviewing', value: 'reviewing' },
+    { labelKey: 'jobs.filter.waiting', value: 'waiting' },
+    { labelKey: 'jobs.filter.created', value: 'created' },
+    { labelKey: 'jobs.filter.processing', value: 'processing' },
+    { labelKey: 'jobs.filter.completed', value: 'completed' },
+    { labelKey: 'jobs.filter.paused', value: 'paused' },
+    { labelKey: 'jobs.filter.failed', value: 'failed' },
+    { labelKey: 'jobs.filter.cancelled', value: 'cancelled' },
   ];
 
   readonly filteredJobs = computed(() => {
@@ -1420,16 +1423,9 @@ export class JobListComponent implements OnInit, OnDestroy {
     return jobs.filter((j) => j.parent_job_id === parentId).length;
   }
 
-  formatStatus(status: string): string {
-    return status
-      .split('_')
-      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-      .join(' ');
-  }
-
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString(undefined, {
+    return date.toLocaleDateString(this.transloco.getActiveLang(), {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',

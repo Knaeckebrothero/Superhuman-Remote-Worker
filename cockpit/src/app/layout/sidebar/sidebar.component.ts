@@ -10,17 +10,18 @@ import {LayoutPickerComponent} from '../../debug/components/layout-picker/layout
 import {NotificationBellComponent} from '../../shared/components/notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
         <span class="sidebar-logo">SRW</span>
-        <span class="sidebar-label">Cockpit</span>
-        <button class="collapse-btn" (click)="sidebar.collapse()" title="Collapse sidebar">
+        <span class="sidebar-label">{{ 'nav.cockpit' | transloco }}</span>
+        <button class="collapse-btn" (click)="sidebar.collapse()" [title]="'nav.collapseSidebar' | transloco">
           <span class="collapse-icon">chevron_left</span>
         </button>
       </div>
@@ -34,7 +35,7 @@ import {environment} from '../../core/environment';
             [routerLinkActiveOptions]="{ exact: true }"
           >
             <span class="nav-icon">construction</span>
-            Builder
+            {{ 'nav.builder' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -42,7 +43,7 @@ import {environment} from '../../core/environment';
             routerLinkActive="active"
           >
             <span class="nav-icon">chat</span>
-            Sessions
+            {{ 'nav.sessions' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -50,7 +51,7 @@ import {environment} from '../../core/environment';
             routerLinkActive="active"
           >
             <span class="nav-icon">work</span>
-            Jobs
+            {{ 'nav.jobs' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -58,7 +59,7 @@ import {environment} from '../../core/environment';
             routerLinkActive="active"
           >
             <span class="nav-icon">folder_shared</span>
-            Projects
+            {{ 'nav.projects' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -66,7 +67,7 @@ import {environment} from '../../core/environment';
             routerLinkActive="active"
           >
             <span class="nav-icon">database</span>
-            Data Sources
+            {{ 'nav.datasources' | transloco }}
           </a>
           <a
             class="nav-link"
@@ -74,7 +75,7 @@ import {environment} from '../../core/environment';
             routerLinkActive="active"
           >
             <span class="nav-icon">add_circle</span>
-            Create
+            {{ 'nav.create' | transloco }}
           </a>
           @if (!viewport.isMobile()) {
             <a
@@ -83,7 +84,7 @@ import {environment} from '../../core/environment';
               routerLinkActive="active"
             >
               <span class="nav-icon">bug_report</span>
-              Debug
+              {{ 'nav.debug' | transloco }}
             </a>
           }
         </div>
@@ -150,15 +151,15 @@ import {environment} from '../../core/environment';
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
             @if (user.is_admin) {
-              <span class="admin-badge">admin</span>
+              <span class="admin-badge">{{ 'nav.admin' | transloco }}</span>
             }
           </div>
           <div class="footer-actions">
             <app-notification-bell />
-            <a class="footer-link" routerLink="/settings" routerLinkActive="active" title="Settings">
+            <a class="footer-link" routerLink="/settings" routerLinkActive="active" [title]="'nav.settings' | transloco">
               <span class="nav-icon">settings</span>
             </a>
-            <button class="logout-button" (click)="logout()">Logout</button>
+            <button class="logout-button" (click)="logout()">{{ 'nav.logout' | transloco }}</button>
           </div>
         }
       </div>

@@ -3,6 +3,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {PersistentChatComponent} from '../../../shared/components/persistent-chat/persistent-chat.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ToastService} from '../../../core/services/toast.service';
+import {ErrorMessageService} from '../../../core/services/error-message.service';
 
 @Component({
     selector: 'app-chat-page',
@@ -23,6 +24,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly router = inject(Router);
     private readonly chat = inject(PersistentChatService);
     private readonly toast = inject(ToastService);
+    private readonly errors = inject(ErrorMessageService);
 
     ngOnInit(): void {
         const threadId = this.route.snapshot.paramMap.get('threadId');
@@ -34,7 +36,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.chat.createAndConnect(state.createBody).then(
                     id => this.router.navigate(['/sessions', id], {replaceUrl: true}),
                     err => {
-                        this.toast.error(err?.error?.detail || 'Failed to create session');
+                        this.toast.error(this.errors.translate(err, 'errors.sessions.createFailed'));
                         this.router.navigate(['/sessions']);
                     }
                 );

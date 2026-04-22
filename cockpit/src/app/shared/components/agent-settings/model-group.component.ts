@@ -1,5 +1,6 @@
 import {Component, computed, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
 import {readConfigPath, SettingsMode} from './agent-settings.types';
@@ -18,15 +19,15 @@ const STORAGE_KEYS = {
 @Component({
   selector: 'app-model-group',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="settings-group">
-      <div class="group-label">Model</div>
+      <div class="group-label">{{ 'agentSettings.model.group' | transloco }}</div>
 
       <!-- Model Preset Chips (job mode only) -->
       @if (mode() === 'job' && availablePresets().length > 0) {
         <div class="field-row preset-row">
-          <label class="field-label">Preset</label>
+          <label class="field-label">{{ 'agentSettings.model.preset' | transloco }}</label>
           <div class="preset-chips">
             @for (preset of availablePresets(); track preset.label) {
               <button
@@ -36,7 +37,7 @@ const STORAGE_KEYS = {
                 [class.unconfigured]="!preset.configured"
                 (click)="applyPreset(preset)"
                 [disabled]="disabled()"
-                [title]="preset.configured ? '' : 'One or both models lack an API key'"
+                [title]="preset.configured ? '' : ('agentSettings.model.presetUnconfigured' | transloco)"
               >{{ preset.label }}</button>
             }
           </div>
@@ -46,7 +47,7 @@ const STORAGE_KEYS = {
       @if (mode() === 'job') {
         <!-- Strategic Model -->
         <div class="field-row" [class.modified]="strategicModel() !== null">
-          <label class="field-label">Strategic</label>
+          <label class="field-label">{{ 'agentSettings.model.strategic' | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -54,9 +55,9 @@ const STORAGE_KEYS = {
               (ngModelChange)="onStrategicModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">Default</option>
+              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
+                <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -64,14 +65,14 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (strategicModel() !== null) {
-              <button type="button" class="reset-btn" (click)="onStrategicModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onStrategicModelChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco">close</button>
             }
           </div>
         </div>
 
         <!-- Tactical Model -->
         <div class="field-row" [class.modified]="tacticalModel() !== null">
-          <label class="field-label">Tactical</label>
+          <label class="field-label">{{ 'agentSettings.model.tactical' | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -79,9 +80,9 @@ const STORAGE_KEYS = {
               (ngModelChange)="onTacticalModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">Default</option>
+              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
+                <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -89,14 +90,14 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (tacticalModel() !== null) {
-              <button type="button" class="reset-btn" (click)="onTacticalModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onTacticalModelChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco">close</button>
             }
           </div>
         </div>
       } @else {
         <!-- Session: single model -->
         <div class="field-row" [class.modified]="sessionModel() !== null">
-          <label class="field-label">Model</label>
+          <label class="field-label">{{ 'agentSettings.model.single' | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -104,9 +105,9 @@ const STORAGE_KEYS = {
               (ngModelChange)="onSessionModelChange($event)"
               [disabled]="disabled()"
             >
-              <option [ngValue]="null">Default</option>
+              <option [ngValue]="null">{{ 'agentSettings.model.default' | transloco }}</option>
               @for (group of availableModels(); track group.group) {
-                <optgroup [label]="group.configured ? group.group : group.group + ' (no API key)'">
+                <optgroup [label]="providerLabel(group)">
                   @for (model of group.models; track model) {
                     <option [value]="model">{{ model }}</option>
                   }
@@ -114,7 +115,7 @@ const STORAGE_KEYS = {
               }
             </select>
             @if (sessionModel() !== null) {
-              <button type="button" class="reset-btn" (click)="onSessionModelChange(null)" title="Reset to default">close</button>
+              <button type="button" class="reset-btn" (click)="onSessionModelChange(null)" [title]="'agentSettings.common.resetToDefault' | transloco">close</button>
             }
           </div>
         </div>
@@ -233,6 +234,13 @@ const STORAGE_KEYS = {
 export class ModelGroupComponent {
   private readonly modelService = inject(ModelService);
   private readonly settingsService = inject(SettingsService);
+  private readonly transloco = inject(TranslocoService);
+
+  providerLabel(group: {group: string; configured: boolean}): string {
+    return group.configured
+      ? group.group
+      : this.transloco.translate('agentSettings.model.providerNoKey', {provider: group.group});
+  }
 
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
