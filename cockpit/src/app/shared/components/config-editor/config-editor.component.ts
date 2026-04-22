@@ -2,6 +2,7 @@ import { Component, effect, inject, input, output, signal, OnInit } from '@angul
 import { FormsModule } from '@angular/forms';
 import { NgTemplateOutlet } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
+import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 
 // =============================================================================
 // Schema Node Model
@@ -148,17 +149,17 @@ function getNestedValue(obj: unknown, path: string): unknown {
 @Component({
   selector: 'app-config-editor',
   standalone: true,
-  imports: [FormsModule, NgTemplateOutlet],
+  imports: [FormsModule, NgTemplateOutlet, TranslocoPipe],
   template: `
     @if (!schemaLoaded()) {
-      <div class="loading">Loading schema...</div>
+      <div class="loading">{{ 'configEditor.loading' | transloco }}</div>
     } @else {
       <!-- Mode toggle -->
       <div class="mode-toggle">
-        <button type="button" [class.active]="mode() === 'visual'" (click)="switchMode('visual')">Visual</button>
-        <button type="button" [class.active]="mode() === 'json'" (click)="switchMode('json')">JSON</button>
+        <button type="button" [class.active]="mode() === 'visual'" (click)="switchMode('visual')">{{ 'configEditor.modeVisual' | transloco }}</button>
+        <button type="button" [class.active]="mode() === 'json'" (click)="switchMode('json')">{{ 'configEditor.modeJson' | transloco }}</button>
         <span class="override-count" [class.has-overrides]="overrideCount() > 0">
-          {{ overrideCount() }} override{{ overrideCount() !== 1 ? 's' : '' }}
+          {{ (overrideCount() === 1 ? 'configEditor.overrideSingle' : 'configEditor.overridePlural') | transloco: {n: overrideCount()} }}
         </span>
       </div>
 
@@ -235,7 +236,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
             <div class="json-error">{{ jsonError() }}</div>
           }
           <span class="field-hint">
-            Full resolved config (expert defaults + your overrides). Edit any value — only changes are sent as overrides.
+            {{ 'configEditor.jsonHint' | transloco }}
           </span>
         </div>
       }
@@ -249,7 +250,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
             }
             <span>{{ node.title }}</span>
             @if (node.nullable) {
-              <span class="nullable-badge">nullable</span>
+              <span class="nullable-badge">{{ 'configEditor.nullable' | transloco }}</span>
             }
           </div>
 
@@ -261,7 +262,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
               (ngModelChange)="setSmartOverride(node.path, $event === '__null__' ? null : $event, node.defaultValue)"
             >
               @if (node.nullable || node.defaultValue === undefined) {
-                <option value="__null__">Default{{ node.nullable ? ' (auto-detect)' : '' }}</option>
+                <option value="__null__">{{ (node.nullable ? 'configEditor.defaultAutoDetect' : 'configEditor.defaultOption') | transloco }}</option>
               }
               @for (opt of node.enumValues; track opt) {
                 <option [value]="opt">{{ opt }}</option>
@@ -293,7 +294,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
               />
               <span class="slider-value">{{ getDisplayValue(node.path, node.defaultValue) ?? '-' }}</span>
               @if (isModified(node.path)) {
-                <button type="button" class="clear-btn" (click)="clearOverride(node.path)" title="Reset to default">
+                <button type="button" class="clear-btn" (click)="clearOverride(node.path)" [title]="'configEditor.resetToDefault' | transloco">
                   <span class="material-symbols-outlined">close</span>
                 </button>
               }
@@ -323,7 +324,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
               />
               <span class="toggle-slider"></span>
               @if (isModified(node.path)) {
-                <button type="button" class="clear-btn" (click)="clearOverride(node.path); $event.preventDefault()" title="Reset to default">
+                <button type="button" class="clear-btn" (click)="clearOverride(node.path); $event.preventDefault()" [title]="'configEditor.resetToDefault' | transloco">
                   <span class="material-symbols-outlined">close</span>
                 </button>
               }
@@ -338,7 +339,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
               [ngModel]="getArrayDisplay(node.path, node.defaultValue)"
               (ngModelChange)="setArrayOverride(node.path, $event, node.defaultValue)"
             />
-            <span class="field-hint">Comma-separated values</span>
+            <span class="field-hint">{{ 'configEditor.arrayHint' | transloco }}</span>
           }
 
           @if (node.description) {
@@ -650,6 +651,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
 })
 export class ConfigEditorComponent implements OnInit {
   private readonly http = inject(HttpClient);
+  private readonly transloco = inject(TranslocoService);
 
   // Inputs
   readonly expertConfig = input<Record<string, unknown>>({});
@@ -840,11 +842,11 @@ export class ConfigEditorComponent implements OnInit {
           this.jsonError.set(null);
           this.emitValue();
         } else {
-          this.jsonError.set('Root must be an object');
+          this.jsonError.set(this.transloco.translate('configEditor.errors.rootMustBeObject'));
           return;
         }
       } catch (e: any) {
-        this.jsonError.set(e.message || 'Invalid JSON');
+        this.jsonError.set(e.message || this.transloco.translate('configEditor.errors.invalidJson'));
         return;
       }
     }
@@ -863,10 +865,10 @@ export class ConfigEditorComponent implements OnInit {
         this.overrides.set(flattenObject(diff));
         this.emitValue();
       } else {
-        this.jsonError.set('Root must be an object');
+        this.jsonError.set(this.transloco.translate('configEditor.errors.rootMustBeObject'));
       }
     } catch (e: any) {
-      this.jsonError.set(e.message || 'Invalid JSON');
+      this.jsonError.set(e.message || this.transloco.translate('configEditor.errors.invalidJson'));
     }
   }
 

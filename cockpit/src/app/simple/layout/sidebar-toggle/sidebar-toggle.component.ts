@@ -1,12 +1,14 @@
 import { Component, inject } from '@angular/core';
 import { SidebarService } from '../../../core/services/sidebar.service';
+import { TranslocoPipe } from '@jsverse/transloco';
 
 @Component({
   selector: 'app-sidebar-toggle',
   standalone: true,
+  imports: [TranslocoPipe],
   template: `
     @if (sidebar.collapsed()) {
-      <button class="sidebar-toggle" (click)="sidebar.expand()" title="Open sidebar">
+      <button class="sidebar-toggle" (click)="sidebar.expand()" [title]="'nav.openSidebar' | transloco">
         <span class="toggle-icon">menu</span>
       </button>
     }

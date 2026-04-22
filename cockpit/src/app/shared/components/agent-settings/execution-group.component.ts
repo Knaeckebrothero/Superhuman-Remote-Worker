@@ -1,5 +1,7 @@
-import {Component, computed, input, output, signal} from '@angular/core';
+import {Component, computed, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {toSignal} from '@angular/core/rxjs-interop';
 import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
@@ -15,15 +17,15 @@ import {
 @Component({
   selector: 'app-execution-group',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="settings-group">
-      <div class="group-label">Execution</div>
+      <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
 
       <!-- Autonomy (job) or Permission Mode (session) -->
       @if (mode() === 'job') {
         <div class="field-row" [class.modified]="autonomy() !== null">
-          <label class="field-label">Autonomy</label>
+          <label class="field-label">{{ 'agentSettings.execution.autonomy' | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -32,11 +34,11 @@ import {
               [disabled]="disabled()"
             >
               @for (level of autonomyLevels; track level.value) {
-                <option [value]="level.value">{{ level.label }}</option>
+                <option [value]="level.value">{{ 'agentSettings.autonomy.' + level.value + '.label' | transloco }}</option>
               }
             </select>
             @if (autonomy() !== null) {
-              <button type="button" class="reset-btn" (click)="autonomy.set(null)" title="Reset to default">
+              <button type="button" class="reset-btn" (click)="autonomy.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
                 close
               </button>
             }
@@ -45,7 +47,7 @@ import {
         </div>
       } @else {
         <div class="field-row" [class.modified]="permissionMode() !== null">
-          <label class="field-label">Permission Mode</label>
+          <label class="field-label">{{ 'agentSettings.execution.permissionMode' | transloco }}</label>
           <div class="field-control">
             <select
               class="form-input"
@@ -54,11 +56,11 @@ import {
               [disabled]="disabled()"
             >
               @for (pm of permissionModes; track pm.value) {
-                <option [value]="pm.value">{{ pm.label }}</option>
+                <option [value]="pm.value">{{ 'agentSettings.permissionModes.' + pm.value + '.label' | transloco }}</option>
               }
             </select>
             @if (permissionMode() !== null) {
-              <button type="button" class="reset-btn" (click)="permissionMode.set(null)" title="Reset to default">
+              <button type="button" class="reset-btn" (click)="permissionMode.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
                 close
               </button>
             }
@@ -77,10 +79,10 @@ import {
               (change)="onScholarChange($event)"
               [disabled]="disabled()"
             >
-            <span>Scholar (pre-research)</span>
+            <span>{{ 'agentSettings.execution.scholar' | transloco }}</span>
           </label>
           @if (scholar() !== null) {
-            <button type="button" class="reset-btn" (click)="scholar.set(null)" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="scholar.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
               close
             </button>
           }
@@ -97,7 +99,7 @@ import {
               (change)="onCriticChange($event)"
               [disabled]="disabled()"
             >
-            <span>Critic (verification)</span>
+            <span>{{ 'agentSettings.execution.critic' | transloco }}</span>
           </label>
           @if (effectiveCritic()) {
             <select
@@ -107,12 +109,12 @@ import {
               [disabled]="disabled()"
             >
               @for (opt of criticRoundOptions; track opt.value) {
-                <option [ngValue]="opt.value">{{ opt.label }}</option>
+                <option [ngValue]="opt.value">{{ 'agentSettings.criticRounds.' + opt.value | transloco }}</option>
               }
             </select>
           }
           @if (critic() !== null || criticRounds() !== null) {
-            <button type="button" class="reset-btn" (click)="resetCritic()" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="resetCritic()" [title]="'agentSettings.common.resetToDefault' | transloco">
               close
             </button>
           }
@@ -129,10 +131,10 @@ import {
               (change)="onProjectMemoryChange($event)"
               [disabled]="disabled()"
             >
-            <span>Project memory</span>
+            <span>{{ 'agentSettings.execution.projectMemory' | transloco }}</span>
           </label>
           @if (projectMemory() !== null) {
-            <button type="button" class="reset-btn" (click)="projectMemory.set(null)" title="Reset to default">
+            <button type="button" class="reset-btn" (click)="projectMemory.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
               close
             </button>
           }
@@ -245,6 +247,11 @@ import {
   `],
 })
 export class ExecutionGroupComponent {
+  private readonly transloco = inject(TranslocoService);
+  private readonly activeLang = toSignal(this.transloco.langChanges$, {
+    initialValue: this.transloco.getActiveLang(),
+  });
+
   /** Merged expert/framework config. */
   config = input<Record<string, unknown>>({});
   mode = input<SettingsMode>('job');
@@ -288,14 +295,19 @@ export class ExecutionGroupComponent {
   );
 
   readonly effectiveAutonomyDesc = computed(() => {
+    this.activeLang();
     const val = this.autonomy() ?? this.resolvedAutonomy();
-    return this.autonomyLevels.find(l => l.value === val)?.description
-      ?? 'Controls when the agent pauses for human review';
+    const known = this.autonomyLevels.find(l => l.value === val);
+    if (!known) return this.transloco.translate('agentSettings.execution.autonomyDefaultHint');
+    return this.transloco.translate(`agentSettings.autonomy.${val}.description`);
   });
 
   readonly effectivePermissionDesc = computed(() => {
+    this.activeLang();
     const val = this.permissionMode() ?? this.resolvedPermissionMode();
-    return this.permissionModes.find(p => p.value === val)?.description ?? '';
+    const known = this.permissionModes.find(p => p.value === val);
+    if (!known) return '';
+    return this.transloco.translate(`agentSettings.permissionModes.${val}.description`);
   });
 
   readonly effectiveCritic = computed(() =>

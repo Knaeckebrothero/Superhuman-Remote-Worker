@@ -184,6 +184,9 @@ jobs:
       - name: Install dependencies
         working-directory: cockpit
         run: npm ci
+      - name: Check i18n parity
+        working-directory: cockpit
+        run: npm run i18n:check
       - name: Run tests
         working-directory: cockpit
         run: npm test

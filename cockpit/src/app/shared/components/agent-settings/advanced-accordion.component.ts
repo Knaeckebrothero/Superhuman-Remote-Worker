@@ -1,5 +1,6 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe} from '@jsverse/transloco';
 import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
 
@@ -10,14 +11,14 @@ import {getReasoningOptions} from './reasoning-options';
 @Component({
   selector: 'app-advanced-accordion',
   standalone: true,
-    imports: [FormsModule],
+    imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
       <div class="accordion-section" [class.expanded]="expanded().has('inference')">
         <button type="button" class="accordion-header" (click)="toggleSection('inference')">
           <span class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</span>
-          Inference Parameters
+          {{ 'advanced.sections.inference' | transloco }}
           @if (inferenceModifiedCount() > 0) {
             <span class="modified-badge">{{ inferenceModifiedCount() }}</span>
           }
@@ -27,9 +28,9 @@ import {getReasoningOptions} from './reasoning-options';
             @if (mode() === 'job') {
               <!-- Strategic phase -->
               <div class="phase-section">
-                <span class="phase-label">Strategic</span>
+                <span class="phase-label">{{ 'advanced.phases.strategic' | transloco }}</span>
                 <div class="field-row" [class.modified]="strategicReasoning() !== null">
-                  <label class="field-label">Reasoning</label>
+                  <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="strategicReasoning() ?? resolvedStrategicReasoning()"
@@ -50,7 +51,7 @@ import {getReasoningOptions} from './reasoning-options';
                 </div>
                 <div class="field-row" [class.modified]="strategicTemperature() !== null">
                   <label class="field-label">
-                    Temperature: {{ effectiveStrategicTemp() }}
+                    {{ 'advanced.labels.temperature' | transloco: {value: effectiveStrategicTemp()} }}
                   </label>
                   <div class="slider-row">
                     <span class="slider-label">0</span>
@@ -70,7 +71,7 @@ import {getReasoningOptions} from './reasoning-options';
                       [checked]="strategicMultimodal() ?? resolvedStrategicMultimodal()"
                       (change)="onStrategicMultimodalChange($event)"
                       [disabled]="disabled()">
-                    <span>Multimodal (images)</span>
+                    <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                   </label>
                   @if (strategicMultimodal() !== null) {
                     <button type="button" class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()">close</button>
@@ -79,9 +80,9 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
               <!-- Tactical phase -->
               <div class="phase-section">
-                <span class="phase-label">Tactical</span>
+                <span class="phase-label">{{ 'advanced.phases.tactical' | transloco }}</span>
                 <div class="field-row" [class.modified]="tacticalReasoning() !== null">
-                  <label class="field-label">Reasoning</label>
+                  <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
                   <div class="field-control">
                     <select class="form-input"
                       [ngModel]="tacticalReasoning() ?? resolvedTacticalReasoning()"
@@ -102,7 +103,7 @@ import {getReasoningOptions} from './reasoning-options';
                 </div>
                 <div class="field-row" [class.modified]="tacticalTemperature() !== null">
                   <label class="field-label">
-                    Temperature: {{ effectiveTacticalTemp() }}
+                    {{ 'advanced.labels.temperature' | transloco: {value: effectiveTacticalTemp()} }}
                   </label>
                   <div class="slider-row">
                     <span class="slider-label">0</span>
@@ -122,7 +123,7 @@ import {getReasoningOptions} from './reasoning-options';
                       [checked]="tacticalMultimodal() ?? resolvedTacticalMultimodal()"
                       (change)="onTacticalMultimodalChange($event)"
                       [disabled]="disabled()">
-                    <span>Multimodal (images)</span>
+                    <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                   </label>
                   @if (tacticalMultimodal() !== null) {
                     <button type="button" class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()">close</button>
@@ -132,7 +133,7 @@ import {getReasoningOptions} from './reasoning-options';
             } @else {
               <!-- Session: single model inference settings -->
               <div class="field-row" [class.modified]="sessionReasoning() !== null">
-                <label class="field-label">Reasoning</label>
+                <label class="field-label">{{ 'advanced.labels.reasoning' | transloco }}</label>
                 <div class="field-control">
                   <select class="form-input"
                     [ngModel]="sessionReasoning() ?? resolvedSessionReasoning()"
@@ -153,7 +154,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
               <div class="field-row" [class.modified]="sessionTemperature() !== null">
                 <label class="field-label">
-                  Temperature: {{ effectiveSessionTemp() }}
+                  {{ 'advanced.labels.temperature' | transloco: {value: effectiveSessionTemp()} }}
                 </label>
                 <div class="slider-row">
                   <span class="slider-label">0</span>
@@ -173,7 +174,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [checked]="sessionMultimodal() ?? resolvedSessionMultimodal()"
                     (change)="onSessionMultimodalChange($event)"
                     [disabled]="disabled()">
-                  <span>Multimodal (images)</span>
+                  <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                 </label>
                 @if (sessionMultimodal() !== null) {
                   <button type="button" class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()">close</button>
@@ -184,39 +185,39 @@ import {getReasoningOptions} from './reasoning-options';
             <!-- Shared inference params -->
             <div class="shared-params">
               <div class="field-row" [class.modified]="topP() !== null">
-                <label class="field-label">Top-p</label>
+                <label class="field-label">{{ 'advanced.labels.topP' | transloco }}</label>
                 <div class="field-control">
                   <input type="number" class="form-input compact-input" min="0" max="1" step="0.05"
                     [ngModel]="topP() ?? resolvedTopP()"
                     (ngModelChange)="onTopPChange($event)"
                     [disabled]="disabled()"
-                    placeholder="auto">
+                    [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (topP() !== null) {
                     <button type="button" class="reset-btn" (click)="topP.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
               <div class="field-row" [class.modified]="topK() !== null">
-                <label class="field-label">Top-k</label>
+                <label class="field-label">{{ 'advanced.labels.topK' | transloco }}</label>
                 <div class="field-control">
                   <input type="number" class="form-input compact-input" min="0" step="1"
                     [ngModel]="topK() ?? resolvedTopK()"
                     (ngModelChange)="onTopKChange($event)"
                     [disabled]="disabled()"
-                    placeholder="auto">
+                    [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (topK() !== null) {
                     <button type="button" class="reset-btn" (click)="topK.set(null); emitChange()">close</button>
                   }
                 </div>
               </div>
               <div class="field-row" [class.modified]="maxOutputTokens() !== null">
-                <label class="field-label">Max output tokens</label>
+                <label class="field-label">{{ 'advanced.labels.maxOutputTokens' | transloco }}</label>
                 <div class="field-control">
                   <input type="number" class="form-input compact-input" min="1" step="100"
                     [ngModel]="maxOutputTokens() ?? resolvedMaxOutputTokens()"
                     (ngModelChange)="onMaxOutputTokensChange($event)"
                     [disabled]="disabled()"
-                    placeholder="auto">
+                    [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (maxOutputTokens() !== null) {
                     <button type="button" class="reset-btn" (click)="maxOutputTokens.set(null); emitChange()">close</button>
                   }
@@ -228,7 +229,7 @@ import {getReasoningOptions} from './reasoning-options';
                     [checked]="parallelToolCalls() ?? resolvedParallelToolCalls()"
                     (change)="onParallelToolCallsChange($event)"
                     [disabled]="disabled()">
-                  <span>Parallel tool calls</span>
+                  <span>{{ 'advanced.labels.parallelToolCalls' | transloco }}</span>
                 </label>
                 @if (parallelToolCalls() !== null) {
                   <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()">close</button>
@@ -243,12 +244,12 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('limits')">
         <button type="button" class="accordion-header" (click)="toggleSection('limits')">
           <span class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</span>
-          Limits &amp; Safety
+          {{ 'advanced.sections.limits' | transloco }}
         </button>
         @if (expanded().has('limits')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="messageCountThreshold() !== null">
-              <label class="field-label">Message count threshold</label>
+              <label class="field-label">{{ 'advanced.labels.messageCountThreshold' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="messageCountThreshold() ?? resolvedMessageCountThreshold()"
@@ -260,7 +261,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="toolRetryCount() !== null">
-              <label class="field-label">Tool retry count</label>
+              <label class="field-label">{{ 'advanced.labels.toolRetryCount' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0" max="10"
                   [ngModel]="toolRetryCount() ?? resolvedToolRetryCount()"
@@ -272,7 +273,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="progressStallThreshold() !== null">
-              <label class="field-label">Progress stall threshold</label>
+              <label class="field-label">{{ 'advanced.labels.progressStallThreshold' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="progressStallThreshold() ?? resolvedProgressStallThreshold()"
@@ -284,7 +285,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="maxToolCallsPerPhase() !== null">
-              <label class="field-label">Max tool calls per phase</label>
+              <label class="field-label">{{ 'advanced.labels.maxToolCallsPerPhase' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="maxToolCallsPerPhase() ?? resolvedMaxToolCallsPerPhase()"
@@ -303,7 +304,7 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('memory')">
         <button type="button" class="accordion-header" (click)="toggleSection('memory')">
           <span class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</span>
-          Memory Tuning
+          {{ 'advanced.sections.memory' | transloco }}
         </button>
         @if (expanded().has('memory')) {
           <div class="accordion-body">
@@ -313,14 +314,14 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="memoryEnabled() ?? resolvedMemoryEnabled()"
                   (change)="onMemoryEnabledChange($event)"
                   [disabled]="disabled()">
-                <span>Memory enabled</span>
+                <span>{{ 'advanced.labels.memoryEnabled' | transloco }}</span>
               </label>
               @if (memoryEnabled() !== null) {
                 <button type="button" class="reset-btn" (click)="memoryEnabled.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="memoryBudget() !== null">
-              <label class="field-label">Budget tokens</label>
+              <label class="field-label">{{ 'advanced.labels.budgetTokens' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="memoryBudget() ?? resolvedMemoryBudget()"
@@ -339,7 +340,7 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('context')">
         <button type="button" class="accordion-header" (click)="toggleSection('context')">
           <span class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</span>
-          Context Management
+          {{ 'advanced.sections.context' | transloco }}
         </button>
         @if (expanded().has('context')) {
           <div class="accordion-body">
@@ -349,14 +350,14 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="compactOnArchive() ?? resolvedCompactOnArchive()"
                   (change)="onCompactOnArchiveChange($event)"
                   [disabled]="disabled()">
-                <span>Compact on archive</span>
+                <span>{{ 'advanced.labels.compactOnArchive' | transloco }}</span>
               </label>
               @if (compactOnArchive() !== null) {
                 <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="keepRecentToolResults() !== null">
-              <label class="field-label">Keep recent tool results</label>
+              <label class="field-label">{{ 'advanced.labels.keepRecentToolResults' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0"
                   [ngModel]="keepRecentToolResults() ?? resolvedKeepRecentToolResults()"
@@ -368,7 +369,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="keepRecentMessages() !== null">
-              <label class="field-label">Keep recent messages</label>
+              <label class="field-label">{{ 'advanced.labels.keepRecentMessages' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0"
                   [ngModel]="keepRecentMessages() ?? resolvedKeepRecentMessages()"
@@ -387,19 +388,19 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('workspace')">
         <button type="button" class="accordion-header" (click)="toggleSection('workspace')">
           <span class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</span>
-          Workspace
+          {{ 'advanced.sections.workspace' | transloco }}
         </button>
         @if (expanded().has('workspace')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="workspaceBackend() !== null">
-              <label class="field-label">Backend</label>
+              <label class="field-label">{{ 'advanced.labels.backend' | transloco }}</label>
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="workspaceBackend() ?? resolvedWorkspaceBackend()"
                   (ngModelChange)="workspaceBackend.set($event); emitChange()"
                   [disabled]="disabled()">
-                  <option value="sandbox">Container</option>
-                  <option value="vm">VM (QEMU)</option>
+                  <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
+                  <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
                 </select>
                 @if (workspaceBackend() !== null) {
                   <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()">close</button>
@@ -408,7 +409,7 @@ import {getReasoningOptions} from './reasoning-options';
             </div>
             @if ((workspaceBackend() ?? resolvedWorkspaceBackend()) === 'vm') {
               <div class="field-row" [class.modified]="vmCpuCores() !== null">
-                <label class="field-label">VM CPU cores</label>
+                <label class="field-label">{{ 'advanced.labels.vmCpuCores' | transloco }}</label>
                 <div class="field-control">
                   <input type="number" class="form-input compact-input" min="1" max="16" step="1"
                     [ngModel]="vmCpuCores() ?? resolvedVmCpuCores()"
@@ -420,7 +421,7 @@ import {getReasoningOptions} from './reasoning-options';
                 </div>
               </div>
               <div class="field-row" [class.modified]="vmMemory() !== null">
-                <label class="field-label">VM memory</label>
+                <label class="field-label">{{ 'advanced.labels.vmMemory' | transloco }}</label>
                 <div class="field-control">
                   <input type="text" class="form-input compact-input" placeholder="4Gi"
                     [ngModel]="vmMemory() ?? resolvedVmMemory()"
@@ -433,7 +434,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
-              <label class="field-label">Max read words</label>
+              <label class="field-label">{{ 'advanced.labels.maxReadWords' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxReadWords() ?? resolvedMaxReadWords()"
@@ -445,7 +446,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="maxWriteWords() !== null">
-              <label class="field-label">Max write words</label>
+              <label class="field-label">{{ 'advanced.labels.maxWriteWords' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="0" step="1000"
                   [ngModel]="maxWriteWords() ?? resolvedMaxWriteWords()"
@@ -462,7 +463,7 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="gitVersioning() ?? resolvedGitVersioning()"
                   (change)="onGitVersioningChange($event)"
                   [disabled]="disabled()">
-                <span>Git versioning</span>
+                <span>{{ 'advanced.labels.gitVersioning' | transloco }}</span>
               </label>
               @if (gitVersioning() !== null) {
                 <button type="button" class="reset-btn" (click)="gitVersioning.set(null); emitChange()">close</button>
@@ -476,19 +477,19 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('shell')">
         <button type="button" class="accordion-header" (click)="toggleSection('shell')">
           <span class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</span>
-          Shell
+          {{ 'advanced.sections.shell' | transloco }}
         </button>
         @if (expanded().has('shell')) {
           <div class="accordion-body">
             <div class="field-row" [class.modified]="shellMode() !== null">
-              <label class="field-label">Mode</label>
+              <label class="field-label">{{ 'advanced.labels.mode' | transloco }}</label>
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="shellMode() ?? resolvedShellMode()"
                   (ngModelChange)="shellMode.set($event); emitChange()"
                   [disabled]="disabled()">
-                  <option value="stateless">Stateless</option>
-                  <option value="persistent">Persistent</option>
+                  <option value="stateless">{{ 'advanced.options.stateless' | transloco }}</option>
+                  <option value="persistent">{{ 'advanced.options.persistent' | transloco }}</option>
                 </select>
                 @if (shellMode() !== null) {
                   <button type="button" class="reset-btn" (click)="shellMode.set(null); emitChange()">close</button>
@@ -501,14 +502,14 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="shellSandbox() ?? resolvedShellSandbox()"
                   (change)="onShellSandboxChange($event)"
                   [disabled]="disabled()">
-                <span>Sandbox</span>
+                <span>{{ 'advanced.labels.sandbox' | transloco }}</span>
               </label>
               @if (shellSandbox() !== null) {
                 <button type="button" class="reset-btn" (click)="shellSandbox.set(null); emitChange()">close</button>
               }
             </div>
             <div class="field-row" [class.modified]="shellTimeout() !== null">
-              <label class="field-label">Default timeout (seconds)</label>
+              <label class="field-label">{{ 'advanced.labels.defaultTimeout' | transloco }}</label>
               <div class="field-control">
                 <input type="number" class="form-input compact-input" min="1"
                   [ngModel]="shellTimeout() ?? resolvedShellTimeout()"
@@ -520,15 +521,15 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
             </div>
             <div class="field-row" [class.modified]="sudoAction() !== null">
-              <label class="field-label">Sudo action</label>
+              <label class="field-label">{{ 'advanced.labels.sudoAction' | transloco }}</label>
               <div class="field-control">
                 <select class="form-input"
                   [ngModel]="sudoAction() ?? resolvedSudoAction()"
                   (ngModelChange)="sudoAction.set($event); emitChange()"
                   [disabled]="disabled()">
-                  <option value="freeze">Freeze (ask user)</option>
-                  <option value="block">Block (deny)</option>
-                  <option value="allow">Allow</option>
+                  <option value="freeze">{{ 'advanced.options.sudoFreeze' | transloco }}</option>
+                  <option value="block">{{ 'advanced.options.sudoBlock' | transloco }}</option>
+                  <option value="allow">{{ 'advanced.options.sudoAllow' | transloco }}</option>
                 </select>
                 @if (sudoAction() !== null) {
                   <button type="button" class="reset-btn" (click)="sudoAction.set(null); emitChange()">close</button>
@@ -543,7 +544,7 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('research')">
         <button type="button" class="accordion-header" (click)="toggleSection('research')">
           <span class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</span>
-          Research &amp; Browser
+          {{ 'advanced.sections.research' | transloco }}
         </button>
         @if (expanded().has('research')) {
           <div class="accordion-body">
@@ -553,7 +554,7 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="proxyEnabled() ?? resolvedProxyEnabled()"
                   (change)="onProxyEnabledChange($event)"
                   [disabled]="disabled()">
-                <span>Proxy enabled</span>
+                <span>{{ 'advanced.labels.proxyEnabled' | transloco }}</span>
               </label>
               @if (proxyEnabled() !== null) {
                 <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()">close</button>
@@ -565,7 +566,7 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="browserHeadless() ?? resolvedBrowserHeadless()"
                   (change)="onBrowserHeadlessChange($event)"
                   [disabled]="disabled()">
-                <span>Browser headless</span>
+                <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
               </label>
               @if (browserHeadless() !== null) {
                 <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()">close</button>
@@ -577,7 +578,7 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="browserVision() ?? resolvedBrowserVision()"
                   (change)="onBrowserVisionChange($event)"
                   [disabled]="disabled()">
-                <span>Browser use vision</span>
+                <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
               </label>
               @if (browserVision() !== null) {
                 <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()">close</button>
@@ -591,7 +592,7 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="accordion-section" [class.expanded]="expanded().has('auxiliary')">
         <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')">
           <span class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</span>
-          Auxiliary LLM
+          {{ 'advanced.sections.auxiliary' | transloco }}
         </button>
         @if (expanded().has('auxiliary')) {
           <div class="accordion-body">
@@ -601,7 +602,7 @@ import {getReasoningOptions} from './reasoning-options';
                   [checked]="auxEnabled() ?? resolvedAuxEnabled()"
                   (change)="onAuxEnabledChange($event)"
                   [disabled]="disabled()">
-                <span>Auxiliary LLM enabled</span>
+                <span>{{ 'advanced.labels.auxEnabled' | transloco }}</span>
               </label>
               @if (auxEnabled() !== null) {
                 <button type="button" class="reset-btn" (click)="auxEnabled.set(null); emitChange()">close</button>
@@ -609,7 +610,7 @@ import {getReasoningOptions} from './reasoning-options';
             </div>
             @if (effectiveAuxEnabled()) {
               <div class="field-row" [class.modified]="auxModel() !== null">
-                <label class="field-label">Model</label>
+                <label class="field-label">{{ 'advanced.labels.model' | transloco }}</label>
                 <div class="field-control">
                   <input type="text" class="form-input"
                     [ngModel]="auxModel() ?? resolvedAuxModel()"
@@ -623,7 +624,7 @@ import {getReasoningOptions} from './reasoning-options';
               </div>
               <div class="field-row" [class.modified]="auxTemperature() !== null">
                 <label class="field-label">
-                  Temperature: {{ effectiveAuxTemp() }}
+                  {{ 'advanced.labels.temperature' | transloco: {value: effectiveAuxTemp()} }}
                 </label>
                 <div class="slider-row">
                   <span class="slider-label">0</span>
@@ -647,12 +648,12 @@ import {getReasoningOptions} from './reasoning-options';
         <div class="accordion-section" [class.expanded]="expanded().has('session')">
           <button type="button" class="accordion-header" (click)="toggleSection('session')">
             <span class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</span>
-            Session
+            {{ 'advanced.sections.session' | transloco }}
           </button>
           @if (expanded().has('session')) {
             <div class="accordion-body">
               <div class="field-row" [class.modified]="idleTimeout() !== null">
-                <label class="field-label">Idle timeout (minutes)</label>
+                <label class="field-label">{{ 'advanced.labels.idleTimeout' | transloco }}</label>
                 <div class="field-control">
                   <input type="number" class="form-input compact-input" min="0"
                     [ngModel]="idleTimeout() ?? resolvedIdleTimeout()"
@@ -662,10 +663,10 @@ import {getReasoningOptions} from './reasoning-options';
                     <button type="button" class="reset-btn" (click)="idleTimeout.set(null); emitChange()">close</button>
                   }
                 </div>
-                <span class="field-hint">0 = disabled</span>
+                <span class="field-hint">{{ 'advanced.hints.idleDisabled' | transloco }}</span>
               </div>
               <div class="field-row" [class.modified]="greeting() !== null">
-                <label class="field-label">Greeting</label>
+                <label class="field-label">{{ 'advanced.labels.greeting' | transloco }}</label>
                 <div class="field-control">
                   <input type="text" class="form-input"
                     [ngModel]="greeting() ?? resolvedGreeting()"
@@ -685,7 +686,7 @@ import {getReasoningOptions} from './reasoning-options';
       <div class="config-viewer-section">
         <button type="button" class="accordion-header" (click)="showResolvedConfig.set(!showResolvedConfig())">
           <span class="accordion-icon">{{ showResolvedConfig() ? 'expand_less' : 'expand_more' }}</span>
-          View resolved config (JSON)
+          {{ 'advanced.sections.viewResolvedConfig' | transloco }}
         </button>
         @if (showResolvedConfig()) {
           <div class="config-viewer">

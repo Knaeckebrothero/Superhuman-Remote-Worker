@@ -10,6 +10,7 @@ import {FilePreview, UploadStatus} from '../../../core/models/file.model';
 import {AgentSettingsComponent} from '../agent-settings/agent-settings.component';
 import {PRIORITY_LEVELS} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../../core/services/model.service';
+import {TranslocoPipe} from '@jsverse/transloco';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -17,11 +18,11 @@ import {ModelService} from '../../../core/services/model.service';
 @Component({
   selector: 'app-job-create',
   standalone: true,
-  imports: [FormsModule, AgentSettingsComponent],
+  imports: [FormsModule, AgentSettingsComponent, TranslocoPipe],
   template: `
     <div class="job-create-container">
       <div class="header-bar">
-        <span class="title">Create New Job</span>
+        <span class="title">{{ 'jobs.create.title' | transloco }}</span>
       </div>
 
       <div class="form-container">
@@ -29,7 +30,7 @@ import {ModelService} from '../../../core/services/model.service';
         @if (successMessage()) {
           <div class="success-message">
             <span>{{ successMessage() }}</span>
-            <button class="dismiss-btn" (click)="clearSuccess()">Dismiss</button>
+            <button class="dismiss-btn" (click)="clearSuccess()">{{ 'jobs.create.dismiss' | transloco }}</button>
           </div>
         }
 
@@ -37,7 +38,7 @@ import {ModelService} from '../../../core/services/model.service';
         @if (errorMessage()) {
           <div class="error-message">
             <span>{{ errorMessage() }}</span>
-            <button class="dismiss-btn" (click)="clearError()">Dismiss</button>
+            <button class="dismiss-btn" (click)="clearError()">{{ 'jobs.create.dismiss' | transloco }}</button>
           </div>
         }
 
@@ -45,7 +46,7 @@ import {ModelService} from '../../../core/services/model.service';
           <!-- Project Selector -->
           @if (projects().length > 0) {
             <div class="form-group">
-              <label for="project" class="form-label">Project</label>
+              <label for="project" class="form-label">{{ 'jobs.create.projectLabel' | transloco }}</label>
               <select
                 id="project"
                 name="project"
@@ -54,21 +55,21 @@ import {ModelService} from '../../../core/services/model.service';
                 (ngModelChange)="selectedProjectId.set($event)"
                 [disabled]="isSubmitting()"
               >
-                <option [ngValue]="null">No project</option>
+                <option [ngValue]="null">{{ 'jobs.create.projectNone' | transloco }}</option>
                 @for (proj of projects(); track proj.id) {
                   <option [value]="proj.id">
-                    {{ proj.name }}@if (proj.is_default) { (Personal)}
+                    {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}
                   </option>
                 }
               </select>
-              <span class="field-hint">Select which project this job belongs to</span>
+              <span class="field-hint">{{ 'jobs.create.projectHint' | transloco }}</span>
             </div>
           }
 
           <!-- Description Field (Required) -->
           <div class="form-group">
             <label for="description" class="form-label">
-              Description <span class="required">*</span>
+              {{ 'jobs.create.descriptionLabel' | transloco }} <span class="required">*</span>
             </label>
             <textarea
               id="description"
@@ -78,34 +79,34 @@ import {ModelService} from '../../../core/services/model.service';
               (ngModelChange)="onDescriptionEdit($event)"
               required
               rows="6"
-              placeholder="Describe what the agent should accomplish..."
+              [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
               [disabled]="isSubmitting() || artifacts.streaming()"
             ></textarea>
-            <span class="field-hint">Describe what you want the agent to do</span>
+            <span class="field-hint">{{ 'jobs.create.descriptionHint' | transloco }}</span>
           </div>
 
           <!-- Kickoff Message (optional opening prompt) -->
           <div class="form-group">
-            <label for="kickoff" class="form-label">Opening Message</label>
+            <label for="kickoff" class="form-label">{{ 'jobs.create.kickoffLabel' | transloco }}</label>
             <textarea
               id="kickoff"
               name="kickoff"
               class="form-textarea"
               [(ngModel)]="kickoffMessage"
               rows="3"
-              placeholder="Say something to the AI... (e.g., 'Start by reviewing the document structure')"
+              [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
               [disabled]="isSubmitting() || artifacts.streaming()"
             ></textarea>
-            <span class="field-hint">Optional opening prompt — gives the agent initial direction</span>
+            <span class="field-hint">{{ 'jobs.create.kickoffHint' | transloco }}</span>
           </div>
 
           <!-- Expert Selector -->
           <div class="form-group">
-            <label class="form-label">Agent Expert</label>
+            <label class="form-label">{{ 'jobs.create.expertLabel' | transloco }}</label>
             @if (isLoadingExperts()) {
               <div class="expert-loading">
                 <span class="spinner-small"></span>
-                Loading experts...
+                {{ 'jobs.create.expertLoading' | transloco }}
               </div>
             } @else if (experts().length > 0) {
               <div class="expert-grid">
@@ -137,16 +138,16 @@ import {ModelService} from '../../../core/services/model.service';
             }
             <span class="field-hint">
               @if (selectedExpert()) {
-                Selected: {{ selectedExpert()!.display_name }}
+                {{ 'jobs.create.expertSelectedPrefix' | transloco }} {{ selectedExpert()!.display_name }}
               } @else {
-                Select an expert profile or leave unselected for the default agent
+                {{ 'jobs.create.expertHintUnselected' | transloco }}
               }
             </span>
           </div>
 
           <!-- File Upload Dropzone -->
           <div class="form-group">
-            <label class="form-label">Documents</label>
+            <label class="form-label">{{ 'jobs.create.documentsLabel' | transloco }}</label>
             <div
               class="dropzone"
               [class.dragover]="isDragOver()"
@@ -160,8 +161,8 @@ import {ModelService} from '../../../core/services/model.service';
               @if (filePreviews().length === 0) {
                 <div class="dropzone-content">
                   <span class="dropzone-icon">upload_file</span>
-                  <span class="dropzone-text">Drop files here or click to browse</span>
-                  <span class="dropzone-hint">Max {{ fileService.getMaxFiles() }} files, {{ fileService.getMaxFileSizeMB() }}MB each</span>
+                  <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
+                  <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getMaxFiles(), maxSizeMb: fileService.getMaxFileSizeMB() } }}</span>
                 </div>
               } @else {
                 <div class="file-list">
@@ -201,7 +202,7 @@ import {ModelService} from '../../../core/services/model.service';
                 </div>
                 @if (!isSubmitting()) {
                   <button type="button" class="add-more-btn" (click)="triggerFileInput()">
-                    + Add more files
+                    {{ 'jobs.create.addMore' | transloco }}
                   </button>
                 }
               }
@@ -214,34 +215,34 @@ import {ModelService} from '../../../core/services/model.service';
               (change)="onFilesSelected($event)"
               style="display: none"
             >
-            <span class="field-hint">Optional: Upload documents for the agent to process</span>
+            <span class="field-hint">{{ 'jobs.create.documentsOptional' | transloco }}</span>
           </div>
 
           <!-- Priority -->
           <div class="form-group">
-            <label for="priority" class="form-label">Priority</label>
+            <label for="priority" class="form-label">{{ 'jobs.create.priorityLabel' | transloco }}</label>
             <select id="priority" name="priority" class="form-input"
               [ngModel]="selectedPriority()" (ngModelChange)="selectedPriority.set($event)"
               [disabled]="isSubmitting()">
               @for (level of priorityLevels; track level.value) {
-                <option [ngValue]="level.value">{{ level.label }}</option>
+                <option [ngValue]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
               }
             </select>
-            <span class="field-hint">Higher priority jobs run first and can preempt lower priority jobs</span>
+            <span class="field-hint">{{ 'jobs.create.priorityHint' | transloco }}</span>
           </div>
 
           <!-- Cloud Storage Access Override -->
           @if (selectedProjectHasCloudStorage()) {
             <div class="form-group">
-              <label for="cloudStorage" class="form-label">Cloud Storage Access</label>
+              <label for="cloudStorage" class="form-label">{{ 'jobs.create.cloudStorageLabel' | transloco }}</label>
               <select id="cloudStorage" name="cloudStorage" class="form-input"
                 [ngModel]="cloudStorageOverride()" (ngModelChange)="cloudStorageOverride.set($event)"
                 [disabled]="isSubmitting()">
-                <option value="inherit">Inherit from project</option>
-                <option value="readonly">Read Only</option>
-                <option value="readwrite">Read & Write</option>
+                <option value="inherit">{{ 'jobs.create.cloudStorageInherit' | transloco }}</option>
+                <option value="readonly">{{ 'jobs.create.cloudStorageReadonly' | transloco }}</option>
+                <option value="readwrite">{{ 'jobs.create.cloudStorageReadwrite' | transloco }}</option>
               </select>
-              <span class="field-hint">Override the project's default cloud storage access mode for this job</span>
+              <span class="field-hint">{{ 'jobs.create.cloudStorageHint' | transloco }}</span>
             </div>
           }
 
@@ -268,7 +269,7 @@ import {ModelService} from '../../../core/services/model.service';
               (click)="resetForm()"
               [disabled]="isSubmitting()"
             >
-              Reset
+              {{ 'jobs.create.reset' | transloco }}
             </button>
             <button
               type="submit"
@@ -277,12 +278,12 @@ import {ModelService} from '../../../core/services/model.service';
             >
               @if (isSubmitting()) {
                 <span class="spinner-small"></span>
-                Creating...
+                {{ 'jobs.create.creating' | transloco }}
               } @else if (isUploading()) {
                 <span class="spinner-small"></span>
-                Uploading...
+                {{ 'jobs.create.uploading' | transloco }}
               } @else {
-                Create Job
+                {{ 'jobs.create.submit' | transloco }}
               }
             </button>
           </div>
@@ -1290,6 +1291,12 @@ export class JobCreateComponent implements OnInit {
 
   readonly selectedPriority = signal<number>(5);
   readonly priorityLevels = PRIORITY_LEVELS;
+
+  getPriorityKey(value: number): string {
+    if (value === 0) return 'jobs.create.priorityLow';
+    if (value === 10) return 'jobs.create.priorityHigh';
+    return 'jobs.create.priorityNormal';
+  }
 
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);

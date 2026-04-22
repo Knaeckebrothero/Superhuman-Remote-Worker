@@ -1,5 +1,6 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe} from '@jsverse/transloco';
 import {
     JOB_TOOL_CATEGORIES,
     readConfigPath,
@@ -16,10 +17,10 @@ import {
 @Component({
   selector: 'app-tools-group',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="settings-group">
-      <div class="group-label">Tools</div>
+      <div class="group-label">{{ 'agentSettings.tools.group' | transloco }}</div>
       <div class="tool-toggles">
         @for (cat of categories(); track cat.key) {
           <label
@@ -35,21 +36,21 @@ import {
             >
             <span class="tool-toggle-icon">{{ cat.icon }}</span>
             <span class="tool-toggle-info">
-              <span class="tool-toggle-name">{{ cat.label }}</span>
-              <span class="tool-toggle-desc">{{ cat.description }}</span>
+              <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}</span>
+              <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + cat.key + '.description' | transloco }}</span>
             </span>
             @if (isModified(cat.key)) {
               <button
                 class="reset-btn"
                 (click)="resetCategory(cat.key, $event)"
-                title="Reset to default"
+                [title]="'agentSettings.common.resetToDefault' | transloco"
               >close</button>
             }
           </label>
           @if (cat.key === 'delegation' && isCategoryEnabled('delegation')) {
             <div class="inline-params">
               <div class="inline-field" [class.modified]="delegationMaxDepth() !== null">
-                <label class="inline-label">Max depth</label>
+                <label class="inline-label">{{ 'agentSettings.tools.maxDepth' | transloco }}</label>
                 <select class="inline-input"
                   [ngModel]="delegationMaxDepth() ?? resolvedDelegationMaxDepth()"
                   (ngModelChange)="onDelegationMaxDepthChange($event)"
@@ -63,7 +64,7 @@ import {
                 }
               </div>
               <div class="inline-field" [class.modified]="delegationTimeout() !== null">
-                <label class="inline-label">Timeout (sec)</label>
+                <label class="inline-label">{{ 'agentSettings.tools.timeout' | transloco }}</label>
                 <input type="number" class="inline-input number-input" min="60" step="60"
                   [ngModel]="delegationTimeout() ?? resolvedDelegationTimeout()"
                   (ngModelChange)="onDelegationTimeoutChange($event)"

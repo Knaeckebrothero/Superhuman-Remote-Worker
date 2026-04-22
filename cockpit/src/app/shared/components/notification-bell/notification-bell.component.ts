@@ -1,5 +1,6 @@
 import { Component, inject } from '@angular/core';
 import { Router } from '@angular/router';
+import { TranslocoService } from '@jsverse/transloco';
 import { ActionCenterService } from '../../../core/services/action-center.service';
 
 @Component({
@@ -66,6 +67,7 @@ import { ActionCenterService } from '../../../core/services/action-center.servic
 export class NotificationBellComponent {
   readonly actionCenter = inject(ActionCenterService);
   private readonly router = inject(Router);
+  private readonly transloco = inject(TranslocoService);
 
   goToInbox(): void {
     this.router.navigate(['/inbox']);
@@ -73,12 +75,13 @@ export class NotificationBellComponent {
 
   tooltipText(): string {
     const c = this.actionCenter.counts();
-    if (c.total === 0) return 'Action Center';
+    if (c.total === 0) return this.transloco.translate('notificationBell.title');
+    const t = this.transloco;
     const parts: string[] = [];
-    if (c.messages > 0) parts.push(`${c.messages} message${c.messages > 1 ? 's' : ''}`);
-    if (c.sudo > 0) parts.push(`${c.sudo} sudo`);
-    if (c.reviews > 0) parts.push(`${c.reviews} review${c.reviews > 1 ? 's' : ''}`);
-      if (c.sessions > 0) parts.push(`${c.sessions} session${c.sessions > 1 ? 's' : ''}`);
+    if (c.messages > 0) parts.push(t.translate(c.messages === 1 ? 'notificationBell.messagesSingle' : 'notificationBell.messagesPlural', {n: c.messages}));
+    if (c.sudo > 0) parts.push(t.translate('notificationBell.sudo', {n: c.sudo}));
+    if (c.reviews > 0) parts.push(t.translate(c.reviews === 1 ? 'notificationBell.reviewsSingle' : 'notificationBell.reviewsPlural', {n: c.reviews}));
+    if (c.sessions > 0) parts.push(t.translate(c.sessions === 1 ? 'notificationBell.sessionsSingle' : 'notificationBell.sessionsPlural', {n: c.sessions}));
     return parts.join(', ');
   }
 }

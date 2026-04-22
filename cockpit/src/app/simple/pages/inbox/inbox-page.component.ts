@@ -14,6 +14,7 @@ import {ActivatedRoute, Router} from '@angular/router';
 import {JsonPipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ViewportService} from '../../../core/services/viewport.service';
 import {ActionCenterService} from '../../../core/services/action-center.service';
 import {SudoRequest, SudoService} from '../../../core/services/sudo.service';
@@ -48,11 +49,11 @@ function secondsLeft(req: SudoRequest): number {
   return Math.max(0, Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000));
 }
 
-function relativeTime(iso: string): string {
+function relativeTime(iso: string, nowLabel: string): string {
   if (!iso) return '';
   const diff = Date.now() - new Date(iso).getTime();
   const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'now';
+  if (mins < 1) return nowLabel;
   if (mins < 60) return `${mins}m`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h`;
@@ -62,7 +63,7 @@ function relativeTime(iso: string): string {
 @Component({
   selector: 'app-inbox-page',
   standalone: true,
-  imports: [FormsModule, JsonPipe, MarkdownComponent, SidebarToggleComponent],
+  imports: [FormsModule, JsonPipe, MarkdownComponent, SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
       <!-- Header -->
@@ -70,11 +71,11 @@ function relativeTime(iso: string): string {
         <div class="header-left">
           <app-sidebar-toggle />
           @if (isMobileDetail()) {
-            <button class="back-btn" (click)="deselect()">
+            <button class="back-btn" (click)="deselect()" [title]="'inbox.backBtn' | transloco">
               <span class="icon">arrow_back</span>
             </button>
           }
-          <h1 class="header-title">Action Center</h1>
+          <h1 class="header-title">{{ 'inbox.title' | transloco }}</h1>
         </div>
 
         <div class="filter-chips">
@@ -83,7 +84,7 @@ function relativeTime(iso: string): string {
             [class.active]="activeFilter() === null"
             (click)="setFilter(null)"
           >
-            All
+            {{ 'inbox.filters.all' | transloco }}
             @if (actionCenter.counts().total > 0) {
               <span class="chip-count">{{ actionCenter.counts().total }}</span>
             }
@@ -94,7 +95,7 @@ function relativeTime(iso: string): string {
             (click)="setFilter('message')"
           >
             <span class="chip-icon">mail</span>
-            Messages
+            {{ 'inbox.filters.messages' | transloco }}
             @if (actionCenter.counts().messages > 0) {
               <span class="chip-count">{{ actionCenter.counts().messages }}</span>
             }
@@ -105,7 +106,7 @@ function relativeTime(iso: string): string {
             (click)="setFilter('sudo')"
           >
             <span class="chip-icon">admin_panel_settings</span>
-            Sudo
+            {{ 'inbox.filters.sudo' | transloco }}
             @if (actionCenter.counts().sudo > 0) {
               <span class="chip-count">{{ actionCenter.counts().sudo }}</span>
             }
@@ -116,7 +117,7 @@ function relativeTime(iso: string): string {
             (click)="setFilter('review')"
           >
             <span class="chip-icon">rate_review</span>
-            Reviews
+            {{ 'inbox.filters.reviews' | transloco }}
             @if (actionCenter.counts().reviews > 0) {
               <span class="chip-count">{{ actionCenter.counts().reviews }}</span>
             }
@@ -127,7 +128,7 @@ function relativeTime(iso: string): string {
             (click)="setFilter('session')"
           >
             <span class="chip-icon">smart_toy</span>
-            Sessions
+            {{ 'inbox.filters.sessions' | transloco }}
             @if (actionCenter.counts().sessions > 0) {
               <span class="chip-count">{{ actionCenter.counts().sessions }}</span>
             }
@@ -138,9 +139,9 @@ function relativeTime(iso: string): string {
           <span
             class="sse-dot"
             [class.connected]="sudo.isConnected()"
-            [title]="sudo.isConnected() ? 'SSE connected' : 'SSE disconnected'"
+            [title]="(sudo.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
           ></span>
-          <button class="icon-btn" (click)="refresh()" title="Refresh">
+          <button class="icon-btn" (click)="refresh()" [title]="'inbox.refresh' | transloco">
             <span class="icon">refresh</span>
           </button>
         </div>
@@ -149,15 +150,15 @@ function relativeTime(iso: string): string {
       <!-- Body: list + detail -->
       <div class="inbox-body" [class.mobile-detail]="isMobileDetail()">
         <!-- Left: Item List -->
-        <div class="list-panel" role="feed" aria-label="Action center items">
+        <div class="list-panel" role="feed" [attr.aria-label]="'inbox.listAriaLabel' | transloco">
           @if (filteredItems().length === 0) {
             <div class="empty-list">
               <span class="empty-icon">inbox</span>
               <span class="empty-text">
                 @if (activeFilter()) {
-                  No {{ activeFilter() }} items
+                  {{ 'inbox.list.empty.' + activeFilter() | transloco }}
                 } @else {
-                  All clear — no items need your attention
+                  {{ 'inbox.list.emptyAll' | transloco }}
                 }
               </span>
             </div>
@@ -197,14 +198,14 @@ function relativeTime(iso: string): string {
                   </div>
                   <div class="item-subtitle">
                     @if (item.type === 'message' && item.message?.mode === 'blocking') {
-                      <span class="mode-badge blocking">blocking</span>
+                      <span class="mode-badge blocking">{{ 'inbox.list.modeBlocking' | transloco }}</span>
                     }
                     @if (item.status === 'resolved') {
                       <span class="resolved-badge">
                         @if (item.type === 'sudo' && item.sudo) {
                           {{ item.sudo.status }}
                         } @else {
-                          resolved
+                          {{ 'inbox.list.resolved' | transloco }}
                         }
                       </span>
                     }
@@ -222,9 +223,9 @@ function relativeTime(iso: string): string {
             <!-- Empty state -->
             <div class="detail-empty">
               <span class="detail-empty-icon">select_all</span>
-              <span class="detail-empty-text">Select an item to view details</span>
+              <span class="detail-empty-text">{{ 'inbox.detail.emptyText' | transloco }}</span>
               <span class="detail-empty-hint">
-                Use <kbd>j</kbd>/<kbd>k</kbd> to navigate, <kbd>Enter</kbd> to select
+                {{ 'inbox.detail.hintUse' | transloco }} <kbd>j</kbd>/<kbd>k</kbd> {{ 'inbox.detail.hintToNavigate' | transloco }} <kbd>Enter</kbd> {{ 'inbox.detail.hintToSelect' | transloco }}
               </span>
             </div>
           } @else if (selectedItem()!.type === 'sudo' && selectedItem()!.sudo) {
@@ -235,7 +236,7 @@ function relativeTime(iso: string): string {
                   <span class="icon">
                     {{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'cloud_upload' : 'admin_panel_settings' }}
                   </span>
-                  {{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'VM Upgrade Request' : 'Sudo Request' }}
+                  {{ (selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'inbox.sudoDetail.vmUpgradeRequest' : 'inbox.sudoDetail.sudoRequest') | transloco }}
                 </span>
                 @if (selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
                   <span class="risk-badge" [class]="'risk-' + getRisk(selectedItem()!.sudo!)">
@@ -244,7 +245,7 @@ function relativeTime(iso: string): string {
                 }
                 @if (selectedItem()!.sudo!.status === 'pending' && selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
                   <span class="detail-countdown" [class]="'ttl-' + ttlColor(selectedItem()!.sudo!)">
-                    {{ getSecondsLeft(selectedItem()!.sudo!) }}s remaining
+                    {{ 'inbox.sudoDetail.secondsRemaining' | transloco: {seconds: getSecondsLeft(selectedItem()!.sudo!)} }}
                   </span>
                 }
                 <span class="status-badge" [class]="'status-' + selectedItem()!.sudo!.status">
@@ -259,22 +260,22 @@ function relativeTime(iso: string): string {
               <div class="meta-grid">
                 @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
                   <div class="meta-row">
-                    <span class="meta-label">Workspace</span>
+                    <span class="meta-label">{{ 'inbox.sudoDetail.workspace' | transloco }}</span>
                     <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
                   </div>
                 } @else {
                   <div class="meta-row">
-                    <span class="meta-label">User</span>
+                    <span class="meta-label">{{ 'inbox.sudoDetail.user' | transloco }}</span>
                     <span class="meta-value">{{ selectedItem()!.sudo!.requesting_user }} → {{ selectedItem()!.sudo!.target_user }}</span>
                   </div>
                   <div class="meta-row">
-                    <span class="meta-label">VM</span>
+                    <span class="meta-label">{{ 'inbox.sudoDetail.vm' | transloco }}</span>
                     <span class="meta-value">{{ selectedItem()!.sudo!.vm_name }}</span>
                   </div>
                 }
                 @if (selectedItem()!.sudo!.working_directory) {
                   <div class="meta-row">
-                    <span class="meta-label">CWD</span>
+                    <span class="meta-label">{{ 'inbox.sudoDetail.cwd' | transloco }}</span>
                     <span class="meta-value mono">{{ selectedItem()!.sudo!.working_directory }}</span>
                   </div>
                 }
@@ -283,30 +284,29 @@ function relativeTime(iso: string): string {
               @if (selectedItem()!.sudo!.status === 'pending') {
                 @if (selectedItem()!.sudo!.request_type === 'vm_upgrade') {
                   <div class="upgrade-hint">
-                    Agent attempted sudo in a container workspace. Upgrade to a VM for full sudo access,
-                    or resume the job without a VM.
+                    {{ 'inbox.sudoDetail.upgradeHint' | transloco }}
                   </div>
                   <div class="action-bar">
                     <button class="btn btn-upgrade" (click)="approveVmUpgrade()">
-                      <span class="icon">cloud_upload</span> Upgrade to VM
+                      <span class="icon">cloud_upload</span> {{ 'inbox.sudoDetail.upgradeToVm' | transloco }}
                       <kbd>u</kbd>
                     </button>
                     <button class="btn btn-resume" (click)="resumeWithoutVmSudo()">
-                      <span class="icon">play_arrow</span> Resume without VM
+                      <span class="icon">play_arrow</span> {{ 'inbox.sudoDetail.resumeWithoutVm' | transloco }}
                     </button>
                     <button class="btn btn-deny" (click)="startDenySudo()">
-                      <span class="icon">close</span> Deny
+                      <span class="icon">close</span> {{ 'inbox.sudoDetail.deny' | transloco }}
                       <kbd>d</kbd>
                     </button>
                   </div>
                 } @else {
                   <div class="action-bar">
                     <button class="btn btn-approve" (click)="approveSudo()">
-                      <span class="icon">check</span> Approve
+                      <span class="icon">check</span> {{ 'inbox.sudoDetail.approve' | transloco }}
                       <kbd>a</kbd>
                     </button>
                     <button class="btn btn-deny" (click)="startDenySudo()">
-                      <span class="icon">close</span> Deny
+                      <span class="icon">close</span> {{ 'inbox.sudoDetail.deny' | transloco }}
                       <kbd>d</kbd>
                     </button>
                   </div>
@@ -315,7 +315,7 @@ function relativeTime(iso: string): string {
 
               @if (selectedItem()!.sudo!.decision_reason) {
                 <div class="decision-info">
-                  <span class="meta-label">Reason</span>
+                  <span class="meta-label">{{ 'inbox.sudoDetail.reason' | transloco }}</span>
                   <span class="decision-reason">{{ selectedItem()!.sudo!.decision_reason }}</span>
                 </div>
               }
@@ -324,20 +324,20 @@ function relativeTime(iso: string): string {
               <details class="rules-section">
                 <summary class="rules-toggle">
                   <span class="icon">settings</span>
-                  Auto-Approval Rules ({{ sudo.rules().length }})
+                  {{ 'inbox.sudoDetail.rulesToggle' | transloco: {count: sudo.rules().length} }}
                 </summary>
                 <div class="rules-body">
                   <div class="rule-form">
                     <input
                       class="input"
-                      placeholder="Pattern (e.g. apt-get install *)"
+                      [placeholder]="'inbox.sudoDetail.rulePatternPlaceholder' | transloco"
                       [(ngModel)]="newRulePattern"
                     />
                     <select class="select" [(ngModel)]="newRuleAction">
-                      <option value="approve">Approve</option>
-                      <option value="deny">Deny</option>
+                      <option value="approve">{{ 'inbox.sudoDetail.ruleActionApprove' | transloco }}</option>
+                      <option value="deny">{{ 'inbox.sudoDetail.ruleActionDeny' | transloco }}</option>
                     </select>
-                    <button class="btn btn-sm" (click)="addRule()">Add</button>
+                    <button class="btn btn-sm" (click)="addRule()">{{ 'inbox.sudoDetail.ruleAdd' | transloco }}</button>
                   </div>
                   @for (rule of sudo.rules(); track rule.id) {
                     <div class="rule-row">
@@ -358,38 +358,38 @@ function relativeTime(iso: string): string {
               <div class="detail-header">
                 <span class="detail-type-badge message">
                   <span class="icon">mail</span>
-                  {{ selectedItem()!.message!.subject || 'Message' }}
+                  {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
                 </span>
                 @if (selectedItem()!.message!.mode === 'blocking') {
-                  <span class="mode-badge blocking">blocking</span>
+                  <span class="mode-badge blocking">{{ 'inbox.messageDetail.modeBlocking' | transloco }}</span>
                 } @else {
-                  <span class="mode-badge async">async</span>
+                  <span class="mode-badge async">{{ 'inbox.messageDetail.modeAsync' | transloco }}</span>
                 }
               </div>
 
               <div class="thread-meta">
-                {{ selectedItem()!.message!.configName || 'agent' }}
+                {{ selectedItem()!.message!.configName || ('inbox.messageDetail.defaultAgent' | transloco) }}
                 @if (selectedItem()!.message!.jobDescription) {
                   · {{ selectedItem()!.message!.jobDescription }}
                 }
                 @if (selectedItem()!.jobId) {
-                  · job {{ selectedItem()!.jobId!.slice(0, 8) }}
+                  · {{ 'inbox.messageDetail.jobPrefix' | transloco }} {{ selectedItem()!.jobId!.slice(0, 8) }}
                 }
               </div>
 
               <!-- Thread messages -->
               <div class="thread-body" #threadBody>
                 @if (threadLoading()) {
-                  <div class="thread-loading">Loading thread...</div>
+                  <div class="thread-loading">{{ 'inbox.messageDetail.threadLoading' | transloco }}</div>
                 } @else if (threadDetail()) {
                   @for (msg of threadDetail()!.messages; track msg.id) {
                     <div class="msg-bubble" [class]="'msg-' + msg.direction">
                       <div class="msg-header">
                         <span class="msg-sender">
                           @if (msg.direction === 'outbound') {
-                            Agent
+                            {{ 'inbox.messageDetail.senderAgent' | transloco }}
                           } @else {
-                            You
+                            {{ 'inbox.messageDetail.senderYou' | transloco }}
                           }
                         </span>
                         <span class="msg-time">{{ formatMsgTime(msg.created_at) }}</span>
@@ -404,7 +404,7 @@ function relativeTime(iso: string): string {
                     @if (selectedItem()!.message!.lastMessage) {
                       <div class="msg-preview">{{ selectedItem()!.message!.lastMessage }}</div>
                     } @else {
-                      No messages loaded
+                      {{ 'inbox.messageDetail.noMessagesLoaded' | transloco }}
                     }
                   </div>
                 }
@@ -414,7 +414,7 @@ function relativeTime(iso: string): string {
               <div class="reply-form">
                 <textarea
                   class="reply-input"
-                  placeholder="Type a reply..."
+                  [placeholder]="'inbox.messageDetail.replyPlaceholder' | transloco"
                   [(ngModel)]="replyText"
                   (keydown.control.enter)="sendReply()"
                   (keydown.meta.enter)="sendReply()"
@@ -424,7 +424,7 @@ function relativeTime(iso: string): string {
                 <div class="reply-actions">
                   <label class="urgent-check">
                     <input type="checkbox" [(ngModel)]="replyUrgent" />
-                    Mark as urgent
+                    {{ 'inbox.messageDetail.markUrgent' | transloco }}
                   </label>
                   <button
                     class="btn btn-send"
@@ -432,7 +432,7 @@ function relativeTime(iso: string): string {
                     (click)="sendReply()"
                   >
                     <span class="icon">send</span>
-                    Send
+                    {{ 'inbox.messageDetail.send' | transloco }}
                     <kbd>Ctrl+Enter</kbd>
                   </button>
                 </div>
@@ -445,34 +445,34 @@ function relativeTime(iso: string): string {
               <div class="detail-header">
                 <span class="detail-type-badge review">
                   <span class="icon">rate_review</span>
-                  Job Review
+                  {{ 'inbox.reviewDetail.jobReview' | transloco }}
                 </span>
                 <span class="freeze-badge" [class]="
                   frozenData()?.freeze_type === 'phase_boundary' ? 'phase' :
                   frozenData()?.freeze_type === 'vm_upgrade_required' ? 'upgrade' : 'complete'
                 ">
-                  {{ frozenData()?.freeze_type === 'phase_boundary' ? 'Phase Boundary' :
-                     frozenData()?.freeze_type === 'vm_upgrade_required' ? 'Sudo Required' : 'Job Complete' }}
+                  {{ (frozenData()?.freeze_type === 'phase_boundary' ? 'inbox.reviewDetail.freezePhase' :
+                     frozenData()?.freeze_type === 'vm_upgrade_required' ? 'inbox.reviewDetail.freezeUpgrade' : 'inbox.reviewDetail.freezeComplete') | transloco }}
                 </span>
               </div>
 
               <div class="review-job-info">
                 <div class="review-job-desc">{{ selectedItem()!.review!.jobDescription }}</div>
                 <div class="review-job-meta">
-                  <span>{{ selectedItem()!.review!.configName || 'agent' }}</span>
-                  <span>ID: {{ selectedItem()!.review!.jobId.slice(0, 8) }}</span>
+                  <span>{{ selectedItem()!.review!.configName || ('inbox.reviewDetail.defaultAgent' | transloco) }}</span>
+                  <span>{{ 'inbox.reviewDetail.idPrefix' | transloco }} {{ selectedItem()!.review!.jobId.slice(0, 8) }}</span>
                   @if (frozenData()?.phase_number !== undefined) {
-                    <span>Phase {{ frozenData()?.phase_number }}</span>
+                    <span>{{ 'inbox.reviewDetail.phase' | transloco: {number: frozenData()?.phase_number} }}</span>
                   }
                 </div>
               </div>
 
               @if (reviewLoading()) {
-                <div class="review-loading">Loading frozen data...</div>
+                <div class="review-loading">{{ 'inbox.reviewDetail.loadingFrozen' | transloco }}</div>
               } @else if (frozenData()) {
                 @if (frozenData()!.summary) {
                   <div class="review-section">
-                    <div class="review-section-title">Summary</div>
+                    <div class="review-section-title">{{ 'inbox.reviewDetail.summary' | transloco }}</div>
                     <div class="review-summary">
                       <markdown [data]="frozenData()!.summary!"></markdown>
                     </div>
@@ -481,7 +481,7 @@ function relativeTime(iso: string): string {
 
                 @if (frozenData()!.confidence !== undefined && frozenData()!.confidence !== null) {
                   <div class="review-section">
-                    <div class="review-section-title">Confidence</div>
+                    <div class="review-section-title">{{ 'inbox.reviewDetail.confidence' | transloco }}</div>
                     <div class="confidence-bar-wrap">
                       <div class="confidence-bar">
                         <div
@@ -499,7 +499,7 @@ function relativeTime(iso: string): string {
 
                 @if (frozenData()!.deliverables?.length) {
                   <div class="review-section">
-                    <div class="review-section-title">Deliverables</div>
+                    <div class="review-section-title">{{ 'inbox.reviewDetail.deliverables' | transloco }}</div>
                     <ul class="deliverables-list">
                       @for (d of frozenData()!.deliverables; track d) {
                         <li>{{ d }}</li>
@@ -517,7 +517,7 @@ function relativeTime(iso: string): string {
                       <code class="upgrade-command">{{ frozenData()!.command }}</code>
                     }
                     <div class="upgrade-hint">
-                      Upgrade to a VM for sudo access, or resume without a VM.
+                      {{ 'inbox.reviewDetail.upgradeHint' | transloco }}
                     </div>
                     <div class="upgrade-buttons">
                       <button
@@ -525,14 +525,14 @@ function relativeTime(iso: string): string {
                         [disabled]="reviewActing()"
                         (click)="upgradeToVm()"
                       >
-                        <span class="icon">cloud_upload</span> Upgrade to VM
+                        <span class="icon">cloud_upload</span> {{ 'inbox.reviewDetail.upgradeToVm' | transloco }}
                       </button>
                       <button
                         class="btn btn-resume"
                         [disabled]="reviewActing()"
                         (click)="resumeWithoutVm()"
                       >
-                        <span class="icon">play_arrow</span> Resume without VM
+                        <span class="icon">play_arrow</span> {{ 'inbox.reviewDetail.resumeWithoutVm' | transloco }}
                       </button>
                     </div>
                   </div>
@@ -540,7 +540,7 @@ function relativeTime(iso: string): string {
                   <div class="review-action-group">
                     <textarea
                       class="input review-notes"
-                      placeholder="Optional notes..."
+                      [placeholder]="'inbox.reviewDetail.notesPlaceholder' | transloco"
                       [(ngModel)]="reviewNotes"
                       rows="2"
                     ></textarea>
@@ -549,7 +549,7 @@ function relativeTime(iso: string): string {
                       [disabled]="reviewActing()"
                       (click)="approveReview()"
                     >
-                      <span class="icon">check_circle</span> Approve
+                      <span class="icon">check_circle</span> {{ 'inbox.reviewDetail.approve' | transloco }}
                       <kbd>a</kbd>
                     </button>
                   </div>
@@ -557,7 +557,7 @@ function relativeTime(iso: string): string {
                   <div class="review-action-group">
                     <textarea
                       class="input review-notes"
-                      placeholder="Feedback for next phase..."
+                      [placeholder]="'inbox.reviewDetail.feedbackPlaceholder' | transloco"
                       [(ngModel)]="reviewFeedback"
                       rows="2"
                     ></textarea>
@@ -566,7 +566,7 @@ function relativeTime(iso: string): string {
                       [disabled]="reviewActing()"
                       (click)="resumeReview()"
                     >
-                      <span class="icon">play_arrow</span> Resume with Feedback
+                      <span class="icon">play_arrow</span> {{ 'inbox.reviewDetail.resumeWithFeedback' | transloco }}
                     </button>
                   </div>
                 }
@@ -578,9 +578,9 @@ function relativeTime(iso: string): string {
               <div class="detail-header">
                 <span class="detail-type-badge session">
                   <span class="icon">smart_toy</span>
-                  Agent Session
+                  {{ 'inbox.sessionDetail.agentSession' | transloco }}
                 </span>
-                <span class="status-badge status-pending">needs attention</span>
+                <span class="status-badge status-pending">{{ 'inbox.sessionDetail.needsAttention' | transloco }}</span>
               </div>
 
               <h3 class="session-title">{{ selectedItem()!.title }}</h3>
@@ -588,32 +588,32 @@ function relativeTime(iso: string): string {
 
               @if (selectedItem()!.session!.event.tool) {
                 <div class="session-section">
-                  <span class="meta-label">Tool</span>
+                  <span class="meta-label">{{ 'inbox.sessionDetail.tool' | transloco }}</span>
                   <code class="command-block">{{ selectedItem()!.session!.event.tool }}</code>
                 </div>
                 @if (selectedItem()!.session!.event.args) {
                   <div class="session-section">
-                    <span class="meta-label">Arguments</span>
+                    <span class="meta-label">{{ 'inbox.sessionDetail.arguments' | transloco }}</span>
                     <pre class="args-block">{{ selectedItem()!.session!.event.args | json }}</pre>
                   </div>
                 }
               }
               @if (selectedItem()!.session!.event.command) {
                 <div class="session-section">
-                  <span class="meta-label">Command</span>
+                  <span class="meta-label">{{ 'inbox.sessionDetail.command' | transloco }}</span>
                   <code class="command-block">{{ selectedItem()!.session!.event.command }}</code>
                 </div>
               }
               @if (selectedItem()!.session!.event.reason) {
                 <div class="session-section">
-                  <span class="meta-label">Reason</span>
+                  <span class="meta-label">{{ 'inbox.sessionDetail.reason' | transloco }}</span>
                   <span>{{ selectedItem()!.session!.event.reason }}</span>
                 </div>
               }
 
               <div class="session-actions">
                 <button class="btn btn-primary" (click)="goToSession(selectedItem()!.session!.threadId)">
-                  <span class="icon">open_in_new</span> Go to Session
+                  <span class="icon">open_in_new</span> {{ 'inbox.sessionDetail.goToSession' | transloco }}
                 </button>
               </div>
             </div>
@@ -628,22 +628,22 @@ function relativeTime(iso: string): string {
         <div class="dialog" (click)="$event.stopPropagation()">
           <div class="dialog-title">
             <span class="icon">block</span>
-            Deny: {{ denyTarget()!.command }}
+            {{ 'inbox.denyDialog.titlePrefix' | transloco }} {{ denyTarget()!.command }}
           </div>
           <textarea
             class="input deny-reason"
-            placeholder="Reason for denial (required)"
+            [placeholder]="'inbox.denyDialog.reasonPlaceholder' | transloco"
             [(ngModel)]="denyReason"
             rows="3"
           ></textarea>
           <div class="dialog-actions">
-            <button class="btn btn-ghost" (click)="cancelDeny()">Cancel</button>
+            <button class="btn btn-ghost" (click)="cancelDeny()">{{ 'inbox.denyDialog.cancel' | transloco }}</button>
             <button
               class="btn btn-deny"
               [disabled]="!denyReason.trim()"
               (click)="confirmDeny()"
             >
-              Deny
+              {{ 'inbox.denyDialog.deny' | transloco }}
             </button>
           </div>
         </div>
@@ -654,23 +654,23 @@ function relativeTime(iso: string): string {
     @if (showShortcuts()) {
       <div class="dialog-overlay" (click)="showShortcuts.set(false)">
         <div class="shortcuts-dialog" (click)="$event.stopPropagation()">
-          <div class="shortcuts-title">Keyboard Shortcuts</div>
+          <div class="shortcuts-title">{{ 'inbox.shortcuts.title' | transloco }}</div>
           <div class="shortcuts-grid">
-            <kbd>j</kbd><span>Next item</span>
-            <kbd>k</kbd><span>Previous item</span>
-            <kbd>Enter</kbd><span>Select item</span>
-            <kbd>Escape</kbd><span>Deselect / close</span>
-            <kbd>a</kbd><span>Approve (sudo / review)</span>
-            <kbd>d</kbd><span>Deny (sudo)</span>
-            <kbd>r</kbd><span>Focus reply (message)</span>
-            <kbd>Ctrl+Enter</kbd><span>Send reply</span>
-            <kbd>1</kbd><span>Filter: Messages</span>
-            <kbd>2</kbd><span>Filter: Sudo</span>
-            <kbd>3</kbd><span>Filter: Reviews</span>
-            <kbd>0</kbd><span>Clear filter</span>
-            <kbd>?</kbd><span>Toggle this overlay</span>
+            <kbd>j</kbd><span>{{ 'inbox.shortcuts.nextItem' | transloco }}</span>
+            <kbd>k</kbd><span>{{ 'inbox.shortcuts.prevItem' | transloco }}</span>
+            <kbd>Enter</kbd><span>{{ 'inbox.shortcuts.selectItem' | transloco }}</span>
+            <kbd>Escape</kbd><span>{{ 'inbox.shortcuts.deselect' | transloco }}</span>
+            <kbd>a</kbd><span>{{ 'inbox.shortcuts.approveSudoReview' | transloco }}</span>
+            <kbd>d</kbd><span>{{ 'inbox.shortcuts.denySudo' | transloco }}</span>
+            <kbd>r</kbd><span>{{ 'inbox.shortcuts.focusReply' | transloco }}</span>
+            <kbd>Ctrl+Enter</kbd><span>{{ 'inbox.shortcuts.sendReply' | transloco }}</span>
+            <kbd>1</kbd><span>{{ 'inbox.shortcuts.filterMessages' | transloco }}</span>
+            <kbd>2</kbd><span>{{ 'inbox.shortcuts.filterSudo' | transloco }}</span>
+            <kbd>3</kbd><span>{{ 'inbox.shortcuts.filterReviews' | transloco }}</span>
+            <kbd>0</kbd><span>{{ 'inbox.shortcuts.clearFilter' | transloco }}</span>
+            <kbd>?</kbd><span>{{ 'inbox.shortcuts.toggleOverlay' | transloco }}</span>
           </div>
-          <button class="btn btn-ghost shortcuts-close" (click)="showShortcuts.set(false)">Close</button>
+          <button class="btn btn-ghost shortcuts-close" (click)="showShortcuts.set(false)">{{ 'inbox.shortcuts.close' | transloco }}</button>
         </div>
       </div>
     }
@@ -1738,6 +1738,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly zone = inject(NgZone);
+  private readonly transloco = inject(TranslocoService);
 
   @ViewChild('threadBody') threadBodyRef?: ElementRef<HTMLElement>;
   @ViewChild('replyInput') replyInputRef?: ElementRef<HTMLTextAreaElement>;
@@ -2033,7 +2034,9 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   // --- Helpers ---
   getRisk(req: SudoRequest): string { return riskLevel(req); }
   getSecondsLeft(req: SudoRequest): number { return secondsLeft(req); }
-  relativeTime(iso: string): string { return relativeTime(iso); }
+  relativeTime(iso: string): string {
+    return relativeTime(iso, this.transloco.translate('inbox.time.now'));
+  }
 
   ttlColor(req: SudoRequest): string {
     const s = secondsLeft(req);
@@ -2060,7 +2063,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   formatMsgTime(iso: string): string {
     if (!iso) return '';
     const d = new Date(iso);
-    return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+    return d.toLocaleTimeString(this.transloco.getActiveLang(), { hour: '2-digit', minute: '2-digit' });
   }
 
   // --- Keyboard navigation ---

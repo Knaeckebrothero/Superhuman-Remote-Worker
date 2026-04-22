@@ -1,5 +1,6 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {
     Datasource,
@@ -15,12 +16,12 @@ import {
 @Component({
   selector: 'app-datasource-list',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, TranslocoPipe],
   template: `
     <div class="ds-container">
       <!-- Header -->
       <div class="header-bar">
-        <span class="title">Datasources</span>
+        <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
             <button
@@ -28,13 +29,13 @@ import {
               [class.active]="typeFilter() === filter.value"
               (click)="typeFilter.set(filter.value)"
             >
-              {{ filter.label }}
+              {{ filter.labelKey | transloco }}
             </button>
           }
         </div>
         <div class="header-actions">
           <button class="action-btn new-btn" (click)="openCreateForm()" [disabled]="showForm()">
-            <span class="mat-icon">add</span> New
+            <span class="mat-icon">add</span> {{ 'datasources.new' | transloco }}
           </button>
           <button class="action-btn" (click)="refresh()" [disabled]="isLoading()">
             <span class="mat-icon">refresh</span>
@@ -46,13 +47,13 @@ import {
       @if (successMessage()) {
         <div class="msg success-msg">
           <span>{{ successMessage() }}</span>
-          <button class="dismiss-btn" (click)="successMessage.set(null)">Dismiss</button>
+          <button class="dismiss-btn" (click)="successMessage.set(null)">{{ 'datasources.dismiss' | transloco }}</button>
         </div>
       }
       @if (errorMessage()) {
         <div class="msg error-msg">
           <span>{{ errorMessage() }}</span>
-          <button class="dismiss-btn" (click)="errorMessage.set(null)">Dismiss</button>
+          <button class="dismiss-btn" (click)="errorMessage.set(null)">{{ 'datasources.dismiss' | transloco }}</button>
         </div>
       }
 
@@ -60,7 +61,7 @@ import {
       @if (showForm()) {
         <div class="form-panel">
           <div class="form-header">
-            <span>{{ editingId() ? 'Edit Datasource' : 'New Datasource' }}</span>
+            <span>{{ (editingId() ? 'datasources.form.editTitle' : 'datasources.form.newTitle') | transloco }}</span>
             <button class="close-btn" (click)="closeForm()">
               <span class="mat-icon">close</span>
             </button>
@@ -69,31 +70,31 @@ import {
           <div class="form-body">
             <div class="form-row">
               <div class="form-group flex-1">
-                <label class="form-label">Name <span class="required">*</span></label>
+                <label class="form-label">{{ 'datasources.form.nameLabel' | transloco }} <span class="required">*</span></label>
                 <input
                   class="form-input"
                   [(ngModel)]="formData.name"
-                  placeholder="e.g. Production Analytics DB"
+                  [placeholder]="'datasources.form.namePlaceholder' | transloco"
                   [disabled]="isSaving()"
                 >
               </div>
               <div class="form-group">
-                <label class="form-label">Type <span class="required">*</span></label>
+                <label class="form-label">{{ 'datasources.form.typeLabel' | transloco }} <span class="required">*</span></label>
                 <select
                   class="form-input form-select"
                   [(ngModel)]="formData.type"
                   [disabled]="isSaving() || !!editingId()"
                   (ngModelChange)="onTypeChange()"
                 >
-                  <optgroup label="CLI-based">
-                    <option value="generic">Generic</option>
-                    <option value="repository">Repository</option>
+                  <optgroup [label]="'datasources.form.typeGroupCli' | transloco">
+                    <option value="generic">{{ 'datasources.form.optGeneric' | transloco }}</option>
+                    <option value="repository">{{ 'datasources.form.optRepository' | transloco }}</option>
                   </optgroup>
-                  <optgroup label="Managed">
-                    <option value="postgresql">PostgreSQL</option>
-                    <option value="neo4j">Neo4j</option>
-                    <option value="mongodb">MongoDB</option>
-                    <option value="webdav">WebDAV</option>
+                  <optgroup [label]="'datasources.form.typeGroupManaged' | transloco">
+                    <option value="postgresql">{{ 'datasources.form.optPostgresql' | transloco }}</option>
+                    <option value="neo4j">{{ 'datasources.form.optNeo4j' | transloco }}</option>
+                    <option value="mongodb">{{ 'datasources.form.optMongodb' | transloco }}</option>
+                    <option value="webdav">{{ 'datasources.form.optWebdav' | transloco }}</option>
                   </optgroup>
                 </select>
               </div>
@@ -103,7 +104,7 @@ import {
             @if (formData.type !== 'generic') {
               <div class="form-group">
                 <label class="form-label">
-                  {{ formData.type === 'repository' ? 'Repository URL' : 'Connection URL' }}
+                  {{ (formData.type === 'repository' ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco }}
                   <span class="required">*</span>
                 </label>
                 <input
@@ -118,11 +119,11 @@ import {
             <!-- Generic: optional connection URL -->
             @if (formData.type === 'generic') {
               <div class="form-group">
-                <label class="form-label">Connection URL <span class="hint-inline">(optional)</span></label>
+                <label class="form-label">{{ 'datasources.form.connectionUrlLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
                 <input
                   class="form-input mono"
                   [(ngModel)]="formData.connection_url"
-                  placeholder="e.g. postgresql://host:5432/db or https://api.example.com"
+                  [placeholder]="'datasources.form.genericUrlPlaceholder' | transloco"
                   [disabled]="isSaving()"
                 >
               </div>
@@ -130,13 +131,13 @@ import {
 
             <div class="form-group">
               <label class="form-label">
-                Description
+                {{ 'datasources.form.descriptionLabel' | transloco }}
                 @if (formData.type === 'generic') { <span class="required">*</span> }
               </label>
               <textarea
                 class="form-textarea"
                 [(ngModel)]="formData.description"
-                [placeholder]="formData.type === 'generic' ? 'Describe this resource for the AI — what it is, how to use it, what data it contains' : 'What this datasource contains (included in agent context)'"
+                [placeholder]="(formData.type === 'generic' ? 'datasources.form.descriptionPlaceholderGeneric' : 'datasources.form.descriptionPlaceholderManaged') | transloco"
                 [rows]="formData.type === 'generic' ? 3 : 2"
                 [disabled]="isSaving()"
               ></textarea>
@@ -145,11 +146,11 @@ import {
             <!-- Generic: CLI hint -->
             @if (formData.type === 'generic') {
               <div class="form-group">
-                <label class="form-label">CLI Hint <span class="hint-inline">(optional)</span></label>
+                <label class="form-label">{{ 'datasources.form.cliHintLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
                 <input
                   class="form-input mono"
                   [(ngModel)]="formData.cli_hint"
-                  placeholder="e.g. psql $DATABASE_URL"
+                  [placeholder]="'datasources.form.cliHintPlaceholder' | transloco"
                   [disabled]="isSaving()"
                 >
               </div>
@@ -158,14 +159,14 @@ import {
             <!-- Generic: Environment Variables -->
             @if (formData.type === 'generic') {
               <div class="form-group">
-                <label class="form-label">Environment Variables</label>
+                <label class="form-label">{{ 'datasources.form.envVarsLabel' | transloco }}</label>
                 <div class="env-vars-editor">
                   @for (envVar of envVars; track $index) {
                     <div class="env-var-row">
                       <input
                         class="form-input mono env-key"
                         [(ngModel)]="envVar.key"
-                        placeholder="ENV_VAR_NAME"
+                        [placeholder]="'datasources.form.envKeyPlaceholder' | transloco"
                         [disabled]="isSaving()"
                       >
                       <span class="env-eq">=</span>
@@ -173,21 +174,20 @@ import {
                         class="form-input mono env-val"
                         type="password"
                         [(ngModel)]="envVar.value"
-                        placeholder="value"
+                        [placeholder]="'datasources.form.envValuePlaceholder' | transloco"
                         [disabled]="isSaving()"
                       >
-                      <button class="icon-btn delete" (click)="removeEnvVar($index)" [disabled]="isSaving()" title="Remove">
+                      <button class="icon-btn delete" (click)="removeEnvVar($index)" [disabled]="isSaving()" [title]="'datasources.form.envRemoveTooltip' | transloco">
                         <span class="mat-icon">close</span>
                       </button>
                     </div>
                   }
                   <button class="btn btn-add-env" (click)="addEnvVar()" [disabled]="isSaving()">
-                    <span class="mat-icon">add</span> Add variable
+                    <span class="mat-icon">add</span> {{ 'datasources.form.envAdd' | transloco }}
                   </button>
                 </div>
                 <div class="form-hint">
-                  Credentials are injected as environment variables into the agent workspace.
-                  Read-only access cannot be enforced — use a database account with restricted permissions if needed.
+                  {{ 'datasources.form.envHint' | transloco }}
                 </div>
               </div>
             }
@@ -195,11 +195,11 @@ import {
             <!-- Repository: default branch -->
             @if (formData.type === 'repository') {
               <div class="form-group">
-                <label class="form-label">Default Branch <span class="hint-inline">(optional)</span></label>
+                <label class="form-label">{{ 'datasources.form.defaultBranchLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
                 <input
                   class="form-input"
                   [(ngModel)]="formData.default_branch"
-                  placeholder="main"
+                  [placeholder]="'datasources.form.defaultBranchPlaceholder' | transloco"
                   [disabled]="isSaving()"
                 >
               </div>
@@ -208,31 +208,31 @@ import {
             <!-- Repository: auth method -->
             @if (formData.type === 'repository') {
               <div class="form-group">
-                <label class="form-label">Auth Method <span class="required">*</span></label>
+                <label class="form-label">{{ 'datasources.form.authMethodLabel' | transloco }} <span class="required">*</span></label>
                 <select
                   class="form-input form-select"
                   [(ngModel)]="gitAuthMethod"
                   [disabled]="isSaving()"
                 >
-                  <option value="token">HTTPS Token</option>
-                  <option value="ssh">SSH Key</option>
+                  <option value="token">{{ 'datasources.form.authToken' | transloco }}</option>
+                  <option value="ssh">{{ 'datasources.form.authSsh' | transloco }}</option>
                 </select>
               </div>
               @if (gitAuthMethod === 'token') {
                 <div class="form-group">
-                  <label class="form-label">Access Token</label>
+                  <label class="form-label">{{ 'datasources.form.tokenLabel' | transloco }}</label>
                   <input
                     class="form-input mono"
                     type="password"
                     [(ngModel)]="formCredentials.password"
-                    placeholder="ghp_xxxx or personal access token"
+                    [placeholder]="'datasources.form.tokenPlaceholder' | transloco"
                     [disabled]="isSaving()"
                   >
                 </div>
               }
               @if (gitAuthMethod === 'ssh') {
                 <div class="form-group">
-                  <label class="form-label">SSH Private Key</label>
+                  <label class="form-label">{{ 'datasources.form.sshKeyLabel' | transloco }}</label>
                   <textarea
                     class="form-textarea mono"
                     [(ngModel)]="gitSshKey"
@@ -243,8 +243,7 @@ import {
                 </div>
               }
               <div class="form-hint">
-                The repository will be cloned into the workspace and git credentials configured automatically.
-                The agent uses standard git commands — no credential setup required.
+                {{ 'datasources.form.repoHint' | transloco }}
               </div>
             }
 
@@ -252,21 +251,21 @@ import {
             @if (formData.type === 'neo4j' || formData.type === 'webdav') {
               <div class="form-row">
                 <div class="form-group flex-1">
-                  <label class="form-label">Username</label>
+                  <label class="form-label">{{ 'datasources.form.usernameLabel' | transloco }}</label>
                   <input
                     class="form-input"
                     [(ngModel)]="formCredentials.username"
-                    placeholder="neo4j"
+                    [placeholder]="'datasources.form.usernamePlaceholder' | transloco"
                     [disabled]="isSaving()"
                   >
                 </div>
                 <div class="form-group flex-1">
-                  <label class="form-label">Password</label>
+                  <label class="form-label">{{ 'datasources.form.passwordLabel' | transloco }}</label>
                   <input
                     class="form-input"
                     type="password"
                     [(ngModel)]="formCredentials.password"
-                    placeholder="password"
+                    [placeholder]="'datasources.form.passwordPlaceholder' | transloco"
                     [disabled]="isSaving()"
                   >
                 </div>
@@ -282,22 +281,22 @@ import {
                     [disabled]="!formData.connection_url || isTesting()"
                   >
                     @if (isTesting()) {
-                      <span class="spinner-small"></span> Testing...
+                      <span class="spinner-small"></span> {{ 'datasources.form.testing' | transloco }}
                     } @else {
-                      <span class="mat-icon">cable</span> Test
+                      <span class="mat-icon">cable</span> {{ 'datasources.form.test' | transloco }}
                     }
                   </button>
                 }
-                <button class="btn btn-secondary" (click)="closeForm()" [disabled]="isSaving()">Cancel</button>
+                <button class="btn btn-secondary" (click)="closeForm()" [disabled]="isSaving()">{{ 'datasources.form.cancel' | transloco }}</button>
                 <button
                   class="btn btn-primary"
                   (click)="saveForm()"
                   [disabled]="!canSave() || isSaving()"
                 >
                   @if (isSaving()) {
-                    <span class="spinner-small"></span> Saving...
+                    <span class="spinner-small"></span> {{ 'datasources.form.saving' | transloco }}
                   } @else {
-                    {{ editingId() ? 'Update' : 'Create' }}
+                    {{ (editingId() ? 'datasources.form.update' : 'datasources.form.create') | transloco }}
                   }
                 </button>
               </div>
@@ -321,7 +320,7 @@ import {
       @if (isLoading() && filteredDatasources().length === 0 && !showForm()) {
         <div class="center-state">
           <div class="spinner"></div>
-          <span>Loading datasources...</span>
+          <span>{{ 'datasources.table.loading' | transloco }}</span>
         </div>
       }
 
@@ -329,8 +328,8 @@ import {
       @if (!isLoading() && filteredDatasources().length === 0 && !showForm()) {
         <div class="center-state">
           <span class="mat-icon empty-icon">database</span>
-          <span>No datasources found</span>
-          <span class="hint">Create a datasource to connect agents to external databases</span>
+          <span>{{ 'datasources.table.empty' | transloco }}</span>
+          <span class="hint">{{ 'datasources.table.emptyHint' | transloco }}</span>
         </div>
       }
 
@@ -340,11 +339,11 @@ import {
           <table class="ds-table">
             <thead>
               <tr>
-                <th>Type</th>
-                <th>Name</th>
-                <th>URL</th>
-                <th>Scope</th>
-                <th>Actions</th>
+                <th>{{ 'datasources.table.colType' | transloco }}</th>
+                <th>{{ 'datasources.table.colName' | transloco }}</th>
+                <th>{{ 'datasources.table.colUrl' | transloco }}</th>
+                <th>{{ 'datasources.table.colScope' | transloco }}</th>
+                <th>{{ 'datasources.table.colActions' | transloco }}</th>
               </tr>
             </thead>
             <tbody>
@@ -353,7 +352,7 @@ import {
                   <td>
                     <span class="type-badge" [class]="'type-' + ds.type">
                       <span class="mat-icon">{{ getTypeIcon(ds.type) }}</span>
-                      {{ ds.type }}
+                      {{ 'datasources.filter.' + ds.type | transloco }}
                     </span>
                   </td>
                   <td class="name-cell">
@@ -365,7 +364,7 @@ import {
                   <td class="url-cell mono">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
                   <td>
                     <span class="scope-badge" [class.scope-global]="!ds.job_id" [class.scope-job]="!!ds.job_id">
-                      {{ ds.job_id ? 'Job' : 'Global' }}
+                      {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
                     </span>
                   </td>
                   <td class="actions-cell">
@@ -373,7 +372,7 @@ import {
                       class="icon-btn test"
                       (click)="testDatasource(ds.id)"
                       [disabled]="testingIds().has(ds.id)"
-                      title="Test connection"
+                      [title]="'datasources.table.testTooltip' | transloco"
                     >
                       @if (testingIds().has(ds.id)) {
                         <span class="spinner-tiny"></span>
@@ -381,10 +380,10 @@ import {
                         <span class="mat-icon">cable</span>
                       }
                     </button>
-                    <button class="icon-btn edit" (click)="openEditForm(ds)" title="Edit">
+                    <button class="icon-btn edit" (click)="openEditForm(ds)" [title]="'datasources.table.editTooltip' | transloco">
                       <span class="mat-icon">edit</span>
                     </button>
-                    <button class="icon-btn delete" (click)="deleteDatasource(ds)" title="Delete">
+                    <button class="icon-btn delete" (click)="deleteDatasource(ds)" [title]="'datasources.table.deleteTooltip' | transloco">
                       <span class="mat-icon">delete</span>
                     </button>
 
@@ -1072,6 +1071,7 @@ import {
 })
 export class DatasourceListComponent implements OnInit {
   private readonly api = inject(ApiService);
+  private readonly transloco = inject(TranslocoService);
 
   // State signals
   readonly datasources = signal<Datasource[]>([]);
@@ -1089,13 +1089,13 @@ export class DatasourceListComponent implements OnInit {
 
   // Filter options
   readonly typeFilters = [
-    { label: 'All', value: 'all' },
-    { label: 'Generic', value: 'generic' },
-    { label: 'Repository', value: 'repository' },
-    { label: 'PostgreSQL', value: 'postgresql' },
-    { label: 'Neo4j', value: 'neo4j' },
-    { label: 'MongoDB', value: 'mongodb' },
-    { label: 'WebDAV', value: 'webdav' },
+    { labelKey: 'datasources.filter.all', value: 'all' },
+    { labelKey: 'datasources.filter.generic', value: 'generic' },
+    { labelKey: 'datasources.filter.repository', value: 'repository' },
+    { labelKey: 'datasources.filter.postgresql', value: 'postgresql' },
+    { labelKey: 'datasources.filter.neo4j', value: 'neo4j' },
+    { labelKey: 'datasources.filter.mongodb', value: 'mongodb' },
+    { labelKey: 'datasources.filter.webdav', value: 'webdav' },
   ];
 
   // Computed filtered list
@@ -1229,12 +1229,7 @@ export class DatasourceListComponent implements OnInit {
 
     // Warn when creating a repository without credentials
     if (this.formData.type === 'repository' && this.buildCredentials()?.['read_only']) {
-      const confirmed = confirm(
-        'No authentication credentials provided.\n\n' +
-        'This repository will be cloned as read-only — the agent can browse ' +
-        'and read the code but will not be able to push changes.\n\n' +
-        'Continue?'
-      );
+      const confirmed = confirm(this.transloco.translate('datasources.messages.repoNoAuthConfirm'));
       if (!confirmed) return;
     }
 
@@ -1258,16 +1253,16 @@ export class DatasourceListComponent implements OnInit {
         next: (result) => {
           this.isSaving.set(false);
           if (result) {
-            this.successMessage.set('Datasource updated');
+            this.successMessage.set(this.transloco.translate('datasources.messages.updated'));
             this.closeForm();
             this.refresh();
           } else {
-            this.errorMessage.set('Failed to update datasource');
+            this.errorMessage.set(this.transloco.translate('datasources.messages.updateFailed'));
           }
         },
         error: () => {
           this.isSaving.set(false);
-          this.errorMessage.set('Error updating datasource');
+          this.errorMessage.set(this.transloco.translate('datasources.messages.updateError'));
         },
       });
     } else {
@@ -1284,14 +1279,14 @@ export class DatasourceListComponent implements OnInit {
       this.api.createDatasource(create).subscribe({
         next: (result) => {
           this.isSaving.set(false);
-          this.successMessage.set(`Datasource "${result.name}" created`);
+          this.successMessage.set(this.transloco.translate('datasources.messages.created', {name: result.name}));
           this.closeForm();
           this.refresh();
         },
         error: (err) => {
           this.isSaving.set(false);
           const detail = err?.error?.detail;
-          this.errorMessage.set(detail || 'Failed to create datasource');
+          this.errorMessage.set(detail || this.transloco.translate('datasources.messages.createFailed'));
         },
       });
     }
@@ -1310,7 +1305,7 @@ export class DatasourceListComponent implements OnInit {
         },
         error: () => {
           this.isTesting.set(false);
-          this.formTestResult.set({ status: 'error', message: 'Request failed' });
+          this.formTestResult.set({ status: 'error', message: this.transloco.translate('datasources.messages.testFailed') });
         },
       });
     } else {
@@ -1342,16 +1337,16 @@ export class DatasourceListComponent implements OnInit {
               },
               error: () => {
                 this.isTesting.set(false);
-                this.formTestResult.set({ status: 'error', message: 'Test request failed' });
+                this.formTestResult.set({ status: 'error', message: this.transloco.translate('datasources.messages.testRequestFailed') });
               },
             });
           } else {
-            this.errorMessage.set('Failed to create datasource for testing');
+            this.errorMessage.set(this.transloco.translate('datasources.messages.createForTestFailed'));
           }
         },
         error: () => {
           this.isSaving.set(false);
-          this.errorMessage.set('Error creating datasource');
+          this.errorMessage.set(this.transloco.translate('datasources.messages.createError'));
         },
       });
     }
@@ -1380,7 +1375,7 @@ export class DatasourceListComponent implements OnInit {
         });
         this.testResults.update((r) => ({
           ...r,
-          [id]: { status: 'error' as const, message: 'Request failed' },
+          [id]: { status: 'error' as const, message: this.transloco.translate('datasources.messages.testFailed') },
         }));
       },
     });
@@ -1391,14 +1386,14 @@ export class DatasourceListComponent implements OnInit {
     this.api.deleteDatasource(ds.id).subscribe({
       next: (result) => {
         if (result) {
-          this.successMessage.set(`Datasource "${ds.name}" deleted`);
+          this.successMessage.set(this.transloco.translate('datasources.messages.deleted', {name: ds.name}));
           this.refresh();
         } else {
-          this.errorMessage.set('Failed to delete datasource');
+          this.errorMessage.set(this.transloco.translate('datasources.messages.deleteFailed'));
         }
       },
       error: () => {
-        this.errorMessage.set('Error deleting datasource');
+        this.errorMessage.set(this.transloco.translate('datasources.messages.deleteError'));
       },
     });
   }

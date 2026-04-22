@@ -221,6 +221,7 @@ export interface UserSettings {
   default_tactical_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
+  language?: 'en' | 'de-DE' | null;
   communication?: CommunicationSettings | null;
   persistent_agent?: PersistentAgentSettings | null;
   _resolved?: ResolvedDefaults;
