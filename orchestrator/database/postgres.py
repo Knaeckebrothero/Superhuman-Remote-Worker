@@ -3427,6 +3427,312 @@ class PostgresDB:
         return resolved
 
     # =========================================================================
+    # USER LLM ENDPOINT OPERATIONS
+    # =========================================================================
+
+    async def list_user_llm_endpoints(self, user_id: str) -> List[Dict[str, Any]]:
+        """List a user's LLM endpoints with their model rows.
+
+        Returns one dict per endpoint with a nested ``models`` list.
+        API keys are never returned — only ``key_prefix`` for display.
+        """
+        async with self.acquire() as conn:
+            endpoint_rows = await conn.fetch(
+                """
+                SELECT id, label, base_url, key_prefix, created_at, updated_at
+                FROM user_llm_endpoints
+                WHERE user_id = $1
+                ORDER BY label
+                """,
+                UUID(user_id),
+            )
+            if not endpoint_rows:
+                return []
+
+            endpoint_ids = [r["id"] for r in endpoint_rows]
+            model_rows = await conn.fetch(
+                """
+                SELECT id, endpoint_id, model_id, display_name, family,
+                       context_window, reasoning_level, enabled, created_at
+                FROM user_llm_endpoint_models
+                WHERE endpoint_id = ANY($1::uuid[])
+                ORDER BY endpoint_id, display_name
+                """,
+                endpoint_ids,
+            )
+
+        models_by_endpoint: Dict[Any, List[Dict[str, Any]]] = {}
+        for m in model_rows:
+            models_by_endpoint.setdefault(m["endpoint_id"], []).append(dict(m))
+
+        result = []
+        for e in endpoint_rows:
+            e_dict = dict(e)
+            e_dict["models"] = models_by_endpoint.get(e["id"], [])
+            result.append(e_dict)
+        return result
+
+    async def get_user_llm_endpoint(
+        self, endpoint_id: str, user_id: str | None = None
+    ) -> Dict[str, Any] | None:
+        """Fetch a single endpoint row (including api_key — for dispatch only).
+
+        If ``user_id`` is provided, the query is scoped to that user for
+        authorization; callers that have already checked ownership can omit it.
+        """
+        query = """
+            SELECT id, user_id, label, base_url, api_key, key_prefix,
+                   created_at, updated_at
+            FROM user_llm_endpoints
+            WHERE id = $1
+        """
+        args: List[Any] = [UUID(endpoint_id)]
+        if user_id is not None:
+            query += " AND user_id = $2"
+            args.append(UUID(user_id))
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+            return dict(row) if row else None
+
+    async def create_user_llm_endpoint(
+        self,
+        user_id: str,
+        label: str,
+        base_url: str,
+        api_key: str | None,
+        key_prefix: str | None,
+    ) -> Dict[str, Any]:
+        """Create a new LLM endpoint for a user. Label must be unique per user."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_llm_endpoints
+                    (user_id, label, base_url, api_key, key_prefix)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, label, base_url, key_prefix, created_at, updated_at
+                """,
+                UUID(user_id),
+                label,
+                base_url,
+                api_key,
+                key_prefix,
+            )
+            return dict(row)
+
+    async def update_user_llm_endpoint(
+        self,
+        endpoint_id: str,
+        user_id: str,
+        label: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        key_prefix: str | None = None,
+        clear_api_key: bool = False,
+    ) -> Dict[str, Any] | None:
+        """Patch an endpoint. Only non-None fields are updated.
+
+        ``clear_api_key=True`` explicitly nulls the key (for endpoints that
+        transition from authenticated to anonymous).
+        """
+        sets: List[str] = []
+        args: List[Any] = [UUID(endpoint_id), UUID(user_id)]
+        param_idx = 3
+        if label is not None:
+            sets.append(f"label = ${param_idx}")
+            args.append(label)
+            param_idx += 1
+        if base_url is not None:
+            sets.append(f"base_url = ${param_idx}")
+            args.append(base_url)
+            param_idx += 1
+        if clear_api_key:
+            sets.append("api_key = NULL")
+            sets.append("key_prefix = NULL")
+        elif api_key is not None:
+            sets.append(f"api_key = ${param_idx}")
+            args.append(api_key)
+            param_idx += 1
+            if key_prefix is not None:
+                sets.append(f"key_prefix = ${param_idx}")
+                args.append(key_prefix)
+                param_idx += 1
+
+        if not sets:
+            # Nothing to change — return current row.
+            return await self.get_user_llm_endpoint(endpoint_id, user_id)
+
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        query = f"""
+            UPDATE user_llm_endpoints
+            SET {", ".join(sets)}
+            WHERE id = $1 AND user_id = $2
+            RETURNING id, label, base_url, key_prefix, created_at, updated_at
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+            return dict(row) if row else None
+
+    async def delete_user_llm_endpoint(self, endpoint_id: str, user_id: str) -> bool:
+        """Delete an endpoint and cascade to its model rows."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM user_llm_endpoints WHERE id = $1 AND user_id = $2",
+                UUID(endpoint_id),
+                UUID(user_id),
+            )
+            return result == "DELETE 1"
+
+    async def create_user_llm_endpoint_model(
+        self,
+        endpoint_id: str,
+        user_id: str,
+        model_id: str,
+        display_name: str,
+        family: str | None = None,
+        context_window: int | None = None,
+        reasoning_level: str | None = None,
+        enabled: bool = True,
+    ) -> Dict[str, Any] | None:
+        """Add a model row to an endpoint.
+
+        Returns None if the endpoint doesn't belong to the user. Raises
+        asyncpg.UniqueViolationError on duplicate (endpoint_id, model_id).
+        """
+        # Authorize: the endpoint must belong to the caller.
+        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
+        if owner is None:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_llm_endpoint_models
+                    (endpoint_id, model_id, display_name, family,
+                     context_window, reasoning_level, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, endpoint_id, model_id, display_name, family,
+                          context_window, reasoning_level, enabled, created_at
+                """,
+                UUID(endpoint_id),
+                model_id,
+                display_name,
+                family,
+                context_window,
+                reasoning_level,
+                enabled,
+            )
+            return dict(row)
+
+    async def update_user_llm_endpoint_model(
+        self,
+        endpoint_id: str,
+        model_id: str,
+        user_id: str,
+        display_name: str | None = None,
+        family: str | None = None,
+        context_window: int | None = None,
+        reasoning_level: str | None = None,
+        enabled: bool | None = None,
+    ) -> Dict[str, Any] | None:
+        """Patch a model row. Only non-None fields are updated."""
+        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
+        if owner is None:
+            return None
+
+        sets: List[str] = []
+        args: List[Any] = [UUID(endpoint_id), model_id]
+        param_idx = 3
+        for name, value in (
+            ("display_name", display_name),
+            ("family", family),
+            ("context_window", context_window),
+            ("reasoning_level", reasoning_level),
+            ("enabled", enabled),
+        ):
+            if value is not None:
+                sets.append(f"{name} = ${param_idx}")
+                args.append(value)
+                param_idx += 1
+
+        if not sets:
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, endpoint_id, model_id, display_name, family,
+                           context_window, reasoning_level, enabled, created_at
+                    FROM user_llm_endpoint_models
+                    WHERE endpoint_id = $1 AND model_id = $2
+                    """,
+                    *args[:2],
+                )
+                return dict(row) if row else None
+
+        query = f"""
+            UPDATE user_llm_endpoint_models
+            SET {", ".join(sets)}
+            WHERE endpoint_id = $1 AND model_id = $2
+            RETURNING id, endpoint_id, model_id, display_name, family,
+                      context_window, reasoning_level, enabled, created_at
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+            return dict(row) if row else None
+
+    async def delete_user_llm_endpoint_model(
+        self, endpoint_id: str, model_id: str, user_id: str
+    ) -> bool:
+        """Delete a model row from an endpoint."""
+        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
+        if owner is None:
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM user_llm_endpoint_models
+                WHERE endpoint_id = $1 AND model_id = $2
+                """,
+                UUID(endpoint_id),
+                model_id,
+            )
+            return result == "DELETE 1"
+
+    async def resolve_user_llm_model(
+        self, user_id: str, model_id: str
+    ) -> Dict[str, Any] | None:
+        """Look up (endpoint + model) by (user_id, model_id) for dispatch.
+
+        Returns a flat dict with the endpoint's base_url/api_key plus the
+        model row's metadata, or None if no match. Used by the registry
+        to resolve custom-endpoint models.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    e.id AS endpoint_id,
+                    e.label AS endpoint_label,
+                    e.base_url,
+                    e.api_key,
+                    m.model_id,
+                    m.display_name,
+                    m.family,
+                    m.context_window,
+                    m.reasoning_level,
+                    m.enabled
+                FROM user_llm_endpoint_models m
+                JOIN user_llm_endpoints e ON e.id = m.endpoint_id
+                WHERE e.user_id = $1
+                  AND m.model_id = $2
+                  AND m.enabled = TRUE
+                LIMIT 1
+                """,
+                UUID(user_id),
+                model_id,
+            )
+            return dict(row) if row else None
+
+    # =========================================================================
     # USER SETTINGS OPERATIONS
     # =========================================================================
 

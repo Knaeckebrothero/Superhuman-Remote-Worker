@@ -15,10 +15,10 @@ from src.core.loader import (
     _load_settings_matrix,
     _parse_llm_config,
     _parse_phase_override,
-    detect_model_family,
     detect_reasoning_method,
     load_uploaded_config,
 )
+from src.core.model_registry import family_of
 
 
 @pytest.fixture(autouse=True)
@@ -30,25 +30,26 @@ def clear_settings_matrix_cache():
 
 
 # =============================================================================
-# detect_model_family — minimax
+# family_of — minimax (registry-backed replacement for detect_model_family)
 # =============================================================================
 
 
-class TestDetectModelFamilyMinimax:
-    def test_bare_name(self):
-        assert detect_model_family("minimax-m2.7") == "minimax"
+class TestFamilyOfMinimax:
+    def test_openrouter_minimax_is_registered(self):
+        # MiniMax is a built-in entry under openrouter/. The registry
+        # reads the `family: minimax` field from models.yaml.
+        assert family_of("openrouter/minimax/minimax-m2.7") == "minimax"
 
-    def test_with_openai_prefix(self):
-        assert detect_model_family("openai/minimax-m2.7") == "minimax"
+    def test_bare_minimax_via_heuristic(self):
+        # family_of's heuristic fallback pattern-matches bare IDs the
+        # registry doesn't know, preserving backward compatibility for
+        # custom endpoints that don't set an explicit family.
+        assert family_of("minimax-m2.7") == "minimax"
 
-    def test_with_openrouter_prefix(self):
-        assert detect_model_family("openrouter/minimax/minimax-01") == "minimax"
-
-    def test_case_insensitive(self):
-        assert detect_model_family("MiniMax-M2.7") == "minimax"
-
-    def test_reasoning_method_is_none(self):
-        assert detect_reasoning_method("minimax-m2.7") == "none"
+    def test_reasoning_method_is_none_for_minimax(self):
+        # detect_reasoning_method still flows through family_of internally,
+        # so it picks up the registry's family for built-in minimax entries.
+        assert detect_reasoning_method("openrouter/minimax/minimax-m2.7") == "none"
 
 
 # =============================================================================

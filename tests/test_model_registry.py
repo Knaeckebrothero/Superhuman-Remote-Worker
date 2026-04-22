@@ -15,6 +15,7 @@ from src.core.model_registry import (
     UnknownModelError,
     _factory_provider,
     list_builtin_models,
+    register_custom_lookup,
     reload_registry,
     resolve_model,
 )
@@ -106,7 +107,7 @@ class TestResolveBuiltinModels:
     async def test_local_model_routes_through_openai_factory(self):
         # Currently named with openai/ prefix; PR 2 drops the prefix.
         # Either way, the Local group's factory target is openai.
-        meta = await resolve_model("openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic")
+        meta = await resolve_model("RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         assert meta.provider == "openai"
         assert meta.family == "gemma"
         assert meta.origin == "builtin"
@@ -137,15 +138,16 @@ class TestUnknownModels:
             await resolve_model("")
 
     @pytest.mark.asyncio
-    async def test_user_id_accepted_but_ignored_in_pr1(self):
-        # PR 2 will use user_id for custom-endpoint lookup. PR 1 accepts
-        # the parameter but doesn't dispatch on it; built-in lookup still
-        # wins.
+    async def test_user_id_without_hook_hits_builtin(self):
+        # If no custom-endpoint hook is registered (e.g., agent process,
+        # unit test), user_id is accepted but ignored — built-in lookup runs.
+        register_custom_lookup(None)
         meta = await resolve_model(
             "claude-opus-4-6",
             user_id="11111111-2222-3333-4444-555555555555",
         )
         assert meta.provider == "anthropic"
+        assert meta.origin == "builtin"
 
 
 class TestCatalogCoverage:
@@ -194,6 +196,111 @@ class TestReloadRegistry:
         reload_registry()
         after = {m.model_id for m in list_builtin_models()}
         assert before == after
+
+
+class TestCustomEndpointLookup:
+    """resolve_model() defers to the registered custom-endpoint hook when
+    user_id is present; falls back to the built-in catalog otherwise.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_hook(self):
+        # Every test in this class starts with no hook registered.
+        register_custom_lookup(None)
+        yield
+        register_custom_lookup(None)
+
+    @pytest.mark.asyncio
+    async def test_custom_lookup_wins_over_builtin(self):
+        """A user-registered 'gpt-4o' should route to their endpoint, not OpenAI."""
+        calls = []
+
+        async def fake_lookup(user_id, model_id):
+            calls.append((user_id, model_id))
+            return {
+                "endpoint_id": "00000000-0000-0000-0000-000000000001",
+                "base_url": "https://my-vllm.example/v1",
+                "model_id": model_id,
+                "display_name": "My Private GPT-4o",
+                "family": "gpt-4o",
+                "context_window": 128000,
+                "reasoning_level": None,
+            }
+
+        register_custom_lookup(fake_lookup)
+
+        meta = await resolve_model("gpt-4o", user_id="user-1")
+        assert meta.origin == "custom"
+        assert meta.provider == "openai"
+        assert meta.base_url == "https://my-vllm.example/v1"
+        assert meta.display_name == "My Private GPT-4o"
+        assert meta.endpoint_id == "00000000-0000-0000-0000-000000000001"
+        # api_key_ref is None — custom keys travel inline via endpoint_id.
+        assert meta.api_key_ref is None
+        assert calls == [("user-1", "gpt-4o")]
+
+    @pytest.mark.asyncio
+    async def test_missing_custom_row_falls_back_to_builtin(self):
+        async def fake_lookup(user_id, model_id):
+            return None
+
+        register_custom_lookup(fake_lookup)
+
+        meta = await resolve_model("gpt-4o", user_id="user-1")
+        assert meta.origin == "builtin"
+        assert meta.provider == "openai"
+
+    @pytest.mark.asyncio
+    async def test_no_user_id_skips_hook(self):
+        """Even with a hook registered, None user_id never calls it."""
+        hook_called = False
+
+        async def fake_lookup(user_id, model_id):
+            nonlocal hook_called
+            hook_called = True
+            return None
+
+        register_custom_lookup(fake_lookup)
+
+        meta = await resolve_model("gpt-4o", user_id=None)
+        assert hook_called is False
+        assert meta.origin == "builtin"
+
+    @pytest.mark.asyncio
+    async def test_hook_none_falls_back_to_builtin(self):
+        """Registering None (orchestrator shutdown path) must not raise."""
+        register_custom_lookup(None)
+        meta = await resolve_model("gpt-4o", user_id="user-1")
+        assert meta.origin == "builtin"
+
+    @pytest.mark.asyncio
+    async def test_custom_family_default_when_null(self):
+        async def fake_lookup(user_id, model_id):
+            return {
+                "endpoint_id": "00000000-0000-0000-0000-000000000001",
+                "base_url": "https://x/v1",
+                "model_id": model_id,
+                "display_name": "X",
+                "family": None,
+                "context_window": None,
+                "reasoning_level": None,
+            }
+
+        register_custom_lookup(fake_lookup)
+        meta = await resolve_model("some-custom-id", user_id="user-1")
+        assert meta.family == "default"
+
+    @pytest.mark.asyncio
+    async def test_unknown_with_hook_still_raises(self):
+        """If custom lookup returns None and ID isn't built-in, still raises."""
+
+        async def fake_lookup(user_id, model_id):
+            return None
+
+        register_custom_lookup(fake_lookup)
+
+        with pytest.raises(UnknownModelError):
+            await resolve_model("nothing-anywhere", user_id="user-1")
 
 
 class TestModelMetaShape:
