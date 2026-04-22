@@ -172,19 +172,51 @@ CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
 -- merged into resolve_api_keys_for_job() which only covers named providers.
 -- ============================================================================
 
+-- user_id is NULL for system-scoped rows (seeded by helm or created via
+-- Admin → Providers); non-NULL for per-user rows.
 CREATE TABLE IF NOT EXISTS user_llm_endpoints (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     label TEXT NOT NULL,
     base_url TEXT NOT NULL,
     api_key TEXT,
     key_prefix VARCHAR(12),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT uq_user_llm_endpoint_label UNIQUE (user_id, label)
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Drop the plain unique constraint if an older deployment still has it, and
+-- replace it with two partial indexes so user rows are unique-per-user while
+-- system rows (user_id IS NULL) are globally unique on label.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_user_llm_endpoint_label'
+          AND conrelid = 'user_llm_endpoints'::regclass
+    ) THEN
+        ALTER TABLE user_llm_endpoints DROP CONSTRAINT uq_user_llm_endpoint_label;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'user_llm_endpoints'::regclass
+          AND attname = 'user_id'
+          AND attnotnull = TRUE
+    ) THEN
+        ALTER TABLE user_llm_endpoints ALTER COLUMN user_id DROP NOT NULL;
+    END IF;
+END$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_llm_endpoint_label_user
+    ON user_llm_endpoints(user_id, label)
+    WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_llm_endpoint_label_system
+    ON user_llm_endpoints(label)
+    WHERE user_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoints_user ON user_llm_endpoints(user_id);
 
 CREATE TABLE IF NOT EXISTS user_llm_endpoint_models (
@@ -203,6 +235,33 @@ CREATE TABLE IF NOT EXISTS user_llm_endpoint_models (
 
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_endpoint ON user_llm_endpoint_models(endpoint_id);
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_id ON user_llm_endpoint_models(model_id);
+
+-- ============================================================================
+-- 0j. SYSTEM API KEYS
+-- Provider-level API keys not tied to a specific user. Consulted by the
+-- resolver after user and project keys; replaces the env-var fallback.
+-- Seeded by helm on fresh install; mutable via /api/admin/providers/keys.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS system_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(50) NOT NULL UNIQUE,
+    api_key TEXT NOT NULL,
+    key_prefix VARCHAR(12) NOT NULL,
+    label TEXT,
+    seeded_from TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_system_api_key_provider CHECK (provider IN (
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+    ))
+);
+
+-- Default LLM model IDs (builder, browser, citation) piggy-back on the
+-- existing `system_settings` table defined in section 9d. Keys follow the
+-- convention ``llm.default_<kind>_model`` with JSONB value ``{"model": "..."}``.
+-- See db.get_default_llm_model() / db.set_default_llm_model().
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE

@@ -12,14 +12,6 @@ const getEnvOrNull = (key: string): string | null => {
   return null;
 };
 
-const getEnvArray = <T>(key: string, fallback: T[] = []): T[] => {
-  if (typeof window !== 'undefined') {
-    const val = (window as any)['env']?.[key];
-    if (Array.isArray(val) && val.length > 0) return val;
-  }
-  return fallback;
-};
-
 export const environment = {
   // Core
   apiUrl: getEnv('apiUrl', 'http://localhost:8085/api'),
@@ -38,11 +30,4 @@ export const environment = {
   keycloakUrl: getEnv('keycloakUrl', 'http://localhost:8180'),
   keycloakRealm: getEnv('keycloakRealm', 'srw'),
   keycloakClientId: getEnv('keycloakClientId', 'cockpit'),
-
-  // Model configuration — the API (GET /api/models) is the source of
-  // truth. Env-configured lists remain as a last-resort fallback for
-  // deployments that pre-seed env.js; empty by default.
-  models: getEnvArray<{ group: string; models: string[] }>('models'),
-  modelPresets: getEnvArray<{ label: string; strategic: string; tactical: string }>('modelPresets'),
-  builderModels: getEnvArray<{ label: string; id: string }>('builderModels'),
 };

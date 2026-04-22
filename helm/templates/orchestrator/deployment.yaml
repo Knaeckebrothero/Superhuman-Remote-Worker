@@ -64,6 +64,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LICENSE_TERMS_ACCEPTED
+            # Encryption key for API keys stored at rest (user_api_keys,
+            # system_api_keys, user_llm_endpoints.api_key). Must be present
+            # before the orchestrator starts — see NOTES.txt for the
+            # operator backup procedure.
+            - name: APP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: APP_ENCRYPTION_KEY
             # Core databases
             - name: DATABASE_URL
               valueFrom:
@@ -167,11 +176,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: BUILDER_API_KEY
-            - name: BUILDER_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: BUILDER_MODEL
+            # BUILDER_MODEL removed — resolved from system_settings
+            # ('llm.default_builder_model') at request time.
             - name: BUILDER_LLM_PROVIDER
               valueFrom:
                 configMapKeyRef:

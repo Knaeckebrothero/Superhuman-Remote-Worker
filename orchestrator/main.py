@@ -2297,6 +2297,32 @@ class LlmEndpointModelUpdate(BaseModel):
     enabled: bool | None = None
 
 
+class AdminDefaultModelSet(BaseModel):
+    """Request body for setting a default LLM model on the system.
+
+    ``model`` is the model ID to resolve via the registry (e.g.
+    ``RedHatAI/gemma-4-31B-it-FP8-Dynamic``, ``gpt-4o``). Pass an empty
+    string to clear the default.
+    """
+
+    model: str = Field(..., description="Model ID; empty string clears the default")
+
+
+VALID_DEFAULT_MODEL_KINDS = {"builder", "browser", "citation"}
+
+# System-scoped API keys only cover shared providers. Codex auth is
+# user-bound through the proxy and isn't appropriate for a system key.
+VALID_SYSTEM_API_KEY_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "tavily",
+    "vision",
+}
+
+
 class UserSettingsUpdate(BaseModel):
     """Request body for updating user preferences. Null values remove the key."""
 
@@ -2473,12 +2499,13 @@ async def lifespan(app: FastAPI):
     await vector_db.ensure_schema(schema_file=_vector_schema)
     logger.info("Database schemas verified")
 
-    # Wire the model registry's custom-endpoint lookup to the DB. The
-    # registry lives in src/core/ and must not import orchestrator/, so
-    # the hook is injected here (and unset on shutdown below).
-    from src.core.model_registry import register_custom_lookup
+    # Wire the model registry's endpoint lookups to the DB. The registry
+    # lives in src/core/ and must not import orchestrator/, so the hooks
+    # are injected here (and unset on shutdown below).
+    from src.core.model_registry import register_custom_lookup, register_system_lookup
 
     register_custom_lookup(postgres_db.resolve_user_llm_model)
+    register_system_lookup(postgres_db.resolve_system_llm_model)
 
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
@@ -2659,11 +2686,12 @@ async def lifespan(app: FastAPI):
     await nats_bridge.disconnect()
     await gitea_client.close()
 
-    # Unregister the registry's DB hook before disconnecting the pool so
+    # Unregister the registry's DB hooks before disconnecting the pool so
     # any stragglers don't hit a closed connection.
-    from src.core.model_registry import register_custom_lookup
+    from src.core.model_registry import register_custom_lookup, register_system_lookup
 
     register_custom_lookup(None)
+    register_system_lookup(None)
 
     # Disconnect from databases
     await mongodb.disconnect()
@@ -4091,6 +4119,7 @@ async def _route_inbound_reply(
                 job_status=job.get("status", ""),
                 job_description=job.get("description", ""),
                 phase_number=job.get("phase_number"),
+                db=postgres_db,
             )
             if decision.get("action") == "interrupt":
                 await _internal_resume_job(job_id, feedback=message)
@@ -11168,6 +11197,266 @@ async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any
     }
 
 
+# =============================================================================
+# Admin Provider Endpoints
+# System-scoped provider keys, LLM endpoints, and default-model settings.
+# Gated by the srw-admin role via _require_admin.
+# =============================================================================
+
+
+def _serialize_system_api_key(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a system_api_keys row for API responses (prefix only)."""
+    return {
+        "id": str(row["id"]),
+        "provider": row["provider"],
+        "key_prefix": row.get("key_prefix"),
+        "label": row.get("label"),
+        "seeded_from": row.get("seeded_from"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+@app.get("/api/admin/providers/keys")
+async def admin_list_provider_keys(request: Request) -> list[dict[str, Any]]:
+    """List system-scoped provider API keys (prefix only, no full keys)."""
+    await _require_admin(request)
+    rows = await postgres_db.list_system_api_keys()
+    return [_serialize_system_api_key(r) for r in rows]
+
+
+@app.put("/api/admin/providers/keys/{provider}")
+async def admin_set_provider_key(
+    request: Request, provider: str, body: ApiKeySet
+) -> dict[str, Any]:
+    """Set or rotate the system-level API key for a provider."""
+    await _require_admin(request)
+    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider '{provider}'. Valid: "
+                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+            ),
+        )
+    row = await postgres_db.upsert_system_api_key(
+        provider=provider,
+        api_key=body.api_key,
+        key_prefix=body.api_key[:8],
+        label=body.label,
+    )
+    return _serialize_system_api_key(row)
+
+
+@app.delete("/api/admin/providers/keys/{provider}")
+async def admin_delete_provider_key(request: Request, provider: str) -> dict[str, str]:
+    """Remove the system-level key for a provider."""
+    await _require_admin(request)
+    deleted = await postgres_db.delete_system_api_key(provider)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"No system key for provider '{provider}'"
+        )
+    return {"status": "deleted"}
+
+
+@app.get("/api/admin/providers/endpoints")
+async def admin_list_provider_endpoints(request: Request) -> list[dict[str, Any]]:
+    """List system-scoped LLM endpoints with their models."""
+    await _require_admin(request)
+    rows = await postgres_db.list_system_llm_endpoints()
+    return [_serialize_endpoint(r) for r in rows]
+
+
+@app.post("/api/admin/providers/endpoints")
+async def admin_create_provider_endpoint(
+    request: Request, body: LlmEndpointCreate
+) -> dict[str, Any]:
+    """Create a new system-scoped LLM endpoint (visible to every user)."""
+    await _require_admin(request)
+    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+    try:
+        row = await postgres_db.create_system_llm_endpoint(
+            label=body.label,
+            base_url=base_url,
+            api_key=body.api_key,
+            key_prefix=key_prefix,
+        )
+    except Exception as e:
+        if "uq_user_llm_endpoint_label_system" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A system endpoint labeled {body.label!r} already exists.",
+            )
+        raise
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.patch("/api/admin/providers/endpoints/{endpoint_id}")
+async def admin_update_provider_endpoint(
+    request: Request, endpoint_id: str, body: LlmEndpointUpdate
+) -> dict[str, Any]:
+    await _require_admin(request)
+    base_url = None
+    if body.base_url is not None:
+        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+
+    row = await postgres_db.update_system_llm_endpoint(
+        endpoint_id=endpoint_id,
+        label=body.label,
+        base_url=base_url,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        clear_api_key=body.clear_api_key and body.api_key is None,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.delete("/api/admin/providers/endpoints/{endpoint_id}")
+async def admin_delete_provider_endpoint(
+    request: Request, endpoint_id: str
+) -> dict[str, str]:
+    await _require_admin(request)
+    deleted = await postgres_db.delete_system_llm_endpoint(endpoint_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/models")
+async def admin_create_provider_endpoint_model(
+    request: Request, endpoint_id: str, body: LlmEndpointModelCreate
+) -> dict[str, Any]:
+    await _require_admin(request)
+    try:
+        row = await postgres_db.create_system_llm_endpoint_model(
+            endpoint_id=endpoint_id,
+            model_id=body.model_id,
+            display_name=body.display_name,
+            family=body.family,
+            context_window=body.context_window,
+            reasoning_level=body.reasoning_level,
+            enabled=body.enabled,
+        )
+    except Exception as e:
+        if "uq_endpoint_model" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Model {body.model_id!r} is already attached to this endpoint."
+                ),
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+    return _serialize_endpoint_model(row)
+
+
+@app.patch("/api/admin/providers/endpoints/{endpoint_id}/models/{model_id:path}")
+async def admin_update_provider_endpoint_model(
+    request: Request,
+    endpoint_id: str,
+    model_id: str,
+    body: LlmEndpointModelUpdate,
+) -> dict[str, Any]:
+    await _require_admin(request)
+    row = await postgres_db.update_system_llm_endpoint_model(
+        endpoint_id=endpoint_id,
+        model_id=model_id,
+        display_name=body.display_name,
+        family=body.family,
+        context_window=body.context_window,
+        reasoning_level=body.reasoning_level,
+        enabled=body.enabled,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="System endpoint model not found")
+    return _serialize_endpoint_model(row)
+
+
+@app.delete("/api/admin/providers/endpoints/{endpoint_id}/models/{model_id:path}")
+async def admin_delete_provider_endpoint_model(
+    request: Request, endpoint_id: str, model_id: str
+) -> dict[str, str]:
+    await _require_admin(request)
+    deleted = await postgres_db.delete_system_llm_endpoint_model(
+        endpoint_id=endpoint_id, model_id=model_id
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="System endpoint model not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/test")
+async def admin_test_provider_endpoint(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Probe a system endpoint by calling ``GET {base_url}/models`` server-side."""
+    await _require_admin(request)
+    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+
+    probe_url = endpoint["base_url"].rstrip("/") + "/models"
+    headers = {}
+    if endpoint.get("api_key"):
+        headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(probe_url, headers=headers)
+    except httpx.HTTPError as e:
+        return {
+            "ok": False,
+            "status": None,
+            "error": str(e),
+            "probe_url": probe_url,
+        }
+
+    body_preview = resp.text[:500] if resp.text else ""
+    return {
+        "ok": 200 <= resp.status_code < 300,
+        "status": resp.status_code,
+        "error": None if resp.is_success else body_preview,
+        "probe_url": probe_url,
+    }
+
+
+@app.get("/api/admin/providers/defaults")
+async def admin_list_provider_defaults(request: Request) -> dict[str, str | None]:
+    """Return the currently-configured default model IDs for each workload kind."""
+    await _require_admin(request)
+    return {
+        kind: await postgres_db.get_default_llm_model(kind)
+        for kind in sorted(VALID_DEFAULT_MODEL_KINDS)
+    }
+
+
+@app.put("/api/admin/providers/defaults/{kind}")
+async def admin_set_provider_default(
+    request: Request, kind: str, body: AdminDefaultModelSet
+) -> dict[str, str | None]:
+    """Set or clear (empty string) the default model for a workload kind."""
+    admin = await _require_admin(request)
+    if kind not in VALID_DEFAULT_MODEL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid kind '{kind}'. Valid: {sorted(VALID_DEFAULT_MODEL_KINDS)}"
+            ),
+        )
+    await postgres_db.set_default_llm_model(
+        kind, body.model or None, updated_by=str(admin.get("id"))
+    )
+    return {"kind": kind, "model": await postgres_db.get_default_llm_model(kind)}
+
+
 def _resolve_preference_defaults() -> dict[str, Any]:
     """Compute resolved default values for all user preference fields.
 
@@ -11555,6 +11844,36 @@ async def list_available_models(
                     if hm["id"] in overrides:
                         hm["id"] = overrides[hm["id"]]
                         hm["configured"] = True
+
+    # Merge system-scoped LLM endpoints as "System: <label>" groups. These
+    # are seeded by helm or managed via Admin → Providers, and are visible
+    # to every user. Always configured (key lives on the endpoint row).
+    system_endpoints = await postgres_db.list_system_llm_endpoints()
+    for endpoint in system_endpoints:
+        enabled_models = [
+            m for m in endpoint.get("models", []) if m.get("enabled", True)
+        ]
+        if not enabled_models:
+            continue
+        group_name = f"System: {endpoint['label']}"
+        group_models = [m["model_id"] for m in enabled_models]
+        groups.append(
+            {
+                "group": group_name,
+                "provider": "system",
+                "endpoint_id": str(endpoint["id"]),
+                "configured": True,
+                "models": group_models,
+            }
+        )
+        builder_models.extend(
+            {
+                "label": f"{m['display_name']} ({endpoint['label']})",
+                "id": m["model_id"],
+                "configured": True,
+            }
+            for m in enabled_models
+        )
 
     # Merge the user's custom LLM endpoints as "Custom: <label>" groups.
     # Custom models are always configured (their api_key lives on the endpoint
@@ -14077,7 +14396,15 @@ async def send_builder_message(
 
     # Build context
     messages = await postgres_db.get_builder_messages(session_id)
-    raw_model_for_prompt = body.model or get_builder_model()
+    raw_model_for_prompt = body.model or await get_builder_model(postgres_db)
+    if not raw_model_for_prompt:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No default builder model configured. Set one in Admin → "
+                "Providers, or pass `model` explicitly."
+            ),
+        )
     system_prompt = build_system_prompt(
         model=raw_model_for_prompt,
         instructions_content=body.instructions,
@@ -14109,8 +14436,13 @@ async def send_builder_message(
         final_steps = []
 
         try:
-            raw_model = body.model or get_builder_model()
-            llm = _create_builder_llm(raw_model)
+            raw_model = body.model or await get_builder_model(postgres_db)
+            if not raw_model:
+                raise RuntimeError(
+                    "No default builder model configured. Set one in "
+                    "Admin → Providers, or pass `model` explicitly."
+                )
+            llm = await _create_builder_llm(raw_model)
             llm_with_tools = llm.bind_tools(BUILDER_TOOLS)
 
             # Convert dict messages to LangChain types
@@ -14320,11 +14652,14 @@ async def _execute_server_tool(
 # =============================================================================
 
 
-def _create_builder_llm(raw_model: str):
+async def _create_builder_llm(raw_model: str):
     """Create a LangChain LLM for the builder using the shared factory.
 
     Maps builder env vars and settings matrix into an LLMConfig, then
-    delegates to ``create_llm()`` from ``src/core/loader``.
+    delegates to ``create_llm()`` from ``src/core/loader``. The base URL
+    comes from the model registry (user/system endpoints → built-in
+    catalog), with BUILDER_BASE_URL / OPENAI_BASE_URL as deprecated env
+    fallbacks.
     """
     import sys
 
@@ -14362,7 +14697,7 @@ def _create_builder_llm(raw_model: str):
         top_p=settings.get("top_p"),
         top_k=settings.get("top_k"),
         reasoning_level=settings.get("reasoning_effort", "none"),
-        base_url=get_builder_base_url(),
+        base_url=await get_builder_base_url(raw_model),
         api_key=api_key,
         max_output_tokens=settings.get("max_tokens"),
     )
@@ -14466,7 +14801,13 @@ async def _summarize_builder_session(
     summary_prompt = build_summarization_prompt(to_summarize)
 
     try:
-        llm = _create_builder_llm(get_builder_model())
+        model = await get_builder_model(postgres_db)
+        if not model:
+            logger.info(
+                "Skipping builder summarization: no default builder model configured"
+            )
+            return
+        llm = await _create_builder_llm(model)
         lc_messages = [
             SystemMessage(content=summary_prompt[0]["content"]),
             HumanMessage(content=summary_prompt[1]["content"]),
@@ -14492,7 +14833,7 @@ async def _generate_builder_title(
 
     Uses the user's auxiliary model if configured, otherwise the builder model.
     """
-    model = get_builder_model()
+    model = await get_builder_model(postgres_db)
     if user_id:
         try:
             user_settings = await postgres_db.get_user_settings(user_id)
@@ -14502,7 +14843,11 @@ async def _generate_builder_title(
         except Exception:
             pass
 
-    llm = _create_builder_llm(model)
+    if not model:
+        logger.debug("Skipping title generation: no builder model configured")
+        return None
+
+    llm = await _create_builder_llm(model)
 
     prompt_messages = [
         SystemMessage(

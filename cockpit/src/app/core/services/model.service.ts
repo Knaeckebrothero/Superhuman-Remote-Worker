@@ -91,11 +91,16 @@ export class ModelService {
         this.fetchInFlight = false;
       },
       error: () => {
-        // Fallback: use env.js static config if API fails
-        // Static config lacks API-only fields (configured, provider) — cast to match
-        this.models.set(environment.models as ModelGroup[]);
-        this.presets.set(environment.modelPresets as ModelPreset[]);
-        this.builderModels.set(environment.builderModels as BuilderModel[]);
+        // The DB is the source of truth — on failure, surface an empty
+        // catalog so the empty-state banner + disabled pickers render
+        // instead of stale, hard-coded fallbacks.
+        this.models.set([]);
+        this.presets.set([]);
+        this.builderModels.set([]);
+        this.auxiliaryModels.set([]);
+        this.visionModels.set([]);
+        this.whisperModels.set([]);
+        this.embeddingModels.set([]);
         this.providers.set([]);
         this.loading.set(false);
         this.loaded.set(true);

@@ -177,11 +177,14 @@ def _get_browser_llm(context: Optional[ToolContext] = None):
     """Create an LLM instance for browser-use sub-agent.
 
     Resolution order:
-    1. browser.model in YAML config (via ToolContext)
-    2. BROWSER_LLM_MODEL env var
-    3. Fall back to gpt-4o (capable multimodal default)
-
-    Similarly for api_key and base_url.
+    1. ``browser.model`` / ``browser.base_url`` / ``browser.api_key`` in the
+       ToolContext config (populated from ``job.config_override`` when the
+       orchestrator dispatches a job)
+    2. Legacy env vars (``BROWSER_LLM_MODEL``, ``BROWSER_LLM_BASE_URL``,
+       ``BROWSER_LLM_API_KEY`` / ``OPENAI_API_KEY``) — deprecated; a
+       DeprecationWarning is emitted whenever one is used
+    3. Hard default of ``gpt-4o`` for the model (capable multimodal) and the
+       OpenAI-hosted URL for the base
 
     Args:
         context: Optional ToolContext with browser config.
@@ -189,19 +192,55 @@ def _get_browser_llm(context: Optional[ToolContext] = None):
     Returns:
         A LangChain chat model instance
     """
+    import warnings
+
     from langchain_openai import ChatOpenAI
 
     browser_cfg = context.config.get("browser", {}) if context else {}
 
-    model = browser_cfg.get("model") or os.getenv("BROWSER_LLM_MODEL") or "gpt-4o"
+    model = browser_cfg.get("model")
+    if not model:
+        env_model = os.getenv("BROWSER_LLM_MODEL")
+        if env_model:
+            warnings.warn(
+                "BROWSER_LLM_MODEL env var is deprecated — configure the "
+                "browser model via the agent's YAML `browser.model` or the "
+                "orchestrator's `config_override`.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            model = env_model
+        else:
+            model = "gpt-4o"
+
     api_key = (
         browser_cfg.get("api_key")
         or os.getenv("BROWSER_LLM_API_KEY")
         or os.getenv("OPENAI_API_KEY")
     )
-    base_url = browser_cfg.get("base_url") or os.getenv("BROWSER_LLM_BASE_URL")
-    if not base_url and model.lower().startswith("openai/"):
-        base_url = os.getenv("LLM_BASE_URL")
+
+    base_url = browser_cfg.get("base_url")
+    if not base_url:
+        env_url = os.getenv("BROWSER_LLM_BASE_URL")
+        if env_url:
+            warnings.warn(
+                "BROWSER_LLM_BASE_URL env var is deprecated — register the "
+                "browser endpoint via Admin → Providers (or pass "
+                "`browser.base_url` in config_override).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            base_url = env_url
+        elif model.lower().startswith("openai/"):
+            legacy = os.getenv("LLM_BASE_URL")
+            if legacy:
+                warnings.warn(
+                    "LLM_BASE_URL fallback for browser tools is deprecated — "
+                    "set `browser.base_url` explicitly.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                base_url = legacy
 
     kwargs = {
         "model": model,

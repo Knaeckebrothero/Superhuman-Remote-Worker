@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -2634,39 +2635,79 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 # =============================================================================
 
 
-def get_builder_model() -> str:
-    """Get the model name for the builder LLM."""
-    return os.getenv("BUILDER_MODEL", "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
+async def get_builder_model(db=None) -> str | None:
+    """Return the default model ID for the instruction builder.
 
+    Resolution order:
+        1. ``system_settings['llm.default_builder_model']`` (DB, via
+           ``db.get_default_llm_model('builder')``)
+        2. ``BUILDER_MODEL`` env var (deprecated — logs a warning)
+        3. ``None`` — the caller must surface "no default configured"
 
-def get_builder_base_url() -> str | None:
-    """Get the base URL for the builder LLM.
-
-    Falls back to OPENAI_BASE_URL for OpenAI-compatible providers.
-    Anthropic doesn't use a base URL override.
+    ``db`` is the PostgresDB instance; callers in FastAPI endpoints pass
+    the module-level ``postgres_db``. When ``db`` is ``None`` the DB
+    lookup is skipped entirely (used by sync/legacy call paths).
     """
+    if db is not None:
+        configured = await db.get_default_llm_model("builder")
+        if configured:
+            return configured
+
+    env_val = os.getenv("BUILDER_MODEL")
+    if env_val:
+        warnings.warn(
+            "BUILDER_MODEL env var is deprecated — set the default via "
+            "Admin → Providers (system_settings.default_builder_model) or "
+            "the helm `llm.seed.defaultBuilderModel` value instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return env_val
+    return None
+
+
+async def get_builder_base_url(raw_model: str) -> str | None:
+    """Resolve the base URL for a builder model.
+
+    Consults the model registry (which covers user/system endpoints and
+    the built-in catalog), then falls back to ``BUILDER_BASE_URL`` /
+    ``OPENAI_BASE_URL`` env vars for backwards compatibility.
+    """
+    from src.core.model_registry import UnknownModelError, resolve_model
+
+    try:
+        meta = await resolve_model(raw_model)
+    except UnknownModelError:
+        meta = None
+
+    if meta is not None and meta.base_url:
+        return meta.base_url
+
     explicit = os.getenv("BUILDER_BASE_URL")
     if explicit:
+        warnings.warn(
+            "BUILDER_BASE_URL env var is deprecated — register an LLM "
+            "endpoint via Admin → Providers (or helm `llm.seed.systemEndpoints`) "
+            "and let the registry resolve the URL.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return explicit
-    provider = get_builder_provider()
-    if provider == "anthropic":
+
+    if get_builder_provider(raw_model) == "anthropic":
         return None
     return os.getenv("OPENAI_BASE_URL")
 
 
-def get_builder_provider() -> str:
-    """Detect the LLM provider for the builder.
-
-    If BUILDER_LLM_PROVIDER is set, use that.
-    Otherwise auto-detect from model name.
-    """
+def get_builder_provider(raw_model: str) -> str:
+    """Detect the LLM provider for a given builder model."""
     explicit = os.getenv("BUILDER_LLM_PROVIDER")
     if explicit:
         return explicit.lower()
 
-    model = get_builder_model()
-    if model.startswith("claude-"):
+    lower = raw_model.lower()
+    if lower.startswith("claude-"):
         return "anthropic"
-    if model.startswith("codex/"):
+    if lower.startswith("codex/"):
         return "openai"  # Codex proxy is OpenAI-compatible
     return "openai"

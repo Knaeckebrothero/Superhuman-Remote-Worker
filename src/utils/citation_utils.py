@@ -7,6 +7,7 @@ package that provides source verification and citation management.
 
 import os
 import logging
+import warnings
 from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -37,24 +38,66 @@ def is_citation_engine_available() -> bool:
     return _citation_engine_available
 
 
-def get_citation_engine_config() -> Dict[str, Any]:
-    """Get Citation Engine configuration from environment variables.
+def get_citation_engine_config(
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build Citation Engine configuration.
+
+    ``overrides`` is the preferred path: the orchestrator passes resolved
+    values (model, base URL, DB URL) through job ``config_override`` at
+    dispatch, and the agent surfaces those here. When an override is
+    missing, the legacy env var is read and a ``DeprecationWarning`` is
+    emitted — those env vars come from the helm ConfigMap on pre-stage-5
+    deployments and will disappear entirely once the chart cleanup lands.
+
+    Args:
+        overrides: Optional dict with ``llm_model``, ``llm_url``,
+            ``db_url``, ``reasoning_required``.
 
     Returns:
-        Configuration dictionary for Citation Engine
+        Configuration dictionary for Citation Engine.
     """
-    llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4")
-    llm_url = os.getenv("CITATION_LLM_URL")
-    if not llm_url and llm_model.lower().startswith("openai/"):
-        llm_url = os.getenv("LLM_BASE_URL")
+    overrides = overrides or {}
+
+    llm_model = overrides.get("llm_model")
+    if not llm_model:
+        env_model = os.getenv("CITATION_LLM_MODEL")
+        if env_model:
+            warnings.warn(
+                "CITATION_LLM_MODEL env var is deprecated — pass "
+                "config_override['llm_model'] from the orchestrator instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            llm_model = env_model
+        else:
+            llm_model = "gpt-4"
+
+    llm_url = overrides.get("llm_url")
+    if not llm_url:
+        env_url = os.getenv("CITATION_LLM_URL")
+        if env_url:
+            warnings.warn(
+                "CITATION_LLM_URL env var is deprecated — pass "
+                "config_override['llm_url'] from the orchestrator instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            llm_url = env_url
+
+    db_url = overrides.get("db_url") or os.getenv(
+        "CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))
+    )
+
+    reasoning = overrides.get("reasoning_required") or os.getenv(
+        "CITATION_REASONING_REQUIRED", "low"
+    )
 
     return {
-        "db_url": os.getenv(
-            "CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))
-        ),
+        "db_url": db_url,
         "llm_url": llm_url,
         "llm_model": llm_model,
-        "reasoning_required": os.getenv("CITATION_REASONING_REQUIRED", "low"),
+        "reasoning_required": reasoning,
     }
 
 
@@ -74,7 +117,8 @@ async def create_citation_engine(
         logger.warning("Citation Engine not available")
         return None
 
-    config = config or get_citation_engine_config()
+    if config is None:
+        config = get_citation_engine_config()
 
     try:
         engine = CitationEngine(

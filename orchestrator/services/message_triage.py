@@ -4,16 +4,27 @@ When a user sends an unprompted message (not a reply to a blocking request),
 this service uses an LLM to decide whether to interrupt the running agent
 immediately or queue the message for the next strategic phase.
 
-Uses the builder's LLM configuration (same model/API key). Falls back to
-"queue" on any failure — triage is advisory, never blocks delivery.
+Uses the builder's LLM configuration — the same default model, system
+endpoint, and system API key that drive the instruction-builder chat. Falls
+back to ``queue`` on any failure, since triage is advisory and never blocks
+delivery.
 
-Environment:
-    Uses existing builder LLM config (OPENAI_API_KEY, LLM_BASE_URL, etc.)
+Resolution order (mirrors ``services.builder_tools``):
+
+1. ``db.get_default_llm_model('builder')`` → registry-resolved base URL +
+   ``system_api_keys[provider]``.
+2. Env vars (``AUXILIARY_MODEL`` / ``TRIAGE_MODEL``, ``LLM_BASE_URL``,
+   ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / ``GROQ_API_KEY``) as a legacy
+   fallback for agents that have not been routed through the orchestrator's
+   DB-backed config.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+import warnings
 
 import httpx
 
@@ -40,12 +51,97 @@ QUEUE if the message:
 Respond with JSON: {"action": "interrupt" or "queue", "reason": "brief explanation"}
 """
 
+_PROVIDER_FOR_MODEL = {
+    "claude": "anthropic",
+    "anthropic": "anthropic",
+    "groq": "groq",
+    "gemini": "google",
+    "gpt": "openai",
+    "codex": "openai",
+}
+
+
+def _infer_provider(model: str) -> str:
+    lowered = model.lower()
+    for prefix, provider in _PROVIDER_FOR_MODEL.items():
+        if lowered.startswith(prefix) or f"/{prefix}" in lowered:
+            return provider
+    return "openai"
+
+
+async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
+    """Pull model, base_url, and api_key from the DB-backed config.
+
+    Returns None when the DB has no default configured or no usable key —
+    the caller falls back to env-var resolution.
+    """
+    if db is None:
+        return None
+
+    try:
+        model = await db.get_default_llm_model("builder")
+    except Exception as e:
+        logger.debug("triage DB default lookup failed: %s", e)
+        return None
+    if not model:
+        return None
+
+    base_url: str | None = None
+    try:
+        from src.core.model_registry import UnknownModelError, resolve_model
+
+        meta = await resolve_model(model)
+        if meta is not None and meta.base_url:
+            base_url = meta.base_url
+    except (UnknownModelError, ImportError, Exception) as e:  # noqa: BLE001
+        logger.debug("triage registry lookup failed for %s: %s", model, e)
+
+    if not base_url:
+        base_url = "https://api.openai.com/v1"
+
+    provider = _infer_provider(model)
+    api_key: str | None = None
+    try:
+        api_key = await db.get_system_api_key(provider)
+    except Exception as e:
+        logger.debug("triage system_api_keys lookup failed for %s: %s", provider, e)
+
+    if not api_key:
+        return None
+
+    return model, base_url, api_key
+
+
+def _resolve_from_env() -> tuple[str, str, str] | None:
+    """Legacy env-var fallback. Emits a deprecation warning on hit."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        for var in ("ANTHROPIC_API_KEY", "GROQ_API_KEY"):
+            api_key = os.getenv(var, "")
+            if api_key:
+                break
+    if not api_key:
+        return None
+
+    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    model = os.getenv("AUXILIARY_MODEL", os.getenv("TRIAGE_MODEL", "gpt-4o-mini"))
+
+    warnings.warn(
+        "message_triage falling back to env-var LLM config — configure a "
+        "default builder model via Admin → Providers so the DB-backed path "
+        "is used instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return model, base_url, api_key
+
 
 async def triage_message(
     message: str,
     job_status: str,
     job_description: str,
     phase_number: int | None = None,
+    db=None,
 ) -> dict:
     """Triage an inbound message to decide delivery strategy.
 
@@ -54,6 +150,8 @@ async def triage_message(
         job_status: Current job status (e.g., "processing")
         job_description: Job description for context
         phase_number: Current phase number (optional)
+        db: Optional ``PostgresDB`` for registry-backed config resolution.
+            When omitted, falls back to env vars.
 
     Returns:
         Dict with "action" ("interrupt" or "queue") and "reason".
@@ -61,20 +159,14 @@ async def triage_message(
     """
     fallback = {"action": "queue", "reason": "triage unavailable"}
 
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        # Try other providers
-        for var in ("ANTHROPIC_API_KEY", "GROQ_API_KEY"):
-            api_key = os.getenv(var, "")
-            if api_key:
-                break
-
-    if not api_key:
-        logger.debug("No API key for message triage — defaulting to queue")
+    resolved = await _resolve_triage_config(db)
+    if resolved is None:
+        resolved = _resolve_from_env()
+    if resolved is None:
+        logger.debug("No LLM config available for message triage — defaulting to queue")
         return fallback
 
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    model = os.getenv("AUXILIARY_MODEL", os.getenv("TRIAGE_MODEL", "gpt-4o-mini"))
+    model, base_url, api_key = resolved
 
     phase_str = f"Phase {phase_number}" if phase_number is not None else "unknown phase"
     context = (

@@ -26,7 +26,45 @@ try:
 except ImportError:
     asyncpg = None
 
+from orchestrator.security.crypto import (
+    DecryptionError,
+    decrypt,
+    encrypt,
+    is_encrypted,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _encrypt_optional(value: str | None) -> str | None:
+    """Encrypt a credential before storage. NULL stays NULL; empty is treated as NULL."""
+    if value is None or value == "":
+        return None
+    return encrypt(value)
+
+
+def _decrypt_stored(value: str | None, *, field: str) -> str | None:
+    """Decrypt a credential after fetch. NULL stays NULL.
+
+    If the value is not a v1 ciphertext (e.g. pre-encryption dev data), the
+    row is unusable — return None and log rather than crash the caller. Pre-
+    production upgrade path: operators re-add keys through the UI.
+    """
+    if value is None:
+        return None
+    if not is_encrypted(value):
+        logger.warning(
+            "Encountered non-encrypted value in %s; ignoring. "
+            "Re-add the credential via the UI.",
+            field,
+        )
+        return None
+    try:
+        return decrypt(value)
+    except DecryptionError as exc:
+        logger.error("Failed to decrypt %s: %s", field, exc)
+        return None
+
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
@@ -3283,7 +3321,7 @@ class PostgresDB:
                 """,
                 UUID(user_id),
                 provider,
-                api_key,
+                encrypt(api_key),
                 key_prefix,
                 label,
             )
@@ -3306,11 +3344,12 @@ class PostgresDB:
     async def get_user_api_key(self, user_id: str, provider: str) -> str | None:
         """Get the full API key for a user+provider (for dispatch only)."""
         async with self.acquire() as conn:
-            return await conn.fetchval(
+            stored = await conn.fetchval(
                 "SELECT api_key FROM user_api_keys WHERE user_id = $1 AND provider = $2",
                 UUID(user_id),
                 provider,
             )
+        return _decrypt_stored(stored, field=f"user_api_keys[{provider}]")
 
     async def delete_user_api_key(self, user_id: str, provider: str) -> bool:
         """Delete a user's API key for a provider."""
@@ -3349,7 +3388,7 @@ class PostgresDB:
                 """,
                 UUID(project_id),
                 provider,
-                api_key,
+                encrypt(api_key),
                 key_prefix,
                 label,
             )
@@ -3372,11 +3411,12 @@ class PostgresDB:
     async def get_project_api_key(self, project_id: str, provider: str) -> str | None:
         """Get the full API key for a project+provider (for dispatch only)."""
         async with self.acquire() as conn:
-            return await conn.fetchval(
+            stored = await conn.fetchval(
                 "SELECT api_key FROM project_api_keys WHERE project_id = $1 AND provider = $2",
                 UUID(project_id),
                 provider,
             )
+        return _decrypt_stored(stored, field=f"project_api_keys[{provider}]")
 
     async def delete_project_api_key(self, project_id: str, provider: str) -> bool:
         """Delete a project's API key for a provider."""
@@ -3397,14 +3437,26 @@ class PostgresDB:
         user_id: str | None,
         project_id: str | None,
     ) -> Dict[str, str]:
-        """Resolve all API keys for a job (user > project fallback).
+        """Resolve all API keys for a job.
 
-        Returns dict mapping provider -> api_key for all providers
-        where at least one key exists.
+        Precedence (lowest → highest): system → project → user. Higher-
+        precedence values overwrite lower ones in the returned dict.
+        Returns a dict mapping provider -> api_key for every provider
+        where at least one key is configured.
         """
         resolved: Dict[str, str] = {}
 
-        # Project keys first (lower priority — user keys will override)
+        # System-level keys (lowest precedence; replaces env-var fallback)
+        async with self.acquire() as conn:
+            rows = await conn.fetch("SELECT provider, api_key FROM system_api_keys")
+            for row in rows:
+                plain = _decrypt_stored(
+                    row["api_key"], field=f"system_api_keys[{row['provider']}]"
+                )
+                if plain is not None:
+                    resolved[row["provider"]] = plain
+
+        # Project keys override system
         if project_id:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
@@ -3412,9 +3464,13 @@ class PostgresDB:
                     UUID(project_id),
                 )
                 for row in rows:
-                    resolved[row["provider"]] = row["api_key"]
+                    plain = _decrypt_stored(
+                        row["api_key"], field=f"project_api_keys[{row['provider']}]"
+                    )
+                    if plain is not None:
+                        resolved[row["provider"]] = plain
 
-        # User keys override project keys
+        # User keys override project and system
         if user_id:
             async with self.acquire() as conn:
                 rows = await conn.fetch(
@@ -3422,7 +3478,11 @@ class PostgresDB:
                     UUID(user_id),
                 )
                 for row in rows:
-                    resolved[row["provider"]] = row["api_key"]
+                    plain = _decrypt_stored(
+                        row["api_key"], field=f"user_api_keys[{row['provider']}]"
+                    )
+                    if plain is not None:
+                        resolved[row["provider"]] = plain
 
         return resolved
 
@@ -3493,7 +3553,13 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
-            return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        result["api_key"] = _decrypt_stored(
+            result.get("api_key"), field=f"user_llm_endpoints[{result['id']}].api_key"
+        )
+        return result
 
     async def create_user_llm_endpoint(
         self,
@@ -3515,7 +3581,7 @@ class PostgresDB:
                 UUID(user_id),
                 label,
                 base_url,
-                api_key,
+                _encrypt_optional(api_key),
                 key_prefix,
             )
             return dict(row)
@@ -3551,7 +3617,7 @@ class PostgresDB:
             sets.append("key_prefix = NULL")
         elif api_key is not None:
             sets.append(f"api_key = ${param_idx}")
-            args.append(api_key)
+            args.append(encrypt(api_key))
             param_idx += 1
             if key_prefix is not None:
                 sets.append(f"key_prefix = ${param_idx}")
@@ -3730,7 +3796,448 @@ class PostgresDB:
                 UUID(user_id),
                 model_id,
             )
+        if row is None:
+            return None
+        result = dict(row)
+        result["api_key"] = _decrypt_stored(
+            result.get("api_key"),
+            field=f"user_llm_endpoints[{result['endpoint_id']}].api_key",
+        )
+        return result
+
+    # =========================================================================
+    # SYSTEM API KEY OPERATIONS
+    # Provider-level keys shared across users, seeded by helm or managed via
+    # Admin → Providers. Consulted by resolve_api_keys_for_job after user/
+    # project keys; replaces the legacy env-var fallback.
+    # =========================================================================
+
+    async def list_system_api_keys(self) -> List[Dict[str, Any]]:
+        """List system API keys (prefix only, no full key)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, provider, key_prefix, label, seeded_from,
+                       created_at, updated_at
+                FROM system_api_keys
+                ORDER BY provider
+                """
+            )
+            return [dict(r) for r in rows]
+
+    async def get_system_api_key(self, provider: str) -> str | None:
+        """Get the full (decrypted) API key for a provider, or None."""
+        async with self.acquire() as conn:
+            stored = await conn.fetchval(
+                "SELECT api_key FROM system_api_keys WHERE provider = $1",
+                provider,
+            )
+        return _decrypt_stored(stored, field=f"system_api_keys[{provider}]")
+
+    async def upsert_system_api_key(
+        self,
+        provider: str,
+        api_key: str,
+        key_prefix: str,
+        label: str | None = None,
+        seeded_from: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create or replace the system-level API key for a provider.
+
+        ``seeded_from`` is a breadcrumb set by the helm seed job; admin-UI
+        edits pass ``None`` so subsequent re-seeds skip overwriting.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO system_api_keys
+                    (provider, api_key, key_prefix, label, seeded_from)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (provider) DO UPDATE
+                SET api_key = EXCLUDED.api_key,
+                    key_prefix = EXCLUDED.key_prefix,
+                    label = EXCLUDED.label,
+                    seeded_from = EXCLUDED.seeded_from,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id, provider, key_prefix, label, seeded_from,
+                          created_at, updated_at
+                """,
+                provider,
+                encrypt(api_key),
+                key_prefix,
+                label,
+                seeded_from,
+            )
+            return dict(row)
+
+    async def delete_system_api_key(self, provider: str) -> bool:
+        """Remove the system-level key for a provider."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM system_api_keys WHERE provider = $1",
+                provider,
+            )
+            return result == "DELETE 1"
+
+    # =========================================================================
+    # SYSTEM LLM ENDPOINT OPERATIONS
+    # System-scoped endpoints (user_id IS NULL) are visible to every user.
+    # They are seeded by helm on fresh install and edited via Admin → Providers.
+    # Schema is shared with user_llm_endpoints; only the scoping differs.
+    # =========================================================================
+
+    async def list_system_llm_endpoints(self) -> List[Dict[str, Any]]:
+        """List system-scoped endpoints with their model rows.
+
+        API keys are never returned — only ``key_prefix`` for display.
+        """
+        async with self.acquire() as conn:
+            endpoint_rows = await conn.fetch(
+                """
+                SELECT id, label, base_url, key_prefix, created_at, updated_at
+                FROM user_llm_endpoints
+                WHERE user_id IS NULL
+                ORDER BY label
+                """
+            )
+            if not endpoint_rows:
+                return []
+
+            endpoint_ids = [r["id"] for r in endpoint_rows]
+            model_rows = await conn.fetch(
+                """
+                SELECT id, endpoint_id, model_id, display_name, family,
+                       context_window, reasoning_level, enabled, created_at
+                FROM user_llm_endpoint_models
+                WHERE endpoint_id = ANY($1::uuid[])
+                ORDER BY endpoint_id, display_name
+                """,
+                endpoint_ids,
+            )
+
+        models_by_endpoint: Dict[Any, List[Dict[str, Any]]] = {}
+        for m in model_rows:
+            models_by_endpoint.setdefault(m["endpoint_id"], []).append(dict(m))
+
+        result = []
+        for e in endpoint_rows:
+            e_dict = dict(e)
+            e_dict["models"] = models_by_endpoint.get(e["id"], [])
+            result.append(e_dict)
+        return result
+
+    async def resolve_system_llm_model(self, model_id: str) -> Dict[str, Any] | None:
+        """Look up a system-scoped (endpoint + model) by model_id for dispatch.
+
+        Returns a flat dict with the endpoint's base_url/api_key plus the
+        model row's metadata, or None if no match. Registered as the
+        system-scope lookup in src/core/model_registry.py.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    e.id AS endpoint_id,
+                    e.label AS endpoint_label,
+                    e.base_url,
+                    e.api_key,
+                    m.model_id,
+                    m.display_name,
+                    m.family,
+                    m.context_window,
+                    m.reasoning_level,
+                    m.enabled
+                FROM user_llm_endpoint_models m
+                JOIN user_llm_endpoints e ON e.id = m.endpoint_id
+                WHERE e.user_id IS NULL
+                  AND m.model_id = $1
+                  AND m.enabled = TRUE
+                LIMIT 1
+                """,
+                model_id,
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["api_key"] = _decrypt_stored(
+            result.get("api_key"),
+            field=f"user_llm_endpoints[{result['endpoint_id']}].api_key",
+        )
+        return result
+
+    async def get_system_llm_endpoint(self, endpoint_id: str) -> Dict[str, Any] | None:
+        """Fetch a single system endpoint row (with decrypted api_key).
+
+        Returns None when the endpoint does not exist or is user-scoped.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, label, base_url, api_key, key_prefix,
+                       created_at, updated_at
+                FROM user_llm_endpoints
+                WHERE id = $1 AND user_id IS NULL
+                """,
+                UUID(endpoint_id),
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["api_key"] = _decrypt_stored(
+            result.get("api_key"),
+            field=f"user_llm_endpoints[{result['id']}].api_key",
+        )
+        return result
+
+    async def create_system_llm_endpoint(
+        self,
+        label: str,
+        base_url: str,
+        api_key: str | None,
+        key_prefix: str | None,
+    ) -> Dict[str, Any]:
+        """Create a new system-scoped LLM endpoint. Label must be globally unique."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_llm_endpoints
+                    (user_id, label, base_url, api_key, key_prefix)
+                VALUES (NULL, $1, $2, $3, $4)
+                RETURNING id, label, base_url, key_prefix, created_at, updated_at
+                """,
+                label,
+                base_url,
+                _encrypt_optional(api_key),
+                key_prefix,
+            )
+            return dict(row)
+
+    async def update_system_llm_endpoint(
+        self,
+        endpoint_id: str,
+        label: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        key_prefix: str | None = None,
+        clear_api_key: bool = False,
+    ) -> Dict[str, Any] | None:
+        """Patch a system endpoint. Only non-None fields are updated.
+
+        Returns None if no row matches (endpoint missing or user-scoped).
+        """
+        sets: List[str] = []
+        args: List[Any] = [UUID(endpoint_id)]
+        param_idx = 2
+        if label is not None:
+            sets.append(f"label = ${param_idx}")
+            args.append(label)
+            param_idx += 1
+        if base_url is not None:
+            sets.append(f"base_url = ${param_idx}")
+            args.append(base_url)
+            param_idx += 1
+        if clear_api_key:
+            sets.append("api_key = NULL")
+            sets.append("key_prefix = NULL")
+        elif api_key is not None:
+            sets.append(f"api_key = ${param_idx}")
+            args.append(encrypt(api_key))
+            param_idx += 1
+            if key_prefix is not None:
+                sets.append(f"key_prefix = ${param_idx}")
+                args.append(key_prefix)
+                param_idx += 1
+
+        if not sets:
+            # No-op patch — just return current row for parity with user variant.
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, label, base_url, key_prefix, created_at, updated_at
+                    FROM user_llm_endpoints
+                    WHERE id = $1 AND user_id IS NULL
+                    """,
+                    UUID(endpoint_id),
+                )
+                return dict(row) if row else None
+
+        sets.append("updated_at = CURRENT_TIMESTAMP")
+        query = f"""
+            UPDATE user_llm_endpoints
+            SET {", ".join(sets)}
+            WHERE id = $1 AND user_id IS NULL
+            RETURNING id, label, base_url, key_prefix, created_at, updated_at
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
             return dict(row) if row else None
+
+    async def delete_system_llm_endpoint(self, endpoint_id: str) -> bool:
+        """Delete a system endpoint (cascades to model rows)."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM user_llm_endpoints
+                WHERE id = $1 AND user_id IS NULL
+                """,
+                UUID(endpoint_id),
+            )
+            return result == "DELETE 1"
+
+    async def create_system_llm_endpoint_model(
+        self,
+        endpoint_id: str,
+        model_id: str,
+        display_name: str,
+        family: str | None = None,
+        context_window: int | None = None,
+        reasoning_level: str | None = None,
+        enabled: bool = True,
+    ) -> Dict[str, Any] | None:
+        """Add a model row to a system endpoint.
+
+        Returns None if the endpoint does not exist or is user-scoped.
+        Raises asyncpg.UniqueViolationError on duplicate (endpoint_id, model_id).
+        """
+        owner = await self.get_system_llm_endpoint(endpoint_id)
+        if owner is None:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_llm_endpoint_models
+                    (endpoint_id, model_id, display_name, family,
+                     context_window, reasoning_level, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, endpoint_id, model_id, display_name, family,
+                          context_window, reasoning_level, enabled, created_at
+                """,
+                UUID(endpoint_id),
+                model_id,
+                display_name,
+                family,
+                context_window,
+                reasoning_level,
+                enabled,
+            )
+            return dict(row)
+
+    async def update_system_llm_endpoint_model(
+        self,
+        endpoint_id: str,
+        model_id: str,
+        display_name: str | None = None,
+        family: str | None = None,
+        context_window: int | None = None,
+        reasoning_level: str | None = None,
+        enabled: bool | None = None,
+    ) -> Dict[str, Any] | None:
+        """Patch a system endpoint model row. Only non-None fields are updated."""
+        owner = await self.get_system_llm_endpoint(endpoint_id)
+        if owner is None:
+            return None
+
+        sets: List[str] = []
+        args: List[Any] = [UUID(endpoint_id), model_id]
+        param_idx = 3
+        for name, value in (
+            ("display_name", display_name),
+            ("family", family),
+            ("context_window", context_window),
+            ("reasoning_level", reasoning_level),
+            ("enabled", enabled),
+        ):
+            if value is not None:
+                sets.append(f"{name} = ${param_idx}")
+                args.append(value)
+                param_idx += 1
+
+        if not sets:
+            async with self.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, endpoint_id, model_id, display_name, family,
+                           context_window, reasoning_level, enabled, created_at
+                    FROM user_llm_endpoint_models
+                    WHERE endpoint_id = $1 AND model_id = $2
+                    """,
+                    *args[:2],
+                )
+                return dict(row) if row else None
+
+        query = f"""
+            UPDATE user_llm_endpoint_models
+            SET {", ".join(sets)}
+            WHERE endpoint_id = $1 AND model_id = $2
+            RETURNING id, endpoint_id, model_id, display_name, family,
+                      context_window, reasoning_level, enabled, created_at
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, *args)
+            return dict(row) if row else None
+
+    async def delete_system_llm_endpoint_model(
+        self, endpoint_id: str, model_id: str
+    ) -> bool:
+        """Delete a model row from a system endpoint."""
+        owner = await self.get_system_llm_endpoint(endpoint_id)
+        if owner is None:
+            return False
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM user_llm_endpoint_models
+                WHERE endpoint_id = $1 AND model_id = $2
+                """,
+                UUID(endpoint_id),
+                model_id,
+            )
+            return result == "DELETE 1"
+
+    # =========================================================================
+    # DEFAULT LLM MODEL HELPERS
+    # Thin wrappers over the existing system_settings table (section 9d).
+    # Keys: llm.default_builder_model / llm.default_browser_model /
+    #       llm.default_citation_model
+    # Value shape: {"model": "<model_id>"}
+    # Replaces the BUILDER_MODEL / BROWSER_LLM_MODEL / CITATION_LLM_MODEL
+    # env vars as the source of truth for the default model per workload.
+    # =========================================================================
+
+    @staticmethod
+    def _default_llm_model_key(kind: str) -> str:
+        return f"llm.default_{kind}_model"
+
+    async def get_default_llm_model(self, kind: str) -> str | None:
+        """Return the configured default model ID for ``kind`` or None.
+
+        ``kind`` is one of 'builder', 'browser', 'citation'.
+        """
+        row = await self.get_system_setting(self._default_llm_model_key(kind))
+        if row is None:
+            return None
+        value = row.get("value")
+        if isinstance(value, dict):
+            model = value.get("model")
+            return model if isinstance(model, str) and model else None
+        if isinstance(value, str) and value:
+            return value
+        return None
+
+    async def set_default_llm_model(
+        self,
+        kind: str,
+        model: str | None,
+        *,
+        updated_by: str | None = None,
+    ) -> None:
+        """Set or clear the default model ID for ``kind``."""
+        key = self._default_llm_model_key(kind)
+        if model is None or model == "":
+            await self.delete_system_setting(key)
+            return
+        await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
 
     # =========================================================================
     # USER SETTINGS OPERATIONS
