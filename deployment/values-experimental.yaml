@@ -25,13 +25,13 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-f11b8ce
+    tag: sha-2dd8e7f
   agent:
-    tag: sha-ce22531
+    tag: sha-2dd8e7f
   cockpit:
-    tag: sha-0e6611a
+    tag: sha-2dd8e7f
   mcp:
-    tag: sha-5788dfd
+    tag: sha-2dd8e7f
   workspace:
     tag: sha-5788dfd
   vpn:
