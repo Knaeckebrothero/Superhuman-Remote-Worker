@@ -1,0 +1,233 @@
+"""Tests for the model registry (src/core/model_registry.py).
+
+Locks in provider/family/origin contracts for every built-in model ID and
+validates the registry's load-from-YAML path, so the PR 2 refactor that
+swaps out _detect_provider / detect_model_family has a regression anchor.
+"""
+
+from pathlib import Path
+
+import pytest
+import yaml
+
+from src.core.model_registry import (
+    ModelMeta,
+    UnknownModelError,
+    _factory_provider,
+    list_builtin_models,
+    reload_registry,
+    resolve_model,
+)
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_MODELS_YAML = _REPO_ROOT / "config" / "models.yaml"
+_SETTINGS_MATRIX_YAML = _REPO_ROOT / "config" / "settings_matrix.yaml"
+
+
+def _load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+class TestFactoryProviderMapping:
+    """_factory_provider maps YAML labels to LLM factory keys."""
+
+    def test_local_maps_to_openai(self):
+        assert _factory_provider("local") == "openai"
+
+    def test_none_maps_to_openai(self):
+        assert _factory_provider(None) == "openai"
+
+    def test_known_providers_pass_through(self):
+        for p in ("openai", "anthropic", "google", "groq", "openrouter", "codex"):
+            assert _factory_provider(p) == p
+
+    def test_unknown_label_falls_back_to_openai(self):
+        # Keeps the system forgiving of YAML typos — dispatch won't crash,
+        # it'll just route through the OpenAI factory.
+        assert _factory_provider("made-up-provider") == "openai"
+
+
+class TestResolveBuiltinModels:
+    """resolve_model() returns correct metadata for every built-in entry."""
+
+    @pytest.mark.asyncio
+    async def test_claude_opus(self):
+        meta = await resolve_model("claude-opus-4-6")
+        assert meta.provider == "anthropic"
+        assert meta.family == "claude-opus"
+        assert meta.origin == "builtin"
+        assert meta.display_name == "Claude Opus 4.6"
+
+    @pytest.mark.asyncio
+    async def test_claude_sonnet(self):
+        meta = await resolve_model("claude-sonnet-4-5-20250929")
+        assert meta.provider == "anthropic"
+        assert meta.family == "claude-sonnet"
+
+    @pytest.mark.asyncio
+    async def test_gemini_pro(self):
+        meta = await resolve_model("gemini-2.5-pro")
+        assert meta.provider == "google"
+        assert meta.family == "gemini"
+
+    @pytest.mark.asyncio
+    async def test_gpt_4o(self):
+        meta = await resolve_model("gpt-4o")
+        assert meta.provider == "openai"
+        assert meta.family == "default"
+
+    @pytest.mark.asyncio
+    async def test_groq_kimi(self):
+        meta = await resolve_model("groq/moonshotai/kimi-k2-instruct-0905")
+        assert meta.provider == "groq"
+        assert meta.family == "default"
+
+    @pytest.mark.asyncio
+    async def test_groq_gpt_oss(self):
+        meta = await resolve_model("groq/gpt-oss-120b")
+        assert meta.provider == "groq"
+        assert meta.family == "gpt-oss"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_minimax(self):
+        meta = await resolve_model("openrouter/minimax/minimax-m2.7")
+        assert meta.provider == "openrouter"
+        assert meta.family == "minimax"
+
+    @pytest.mark.asyncio
+    async def test_codex(self):
+        meta = await resolve_model("codex/gpt-5.3-codex")
+        assert meta.provider == "codex"
+        assert meta.family == "gpt-5"
+
+    @pytest.mark.asyncio
+    async def test_local_model_routes_through_openai_factory(self):
+        # Currently named with openai/ prefix; PR 2 drops the prefix.
+        # Either way, the Local group's factory target is openai.
+        meta = await resolve_model("openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic")
+        assert meta.provider == "openai"
+        assert meta.family == "gemma"
+        assert meta.origin == "builtin"
+
+
+class TestHelperOnlyModels:
+    """Models that live only in builder/auxiliary/vision lists, not groups[]."""
+
+    @pytest.mark.asyncio
+    async def test_gpt_4_1_mini_from_vision_list(self):
+        # gpt-4.1-mini is only in vision_models, not in groups[].
+        meta = await resolve_model("gpt-4.1-mini")
+        assert meta.provider == "openai"
+        assert meta.origin == "builtin"
+
+
+class TestUnknownModels:
+    @pytest.mark.asyncio
+    async def test_unknown_id_raises(self):
+        with pytest.raises(UnknownModelError) as exc_info:
+            await resolve_model("totally-made-up-model-xyz")
+        assert exc_info.value.model_id == "totally-made-up-model-xyz"
+        assert "totally-made-up-model-xyz" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_empty_id_raises(self):
+        with pytest.raises(UnknownModelError):
+            await resolve_model("")
+
+    @pytest.mark.asyncio
+    async def test_user_id_accepted_but_ignored_in_pr1(self):
+        # PR 2 will use user_id for custom-endpoint lookup. PR 1 accepts
+        # the parameter but doesn't dispatch on it; built-in lookup still
+        # wins.
+        meta = await resolve_model(
+            "claude-opus-4-6",
+            user_id="11111111-2222-3333-4444-555555555555",
+        )
+        assert meta.provider == "anthropic"
+
+
+class TestCatalogCoverage:
+    """Contract tests against config/models.yaml — catches drift."""
+
+    def test_every_groups_entry_is_registered(self):
+        data = _load_yaml(_MODELS_YAML)
+        all_ids = list_builtin_models()
+        registered_ids = {m.model_id for m in all_ids}
+        for group in data.get("groups", []):
+            for entry in group.get("models", []):
+                assert entry["id"] in registered_ids, (
+                    f"Model {entry['id']!r} from group {group.get('name')!r} "
+                    f"was not registered"
+                )
+
+    def test_every_family_has_settings_matrix_entry_or_default(self):
+        """Every family used in models.yaml should resolve cleanly through
+        settings_matrix.yaml — either via a dedicated entry or the 'default'
+        fallback. Custom models default to family='default', so the default
+        entry must exist.
+        """
+        matrix = _load_yaml(_SETTINGS_MATRIX_YAML)
+        assert "default" in matrix, (
+            "settings_matrix.yaml must contain a 'default' entry — custom "
+            "models without a family rely on it."
+        )
+
+        families = {m.family for m in list_builtin_models()}
+        for family in families:
+            # Either the family has its own matrix entry, or 'default'
+            # covers it. Both are acceptable.
+            assert family == "default" or family in matrix or "default" in matrix
+
+    def test_no_duplicate_model_ids(self):
+        ids = [m.model_id for m in list_builtin_models()]
+        assert len(ids) == len(set(ids)), (
+            f"Duplicate model IDs in built-in registry: "
+            f"{[i for i in ids if ids.count(i) > 1]}"
+        )
+
+
+class TestReloadRegistry:
+    def test_reload_is_idempotent(self):
+        before = {m.model_id for m in list_builtin_models()}
+        reload_registry()
+        after = {m.model_id for m in list_builtin_models()}
+        assert before == after
+
+
+class TestModelMetaShape:
+    """ModelMeta is frozen and carries the expected fields."""
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_frozen(self):
+        meta = await resolve_model("gpt-4o")
+        with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
+            meta.provider = "anthropic"  # type: ignore[misc]
+
+    @pytest.mark.asyncio
+    async def test_default_origin_is_builtin(self):
+        meta = await resolve_model("gpt-4o")
+        assert meta.origin == "builtin"
+        assert meta.endpoint_id is None
+
+    @pytest.mark.asyncio
+    async def test_api_key_ref_matches_provider_for_builtins(self):
+        # For built-ins, api_key_ref == provider (used to look up the
+        # right entry in user_api_keys at dispatch time).
+        meta = await resolve_model("claude-opus-4-6")
+        assert meta.api_key_ref == "anthropic"
+
+    def test_dataclass_shape(self):
+        # Construct a ModelMeta to validate the full field set.
+        meta = ModelMeta(
+            model_id="test/model",
+            provider="openai",
+            family="default",
+            display_name="Test",
+        )
+        assert meta.base_url is None
+        assert meta.context_window is None
+        assert meta.reasoning_level is None
+        assert meta.origin == "builtin"
+        assert meta.endpoint_id is None
