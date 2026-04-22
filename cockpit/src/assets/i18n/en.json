@@ -225,6 +225,76 @@
       "uploading": "Uploading..."
     }
   },
+  "admin": {
+    "providers": {
+      "title": "Providers",
+      "desc": "System-scoped LLM providers, custom endpoints, and default models. Changes apply to every user.",
+      "keys": {
+        "title": "Provider API Keys",
+        "desc": "System-wide API keys used when a user hasn't supplied their own. Stored encrypted at rest.",
+        "empty": "No system keys configured. Add one below, or seed via helm.llm.seed.systemApiKeys.",
+        "colProvider": "Provider",
+        "colKey": "Key",
+        "colLabel": "Label",
+        "colSource": "Source",
+        "colUpdated": "Updated",
+        "seededBadge": "Seeded",
+        "manualBadge": "Manual",
+        "addTitle": "Add / Update Key",
+        "labelPlaceholder": "Label (optional)",
+        "keyPlaceholder": "API key (e.g. sk-...)",
+        "saveButton": "Save Key",
+        "confirmDelete": "Remove this system-wide key? Users without their own key for this provider will lose access."
+      },
+      "endpoints": {
+        "title": "System Endpoints",
+        "desc": "Shared OpenAI-compatible endpoints (vLLM, Ollama, private gateways) visible to every user.",
+        "empty": "No system endpoints. Add one below, or seed via helm.llm.seed.systemEndpoints.",
+        "noKey": "no key",
+        "noModels": "No models attached yet. Add one below.",
+        "addTitle": "Add Endpoint",
+        "createButton": "Create Endpoint",
+        "labelPlaceholder": "Label (e.g. Local Gemma)",
+        "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
+        "apiKeyPlaceholder": "API key (optional)",
+        "allowInsecure": "Allow http:// (not recommended outside local dev)",
+        "confirmDelete": "Delete this system endpoint and all its models?",
+        "confirmDeleteModel": "Remove this model from the endpoint?",
+        "testButton": "Test",
+        "testing": "Testing...",
+        "testOk": "OK ({{status}})",
+        "testFail": "Failed ({{status}}): {{error}}",
+        "colModelId": "Model ID",
+        "colDisplayName": "Display name",
+        "colFamily": "Family",
+        "colContext": "Context",
+        "modelIdPlaceholder": "Model ID (e.g. my-org/my-model)",
+        "displayNamePlaceholder": "Display name",
+        "familyPlaceholder": "Family (optional)",
+        "contextPlaceholder": "Context window (tokens)",
+        "addModelButton": "Add Model",
+        "errorUrlScheme": "Base URL must start with http:// or https://",
+        "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox."
+      },
+      "defaults": {
+        "title": "Default Models",
+        "desc": "Which model to use when a job or tool doesn't specify one. Each kind applies to a different workload.",
+        "unset": "— not set —",
+        "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
+        "kind": {
+          "builder": "Builder (job authoring / UI helper)",
+          "browser": "Browser (research subagent)",
+          "citation": "Citation engine"
+        }
+      }
+    }
+  },
+  "emptyCatalog": {
+    "bannerUser": "No LLMs configured yet — add an API key in Settings → API Keys, or register a custom LLM, to use the app.",
+    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Providers to use the app.",
+    "pickerCta": "Configure a provider to enable this picker.",
+    "dismiss": "Dismiss"
+  },
   "settings": {
     "title": "Settings",
     "language": {

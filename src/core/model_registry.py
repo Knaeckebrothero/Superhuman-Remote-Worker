@@ -1,12 +1,15 @@
 """Model registry — single source of truth for model routing metadata.
 
 Resolves a model ID to a ModelMeta (provider, family, base_url, api_key_ref,
-etc.) via two sources:
+etc.) via three sources:
 
 1. The per-user ``user_llm_endpoint_models`` table, queried through a
    callable installed by ``register_custom_lookup`` at orchestrator startup
    (``origin='custom'``).
-2. The built-in catalog loaded at import time from ``config/models.yaml``
+2. System-scoped rows in the same table (``user_id IS NULL``), queried
+   through a callable installed by ``register_system_lookup``
+   (``origin='system'``).
+3. The built-in catalog loaded at import time from ``config/models.yaml``
    (``origin='builtin'``).
 
 Unknown IDs raise ``UnknownModelError``. Dispatch code consumes the
@@ -173,24 +176,37 @@ def _load_builtin_catalog() -> dict[str, ModelMeta]:
 _builtin_registry: dict[str, ModelMeta] = _load_builtin_catalog()
 
 
-# Dependency injection: the orchestrator registers a DB-backed lookup at
+# Dependency injection: the orchestrator registers DB-backed lookups at
 # startup so src/core/ stays import-free of orchestrator/database/. In
-# contexts without a DB (agent process, tests), the hook stays None and
+# contexts without a DB (agent process, tests), the hooks stay None and
 # resolve_model() skips straight to the built-in catalog.
 CustomLookup = Callable[[str, str], Awaitable[Optional[dict[str, Any]]]]
+SystemLookup = Callable[[str], Awaitable[Optional[dict[str, Any]]]]
 _custom_lookup: Optional[CustomLookup] = None
+_system_lookup: Optional[SystemLookup] = None
 
 
 def register_custom_lookup(fn: Optional[CustomLookup]) -> None:
-    """Install (or clear) the custom-endpoint lookup callable.
+    """Install (or clear) the per-user custom-endpoint lookup callable.
 
     The callable takes (user_id, model_id) and returns either None or a
-    row dict with keys: endpoint_id, base_url, model_id, display_name,
-    family, context_window, reasoning_level. Typically wired to
-    ``postgres_db.resolve_user_llm_model`` at orchestrator startup.
+    row dict with keys: endpoint_id, base_url, api_key, model_id,
+    display_name, family, context_window, reasoning_level. Typically wired
+    to ``postgres_db.resolve_user_llm_model`` at orchestrator startup.
     """
     global _custom_lookup
     _custom_lookup = fn
+
+
+def register_system_lookup(fn: Optional[SystemLookup]) -> None:
+    """Install (or clear) the system-scope endpoint lookup callable.
+
+    The callable takes (model_id,) and returns either None or a row dict
+    with the same shape as the custom lookup (minus user_id). Wired to
+    ``postgres_db.resolve_system_llm_model`` at orchestrator startup.
+    """
+    global _system_lookup
+    _system_lookup = fn
 
 
 def reload_registry() -> None:
@@ -279,13 +295,14 @@ def family_of(model_id: str, default: str = "default") -> str:
     return default
 
 
-def _custom_row_to_meta(row: dict[str, Any]) -> ModelMeta:
-    """Build a ModelMeta from a custom-endpoint lookup row.
+def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
+    """Build a ModelMeta from a user/system endpoint lookup row.
 
-    Custom endpoints always route through the openai factory (the wire
-    protocol is OpenAI-compatible). api_key_ref is None because the key
-    travels inline on the endpoint row — the dispatcher fetches it via
-    get_user_llm_endpoint(endpoint_id), not through resolve_api_keys_for_job.
+    Endpoint-backed models always route through the openai factory (the
+    wire protocol is OpenAI-compatible). api_key_ref is None because the
+    key travels inline on the endpoint row — the dispatcher fetches it
+    via get_user_llm_endpoint(endpoint_id), not through
+    resolve_api_keys_for_job.
     """
     return ModelMeta(
         model_id=row["model_id"],
@@ -296,9 +313,15 @@ def _custom_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         api_key_ref=None,
         context_window=row.get("context_window"),
         reasoning_level=row.get("reasoning_level"),
-        origin="custom",
+        origin=origin,
         endpoint_id=str(row["endpoint_id"]),
     )
+
+
+# Kept for backwards-compat with any external imports. Prefer
+# ``_endpoint_row_to_meta`` in new code.
+def _custom_row_to_meta(row: dict[str, Any]) -> ModelMeta:
+    return _endpoint_row_to_meta(row, origin="custom")
 
 
 async def resolve_model(
@@ -308,10 +331,13 @@ async def resolve_model(
     """Resolve a model ID to its routing metadata.
 
     Resolution order:
-        1. Per-user custom endpoints (when user_id is set and a lookup
-           hook has been registered via register_custom_lookup).
-        2. Built-in catalog from config/models.yaml.
-        3. Miss → UnknownModelError.
+        1. Per-user custom endpoints (when user_id is set and the custom
+           lookup hook has been registered).
+        2. System-scoped endpoints (when the system lookup hook has been
+           registered). Shared across all users; seeded by helm or
+           managed via Admin → Providers.
+        3. Built-in catalog from config/models.yaml.
+        4. Miss → UnknownModelError.
 
     Args:
         model_id: Model identifier (e.g., "claude-opus-4-6",
@@ -328,7 +354,12 @@ async def resolve_model(
     if user_id and _custom_lookup is not None:
         row = await _custom_lookup(user_id, model_id)
         if row is not None:
-            return _custom_row_to_meta(row)
+            return _endpoint_row_to_meta(row, origin="custom")
+
+    if _system_lookup is not None:
+        row = await _system_lookup(model_id)
+        if row is not None:
+            return _endpoint_row_to_meta(row, origin="system")
 
     meta = _builtin_registry.get(model_id)
     if meta is not None:

@@ -1,5 +1,4 @@
 import {effect, inject, Injectable, signal} from '@angular/core';
-import {environment} from '../environment';
 import {JobContextService} from './job-context.service';
 import {ModelService} from './model.service';
 import {SettingsService} from './settings.service';
@@ -193,7 +192,11 @@ export class JobArtifactService {
   }
 
   private loadBuilderModel(): string {
-    return this.loadBuilderModelFromStorage() ?? environment.builderModels[0]?.id ?? 'RedHatAI/gemma-4-31B-it-FP8-Dynamic';
+    // No env fallback — catalog comes from GET /api/models, which is the
+    // only source of truth. Server prefs hydrate the signal via the effect
+    // in the constructor; until then an empty string means "unselected" and
+    // the shell shows its "Select model" affordance.
+    return this.loadBuilderModelFromStorage() ?? '';
   }
 
   private loadBuilderModelFromStorage(): string | null {

@@ -106,18 +106,22 @@ describe('ModelService', () => {
   });
 
   describe('error fallback', () => {
-    it('should fall back to environment.models on API error', () => {
+    it('should surface an empty catalog on API error', () => {
       const http = {
         get: vi.fn().mockReturnValue(throwError(() => new Error('Network error'))),
       };
       const {service} = createService(http);
       service.load();
 
-      // Should still be loaded (with fallback data)
       expect(service.loaded()).toBe(true);
       expect(service.loading()).toBe(false);
-      // Fallback data comes from environment.ts — in test env it's empty arrays
-      // The important thing is it doesn't throw and sets loaded=true
+      // No hard-coded fallback — DB is the only source of truth. Empty
+      // signals drive the empty-state banner + disabled pickers.
+      expect(service.models()).toEqual([]);
+      expect(service.presets()).toEqual([]);
+      expect(service.builderModels()).toEqual([]);
+      expect(service.auxiliaryModels()).toEqual([]);
+      expect(service.providers()).toEqual([]);
     });
 
     it('should allow retry after error with force=true', () => {

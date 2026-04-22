@@ -1,0 +1,101 @@
+{{- if .Values.llm.seed.enabled }}
+{{- /*
+Short-lived Job that seeds system_api_keys and user_llm_endpoints from the
+helm-rendered payload. Insert-only: `helm upgrade` re-runs this against an
+already-seeded stack and exits 0 after logging "skipped" for every entry.
+
+API keys are injected via env vars (never written into the ConfigMap) — each
+`llm.seed.systemApiKeys[provider]` entry becomes a `SEED_<PROVIDER>_API_KEY`
+env var sourced from the referenced Secret, and each endpoint's apiKeyRef
+becomes `SEED_ENDPOINT_<index>_API_KEY`.
+*/ -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "srw.fullname" . }}-llm-seed
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "llm-seed") | nindent 4 }}
+  annotations:
+    # Run after the orchestrator's own init has applied the schema. The
+    # orchestrator ensures schemas at startup, so the Deployment must be
+    # Ready before we seed. hook-weight 10 places us after all weight<10
+    # hooks (e.g. ConfigMap at weight 0).
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "llm-seed") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
+        {{- end }}
+        - name: wait-for-orchestrator
+          # The orchestrator runs ensure_schema() on startup — delay the seed
+          # until its health endpoint is responsive so the tables exist.
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - >-
+              until wget -q -O- http://{{ include "srw.fullname" . }}-orchestrator:8085/health >/dev/null;
+              do echo "waiting for orchestrator..."; sleep 3; done
+      containers:
+        - name: seed
+          image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
+          imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
+          command: ["python", "-m", "orchestrator.seed.llm_config"]
+          args: ["--payload", "/seed/llm.yaml"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: DATABASE_URL
+            - name: APP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: APP_ENCRYPTION_KEY
+            {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
+            - name: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "systemApiKeys entry missing secretName" $ref.secretName | quote }}
+                  key: {{ required "systemApiKeys entry missing key" $ref.key | quote }}
+            {{- end }}
+            {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
+            {{- if $ep.apiKeyRef }}
+            - name: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "apiKeyRef.secretName is required" $ep.apiKeyRef.secretName | quote }}
+                  key: {{ required "apiKeyRef.key is required" $ep.apiKeyRef.key | quote }}
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: seed-payload
+              mountPath: /seed
+              readOnly: true
+          resources:
+            {{- toYaml .Values.llm.seed.resources | nindent 12 }}
+      volumes:
+        - name: seed-payload
+          configMap:
+            name: {{ include "srw.fullname" . }}-llm-seed
+            items:
+              - key: llm.yaml
+                path: llm.yaml
+{{- end }}
