@@ -146,7 +146,12 @@ gemma:
   temperature: 0.3
   top_p: 0.95
   top_k: 64
-  # repetition_penalty: leave unset (Google does not recommend a value)
+  # Partial mitigation for vllm#40080 — Gemma 4 + xgrammar JSON schema
+  # enters infinite repetition loops. Values >1.0 discourage token repeats.
+  # Kept mild (1.05) to avoid distorting legitimate repeated structure
+  # (e.g. code, tables, list items). Upstream fix not yet shipped.
+  repetition_penalty: 1.05
+  frequency_penalty: 0.1  # Additional defense-in-depth against loop output
   multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
   parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
   model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
