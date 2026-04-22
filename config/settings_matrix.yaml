@@ -137,3 +137,22 @@ gpt-oss:
     summarization_safe_limit: 100000
     summarization_chunk_size: 75000
     message_count_min_tokens: 60000
+
+gemma:
+  # Google official for Gemma 4 instruct is temp=1.0, top_p=0.95, top_k=64.
+  # We run temp=0.3 because the workload is heavy tool-calling / structured
+  # output and community evidence shows high entropy increases malformed
+  # tool-call rate on vLLM's gemma4 parser.
+  temperature: 0.3
+  top_p: 0.95
+  top_k: 64
+  # repetition_penalty: leave unset (Google does not recommend a value)
+  multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
+  parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
+  model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
+  limits:
+    model_max_context_tokens: 110000
+    context_threshold_tokens: 85000
+    summarization_safe_limit: 100000
+    summarization_chunk_size: 75000
+    message_count_min_tokens: 60000
