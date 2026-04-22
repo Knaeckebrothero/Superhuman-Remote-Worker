@@ -6,6 +6,7 @@ import {of, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {ErrorMessageService} from '../../../core/services/error-message.service';
@@ -52,6 +53,20 @@ function createComponent() {
         updatePreferences: vi.fn().mockReturnValue(of({status: 'ok'})),
     };
 
+    const mockModelService: any = {
+        models: signal([]),
+        presets: signal([]),
+        builderModels: signal([]),
+        auxiliaryModels: signal([]),
+        visionModels: signal([]),
+        whisperModels: signal([]),
+        embeddingModels: signal([]),
+        providers: signal([]),
+        loaded: signal(false),
+        loading: signal(false),
+        load: vi.fn(),
+    };
+
     const injector = Injector.create({
         providers: [
             {provide: HttpClient, useValue: mockHttp},
@@ -61,6 +76,7 @@ function createComponent() {
             {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
             {provide: UserService, useValue: mockUserService},
             {provide: SettingsService, useValue: mockSettings},
+            {provide: ModelService, useValue: mockModelService},
             {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
         ],
     });

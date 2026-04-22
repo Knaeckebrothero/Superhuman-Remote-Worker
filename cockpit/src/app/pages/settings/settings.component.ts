@@ -16,6 +16,7 @@ import {
     ApiKeyProvider,
     CodexStatus,
     CommunicationSettings,
+    LlmEndpointTestResult,
     McpTokenCreateResponse,
     Project
 } from '../../core/models/api.model';
@@ -129,6 +130,180 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               [disabled]="settingKey() || !keyValue.trim()"
             >
               {{ settingKey() ? ('common.saving' | transloco) : ('settings.apiKeys.saveButton' | transloco) }}
+            </button>
+          </div>
+        </section>
+
+        <!-- LLM Endpoints Section -->
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="section-title">{{ 'settings.llmEndpoints.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.llmEndpoints.desc' | transloco }}</p>
+
+          @if (settingsService.llmEndpoints().length > 0) {
+            @for (endpoint of settingsService.llmEndpoints(); track endpoint.id) {
+              <div class="endpoint-card">
+                <div class="endpoint-head">
+                  <div class="endpoint-title">
+                    <strong>{{ endpoint.label }}</strong>
+                    <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
+                    @if (endpoint.key_prefix) {
+                      <span class="endpoint-key mono">key {{ endpoint.key_prefix }}...</span>
+                    } @else {
+                      <span class="endpoint-key muted">{{ 'settings.llmEndpoints.noKey' | transloco }}</span>
+                    }
+                  </div>
+                  <div class="endpoint-actions">
+                    <button
+                      class="test-btn"
+                      (click)="testLlmEndpoint(endpoint.id)"
+                      [disabled]="testingEndpointId() === endpoint.id"
+                    >
+                      {{ testingEndpointId() === endpoint.id
+                          ? ('settings.llmEndpoints.testing' | transloco)
+                          : ('settings.llmEndpoints.testButton' | transloco) }}
+                    </button>
+                    <button class="revoke-btn" (click)="deleteLlmEndpoint(endpoint.id)">
+                      {{ 'common.delete' | transloco }}
+                    </button>
+                  </div>
+                </div>
+
+                @if (testResults()[endpoint.id]) {
+                  <div
+                    class="test-result"
+                    [class.ok]="testResults()[endpoint.id]!.ok"
+                    [class.err]="!testResults()[endpoint.id]!.ok"
+                  >
+                    @if (testResults()[endpoint.id]!.ok) {
+                      {{ 'settings.llmEndpoints.testOk' | transloco: {status: testResults()[endpoint.id]!.status} }}
+                    } @else {
+                      {{ 'settings.llmEndpoints.testFail' | transloco:
+                        {status: testResults()[endpoint.id]!.status ?? '-',
+                         error: testResults()[endpoint.id]!.error ?? ''} }}
+                    }
+                  </div>
+                }
+
+                <!-- Models subtable -->
+                <div class="models-subtable">
+                  @if (endpoint.models.length > 0) {
+                    <div class="model-row model-header">
+                      <span class="col-model-id">{{ 'settings.llmEndpoints.colModelId' | transloco }}</span>
+                      <span class="col-model-name">{{ 'settings.llmEndpoints.colDisplayName' | transloco }}</span>
+                      <span class="col-model-family">{{ 'settings.llmEndpoints.colFamily' | transloco }}</span>
+                      <span class="col-model-ctx">{{ 'settings.llmEndpoints.colContext' | transloco }}</span>
+                      <span class="col-model-action"></span>
+                    </div>
+                    @for (model of endpoint.models; track model.id) {
+                      <div class="model-row">
+                        <span class="col-model-id mono">{{ model.model_id }}</span>
+                        <span class="col-model-name">{{ model.display_name }}</span>
+                        <span class="col-model-family">{{ model.family || '-' }}</span>
+                        <span class="col-model-ctx">{{ model.context_window || '-' }}</span>
+                        <span class="col-model-action">
+                          <button
+                            class="revoke-btn"
+                            (click)="deleteLlmEndpointModel(endpoint.id, model.model_id)"
+                          >{{ 'common.delete' | transloco }}</button>
+                        </span>
+                      </div>
+                    }
+                  } @else {
+                    <p class="empty-state-inline">{{ 'settings.llmEndpoints.noModels' | transloco }}</p>
+                  }
+
+                  <!-- Add-model form -->
+                  <div class="add-model-form">
+                    <div class="form-row three-col">
+                      <input
+                        type="text"
+                        class="form-input"
+                        [placeholder]="'settings.llmEndpoints.modelIdPlaceholder' | transloco"
+                        [(ngModel)]="newModelIds[endpoint.id]"
+                      />
+                      <input
+                        type="text"
+                        class="form-input"
+                        [placeholder]="'settings.llmEndpoints.displayNamePlaceholder' | transloco"
+                        [(ngModel)]="newModelDisplayNames[endpoint.id]"
+                      />
+                      <input
+                        type="text"
+                        class="form-input"
+                        [placeholder]="'settings.llmEndpoints.familyPlaceholder' | transloco"
+                        [(ngModel)]="newModelFamilies[endpoint.id]"
+                      />
+                    </div>
+                    <div class="form-row two-col">
+                      <input
+                        type="number"
+                        class="form-input"
+                        [placeholder]="'settings.llmEndpoints.contextPlaceholder' | transloco"
+                        [(ngModel)]="newModelContexts[endpoint.id]"
+                      />
+                      <button
+                        class="create-btn"
+                        (click)="addEndpointModel(endpoint.id)"
+                        [disabled]="!newModelIds[endpoint.id]?.trim() || !newModelDisplayNames[endpoint.id]?.trim()"
+                      >
+                        {{ 'settings.llmEndpoints.addModelButton' | transloco }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            }
+          } @else {
+            <p class="empty-state">{{ 'settings.llmEndpoints.empty' | transloco }}</p>
+          }
+
+          <!-- Create endpoint form -->
+          <div class="create-form">
+            <h3 class="form-title">{{ 'settings.llmEndpoints.addTitle' | transloco }}</h3>
+            <div class="form-row two-col">
+              <input
+                type="text"
+                class="form-input"
+                [placeholder]="'settings.llmEndpoints.labelPlaceholder' | transloco"
+                [(ngModel)]="newEndpointLabel"
+                [disabled]="creatingEndpoint()"
+              />
+              <input
+                type="text"
+                class="form-input"
+                [placeholder]="'settings.llmEndpoints.baseUrlPlaceholder' | transloco"
+                [(ngModel)]="newEndpointBaseUrl"
+                [disabled]="creatingEndpoint()"
+              />
+            </div>
+            <div class="form-row">
+              <input
+                type="password"
+                class="form-input"
+                [placeholder]="'settings.llmEndpoints.apiKeyPlaceholder' | transloco"
+                [(ngModel)]="newEndpointApiKey"
+                [disabled]="creatingEndpoint()"
+              />
+            </div>
+            <label class="inline-checkbox">
+              <input
+                type="checkbox"
+                [(ngModel)]="newEndpointAllowInsecure"
+                [disabled]="creatingEndpoint()"
+              />
+              <span>{{ 'settings.llmEndpoints.allowInsecure' | transloco }}</span>
+            </label>
+            @if (endpointFormError()) {
+              <p class="form-error">{{ endpointFormError() }}</p>
+            }
+            <button
+              class="create-btn"
+              (click)="createLlmEndpoint()"
+              [disabled]="creatingEndpoint() || !newEndpointLabel.trim() || !newEndpointBaseUrl.trim()"
+            >
+              {{ creatingEndpoint()
+                  ? ('common.saving' | transloco)
+                  : ('settings.llmEndpoints.createButton' | transloco) }}
             </button>
           </div>
         </section>
@@ -1064,6 +1239,147 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       gap: 10px;
     }
 
+    .three-col {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 10px;
+    }
+
+    /* LLM Endpoints */
+    .endpoint-card {
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+      background: var(--surface-0, #1e1e2e);
+    }
+
+    .endpoint-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+
+    .endpoint-title {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .endpoint-url {
+      font-size: 12px;
+      color: var(--text-muted, #6c7086);
+      word-break: break-all;
+    }
+
+    .endpoint-key {
+      font-size: 11px;
+      color: var(--text-muted, #6c7086);
+    }
+
+    .endpoint-key.muted {
+      font-style: italic;
+    }
+
+    .endpoint-actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .test-btn {
+      padding: 6px 12px;
+      background: transparent;
+      border: 1px solid var(--accent-color, #cba6f7);
+      color: var(--accent-color, #cba6f7);
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: opacity 0.15s ease;
+    }
+
+    .test-btn:hover:not(:disabled) { opacity: 0.8; }
+    .test-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .test-result {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      margin-bottom: 10px;
+    }
+
+    .test-result.ok {
+      background: color-mix(in srgb, #a6e3a1 20%, transparent);
+      color: #a6e3a1;
+    }
+
+    .test-result.err {
+      background: color-mix(in srgb, #f38ba8 20%, transparent);
+      color: #f38ba8;
+      word-break: break-word;
+    }
+
+    .models-subtable {
+      border-top: 1px solid var(--border-color, #313244);
+      padding-top: 10px;
+    }
+
+    .model-row {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr 0.8fr 0.8fr 80px;
+      gap: 8px;
+      align-items: center;
+      padding: 6px 0;
+      font-size: 13px;
+    }
+
+    .model-header {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted, #6c7086);
+      border-bottom: 1px solid var(--border-color, #313244);
+      padding-bottom: 6px;
+      margin-bottom: 4px;
+    }
+
+    .col-model-id {
+      word-break: break-all;
+    }
+
+    .empty-state-inline {
+      font-size: 12px;
+      color: var(--text-muted, #6c7086);
+      padding: 4px 0;
+      margin: 0 0 8px;
+    }
+
+    .add-model-form {
+      margin-top: 8px;
+      padding-top: 10px;
+      border-top: 1px dashed var(--border-color, #313244);
+    }
+
+    .inline-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted, #6c7086);
+      margin-bottom: 10px;
+      cursor: pointer;
+    }
+
+    .form-error {
+      color: #f38ba8;
+      font-size: 12px;
+      margin: 0 0 10px;
+    }
+
     .subsection-title {
       font-size: 12px;
       font-weight: 600;
@@ -1407,6 +1723,23 @@ export class SettingsComponent implements OnInit {
   keyLabel = '';
   readonly settingKey = signal(false);
 
+  // LLM endpoint form state
+  newEndpointLabel = '';
+  newEndpointBaseUrl = '';
+  newEndpointApiKey = '';
+  newEndpointAllowInsecure = false;
+  readonly creatingEndpoint = signal(false);
+  readonly endpointFormError = signal<string>('');
+  readonly testingEndpointId = signal<string | null>(null);
+  readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
+
+  // Per-endpoint "add model" input fields, keyed by endpoint_id.
+  // Plain records — ngModel binds directly to these.
+  newModelIds: Record<string, string> = {};
+  newModelDisplayNames: Record<string, string> = {};
+  newModelFamilies: Record<string, string> = {};
+  newModelContexts: Record<string, number | null> = {};
+
   // Preferences form state — null = user hasn't overridden, use resolved default
   readonly prefModel = signal<string | null>(null);
   readonly prefAuxModel = signal<string | null>(null);
@@ -1565,6 +1898,7 @@ export class SettingsComponent implements OnInit {
     this.modelService.load();
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
+    this.settingsService.loadLlmEndpoints();
     this.settingsService.loadPreferences();
     // Admin-only loaders (codex status + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
@@ -1664,6 +1998,116 @@ export class SettingsComponent implements OnInit {
 
   deleteApiKey(provider: string): void {
     this.settingsService.deleteApiKey(provider).subscribe();
+  }
+
+  // ── LLM Endpoints ─────────────────────────────────────────────────
+
+  createLlmEndpoint(): void {
+    const label = this.newEndpointLabel.trim();
+    const baseUrl = this.newEndpointBaseUrl.trim();
+    if (!label || !baseUrl) return;
+
+    const httpsLike = /^https?:\/\//i.test(baseUrl);
+    if (!httpsLike) {
+      this.endpointFormError.set(
+        this.transloco.translate('settings.llmEndpoints.errorUrlScheme'),
+      );
+      return;
+    }
+    if (baseUrl.startsWith('http://') && !this.newEndpointAllowInsecure) {
+      this.endpointFormError.set(
+        this.transloco.translate('settings.llmEndpoints.errorHttpNeedsOptIn'),
+      );
+      return;
+    }
+
+    this.endpointFormError.set('');
+    this.creatingEndpoint.set(true);
+    this.settingsService
+      .createLlmEndpoint({
+        label,
+        base_url: baseUrl,
+        api_key: this.newEndpointApiKey.trim() || null,
+        allow_insecure: this.newEndpointAllowInsecure,
+      })
+      .subscribe({
+        next: () => {
+          this.newEndpointLabel = '';
+          this.newEndpointBaseUrl = '';
+          this.newEndpointApiKey = '';
+          this.newEndpointAllowInsecure = false;
+          this.creatingEndpoint.set(false);
+        },
+        error: (err) => {
+          this.creatingEndpoint.set(false);
+          const detail = err?.error?.detail ?? err?.message ?? 'Failed';
+          this.endpointFormError.set(String(detail));
+        },
+      });
+  }
+
+  deleteLlmEndpoint(endpointId: string): void {
+    const msg = this.transloco.translate('settings.llmEndpoints.confirmDelete');
+    if (!window.confirm(msg)) return;
+    this.settingsService.deleteLlmEndpoint(endpointId).subscribe({
+      next: () => {
+        const next = {...this.testResults()};
+        delete next[endpointId];
+        this.testResults.set(next);
+      },
+    });
+  }
+
+  testLlmEndpoint(endpointId: string): void {
+    this.testingEndpointId.set(endpointId);
+    this.settingsService.testLlmEndpoint(endpointId).subscribe({
+      next: (result) => {
+        this.testResults.set({...this.testResults(), [endpointId]: result});
+        this.testingEndpointId.set(null);
+      },
+      error: (err) => {
+        this.testResults.set({
+          ...this.testResults(),
+          [endpointId]: {
+            ok: false,
+            status: null,
+            error: err?.error?.detail ?? err?.message ?? 'Request failed',
+            probe_url: '',
+          },
+        });
+        this.testingEndpointId.set(null);
+      },
+    });
+  }
+
+  addEndpointModel(endpointId: string): void {
+    const modelId = (this.newModelIds[endpointId] ?? '').trim();
+    const displayName = (this.newModelDisplayNames[endpointId] ?? '').trim();
+    if (!modelId || !displayName) return;
+
+    const family = (this.newModelFamilies[endpointId] ?? '').trim() || null;
+    const ctx = this.newModelContexts[endpointId];
+    const contextWindow = typeof ctx === 'number' && ctx > 0 ? ctx : null;
+
+    this.settingsService
+      .createLlmEndpointModel(endpointId, {
+        model_id: modelId,
+        display_name: displayName,
+        family,
+        context_window: contextWindow,
+      })
+      .subscribe({
+        next: () => {
+          delete this.newModelIds[endpointId];
+          delete this.newModelDisplayNames[endpointId];
+          delete this.newModelFamilies[endpointId];
+          delete this.newModelContexts[endpointId];
+        },
+      });
+  }
+
+  deleteLlmEndpointModel(endpointId: string, modelId: string): void {
+    this.settingsService.deleteLlmEndpointModel(endpointId, modelId).subscribe();
   }
 
   // ── Preferences ───────────────────────────────────────────────────

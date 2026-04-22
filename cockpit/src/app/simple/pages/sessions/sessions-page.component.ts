@@ -7,6 +7,7 @@ import {TranslocoDatePipe} from '@jsverse/transloco-locale';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
+import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
 import {ToastService} from '../../../core/services/toast.service';
 import {ErrorMessageService} from '../../../core/services/error-message.service';
@@ -71,20 +72,13 @@ interface Project {
             <label>{{ 'sessions.create.modelLabel' | transloco }}</label>
             <select [(ngModel)]="newModel">
               <option value="">{{ 'sessions.create.modelConfigDefault' | transloco }}</option>
-              <optgroup label="Local">
-                <option value="RedHatAI/gemma-4-31B-it-FP8-Dynamic">Gemma 4 31B (local)</option>
-              </optgroup>
-              <optgroup label="OpenAI">
-                <option value="gpt-5.4">GPT-5.4</option>
-                <option value="codex/gpt-5.3-codex">Codex (coding)</option>
-                <option value="codex/gpt-5.3-codex-spark">Codex Spark (ultra-fast)</option>
-              </optgroup>
-              <optgroup label="Anthropic">
-                <option value="claude-opus-4-6">Claude Opus 4.6</option>
-              </optgroup>
-              <optgroup label="OpenRouter">
-                <option value="openrouter/minimax/minimax-m2.7">MiniMax M2.7</option>
-              </optgroup>
+              @for (group of modelService.models(); track group.group) {
+                <optgroup [label]="group.group">
+                  @for (model of group.models; track model) {
+                    <option [value]="model">{{ model }}</option>
+                  }
+                </optgroup>
+              }
             </select>
           </div>
           <div class="form-group">
@@ -573,6 +567,7 @@ export class SessionsPageComponent implements OnInit {
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
     private readonly settingsService = inject(SettingsService);
+    readonly modelService = inject(ModelService);
     readonly chat = inject(PersistentChatService);
     private readonly transloco = inject(TranslocoService);
 
@@ -602,6 +597,7 @@ export class SessionsPageComponent implements OnInit {
     ngOnInit(): void {
         this.loadThreads();
         this.loadProjects();
+        this.modelService.load();
     }
 
     async loadThreads(): Promise<void> {

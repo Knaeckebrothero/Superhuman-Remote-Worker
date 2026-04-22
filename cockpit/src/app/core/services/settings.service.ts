@@ -1,7 +1,20 @@
 import {inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
-import {ApiKeyEntry, ApiKeySetRequest, CodexStatus, ResolvedDefaults, UserSettings} from '../models/api.model';
+import {
+  ApiKeyEntry,
+  ApiKeySetRequest,
+  CodexStatus,
+  LlmEndpoint,
+  LlmEndpointCreateRequest,
+  LlmEndpointModel,
+  LlmEndpointModelCreateRequest,
+  LlmEndpointModelUpdateRequest,
+  LlmEndpointTestResult,
+  LlmEndpointUpdateRequest,
+  ResolvedDefaults,
+  UserSettings,
+} from '../models/api.model';
 import {environment} from '../environment';
 
 @Injectable({ providedIn: 'root' })
@@ -11,6 +24,9 @@ export class SettingsService {
 
   /** Current user's API keys (prefix only, no full keys). */
   readonly apiKeys = signal<ApiKeyEntry[]>([]);
+
+  /** Current user's registered LLM endpoints with nested models. */
+  readonly llmEndpoints = signal<LlmEndpoint[]>([]);
 
   /** Current user's preference settings (user overrides only). */
   readonly preferences = signal<UserSettings>({});
@@ -37,6 +53,73 @@ export class SettingsService {
     return this.http
       .delete<{ status: string }>(`${this.baseUrl}/settings/api-keys/${provider}`)
       .pipe(tap(() => this.loadApiKeys()));
+  }
+
+  // ── User LLM Endpoints ────────────────────────────────────────────
+
+  loadLlmEndpoints(): void {
+    this.http
+      .get<LlmEndpoint[]>(`${this.baseUrl}/settings/llm-endpoints`)
+      .pipe(catchError(() => of([])))
+      .subscribe((endpoints) => this.llmEndpoints.set(endpoints));
+  }
+
+  createLlmEndpoint(body: LlmEndpointCreateRequest): Observable<LlmEndpoint> {
+    return this.http
+      .post<LlmEndpoint>(`${this.baseUrl}/settings/llm-endpoints`, body)
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  updateLlmEndpoint(endpointId: string, body: LlmEndpointUpdateRequest): Observable<LlmEndpoint> {
+    return this.http
+      .patch<LlmEndpoint>(`${this.baseUrl}/settings/llm-endpoints/${endpointId}`, body)
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  deleteLlmEndpoint(endpointId: string): Observable<{ status: string }> {
+    return this.http
+      .delete<{ status: string }>(`${this.baseUrl}/settings/llm-endpoints/${endpointId}`)
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  createLlmEndpointModel(
+    endpointId: string,
+    body: LlmEndpointModelCreateRequest,
+  ): Observable<LlmEndpointModel> {
+    return this.http
+      .post<LlmEndpointModel>(
+        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models`,
+        body,
+      )
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  updateLlmEndpointModel(
+    endpointId: string,
+    modelId: string,
+    body: LlmEndpointModelUpdateRequest,
+  ): Observable<LlmEndpointModel> {
+    return this.http
+      .patch<LlmEndpointModel>(
+        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models/${encodeURIComponent(modelId)}`,
+        body,
+      )
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  deleteLlmEndpointModel(endpointId: string, modelId: string): Observable<{ status: string }> {
+    return this.http
+      .delete<{ status: string }>(
+        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models/${encodeURIComponent(modelId)}`,
+      )
+      .pipe(tap(() => this.loadLlmEndpoints()));
+  }
+
+  testLlmEndpoint(endpointId: string): Observable<LlmEndpointTestResult> {
+    return this.http.post<LlmEndpointTestResult>(
+      `${this.baseUrl}/settings/llm-endpoints/${endpointId}/test`,
+      {},
+    );
   }
 
   // ── User Preferences ──────────────────────────────────────────────

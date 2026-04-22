@@ -184,6 +184,82 @@ export interface ApiKeySetRequest {
   label?: string | null;
 }
 
+// =============================================================================
+// LLM Endpoint Models
+// =============================================================================
+
+/**
+ * A single model attached to an LLM endpoint.
+ * Matches orchestrator `_serialize_endpoint_model`.
+ */
+export interface LlmEndpointModel {
+  id: string;
+  endpoint_id: string;
+  model_id: string;
+  display_name: string;
+  family: string | null;
+  context_window: number | null;
+  reasoning_level: string | null;
+  enabled: boolean;
+  created_at: string | null;
+}
+
+/**
+ * A user-registered OpenAI-compatible LLM endpoint with its model rows.
+ * Matches orchestrator `_serialize_endpoint`.
+ */
+export interface LlmEndpoint {
+  id: string;
+  label: string;
+  base_url: string;
+  key_prefix: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  models: LlmEndpointModel[];
+}
+
+export interface LlmEndpointCreateRequest {
+  label: string;
+  base_url: string;
+  api_key?: string | null;
+  allow_insecure?: boolean;
+}
+
+export interface LlmEndpointUpdateRequest {
+  label?: string | null;
+  base_url?: string | null;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  allow_insecure?: boolean;
+}
+
+export interface LlmEndpointModelCreateRequest {
+  model_id: string;
+  display_name: string;
+  family?: string | null;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  enabled?: boolean;
+}
+
+export interface LlmEndpointModelUpdateRequest {
+  display_name?: string | null;
+  family?: string | null;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  enabled?: boolean | null;
+}
+
+/**
+ * Response from the test-connection probe (POST /api/settings/llm-endpoints/{id}/test).
+ */
+export interface LlmEndpointTestResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string;
+}
+
 /**
  * Resolved default values for every user preference field.
  * Returned by the backend in the `_resolved` key of GET /api/settings/preferences.
