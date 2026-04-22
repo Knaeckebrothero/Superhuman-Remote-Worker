@@ -368,13 +368,13 @@ class TestProviderFiltering:
     def test_auxiliary_models_filtered(self, catalog):
         result = self._filter(catalog, {"local"})
         aux_ids = [m["id"] for m in result["auxiliary_models"]]
-        assert "openai/gpt-oss-120b" in aux_ids  # local provider
+        assert "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic" in aux_ids  # local provider
         assert "gpt-4o-mini" not in aux_ids  # openai provider
 
     def test_builder_models_filtered(self, catalog):
         result = self._filter(catalog, {"local", "codex"})
         builder_ids = [m["id"] for m in result["builder_models"]]
-        assert "openai/gpt-oss-120b" in builder_ids  # local
+        assert "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic" in builder_ids  # local
         assert "codex/gpt-5.4" in builder_ids  # codex
         assert "claude-opus-4-6" not in builder_ids  # anthropic — not available
 

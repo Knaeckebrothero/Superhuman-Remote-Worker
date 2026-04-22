@@ -146,7 +146,7 @@ class TestAuxiliaryConfigParsing:
 
         config = load_agent_config("config/defaults.yaml")
         assert config.auxiliary.enabled is True
-        assert config.auxiliary.model == "openai/gpt-oss-120b"
+        assert config.auxiliary.model == "openai/RedHatAI/gemma-4-31B-it-FP8-Dynamic"
         assert config.auxiliary.tasks["extract_memories"].enabled is True
         assert config.auxiliary.tasks["curate_knowledge"].enabled is True
 

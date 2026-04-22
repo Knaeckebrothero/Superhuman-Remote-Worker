@@ -1700,6 +1700,8 @@ def detect_model_family(model: str) -> str:
         return "gemini"
     if name.startswith("gpt-oss"):
         return "gpt-oss"
+    if "gemma" in name:
+        return "gemma"
     if "minimax" in name:
         return "minimax"
 
@@ -1727,7 +1729,14 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
 
     if family == "gpt-oss":
         return "prompt"
-    if family in ("claude-opus", "claude-sonnet", "claude-haiku", "gemini", "minimax"):
+    if family in (
+        "claude-opus",
+        "claude-sonnet",
+        "claude-haiku",
+        "gemini",
+        "minimax",
+        "gemma",
+    ):
         return "none"
     # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
     return "api"

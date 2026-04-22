@@ -58,8 +58,10 @@ export function getReasoningOptions(model: string | null): ReasoningOption[] {
     }
   }
 
-  // Model families that don't support reasoning control
-  if (name.startsWith('claude') || name.startsWith('gemini')) return base;
+  // Model families that don't support reasoning control.
+  // Gemma 4 has a binary thinking toggle, not level control, and we keep it off
+  // due to vLLM parser bugs under tool calling (vllm#39043).
+  if (name.startsWith('claude') || name.startsWith('gemini') || name.includes('gemma')) return base;
 
   // gpt-oss (vLLM prompt injection) supports all levels
   if (name.startsWith('gpt-oss')) {
