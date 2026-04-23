@@ -53,19 +53,24 @@ def _decode_key(raw: str) -> bytes:
     if len(raw) == KEY_BYTES:
         return raw.encode("utf-8")
 
-    # Try standard base64, then url-safe base64. Only standard b64decode
-    # supports validate=True; for the url-safe variant we compare after
-    # decode to detect garbage.
-    for decoder in (
-        lambda s: base64.b64decode(s, validate=True),
-        base64.urlsafe_b64decode,
-    ):
-        try:
-            decoded = decoder(raw)
-        except (ValueError, base64.binascii.Error):
-            continue
-        if len(decoded) == KEY_BYTES:
-            return decoded
+    # Try standard base64, then url-safe base64. Both variants are tried
+    # with and without added padding: Vault/ESO/YAML pipelines sometimes
+    # strip trailing `=`, and Python's decoders reject unpadded input
+    # rather than inferring the length. Only standard b64decode supports
+    # validate=True; for the url-safe variant we rely on length check
+    # after decode to detect garbage.
+    padding = "=" * (-len(raw) % 4)
+    for candidate in (raw, raw + padding):
+        for decoder in (
+            lambda s: base64.b64decode(s, validate=True),
+            base64.urlsafe_b64decode,
+        ):
+            try:
+                decoded = decoder(candidate)
+            except (ValueError, base64.binascii.Error):
+                continue
+            if len(decoded) == KEY_BYTES:
+                return decoded
 
     raise EncryptionKeyError(
         f"{ENV_VAR} must decode to {KEY_BYTES} bytes "

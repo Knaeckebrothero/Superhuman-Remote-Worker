@@ -152,14 +152,9 @@ ingress:
     issuerName: ""
   # -- Extra annotations for all Ingress resources
   annotations: {}
-  # -- Traefik CORS middleware for cockpit -> API cross-origin.
-  # Disabled by default: the orchestrator's FastAPI CORSMiddleware already
-  # handles CORS (configured via CORS_ORIGINS from srw.cockpitUrl). Enabling
-  # both layers causes duplicate Access-Control-Allow-Origin headers, which
-  # browsers reject as a CORS failure (Angular reports "0 undefined").
-  # Only turn this on if you disable FastAPI's CORSMiddleware.
+  # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
   cors:
-    enabled: false
+    enabled: true
 
 # =============================================================================
 # Secrets — three modes (pick one)
