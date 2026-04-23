@@ -6,8 +6,14 @@
 #   OPENCLOUD_KEYCLOAK_CLIENT_SECRET, PGADMIN_OIDC_CLIENT_SECRET,
 #   MCP_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
 #
-# The realm-export JSON uses ${env.VAR} placeholders — Keycloak resolves
-# them at import time from the container's environment.
+# The realm-export JSON uses ${VAR} placeholders — Keycloak resolves them
+# from the container's environment at realm import time.
+#
+# IMPORTANT: Use plain ${VAR}, NOT the legacy $[env.VAR] style (write it out,
+# do not use the bracket form here). The env.-prefix syntax is Keycloak ≤24
+# and silently fails to substitute in 25+ for client secrets and user
+# credentials — the literal placeholder string becomes the stored credential,
+# causing invalid_client_credentials errors.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -125,7 +131,7 @@ data:
           "implicitFlowEnabled": false,
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
-          "secret": "${env.GITEA_OIDC_CLIENT_SECRET}",
+          "secret": "${GITEA_OIDC_CLIENT_SECRET}",
           "redirectUris": [
             "http://localhost:3000/user/oauth2/Keycloak/callback",
             "{{ include "srw.gitUrl" . }}/user/oauth2/Keycloak/callback"
@@ -192,7 +198,7 @@ data:
           "implicitFlowEnabled": false,
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
-          "secret": "${env.NEXTCLOUD_OIDC_CLIENT_SECRET}",
+          "secret": "${NEXTCLOUD_OIDC_CLIENT_SECRET}",
           "redirectUris": [
             "http://localhost:8800/apps/user_oidc/code",
             "{{ include "srw.cloudUrl" . }}/apps/user_oidc/code"
@@ -219,7 +225,7 @@ data:
           "implicitFlowEnabled": false,
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
-          "secret": "${env.PGADMIN_OIDC_CLIENT_SECRET}",
+          "secret": "${PGADMIN_OIDC_CLIENT_SECRET}",
           "redirectUris": [
             "http://localhost:5050/oauth2/authorize",
             "https://pgadmin.{{ .Values.global.domain }}/oauth2/authorize"
@@ -245,7 +251,7 @@ data:
           "implicitFlowEnabled": false,
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
-          "secret": "${env.MCP_OIDC_CLIENT_SECRET}",
+          "secret": "${MCP_OIDC_CLIENT_SECRET}",
           "redirectUris": [
             "http://localhost:8055/auth/callback",
             "{{ include "srw.mcpUrl" . }}/auth/callback"
@@ -282,7 +288,7 @@ data:
           "credentials": [
             {
               "type": "password",
-              "value": "${env.KC_REALM_ADMIN_PASSWORD}",
+              "value": "${KC_REALM_ADMIN_PASSWORD}",
               "temporary": false
             }
           ]
@@ -461,7 +467,7 @@ data:
         }
       ],
       "smtpServer": {
-        "host": "${env.SMTP_HOST}",
+        "host": "${SMTP_HOST}",
         "port": "1025",
         "from": "noreply@{{ .Values.global.domain }}",
         "fromDisplayName": "Superhuman Remote Worker",
@@ -469,8 +475,8 @@ data:
         "starttls": "true",
         "envelopeFrom": "noreply@{{ .Values.global.domain }}",
         "auth": "true",
-        "user": "${env.SMTP_USER}",
-        "password": "${env.SMTP_PASSWORD}"
+        "user": "${SMTP_USER}",
+        "password": "${SMTP_PASSWORD}"
       },
       "internationalizationEnabled": false,
       "loginTheme": "keycloak",
@@ -605,7 +611,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: KEYCLOAK_ADMIN_PASSWORD
-            # Realm import secrets (resolved via ${env.VAR} in realm JSON)
+            # Realm import secrets — referenced as ${VAR} in realm JSON and
+            # resolved by Keycloak at import time from these env vars.
             - name: KC_REALM_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -667,17 +674,21 @@ spec:
                   - -c
                   - |
                     # Sync OIDC client config from env vars into Keycloak DB.
-                    # Realm import resolves ${env.VAR} only on first boot; if the
-                    # realm already exists the placeholders are stored literally
-                    # and protocol mapper configs can be empty. This hook runs on
-                    # every start and ensures secrets + mappers are correct.
+                    # Realm import only runs on FIRST boot (empty DB). On every
+                    # subsequent pod start the realm already exists, so any
+                    # secret rotation in Vault/ESO must be propagated via
+                    # kcadm here. The hook also ensures the OpenCloud client
+                    # set + groups exist (idempotent, mirrors
+                    # setup-opencloud-client.sh).
                     KC="/opt/keycloak/bin/kcadm.sh"
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080 \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
                     # --- Set realm admin password ---
-                    # ${env.VAR} substitution in realm import doesn't resolve for
-                    # credentials, so set the password explicitly on every start.
+                    # Realm import does resolve ${KC_REALM_ADMIN_PASSWORD} on
+                    # first boot (verified on Keycloak 26.2), but we still
+                    # force-set on every start so Vault-rotated admin
+                    # passwords propagate without requiring a DB wipe.
                     $KC set-password -r {{ .Values.keycloak.realm }} --username test --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
                     # --- Sync client secrets ---
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
@@ -692,7 +703,9 @@ spec:
                       $KC update "clients/$ID" -r {{ .Values.keycloak.realm }} -s "secret=$SEC" 2>/dev/null
                     done
                     # --- Sync SMTP config ---
-                    # Realm import stores ${env.SMTP_*} literally on re-imports; force-update every start.
+                    # Force-update on every start so rotated SMTP creds
+                    # propagate without a DB wipe. Realm import only runs
+                    # on first boot with an empty DB.
                     if [ -n "$SMTP_HOST" ]; then
                       $KC update "realms/{{ .Values.keycloak.realm }}" \
                         -s "smtpServer.host=$SMTP_HOST" \

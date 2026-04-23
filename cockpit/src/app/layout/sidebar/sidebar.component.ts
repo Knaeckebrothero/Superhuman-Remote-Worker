@@ -87,6 +87,24 @@ import {TranslocoPipe} from '@jsverse/transloco';
               {{ 'nav.debug' | transloco }}
             </a>
           }
+          @if (userService.currentUser()?.is_admin) {
+            <a
+              class="nav-link"
+              routerLink="/admin/providers"
+              routerLinkActive="active"
+            >
+              <span class="nav-icon">key</span>
+              Admin · Providers
+            </a>
+            <a
+              class="nav-link"
+              routerLink="/admin/users"
+              routerLinkActive="active"
+            >
+              <span class="nav-icon">group</span>
+              Admin · Users
+            </a>
+          }
         </div>
 
         @if (isDebugRoute()) {

@@ -152,7 +152,17 @@ export interface User {
   default_project_id?: string | null;
   is_admin?: boolean;
   is_approved?: boolean;
+  can_use_vm?: boolean;
   created_at: string;
+}
+
+/**
+ * Response body from /api/admin/system-settings/vm_workspaces (GET/PUT).
+ */
+export interface VmWorkspacesSetting {
+  enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
 }
 
 // =============================================================================

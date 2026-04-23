@@ -1,8 +1,9 @@
-import {Component, computed, input, output, signal} from '@angular/core';
+import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
+import {UserService} from '../../../core/services/user.service';
 
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
@@ -400,7 +401,9 @@ import {getReasoningOptions} from './reasoning-options';
                   (ngModelChange)="workspaceBackend.set($event); emitChange()"
                   [disabled]="disabled()">
                   <option value="sandbox">{{ 'advanced.options.container' | transloco }}</option>
-                  <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
+                  @if (canUseVm()) {
+                    <option value="vm">{{ 'advanced.options.vmQemu' | transloco }}</option>
+                  }
                 </select>
                 @if (workspaceBackend() !== null) {
                   <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()">close</button>
@@ -937,6 +940,12 @@ export class AdvancedAccordionComponent {
   readonly keepRecentMessages = signal<number | null>(null);
 
   // --- Workspace ---
+  private readonly userService = inject(UserService);
+  /** Whether the current user is allowed to pick the VM backend. Admins always qualify. */
+  readonly canUseVm = computed(() => {
+    const u = this.userService.currentUser();
+    return !!(u?.is_admin || u?.can_use_vm);
+  });
   readonly workspaceBackend = signal<string | null>(null);
   readonly vmCpuCores = signal<number | null>(null);
   readonly vmMemory = signal<string | null>(null);
@@ -1103,6 +1112,21 @@ export class AdvancedAccordionComponent {
       next.add(section);
     }
     this.expanded.set(next);
+  }
+
+  constructor() {
+    // Snap ineligible users off 'vm' so the form can't submit a denied backend.
+    // The server is authoritative — this is a UX safeguard.
+    effect(() => {
+      if (this.canUseVm()) return;
+      const effective = this.workspaceBackend() ?? this.resolvedWorkspaceBackend();
+      if (effective === 'vm') {
+        this.workspaceBackend.set('sandbox');
+        this.vmCpuCores.set(null);
+        this.vmMemory.set(null);
+        this.emitChange();
+      }
+    });
   }
 
   emitChange(): void { this.change.emit(); }

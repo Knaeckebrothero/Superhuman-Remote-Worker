@@ -143,7 +143,6 @@ For Kubernetes deployment (recommended for production), see [`docs/deployment.md
 git clone <repo-url>
 cd Superhuman-Remote-Worker
 cp .env.example .env
-cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json
 ```
 
 ### 2. Edit Environment Variables

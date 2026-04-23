@@ -5,7 +5,7 @@
   "displayNameHtml": "<strong>Superhuman Remote Worker</strong>",
   "registrationAllowed": true,
   "registrationEmailAsUsername": false,
-  "verifyEmail": false,
+  "verifyEmail": true,
   "loginWithEmailAllowed": true,
   "duplicateEmailsAllowed": false,
   "resetPasswordAllowed": true,
@@ -51,16 +51,18 @@
       "serviceAccountsEnabled": false,
       "redirectUris": [
         "http://localhost:4200/*",
-        "http://localhost:4000/*"
+        "http://localhost:4000/*",
+        "https://superhuman-remote-worker.com/*"
       ],
       "webOrigins": [
         "http://localhost:4200",
-        "http://localhost:4000"
+        "http://localhost:4000",
+        "https://superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "attributes": {
         "pkce.code.challenge.method": "S256",
-        "post.logout.redirect.uris": "http://localhost:4200/*##http://localhost:4000/*"
+        "post.logout.redirect.uris": "http://localhost:4200/*##http://localhost:4000/*##https://superhuman-remote-worker.com/*"
       },
       "defaultClientScopes": [
         "openid",
@@ -108,12 +110,14 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "secret": "gitea-client-secret",
+      "secret": "${GITEA_OIDC_CLIENT_SECRET}",
       "redirectUris": [
-        "http://localhost:3000/user/oauth2/Keycloak/callback"
+        "http://localhost:3000/user/oauth2/Keycloak/callback",
+        "https://git.superhuman-remote-worker.com/user/oauth2/Keycloak/callback"
       ],
       "webOrigins": [
-        "http://localhost:3000"
+        "http://localhost:3000",
+        "https://git.superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "defaultClientScopes": [
@@ -127,7 +131,7 @@
           "protocol": "openid-connect",
           "protocolMapper": "oidc-usermodel-attribute-mapper",
           "config": {
-            "user.attribute": "gitea_username",
+            "user.attribute": "username",
             "claim.name": "preferred_username",
             "id.token.claim": "true",
             "access.token.claim": "true",
@@ -173,12 +177,14 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "secret": "nextcloud-client-secret",
+      "secret": "${NEXTCLOUD_OIDC_CLIENT_SECRET}",
       "redirectUris": [
-        "http://localhost:8800/apps/user_oidc/code"
+        "http://localhost:8800/apps/user_oidc/code",
+        "https://cloud.superhuman-remote-worker.com/apps/user_oidc/code"
       ],
       "webOrigins": [
-        "http://localhost:8800"
+        "http://localhost:8800",
+        "https://cloud.superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "defaultClientScopes": [
@@ -198,12 +204,14 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "secret": "pgadmin-client-secret",
+      "secret": "${PGADMIN_OIDC_CLIENT_SECRET}",
       "redirectUris": [
-        "http://localhost:5050/oauth2/authorize"
+        "http://localhost:5050/oauth2/authorize",
+        "https://pgadmin.superhuman-remote-worker.com/oauth2/authorize"
       ],
       "webOrigins": [
-        "http://localhost:5050"
+        "http://localhost:5050",
+        "https://pgadmin.superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "defaultClientScopes": [
@@ -222,12 +230,14 @@
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "secret": "${env.MCP_OIDC_CLIENT_SECRET}",
+      "secret": "${MCP_OIDC_CLIENT_SECRET}",
       "redirectUris": [
-        "http://localhost:8055/auth/callback"
+        "http://localhost:8055/auth/callback",
+        "https://mcp.superhuman-remote-worker.com/auth/callback"
       ],
       "webOrigins": [
-        "http://localhost:8055"
+        "http://localhost:8055",
+        "https://mcp.superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "defaultClientScopes": [
@@ -240,7 +250,7 @@
     {
       "clientId": "opencloud-web",
       "name": "OpenCloud Web",
-      "description": "OpenCloud browser login — public client for user-facing OIDC flow (Phase 2)",
+      "description": "OpenCloud browser login — public client for user-facing OIDC flow",
       "enabled": true,
       "publicClient": true,
       "standardFlowEnabled": true,
@@ -248,10 +258,12 @@
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
       "redirectUris": [
-        "http://localhost:9200/*"
+        "http://localhost:9200/*",
+        "https://cloud.superhuman-remote-worker.com/*"
       ],
       "webOrigins": [
-        "http://localhost:9200"
+        "http://localhost:9200",
+        "https://cloud.superhuman-remote-worker.com"
       ],
       "protocol": "openid-connect",
       "attributes": {
@@ -267,31 +279,43 @@
     {
       "clientId": "opencloud-orchestrator",
       "name": "OpenCloud Orchestrator Service Account",
-      "description": "Service-account client for orchestrator → LibreGraph admin calls (Phase 2). Requires the opencloud-admin group to be assigned to its service-account user.",
+      "description": "Service-account client for orchestrator → LibreGraph admin calls. The service-account user must be a member of the opencloudAdmin group for admin privileges.",
       "enabled": true,
       "publicClient": false,
       "standardFlowEnabled": false,
       "implicitFlowEnabled": false,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": true,
-      "secret": "${env.OPENCLOUD_KEYCLOAK_CLIENT_SECRET}",
+      "secret": "${OPENCLOUD_KEYCLOAK_CLIENT_SECRET}",
       "protocol": "openid-connect",
       "defaultClientScopes": [
         "openid",
         "profile",
+        "email",
         "groups"
       ]
     }
   ],
   "groups": [
     {
-      "name": "opencloud-admin",
-      "path": "/opencloud-admin",
+      "name": "opencloudAdmin",
+      "path": "/opencloudAdmin",
+      "attributes": {},
+      "realmRoles": [],
+      "clientRoles": {},
+      "subGroups": []
+    },
+    {
+      "name": "opencloudUser",
+      "path": "/opencloudUser",
       "attributes": {},
       "realmRoles": [],
       "clientRoles": {},
       "subGroups": []
     }
+  ],
+  "defaultGroups": [
+    "/opencloudUser"
   ],
   "users": [
     {
@@ -299,13 +323,16 @@
       "enabled": true,
       "emailVerified": true,
       "serviceAccountClientId": "opencloud-orchestrator",
+      "firstName": "OpenCloud",
+      "lastName": "Orchestrator",
+      "email": "orchestrator@srw.local",
       "groups": [
-        "/opencloud-admin"
+        "/opencloudAdmin"
       ]
     },
     {
       "username": "test",
-      "email": "admin@srw.dev",
+      "email": "test@srw.local",
       "emailVerified": true,
       "enabled": true,
       "firstName": "Test",
@@ -317,6 +344,9 @@
         "admin",
         "user",
         "default-roles-srw"
+      ],
+      "groups": [
+        "/opencloudAdmin"
       ],
       "credentials": [
         {
@@ -338,6 +368,142 @@
     }
   ],
   "clientScopes": [
+    {
+      "name": "email",
+      "protocol": "openid-connect",
+      "description": "OpenID Connect built-in scope: email",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Your email address"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "emailVerified",
+            "claim.name": "email_verified",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "boolean"
+          }
+        }
+      ]
+    },
+    {
+      "name": "profile",
+      "protocol": "openid-connect",
+      "description": "OpenID Connect built-in scope: profile",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true",
+        "consent.screen.text": "Your user profile"
+      },
+      "protocolMappers": [
+        {
+          "name": "username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "username",
+            "claim.name": "preferred_username",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "full name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-full-name-mapper",
+          "config": {
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "given name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "family name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "name": "roles",
+      "protocol": "openid-connect",
+      "description": "Realm and client role mappings",
+      "attributes": {
+        "include.in.token.scope": "false",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "client roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "config": {
+            "multivalued": "true",
+            "claim.name": "resource_access.${client_id}.roles",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
     {
       "name": "groups",
       "protocol": "openid-connect",
@@ -364,16 +530,15 @@
     }
   ],
   "smtpServer": {
-    "host": "${env.SMTP_HOST}",
+    "host": "srw-protonmail-bridge",
     "port": "1025",
     "from": "noreply@superhuman-remote-worker.com",
     "fromDisplayName": "Superhuman Remote Worker",
     "ssl": "false",
-    "starttls": "true",
-    "envelopeFrom": "noreply@superhuman-remote-worker.com",
+    "starttls": "false",
     "auth": "true",
-    "user": "${env.SMTP_USER}",
-    "password": "${env.SMTP_PASSWORD}"
+    "user": "project@redacted.invalid",
+    "password": "**"
   },
   "internationalizationEnabled": false,
   "loginTheme": "keycloak",

@@ -164,6 +164,7 @@ interface Project {
                 <div class="session-info">
                   <span class="session-status-dot" [class]="thread.status"></span>
                   <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
+                  <span class="session-id" title="Session ID">{{ thread.id.slice(0, 8) }}</span>
                   <span class="session-config">{{ thread.config_name | titlecase }}</span>
                 </div>
                 <div class="session-meta">
@@ -469,6 +470,13 @@ interface Project {
       padding: 1px 6px;
       border-radius: 3px;
       background: var(--surface-0, #313244);
+      color: var(--text-muted, #6c7086);
+      flex-shrink: 0;
+    }
+
+    .session-id {
+      font-family: var(--font-mono, monospace);
+      font-size: 10px;
       color: var(--text-muted, #6c7086);
       flex-shrink: 0;
     }

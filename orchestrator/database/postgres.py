@@ -26,7 +26,7 @@ try:
 except ImportError:
     asyncpg = None
 
-from orchestrator.security.crypto import (
+from security.crypto import (
     DecryptionError,
     decrypt,
     encrypt,
@@ -4290,7 +4290,7 @@ class PostgresDB:
             rows = await conn.fetch(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, created_at
+                       is_admin, can_use_vm, created_at
                 FROM users
                 ORDER BY created_at ASC
                 LIMIT $1
@@ -4318,7 +4318,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, keycloak_sub, created_at
+                       is_admin, can_use_vm, keycloak_sub, created_at
                 FROM users
                 WHERE id = $1
                 """,
@@ -4340,7 +4340,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, keycloak_sub, created_at
+                       is_admin, can_use_vm, keycloak_sub, created_at
                 FROM users
                 WHERE keycloak_sub = $1
                 """,
@@ -4379,7 +4379,7 @@ class PostgresDB:
                 existing = await conn.fetchrow(
                     """
                     SELECT id, display_name, avatar_color, email, default_project_id,
-                           is_admin, keycloak_sub, created_at
+                           is_admin, can_use_vm, keycloak_sub, created_at
                     FROM users
                     WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
                     """,
@@ -4401,7 +4401,7 @@ class PostgresDB:
             existing_sub = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, keycloak_sub, created_at
+                       is_admin, can_use_vm, keycloak_sub, created_at
                 FROM users WHERE keycloak_sub = $1
                 """,
                 sub,
@@ -4423,7 +4423,7 @@ class PostgresDB:
                                           keycloak_sub, default_project_id)
                         VALUES ($1, '#89b4fa', $2, $3, $4, (SELECT id FROM new_project))
                         RETURNING id, display_name, avatar_color, email, default_project_id,
-                                  is_admin, keycloak_sub, created_at
+                                  is_admin, can_use_vm, keycloak_sub, created_at
                     ),
                     membership AS (
                         INSERT INTO project_members (project_id, user_id, role)
@@ -4445,7 +4445,7 @@ class PostgresDB:
                     retry = await conn.fetchrow(
                         """
                         SELECT id, display_name, avatar_color, email, default_project_id,
-                               is_admin, keycloak_sub, created_at
+                               is_admin, can_use_vm, keycloak_sub, created_at
                         FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
                         LIMIT 1
                         """,
@@ -4469,7 +4469,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, keycloak_sub, created_at
+                       is_admin, can_use_vm, keycloak_sub, created_at
                 FROM users
                 WHERE LOWER(email) = LOWER($1)
                 """,
@@ -4576,6 +4576,8 @@ class PostgresDB:
         display_name: str | None = None,
         avatar_color: str | None = None,
         email: str | None = None,
+        is_admin: bool | None = None,
+        can_use_vm: bool | None = None,
     ) -> bool:
         """Update a user.
 
@@ -4584,6 +4586,8 @@ class PostgresDB:
             display_name: New display name
             avatar_color: New avatar color
             email: New email address
+            is_admin: New admin flag (admin-only callers)
+            can_use_vm: New per-user VM grant (admin-only callers)
 
         Returns:
             True if updated, False if not found
@@ -4611,6 +4615,16 @@ class PostgresDB:
             param_count += 1
             updates.append(f"email = ${param_count}")
             values.append(email)
+
+        if is_admin is not None:
+            param_count += 1
+            updates.append(f"is_admin = ${param_count}")
+            values.append(bool(is_admin))
+
+        if can_use_vm is not None:
+            param_count += 1
+            updates.append(f"can_use_vm = ${param_count}")
+            values.append(bool(can_use_vm))
 
         if not updates:
             return False

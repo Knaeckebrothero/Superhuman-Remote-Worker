@@ -11,6 +11,7 @@ defaults and the system continues without workspace delivery.
 import logging
 import os
 import re
+import secrets
 from typing import Optional
 
 import httpx
@@ -1253,34 +1254,266 @@ class GiteaClient:
             )
             return False
 
+    async def _get_oidc_source_id(
+        self, provider_name: str = "Keycloak"
+    ) -> Optional[int]:
+        """Return the integer ID of the named OIDC auth source, or None.
+
+        Used when pre-provisioning users via ensure_user so Gitea matches
+        them to the correct auth source on subsequent OIDC login (instead
+        of creating a duplicate local user).
+
+        Strategy:
+            1. Try /api/v1/admin/auths (Gitea 1.23+). If it returns the
+               source, use the reported ID.
+            2. If that API is unavailable (404 on Gitea 1.22), probe the
+               OAuth redirect endpoint /user/oauth2/{provider_name}. A
+               307/302 means the source is registered; 500 means it is
+               not. On success, return 1 by convention — the dev compose
+               entrypoint always creates Keycloak as the first auth source.
+            3. Return None if the source is not yet registered so callers
+               skip pre-provisioning rather than create broken records.
+        """
+        if not self._initialized:
+            return None
+        client = self._get_client()
+        try:
+            resp = await client.get(f"{self._url}/api/v1/admin/auths")
+            if resp.status_code == 200:
+                for src in resp.json():
+                    if src.get("name") == provider_name:
+                        return src.get("id")
+                # API works but source not registered yet
+                return None
+        except httpx.HTTPError:
+            pass
+
+        # Fallback for Gitea <1.23: readiness probe via OAuth redirect.
+        try:
+            resp = await client.get(
+                f"{self._url}/user/oauth2/{provider_name}",
+                follow_redirects=False,
+            )
+            if resp.status_code in (302, 307):
+                return 1
+        except httpx.HTTPError:
+            pass
+        return None
+
+    async def _find_user_by_login(self, username: str) -> Optional[dict]:
+        """Fetch a Gitea user record by login (username). Returns full dict
+        including source_id and login_name, or None if not found.
+        """
+        if not self._initialized or not username:
+            return None
+        client = self._get_client()
+        try:
+            resp = await client.get(f"{self._url}/api/v1/users/{username}")
+            if resp.status_code == 200:
+                return resp.json()
+        except httpx.HTTPError:
+            pass
+        return None
+
+    async def _repair_user_source(
+        self,
+        username: str,
+        source_id: int,
+        login_name: str,
+    ) -> bool:
+        """Relink an existing Gitea user to the given OIDC source_id.
+
+        Heals users that were created with the wrong source_id (e.g.
+        source_id=0 because the OIDC auth source wasn't registered when
+        ensure_user first fired). Without this, Gitea's OIDC login sees
+        an unlinked local user with matching login_name and prompts for
+        password-based "Link to Existing Account" instead of auto-linking.
+        """
+        if not self._initialized or not username:
+            return False
+        client = self._get_client()
+        try:
+            resp = await client.patch(
+                f"{self._url}/api/v1/admin/users/{username}",
+                json={
+                    "source_id": source_id,
+                    "login_name": login_name,
+                },
+            )
+            if resp.status_code in (200, 201):
+                logger.info(
+                    f"Relinked Gitea user '{username}' to source_id={source_id}"
+                )
+                return True
+            logger.warning(
+                f"Failed to relink user '{username}' to source_id={source_id} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to relink user '{username}': {e}")
+            return False
+
+    async def ensure_user(
+        self,
+        email: str,
+        username: str,
+        full_name: Optional[str] = None,
+        sub: Optional[str] = None,
+        provider_name: str = "Keycloak",
+    ) -> Optional[str]:
+        """Idempotently pre-provision a Gitea user linked to the OIDC source.
+
+        Closes the race where the orchestrator grants repo access to a user
+        who has logged into cockpit via Keycloak but has not yet logged into
+        Gitea directly (so Gitea's OIDC auto-registration hasn't fired).
+
+        The created user has source_id pointing at the Keycloak auth source
+        AND login_name set to the Keycloak subject (sub) UUID — that's the
+        field Gitea matches on during OIDC login, so the user is linked to
+        this pre-provisioned row instead of getting a duplicate account.
+
+        Args:
+            email: User's email address (must match Keycloak claim).
+            username: Gitea username — should match Keycloak preferred_username
+                so the login label is recognizable.
+            full_name: Optional display name.
+            sub: Keycloak subject identifier — used as Gitea's login_name so
+                OIDC login resolves to this account. Strongly recommended;
+                falling back to username risks duplicate accounts on first
+                direct Gitea login.
+            provider_name: Gitea auth source name (default: "Keycloak").
+
+        Returns:
+            The Gitea username on success (existing or newly created), None
+            on failure.
+        """
+        if not self._initialized or not email or not username:
+            return None
+
+        source_id = await self._get_oidc_source_id(provider_name)
+        # Gitea's OIDC login matches existing users by login_name == sub.
+        # Use sub when provided, fall back to username (creates duplicate
+        # risk, but better than nothing for non-OIDC providers).
+        login_name = sub or username
+
+        existing_login = await self.find_user_by_email(email)
+        if existing_login:
+            # Heal users created before the OIDC source was registered
+            # (source_id=0) OR pointing at a stale sub (login_name mismatch).
+            # Without this, Gitea's OIDC login shows "Link to Existing
+            # Account" instead of linking silently.
+            if source_id:
+                detail = await self._find_user_by_login(existing_login)
+                if detail and (
+                    detail.get("source_id") != source_id
+                    or detail.get("login_name") != login_name
+                ):
+                    await self._repair_user_source(
+                        existing_login, source_id, login_name
+                    )
+            return existing_login
+
+        if not source_id:
+            # OIDC source not yet registered in Gitea (likely the compose
+            # entrypoint's `gitea admin auth add-oauth` hasn't run yet).
+            # Creating a user with source_id=0 would produce a local
+            # account that can't be auto-linked by subsequent OIDC login,
+            # so skip. The grant_user_repo_access caller will retry later
+            # when either the source registers or the user visits Gitea
+            # directly (triggering Gitea's own OIDC auto-registration).
+            logger.info(
+                f"Skipping Gitea pre-provision for '{email}' — "
+                f"OIDC auth source '{provider_name}' not registered yet"
+            )
+            return None
+
+        client = self._get_client()
+        # OIDC users never password-authenticate against Gitea — we still
+        # need to set *something* since the admin API requires it. Random
+        # URL-safe token, never persisted anywhere readable.
+        placeholder = secrets.token_urlsafe(32)
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/admin/users",
+                json={
+                    "username": username,
+                    "login_name": login_name,
+                    "email": email,
+                    "full_name": full_name or username,
+                    "password": placeholder,
+                    "must_change_password": False,
+                    "send_notify": False,
+                    "source_id": source_id,
+                },
+            )
+            if resp.status_code in (200, 201):
+                logger.info(
+                    f"Pre-provisioned Gitea user '{username}' "
+                    f"(email={email}, source_id={source_id})"
+                )
+                return username
+            if resp.status_code == 422:
+                # Name or email collision — user exists under a slightly
+                # different identity; leave lookup to the caller.
+                logger.debug(
+                    f"Gitea rejected ensure_user for '{username}' (422 — "
+                    f"likely username/email collision)"
+                )
+                return None
+            logger.warning(
+                f"Failed to pre-provision Gitea user '{username}' "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return None
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to pre-provision Gitea user '{username}': {e}")
+            return None
+
     async def grant_user_repo_access(
-        self, email: str, repo_name: str, permission: str = "read"
+        self,
+        email: str,
+        repo_name: str,
+        permission: str = "read",
+        username: Optional[str] = None,
+        full_name: Optional[str] = None,
+        sub: Optional[str] = None,
     ) -> bool:
         """Grant a user access to a repository by email.
 
         Resolves the user's Gitea account by email, then adds them as a
-        collaborator. Skips gracefully if the user has no Gitea account
-        (hasn't logged into Gitea via OIDC yet).
+        collaborator. If the user has no Gitea account yet and ``username``
+        is provided, pre-provisions the account via ensure_user so the
+        grant can proceed — this closes the race where a thread is created
+        before the user's first Gitea OIDC login.
 
         Args:
             email: User's email address.
             repo_name: Repository name.
             permission: Access level — "read", "write", or "admin".
+            username: Gitea username (from Keycloak preferred_username) used
+                as a fallback to create the account if missing.
+            full_name: Optional display name for the created account.
+            sub: Keycloak subject — used as Gitea login_name so subsequent
+                OIDC login links to this pre-provisioned account.
 
         Returns:
-            True if granted, False if user not found or operation failed.
+            True if granted, False if user not found/creatable or op failed.
         """
         if not self._initialized:
             return False
 
-        username = await self.find_user_by_email(email)
-        if not username:
+        resolved = await self.find_user_by_email(email)
+        if not resolved and username:
+            resolved = await self.ensure_user(email, username, full_name, sub=sub)
+        if not resolved:
             logger.debug(
                 f"No Gitea account for '{email}', skipping access grant on '{repo_name}'"
             )
             return False
 
-        return await self.add_collaborator(repo_name, username, permission)
+        return await self.add_collaborator(repo_name, resolved, permission)
 
     async def revoke_user_repo_access(self, email: str, repo_name: str) -> bool:
         """Revoke a user's access to a repository by email.
