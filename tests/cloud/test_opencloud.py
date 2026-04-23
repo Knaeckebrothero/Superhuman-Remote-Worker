@@ -159,7 +159,9 @@ class FakeOpenCloud:
             if "/dav/spaces/" in path:
                 after = path.split("/dav/spaces/", 1)[-1]
                 drive_part = after.split("/", 1)[0]
-            file_id = f"item-{drive_part}-{segment}" if drive_part else f"item-{segment}"
+            file_id = (
+                f"item-{drive_part}-{segment}" if drive_part else f"item-{segment}"
+            )
             body = (
                 '<?xml version="1.0"?>'
                 '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
