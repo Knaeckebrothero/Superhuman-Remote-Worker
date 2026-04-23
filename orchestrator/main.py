@@ -823,9 +823,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
 
-        # Resolve the main LLM through the registry. Custom endpoints carry
-        # their own inline base_url + api_key (from the user_llm_endpoints
-        # row); built-ins look up their api_key via resolved_keys.
+        # Resolve the main LLM through the registry. Endpoint-backed
+        # models (custom = per-user, system = helm-seeded / Admin →
+        # Providers) carry their own inline base_url + api_key on the
+        # user_llm_endpoints row; built-ins look up their api_key via
+        # resolved_keys.
         config_override = config_override or {}
         llm_over = config_override.setdefault("llm", {})
         model_id = llm_over.get("model")
@@ -836,7 +838,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             except UnknownModelError:
                 meta = None
 
-        if meta is not None and meta.origin == "custom" and meta.endpoint_id:
+        if (
+            meta is not None
+            and meta.origin in ("custom", "system")
+            and meta.endpoint_id
+        ):
             endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
             if endpoint_row:
                 if endpoint_row.get("base_url"):
@@ -844,7 +850,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 if endpoint_row.get("api_key"):
                     llm_over.setdefault("api_key", endpoint_row["api_key"])
                 logger.info(
-                    f"Dispatch: routed {model_id} to custom endpoint "
+                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
                     f"{endpoint_row.get('label') or meta.endpoint_id}"
                 )
         elif resolved_keys:
@@ -1548,8 +1554,10 @@ async def _inject_model_credentials(
     """Populate a config-override section with the right base_url + api_key
     for a given model ID.
 
-    For custom endpoints (``origin == 'custom'``): looks up the endpoint
-    row and inlines its ``base_url`` + ``api_key``.
+    For endpoint-backed models (``origin`` in {``custom``, ``system``}):
+    looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
+    Custom endpoints are user-scoped; system endpoints are helm-seeded or
+    managed via Admin → Providers. Both live in user_llm_endpoints.
 
     For built-ins: injects the named provider's key from ``resolved_keys``
     (the user > project > env resolution chain). No base_url injection —
@@ -1567,7 +1575,7 @@ async def _inject_model_credentials(
     except UnknownModelError:
         meta = None
 
-    if meta is not None and meta.origin == "custom" and meta.endpoint_id:
+    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
             if endpoint_row.get("base_url"):
@@ -14918,11 +14926,10 @@ async def _execute_server_tool(
 async def _create_builder_llm(raw_model: str):
     """Create a LangChain LLM for the builder using the shared factory.
 
-    Maps builder env vars and settings matrix into an LLMConfig, then
-    delegates to ``create_llm()`` from ``src/core/loader``. The base URL
-    comes from the model registry (user/system endpoints → built-in
-    catalog), with BUILDER_BASE_URL / OPENAI_BASE_URL as deprecated env
-    fallbacks.
+    Routes through the model registry so DB-backed endpoints (custom or
+    system-scoped, managed via Admin → Providers or helm seed) carry
+    their own base_url and api_key. Falls back to builder-specific env
+    vars for built-in catalog models and registry misses.
     """
     import sys
 
@@ -14934,25 +14941,48 @@ async def _create_builder_llm(raw_model: str):
 
     settings = resolve_builder_settings(raw_model)
 
-    # Resolve API key from builder-specific env vars
+    base_url: str | None = None
     api_key: str | None = None
-    provider_lower = raw_model.lower()
-    if provider_lower.startswith("claude"):
-        api_key = (
-            os.getenv("BUILDER_ANTHROPIC_API_KEY")
-            or os.getenv("BUILDER_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
-    elif provider_lower.startswith("codex/"):
-        api_key = os.getenv("CODEX_API_KEY", "not-needed")
-    elif provider_lower.startswith("openrouter/"):
-        api_key = os.getenv("OPENROUTER_API_KEY")
-    else:
-        api_key = (
-            os.getenv("BUILDER_OPENAI_API_KEY")
-            or os.getenv("BUILDER_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
+
+    try:
+        meta = await _resolve_model(raw_model)
+    except UnknownModelError:
+        meta = None
+
+    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            base_url = endpoint_row.get("base_url")
+            # Keyless local endpoints (vLLM, Ollama) still need a
+            # placeholder; do not fall through to env vars, or a stray
+            # OPENAI_API_KEY would leak into a local-only endpoint.
+            api_key = endpoint_row.get("api_key") or "not-needed"
+            logger.info(
+                f"Builder: routed {raw_model} to {meta.origin} endpoint "
+                f"{endpoint_row.get('label') or meta.endpoint_id}"
+            )
+
+    if base_url is None:
+        base_url = await get_builder_base_url(raw_model)
+
+    if api_key is None:
+        provider_lower = raw_model.lower()
+        if provider_lower.startswith("claude"):
+            api_key = (
+                os.getenv("BUILDER_ANTHROPIC_API_KEY")
+                or os.getenv("BUILDER_API_KEY")
+                or os.getenv("ANTHROPIC_API_KEY")
+            )
+        elif provider_lower.startswith("codex/"):
+            api_key = os.getenv("CODEX_API_KEY", "not-needed")
+        elif provider_lower.startswith("openrouter/"):
+            api_key = os.getenv("OPENROUTER_API_KEY")
+        else:
+            api_key = (
+                os.getenv("BUILDER_OPENAI_API_KEY")
+                or os.getenv("BUILDER_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+            )
 
     config = LLMConfig(
         model=raw_model,
@@ -14960,7 +14990,7 @@ async def _create_builder_llm(raw_model: str):
         top_p=settings.get("top_p"),
         top_k=settings.get("top_k"),
         reasoning_level=settings.get("reasoning_effort", "none"),
-        base_url=await get_builder_base_url(raw_model),
+        base_url=base_url,
         api_key=api_key,
         max_output_tokens=settings.get("max_tokens"),
     )

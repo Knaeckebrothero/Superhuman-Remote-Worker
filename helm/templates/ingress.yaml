@@ -381,7 +381,15 @@ spec:
 ---
 {{- end }}
 {{- if .Values.ingress.cors.enabled }}
-# CORS middleware for cross-origin API access (cockpit -> API)
+# CORS middleware for cross-origin API access (cockpit -> API).
+#
+# OFF BY DEFAULT. The orchestrator's FastAPI CORSMiddleware already
+# emits the required headers (origins come from CORS_ORIGINS, sourced
+# from srw.cockpitUrl). Layering this Traefik middleware on top produces
+# duplicate Access-Control-Allow-Origin headers, which browsers reject
+# as a CORS failure (Angular HttpClient surfaces this as "0 undefined"
+# on POST/PATCH/DELETE while GETs appear to "succeed" via catchError
+# fallbacks). Only enable if you first disable FastAPI's CORSMiddleware.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
