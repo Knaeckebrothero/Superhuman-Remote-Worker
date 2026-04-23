@@ -8879,8 +8879,11 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
         "project_ids": metadata.get("project_ids"),
         # Resolved datasources for the thread
         "datasources": await _resolve_thread_datasources(metadata),
-        # Nextcloud session folder (for workspace sync)
+        # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": thread.get("nc_session_folder"),
+        # Structured cloud-sync config (backend + webdav URL + auth).
+        # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
+        "cloud_sync": _build_agent_cloud_sync(thread),
     }
 
 
@@ -9531,6 +9534,64 @@ def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
         return backend.get_session_folder_browser_url(handle)
     except Exception:
         return None
+
+
+def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Build the ``cloud_sync`` payload the agent uses to push/pull session files.
+
+    Shape mirrors ``src/services/cloud_sync/__init__.py::build_workspace_sync``.
+    Returns ``None`` when there's no session folder or the backend is offline.
+    Never logs the auth payload.
+    """
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not handle_str:
+        return None
+    backend_id = thread.get("main_cloud_backend") or None
+    backend = main_cloud_router.for_backend(backend_id)
+    if not backend.is_initialized:
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        webdav_url = backend.get_session_folder_webdav_url(handle)
+    except Exception:
+        return None
+    if not webdav_url:
+        return None
+
+    if backend.backend_id == "nextcloud":
+        creds = backend.webdav_credentials or {}
+        if not creds.get("username") or not creds.get("password"):
+            return None
+        return {
+            "backend": "nextcloud",
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "basic",
+                "username": creds["username"],
+                "password": creds["password"],
+            },
+        }
+    if backend.backend_id == "opencloud":
+        settings = getattr(backend, "_settings", None)
+        if settings is None:
+            return None
+        try:
+            client_secret = settings.keycloak_client_secret.get_secret_value()
+        except Exception:
+            return None
+        return {
+            "backend": "opencloud",
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "keycloak_client_credentials",
+                "issuer": str(settings.keycloak_issuer).rstrip("/"),
+                "client_id": settings.keycloak_client_id,
+                "client_secret": client_secret,
+            },
+        }
+    return None
 
 
 @app.get("/api/persistent/threads/{thread_id}")
