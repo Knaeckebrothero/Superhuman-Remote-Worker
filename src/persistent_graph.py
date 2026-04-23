@@ -274,7 +274,9 @@ async def run_persistent_loop(
         turn_metrics = result.metrics if result else None
         await callbacks.on_turn_complete(turn_id, turn_metrics)
 
-        # Auto-commit workspace changes after tool-executing turns
+        # Auto-commit workspace changes after tool-executing turns.
+        # Push is throttled to every 5th turn so the upstream gets a
+        # checkpoint without paying a network round-trip per turn.
         if tool_calls_this_turn > 0 and tool_context:
             ws_mgr = getattr(tool_context, "workspace_manager", None)
             git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
@@ -282,7 +284,8 @@ async def run_persistent_loop(
                 try:
                     if git_mgr.has_uncommitted_changes():
                         git_mgr.commit(f"Auto-commit after turn {turn_id}")
-                    git_mgr.push()
+                    if turn_count % 5 == 0:
+                        git_mgr.push()
                 except Exception as e:
                     logger.debug(f"Git auto-commit/push failed (non-fatal): {e}")
 
