@@ -84,8 +84,9 @@ async def get_current_user(request: Request, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
-        # Attach transient approval flag (not stored in DB)
+        # Attach transient approval flag + preferred_username (not stored in DB)
         user["is_approved"] = is_approved
+        user["preferred_username"] = claims.get("preferred_username")
         return user
 
     # First login — create local user row
@@ -115,8 +116,24 @@ async def get_current_user(request: Request, db) -> dict:
             preferred_username=claims.get("preferred_username"),
         )
     )
-    # Attach transient approval flag (not stored in DB)
+    # Same treatment for Gitea — without this, the first thread created
+    # immediately after cockpit login hits a race where grant_user_repo_access
+    # can't find the user in Gitea yet (OIDC auto-registration only happens
+    # on first direct Gitea visit), leaving the thread repo invisible
+    # behind Gitea's 404-for-private-repos-you-can't-see behavior.
+    asyncio.create_task(
+        _ensure_gitea_user(
+            sub=sub,
+            email=email,
+            preferred_username=claims.get("preferred_username"),
+            display_name=display_name,
+        )
+    )
+    # Attach transient approval flag (not stored in DB) plus preferred_username
+    # from the claim — downstream handlers (e.g. thread creation) pass this to
+    # Gitea so ensure_user can provision with the correct login_name.
     user["is_approved"] = is_approved
+    user["preferred_username"] = claims.get("preferred_username")
     return user
 
 
@@ -148,6 +165,47 @@ async def _ensure_cloud_user(
         )
     except Exception as e:
         logger.warning("Main-cloud ensure_user failed for sub=%s: %s", sub, e)
+
+
+async def _ensure_gitea_user(
+    *,
+    sub: str,
+    email: str,
+    preferred_username: str | None,
+    display_name: str,
+) -> None:
+    """Background pre-provision a Gitea user on first cockpit login.
+
+    Mirrors _ensure_cloud_user but for Gitea. Without this, a user who
+    creates a thread immediately after signing into cockpit (but before
+    ever visiting Gitea) won't be a collaborator on their own thread
+    repo — Gitea's OIDC auto-registration only fires on direct Gitea
+    visits.
+
+    Passes ``sub`` through so Gitea stores it as login_name — that's the
+    key Gitea matches on during later direct OIDC login, preventing
+    duplicate accounts.
+
+    Imported lazily to avoid a circular import with main.
+    """
+    try:
+        from main import gitea_client  # noqa: PLC0415
+
+        if not gitea_client.is_initialized:
+            return
+        # preferred_username is the canonical Gitea login; fall back to
+        # email-localpart for clients that don't emit the claim.
+        username = preferred_username or (email.split("@")[0] if email else None)
+        if not username or not email:
+            return
+        await gitea_client.ensure_user(
+            email=email,
+            username=username,
+            full_name=display_name,
+            sub=sub,
+        )
+    except Exception as e:
+        logger.warning("Gitea ensure_user failed for email=%s: %s", email, e)
 
 
 async def _get_user_from_mcp_headers(request: Request, db) -> dict:

@@ -157,6 +157,9 @@ const CATEGORY_LABELS: Record<string, string> = {
           </a>
           <span class="header-icon">smart_toy</span>
           <span class="header-title">{{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}</span>
+          @if (chat.threadId(); as tid) {
+            <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
+          }
           <span class="status-dot" [class]="connectionClass()"></span>
           <span class="status-label">{{ connectionLabel() }}</span>
         </div>
@@ -643,6 +646,12 @@ const CATEGORY_LABELS: Record<string, string> = {
         font-size: 14px;
         font-weight: 600;
         color: var(--text-primary, #cdd6f4);
+      }
+
+      .header-session-id {
+        font-family: var(--font-mono, monospace);
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
       }
 
       .status-dot {

@@ -19,8 +19,8 @@ docker/vpn/config
 docker/vpn/cluster.conf
 docker/vpn/research.conf
 
-# Keycloak realm config (contains credentials; .example is tracked)
-docker/keycloak/realm-export.json
+# Keycloak realm config is now tracked — all secrets are ${env.VAR}
+# references resolved from .env at import time, not hardcoded in the JSON.
 
 # MCP configuration files
 .mcp.json

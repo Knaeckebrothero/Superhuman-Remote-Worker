@@ -18,7 +18,7 @@
 #
 # Prerequisites:
 #   - Copy .env.example to .env and configure API keys + VPN credentials
-#   - Copy docker/keycloak/realm-export.json.example to docker/keycloak/realm-export.json
+#     (including the OIDC_CLIENT_SECRET values — compose fails fast if unset)
 #   - Ensure GHCR images are accessible (or use docker-compose.local.yaml)
 #
 # Exposed ports:
@@ -122,14 +122,26 @@ services:
       # Admin console credentials
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      # SMTP — realm JSON resolves ${env.SMTP_*} from these at import time.
-      # Default: Proton Bridge on host machine (Podman: host.containers.internal)
+      # SMTP — Proton Bridge on host machine (Podman: host.containers.internal).
+      # (Current realm-export.json has SMTP hardcoded; these are unused until
+      # the realm JSON is converted to ${SMTP_HOST}/${SMTP_USER}/${SMTP_PASSWORD}
+      # placeholders. Left here as forward-compat hooks.)
       SMTP_HOST: "${SMTP_HOST:-host.containers.internal}"
       SMTP_USER: "${SMTP_USER:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      # OIDC client secrets — realm JSON references these as ${*_OIDC_CLIENT_SECRET}
+      # placeholders and Keycloak resolves them from these env vars at realm
+      # import time. (Keycloak 26's placeholder syntax is ${VAR}, NOT ${env.VAR}
+      # — the env. prefix is legacy and silently fails to substitute.)
+      # `:?` fails fast if any is unset so silent "invalid_client_credentials"
+      # / "client_not_found" misconfigurations surface at `up` time instead
+      # of at the first OAuth redirect.
+      GITEA_OIDC_CLIENT_SECRET: "${GITEA_OIDC_CLIENT_SECRET:?GITEA_OIDC_CLIENT_SECRET required for Keycloak realm import}"
+      NEXTCLOUD_OIDC_CLIENT_SECRET: "${NEXTCLOUD_OIDC_CLIENT_SECRET:?NEXTCLOUD_OIDC_CLIENT_SECRET required}"
+      PGADMIN_OIDC_CLIENT_SECRET: "${PGADMIN_OIDC_CLIENT_SECRET:?PGADMIN_OIDC_CLIENT_SECRET required}"
+      MCP_OIDC_CLIENT_SECRET: "${MCP_OIDC_CLIENT_SECRET:?MCP_OIDC_CLIENT_SECRET required}"
+      OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "${OPENCLOUD_KEYCLOAK_CLIENT_SECRET:?OPENCLOUD_KEYCLOAK_CLIENT_SECRET required}"
     volumes:
-      # Copy realm-export.json.example to realm-export.json and edit credentials.
-      # See docker/keycloak/realm-export.json.example for the template.
       - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
     ports:
       - "${KEYCLOAK_PORT:-8180}:8080"
