@@ -391,8 +391,7 @@ Database ports (postgres, vector, mongodb, neo4j) are internal-only in productio
 ### Prerequisites
 
 ```bash
-cp .env.example .env                                          # Configure API keys, VPN, SSO
-cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json  # Keycloak realm config
+cp .env.example .env                                          # Configure API keys, VPN, SSO, OIDC secrets
 ```
 
 ## Image Documentation

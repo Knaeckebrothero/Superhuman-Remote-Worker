@@ -82,6 +82,14 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: per-user grant for VM workspace backend (default-deny).
+-- Admins bypass this check in code; kill-switch in system_settings['vm_workspaces']
+-- overrides everyone.
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN can_use_vm BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Migration: Add keycloak_sub for OIDC user linking (SSO Phase 2)
 DO $$ BEGIN
     ALTER TABLE users ADD COLUMN keycloak_sub TEXT UNIQUE;

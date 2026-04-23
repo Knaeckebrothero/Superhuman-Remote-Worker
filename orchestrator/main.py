@@ -1411,6 +1411,44 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+async def _check_vm_permission(
+    user: dict | None,
+    *,
+    job_needs_vm: bool,
+) -> None:
+    """Enforce admin VM-workspace controls.
+
+    Raises HTTPException(403) when either:
+      - The global kill-switch `system_settings['vm_workspaces']` is set
+        to `{"enabled": false}` (blocks everyone, including admins).
+      - The user is a non-admin without `can_use_vm=True`.
+
+    No-op when ``job_needs_vm`` is False. Absent/malformed setting row is
+    treated as enabled (fail-open for fresh installs).
+    """
+    if not job_needs_vm:
+        return
+    row: dict | None = None
+    try:
+        row = await postgres_db.get_system_setting("vm_workspaces")
+    except Exception:
+        # DB read failure is non-fatal for the gate — defer to per-user check.
+        logger.exception("Failed to read vm_workspaces kill-switch; fail-open")
+    value = (row or {}).get("value") or {}
+    if isinstance(value, dict) and value.get("enabled") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="VM workspaces are globally disabled by the administrator",
+        )
+    if user and user.get("is_admin"):
+        return
+    if not user or not user.get("can_use_vm"):
+        raise HTTPException(
+            status_code=403,
+            detail="User is not permitted to use VM workspaces",
+        )
+
+
 async def _archive_and_cleanup_workspace(
     entity_id: str,
     entity_type: str = "jobs",
@@ -1599,6 +1637,32 @@ async def _try_dispatch_pending_jobs() -> None:
             for job in pending_jobs:
                 job_id = str(job["id"])
                 if _job_needs_vm(job):
+                    # Admin-gated permission check (kill-switch + per-user grant).
+                    # Re-verified here in case a grant was revoked or the
+                    # kill-switch flipped after the job was submitted. Already
+                    # running VMs aren't torn down by this check — the gate
+                    # only blocks jobs that haven't been dispatched yet.
+                    creator = None
+                    creator_id = job.get("user_id")
+                    if creator_id:
+                        try:
+                            creator = await postgres_db.get_user(str(creator_id))
+                        except Exception:
+                            creator = None
+                    try:
+                        await _check_vm_permission(creator, job_needs_vm=True)
+                    except HTTPException as permission_error:
+                        logger.error(
+                            "Dispatcher: job %s denied VM workspace: %s",
+                            job_id,
+                            permission_error.detail,
+                        )
+                        await postgres_db.update_job_status(
+                            job_id,
+                            status="failed",
+                            error_message=str(permission_error.detail),
+                        )
+                        continue
                     vm_ctx = _get_vm_context(job)
                     if not vm_ctx.get("status"):
                         # VM needed but not provisioned yet
@@ -2182,6 +2246,13 @@ class UserUpdate(BaseModel):
     display_name: str | None = None
     avatar_color: str | None = None
     email: str | None = None
+
+
+class AdminUserUpdate(BaseModel):
+    """Admin-only update body for toggling privileged user flags."""
+
+    is_admin: bool | None = None
+    can_use_vm: bool | None = None
 
 
 class McpTokenCreate(BaseModel):
@@ -3008,6 +3079,22 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                     )
                 else:
                     config_override = project_default_override
+
+        # VM permission gate: refuse at submit time so the user gets a clear
+        # 403 instead of a silent failure later in the dispatcher. The
+        # dispatcher re-checks too (in case the grant is revoked after
+        # submission) — defense in depth.
+        needs_vm = _job_needs_vm(
+            {"context": context, "config_override": config_override}
+        )
+        if needs_vm:
+            creator = None
+            if job.user_id:
+                try:
+                    creator = await postgres_db.get_user(job.user_id)
+                except Exception:
+                    creator = None
+            await _check_vm_permission(creator, job_needs_vm=True)
 
         result = await postgres_db.create_job(
             description=job.description,
@@ -9206,7 +9293,91 @@ async def create_thread(
                 thread_id,
             )
 
-        # Provision agent pod / assign from pool
+        # Run Gitea + Nextcloud setup in parallel, and AWAIT both before
+        # assigning an agent. The workspace container is already provisioning
+        # in the background above. If we fired the agent-attach first, the
+        # agent could see `status=ready` on the workspace before _setup_gitea
+        # had written `git_remote_url`, so WorkspaceManager would init a
+        # local-only repo with no origin — commits would accumulate but
+        # never push. Blocking on gather here is cheap (Gitea create_repo is
+        # ~50ms) and makes the workspace→remote wiring race-free.
+        async def _setup_gitea() -> None:
+            if not gitea_client.is_initialized and gitea_client.is_configured:
+                await gitea_client.ensure_initialized()
+            if not gitea_client.is_initialized:
+                return
+            repo_name = f"thread-{thread_id[:8]}"
+            git_remote_url = await gitea_client.create_repo(repo_name)
+            if git_remote_url:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id,
+                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
+                )
+                if user.get("email"):
+                    try:
+                        # Pass username + full_name + sub so grant_user_repo_access
+                        # can pre-provision the Gitea user if they haven't
+                        # visited Gitea directly yet. sub is used as login_name
+                        # so Gitea's OIDC matches this account on first direct
+                        # login instead of creating a duplicate.
+                        email_local = user["email"].split("@")[0]
+                        await gitea_client.grant_user_repo_access(
+                            user["email"],
+                            repo_name,
+                            username=user.get("preferred_username") or email_local,
+                            full_name=user.get("display_name"),
+                            sub=user.get("keycloak_sub"),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to grant Gitea access for thread %s: %s",
+                            thread_id,
+                            e,
+                        )
+
+        async def _setup_main_cloud() -> None:
+            backend = main_cloud_router.active
+            if not backend.is_initialized and backend.is_configured:
+                await backend.ensure_initialized()
+            if not backend.is_initialized:
+                return
+            try:
+                session_handle = await backend.ensure_session_folder(
+                    session_id=thread_id[:8]
+                )
+                share_handle = None
+                # ensure_user (not just resolve_user_identity) so we synchronously
+                # provision the cloud user record here — otherwise we race the
+                # fire-and-forget JIT task from auth.get_current_user and the
+                # share gets skipped on a user's very first session.
+                resolved_user_id = await backend.ensure_user(
+                    sub=user.get("keycloak_sub") or "",
+                    issuer=getattr(backend, "_keycloak_issuer", "") or "",
+                    email=user.get("email"),
+                    display_name=user.get("display_name"),
+                    preferred_username=user.get("preferred_username"),
+                )
+                if resolved_user_id:
+                    share_handle = await backend.share_session_folder(
+                        session_handle, resolved_user_id
+                    )
+                await postgres_db.update_thread_main_cloud(
+                    thread_id,
+                    backend_id=backend.backend_id,
+                    session_handle=session_handle.to_db(),
+                    share_handle=share_handle.to_db() if share_handle else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to provision main-cloud session folder for thread %s: %s",
+                    thread_id,
+                    e,
+                )
+
+        await asyncio.gather(_setup_gitea(), _setup_main_cloud())
+
+        # Provision agent pod / assign from pool (fires AFTER Gitea setup so
+        # the agent's workspace-readiness poll sees git_remote_url).
         # Priority: unified provisioner (K8s) → Docker Compose pool → manual
         use_k8s_agent = agent_provisioner.is_available and (
             agent_provisioner.in_cluster or not docker_provisioner.is_available
@@ -9314,67 +9485,6 @@ async def create_thread(
                 thread_id,
             )
 
-        # Run Gitea + Nextcloud setup in parallel (non-blocking services,
-        # independent of each other). This runs AFTER the workspace/agent
-        # tasks are already fired so image pull happens concurrently.
-        async def _setup_gitea() -> None:
-            if not gitea_client.is_initialized and gitea_client.is_configured:
-                await gitea_client.ensure_initialized()
-            if not gitea_client.is_initialized:
-                return
-            repo_name = f"thread-{thread_id[:8]}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id,
-                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
-                )
-                if user.get("email"):
-                    try:
-                        await gitea_client.grant_user_repo_access(
-                            user["email"], repo_name
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to grant Gitea access for thread %s: %s",
-                            thread_id,
-                            e,
-                        )
-
-        async def _setup_main_cloud() -> None:
-            backend = main_cloud_router.active
-            if not backend.is_initialized and backend.is_configured:
-                await backend.ensure_initialized()
-            if not backend.is_initialized:
-                return
-            try:
-                session_handle = await backend.ensure_session_folder(
-                    session_id=thread_id[:8]
-                )
-                share_handle = None
-                resolved_user_id = await backend.resolve_user_identity(
-                    user.get("email"),
-                    user.get("display_name", "").lower(),
-                )
-                if resolved_user_id:
-                    share_handle = await backend.share_session_folder(
-                        session_handle, resolved_user_id
-                    )
-                await postgres_db.update_thread_main_cloud(
-                    thread_id,
-                    backend_id=backend.backend_id,
-                    session_handle=session_handle.to_db(),
-                    share_handle=share_handle.to_db() if share_handle else None,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to provision main-cloud session folder for thread %s: %s",
-                    thread_id,
-                    e,
-                )
-
-        await asyncio.gather(_setup_gitea(), _setup_main_cloud())
-
         return {"thread_id": thread_id, "status": "created"}
     except HTTPException:
         raise
@@ -9476,30 +9586,33 @@ async def end_thread(
         await persistent_provisioner.delete_agent_pod(thread_id)
         await persistent_provisioner.delete_agent_pvc(thread_id)
 
-    # Clean up Gitea repo
-    repo_name = ws_ctx.get("repo_name")
-    if repo_name and gitea_client.is_initialized:
-        await gitea_client.delete_repo(repo_name)
-
-    # Clean up main-cloud session folder (and its share, if any)
-    session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
-        "nc_session_folder"
-    )
-    if session_handle_str:
-        backend = main_cloud_router.for_thread(thread)
-        if backend.is_initialized:
-            try:
-                session_handle = SessionFolderHandle.from_db(
-                    session_handle_str, backend=backend.backend_id
-                )
-                await backend.delete_session_folder(session_handle)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to delete main-cloud session folder for "
-                    f"thread {thread_id}: {e}"
-                )
-
+    # Destructive cleanup of user-visible resources runs ONLY on permanent
+    # delete. A soft "end" keeps the Gitea repo and the cloud session folder
+    # around so resume restores the thread with its data intact — the workspace
+    # container is already snapshotted to S3 above, so the file tree survives
+    # there either way.
     if permanent:
+        repo_name = ws_ctx.get("repo_name")
+        if repo_name and gitea_client.is_initialized:
+            await gitea_client.delete_repo(repo_name)
+
+        session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
+            "nc_session_folder"
+        )
+        if session_handle_str:
+            backend = main_cloud_router.for_thread(thread)
+            if backend.is_initialized:
+                try:
+                    session_handle = SessionFolderHandle.from_db(
+                        session_handle_str, backend=backend.backend_id
+                    )
+                    await backend.delete_session_folder(session_handle)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete main-cloud session folder for "
+                        f"thread {thread_id}: {e}"
+                    )
+
         await postgres_db.delete_thread(thread_id)
         return {"status": "deleted"}
 
@@ -10715,6 +10828,7 @@ def _user_dict(user: dict) -> dict:
         else None,
         "is_admin": user.get("is_admin", False),
         "is_approved": user.get("is_approved", False),
+        "can_use_vm": bool(user.get("can_use_vm", False)),
         "created_at": user["created_at"],
     }
 
@@ -12497,6 +12611,59 @@ async def delete_main_cloud_settings(request: Request) -> dict[str, Any]:
     }
 
 
+def _vm_workspaces_response(row: dict | None) -> dict[str, Any]:
+    """Shape the vm_workspaces system_settings row for API responses."""
+    value = (row or {}).get("value") or {}
+    enabled = True
+    if isinstance(value, dict) and value.get("enabled") is False:
+        enabled = False
+    updated_at = (row or {}).get("updated_at")
+    return {
+        "enabled": enabled,
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+@app.get("/api/admin/system-settings/vm_workspaces")
+async def get_vm_workspaces_settings(request: Request) -> dict[str, Any]:
+    """Return the global VM-workspaces kill-switch.
+
+    Admin-only. Absent row is reported as enabled (fail-open default).
+    """
+    await _require_admin(request)
+    try:
+        row = await postgres_db.get_system_setting("vm_workspaces")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _vm_workspaces_response(row)
+
+
+@app.put("/api/admin/system-settings/vm_workspaces")
+async def put_vm_workspaces_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Toggle the global VM-workspaces kill-switch.
+
+    Admin-only. When disabled, every VM workspace request is denied,
+    including those from admin users. Already-running VMs are not torn
+    down — the switch only blocks new dispatches.
+    """
+    admin = await _require_admin(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="`enabled` must be a boolean")
+    try:
+        row = await postgres_db.upsert_system_setting(
+            "vm_workspaces",
+            {"enabled": enabled},
+            updated_by=admin.get("email") or str(admin.get("id", "")),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _vm_workspaces_response(row)
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -12594,6 +12761,41 @@ async def delete_user(user_id: str, request: Request) -> dict[str, str]:
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
     return {"status": "deleted"}
+
+
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request) -> list[dict[str, Any]]:
+    """List all users including admin/VM flags (admin-only)."""
+    await _require_admin(request)
+    try:
+        return await postgres_db.list_users()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_patch_user(
+    user_id: str, body: AdminUserUpdate, request: Request
+) -> dict[str, str]:
+    """Toggle privileged user flags (admin-only).
+
+    Accepts partial updates of ``is_admin`` and ``can_use_vm``. Refuses
+    to let an admin clear their own ``is_admin`` flag — lockout prevention.
+    """
+    admin = await _require_admin(request)
+    if body.is_admin is False and str(admin.get("id")) == user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Admins cannot clear their own is_admin flag",
+        )
+    success = await postgres_db.update_user(
+        user_id=user_id,
+        is_admin=body.is_admin,
+        can_use_vm=body.can_use_vm,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return {"status": "updated"}
 
 
 # =============================================================================

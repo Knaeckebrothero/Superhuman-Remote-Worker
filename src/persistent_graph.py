@@ -282,10 +282,9 @@ async def run_persistent_loop(
                 try:
                     if git_mgr.has_uncommitted_changes():
                         git_mgr.commit(f"Auto-commit after turn {turn_id}")
-                    if turn_count % 5 == 0:
-                        git_mgr.push()
+                    git_mgr.push()
                 except Exception as e:
-                    logger.debug(f"Git auto-commit failed (non-fatal): {e}")
+                    logger.debug(f"Git auto-commit/push failed (non-fatal): {e}")
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "

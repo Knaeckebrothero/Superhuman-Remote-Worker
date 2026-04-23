@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Keycloak OpenCloud client seeder
+# Keycloak OpenCloud client seeder — drift repair / escape hatch
 # =============================================================================
+#
+# NOTE (2026-04-23): Fresh Docker Compose stacks now provision the OpenCloud
+# Keycloak clients automatically via docker/keycloak/realm-export.json on
+# Keycloak's first boot. For a clean deploy:
+#
+#   podman-compose down -v     # drop Keycloak DB so the realm re-imports
+#   podman-compose up -d
+#
+# This script is retained as the escape hatch for PERSISTED Keycloak DBs
+# where the realm already exists from an earlier boot and needs incremental
+# updates (e.g., you added a new client or rotated a secret without wanting
+# to wipe your local users/tokens). It is idempotent — running it against
+# a fresh-import realm is a no-op that logs "already exists".
 #
 # Creates (or verifies) the two Keycloak clients the OpenCloud backend needs:
 #
@@ -10,12 +23,9 @@
 #                               orchestrator/services/cloud/opencloud.py
 #
 # ...and makes sure the orchestrator's service-account user is a member of the
-# `opencloud-admin` group. That group membership is what gives the service
+# `opencloudAdmin` group. That group membership is what gives the service
 # account's access tokens admin privileges in OpenCloud (the proxy maps the
-# `opencloud-admin` group claim to the OpenCloud admin role).
-#
-# If the clients already exist (e.g. via realm-export.json), the script is
-# a no-op verification. Safe to re-run.
+# `opencloudAdmin` group claim to the OpenCloud admin role).
 #
 # Usage:
 #   ./docker/keycloak/setup-opencloud-client.sh

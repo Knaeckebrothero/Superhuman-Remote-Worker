@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Optional
 from urllib.parse import quote
@@ -46,22 +47,35 @@ BACKEND_ID = "opencloud"
 
 _DEFAULT_QUOTA_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
 # OpenCloud ships several roles with identical displayName ("Can edit",
-# "Can view") but different applicability — some work on Spaces, others on
-# shares or files. The `@libre.graph.weight` distinguishes them:
+# "Can view") but different applicability — some work on whole Spaces,
+# others on subfolders/files inside a Space. The `@libre.graph.weight`
+# distinguishes them:
 #
 #   "Can view"   weight=10 (shares)  / weight=40 (Spaces)
 #   "Can edit"   weight=60 (shares)  / weight=90 (Spaces) / weight=100 (files)
 #   "Can manage" weight=120 (Spaces only)
 #
-# We need the Space-applicable roles for project folder + session folder
-# invitations, so we pick by weight. The well-known UUIDs are stable across
-# OpenCloud releases (they come from the roleDefinitions compiled into the
-# binary), but we still resolve by (displayName, weight) at runtime so
-# forks that change the UUIDs keep working.
-_SPACE_EDITOR_ROLE_WEIGHT = 90  # "Can edit" — Space-applicable
-_SPACE_VIEWER_ROLE_WEIGHT = 40  # "Can view" — Space-applicable
+# The Space-weighted roles (40 / 90 / 120) target the `/drives/{id}/root/invite`
+# endpoint — i.e. granting access to a whole drive. The share-weighted roles
+# (10 / 60) target `/drives/{id}/items/{item}/invite` — i.e. a specific
+# subfolder within a drive. Using the wrong weight returns
+# `400 "role not applicable to this resource"`.
+#
+# Session folders are subfolders inside the agent-home Space, so they invite
+# with the share-weighted "Can edit" (weight=60). Project folders share the
+# whole Space with a group, so they use the Space-weighted "Can edit"
+# (weight=90).
+#
+# The well-known UUIDs are stable across OpenCloud releases (they come from
+# the roleDefinitions compiled into the binary), but we still resolve by
+# (displayName, weight) at runtime so forks that change the UUIDs keep
+# working.
+_SPACE_EDITOR_ROLE_WEIGHT = 90  # "Can edit" — whole-Space invite
+_SPACE_VIEWER_ROLE_WEIGHT = 40  # "Can view" — whole-Space invite
 _SPACE_EDITOR_ROLE_NAME = "Can edit"
 _SPACE_VIEWER_ROLE_NAME = "Can view"
+_FOLDER_EDITOR_ROLE_WEIGHT = 60  # "Can edit" — subfolder invite
+_FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
 
@@ -295,11 +309,12 @@ class OpenCloudBackend:
             return fallback
         if not email or not display_name:
             return None
+        # userType is read-only in OpenCloud's LibreGraph impl — including it
+        # yields 400 "userType is a read-only attribute". Defaults to Member.
         body: dict[str, Any] = {
             "accountEnabled": True,
             "displayName": display_name,
             "mail": email,
-            "userType": "Member",
             "identities": [
                 {"issuer": issuer, "issuerAssignedId": sub},
             ],
@@ -308,7 +323,13 @@ class OpenCloudBackend:
             body["onPremisesSamAccountName"] = preferred_username
         try:
             resp = await self._graph_post("/graph/v1.0/users", json=body)
-            if resp.status_code == 409:
+            # OpenCloud returns 400 with an error code of "nameAlreadyExists" on
+            # concurrent-create collisions (not the 409 LibreGraph docs imply).
+            # Treat both as a race — look up the user that the other caller
+            # already created instead of failing the whole provision.
+            if resp.status_code == 409 or (
+                resp.status_code == 400 and "nameAlreadyExists" in resp.text
+            ):
                 return await self._find_user_by_sub(
                     issuer, sub
                 ) or await self.resolve_user_identity(email, display_name)
@@ -658,10 +679,24 @@ class OpenCloudBackend:
                     continue
                 resp.raise_for_status()
             logger.info("Created OpenCloud session folder: %s", folder_path)
+            vendor_meta: dict[str, Any] = {"drive_id": self._agent_home_drive_id}
+            try:
+                # Capture the compound fileId so the cloud-button URL can
+                # deep-link via OpenCloud's /f/<fileId> private-link resolver.
+                # PROPFIND failure is non-fatal — URL falls back to Shares view.
+                vendor_meta["item_id"] = await self._resolve_item_id(
+                    self._agent_home_drive_id, folder_path
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not resolve item_id for new session folder %s: %s",
+                    folder_path,
+                    e,
+                )
             return SessionFolderHandle(
                 backend=self.backend_id,
                 native_id=folder_path,
-                vendor_meta={"drive_id": self._agent_home_drive_id},
+                vendor_meta=vendor_meta,
             )
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
@@ -719,8 +754,8 @@ class OpenCloudBackend:
         folder_path = handle.native_id
         try:
             role_id = await self._role_id(
-                _SPACE_EDITOR_ROLE_NAME,
-                _SPACE_EDITOR_ROLE_WEIGHT,
+                _FOLDER_EDITOR_ROLE_NAME,
+                _FOLDER_EDITOR_ROLE_WEIGHT,
             )
             item_id = await self._resolve_item_id(str(drive_id), folder_path)
             safe_drive = quote(str(drive_id), safe="")
@@ -809,22 +844,22 @@ class OpenCloudBackend:
     def get_session_folder_browser_url(
         self, handle: SessionFolderHandle
     ) -> Optional[str]:
-        """Best-effort browser link into the session folder.
+        """Best-effort browser link to the session folder for the thread owner.
 
-        Prefers the agent-home Space's authoritative ``webUrl`` (captured
-        at init) as the base, for the same reason as
-        :meth:`get_project_folder_browser_url` — OpenCloud Web routes by
-        drive alias, so the raw ``/files/spaces/<drive_id>/...`` pattern
-        silently drops the user on their personal space.
+        Session folders live in the orchestrator's ``srw-agent-home`` Space
+        and are shared with the owner via a folder-level invite. Deep-linking
+        into that Space 404s for the recipient because they are not a Space
+        member. OpenCloud's ``/f/<fileId>`` private-link resolver handles this
+        by dispatching on the viewer's effective access — a share recipient
+        gets routed to their Shares-mounted view of the same folder. Fall
+        back to the "Shared with me" list if the item_id wasn't captured
+        (older sessions created before we started storing it).
         """
-        safe_path = quote(handle.native_id, safe="/")
-        if self._agent_home_web_url:
-            return f"{self._agent_home_web_url}/{safe_path}"
-        drive_id = handle.vendor_meta.get("drive_id") or self._agent_home_drive_id
-        if not drive_id:
-            return None
-        safe_id = quote(str(drive_id), safe="")
-        return f"{self._public_url}/files/spaces/{safe_id}/{safe_path}"
+        item_id = handle.vendor_meta.get("item_id")
+        if item_id:
+            safe_id = quote(str(item_id), safe="")
+            return f"{self._public_url}/f/{safe_id}"
+        return f"{self._public_url}/files/shares/with-me"
 
     def get_session_folder_webdav_url(
         self, handle: SessionFolderHandle
@@ -1164,23 +1199,61 @@ class OpenCloudBackend:
     # ---------------------------------------------------------------- Item lookup
 
     async def _resolve_item_id(self, drive_id: str, folder_path: str) -> str:
-        """Look up a folder's LibreGraph item id by path under a drive.
+        """Look up a folder's LibreGraph item id by path, via WebDAV PROPFIND.
 
-        Uses the drives/{id}/root:/{path} syntax. Raises NOT_FOUND if the
-        folder doesn't exist.
+        Returns the compound fileid ``{drive_id}!{item_uuid}`` that the
+        ``/graph/v1beta1/drives/{id}/items/{item}/invite`` endpoint
+        expects.
+
+        We use WebDAV here instead of LibreGraph's native
+        ``/graph/v1.0/drives/{id}/root:/{path}`` form because the latter
+        returns 404 for subfolders of project Spaces on current OpenCloud
+        (tested against docker.io/opencloudeu/opencloud:latest as of
+        2026-04-23). PROPFIND on the corresponding ``/dav/spaces/`` URL
+        reliably returns the item's ``oc:fileid``, which is the compound
+        id the /invite endpoint wants.
+
+        Raises NOT_FOUND if the folder doesn't exist.
         """
+        assert self._client is not None
         safe_drive = quote(drive_id, safe="")
         safe_path = quote(folder_path.strip("/"), safe="/")
-        resp = await self._graph_get(
-            f"/graph/v1.0/drives/{safe_drive}/root:/{safe_path}",
-        )
-        data = resp.json()
-        item_id = data.get("id")
-        if not item_id:
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                f"/dav/spaces/{safe_drive}/{safe_path}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Depth": "0",
+                },
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
             raise CloudBackendError(
                 CloudBackendErrorKind.NOT_FOUND,
                 f"item {folder_path!r} not found in drive {drive_id}",
                 backend=self.backend_id,
-                raw=data,
+                status_code=404,
             )
-        return str(item_id)
+        if resp.status_code not in (200, 207):
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                (
+                    f"unexpected PROPFIND status {resp.status_code} "
+                    f"for {folder_path!r} in drive {drive_id}"
+                ),
+                backend=self.backend_id,
+                status_code=resp.status_code,
+                raw={"body": resp.text[:500]},
+            )
+        match = re.search(r"<oc:fileid>([^<]+)</oc:fileid>", resp.text)
+        if not match:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"oc:fileid missing in PROPFIND response for {folder_path!r}",
+                backend=self.backend_id,
+                raw={"body": resp.text[:500]},
+            )
+        return match.group(1)

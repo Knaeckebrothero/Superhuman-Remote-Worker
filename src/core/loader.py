@@ -1770,8 +1770,13 @@ def _create_openai_llm(
 
     # Build model kwargs
     model_kwargs = {}
-    if config.top_k is not None:
-        model_kwargs["top_k"] = config.top_k
+    # top_k is non-standard for the OpenAI Chat Completions API. Route it
+    # via extra_body so OpenAI-compatible endpoints (vLLM, Ollama, etc.)
+    # receive it in the request body; skip it for native api.openai.com
+    # since the SDK rejects unknown kwargs.
+    extra_body: dict = {}
+    if config.top_k is not None and base_url:
+        extra_body["top_k"] = config.top_k
 
     # Build kwargs for ChatOpenAI.
     # Force Chat Completions API — LangChain auto-detects Responses API for
@@ -1805,6 +1810,9 @@ def _create_openai_llm(
     # Only add model_kwargs if non-empty
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
+
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
 
     if config.max_output_tokens is not None:
         llm_kwargs["max_tokens"] = config.max_output_tokens
@@ -2173,8 +2181,11 @@ def _create_codex_llm(
 
     # Build model kwargs
     model_kwargs = {}
+    # top_k is non-standard for the OpenAI Responses API. Route it via
+    # extra_body so the proxy can forward it to the underlying provider.
+    extra_body: dict = {}
     if config.top_k is not None:
-        model_kwargs["top_k"] = config.top_k
+        extra_body["top_k"] = config.top_k
 
     # Build kwargs for ReasoningChatOpenAI.
     # The Codex proxy (CLIProxyAPI) only supports the Responses API endpoint
@@ -2211,6 +2222,9 @@ def _create_codex_llm(
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
+
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
 
     if config.max_output_tokens is not None:
         llm_kwargs["max_tokens"] = config.max_output_tokens

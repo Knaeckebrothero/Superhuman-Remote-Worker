@@ -13,6 +13,7 @@ import {SessionsPageComponent} from './simple/pages/sessions/sessions-page.compo
 import {SessionCreateComponent} from './simple/pages/session-create/session-create.component';
 import {DatasourcesPageComponent} from './simple/pages/datasources/datasources-page.component';
 import {AdminProvidersComponent} from './pages/admin/providers/providers.component';
+import {AdminUsersComponent} from './pages/admin/users/users.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 
@@ -30,6 +31,7 @@ export const routes: Routes = [
   { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
   { path: 'admin/providers', component: AdminProvidersComponent, canActivate: [authGuard, adminGuard] },
+  { path: 'admin/users', component: AdminUsersComponent, canActivate: [authGuard, adminGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
 
   // Redirects for old bookmarks
