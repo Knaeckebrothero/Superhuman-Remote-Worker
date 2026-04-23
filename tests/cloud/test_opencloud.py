@@ -149,6 +149,32 @@ class FakeOpenCloud:
             return httpx.Response(201)
         if request.method == "DELETE":
             return httpx.Response(204)
+        if request.method == "PROPFIND":
+            # `_resolve_item_id` parses <oc:fileid> out of the body; the real
+            # server returns 207 Multi-Status. The item id OpenCloud hands back
+            # is a compound ``{drive_id}!{item_uuid}``, so synthesize one that
+            # looks the part.
+            segment = path.rsplit("/", 1)[-1] or "root"
+            drive_part = ""
+            if "/dav/spaces/" in path:
+                after = path.split("/dav/spaces/", 1)[-1]
+                drive_part = after.split("/", 1)[0]
+            file_id = f"item-{drive_part}-{segment}" if drive_part else f"item-{segment}"
+            body = (
+                '<?xml version="1.0"?>'
+                '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+                "<d:response>"
+                f"<d:href>{path}</d:href>"
+                "<d:propstat><d:prop>"
+                f"<oc:fileid>{file_id}</oc:fileid>"
+                "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>"
+                "</d:response></d:multistatus>"
+            )
+            return httpx.Response(
+                207,
+                content=body.encode(),
+                headers={"Content-Type": "application/xml"},
+            )
         return httpx.Response(500, content=f"unexpected webdav call: {path}".encode())
 
     def _handle_graph(self, request: httpx.Request) -> httpx.Response:
