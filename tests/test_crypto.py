@@ -55,6 +55,19 @@ class TestKeyFormats:
         _set_key(monkeypatch, "a" * 32)
         assert crypto.decrypt(crypto.encrypt("ok")) == "ok"
 
+    def test_unpadded_base64_key_accepted(self, monkeypatch):
+        # Vault/ESO/YAML pipelines sometimes strip trailing '=' padding,
+        # producing a 43-char base64 string instead of 44. The decoder
+        # should auto-pad rather than reject outright.
+        raw = base64.b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+        _set_key(monkeypatch, raw)
+        assert crypto.decrypt(crypto.encrypt("ok")) == "ok"
+
+    def test_unpadded_urlsafe_base64_key_accepted(self, monkeypatch):
+        raw = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+        _set_key(monkeypatch, raw)
+        assert crypto.decrypt(crypto.encrypt("ok")) == "ok"
+
     def test_missing_env_raises(self, monkeypatch):
         _set_key(monkeypatch, None)
         with pytest.raises(crypto.EncryptionKeyError):

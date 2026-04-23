@@ -2825,6 +2825,30 @@ async def _unknown_model_handler(
     )
 
 
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Return a CORS-friendly 500 for any otherwise-unhandled exception.
+
+    Without this, Starlette's outermost ServerErrorMiddleware produces a
+    bare 500 that skips the CORSMiddleware on the way out. Browsers then
+    drop the response (no Access-Control-Allow-Origin header) and Angular
+    surfaces it as a status-0 "network failure" instead of a real 5xx,
+    which makes server-side bugs look like client-side connectivity
+    issues. Handling here keeps the response inside the middleware stack
+    so CORS headers are attached.
+
+    HTTPException / RequestValidationError / UnknownModelError are
+    dispatched to their own handlers first, so they don't reach here.
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+    )
+
+
 # Request logging middleware — replaces uvicorn's shallow access log with
 # app-level logging that includes response timing and error tracebacks.
 _SILENT_PATHS = {"/api/health"}
