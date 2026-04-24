@@ -61,6 +61,7 @@ class ModelMeta:
     reasoning_level: Optional[str] = None
     origin: str = "builtin"
     endpoint_id: Optional[str] = None
+    capability: str = "chat"
 
 
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
@@ -180,8 +181,8 @@ _builtin_registry: dict[str, ModelMeta] = _load_builtin_catalog()
 # startup so src/core/ stays import-free of orchestrator/database/. In
 # contexts without a DB (agent process, tests), the hooks stay None and
 # resolve_model() skips straight to the built-in catalog.
-CustomLookup = Callable[[str, str], Awaitable[Optional[dict[str, Any]]]]
-SystemLookup = Callable[[str], Awaitable[Optional[dict[str, Any]]]]
+CustomLookup = Callable[..., Awaitable[Optional[dict[str, Any]]]]
+SystemLookup = Callable[..., Awaitable[Optional[dict[str, Any]]]]
 _custom_lookup: Optional[CustomLookup] = None
 _system_lookup: Optional[SystemLookup] = None
 
@@ -189,10 +190,11 @@ _system_lookup: Optional[SystemLookup] = None
 def register_custom_lookup(fn: Optional[CustomLookup]) -> None:
     """Install (or clear) the per-user custom-endpoint lookup callable.
 
-    The callable takes (user_id, model_id) and returns either None or a
-    row dict with keys: endpoint_id, base_url, api_key, model_id,
-    display_name, family, context_window, reasoning_level. Typically wired
-    to ``postgres_db.resolve_user_llm_model`` at orchestrator startup.
+    The callable takes (user_id, model_id, capability) and returns either
+    None or a row dict with keys: endpoint_id, base_url, api_key, model_id,
+    display_name, family, context_window, reasoning_level, capability.
+    Typically wired to ``postgres_db.resolve_user_llm_model`` at orchestrator
+    startup, whose ``capability`` parameter defaults to ``'chat'``.
     """
     global _custom_lookup
     _custom_lookup = fn
@@ -201,9 +203,10 @@ def register_custom_lookup(fn: Optional[CustomLookup]) -> None:
 def register_system_lookup(fn: Optional[SystemLookup]) -> None:
     """Install (or clear) the system-scope endpoint lookup callable.
 
-    The callable takes (model_id,) and returns either None or a row dict
-    with the same shape as the custom lookup (minus user_id). Wired to
-    ``postgres_db.resolve_system_llm_model`` at orchestrator startup.
+    The callable takes (model_id, capability) and returns either None or a
+    row dict with the same shape as the custom lookup (minus user_id).
+    Wired to ``postgres_db.resolve_system_llm_model`` at orchestrator
+    startup, whose ``capability`` parameter defaults to ``'chat'``.
     """
     global _system_lookup
     _system_lookup = fn
@@ -315,6 +318,7 @@ def _endpoint_row_to_meta(row: dict[str, Any], *, origin: str) -> ModelMeta:
         reasoning_level=row.get("reasoning_level"),
         origin=origin,
         endpoint_id=str(row["endpoint_id"]),
+        capability=row.get("capability") or "chat",
     )
 
 
@@ -327,6 +331,7 @@ def _custom_row_to_meta(row: dict[str, Any]) -> ModelMeta:
 async def resolve_model(
     model_id: str,
     user_id: Optional[str] = None,
+    capability: str = "chat",
 ) -> ModelMeta:
     """Resolve a model ID to its routing metadata.
 
@@ -336,7 +341,8 @@ async def resolve_model(
         2. System-scoped endpoints (when the system lookup hook has been
            registered). Shared across all users; seeded by helm or
            managed via Admin → Providers.
-        3. Built-in catalog from config/models.yaml.
+        3. Built-in catalog from config/models.yaml (chat-capability only;
+           the built-in catalog tracks only chat models today).
         4. Miss → UnknownModelError.
 
     Args:
@@ -344,6 +350,10 @@ async def resolve_model(
             "RedHatAI/gemma-4-31B-it-FP8-Dynamic").
         user_id: Optional user UUID. Used for custom-endpoint lookup when
             a hook is registered; ignored otherwise.
+        capability: Which capability slot to resolve ('chat', 'vision',
+            'embedding', 'auxiliary', 'whisper'). Defaults to 'chat' so
+            existing callers resolving chat-completion models keep working
+            unchanged; non-chat resolvers pass explicitly.
 
     Returns:
         ModelMeta with provider/family/routing fields populated.
@@ -352,17 +362,18 @@ async def resolve_model(
         UnknownModelError: Model ID not found in any source.
     """
     if user_id and _custom_lookup is not None:
-        row = await _custom_lookup(user_id, model_id)
+        row = await _custom_lookup(user_id, model_id, capability)
         if row is not None:
             return _endpoint_row_to_meta(row, origin="custom")
 
     if _system_lookup is not None:
-        row = await _system_lookup(model_id)
+        row = await _system_lookup(model_id, capability)
         if row is not None:
             return _endpoint_row_to_meta(row, origin="system")
 
-    meta = _builtin_registry.get(model_id)
-    if meta is not None:
-        return meta
+    if capability == "chat":
+        meta = _builtin_registry.get(model_id)
+        if meta is not None:
+            return meta
 
     raise UnknownModelError(model_id)

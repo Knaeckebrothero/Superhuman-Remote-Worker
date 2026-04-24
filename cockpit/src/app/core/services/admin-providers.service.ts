@@ -5,7 +5,10 @@ import {
   ApiKeyProvider,
   ApiKeySetRequest,
   LlmEndpoint,
+  LlmEndpointBatchModelCreateRequest,
+  LlmEndpointBatchModelCreateResult,
   LlmEndpointCreateRequest,
+  LlmEndpointDiscoveryResult,
   LlmEndpointModel,
   LlmEndpointModelCreateRequest,
   LlmEndpointModelUpdateRequest,
@@ -28,7 +31,37 @@ export interface SystemApiKeyEntry {
   updated_at: string | null;
 }
 
-export type DefaultModelKind = 'builder' | 'browser' | 'citation';
+/**
+ * Admins can pin cluster-wide defaults for each of these slots via the
+ * Admin → Providers → Defaults section. Keep this in sync with the
+ * orchestrator's `VALID_DEFAULT_MODEL_KINDS` — unknown kinds are rejected
+ * server-side.
+ */
+export type DefaultModelKind =
+  | 'builder'
+  | 'browser'
+  | 'citation'
+  | 'embedding'
+  | 'vision'
+  | 'auxiliary';
+
+export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
+  'builder',
+  'browser',
+  'citation',
+  'embedding',
+  'vision',
+  'auxiliary',
+];
+
+const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
+  builder: null,
+  browser: null,
+  citation: null,
+  embedding: null,
+  vision: null,
+  auxiliary: null,
+};
 
 /**
  * REST client for the `/api/admin/providers/*` surface. Every call is gated
@@ -41,11 +74,7 @@ export class AdminProvidersService {
 
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
   readonly systemEndpoints = signal<LlmEndpoint[]>([]);
-  readonly defaults = signal<Record<DefaultModelKind, string | null>>({
-    builder: null,
-    browser: null,
-    citation: null,
-  });
+  readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
 
   // ── System API Keys ───────────────────────────────────────────────
 
@@ -126,11 +155,13 @@ export class AdminProvidersService {
   deleteSystemEndpointModel(
     endpointId: string,
     modelId: string,
+    capability: string = 'chat',
   ): Observable<{status: string}> {
+    const url =
+      `${this.baseUrl}/admin/providers/endpoints/${endpointId}/models/` +
+      `${encodeURIComponent(modelId)}?capability=${encodeURIComponent(capability)}`;
     return this.http
-      .delete<{status: string}>(
-        `${this.baseUrl}/admin/providers/endpoints/${endpointId}/models/${encodeURIComponent(modelId)}`,
-      )
+      .delete<{status: string}>(url)
       .pipe(tap(() => this.loadSystemEndpoints()));
   }
 
@@ -141,13 +172,42 @@ export class AdminProvidersService {
     );
   }
 
+  /**
+   * Fetch the model list served by `GET {base_url}/models`. The UI uses
+   * this to render a checkbox + capability dropdown per discovered model
+   * so admins don't have to type ids/display-names by hand.
+   */
+  discoverSystemEndpointModels(endpointId: string): Observable<LlmEndpointDiscoveryResult> {
+    return this.http.post<LlmEndpointDiscoveryResult>(
+      `${this.baseUrl}/admin/providers/endpoints/${endpointId}/discover`,
+      {},
+    );
+  }
+
+  /**
+   * Commit the discovery checklist — inserts multiple model rows in a
+   * single transaction. Pre-existing (model_id, capability) pairs are
+   * reported under `skipped` rather than aborting the whole import.
+   */
+  batchCreateSystemEndpointModels(
+    endpointId: string,
+    body: LlmEndpointBatchModelCreateRequest,
+  ): Observable<LlmEndpointBatchModelCreateResult> {
+    return this.http
+      .post<LlmEndpointBatchModelCreateResult>(
+        `${this.baseUrl}/admin/providers/endpoints/${endpointId}/models:batch`,
+        body,
+      )
+      .pipe(tap(() => this.loadSystemEndpoints()));
+  }
+
   // ── System Defaults ───────────────────────────────────────────────
 
   loadDefaults(): void {
     this.http
       .get<Record<DefaultModelKind, string | null>>(`${this.baseUrl}/admin/providers/defaults`)
-      .pipe(catchError(() => of({builder: null, browser: null, citation: null})))
-      .subscribe((rec) => this.defaults.set(rec));
+      .pipe(catchError(() => of({...EMPTY_DEFAULTS})))
+      .subscribe((rec) => this.defaults.set({...EMPTY_DEFAULTS, ...rec}));
   }
 
   setDefault(kind: DefaultModelKind, model: string): Observable<{kind: string; model: string | null}> {

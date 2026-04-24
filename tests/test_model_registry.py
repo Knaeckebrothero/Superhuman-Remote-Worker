@@ -216,7 +216,7 @@ class TestCustomEndpointLookup:
         """A user-registered 'gpt-4o' should route to their endpoint, not OpenAI."""
         calls = []
 
-        async def fake_lookup(user_id, model_id):
+        async def fake_lookup(user_id, model_id, capability="chat"):
             calls.append((user_id, model_id))
             return {
                 "endpoint_id": "00000000-0000-0000-0000-000000000001",
@@ -242,7 +242,7 @@ class TestCustomEndpointLookup:
 
     @pytest.mark.asyncio
     async def test_missing_custom_row_falls_back_to_builtin(self):
-        async def fake_lookup(user_id, model_id):
+        async def fake_lookup(user_id, model_id, capability="chat"):
             return None
 
         register_custom_lookup(fake_lookup)
@@ -256,7 +256,7 @@ class TestCustomEndpointLookup:
         """Even with a hook registered, None user_id never calls it."""
         hook_called = False
 
-        async def fake_lookup(user_id, model_id):
+        async def fake_lookup(user_id, model_id, capability="chat"):
             nonlocal hook_called
             hook_called = True
             return None
@@ -276,7 +276,7 @@ class TestCustomEndpointLookup:
 
     @pytest.mark.asyncio
     async def test_custom_family_default_when_null(self):
-        async def fake_lookup(user_id, model_id):
+        async def fake_lookup(user_id, model_id, capability="chat"):
             return {
                 "endpoint_id": "00000000-0000-0000-0000-000000000001",
                 "base_url": "https://x/v1",
@@ -295,7 +295,7 @@ class TestCustomEndpointLookup:
     async def test_unknown_with_hook_still_raises(self):
         """If custom lookup returns None and ID isn't built-in, still raises."""
 
-        async def fake_lookup(user_id, model_id):
+        async def fake_lookup(user_id, model_id, capability="chat"):
             return None
 
         register_custom_lookup(fake_lookup)
@@ -321,7 +321,7 @@ class TestSystemEndpointLookup:
     async def test_system_lookup_wins_over_builtin(self):
         """A seeded system endpoint for 'gpt-4o' should route there, not OpenAI."""
 
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             return {
                 "endpoint_id": "00000000-0000-0000-0000-0000000000aa",
                 "base_url": "http://vllm.ai.svc.cluster.local:8000/v1",
@@ -346,7 +346,7 @@ class TestSystemEndpointLookup:
         custom_calls = []
         system_calls = []
 
-        async def fake_custom(user_id, model_id):
+        async def fake_custom(user_id, model_id, capability="chat"):
             custom_calls.append((user_id, model_id))
             return {
                 "endpoint_id": "11111111-1111-1111-1111-111111111111",
@@ -358,7 +358,7 @@ class TestSystemEndpointLookup:
                 "reasoning_level": None,
             }
 
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             system_calls.append(model_id)
             return None
 
@@ -377,7 +377,7 @@ class TestSystemEndpointLookup:
         """System lookup is queried even when user_id is None."""
         called_with = []
 
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             called_with.append(model_id)
             return {
                 "endpoint_id": "22222222-2222-2222-2222-222222222222",
@@ -396,7 +396,7 @@ class TestSystemEndpointLookup:
 
     @pytest.mark.asyncio
     async def test_system_miss_falls_back_to_builtin(self):
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             return None
 
         register_system_lookup(fake_sys)
@@ -405,7 +405,7 @@ class TestSystemEndpointLookup:
 
     @pytest.mark.asyncio
     async def test_unknown_still_raises_with_system_hook(self):
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             return None
 
         register_system_lookup(fake_sys)
@@ -416,10 +416,10 @@ class TestSystemEndpointLookup:
     async def test_custom_miss_falls_through_to_system(self):
         """When user hook returns None, system hook still runs."""
 
-        async def fake_custom(user_id, model_id):
+        async def fake_custom(user_id, model_id, capability="chat"):
             return None
 
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             return {
                 "endpoint_id": "33333333-3333-3333-3333-333333333333",
                 "base_url": "http://sys/v1",

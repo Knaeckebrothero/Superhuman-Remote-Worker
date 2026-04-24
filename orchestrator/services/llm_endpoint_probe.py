@@ -1,0 +1,143 @@
+"""Shared probe helper for LLM endpoint connectivity + model discovery.
+
+Both the ``POST /endpoints/{id}/test`` (connectivity check) and the
+``POST /endpoints/{id}/discover`` (import flow) endpoints call into the
+same probe: ``GET {base_url}/models`` with the endpoint's Bearer token.
+The test handler cares only about success/status; the discover handler
+additionally parses the ``data`` array and attaches a capability hint
+per model so the UI can prefill the per-row capability <select>.
+
+The capability hint is a name-based heuristic, not authoritative — users
+are expected to override it at import time when the provider's naming
+convention doesn't line up (e.g., ``text-embedding-3-*`` → embedding, but
+a homegrown ``my-multimodal-8b`` would be tagged ``chat`` and the user
+flips it to ``vision`` before committing).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+
+
+@dataclass
+class ProbeResult:
+    """Outcome of probing ``GET {base_url}/models`` on an LLM endpoint.
+
+    ``models`` is empty on any non-2xx response or on parse failure; callers
+    that only care about connectivity (the ``/test`` endpoint) should
+    ignore it.
+    """
+
+    ok: bool
+    status: int | None
+    error: str | None
+    probe_url: str
+    models: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _capability_hint(model_id: str) -> str:
+    """Heuristic: map a model_id to the most likely capability slot.
+
+    Treated as a suggestion — the UI lets the user override per-row before
+    import. Pattern checks run in decreasing specificity so ``whisper`` and
+    ``embed`` hit before the ``vision``/``vl`` fallbacks.
+    """
+    name = model_id.lower()
+    if "whisper" in name:
+        return "whisper"
+    if "embed" in name or name.endswith("-embedding") or "rerank" in name:
+        # rerank has no dedicated slot today; surfacing as 'embedding' keeps
+        # it out of the chat catalog until we have a rerank consumer.
+        return "embedding"
+    if "vision" in name or "-vl" in name or "multimodal" in name:
+        return "vision"
+    # Deliberately no 'auxiliary' heuristic — auxiliary is a role, not a
+    # naming convention. Users pick which chat models should fill it.
+    return "chat"
+
+
+async def probe_endpoint_models(
+    base_url: str,
+    api_key: str | None,
+    *,
+    timeout: float = 10.0,
+) -> ProbeResult:
+    """Probe ``{base_url}/models`` and return the parsed model list.
+
+    Does not raise. Transport errors land in ``ProbeResult.error`` so both
+    the test and discover handlers can surface them without wrapping.
+    """
+    probe_url = base_url.rstrip("/") + "/models"
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(probe_url, headers=headers)
+    except httpx.HTTPError as e:
+        return ProbeResult(
+            ok=False,
+            status=None,
+            error=f"{type(e).__name__}: {e}",
+            probe_url=probe_url,
+        )
+
+    if not (200 <= resp.status_code < 300):
+        return ProbeResult(
+            ok=False,
+            status=resp.status_code,
+            error=(resp.text[:500] if resp.text else None),
+            probe_url=probe_url,
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError as e:
+        return ProbeResult(
+            ok=False,
+            status=resp.status_code,
+            error=f"Response body is not JSON: {e}",
+            probe_url=probe_url,
+        )
+
+    raw = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list):
+        return ProbeResult(
+            ok=True,
+            status=resp.status_code,
+            error=None,
+            probe_url=probe_url,
+            models=[],
+        )
+
+    models: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, str):
+            model_id = item
+            owned_by = None
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("name")
+            owned_by = item.get("owned_by") or item.get("owner")
+        else:
+            continue
+        if not model_id:
+            continue
+        models.append(
+            {
+                "id": model_id,
+                "owned_by": owned_by,
+                "capability_hint": _capability_hint(model_id),
+            }
+        )
+
+    return ProbeResult(
+        ok=True,
+        status=resp.status_code,
+        error=None,
+        probe_url=probe_url,
+        models=models,
+    )
