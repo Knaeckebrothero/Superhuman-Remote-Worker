@@ -269,23 +269,42 @@
         "colDisplayName": "Anzeigename",
         "colFamily": "Familie",
         "colContext": "Kontext",
+        "colCapability": "Fähigkeit",
         "modelIdPlaceholder": "Modell-ID (z.B. my-org/my-model)",
         "displayNamePlaceholder": "Anzeigename",
         "familyPlaceholder": "Familie (optional)",
         "contextPlaceholder": "Kontextfenster (Tokens)",
         "addModelButton": "Modell hinzufügen",
         "errorUrlScheme": "Basis-URL muss mit http:// oder https:// beginnen",
-        "errorHttpNeedsOptIn": "http://-URLs erfordern die Checkbox 'http:// erlauben'."
+        "errorHttpNeedsOptIn": "http://-URLs erfordern die Checkbox 'http:// erlauben'.",
+        "discoverButton": "Aus /v1/models entdecken",
+        "discovering": "Entdecke...",
+        "discoverOk": "{{count}} Modelle gefunden",
+        "discoverFail": "Entdeckung fehlgeschlagen: {{error}}",
+        "importSelected": "Auswahl importieren",
+        "alreadyRegistered": "bereits hinzugefügt",
+        "editCapabilityReadonly": "Fähigkeit kann nicht geändert werden — Modell löschen und neu anlegen, um es einem anderen Slot zuzuweisen.",
+        "capability": {
+          "chat": "Chat",
+          "vision": "Vision",
+          "embedding": "Embedding",
+          "auxiliary": "Hilfsmodell",
+          "whisper": "Whisper"
+        }
       },
       "defaults": {
         "title": "Standardmodelle",
         "desc": "Welches Modell verwendet wird, wenn ein Job oder Tool keines vorgibt. Jeder Typ trifft andere Workloads.",
         "unset": "— nicht gesetzt —",
         "emptyCatalog": "Der Modellkatalog ist leer. Füge oben einen Anbieter-Key oder Endpunkt hinzu, danach einen Standard auswählen.",
+        "auxiliaryGroup": "Hilfsmodelle",
         "kind": {
           "builder": "Builder (Auftrags-Autor / UI-Helfer)",
           "browser": "Browser (Recherche-Subagent)",
-          "citation": "Zitationsengine"
+          "citation": "Zitationsengine",
+          "embedding": "Embedding (Memory / Zitationsvektoren)",
+          "vision": "Vision (Bildbeschreibung)",
+          "auxiliary": "Hilfsmodell (Memory-Extraktion / Kuration / Titel)"
         }
       }
     }
