@@ -9,7 +9,7 @@ defaultNamespace: superhuman-remote-worker
 # Create a dockerconfigjson secret in fleet-default and uncomment secretName.
 helm:
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev"
-  version: "0.0.0-dev.sha.80545c2"
+  version: "0.0.0-dev.sha.1d09511"
   valuesFiles:
     - values-experimental.yaml
   # secretName: ghcr-helm-auth
