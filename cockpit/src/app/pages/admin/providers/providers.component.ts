@@ -11,6 +11,7 @@ import {ModelService} from '../../../core/services/model.service';
 import {
   ApiKeyProvider,
   LlmEndpointDiscoveryResult,
+  LlmEndpointModel,
   LlmEndpointTestResult,
   LlmModelCapability,
 } from '../../../core/models/api.model';
@@ -202,23 +203,70 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                       <span class="col-model-action"></span>
                     </div>
                     @for (model of endpoint.models; track model.id) {
-                      <div class="model-row">
-                        <span class="col-model-id mono">{{ model.model_id }}</span>
-                        <span class="col-model-name">{{ model.display_name }}</span>
-                        <span class="col-model-cap">
-                          <span class="badge">
-                            {{ ('admin.providers.endpoints.capability.' + (model.capability || 'chat')) | transloco }}
+                      @if (editingModelDbId() === model.id) {
+                        <div class="model-row model-row-editing">
+                          <span class="col-model-id mono" [title]="model.model_id">{{ model.model_id }}</span>
+                          <input
+                            type="text"
+                            class="form-input form-input-sm"
+                            [placeholder]="'admin.providers.endpoints.displayNamePlaceholder' | transloco"
+                            [(ngModel)]="editModelDisplayName"
+                          />
+                          <span class="col-model-cap" [title]="'admin.providers.endpoints.editCapabilityReadonly' | transloco">
+                            <span class="badge">
+                              {{ ('admin.providers.endpoints.capability.' + (model.capability || 'chat')) | transloco }}
+                            </span>
                           </span>
-                        </span>
-                        <span class="col-model-family">{{ model.family || '-' }}</span>
-                        <span class="col-model-ctx">{{ model.context_window || '-' }}</span>
-                        <span class="col-model-action">
-                          <button
-                            class="revoke-btn"
-                            (click)="deleteEndpointModel(endpoint.id, model.model_id, model.capability)"
-                          >{{ 'common.delete' | transloco }}</button>
-                        </span>
-                      </div>
+                          <input
+                            type="text"
+                            class="form-input form-input-sm"
+                            [placeholder]="'admin.providers.endpoints.familyPlaceholder' | transloco"
+                            [(ngModel)]="editModelFamily"
+                          />
+                          <input
+                            type="number"
+                            class="form-input form-input-sm"
+                            [placeholder]="'admin.providers.endpoints.contextPlaceholder' | transloco"
+                            [(ngModel)]="editModelContext"
+                          />
+                          <span class="col-model-action edit-actions">
+                            <button
+                              class="test-btn"
+                              (click)="saveEditModel(endpoint.id, model)"
+                              [disabled]="savingEditModel() || !editModelDisplayName.trim()"
+                            >
+                              {{ savingEditModel() ? ('common.saving' | transloco) : ('common.save' | transloco) }}
+                            </button>
+                            <button
+                              class="link-btn"
+                              (click)="cancelEditModel()"
+                              [disabled]="savingEditModel()"
+                            >{{ 'common.cancel' | transloco }}</button>
+                          </span>
+                        </div>
+                      } @else {
+                        <div class="model-row">
+                          <span class="col-model-id mono">{{ model.model_id }}</span>
+                          <span class="col-model-name">{{ model.display_name }}</span>
+                          <span class="col-model-cap">
+                            <span class="badge">
+                              {{ ('admin.providers.endpoints.capability.' + (model.capability || 'chat')) | transloco }}
+                            </span>
+                          </span>
+                          <span class="col-model-family">{{ model.family || '-' }}</span>
+                          <span class="col-model-ctx">{{ model.context_window || '-' }}</span>
+                          <span class="col-model-action actions-pair">
+                            <button
+                              class="link-btn"
+                              (click)="startEditModel(model)"
+                            >{{ 'common.edit' | transloco }}</button>
+                            <button
+                              class="revoke-btn"
+                              (click)="deleteEndpointModel(endpoint.id, model.model_id, model.capability)"
+                            >{{ 'common.delete' | transloco }}</button>
+                          </span>
+                        </div>
+                      }
                     }
                   } @else {
                     <p class="empty-state-inline">
@@ -611,12 +659,38 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
     }
     .model-row {
       display: grid;
-      grid-template-columns: 2fr 1.5fr 0.9fr 1fr 0.8fr 70px;
+      grid-template-columns: 2fr 1.5fr 0.9fr 1fr 0.8fr 130px;
       gap: 8px;
       align-items: center;
       padding: 6px 0;
       font-size: 12px;
     }
+    .model-row.model-row-editing {
+      background: rgba(137, 180, 250, 0.06);
+      border-radius: 6px;
+      padding: 8px 6px;
+    }
+    .col-model-action.actions-pair,
+    .col-model-action.edit-actions {
+      display: flex;
+      gap: 6px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+    .link-btn {
+      padding: 4px 8px;
+      background: transparent;
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 6px;
+      color: var(--text-primary, #cdd6f4);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .link-btn:hover:not(:disabled) {
+      border-color: var(--blue, #89b4fa);
+      color: var(--blue, #89b4fa);
+    }
+    .link-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .form-row.four-col > * { flex: 1; }
     .form-input-sm {
       padding: 4px 8px;
@@ -744,6 +818,15 @@ export class AdminProvidersComponent implements OnInit {
   newModelFamilies: Record<string, string> = {};
   newModelContexts: Record<string, number | null> = {};
   newModelCapabilities: Record<string, LlmModelCapability> = {};
+
+  // Inline edit-model state — only one model is edited at a time,
+  // keyed by the row's DB id. Capability is read-only (the backend
+  // uses it as a WHERE selector; changing slots means delete + re-add).
+  readonly editingModelDbId = signal<string | null>(null);
+  readonly savingEditModel = signal(false);
+  editModelDisplayName = '';
+  editModelFamily = '';
+  editModelContext: number | null = null;
 
   ngOnInit(): void {
     this.admin.loadSystemApiKeys();
@@ -878,6 +961,42 @@ export class AdminProvidersComponent implements OnInit {
   ): void {
     if (!confirm(this.transloco.translate('admin.providers.endpoints.confirmDeleteModel'))) return;
     this.admin.deleteSystemEndpointModel(endpointId, modelId, capability).subscribe();
+  }
+
+  startEditModel(model: LlmEndpointModel): void {
+    this.editingModelDbId.set(model.id);
+    this.editModelDisplayName = model.display_name;
+    this.editModelFamily = model.family ?? '';
+    this.editModelContext = model.context_window;
+  }
+
+  cancelEditModel(): void {
+    this.editingModelDbId.set(null);
+  }
+
+  saveEditModel(endpointId: string, model: LlmEndpointModel): void {
+    const displayName = this.editModelDisplayName.trim();
+    if (!displayName) return;
+    this.savingEditModel.set(true);
+    this.admin
+      .updateSystemEndpointModel(endpointId, model.model_id, {
+        display_name: displayName,
+        family: this.editModelFamily.trim() || null,
+        context_window:
+          typeof this.editModelContext === 'number' && this.editModelContext > 0
+            ? this.editModelContext
+            : null,
+        // capability is the WHERE selector on the backend — must match
+        // the current row's slot so PATCH targets the right row.
+        capability: model.capability || 'chat',
+      })
+      .subscribe({
+        next: () => {
+          this.editingModelDbId.set(null);
+          this.savingEditModel.set(false);
+        },
+        error: () => this.savingEditModel.set(false),
+      });
   }
 
   newModelCapabilityFor(endpointId: string): LlmModelCapability {

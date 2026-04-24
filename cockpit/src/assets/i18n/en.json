@@ -5,6 +5,7 @@
     "saved": "Saved",
     "delete": "Delete",
     "cancel": "Cancel",
+    "edit": "Edit",
     "copy": "Copy",
     "copied": "Copied",
     "never": "Never",
@@ -282,6 +283,7 @@
         "discoverFail": "Discovery failed: {{error}}",
         "importSelected": "Import selected",
         "alreadyRegistered": "already added",
+        "editCapabilityReadonly": "Capability can't be changed — delete and re-add to move a model to a different slot.",
         "capability": {
           "chat": "Chat",
           "vision": "Vision",
