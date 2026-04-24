@@ -244,6 +244,31 @@ CREATE TABLE IF NOT EXISTS user_llm_endpoint_models (
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_endpoint ON user_llm_endpoint_models(endpoint_id);
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_id ON user_llm_endpoint_models(model_id);
 
+-- Capability tagging: one endpoint row can back chat + embedding + vision etc.
+-- via multiple model rows with distinct capability values. Idempotent upgrade
+-- path for stacks already running the pre-capability schema.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'user_llm_endpoint_models'
+           AND column_name = 'capability'
+    ) THEN
+        ALTER TABLE user_llm_endpoint_models
+            ADD COLUMN capability TEXT NOT NULL DEFAULT 'chat'
+                CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper'));
+
+        ALTER TABLE user_llm_endpoint_models DROP CONSTRAINT IF EXISTS uq_endpoint_model;
+        ALTER TABLE user_llm_endpoint_models
+            ADD CONSTRAINT uq_endpoint_model_capability
+            UNIQUE (endpoint_id, model_id, capability);
+
+        CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_capability
+            ON user_llm_endpoint_models(capability);
+    END IF;
+END
+$$;
+
 -- ============================================================================
 -- 0j. SYSTEM API KEYS
 -- Provider-level API keys not tied to a specific user. Consulted by the

@@ -3513,7 +3513,7 @@ class PostgresDB:
             model_rows = await conn.fetch(
                 """
                 SELECT id, endpoint_id, model_id, display_name, family,
-                       context_window, reasoning_level, enabled, created_at
+                       context_window, reasoning_level, enabled, capability, created_at
                 FROM user_llm_endpoint_models
                 WHERE endpoint_id = ANY($1::uuid[])
                 ORDER BY endpoint_id, display_name
@@ -3659,11 +3659,13 @@ class PostgresDB:
         context_window: int | None = None,
         reasoning_level: str | None = None,
         enabled: bool = True,
+        capability: str = "chat",
     ) -> Dict[str, Any] | None:
         """Add a model row to an endpoint.
 
         Returns None if the endpoint doesn't belong to the user. Raises
-        asyncpg.UniqueViolationError on duplicate (endpoint_id, model_id).
+        asyncpg.UniqueViolationError on duplicate
+        (endpoint_id, model_id, capability).
         """
         # Authorize: the endpoint must belong to the caller.
         owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
@@ -3675,10 +3677,11 @@ class PostgresDB:
                 """
                 INSERT INTO user_llm_endpoint_models
                     (endpoint_id, model_id, display_name, family,
-                     context_window, reasoning_level, enabled)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     context_window, reasoning_level, enabled, capability)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id, endpoint_id, model_id, display_name, family,
-                          context_window, reasoning_level, enabled, created_at
+                          context_window, reasoning_level, enabled, capability,
+                          created_at
                 """,
                 UUID(endpoint_id),
                 model_id,
@@ -3687,6 +3690,7 @@ class PostgresDB:
                 context_window,
                 reasoning_level,
                 enabled,
+                capability,
             )
             return dict(row)
 
@@ -3700,15 +3704,22 @@ class PostgresDB:
         context_window: int | None = None,
         reasoning_level: str | None = None,
         enabled: bool | None = None,
+        capability: str = "chat",
     ) -> Dict[str, Any] | None:
-        """Patch a model row. Only non-None fields are updated."""
+        """Patch a model row. Only non-None fields are updated.
+
+        ``capability`` is a WHERE-selector (which capability variant of the
+        model row to patch), not a mutable field — defaults to 'chat' so
+        callers that never registered non-chat rows keep working unchanged.
+        Changing a row's capability is delete + re-create.
+        """
         owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
         if owner is None:
             return None
 
         sets: List[str] = []
-        args: List[Any] = [UUID(endpoint_id), model_id]
-        param_idx = 3
+        args: List[Any] = [UUID(endpoint_id), model_id, capability]
+        param_idx = 4
         for name, value in (
             ("display_name", display_name),
             ("family", family),
@@ -3726,29 +3737,39 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     SELECT id, endpoint_id, model_id, display_name, family,
-                           context_window, reasoning_level, enabled, created_at
+                           context_window, reasoning_level, enabled, capability,
+                           created_at
                     FROM user_llm_endpoint_models
-                    WHERE endpoint_id = $1 AND model_id = $2
+                    WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
                     """,
-                    *args[:2],
+                    *args[:3],
                 )
                 return dict(row) if row else None
 
         query = f"""
             UPDATE user_llm_endpoint_models
             SET {", ".join(sets)}
-            WHERE endpoint_id = $1 AND model_id = $2
+            WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
             RETURNING id, endpoint_id, model_id, display_name, family,
-                      context_window, reasoning_level, enabled, created_at
+                      context_window, reasoning_level, enabled, capability,
+                      created_at
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
             return dict(row) if row else None
 
     async def delete_user_llm_endpoint_model(
-        self, endpoint_id: str, model_id: str, user_id: str
+        self,
+        endpoint_id: str,
+        model_id: str,
+        user_id: str,
+        capability: str = "chat",
     ) -> bool:
-        """Delete a model row from an endpoint."""
+        """Delete a model row from an endpoint.
+
+        ``capability`` selects which capability variant to delete; defaults
+        to 'chat' for back-compat with pre-capability callers.
+        """
         owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
         if owner is None:
             return False
@@ -3756,21 +3777,24 @@ class PostgresDB:
             result = await conn.execute(
                 """
                 DELETE FROM user_llm_endpoint_models
-                WHERE endpoint_id = $1 AND model_id = $2
+                WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
                 """,
                 UUID(endpoint_id),
                 model_id,
+                capability,
             )
             return result == "DELETE 1"
 
     async def resolve_user_llm_model(
-        self, user_id: str, model_id: str
+        self, user_id: str, model_id: str, capability: str = "chat"
     ) -> Dict[str, Any] | None:
-        """Look up (endpoint + model) by (user_id, model_id) for dispatch.
+        """Look up (endpoint + model) by (user_id, model_id, capability) for dispatch.
 
         Returns a flat dict with the endpoint's base_url/api_key plus the
         model row's metadata, or None if no match. Used by the registry
-        to resolve custom-endpoint models.
+        to resolve custom-endpoint models. Capability defaults to ``chat``
+        so existing callers routing through chat/completions keep working
+        unchanged; callers resolving embedding/vision/etc. pass explicitly.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -3785,16 +3809,19 @@ class PostgresDB:
                     m.family,
                     m.context_window,
                     m.reasoning_level,
+                    m.capability,
                     m.enabled
                 FROM user_llm_endpoint_models m
                 JOIN user_llm_endpoints e ON e.id = m.endpoint_id
                 WHERE e.user_id = $1
                   AND m.model_id = $2
+                  AND m.capability = $3
                   AND m.enabled = TRUE
                 LIMIT 1
                 """,
                 UUID(user_id),
                 model_id,
+                capability,
             )
         if row is None:
             return None
@@ -3907,7 +3934,7 @@ class PostgresDB:
             model_rows = await conn.fetch(
                 """
                 SELECT id, endpoint_id, model_id, display_name, family,
-                       context_window, reasoning_level, enabled, created_at
+                       context_window, reasoning_level, enabled, capability, created_at
                 FROM user_llm_endpoint_models
                 WHERE endpoint_id = ANY($1::uuid[])
                 ORDER BY endpoint_id, display_name
@@ -3926,12 +3953,16 @@ class PostgresDB:
             result.append(e_dict)
         return result
 
-    async def resolve_system_llm_model(self, model_id: str) -> Dict[str, Any] | None:
-        """Look up a system-scoped (endpoint + model) by model_id for dispatch.
+    async def resolve_system_llm_model(
+        self, model_id: str, capability: str = "chat"
+    ) -> Dict[str, Any] | None:
+        """Look up a system-scoped (endpoint + model + capability) for dispatch.
 
         Returns a flat dict with the endpoint's base_url/api_key plus the
         model row's metadata, or None if no match. Registered as the
-        system-scope lookup in src/core/model_registry.py.
+        system-scope lookup in src/core/model_registry.py. Capability defaults
+        to ``chat`` to preserve existing chat-only resolution semantics;
+        embedding/vision/etc. resolvers pass the explicit value.
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -3946,15 +3977,18 @@ class PostgresDB:
                     m.family,
                     m.context_window,
                     m.reasoning_level,
+                    m.capability,
                     m.enabled
                 FROM user_llm_endpoint_models m
                 JOIN user_llm_endpoints e ON e.id = m.endpoint_id
                 WHERE e.user_id IS NULL
                   AND m.model_id = $1
+                  AND m.capability = $2
                   AND m.enabled = TRUE
                 LIMIT 1
                 """,
                 model_id,
+                capability,
             )
         if row is None:
             return None
@@ -4093,11 +4127,13 @@ class PostgresDB:
         context_window: int | None = None,
         reasoning_level: str | None = None,
         enabled: bool = True,
+        capability: str = "chat",
     ) -> Dict[str, Any] | None:
         """Add a model row to a system endpoint.
 
         Returns None if the endpoint does not exist or is user-scoped.
-        Raises asyncpg.UniqueViolationError on duplicate (endpoint_id, model_id).
+        Raises asyncpg.UniqueViolationError on duplicate
+        (endpoint_id, model_id, capability).
         """
         owner = await self.get_system_llm_endpoint(endpoint_id)
         if owner is None:
@@ -4108,10 +4144,11 @@ class PostgresDB:
                 """
                 INSERT INTO user_llm_endpoint_models
                     (endpoint_id, model_id, display_name, family,
-                     context_window, reasoning_level, enabled)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     context_window, reasoning_level, enabled, capability)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING id, endpoint_id, model_id, display_name, family,
-                          context_window, reasoning_level, enabled, created_at
+                          context_window, reasoning_level, enabled, capability,
+                          created_at
                 """,
                 UUID(endpoint_id),
                 model_id,
@@ -4120,6 +4157,7 @@ class PostgresDB:
                 context_window,
                 reasoning_level,
                 enabled,
+                capability,
             )
             return dict(row)
 
@@ -4132,15 +4170,21 @@ class PostgresDB:
         context_window: int | None = None,
         reasoning_level: str | None = None,
         enabled: bool | None = None,
+        capability: str = "chat",
     ) -> Dict[str, Any] | None:
-        """Patch a system endpoint model row. Only non-None fields are updated."""
+        """Patch a system endpoint model row. Only non-None fields are updated.
+
+        ``capability`` is a WHERE-selector for disambiguating model rows that
+        share a model_id across different capability slots; defaults to
+        'chat' so pre-capability callers keep working unchanged.
+        """
         owner = await self.get_system_llm_endpoint(endpoint_id)
         if owner is None:
             return None
 
         sets: List[str] = []
-        args: List[Any] = [UUID(endpoint_id), model_id]
-        param_idx = 3
+        args: List[Any] = [UUID(endpoint_id), model_id, capability]
+        param_idx = 4
         for name, value in (
             ("display_name", display_name),
             ("family", family),
@@ -4158,29 +4202,35 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     SELECT id, endpoint_id, model_id, display_name, family,
-                           context_window, reasoning_level, enabled, created_at
+                           context_window, reasoning_level, enabled, capability,
+                           created_at
                     FROM user_llm_endpoint_models
-                    WHERE endpoint_id = $1 AND model_id = $2
+                    WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
                     """,
-                    *args[:2],
+                    *args[:3],
                 )
                 return dict(row) if row else None
 
         query = f"""
             UPDATE user_llm_endpoint_models
             SET {", ".join(sets)}
-            WHERE endpoint_id = $1 AND model_id = $2
+            WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
             RETURNING id, endpoint_id, model_id, display_name, family,
-                      context_window, reasoning_level, enabled, created_at
+                      context_window, reasoning_level, enabled, capability,
+                      created_at
         """
         async with self.acquire() as conn:
             row = await conn.fetchrow(query, *args)
             return dict(row) if row else None
 
     async def delete_system_llm_endpoint_model(
-        self, endpoint_id: str, model_id: str
+        self, endpoint_id: str, model_id: str, capability: str = "chat"
     ) -> bool:
-        """Delete a model row from a system endpoint."""
+        """Delete a model row from a system endpoint.
+
+        ``capability`` selects which capability variant to remove; defaults
+        to 'chat' for back-compat with pre-capability callers.
+        """
         owner = await self.get_system_llm_endpoint(endpoint_id)
         if owner is None:
             return False
@@ -4188,12 +4238,92 @@ class PostgresDB:
             result = await conn.execute(
                 """
                 DELETE FROM user_llm_endpoint_models
-                WHERE endpoint_id = $1 AND model_id = $2
+                WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
                 """,
                 UUID(endpoint_id),
                 model_id,
+                capability,
             )
             return result == "DELETE 1"
+
+    async def batch_create_endpoint_models(
+        self,
+        endpoint_id: str,
+        models: list[Dict[str, Any]],
+        *,
+        skip_duplicates: bool = True,
+    ) -> Dict[str, Any]:
+        """Insert multiple model rows under an endpoint in one transaction.
+
+        The caller is responsible for authorizing access to the endpoint —
+        this helper is shared by the user-scoped and admin discovery-import
+        handlers, each of which performs its own ownership check before
+        calling in.
+
+        Each entry in ``models`` is a dict with keys:
+            model_id (required)
+            display_name (required)
+            family, context_window, reasoning_level, enabled (optional)
+            capability (optional; defaults to 'chat')
+
+        When ``skip_duplicates`` is True, rows whose
+        (endpoint_id, model_id, capability) already exist are silently
+        dropped and their ``model_id``s go into the returned ``skipped``
+        list. When False, the first duplicate aborts the transaction and
+        ``asyncpg.UniqueViolationError`` propagates to the caller.
+
+        Returns ``{created: int, skipped: list[str], created_ids: list[str]}``.
+        """
+        skipped: list[str] = []
+        created_ids: list[str] = []
+
+        async with self.acquire() as conn:
+            existing_keys: set[tuple[str, str]] = set()
+            if skip_duplicates:
+                rows = await conn.fetch(
+                    """
+                    SELECT model_id, capability
+                    FROM user_llm_endpoint_models
+                    WHERE endpoint_id = $1
+                    """,
+                    UUID(endpoint_id),
+                )
+                existing_keys = {(r["model_id"], r["capability"]) for r in rows}
+
+            async with conn.transaction():
+                for entry in models:
+                    model_id = entry["model_id"]
+                    capability = entry.get("capability", "chat")
+                    if skip_duplicates and (model_id, capability) in existing_keys:
+                        skipped.append(model_id)
+                        continue
+                    new_id = await conn.fetchval(
+                        """
+                        INSERT INTO user_llm_endpoint_models
+                            (endpoint_id, model_id, display_name, family,
+                             context_window, reasoning_level, enabled, capability)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        RETURNING id
+                        """,
+                        UUID(endpoint_id),
+                        model_id,
+                        entry["display_name"],
+                        entry.get("family"),
+                        entry.get("context_window"),
+                        entry.get("reasoning_level"),
+                        entry.get("enabled", True),
+                        capability,
+                    )
+                    created_ids.append(str(new_id))
+                    # Track within-batch dupes so the same (id, cap) listed
+                    # twice in one payload still trips skip_duplicates.
+                    existing_keys.add((model_id, capability))
+
+        return {
+            "created": len(created_ids),
+            "skipped": skipped,
+            "created_ids": created_ids,
+        }
 
     # =========================================================================
     # DEFAULT LLM MODEL HELPERS

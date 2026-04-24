@@ -113,6 +113,7 @@ from services.builder_tools import (  # noqa: E402
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_config import resolve_builder_settings  # noqa: E402
+from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
 # them here so callers don't each do lazy imports.
@@ -881,10 +882,16 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
 
         # Inject user preferences as lowest-priority config overrides
-        # (only fill gaps not set by per-job or project-level overrides)
+        # (only fill gaps not set by per-job or project-level overrides).
+        # System-settings defaults fill any gap the user didn't set — they're
+        # the admin-controlled cluster-wide fallback, still shadowed by per-job
+        # / project / user overrides so individual users can pick their own
+        # model if they prefer.
         if job.get("user_id"):
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
+            if not aux_model:
+                aux_model = await postgres_db.get_default_llm_model("auxiliary")
             if aux_model:
                 config_override = config_override or {}
                 aux_override = config_override.setdefault("auxiliary", {})
@@ -935,10 +942,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                     )
 
-            # Vision model override (injected as env var). Vision stays
-            # env-var-driven for v1 per the custom_llm_endpoints design;
-            # custom-endpoint support lands in a follow-up.
+            # Vision model override (injected as env var). User preference
+            # wins; otherwise fall back to the admin-controlled system default.
             vision_model = user_settings.get("default_vision_model")
+            if not vision_model:
+                vision_model = await postgres_db.get_default_llm_model("vision")
             if vision_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
@@ -949,9 +957,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         env_keys_block["VISION_API_KEY"] = resolved_keys[
                             vision_provider
                         ]
-                    logger.info(f"Dispatch: injected user vision model: {vision_model}")
+                    logger.info(f"Dispatch: injected vision model: {vision_model}")
 
-            # Whisper model override (injected as env var)
+            # Whisper model override (injected as env var). No system_settings
+            # fallback yet — env-var path in audio_helper is still sufficient
+            # and no consumer is asking for cluster-wide override.
             whisper_model = user_settings.get("default_whisper_model")
             if whisper_model:
                 config_override = config_override or {}
@@ -962,9 +972,14 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user whisper model: {whisper_model}"
                     )
 
-            # Embedding provider and model (per-account)
+            # Embedding provider and model (per-account). The model and
+            # provider fall back to system_settings independently — some
+            # deployments set a default model without pinning the provider,
+            # leaving it up to the agent's existing env-var resolution.
             embedding_provider = user_settings.get("embedding_provider")
             embedding_model = user_settings.get("default_embedding_model")
+            if not embedding_model:
+                embedding_model = await postgres_db.get_default_llm_model("embedding")
             if embedding_provider or embedding_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
@@ -980,7 +995,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 ):
                     env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
                 logger.info(
-                    f"Dispatch: injected user embedding: "
+                    f"Dispatch: injected embedding: "
                     f"provider={embedding_provider}, model={embedding_model}"
                 )
 
@@ -2349,6 +2364,9 @@ class LlmEndpointUpdate(BaseModel):
     allow_insecure: bool = False
 
 
+LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper")
+
+
 class LlmEndpointModelCreate(BaseModel):
     """Request body for attaching a model row to an endpoint."""
 
@@ -2364,6 +2382,14 @@ class LlmEndpointModelCreate(BaseModel):
     context_window: int | None = Field(None, ge=1000)
     reasoning_level: str | None = None
     enabled: bool = True
+    capability: Literal["chat", "vision", "embedding", "auxiliary", "whisper"] = Field(
+        "chat",
+        description=(
+            "Slot this model fills. 'chat' is the default for back-compat; "
+            "'embedding'/'vision'/'auxiliary'/'whisper' route the row to the "
+            "corresponding default-model slots in /api/models."
+        ),
+    )
 
 
 class LlmEndpointModelUpdate(BaseModel):
@@ -2374,6 +2400,23 @@ class LlmEndpointModelUpdate(BaseModel):
     context_window: int | None = Field(None, ge=1000)
     reasoning_level: str | None = None
     enabled: bool | None = None
+    capability: (
+        Literal["chat", "vision", "embedding", "auxiliary", "whisper"] | None
+    ) = None
+
+
+class LlmEndpointBatchModelCreate(BaseModel):
+    """Batch-import model rows under an endpoint — powers the discovery UI."""
+
+    models: list[LlmEndpointModelCreate] = Field(..., min_length=1)
+    skip_duplicates: bool = Field(
+        True,
+        description=(
+            "When True (default), pre-existing (endpoint, model_id, capability) "
+            "rows are skipped and reported in 'skipped'. When False, the first "
+            "conflict raises 409 and nothing is committed."
+        ),
+    )
 
 
 class AdminDefaultModelSet(BaseModel):
@@ -2387,7 +2430,18 @@ class AdminDefaultModelSet(BaseModel):
     model: str = Field(..., description="Model ID; empty string clears the default")
 
 
-VALID_DEFAULT_MODEL_KINDS = {"builder", "browser", "citation"}
+# Slots admins can pin cluster-wide via Admin → Providers → Defaults. The
+# system_settings key pattern is ``llm.default_<kind>_model``. ``whisper``
+# is deliberately absent — env var path in audio_helper still covers it and
+# no consumer is asking for a DB-backed override yet.
+VALID_DEFAULT_MODEL_KINDS = {
+    "builder",
+    "browser",
+    "citation",
+    "embedding",
+    "vision",
+    "auxiliary",
+}
 
 # System-scoped API keys only cover shared providers. Codex auth is
 # user-bound through the proxy and isn't appropriate for a system key.
@@ -11223,6 +11277,7 @@ def _serialize_endpoint_model(row: dict[str, Any]) -> dict[str, Any]:
         "context_window": row.get("context_window"),
         "reasoning_level": row.get("reasoning_level"),
         "enabled": row.get("enabled", True),
+        "capability": row.get("capability") or "chat",
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
     }
 
@@ -11313,12 +11368,16 @@ async def create_llm_endpoint_model(
             context_window=body.context_window,
             reasoning_level=body.reasoning_level,
             enabled=body.enabled,
+            capability=body.capability,
         )
     except Exception as e:
         if "uq_endpoint_model" in str(e):
             raise HTTPException(
                 status_code=409,
-                detail=f"Model {body.model_id!r} is already attached to this endpoint.",
+                detail=(
+                    f"Model {body.model_id!r} with capability {body.capability!r} "
+                    "is already attached to this endpoint."
+                ),
             )
         raise
     if row is None:
@@ -11343,6 +11402,7 @@ async def update_llm_endpoint_model(
         context_window=body.context_window,
         reasoning_level=body.reasoning_level,
         enabled=body.enabled,
+        capability=body.capability or "chat",
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Endpoint model not found")
@@ -11351,13 +11411,17 @@ async def update_llm_endpoint_model(
 
 @app.delete("/api/settings/llm-endpoints/{endpoint_id}/models/{model_id:path}")
 async def delete_llm_endpoint_model(
-    request: Request, endpoint_id: str, model_id: str
+    request: Request,
+    endpoint_id: str,
+    model_id: str,
+    capability: str = "chat",
 ) -> dict[str, str]:
     user = await require_approved_user(request, postgres_db)
     deleted = await postgres_db.delete_user_llm_endpoint_model(
         endpoint_id=endpoint_id,
         model_id=model_id,
         user_id=str(user["id"]),
+        capability=capability,
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="Endpoint model not found")
@@ -11379,28 +11443,83 @@ async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any
     if endpoint is None:
         raise HTTPException(status_code=404, detail="Endpoint not found")
 
-    probe_url = endpoint["base_url"].rstrip("/") + "/models"
-    headers = {}
-    if endpoint.get("api_key"):
-        headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+    }
+
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/models:batch")
+async def batch_create_llm_endpoint_models(
+    request: Request, endpoint_id: str, body: LlmEndpointBatchModelCreate
+) -> dict[str, Any]:
+    """Bulk-import model rows under a user-scoped endpoint (import flow).
+
+    Powers the "Discover → select → import" UX. See
+    ``LlmEndpointBatchModelCreate`` for the request shape and the ``batch_
+    create_endpoint_models`` DB helper for duplicate handling semantics.
+    """
+    user = await require_approved_user(request, postgres_db)
+    endpoint = await postgres_db.get_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(probe_url, headers=headers)
-    except httpx.HTTPError as e:
-        return {
-            "ok": False,
-            "status": None,
-            "error": f"{type(e).__name__}: {e}",
-            "probe_url": probe_url,
-        }
+        result = await postgres_db.batch_create_endpoint_models(
+            endpoint_id=endpoint_id,
+            models=[m.model_dump() for m in body.models],
+            skip_duplicates=body.skip_duplicates,
+        )
+    except Exception as e:
+        if "uq_endpoint_model" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="One or more (model_id, capability) pairs already exist.",
+            )
+        raise
+    return result
 
-    body_preview = resp.text[:500] if resp.text else ""
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/discover")
+async def discover_llm_endpoint_models(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Return the model list served by ``GET {base_url}/models``.
+
+    Each discovered model carries a ``capability_hint`` suggestion (chat /
+    vision / embedding / whisper) derived from the model_id; the UI uses it
+    as the default selection in the import checklist. ``already_registered``
+    is the subset of discovered model_ids that already have at least one
+    row under this endpoint, letting the UI mark them as imported.
+    """
+    user = await require_approved_user(request, postgres_db)
+    endpoint = await postgres_db.get_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+
+    already_registered: set[str] = {m["model_id"] for m in endpoint.get("models", [])}
     return {
-        "ok": 200 <= resp.status_code < 300,
-        "status": resp.status_code,
-        "error": None if resp.is_success else body_preview,
-        "probe_url": probe_url,
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+        "models": result.models,
+        "already_registered": sorted(already_registered),
     }
 
 
@@ -11550,13 +11669,15 @@ async def admin_create_provider_endpoint_model(
             context_window=body.context_window,
             reasoning_level=body.reasoning_level,
             enabled=body.enabled,
+            capability=body.capability,
         )
     except Exception as e:
         if "uq_endpoint_model" in str(e):
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Model {body.model_id!r} is already attached to this endpoint."
+                    f"Model {body.model_id!r} with capability {body.capability!r} "
+                    "is already attached to this endpoint."
                 ),
             )
         raise
@@ -11581,6 +11702,7 @@ async def admin_update_provider_endpoint_model(
         context_window=body.context_window,
         reasoning_level=body.reasoning_level,
         enabled=body.enabled,
+        capability=body.capability or "chat",
     )
     if row is None:
         raise HTTPException(status_code=404, detail="System endpoint model not found")
@@ -11589,11 +11711,14 @@ async def admin_update_provider_endpoint_model(
 
 @app.delete("/api/admin/providers/endpoints/{endpoint_id}/models/{model_id:path}")
 async def admin_delete_provider_endpoint_model(
-    request: Request, endpoint_id: str, model_id: str
+    request: Request,
+    endpoint_id: str,
+    model_id: str,
+    capability: str = "chat",
 ) -> dict[str, str]:
     await _require_admin(request)
     deleted = await postgres_db.delete_system_llm_endpoint_model(
-        endpoint_id=endpoint_id, model_id=model_id
+        endpoint_id=endpoint_id, model_id=model_id, capability=capability
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="System endpoint model not found")
@@ -11610,28 +11735,72 @@ async def admin_test_provider_endpoint(
     if endpoint is None:
         raise HTTPException(status_code=404, detail="System endpoint not found")
 
-    probe_url = endpoint["base_url"].rstrip("/") + "/models"
-    headers = {}
-    if endpoint.get("api_key"):
-        headers["Authorization"] = f"Bearer {endpoint['api_key']}"
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+    }
+
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/models:batch")
+async def admin_batch_create_provider_endpoint_models(
+    request: Request, endpoint_id: str, body: LlmEndpointBatchModelCreate
+) -> dict[str, Any]:
+    """Bulk-import model rows under a system-scoped endpoint (admin)."""
+    await _require_admin(request)
+    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(probe_url, headers=headers)
-    except httpx.HTTPError as e:
-        return {
-            "ok": False,
-            "status": None,
-            "error": str(e),
-            "probe_url": probe_url,
-        }
+        result = await postgres_db.batch_create_endpoint_models(
+            endpoint_id=endpoint_id,
+            models=[m.model_dump() for m in body.models],
+            skip_duplicates=body.skip_duplicates,
+        )
+    except Exception as e:
+        if "uq_endpoint_model" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="One or more (model_id, capability) pairs already exist.",
+            )
+        raise
+    return result
 
-    body_preview = resp.text[:500] if resp.text else ""
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/discover")
+async def admin_discover_provider_endpoint_models(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Return the model list served by ``GET {base_url}/models`` (admin).
+
+    See the user-scoped ``/api/settings/llm-endpoints/{id}/discover`` for
+    the response shape — the admin variant is identical, operating on
+    system-scoped endpoints.
+    """
+    await _require_admin(request)
+    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+
+    already_registered: set[str] = {m["model_id"] for m in endpoint.get("models", [])}
     return {
-        "ok": 200 <= resp.status_code < 300,
-        "status": resp.status_code,
-        "error": None if resp.is_success else body_preview,
-        "probe_url": probe_url,
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+        "models": result.models,
+        "already_registered": sorted(already_registered),
     }
 
 
@@ -12052,66 +12221,76 @@ async def list_available_models(
                         hm["id"] = overrides[hm["id"]]
                         hm["configured"] = True
 
-    # Merge system-scoped LLM endpoints as "System: <label>" groups. These
-    # are seeded by helm or managed via Admin → Providers, and are visible
-    # to every user. Always configured (key lives on the endpoint row).
+    # Merge endpoint-backed models into the catalog, split by capability:
+    # * 'chat'       → provider group + builder_models (chat catalog)
+    # * 'vision'     → vision_models sibling array
+    # * 'embedding'  → embedding_models sibling array
+    # * 'auxiliary'  → auxiliary_models sibling array (chat-compatible;
+    #                  surfacing it in the main catalog would duplicate the
+    #                  same model under two rows, so the auxiliary slot is
+    #                  the only place it shows up)
+    # * 'whisper'    → whisper_models sibling array
+    # Chat models never auto-appear in the auxiliary list — the UI resolves
+    # auxiliary slot dropdowns against chat + auxiliary combined.
+    def _merge_endpoint_models(
+        endpoint: dict[str, Any], group_prefix: str, provider_tag: str
+    ) -> None:
+        enabled_models = [
+            m for m in endpoint.get("models", []) if m.get("enabled", True)
+        ]
+        if not enabled_models:
+            return
+        chat_rows = [
+            m for m in enabled_models if (m.get("capability") or "chat") == "chat"
+        ]
+        if chat_rows:
+            groups.append(
+                {
+                    "group": f"{group_prefix}: {endpoint['label']}",
+                    "provider": provider_tag,
+                    "endpoint_id": str(endpoint["id"]),
+                    "configured": True,
+                    "models": [m["model_id"] for m in chat_rows],
+                }
+            )
+            builder_models.extend(
+                {
+                    "label": f"{m['display_name']} ({endpoint['label']})",
+                    "id": m["model_id"],
+                    "configured": True,
+                }
+                for m in chat_rows
+            )
+
+        for m in enabled_models:
+            cap = m.get("capability") or "chat"
+            if cap == "chat":
+                continue
+            row = {
+                "id": m["model_id"],
+                "label": f"{m['display_name']} ({endpoint['label']})",
+                "configured": True,
+            }
+            if cap == "vision":
+                vision.append(row)
+            elif cap == "embedding":
+                embedding.append(row)
+            elif cap == "auxiliary":
+                auxiliary.append(row)
+            elif cap == "whisper":
+                whisper.append(row)
+
+    # System-scoped LLM endpoints (seeded by helm or managed via Admin →
+    # Providers, visible to every user). Always configured because the key
+    # lives on the endpoint row, not in resolved_keys.
     system_endpoints = await postgres_db.list_system_llm_endpoints()
     for endpoint in system_endpoints:
-        enabled_models = [
-            m for m in endpoint.get("models", []) if m.get("enabled", True)
-        ]
-        if not enabled_models:
-            continue
-        group_name = f"System: {endpoint['label']}"
-        group_models = [m["model_id"] for m in enabled_models]
-        groups.append(
-            {
-                "group": group_name,
-                "provider": "system",
-                "endpoint_id": str(endpoint["id"]),
-                "configured": True,
-                "models": group_models,
-            }
-        )
-        builder_models.extend(
-            {
-                "label": f"{m['display_name']} ({endpoint['label']})",
-                "id": m["model_id"],
-                "configured": True,
-            }
-            for m in enabled_models
-        )
+        _merge_endpoint_models(endpoint, "System", "system")
 
-    # Merge the user's custom LLM endpoints as "Custom: <label>" groups.
-    # Custom models are always configured (their api_key lives on the endpoint
-    # row, not in resolved_keys) and are treated as OpenAI-compatible.
+    # The user's own custom LLM endpoints.
     user_endpoints = await postgres_db.list_user_llm_endpoints(user_id)
     for endpoint in user_endpoints:
-        enabled_models = [
-            m for m in endpoint.get("models", []) if m.get("enabled", True)
-        ]
-        if not enabled_models:
-            continue
-        group_name = f"Custom: {endpoint['label']}"
-        group_models = [m["model_id"] for m in enabled_models]
-        groups.append(
-            {
-                "group": group_name,
-                "provider": "custom",
-                "endpoint_id": str(endpoint["id"]),
-                "configured": True,
-                "models": group_models,
-            }
-        )
-        # Custom models are available in the builder too.
-        builder_models.extend(
-            {
-                "label": f"{m['display_name']} ({endpoint['label']})",
-                "id": m["model_id"],
-                "configured": True,
-            }
-            for m in enabled_models
-        )
+        _merge_endpoint_models(endpoint, "Custom", "custom")
 
     return {
         "groups": groups,

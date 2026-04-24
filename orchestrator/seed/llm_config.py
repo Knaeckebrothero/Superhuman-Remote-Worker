@@ -37,6 +37,10 @@ Payload shape::
             family: "gemma"
             contextWindow: 128000
             reasoningLevel: null
+            capability: chat             # optional; defaults to 'chat'
+          - id: "qwen3-embedding-8b"
+            displayName: "Qwen3 Embedding 8B"
+            capability: embedding        # routes to Admin → Defaults → Embedding
 
 ``apiKeyEnv`` lets helm keep the payload ConfigMap plaintext-free: the Job pod
 mounts the referenced Secret via ``envFrom`` and the seeder resolves the
@@ -202,12 +206,15 @@ async def _seed_endpoints(
                 key_prefix=(api_key[:8] if api_key else None),
             )
             endpoint_id = str(created["id"])
-            existing_model_ids: set[str] = set()
+            existing_model_keys: set[tuple[str, str]] = set()
             report.endpoints_seeded.append(label)
             logger.info("seeded system endpoint %s (%s)", label, base_url)
         else:
             endpoint_id = str(existing["id"])
-            existing_model_ids = {m["model_id"] for m in existing.get("models", [])}
+            existing_model_keys = {
+                (m["model_id"], m.get("capability") or "chat")
+                for m in existing.get("models", [])
+            }
             report.endpoints_skipped.append(label)
             logger.info("endpoint %s already present — leaving untouched", label)
 
@@ -218,7 +225,8 @@ async def _seed_endpoints(
                     "skipping model entry under %s — id missing: %r", label, model
                 )
                 continue
-            if model_id in existing_model_ids:
+            capability = model.get("capability", "chat")
+            if (model_id, capability) in existing_model_keys:
                 report.models_skipped.append((label, model_id))
                 continue
             await db.create_system_llm_endpoint_model(
@@ -233,10 +241,16 @@ async def _seed_endpoints(
                 reasoning_level=model.get("reasoningLevel")
                 or model.get("reasoning_level"),
                 enabled=model.get("enabled", True),
+                capability=capability,
             )
-            existing_model_ids.add(model_id)
+            existing_model_keys.add((model_id, capability))
             report.models_seeded.append((label, model_id))
-            logger.info("seeded model %s under endpoint %s", model_id, label)
+            logger.info(
+                "seeded model %s (capability=%s) under endpoint %s",
+                model_id,
+                capability,
+                label,
+            )
 
 
 async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:

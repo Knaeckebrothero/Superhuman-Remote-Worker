@@ -73,7 +73,7 @@ class TestGetBuilderBaseUrl:
         """Registry-resolved URL beats env vars."""
         monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example/v1")
 
-        async def fake_sys(model_id):
+        async def fake_sys(model_id, capability="chat"):
             return {
                 "endpoint_id": "aa",
                 "base_url": "http://vllm.svc/v1",
@@ -82,6 +82,7 @@ class TestGetBuilderBaseUrl:
                 "family": "gemma",
                 "context_window": 128000,
                 "reasoning_level": None,
+                "capability": capability,
             }
 
         register_system_lookup(fake_sys)
