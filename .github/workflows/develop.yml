@@ -128,10 +128,13 @@ jobs:
         # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
         # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
         #   arxiv pins requests<2.33.0 so we can't upgrade until arxiv releases a fix
+        # CVE-2026-3219: pip treats concatenated tar+ZIP files as ZIP — no fix released;
+        #   requires a maliciously crafted package, not exposed via our install flow
         run: >-
           pip-audit --desc
           --ignore-vuln CVE-2026-4539
           --ignore-vuln CVE-2026-25645
+          --ignore-vuln CVE-2026-3219
       - name: Audit npm dependencies
         working-directory: cockpit
         # lodash-es 4.17.23 is the latest release; no fix available.

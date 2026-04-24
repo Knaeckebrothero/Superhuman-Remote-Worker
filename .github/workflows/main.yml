@@ -104,6 +104,7 @@ jobs:
           pip-audit --desc
           --ignore-vuln CVE-2026-4539
           --ignore-vuln CVE-2026-25645
+          --ignore-vuln CVE-2026-3219
       - name: Audit npm dependencies
         working-directory: cockpit
         run: |
