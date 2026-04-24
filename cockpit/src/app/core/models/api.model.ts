@@ -199,6 +199,18 @@ export interface ApiKeySetRequest {
 // =============================================================================
 
 /**
+ * Which slot a model fills. Chat is the default; non-chat rows are routed
+ * to the matching Admin → Defaults selector (embedding/vision/whisper) or
+ * used as auxiliary LLMs for memory extraction / curation / title gen.
+ */
+export type LlmModelCapability =
+  | 'chat'
+  | 'vision'
+  | 'embedding'
+  | 'auxiliary'
+  | 'whisper';
+
+/**
  * A single model attached to an LLM endpoint.
  * Matches orchestrator `_serialize_endpoint_model`.
  */
@@ -211,6 +223,7 @@ export interface LlmEndpointModel {
   context_window: number | null;
   reasoning_level: string | null;
   enabled: boolean;
+  capability: LlmModelCapability;
   created_at: string | null;
 }
 
@@ -250,6 +263,7 @@ export interface LlmEndpointModelCreateRequest {
   context_window?: number | null;
   reasoning_level?: string | null;
   enabled?: boolean;
+  capability?: LlmModelCapability;
 }
 
 export interface LlmEndpointModelUpdateRequest {
@@ -258,6 +272,24 @@ export interface LlmEndpointModelUpdateRequest {
   context_window?: number | null;
   reasoning_level?: string | null;
   enabled?: boolean | null;
+  capability?: LlmModelCapability | null;
+}
+
+/**
+ * Batch import body for the discovery → checkbox → import flow.
+ * POSTs to /endpoints/{id}/models:batch. When skip_duplicates is true
+ * (default), (model_id, capability) pairs that already exist are reported
+ * under `skipped` rather than failing the whole request.
+ */
+export interface LlmEndpointBatchModelCreateRequest {
+  models: LlmEndpointModelCreateRequest[];
+  skip_duplicates?: boolean;
+}
+
+export interface LlmEndpointBatchModelCreateResult {
+  created: number;
+  skipped: string[];
+  created_ids: string[];
 }
 
 /**
@@ -268,6 +300,26 @@ export interface LlmEndpointTestResult {
   status: number | null;
   error: string | null;
   probe_url: string;
+}
+
+/**
+ * A single model surfaced by `GET {base_url}/models` via the discovery
+ * endpoint. `capability_hint` is a server-side heuristic; the UI lets the
+ * user override per-row before committing the batch import.
+ */
+export interface LlmEndpointDiscoveredModel {
+  id: string;
+  owned_by: string | null;
+  capability_hint: LlmModelCapability;
+}
+
+export interface LlmEndpointDiscoveryResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string;
+  models: LlmEndpointDiscoveredModel[];
+  already_registered: string[];
 }
 
 /**

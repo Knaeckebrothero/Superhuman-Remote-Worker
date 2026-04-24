@@ -494,6 +494,13 @@ llm:
     # local gateways). Visible to every user. `apiKeyRef` is optional — omit
     # for keyless endpoints like in-cluster vLLM.
     #
+    # `capability` on each model is optional and defaults to `chat`. Set it
+    # to `embedding`, `vision`, `auxiliary`, or `whisper` to route the row
+    # to the matching slot in Admin → Providers → Defaults. A single endpoint
+    # can back multiple capabilities (e.g., Groq serving chat + whisper, or
+    # OpenRouter serving chat + embedding) by listing the same `apiKeyRef`
+    # once and adding one model row per capability.
+    #
     # systemEndpoints:
     #   - label: "Local Gemma"
     #     baseUrl: "http://vllm.ai.svc.cluster.local:8000/v1"
@@ -506,6 +513,10 @@ llm:
     #         family: "gemma"
     #         contextWindow: 128000
     #         reasoningLevel: null
+    #         capability: chat           # default; explicit for clarity
+    #       - id: "qwen3-embedding-8b"
+    #         displayName: "Qwen3 Embedding 8B"
+    #         capability: embedding
     systemEndpoints: []
 
     # -- Resource requests for the short-lived seed Job pod.

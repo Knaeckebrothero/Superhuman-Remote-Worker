@@ -98,8 +98,16 @@ class TestProviderWhitelist:
 
 
 class TestDefaultModelKinds:
-    def test_covers_builder_browser_citation(self):
-        assert VALID_DEFAULT_MODEL_KINDS == {"builder", "browser", "citation"}
+    def test_covers_core_workload_kinds(self):
+        # Chat-slot defaults (always present).
+        assert {"builder", "browser", "citation"}.issubset(VALID_DEFAULT_MODEL_KINDS)
+        # Non-chat slots added with the capability extension.
+        assert {"embedding", "vision", "auxiliary"}.issubset(VALID_DEFAULT_MODEL_KINDS)
+
+    def test_whisper_is_not_a_system_default(self):
+        # Env-var path in audio_helper still covers whisper; no admin demand
+        # for cluster-wide override. Revisit when a consumer appears.
+        assert "whisper" not in VALID_DEFAULT_MODEL_KINDS
 
 
 # ---------------------------------------------------------------------------

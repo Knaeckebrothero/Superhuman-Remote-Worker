@@ -268,23 +268,41 @@
         "colDisplayName": "Display name",
         "colFamily": "Family",
         "colContext": "Context",
+        "colCapability": "Capability",
         "modelIdPlaceholder": "Model ID (e.g. my-org/my-model)",
         "displayNamePlaceholder": "Display name",
         "familyPlaceholder": "Family (optional)",
         "contextPlaceholder": "Context window (tokens)",
         "addModelButton": "Add Model",
         "errorUrlScheme": "Base URL must start with http:// or https://",
-        "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox."
+        "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox.",
+        "discoverButton": "Discover from /v1/models",
+        "discovering": "Discovering...",
+        "discoverOk": "Found {{count}} models",
+        "discoverFail": "Discovery failed: {{error}}",
+        "importSelected": "Import selected",
+        "alreadyRegistered": "already added",
+        "capability": {
+          "chat": "Chat",
+          "vision": "Vision",
+          "embedding": "Embedding",
+          "auxiliary": "Auxiliary",
+          "whisper": "Whisper"
+        }
       },
       "defaults": {
         "title": "Default Models",
         "desc": "Which model to use when a job or tool doesn't specify one. Each kind applies to a different workload.",
         "unset": "— not set —",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
+        "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {
           "builder": "Builder (job authoring / UI helper)",
           "browser": "Browser (research subagent)",
-          "citation": "Citation engine"
+          "citation": "Citation engine",
+          "embedding": "Embedding (memory / citation vectors)",
+          "vision": "Vision (image description)",
+          "auxiliary": "Auxiliary (memory extraction / curation / titles)"
         }
       }
     }

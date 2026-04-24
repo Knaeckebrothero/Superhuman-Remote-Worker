@@ -55,7 +55,7 @@ class TestResolveFromDB:
     async def test_uses_registry_base_url_when_resolved(self, monkeypatch):
         from src.core.model_registry import ModelMeta, register_system_lookup
 
-        async def fake_lookup(model_id):
+        async def fake_lookup(model_id, capability="chat"):
             return {
                 "endpoint_id": "ep-1",
                 "base_url": "http://vllm.svc/v1",
