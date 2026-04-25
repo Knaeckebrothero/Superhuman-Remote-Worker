@@ -15,6 +15,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -942,35 +943,34 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                     )
 
-            # Vision model override (injected as env var). User preference
-            # wins; otherwise fall back to the admin-controlled system default.
-            vision_model = user_settings.get("default_vision_model")
-            if not vision_model:
-                vision_model = await postgres_db.get_default_llm_model("vision")
-            if vision_model:
+            # Helper-capability env-var injection (vision / whisper / tts).
+            # Each routes through _inject_env_key_credentials which handles
+            # both built-in models (api_key from resolved_keys[provider]) and
+            # endpoint-registry-backed models (base_url + api_key inlined
+            # from the endpoint row). User preference wins; otherwise the
+            # admin-controlled system_settings default fills the gap.
+            for _kind, _prefix, _user_key in (
+                ("vision", "VISION", "default_vision_model"),
+                ("whisper", "WHISPER", "default_whisper_model"),
+                ("tts", "TTS", "default_tts_model"),
+            ):
+                _model = user_settings.get(_user_key)
+                if not _model:
+                    _model = await postgres_db.get_default_llm_model(_kind)
+                if not _model:
+                    continue
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
-                if "VISION_MODEL" not in env_keys_block:
-                    env_keys_block["VISION_MODEL"] = vision_model
-                    vision_provider = _provider_of_model(vision_model) or "openai"
-                    if resolved_keys and vision_provider in resolved_keys:
-                        env_keys_block["VISION_API_KEY"] = resolved_keys[
-                            vision_provider
-                        ]
-                    logger.info(f"Dispatch: injected vision model: {vision_model}")
-
-            # Whisper model override (injected as env var). No system_settings
-            # fallback yet — env-var path in audio_helper is still sufficient
-            # and no consumer is asking for cluster-wide override.
-            whisper_model = user_settings.get("default_whisper_model")
-            if whisper_model:
-                config_override = config_override or {}
-                env_keys_block = config_override.setdefault("env_keys", {})
-                if "WHISPER_MODEL" not in env_keys_block:
-                    env_keys_block["WHISPER_MODEL"] = whisper_model
-                    logger.info(
-                        f"Dispatch: injected user whisper model: {whisper_model}"
-                    )
+                if f"{_prefix}_MODEL" in env_keys_block:
+                    continue
+                await _inject_env_key_credentials(
+                    env_keys=env_keys_block,
+                    prefix=_prefix,
+                    model_id=_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(f"Dispatch: injected {_kind} model: {_model}")
 
             # Embedding provider and model (per-account). The model and
             # provider fall back to system_settings independently — some
@@ -1607,6 +1607,45 @@ async def _inject_model_credentials(
         and "api_key" not in section
     ):
         section["api_key"] = resolved_keys[provider]
+
+
+async def _inject_env_key_credentials(
+    *,
+    env_keys: dict,
+    prefix: str,
+    model_id: str,
+    user_id: str | None,
+    resolved_keys: dict[str, str] | None,
+) -> None:
+    """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
+
+    Sibling of ``_inject_model_credentials`` for capabilities that travel as
+    flat env vars (vision, whisper, tts, ...) rather than structured config
+    sections. Endpoint-backed models (origin in {'custom','system'})
+    contribute the inline base_url+api_key from the endpoint row;
+    built-ins resolve the api_key via ``resolved_keys[provider]``. All
+    writes are setdefault so caller / earlier overrides win.
+    """
+    env_keys.setdefault(f"{prefix}_MODEL", model_id)
+
+    meta = None
+    try:
+        meta = await _resolve_model(model_id, user_id=user_id)
+    except UnknownModelError:
+        meta = None
+
+    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                env_keys.setdefault(f"{prefix}_BASE_URL", endpoint_row["base_url"])
+            if endpoint_row.get("api_key"):
+                env_keys.setdefault(f"{prefix}_API_KEY", endpoint_row["api_key"])
+        return
+
+    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    if provider and resolved_keys and provider in resolved_keys:
+        env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
 def _dispatch_llm_provider_fallback(
@@ -2364,7 +2403,7 @@ class LlmEndpointUpdate(BaseModel):
     allow_insecure: bool = False
 
 
-LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper")
+LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
 
 
 class LlmEndpointModelCreate(BaseModel):
@@ -2382,12 +2421,14 @@ class LlmEndpointModelCreate(BaseModel):
     context_window: int | None = Field(None, ge=1000)
     reasoning_level: str | None = None
     enabled: bool = True
-    capability: Literal["chat", "vision", "embedding", "auxiliary", "whisper"] = Field(
+    capability: Literal[
+        "chat", "vision", "embedding", "auxiliary", "whisper", "tts"
+    ] = Field(
         "chat",
         description=(
             "Slot this model fills. 'chat' is the default for back-compat; "
-            "'embedding'/'vision'/'auxiliary'/'whisper' route the row to the "
-            "corresponding default-model slots in /api/models."
+            "'embedding'/'vision'/'auxiliary'/'whisper'/'tts' route the row "
+            "to the corresponding default-model slots in /api/models."
         ),
     )
 
@@ -2401,7 +2442,7 @@ class LlmEndpointModelUpdate(BaseModel):
     reasoning_level: str | None = None
     enabled: bool | None = None
     capability: (
-        Literal["chat", "vision", "embedding", "auxiliary", "whisper"] | None
+        Literal["chat", "vision", "embedding", "auxiliary", "whisper", "tts"] | None
     ) = None
 
 
@@ -2431,9 +2472,9 @@ class AdminDefaultModelSet(BaseModel):
 
 
 # Slots admins can pin cluster-wide via Admin → Providers → Defaults. The
-# system_settings key pattern is ``llm.default_<kind>_model``. ``whisper``
-# is deliberately absent — env var path in audio_helper still covers it and
-# no consumer is asking for a DB-backed override yet.
+# system_settings key pattern is ``llm.default_<kind>_model``. ``tts`` is
+# present even without a current consumer in src/services/ — landing the
+# plumbing keeps the registry path uniform across audio capabilities.
 VALID_DEFAULT_MODEL_KINDS = {
     "builder",
     "browser",
@@ -2441,6 +2482,8 @@ VALID_DEFAULT_MODEL_KINDS = {
     "embedding",
     "vision",
     "auxiliary",
+    "whisper",
+    "tts",
 }
 
 # System-scoped API keys only cover shared providers. Codex auth is
@@ -2465,6 +2508,7 @@ class UserSettingsUpdate(BaseModel):
     default_auxiliary_model: str | None = None
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
+    default_tts_model: str | None = None
     default_builder_model: str | None = None
     default_session_model: str | None = None
     default_strategic_model: str | None = None
@@ -9015,14 +9059,41 @@ async def agent_update_thread_config(
     column is updated as well for query consistency.
     """
     try:
-        ok = await postgres_db.merge_thread_config_override(
-            thread_id, request.config_override
-        )
+        # Enrich endpoint-backed model swaps with base_url + api_key so the
+        # persisted override is complete. Without this, a hot-swap to a
+        # custom-endpoint model leaves the next session attach pointing at
+        # the default OpenAI base.
+        config_override = dict(request.config_override or {})
+        llm_section = config_override.get("llm")
+        if llm_section and llm_section.get("model"):
+            thread_row = await postgres_db.get_thread(thread_id)
+            if thread_row:
+                user_id = (
+                    str(thread_row["user_id"]) if thread_row.get("user_id") else None
+                )
+                project_id = (
+                    str(thread_row["project_id"])
+                    if thread_row.get("project_id")
+                    else None
+                )
+                resolved_keys = await postgres_db.resolve_api_keys_for_job(
+                    user_id=user_id, project_id=project_id
+                )
+                llm_section = dict(llm_section)
+                await _inject_model_credentials(
+                    section=llm_section,
+                    model_id=llm_section["model"],
+                    user_id=user_id,
+                    resolved_keys=resolved_keys,
+                )
+                config_override["llm"] = llm_section
+
+        ok = await postgres_db.merge_thread_config_override(thread_id, config_override)
         if not ok:
             raise HTTPException(status_code=404, detail="Thread not found")
 
         # Keep top-level permission_mode column in sync
-        pm = (request.config_override.get("interactive") or {}).get("permission_mode")
+        pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -9301,6 +9372,25 @@ async def create_thread(
         effective_project_ids = request_body.project_ids or (
             [request_body.project_id] if request_body.project_id else []
         )
+
+        # Resolve endpoint-backed model credentials so the agent gets the
+        # right base_url + api_key. Without this, custom/system endpoints
+        # (per-user vLLM, helm-seeded providers) silently route to the
+        # default OpenAI base and 404. Mirrors the dispatch path used for
+        # jobs at the dispatch_job site above.
+        llm_section = config_override.get("llm") or {}
+        if llm_section.get("model"):
+            resolved_keys = await postgres_db.resolve_api_keys_for_job(
+                user_id=str(user["id"]),
+                project_id=effective_project_ids[0] if effective_project_ids else None,
+            )
+            await _inject_model_credentials(
+                section=llm_section,
+                model_id=llm_section["model"],
+                user_id=str(user["id"]),
+                resolved_keys=resolved_keys,
+            )
+            config_override["llm"] = llm_section
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
@@ -11871,6 +11961,7 @@ def _resolve_preference_defaults() -> dict[str, Any]:
         # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
         "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
         "default_whisper_model": os.environ.get("WHISPER_MODEL", "whisper-1"),
+        "default_tts_model": os.environ.get("TTS_MODEL", "tts-1"),
         "default_embedding_model": os.environ.get(
             "EMBEDDING_MODEL", "qwen3-embedding-8b"
         ),
@@ -12150,6 +12241,7 @@ async def list_available_models(
     auxiliary = _annotate_helper("auxiliary_models")
     vision = _annotate_helper("vision_models")
     whisper = _annotate_helper("whisper_models")
+    tts = _annotate_helper("tts_models")
     embedding = _annotate_helper("embedding_models", ("dimensions",))
 
     # Codex subscription override: if the Codex proxy is connected and
@@ -12215,7 +12307,7 @@ async def list_available_models(
                     bm["configured"] = True
 
             # Update helper model lists
-            for helper_list in (auxiliary, vision, whisper, embedding):
+            for helper_list in (auxiliary, vision, whisper, tts, embedding):
                 for hm in helper_list:
                     if hm["id"] in overrides:
                         hm["id"] = overrides[hm["id"]]
@@ -12230,6 +12322,7 @@ async def list_available_models(
     #                  same model under two rows, so the auxiliary slot is
     #                  the only place it shows up)
     # * 'whisper'    → whisper_models sibling array
+    # * 'tts'        → tts_models sibling array
     # Chat models never auto-appear in the auxiliary list — the UI resolves
     # auxiliary slot dropdowns against chat + auxiliary combined.
     def _merge_endpoint_models(
@@ -12279,6 +12372,8 @@ async def list_available_models(
                 auxiliary.append(row)
             elif cap == "whisper":
                 whisper.append(row)
+            elif cap == "tts":
+                tts.append(row)
 
     # System-scoped LLM endpoints (seeded by helm or managed via Admin →
     # Providers, visible to every user). Always configured because the key
@@ -12299,6 +12394,7 @@ async def list_available_models(
         "auxiliary_models": auxiliary,
         "vision_models": vision,
         "whisper_models": whisper,
+        "tts_models": tts,
         "embedding_models": embedding,
         "configured_providers": sorted(configured_providers - {"local"}),
     }
@@ -15111,11 +15207,16 @@ async def _execute_server_tool(
     user_id: str | None = None,
     active_project_id: str | None = None,
 ) -> tuple[str, str | None]:
-    """Execute a server-side builder tool via the shared dispatch module."""
+    """Execute a server-side builder tool via the shared dispatch module.
+
+    Resolves the Tavily key from system_api_keys at call time so the
+    builder_search helper stays DB-agnostic.
+    """
+    tavily_key = await postgres_db.get_system_api_key("tavily")
     return await _dispatch_server_tool(
         tool_name,
         args,
-        tavily_search_fn=tavily_search,
+        tavily_search_fn=partial(tavily_search, api_key=tavily_key),
         user_id=user_id,
         active_project_id=active_project_id,
     )
@@ -15131,8 +15232,11 @@ async def _create_builder_llm(raw_model: str):
 
     Routes through the model registry so DB-backed endpoints (custom or
     system-scoped, managed via Admin → Providers or helm seed) carry
-    their own base_url and api_key. Falls back to builder-specific env
-    vars for built-in catalog models and registry misses.
+    their own base_url and api_key. For built-in catalog models the key
+    is resolved from ``system_api_keys`` by inferred provider (claude →
+    anthropic, openrouter/* → openrouter, else openai). Codex stays on
+    ``CODEX_API_KEY`` because codex auth is user-bound via the proxy and
+    is intentionally absent from ``VALID_SYSTEM_API_KEY_PROVIDERS``.
     """
     import sys
 
@@ -15170,22 +15274,22 @@ async def _create_builder_llm(raw_model: str):
 
     if api_key is None:
         provider_lower = raw_model.lower()
-        if provider_lower.startswith("claude"):
-            api_key = (
-                os.getenv("BUILDER_ANTHROPIC_API_KEY")
-                or os.getenv("BUILDER_API_KEY")
-                or os.getenv("ANTHROPIC_API_KEY")
-            )
-        elif provider_lower.startswith("codex/"):
+        if provider_lower.startswith("codex/"):
             api_key = os.getenv("CODEX_API_KEY", "not-needed")
-        elif provider_lower.startswith("openrouter/"):
-            api_key = os.getenv("OPENROUTER_API_KEY")
         else:
-            api_key = (
-                os.getenv("BUILDER_OPENAI_API_KEY")
-                or os.getenv("BUILDER_API_KEY")
-                or os.getenv("OPENAI_API_KEY")
-            )
+            if provider_lower.startswith("claude"):
+                provider = "anthropic"
+            elif provider_lower.startswith("openrouter/"):
+                provider = "openrouter"
+            else:
+                provider = "openai"
+            api_key = await postgres_db.get_system_api_key(provider)
+            if not api_key:
+                raise RuntimeError(
+                    f"Builder LLM unavailable: no system_api_keys row for "
+                    f"provider '{provider}'. Configure via Admin → Providers "
+                    f"or seed via SEED_{provider.upper()}_API_KEY."
+                )
 
     config = LLMConfig(
         model=raw_model,

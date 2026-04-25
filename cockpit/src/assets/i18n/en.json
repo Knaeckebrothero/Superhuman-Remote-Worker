@@ -289,7 +289,8 @@
           "vision": "Vision",
           "embedding": "Embedding",
           "auxiliary": "Auxiliary",
-          "whisper": "Whisper"
+          "whisper": "Whisper",
+          "tts": "Text-to-speech"
         }
       },
       "defaults": {
@@ -304,7 +305,9 @@
           "citation": "Citation engine",
           "embedding": "Embedding (memory / citation vectors)",
           "vision": "Vision (image description)",
-          "auxiliary": "Auxiliary (memory extraction / curation / titles)"
+          "auxiliary": "Auxiliary (memory extraction / curation / titles)",
+          "whisper": "Whisper (speech-to-text)",
+          "tts": "Text-to-speech"
         }
       }
     }

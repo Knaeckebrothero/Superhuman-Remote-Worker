@@ -256,7 +256,7 @@ BEGIN
     ) THEN
         ALTER TABLE user_llm_endpoint_models
             ADD COLUMN capability TEXT NOT NULL DEFAULT 'chat'
-                CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper'));
+                CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper', 'tts'));
 
         ALTER TABLE user_llm_endpoint_models DROP CONSTRAINT IF EXISTS uq_endpoint_model;
         ALTER TABLE user_llm_endpoint_models
@@ -266,6 +266,34 @@ BEGIN
         CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_capability
             ON user_llm_endpoint_models(capability);
     END IF;
+END
+$$;
+
+-- Idempotent widening of the capability CHECK constraint for stacks that
+-- were migrated before 'tts' joined the enum. Looks the constraint up by
+-- name (auto-named at column-add time), drops it, re-adds with the wider
+-- list. Safe to re-run.
+DO $$
+DECLARE
+    cons_name TEXT;
+BEGIN
+    SELECT conname INTO cons_name
+      FROM pg_constraint
+     WHERE conrelid = 'user_llm_endpoint_models'::regclass
+       AND contype = 'c'
+       AND pg_get_constraintdef(oid) LIKE '%capability%';
+
+    IF cons_name IS NOT NULL THEN
+        EXECUTE format(
+            'ALTER TABLE user_llm_endpoint_models DROP CONSTRAINT %I',
+            cons_name
+        );
+    END IF;
+
+    ALTER TABLE user_llm_endpoint_models
+        ADD CONSTRAINT user_llm_endpoint_models_capability_check
+        CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper', 'tts'));
+EXCEPTION WHEN duplicate_object THEN NULL;
 END
 $$;
 

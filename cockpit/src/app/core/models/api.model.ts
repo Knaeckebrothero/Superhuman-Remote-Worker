@@ -200,15 +200,16 @@ export interface ApiKeySetRequest {
 
 /**
  * Which slot a model fills. Chat is the default; non-chat rows are routed
- * to the matching Admin → Defaults selector (embedding/vision/whisper) or
- * used as auxiliary LLMs for memory extraction / curation / title gen.
+ * to the matching Admin → Defaults selector (embedding/vision/whisper/tts)
+ * or used as auxiliary LLMs for memory extraction / curation / title gen.
  */
 export type LlmModelCapability =
   | 'chat'
   | 'vision'
   | 'embedding'
   | 'auxiliary'
-  | 'whisper';
+  | 'whisper'
+  | 'tts';
 
 /**
  * A single model attached to an LLM endpoint.
@@ -311,6 +312,8 @@ export interface LlmEndpointDiscoveredModel {
   id: string;
   owned_by: string | null;
   capability_hint: LlmModelCapability;
+  family: string | null;
+  context_window: number | null;
 }
 
 export interface LlmEndpointDiscoveryResult {

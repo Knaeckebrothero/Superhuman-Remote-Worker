@@ -1,12 +1,13 @@
 """Tests for ``services.message_triage`` config resolution.
 
 The triage LLM path itself uses httpx and isn't covered here — these tests
-pin the DB-backed resolution that replaces the old env-var reads.
+pin the DB-backed resolution that's the only resolution path now (the
+env-var legacy fallback was removed once all call sites started passing
+``db=postgres_db``).
 """
 
 from __future__ import annotations
 
-import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -15,23 +16,11 @@ import pytest
 from orchestrator.services import message_triage
 
 
-class TestResolveFromEnv:
-    def test_openai_env_works(self, monkeypatch):
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
-        monkeypatch.setenv("LLM_BASE_URL", "https://proxy/v1")
-        monkeypatch.setenv("TRIAGE_MODEL", "gpt-4o-mini")
+class TestEnvFallbackRemoved:
+    """Regression: the legacy ``_resolve_from_env`` is gone."""
 
-        with warnings.catch_warnings(record=True) as warned:
-            warnings.simplefilter("always")
-            resolved = message_triage._resolve_from_env()
-
-        assert resolved == ("gpt-4o-mini", "https://proxy/v1", "sk-from-env")
-        assert any(issubclass(w.category, DeprecationWarning) for w in warned)
-
-    def test_no_keys_returns_none(self, monkeypatch):
-        for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY"):
-            monkeypatch.delenv(var, raising=False)
-        assert message_triage._resolve_from_env() is None
+    def test_no_resolve_from_env_attribute(self):
+        assert not hasattr(message_triage, "_resolve_from_env")
 
 
 class TestResolveFromDB:

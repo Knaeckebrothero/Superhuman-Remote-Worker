@@ -23,6 +23,7 @@ const CAPABILITY_VALUES: LlmModelCapability[] = [
   'embedding',
   'auxiliary',
   'whisper',
+  'tts',
 ];
 
 /**
@@ -473,6 +474,14 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                       }
                     } @else if (kind === 'vision') {
                       @for (m of modelService.visionModels(); track m.id) {
+                        <option [value]="m.id">{{ m.label }}</option>
+                      }
+                    } @else if (kind === 'whisper') {
+                      @for (m of modelService.whisperModels(); track m.id) {
+                        <option [value]="m.id">{{ m.label }}</option>
+                      }
+                    } @else if (kind === 'tts') {
+                      @for (m of modelService.ttsModels(); track m.id) {
                         <option [value]="m.id">{{ m.label }}</option>
                       }
                     } @else {
@@ -1108,6 +1117,8 @@ export class AdminProvidersComponent implements OnInit {
           model_id: m.id,
           display_name: m.id, // the user can rename post-import
           capability: state.capabilities[m.id] ?? m.capability_hint,
+          family: m.family ?? null,
+          context_window: m.context_window ?? null,
         })),
         skip_duplicates: true,
       })
