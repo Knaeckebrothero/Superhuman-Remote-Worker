@@ -344,6 +344,7 @@
       "empty": "Keine eigenen Endpunkte. Fügen Sie einen hinzu, um Modelle an Ihren eigenen Server zu routen.",
       "noKey": "kein Schlüssel",
       "noModels": "Noch keine Modelle zugeordnet. Fügen Sie unten eines hinzu.",
+      "catalogHint": "Welche Modelle dieses Endpunkts verfügbar sind, kuratiert ein Admin – siehe Admin → Modelle.",
       "addTitle": "Endpunkt hinzufügen",
       "createButton": "Endpunkt erstellen",
       "labelPlaceholder": "Bezeichnung (z. B. Mein vLLM)",

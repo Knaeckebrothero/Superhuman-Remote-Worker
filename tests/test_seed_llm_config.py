@@ -24,8 +24,14 @@ def _fake_db(
     *,
     existing_api_keys: list[dict] | None = None,
     existing_endpoints: list[dict] | None = None,
+    existing_catalog_keys: set[tuple[str, str]] | None = None,
 ):
-    """Build a ``PostgresDB``-shaped mock that tracks mutations."""
+    """Build a ``PostgresDB``-shaped mock that tracks mutations.
+
+    ``existing_catalog_keys`` is a set of (provider_ref, model_id) pairs
+    that simulate already-present catalog rows: ``create_model`` returns
+    None for those (matching the ``ON CONFLICT DO NOTHING`` path).
+    """
     db = MagicMock()
     db.list_system_api_keys = AsyncMock(return_value=list(existing_api_keys or []))
     db.list_system_llm_endpoints = AsyncMock(
@@ -42,11 +48,21 @@ def _fake_db(
             "key_prefix": key_prefix,
         }
 
+    catalog_keys = set(existing_catalog_keys or set())
+
     async def _create_model(**kwargs):
-        return {"endpoint_id": kwargs["endpoint_id"], "model_id": kwargs["model_id"]}
+        key = (kwargs["provider_ref"], kwargs["model_id"])
+        if key in catalog_keys:
+            return None
+        catalog_keys.add(key)
+        return {
+            "id": f"catalog-{kwargs['model_id']}",
+            "provider_ref": kwargs["provider_ref"],
+            "model_id": kwargs["model_id"],
+        }
 
     db.create_system_llm_endpoint = AsyncMock(side_effect=_create_endpoint)
-    db.create_system_llm_endpoint_model = AsyncMock(side_effect=_create_model)
+    db.create_model = AsyncMock(side_effect=_create_model)
     return db
 
 
@@ -200,12 +216,17 @@ class TestSeedEndpoints:
             api_key=None,
             key_prefix=None,
         )
-        db.create_system_llm_endpoint_model.assert_awaited_once()
-        kwargs = db.create_system_llm_endpoint_model.await_args.kwargs
+        # Model entries become catalog rows now (provider_kind='endpoint').
+        db.create_model.assert_awaited_once()
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["provider_kind"] == "endpoint"
         assert kwargs["model_id"] == "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
-        assert kwargs["display_name"] == "Gemma 4 31B"
+        assert kwargs["display_label"] == "Gemma 4 31B"
         assert kwargs["family"] == "gemma"
         assert kwargs["context_window"] == 128000
+        assert kwargs["role"] == "chat"
+        assert kwargs["seeded_from"] == "helm:llm.seed"
+        assert kwargs["on_conflict_do_nothing"] is True
         assert report.endpoints_seeded == ["Local Gemma"]
         assert report.models_seeded == [
             ("Local Gemma", "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
@@ -231,17 +252,20 @@ class TestSeedEndpoints:
 
     @pytest.mark.asyncio
     async def test_existing_endpoint_left_alone_but_missing_models_added(self):
-        existing = [
+        existing_endpoint = [
             {
                 "id": "ep-1",
                 "label": "Local Gemma",
                 "base_url": "http://vllm.svc/v1",
-                "models": [
-                    {"model_id": "RedHatAI/gemma-4-31B-it-FP8-Dynamic"},
-                ],
+                "models": [],
             }
         ]
-        db = _fake_db(existing_endpoints=existing)
+        # Pre-seed the catalog with one row — create_model returns None for it
+        # (matching the ON CONFLICT DO NOTHING behavior).
+        db = _fake_db(
+            existing_endpoints=existing_endpoint,
+            existing_catalog_keys={("ep-1", "RedHatAI/gemma-4-31B-it-FP8-Dynamic")},
+        )
         payload = {
             "systemEndpoints": [
                 {
@@ -257,10 +281,8 @@ class TestSeedEndpoints:
         report = await seed(db, payload)
 
         db.create_system_llm_endpoint.assert_not_awaited()
-        db.create_system_llm_endpoint_model.assert_awaited_once()
-        call = db.create_system_llm_endpoint_model.await_args.kwargs
-        assert call["endpoint_id"] == "ep-1"
-        assert call["model_id"] == "RedHatAI/gemma-4-9B-it"
+        # Both attempted; first returns None (already in catalog), second inserts.
+        assert db.create_model.await_count == 2
         assert report.endpoints_skipped == ["Local Gemma"]
         assert report.models_seeded == [("Local Gemma", "RedHatAI/gemma-4-9B-it")]
         assert report.models_skipped == [
@@ -293,7 +315,7 @@ class TestSeedEndpoints:
         }
         report = await seed(db, payload)
         db.create_system_llm_endpoint.assert_awaited_once()
-        db.create_system_llm_endpoint_model.assert_not_awaited()
+        db.create_model.assert_not_awaited()
         assert report.endpoints_seeded == ["Local"]
 
 
@@ -324,7 +346,7 @@ class TestSeedIdempotence:
         assert report1.endpoints_seeded == ["Local"]
         assert report1.models_seeded == [("Local", "m1")]
 
-        # Run 2: state reflects run 1.
+        # Run 2: state reflects run 1 (catalog row already present).
         db2 = _fake_db(
             existing_api_keys=[{"provider": "openai"}],
             existing_endpoints=[
@@ -332,14 +354,16 @@ class TestSeedIdempotence:
                     "id": "ep-1",
                     "label": "Local",
                     "base_url": "http://x/v1",
-                    "models": [{"model_id": "m1"}],
+                    "models": [],
                 }
             ],
+            existing_catalog_keys={("ep-1", "m1")},
         )
         report2 = await seed(db2, payload)
         db2.upsert_system_api_key.assert_not_awaited()
         db2.create_system_llm_endpoint.assert_not_awaited()
-        db2.create_system_llm_endpoint_model.assert_not_awaited()
+        # create_model is still called but returns None (already present).
+        assert db2.create_model.await_count == 1
         assert report2.api_keys_skipped == ["openai"]
         assert report2.endpoints_skipped == ["Local"]
         assert report2.models_skipped == [("Local", "m1")]

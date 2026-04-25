@@ -15,6 +15,7 @@ from src.core.model_registry import (
     UnknownModelError,
     _factory_provider,
     list_builtin_models,
+    register_catalog_lookup,
     register_custom_lookup,
     register_system_lookup,
     reload_registry,
@@ -473,3 +474,158 @@ class TestModelMetaShape:
         assert meta.reasoning_level is None
         assert meta.origin == "builtin"
         assert meta.endpoint_id is None
+
+
+class TestCatalogLookup:
+    """resolve_model() consults the DB-backed catalog hook between the
+    system-endpoint hook and the built-in YAML fallback. Catalog rows carry
+    their transport: 'endpoint' rows inherit base_url+api_key from the joined
+    user_llm_endpoints row; 'system' rows carry api_key_ref so the dispatcher
+    resolves the key via system_api_keys.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_hooks(self):
+        register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
+        yield
+        register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
+
+    @pytest.mark.asyncio
+    async def test_catalog_endpoint_row_resolves_with_inline_base_url(self):
+        async def fake_catalog(model_id, role="chat"):
+            return {
+                "provider_kind": "endpoint",
+                "provider_ref": "11111111-1111-1111-1111-111111111111",
+                "model_id": model_id,
+                "display_label": "Local Gemma",
+                "role": role,
+                "family": "gemma",
+                "context_window": 32000,
+                "reasoning_level": None,
+                "endpoint_id": "11111111-1111-1111-1111-111111111111",
+                "endpoint_label": "vLLM",
+                "endpoint_base_url": "http://vllm.svc/v1",
+                "enabled": True,
+            }
+
+        register_catalog_lookup(fake_catalog)
+        meta = await resolve_model("RedHatAI/gemma-4-31B-it-FP8-Dynamic")
+        assert meta.origin == "catalog"
+        assert meta.provider == "openai"  # endpoint rows route via openai factory
+        assert meta.base_url == "http://vllm.svc/v1"
+        assert meta.endpoint_id == "11111111-1111-1111-1111-111111111111"
+        assert meta.api_key_ref is None
+        assert meta.family == "gemma"
+
+    @pytest.mark.asyncio
+    async def test_catalog_system_row_resolves_with_api_key_ref(self):
+        async def fake_catalog(model_id, role="chat"):
+            return {
+                "provider_kind": "system",
+                "provider_ref": "anthropic",
+                "model_id": model_id,
+                "display_label": "Claude Opus 4.7",
+                "role": role,
+                "family": "claude-opus",
+                "context_window": 200000,
+                "reasoning_level": None,
+                "enabled": True,
+            }
+
+        register_catalog_lookup(fake_catalog)
+        meta = await resolve_model("claude-opus-4-7")
+        assert meta.origin == "catalog"
+        assert meta.provider == "anthropic"
+        assert meta.api_key_ref == "anthropic"
+        assert meta.base_url is None
+        assert meta.endpoint_id is None
+
+    @pytest.mark.asyncio
+    async def test_catalog_runs_after_system_lookup(self):
+        """Catalog hook only fires when the system endpoint hook misses."""
+        order: list[str] = []
+
+        async def fake_sys(model_id, capability="chat"):
+            order.append("system")
+            return None
+
+        async def fake_catalog(model_id, role="chat"):
+            order.append("catalog")
+            return {
+                "provider_kind": "system",
+                "provider_ref": "openai",
+                "model_id": model_id,
+                "display_label": "Custom GPT",
+                "role": role,
+                "family": "default",
+                "enabled": True,
+            }
+
+        register_system_lookup(fake_sys)
+        register_catalog_lookup(fake_catalog)
+
+        meta = await resolve_model("gpt-4o")
+        assert order == ["system", "catalog"]
+        assert meta.origin == "catalog"
+
+    @pytest.mark.asyncio
+    async def test_catalog_miss_falls_back_to_builtin_with_warn(self, caplog):
+        """When the catalog lookup misses, the YAML built-in is returned
+        and a WARN log is emitted so coverage gaps are visible during the
+        rollout window."""
+        import logging
+
+        async def fake_catalog(model_id, role="chat"):
+            return None
+
+        register_catalog_lookup(fake_catalog)
+
+        with caplog.at_level(logging.WARNING, logger="src.core.model_registry"):
+            meta = await resolve_model("gpt-4o")
+
+        assert meta.origin == "builtin"
+        assert any(
+            "YAML fallback" in rec.message and "gpt-4o" in rec.message
+            for rec in caplog.records
+        ), f"expected YAML-fallback WARN, got: {[r.message for r in caplog.records]}"
+
+    @pytest.mark.asyncio
+    async def test_catalog_passes_capability_as_role(self):
+        """resolve_model(..., capability='auxiliary') must reach the catalog
+        with role='auxiliary' so non-chat catalog rows are matchable."""
+        captured: dict = {}
+
+        async def fake_catalog(model_id, role="chat"):
+            captured["model_id"] = model_id
+            captured["role"] = role
+            return None
+
+        register_catalog_lookup(fake_catalog)
+
+        with pytest.raises(UnknownModelError):
+            await resolve_model(
+                "openrouter/openai/text-embedding-3-large", capability="embedding"
+            )
+        assert captured == {
+            "model_id": "openrouter/openai/text-embedding-3-large",
+            "role": "embedding",
+        }
+
+    @pytest.mark.asyncio
+    async def test_disabled_catalog_row_does_not_match(self):
+        """The catalog accessor (resolve_catalog_model in postgres.py) only
+        returns enabled rows — verify the registry treats a None return as a
+        miss and falls through. This test guards against a future regression
+        where the catalog accessor signature changes.
+        """
+
+        async def fake_catalog(model_id, role="chat"):
+            return None  # simulates a disabled-only match
+
+        register_catalog_lookup(fake_catalog)
+        meta = await resolve_model("gpt-4o")
+        assert meta.origin == "builtin"  # falls back to YAML

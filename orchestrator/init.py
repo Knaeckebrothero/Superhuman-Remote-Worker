@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import yaml
+
 # Add project root and orchestrator dir to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 ORCHESTRATOR_DIR = Path(__file__).parent
@@ -280,8 +282,19 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # mirrors the helm seeder Job)
         await _seed_llm_keys_from_env(db)
 
-        # When OpenRouter is the available gateway, pin sensible defaults for
-        # auxiliary + embedding slots that would otherwise be empty
+        # Seed the models catalog from config/models.yaml (idempotent —
+        # admin edits via Cockpit are never clobbered)
+        await _seed_models_from_yaml(db)
+
+        # One-shot migration: promote system-scoped user_llm_endpoint_models
+        # rows to the catalog and drop the legacy table. No-op once the
+        # table is gone.
+        await _migrate_endpoint_models_to_catalog(db)
+
+        # When OpenRouter is the seeded gateway, insert convenience catalog
+        # rows for the auxiliary + embedding routes that would otherwise be
+        # empty (idempotent; resolver picks first-enabled-alphabetical at
+        # call time)
         await _apply_openrouter_defaults(db)
 
         # Backfill Nextcloud cloud folders for existing projects
@@ -865,38 +878,241 @@ async def _seed_llm_keys_from_env(db) -> None:
         )
 
 
-async def _apply_openrouter_defaults(db) -> None:
-    """When OpenRouter is the seeded fallback, pin OpenRouter-routed models
-    as the cluster-wide defaults for slots without one already configured.
+_YAML_GROUP_ROLE = {
+    "auxiliary_models": "auxiliary",
+    "vision_models": "vision",
+    "embedding_models": "embedding",
+}
 
-    Rationale: OpenRouter is a single-key gateway for many provider stacks
-    (chat + embedding routes). When an admin only seeds an OpenRouter key,
-    the auxiliary and embedding slots would otherwise be empty and the
-    relevant features (memory extraction, recall search) would fail at
-    first use. Pinning a reasonable default removes the friction. Admins
-    override via Admin → Defaults; this step never clobbers an existing
-    default — it only fills empty slots.
+
+def _infer_provider_from_model_id(model_id: str) -> str | None:
+    """Best-effort provider inference for catalog seed rows lacking an explicit
+    ``provider`` field. Mirrors the prefix logic in
+    ``orchestrator.main._create_builder_llm``.
+    """
+    name = model_id.lower()
+    if name.startswith("claude"):
+        return "anthropic"
+    if name.startswith("openrouter/"):
+        return "openrouter"
+    if name.startswith("groq/"):
+        return "groq"
+    if name.startswith("codex/"):
+        return "codex"
+    if name.startswith("gemini") or name.startswith("google/"):
+        return "google"
+    if name.startswith("gpt-") or name.startswith("text-embedding-"):
+        return "openai"
+    return None
+
+
+async def _seed_models_from_yaml(db) -> None:
+    """Seed the ``models`` catalog from ``config/models.yaml`` on first boot.
+
+    For each entry in the YAML groups + the auxiliary/vision/embedding helper
+    lists, construct one catalog row per (model, role) and insert with
+    ``ON CONFLICT DO NOTHING`` so admin edits made via the Cockpit are never
+    clobbered by subsequent boots.
+
+    Rows whose inferred provider has no ``system_api_keys`` entry yet are
+    skipped — they would not be reachable. The ``local`` provider (vLLM via
+    a static endpoint) is also skipped: those models surface through the
+    ``user_llm_endpoints`` route, not as system rows.
+    """
+    catalog_path = Path(__file__).resolve().parent.parent / "config" / "models.yaml"
+    if not catalog_path.exists():
+        logger.info(f"  Catalog seed skipped — {catalog_path} not found")
+        return
+
+    try:
+        raw = yaml.safe_load(catalog_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        logger.warning(f"  Could not parse {catalog_path}: {e}")
+        return
+
+    seeded_keys = {k["provider"] for k in await db.list_system_api_keys()}
+
+    rows: list[dict] = []
+    skipped_provider_counts: dict[str, int] = {}
+
+    def _enqueue(
+        provider: str | None, model_id: str, display: str, role: str, family: str | None
+    ) -> None:
+        if not provider or provider == "local":
+            return
+        if provider not in seeded_keys:
+            skipped_provider_counts[provider] = (
+                skipped_provider_counts.get(provider, 0) + 1
+            )
+            return
+        from src.core.model_registry import family_of  # local import: avoids
+        # importing src/* during early startup before sys.path is set up
+
+        rows.append(
+            {
+                "provider_kind": "system",
+                "provider_ref": provider,
+                "model_id": model_id,
+                "display_label": display or model_id,
+                "role": role,
+                "family": family or family_of(model_id),
+                "seeded_from": "config/models.yaml",
+            }
+        )
+
+    for group in raw.get("groups", []):
+        provider = group.get("provider")
+        for entry in group.get("models", []):
+            _enqueue(
+                provider,
+                entry["id"],
+                entry.get("display_name") or entry["id"],
+                "chat",
+                entry.get("family"),
+            )
+
+    for yaml_key, role in _YAML_GROUP_ROLE.items():
+        for entry in raw.get(yaml_key, []):
+            provider = entry.get("provider") or _infer_provider_from_model_id(
+                entry["id"]
+            )
+            _enqueue(
+                provider,
+                entry["id"],
+                entry.get("label") or entry["id"],
+                role,
+                entry.get("family"),
+            )
+
+    inserted = 0
+    for row in rows:
+        result = await db.create_model(**row, on_conflict_do_nothing=True)
+        if result is not None:
+            inserted += 1
+
+    if inserted:
+        logger.info(f"  Seeded {inserted} catalog rows from config/models.yaml")
+    else:
+        logger.info("  No new catalog rows from config/models.yaml (all present)")
+    for provider, count in sorted(skipped_provider_counts.items()):
+        logger.info(
+            f"  Skipped {count} {provider} catalog rows — no system_api_keys row yet"
+        )
+
+
+async def _migrate_endpoint_models_to_catalog(db) -> None:
+    """One-shot migration: promote system-scoped ``user_llm_endpoint_models``
+    rows into the catalog and drop the legacy table.
+
+    Idempotent — bails out cleanly when the table no longer exists. User-
+    scoped rows (``user_llm_endpoints.user_id IS NOT NULL``) are *not*
+    migrated; the dual-scope complexity isn't worth carrying forward, and
+    user-side authoring was unused in practice (per design doc §Decisions).
+    """
+    async with db.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT to_regclass('public.user_llm_endpoint_models') IS NOT NULL"
+        )
+        if not exists:
+            return
+
+        rows = await conn.fetch(
+            """
+            SELECT m.endpoint_id, m.model_id, m.display_name, m.family,
+                   m.context_window, m.reasoning_level, m.enabled, m.capability
+              FROM user_llm_endpoint_models m
+              JOIN user_llm_endpoints e ON e.id = m.endpoint_id
+             WHERE e.user_id IS NULL
+            """
+        )
+
+    promoted = 0
+    skipped_unsupported_role = 0
+    for row in rows:
+        capability = (row["capability"] or "chat").lower()
+        if capability not in ("chat", "auxiliary", "embedding", "vision"):
+            # whisper/tts aren't catalog roles in v1 — drop with the table
+            skipped_unsupported_role += 1
+            continue
+        from src.core.model_registry import family_of  # local import: src/*
+        # path may not be on sys.path until runtime is fully wired
+
+        result = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=str(row["endpoint_id"]),
+            model_id=row["model_id"],
+            display_label=row["display_name"],
+            role=capability,
+            family=row["family"] or family_of(row["model_id"]),
+            context_window=row["context_window"],
+            reasoning_level=row["reasoning_level"],
+            enabled=bool(row["enabled"]),
+            seeded_from="migration:user_llm_endpoint_models",
+            on_conflict_do_nothing=True,
+        )
+        if result is not None:
+            promoted += 1
+
+    async with db.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS user_llm_endpoint_models CASCADE")
+
+    logger.info(
+        "  Migrated user_llm_endpoint_models → models: %d promoted, "
+        "%d skipped (unsupported v1 role); table dropped",
+        promoted,
+        skipped_unsupported_role,
+    )
+
+
+async def _apply_openrouter_defaults(db) -> None:
+    """When OpenRouter is the seeded gateway, insert convenience catalog rows
+    for the OpenRouter-routed auxiliary and embedding models.
+
+    Rationale: OpenRouter is a single-key gateway for many provider stacks.
+    When an admin only seeds an OpenRouter key, the auxiliary and embedding
+    slots would otherwise be empty and dependent features (memory
+    extraction, recall search) would fail at first use. Inserting these
+    rows ensures the catalog has at least one entry per dependent role.
+
+    The default-model resolver's "first-enabled-alphabetical" fallback then
+    handles which one gets used. Admin edits/disables survive subsequent
+    boots via ``ON CONFLICT DO NOTHING``.
     """
     openrouter_key = await db.get_system_api_key("openrouter")
     if not openrouter_key:
         return
 
-    # Conservative picks — fast, widely-available routes. Override via
-    # Admin → Defaults if a different model fits the workload better.
-    fallbacks = {
-        "auxiliary": "openrouter/google/gemini-2.5-flash",
-        "embedding": "openrouter/openai/text-embedding-3-large",
-    }
+    convenience_rows = [
+        {
+            "provider_kind": "system",
+            "provider_ref": "openrouter",
+            "model_id": "openrouter/google/gemini-2.5-flash",
+            "display_label": "Gemini 2.5 Flash (OpenRouter)",
+            "role": "auxiliary",
+            "family": "gemini",
+            "seeded_from": "helm:openrouter-defaults",
+        },
+        {
+            "provider_kind": "system",
+            "provider_ref": "openrouter",
+            "model_id": "openrouter/openai/text-embedding-3-large",
+            "display_label": "text-embedding-3-large (OpenRouter)",
+            "role": "embedding",
+            "family": "default",
+            "seeded_from": "helm:openrouter-defaults",
+        },
+    ]
 
-    for kind, model in fallbacks.items():
-        existing = await db.get_default_llm_model(kind)
-        if existing:
+    inserted = 0
+    for row in convenience_rows:
+        result = await db.create_model(**row, on_conflict_do_nothing=True)
+        if result is not None:
+            inserted += 1
             logger.info(
-                f"  Default {kind} model already set ({existing}) — leaving alone"
+                f"  Inserted openrouter convenience row: {row['model_id']} ({row['role']})"
             )
-            continue
-        await db.set_default_llm_model(kind, model)
-        logger.info(f"  Pinned default {kind} model: {model} (openrouter fallback)")
+    if not inserted:
+        logger.info("  OpenRouter convenience catalog rows already present — no-op")
 
 
 # =============================================================================

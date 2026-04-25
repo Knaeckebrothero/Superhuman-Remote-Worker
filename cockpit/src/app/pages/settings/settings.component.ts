@@ -16,7 +16,6 @@ import {
     ApiKeyProvider,
     CodexStatus,
     CommunicationSettings,
-    LlmEndpointModel,
     LlmEndpointTestResult,
     McpTokenCreateResponse,
     Project
@@ -185,115 +184,9 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   </div>
                 }
 
-                <!-- Models subtable -->
-                <div class="models-subtable">
-                  @if (endpoint.models.length > 0) {
-                    <div class="model-row model-header">
-                      <span class="col-model-id">{{ 'settings.llmEndpoints.colModelId' | transloco }}</span>
-                      <span class="col-model-name">{{ 'settings.llmEndpoints.colDisplayName' | transloco }}</span>
-                      <span class="col-model-family">{{ 'settings.llmEndpoints.colFamily' | transloco }}</span>
-                      <span class="col-model-ctx">{{ 'settings.llmEndpoints.colContext' | transloco }}</span>
-                      <span class="col-model-action"></span>
-                    </div>
-                    @for (model of endpoint.models; track model.id) {
-                      @if (editingModelDbId() === model.id) {
-                        <div class="model-row model-row-editing">
-                          <span class="col-model-id mono" [title]="model.model_id">{{ model.model_id }}</span>
-                          <input
-                            type="text"
-                            class="form-input form-input-sm"
-                            [placeholder]="'settings.llmEndpoints.displayNamePlaceholder' | transloco"
-                            [(ngModel)]="editModelDisplayName"
-                          />
-                          <input
-                            type="text"
-                            class="form-input form-input-sm"
-                            [placeholder]="'settings.llmEndpoints.familyPlaceholder' | transloco"
-                            [(ngModel)]="editModelFamily"
-                          />
-                          <input
-                            type="number"
-                            class="form-input form-input-sm"
-                            [placeholder]="'settings.llmEndpoints.contextPlaceholder' | transloco"
-                            [(ngModel)]="editModelContext"
-                          />
-                          <span class="col-model-action edit-actions">
-                            <button
-                              class="test-btn"
-                              (click)="saveEditModel(endpoint.id, model)"
-                              [disabled]="savingEditModel() || !editModelDisplayName.trim()"
-                            >
-                              {{ savingEditModel() ? ('common.saving' | transloco) : ('common.save' | transloco) }}
-                            </button>
-                            <button
-                              class="link-btn"
-                              (click)="cancelEditModel()"
-                              [disabled]="savingEditModel()"
-                            >{{ 'common.cancel' | transloco }}</button>
-                          </span>
-                        </div>
-                      } @else {
-                        <div class="model-row">
-                          <span class="col-model-id mono">{{ model.model_id }}</span>
-                          <span class="col-model-name">{{ model.display_name }}</span>
-                          <span class="col-model-family">{{ model.family || '-' }}</span>
-                          <span class="col-model-ctx">{{ model.context_window || '-' }}</span>
-                          <span class="col-model-action actions-pair">
-                            <button
-                              class="link-btn"
-                              (click)="startEditModel(model)"
-                            >{{ 'common.edit' | transloco }}</button>
-                            <button
-                              class="revoke-btn"
-                              (click)="deleteLlmEndpointModel(endpoint.id, model.model_id)"
-                            >{{ 'common.delete' | transloco }}</button>
-                          </span>
-                        </div>
-                      }
-                    }
-                  } @else {
-                    <p class="empty-state-inline">{{ 'settings.llmEndpoints.noModels' | transloco }}</p>
-                  }
-
-                  <!-- Add-model form -->
-                  <div class="add-model-form">
-                    <div class="form-row three-col">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'settings.llmEndpoints.modelIdPlaceholder' | transloco"
-                        [(ngModel)]="newModelIds[endpoint.id]"
-                      />
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'settings.llmEndpoints.displayNamePlaceholder' | transloco"
-                        [(ngModel)]="newModelDisplayNames[endpoint.id]"
-                      />
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'settings.llmEndpoints.familyPlaceholder' | transloco"
-                        [(ngModel)]="newModelFamilies[endpoint.id]"
-                      />
-                    </div>
-                    <div class="form-row two-col">
-                      <input
-                        type="number"
-                        class="form-input"
-                        [placeholder]="'settings.llmEndpoints.contextPlaceholder' | transloco"
-                        [(ngModel)]="newModelContexts[endpoint.id]"
-                      />
-                      <button
-                        class="create-btn"
-                        (click)="addEndpointModel(endpoint.id)"
-                        [disabled]="!newModelIds[endpoint.id]?.trim() || !newModelDisplayNames[endpoint.id]?.trim()"
-                      >
-                        {{ 'settings.llmEndpoints.addModelButton' | transloco }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                <p class="catalog-hint">
+                  {{ 'settings.llmEndpoints.catalogHint' | transloco }}
+                </p>
               </div>
             }
           } @else {
@@ -1806,20 +1699,6 @@ export class SettingsComponent implements OnInit {
   readonly testingEndpointId = signal<string | null>(null);
   readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
 
-  // Per-endpoint "add model" input fields, keyed by endpoint_id.
-  // Plain records — ngModel binds directly to these.
-  newModelIds: Record<string, string> = {};
-  newModelDisplayNames: Record<string, string> = {};
-  newModelFamilies: Record<string, string> = {};
-  newModelContexts: Record<string, number | null> = {};
-
-  // Inline edit-model state — only one row edited at a time, keyed by DB id.
-  readonly editingModelDbId = signal<string | null>(null);
-  readonly savingEditModel = signal(false);
-  editModelDisplayName = '';
-  editModelFamily = '';
-  editModelContext: number | null = null;
-
   // Preferences form state — null = user hasn't overridden, use resolved default
   readonly prefModel = signal<string | null>(null);
   readonly prefAuxModel = signal<string | null>(null);
@@ -2158,71 +2037,6 @@ export class SettingsComponent implements OnInit {
         this.testingEndpointId.set(null);
       },
     });
-  }
-
-  addEndpointModel(endpointId: string): void {
-    const modelId = (this.newModelIds[endpointId] ?? '').trim();
-    const displayName = (this.newModelDisplayNames[endpointId] ?? '').trim();
-    if (!modelId || !displayName) return;
-
-    const family = (this.newModelFamilies[endpointId] ?? '').trim() || null;
-    const ctx = this.newModelContexts[endpointId];
-    const contextWindow = typeof ctx === 'number' && ctx > 0 ? ctx : null;
-
-    this.settingsService
-      .createLlmEndpointModel(endpointId, {
-        model_id: modelId,
-        display_name: displayName,
-        family,
-        context_window: contextWindow,
-      })
-      .subscribe({
-        next: () => {
-          delete this.newModelIds[endpointId];
-          delete this.newModelDisplayNames[endpointId];
-          delete this.newModelFamilies[endpointId];
-          delete this.newModelContexts[endpointId];
-        },
-      });
-  }
-
-  deleteLlmEndpointModel(endpointId: string, modelId: string): void {
-    this.settingsService.deleteLlmEndpointModel(endpointId, modelId).subscribe();
-  }
-
-  startEditModel(model: LlmEndpointModel): void {
-    this.editingModelDbId.set(model.id);
-    this.editModelDisplayName = model.display_name;
-    this.editModelFamily = model.family ?? '';
-    this.editModelContext = model.context_window;
-  }
-
-  cancelEditModel(): void {
-    this.editingModelDbId.set(null);
-  }
-
-  saveEditModel(endpointId: string, model: LlmEndpointModel): void {
-    const displayName = this.editModelDisplayName.trim();
-    if (!displayName) return;
-    this.savingEditModel.set(true);
-    this.settingsService
-      .updateLlmEndpointModel(endpointId, model.model_id, {
-        display_name: displayName,
-        family: this.editModelFamily.trim() || null,
-        context_window:
-          typeof this.editModelContext === 'number' && this.editModelContext > 0
-            ? this.editModelContext
-            : null,
-        // capability is the backend WHERE selector; keep the current slot.
-        capability: model.capability || 'chat',
-      })
-      .subscribe({
-        next: () => {
-          this.editingModelDbId.set(null);
-          this.savingEditModel.set(false);
-        },
-        error: () => this.savingEditModel.set(false),
-      });
   }
 
   // ── Preferences ───────────────────────────────────────────────────

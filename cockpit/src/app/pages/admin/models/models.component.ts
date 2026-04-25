@@ -1,0 +1,448 @@
+import {Component, computed, inject, OnInit, signal} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {SidebarToggleComponent} from '../../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {AdminModelsService} from '../../../core/services/admin-models.service';
+import {AdminProvidersService} from '../../../core/services/admin-providers.service';
+import {
+  CATALOG_ROLES,
+  CatalogModel,
+  CatalogModelTestResult,
+  CatalogProviderKind,
+  CatalogRole,
+} from '../../../core/models/api.model';
+
+interface ProviderOption {
+  kind: CatalogProviderKind;
+  ref: string;
+  label: string;
+  available: boolean;
+}
+
+@Component({
+  selector: 'app-admin-models',
+  standalone: true,
+  imports: [FormsModule, SidebarToggleComponent],
+  template: `
+    <div class="admin-page">
+      <div class="admin-container">
+        <div class="page-header">
+          <app-sidebar-toggle />
+          <h1 class="page-title">Models Catalog</h1>
+        </div>
+        <p class="page-desc">
+          Curate the LLM offerings available in builder, sessions, and jobs.
+          Each model anchors to a configured provider (system API key) or a
+          system endpoint.
+        </p>
+
+        <!-- Models list -->
+        <section class="admin-section">
+          <h2 class="section-title">Catalog rows</h2>
+
+          @if (models.loading()) {
+            <p class="muted">Loading…</p>
+          } @else if (models.models().length === 0) {
+            <p class="empty-state">
+              Add a model from a configured provider to make it available
+              in builder, sessions, and jobs.
+            </p>
+          } @else {
+            @for (group of groupedModels(); track group.key) {
+              <div class="provider-group">
+                <h3 class="group-title">{{ group.label }}</h3>
+                <div class="model-table">
+                  <div class="model-header">
+                    <span class="col-display">Display label</span>
+                    <span class="col-id">Model ID</span>
+                    <span class="col-role">Role</span>
+                    <span class="col-family">Family</span>
+                    <span class="col-enabled">Enabled</span>
+                    <span class="col-actions"></span>
+                  </div>
+                  @for (m of group.rows; track m.id) {
+                    <div class="model-row">
+                      <span class="col-display">{{ m.display_label }}</span>
+                      <span class="col-id mono">{{ m.model_id }}</span>
+                      <span class="col-role">{{ m.role }}</span>
+                      <span class="col-family">{{ m.family }}</span>
+                      <span class="col-enabled">
+                        <input
+                          type="checkbox"
+                          [checked]="m.enabled"
+                          (change)="toggleEnabled(m, $event)"
+                        />
+                      </span>
+                      <span class="col-actions">
+                        <button
+                          class="link-btn"
+                          (click)="testRow(m.id)"
+                          [disabled]="testing() === m.id"
+                        >
+                          {{ testing() === m.id ? 'Testing…' : 'Test' }}
+                        </button>
+                        <button class="revoke-btn" (click)="deleteRow(m)">
+                          Delete
+                        </button>
+                        @if (testResults()[m.id]; as result) {
+                          <span
+                            class="test-result"
+                            [class.ok]="result.ok"
+                            [class.fail]="!result.ok"
+                          >
+                            {{ result.ok ? 'OK' : (result.error || 'failed') }}
+                          </span>
+                        }
+                      </span>
+                    </div>
+                  }
+                </div>
+              </div>
+            }
+          }
+        </section>
+
+        <!-- Add model form -->
+        <section class="admin-section">
+          <h2 class="section-title">Add model</h2>
+
+          <div class="create-form">
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Provider</label>
+                <select
+                  class="form-input"
+                  [(ngModel)]="formProviderKey"
+                  [disabled]="creating()"
+                >
+                  @for (p of providerOptions(); track p.kind + ':' + p.ref) {
+                    <option
+                      [value]="p.kind + ':' + p.ref"
+                      [disabled]="!p.available"
+                    >
+                      {{ p.label }}{{ p.available ? '' : ' (not configured)' }}
+                    </option>
+                  }
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Role</label>
+                <select class="form-input" [(ngModel)]="formRole" [disabled]="creating()">
+                  @for (r of roles; track r) {
+                    <option [value]="r">{{ r }}</option>
+                  }
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Model ID</label>
+                <input
+                  type="text"
+                  class="form-input mono"
+                  placeholder="e.g. claude-opus-4-7"
+                  [(ngModel)]="formModelId"
+                  [disabled]="creating()"
+                />
+              </div>
+              <div>
+                <label class="field-label">Display label</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  placeholder="Auto-suggested from ID"
+                  [(ngModel)]="formDisplayLabel"
+                  [disabled]="creating()"
+                />
+              </div>
+            </div>
+
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Family</label>
+                <select class="form-input" [(ngModel)]="formFamily" [disabled]="creating()">
+                  @for (f of models.families(); track f) {
+                    <option [value]="f">{{ f }}</option>
+                  }
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Context window (optional)</label>
+                <input
+                  type="number"
+                  class="form-input"
+                  [(ngModel)]="formContextWindow"
+                  [disabled]="creating()"
+                />
+              </div>
+            </div>
+
+            @if (formError()) {
+              <p class="form-error">{{ formError() }}</p>
+            }
+
+            <div class="form-row">
+              <button
+                class="create-btn"
+                (click)="submit()"
+                [disabled]="!canSubmit() || creating()"
+              >
+                {{ creating() ? 'Adding…' : 'Add model' }}
+              </button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  `,
+  styles: [`
+    .admin-page { padding: 24px; }
+    .admin-container { max-width: 1100px; margin: 0 auto; }
+    .page-header { display: flex; align-items: center; gap: 12px; }
+    .page-title { font-size: 22px; font-weight: 600; margin: 0; }
+    .page-desc { color: var(--text-muted, #6c7086); margin: 8px 0 24px 0; }
+    .admin-section { margin-bottom: 32px; }
+    .section-title { font-size: 16px; font-weight: 600; margin: 0 0 12px 0; }
+    .provider-group { margin-bottom: 18px; }
+    .group-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted, #6c7086);
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      margin: 12px 0 6px 0;
+    }
+    .model-table {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .model-header, .model-row {
+      display: grid;
+      grid-template-columns: 1.4fr 2fr 90px 100px 70px 220px;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 12px;
+      font-size: 13px;
+    }
+    .model-header {
+      font-weight: 600;
+      color: var(--text-muted, #6c7086);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      font-size: 11px;
+    }
+    .model-row {
+      background: var(--surface-0, #313244);
+      border-radius: 6px;
+    }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    .empty-state {
+      padding: 24px;
+      text-align: center;
+      color: var(--text-muted, #6c7086);
+      background: var(--surface-0, #313244);
+      border-radius: 6px;
+    }
+    .muted { color: var(--text-muted, #6c7086); }
+    .col-actions { display: flex; gap: 8px; align-items: center; }
+    .link-btn {
+      background: none;
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: var(--accent, #89b4fa);
+      cursor: pointer;
+    }
+    .link-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .revoke-btn {
+      background: none;
+      border: 1px solid var(--red, #f38ba8);
+      color: var(--red, #f38ba8);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .test-result { font-size: 11px; }
+    .test-result.ok { color: var(--green, #a6e3a1); }
+    .test-result.fail { color: var(--red, #f38ba8); }
+    .create-form {
+      padding: 16px;
+      background: var(--surface-0, #313244);
+      border-radius: 8px;
+    }
+    .form-row {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .form-row.two-col > * { flex: 1; }
+    .field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-muted, #6c7086);
+      margin-bottom: 4px;
+    }
+    .form-input {
+      width: 100%;
+      padding: 8px 12px;
+      background: var(--timeline-bg, #11111b);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 6px;
+      color: var(--text-primary, #cdd6f4);
+      font-family: inherit;
+      font-size: 13px;
+      box-sizing: border-box;
+    }
+    .form-error {
+      color: var(--red, #f38ba8);
+      font-size: 12px;
+      margin: 4px 0 8px 0;
+    }
+    .create-btn {
+      padding: 8px 16px;
+      background: var(--accent, #89b4fa);
+      border: none;
+      border-radius: 6px;
+      color: var(--timeline-bg, #11111b);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .create-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  `],
+})
+export class AdminModelsComponent implements OnInit {
+  readonly models = inject(AdminModelsService);
+  readonly providers = inject(AdminProvidersService);
+
+  readonly roles: CatalogRole[] = CATALOG_ROLES;
+  readonly creating = signal(false);
+  readonly testing = signal<string | null>(null);
+  readonly testResults = signal<Record<string, CatalogModelTestResult>>({});
+  readonly formError = signal<string>('');
+
+  // Form state
+  formProviderKey = '';
+  formRole: CatalogRole = 'chat';
+  formModelId = '';
+  formDisplayLabel = '';
+  formFamily = 'default';
+  formContextWindow: number | null = null;
+
+  /** Provider dropdown options sourced from the keys + endpoints lists. */
+  readonly providerOptions = computed<ProviderOption[]>(() => {
+    const opts: ProviderOption[] = [];
+    for (const key of this.providers.systemApiKeys()) {
+      opts.push({
+        kind: 'system',
+        ref: key.provider,
+        label: key.provider,
+        available: true,
+      });
+    }
+    for (const ep of this.providers.systemEndpoints()) {
+      opts.push({
+        kind: 'endpoint',
+        ref: ep.id,
+        label: `${ep.label} (endpoint)`,
+        available: true,
+      });
+    }
+    return opts;
+  });
+
+  readonly groupedModels = computed(() => {
+    const groups = new Map<string, {key: string; label: string; rows: CatalogModel[]}>();
+    for (const m of this.models.models()) {
+      const key = `${m.provider_kind}:${m.provider_ref}`;
+      const label = m.provider_kind === 'endpoint'
+        ? this.endpointLabel(m.provider_ref)
+        : m.provider_ref;
+      if (!groups.has(key)) {
+        groups.set(key, {key, label, rows: []});
+      }
+      groups.get(key)!.rows.push(m);
+    }
+    return Array.from(groups.values()).sort((a, b) => a.label.localeCompare(b.label));
+  });
+
+  ngOnInit(): void {
+    this.models.loadModels();
+    this.models.loadFamilies();
+    this.providers.loadSystemApiKeys();
+    this.providers.loadSystemEndpoints();
+  }
+
+  endpointLabel(refId: string): string {
+    const ep = this.providers.systemEndpoints().find((e) => e.id === refId);
+    return ep ? `${ep.label} (endpoint)` : `endpoint:${refId}`;
+  }
+
+  canSubmit(): boolean {
+    return (
+      !!this.formProviderKey &&
+      !!this.formModelId.trim() &&
+      !!this.formDisplayLabel.trim() &&
+      !!this.formFamily.trim()
+    );
+  }
+
+  submit(): void {
+    this.formError.set('');
+    const [kind, ref] = this.formProviderKey.split(':') as [CatalogProviderKind, string];
+    if (!kind || !ref) {
+      this.formError.set('Pick a provider.');
+      return;
+    }
+    this.creating.set(true);
+    this.models
+      .createModel({
+        provider_kind: kind,
+        provider_ref: ref,
+        model_id: this.formModelId.trim(),
+        display_label: this.formDisplayLabel.trim(),
+        role: this.formRole,
+        family: this.formFamily.trim(),
+        context_window: this.formContextWindow ?? null,
+      })
+      .subscribe({
+        next: () => {
+          this.formModelId = '';
+          this.formDisplayLabel = '';
+          this.formContextWindow = null;
+          this.creating.set(false);
+        },
+        error: (err) => {
+          this.formError.set(err?.error?.detail ?? 'Failed to add model.');
+          this.creating.set(false);
+        },
+      });
+  }
+
+  toggleEnabled(model: CatalogModel, ev: Event): void {
+    const checked = (ev.target as HTMLInputElement).checked;
+    this.models.updateModel(model.id, {enabled: checked}).subscribe();
+  }
+
+  deleteRow(model: CatalogModel): void {
+    if (!confirm(`Delete "${model.display_label}" from the catalog?`)) return;
+    this.models.deleteModel(model.id).subscribe((res) => {
+      if (res.warning) alert(res.warning);
+    });
+  }
+
+  testRow(id: string): void {
+    this.testing.set(id);
+    this.models.testModel(id).subscribe({
+      next: (result) => {
+        this.testResults.update((curr) => ({...curr, [id]: result}));
+        this.testing.set(null);
+      },
+      error: () => this.testing.set(null),
+    });
+  }
+}

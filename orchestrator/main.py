@@ -842,7 +842,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
 
         if (
             meta is not None
-            and meta.origin in ("custom", "system")
+            and meta.origin in ("custom", "system", "catalog")
             and meta.endpoint_id
         ):
             endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
@@ -892,7 +892,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
             if not aux_model:
-                aux_model = await postgres_db.get_default_llm_model("auxiliary")
+                aux_model = await postgres_db.resolve_default_for_role("auxiliary")
             if aux_model:
                 config_override = config_override or {}
                 aux_override = config_override.setdefault("auxiliary", {})
@@ -956,7 +956,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             ):
                 _model = user_settings.get(_user_key)
                 if not _model:
-                    _model = await postgres_db.get_default_llm_model(_kind)
+                    _model = await postgres_db.resolve_default_for_role(_kind)
                 if not _model:
                     continue
                 config_override = config_override or {}
@@ -979,7 +979,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             embedding_provider = user_settings.get("embedding_provider")
             embedding_model = user_settings.get("default_embedding_model")
             if not embedding_model:
-                embedding_model = await postgres_db.get_default_llm_model("embedding")
+                embedding_model = await postgres_db.resolve_default_for_role(
+                    "embedding"
+                )
             if embedding_provider or embedding_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
@@ -1590,7 +1592,11 @@ async def _inject_model_credentials(
     except UnknownModelError:
         meta = None
 
-    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
             if endpoint_row.get("base_url"):
@@ -1621,10 +1627,11 @@ async def _inject_env_key_credentials(
 
     Sibling of ``_inject_model_credentials`` for capabilities that travel as
     flat env vars (vision, whisper, tts, ...) rather than structured config
-    sections. Endpoint-backed models (origin in {'custom','system'})
-    contribute the inline base_url+api_key from the endpoint row;
-    built-ins resolve the api_key via ``resolved_keys[provider]``. All
-    writes are setdefault so caller / earlier overrides win.
+    sections. Endpoint-backed models (origin in {'custom','system','catalog'}
+    with an endpoint_id) contribute the inline base_url+api_key from the
+    endpoint row; built-ins and system-anchored catalog rows resolve the
+    api_key via ``resolved_keys[provider]``. All writes are setdefault so
+    caller / earlier overrides win.
     """
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
@@ -1634,7 +1641,11 @@ async def _inject_env_key_credentials(
     except UnknownModelError:
         meta = None
 
-    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
             if endpoint_row.get("base_url"):
@@ -2406,60 +2417,6 @@ class LlmEndpointUpdate(BaseModel):
 LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
 
 
-class LlmEndpointModelCreate(BaseModel):
-    """Request body for attaching a model row to an endpoint."""
-
-    model_id: str = Field(..., min_length=1, max_length=500)
-    display_name: str = Field(..., min_length=1, max_length=200)
-    family: str | None = Field(
-        None,
-        description=(
-            "Optional family override for settings_matrix lookup "
-            "(e.g. 'gpt-oss', 'deepseek'). Omit for 'default'."
-        ),
-    )
-    context_window: int | None = Field(None, ge=1000)
-    reasoning_level: str | None = None
-    enabled: bool = True
-    capability: Literal[
-        "chat", "vision", "embedding", "auxiliary", "whisper", "tts"
-    ] = Field(
-        "chat",
-        description=(
-            "Slot this model fills. 'chat' is the default for back-compat; "
-            "'embedding'/'vision'/'auxiliary'/'whisper'/'tts' route the row "
-            "to the corresponding default-model slots in /api/models."
-        ),
-    )
-
-
-class LlmEndpointModelUpdate(BaseModel):
-    """Partial model-row update — only non-None fields are applied."""
-
-    display_name: str | None = None
-    family: str | None = None
-    context_window: int | None = Field(None, ge=1000)
-    reasoning_level: str | None = None
-    enabled: bool | None = None
-    capability: (
-        Literal["chat", "vision", "embedding", "auxiliary", "whisper", "tts"] | None
-    ) = None
-
-
-class LlmEndpointBatchModelCreate(BaseModel):
-    """Batch-import model rows under an endpoint — powers the discovery UI."""
-
-    models: list[LlmEndpointModelCreate] = Field(..., min_length=1)
-    skip_duplicates: bool = Field(
-        True,
-        description=(
-            "When True (default), pre-existing (endpoint, model_id, capability) "
-            "rows are skipped and reported in 'skipped'. When False, the first "
-            "conflict raises 409 and nothing is committed."
-        ),
-    )
-
-
 class AdminDefaultModelSet(BaseModel):
     """Request body for setting a default LLM model on the system.
 
@@ -2469,6 +2426,74 @@ class AdminDefaultModelSet(BaseModel):
     """
 
     model: str = Field(..., description="Model ID; empty string clears the default")
+
+
+# Locked enum for the admin-curated catalog. Adding a new role requires
+# touching every consumer (resolver, dispatcher, default-model fallback),
+# so the schema-level CHECK constraint and this Literal are kept in sync.
+VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision")
+VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
+
+
+class CatalogModelCreate(BaseModel):
+    """Request body for inserting a catalog row (Admin → Models)."""
+
+    provider_kind: Literal["system", "endpoint"]
+    provider_ref: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "system_api_keys.provider slug for provider_kind='system' "
+            "(e.g. 'anthropic'); user_llm_endpoints.id (UUID as text) for "
+            "provider_kind='endpoint'."
+        ),
+    )
+    model_id: str = Field(..., min_length=1, max_length=500)
+    display_label: str = Field(..., min_length=1, max_length=200)
+    role: Literal["chat", "auxiliary", "embedding", "vision"]
+    family: str = Field(
+        ...,
+        min_length=1,
+        description="settings_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
+    )
+    context_window: int | None = Field(
+        None,
+        description=(
+            "Optional override; falls back to settings_matrix family default. "
+            "Pass null (the default) to use the matrix; pass an explicit int "
+            "to override (zero is allowed and round-trips as zero)."
+        ),
+    )
+    reasoning_level: str | None = None
+    params_json: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Optional inference param overrides (e.g. {'temperature': 0.0}). "
+            "Null means 'use family defaults'; explicit zero/false values "
+            "round-trip as themselves (LiteLLM #14661 hazard guarded by "
+            "create_model accessor)."
+        ),
+    )
+    enabled: bool = True
+    notes: str | None = None
+
+
+class CatalogModelUpdate(BaseModel):
+    """Partial update — only fields explicitly set in the request body are
+    applied. Pass ``null`` to clear an optional column to NULL.
+    """
+
+    provider_kind: Literal["system", "endpoint"] | None = None
+    provider_ref: str | None = Field(None, min_length=1)
+    model_id: str | None = Field(None, min_length=1, max_length=500)
+    display_label: str | None = Field(None, min_length=1, max_length=200)
+    role: Literal["chat", "auxiliary", "embedding", "vision"] | None = None
+    family: str | None = Field(None, min_length=1)
+    context_window: int | None = None
+    reasoning_level: str | None = None
+    params_json: dict[str, Any] | None = None
+    enabled: bool | None = None
+    notes: str | None = None
 
 
 # Slots admins can pin cluster-wide via Admin → Providers → Defaults. The
@@ -2676,13 +2701,13 @@ async def lifespan(app: FastAPI):
     await vector_db.ensure_schema(schema_file=_vector_schema)
     logger.info("Database schemas verified")
 
-    # Wire the model registry's endpoint lookups to the DB. The registry
-    # lives in src/core/ and must not import orchestrator/, so the hooks
-    # are injected here (and unset on shutdown below).
-    from src.core.model_registry import register_custom_lookup, register_system_lookup
+    # Wire the model registry's catalog lookup to the DB. The registry lives
+    # in src/core/ and must not import orchestrator/, so the hook is injected
+    # here (and unset on shutdown below). custom/system lookups were retired
+    # along with user_llm_endpoint_models — the catalog covers both scopes.
+    from src.core.model_registry import register_catalog_lookup
 
-    register_custom_lookup(postgres_db.resolve_user_llm_model)
-    register_system_lookup(postgres_db.resolve_system_llm_model)
+    register_catalog_lookup(postgres_db.resolve_catalog_model)
 
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
@@ -2863,12 +2888,11 @@ async def lifespan(app: FastAPI):
     await nats_bridge.disconnect()
     await gitea_client.close()
 
-    # Unregister the registry's DB hooks before disconnecting the pool so
+    # Unregister the registry's DB hook before disconnecting the pool so
     # any stragglers don't hit a closed connection.
-    from src.core.model_registry import register_custom_lookup, register_system_lookup
+    from src.core.model_registry import register_catalog_lookup
 
-    register_custom_lookup(None)
-    register_system_lookup(None)
+    register_catalog_lookup(None)
 
     # Disconnect from databases
     await mongodb.disconnect()
@@ -11345,7 +11369,12 @@ def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
 
 
 def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape an endpoint row for the API response (key_prefix only, no full key)."""
+    """Shape an endpoint row for the API response (key_prefix only, no full key).
+
+    The ``models`` key is kept on the response shape for Cockpit
+    compatibility but is always empty after the catalog flip — model
+    offerings live in the admin-curated ``models`` table now.
+    """
     return {
         "id": str(row["id"]),
         "label": row["label"],
@@ -11353,22 +11382,7 @@ def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
         "key_prefix": row.get("key_prefix"),
         "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
         "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
-        "models": [_serialize_endpoint_model(m) for m in row.get("models", [])],
-    }
-
-
-def _serialize_endpoint_model(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": str(row["id"]),
-        "endpoint_id": str(row["endpoint_id"]),
-        "model_id": row["model_id"],
-        "display_name": row["display_name"],
-        "family": row.get("family"),
-        "context_window": row.get("context_window"),
-        "reasoning_level": row.get("reasoning_level"),
-        "enabled": row.get("enabled", True),
-        "capability": row.get("capability") or "chat",
-        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "models": [],
     }
 
 
@@ -11443,81 +11457,6 @@ async def delete_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, s
     return {"status": "deleted"}
 
 
-@app.post("/api/settings/llm-endpoints/{endpoint_id}/models")
-async def create_llm_endpoint_model(
-    request: Request, endpoint_id: str, body: LlmEndpointModelCreate
-) -> dict[str, Any]:
-    user = await require_approved_user(request, postgres_db)
-    try:
-        row = await postgres_db.create_user_llm_endpoint_model(
-            endpoint_id=endpoint_id,
-            user_id=str(user["id"]),
-            model_id=body.model_id,
-            display_name=body.display_name,
-            family=body.family,
-            context_window=body.context_window,
-            reasoning_level=body.reasoning_level,
-            enabled=body.enabled,
-            capability=body.capability,
-        )
-    except Exception as e:
-        if "uq_endpoint_model" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Model {body.model_id!r} with capability {body.capability!r} "
-                    "is already attached to this endpoint."
-                ),
-            )
-        raise
-    if row is None:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-    return _serialize_endpoint_model(row)
-
-
-@app.patch("/api/settings/llm-endpoints/{endpoint_id}/models/{model_id:path}")
-async def update_llm_endpoint_model(
-    request: Request,
-    endpoint_id: str,
-    model_id: str,
-    body: LlmEndpointModelUpdate,
-) -> dict[str, Any]:
-    user = await require_approved_user(request, postgres_db)
-    row = await postgres_db.update_user_llm_endpoint_model(
-        endpoint_id=endpoint_id,
-        model_id=model_id,
-        user_id=str(user["id"]),
-        display_name=body.display_name,
-        family=body.family,
-        context_window=body.context_window,
-        reasoning_level=body.reasoning_level,
-        enabled=body.enabled,
-        capability=body.capability or "chat",
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="Endpoint model not found")
-    return _serialize_endpoint_model(row)
-
-
-@app.delete("/api/settings/llm-endpoints/{endpoint_id}/models/{model_id:path}")
-async def delete_llm_endpoint_model(
-    request: Request,
-    endpoint_id: str,
-    model_id: str,
-    capability: str = "chat",
-) -> dict[str, str]:
-    user = await require_approved_user(request, postgres_db)
-    deleted = await postgres_db.delete_user_llm_endpoint_model(
-        endpoint_id=endpoint_id,
-        model_id=model_id,
-        user_id=str(user["id"]),
-        capability=capability,
-    )
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Endpoint model not found")
-    return {"status": "deleted"}
-
-
 @app.post("/api/settings/llm-endpoints/{endpoint_id}/test")
 async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any]:
     """Probe an endpoint by calling ``GET {base_url}/models`` server-side.
@@ -11545,50 +11484,14 @@ async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any
     }
 
 
-@app.post("/api/settings/llm-endpoints/{endpoint_id}/models:batch")
-async def batch_create_llm_endpoint_models(
-    request: Request, endpoint_id: str, body: LlmEndpointBatchModelCreate
-) -> dict[str, Any]:
-    """Bulk-import model rows under a user-scoped endpoint (import flow).
-
-    Powers the "Discover → select → import" UX. See
-    ``LlmEndpointBatchModelCreate`` for the request shape and the ``batch_
-    create_endpoint_models`` DB helper for duplicate handling semantics.
-    """
-    user = await require_approved_user(request, postgres_db)
-    endpoint = await postgres_db.get_user_llm_endpoint(
-        endpoint_id=endpoint_id, user_id=str(user["id"])
-    )
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-
-    try:
-        result = await postgres_db.batch_create_endpoint_models(
-            endpoint_id=endpoint_id,
-            models=[m.model_dump() for m in body.models],
-            skip_duplicates=body.skip_duplicates,
-        )
-    except Exception as e:
-        if "uq_endpoint_model" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail="One or more (model_id, capability) pairs already exist.",
-            )
-        raise
-    return result
-
-
 @app.post("/api/settings/llm-endpoints/{endpoint_id}/discover")
 async def discover_llm_endpoint_models(
     request: Request, endpoint_id: str
 ) -> dict[str, Any]:
     """Return the model list served by ``GET {base_url}/models``.
 
-    Each discovered model carries a ``capability_hint`` suggestion (chat /
-    vision / embedding / whisper) derived from the model_id; the UI uses it
-    as the default selection in the import checklist. ``already_registered``
-    is the subset of discovered model_ids that already have at least one
-    row under this endpoint, letting the UI mark them as imported.
+    Read-only — the user-side surface only exposes discovery for browsing;
+    actual catalog authoring is admin-only via Admin → Models.
     """
     user = await require_approved_user(request, postgres_db)
     endpoint = await postgres_db.get_user_llm_endpoint(
@@ -11602,14 +11505,12 @@ async def discover_llm_endpoint_models(
         api_key=endpoint.get("api_key"),
     )
 
-    already_registered: set[str] = {m["model_id"] for m in endpoint.get("models", [])}
     return {
         "ok": result.ok,
         "status": result.status,
         "error": result.error,
         "probe_url": result.probe_url,
         "models": result.models,
-        "already_registered": sorted(already_registered),
     }
 
 
@@ -11745,76 +11646,6 @@ async def admin_delete_provider_endpoint(
     return {"status": "deleted"}
 
 
-@app.post("/api/admin/providers/endpoints/{endpoint_id}/models")
-async def admin_create_provider_endpoint_model(
-    request: Request, endpoint_id: str, body: LlmEndpointModelCreate
-) -> dict[str, Any]:
-    await _require_admin(request)
-    try:
-        row = await postgres_db.create_system_llm_endpoint_model(
-            endpoint_id=endpoint_id,
-            model_id=body.model_id,
-            display_name=body.display_name,
-            family=body.family,
-            context_window=body.context_window,
-            reasoning_level=body.reasoning_level,
-            enabled=body.enabled,
-            capability=body.capability,
-        )
-    except Exception as e:
-        if "uq_endpoint_model" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Model {body.model_id!r} with capability {body.capability!r} "
-                    "is already attached to this endpoint."
-                ),
-            )
-        raise
-    if row is None:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-    return _serialize_endpoint_model(row)
-
-
-@app.patch("/api/admin/providers/endpoints/{endpoint_id}/models/{model_id:path}")
-async def admin_update_provider_endpoint_model(
-    request: Request,
-    endpoint_id: str,
-    model_id: str,
-    body: LlmEndpointModelUpdate,
-) -> dict[str, Any]:
-    await _require_admin(request)
-    row = await postgres_db.update_system_llm_endpoint_model(
-        endpoint_id=endpoint_id,
-        model_id=model_id,
-        display_name=body.display_name,
-        family=body.family,
-        context_window=body.context_window,
-        reasoning_level=body.reasoning_level,
-        enabled=body.enabled,
-        capability=body.capability or "chat",
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="System endpoint model not found")
-    return _serialize_endpoint_model(row)
-
-
-@app.delete("/api/admin/providers/endpoints/{endpoint_id}/models/{model_id:path}")
-async def admin_delete_provider_endpoint_model(
-    request: Request,
-    endpoint_id: str,
-    model_id: str,
-    capability: str = "chat",
-) -> dict[str, str]:
-    await _require_admin(request)
-    deleted = await postgres_db.delete_system_llm_endpoint_model(
-        endpoint_id=endpoint_id, model_id=model_id, capability=capability
-    )
-    if not deleted:
-        raise HTTPException(status_code=404, detail="System endpoint model not found")
-    return {"status": "deleted"}
-
-
 @app.post("/api/admin/providers/endpoints/{endpoint_id}/test")
 async def admin_test_provider_endpoint(
     request: Request, endpoint_id: str
@@ -11837,41 +11668,16 @@ async def admin_test_provider_endpoint(
     }
 
 
-@app.post("/api/admin/providers/endpoints/{endpoint_id}/models:batch")
-async def admin_batch_create_provider_endpoint_models(
-    request: Request, endpoint_id: str, body: LlmEndpointBatchModelCreate
-) -> dict[str, Any]:
-    """Bulk-import model rows under a system-scoped endpoint (admin)."""
-    await _require_admin(request)
-    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
-    if endpoint is None:
-        raise HTTPException(status_code=404, detail="System endpoint not found")
-
-    try:
-        result = await postgres_db.batch_create_endpoint_models(
-            endpoint_id=endpoint_id,
-            models=[m.model_dump() for m in body.models],
-            skip_duplicates=body.skip_duplicates,
-        )
-    except Exception as e:
-        if "uq_endpoint_model" in str(e):
-            raise HTTPException(
-                status_code=409,
-                detail="One or more (model_id, capability) pairs already exist.",
-            )
-        raise
-    return result
-
-
 @app.post("/api/admin/providers/endpoints/{endpoint_id}/discover")
 async def admin_discover_provider_endpoint_models(
     request: Request, endpoint_id: str
 ) -> dict[str, Any]:
     """Return the model list served by ``GET {base_url}/models`` (admin).
 
-    See the user-scoped ``/api/settings/llm-endpoints/{id}/discover`` for
-    the response shape — the admin variant is identical, operating on
-    system-scoped endpoints.
+    Discovery is read-only — admins author catalog rows via Admin → Models
+    using the endpoint as the transport reference. The legacy
+    ``already_registered`` field is gone (the endpoint itself no longer
+    owns model rows after the catalog flip).
     """
     await _require_admin(request)
     endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
@@ -11883,14 +11689,12 @@ async def admin_discover_provider_endpoint_models(
         api_key=endpoint.get("api_key"),
     )
 
-    already_registered: set[str] = {m["model_id"] for m in endpoint.get("models", [])}
     return {
         "ok": result.ok,
         "status": result.status,
         "error": result.error,
         "probe_url": result.probe_url,
         "models": result.models,
-        "already_registered": sorted(already_registered),
     }
 
 
@@ -11921,6 +11725,266 @@ async def admin_set_provider_default(
         kind, body.model or None, updated_by=str(admin.get("id"))
     )
     return {"kind": kind, "model": await postgres_db.get_default_llm_model(kind)}
+
+
+# =============================================================================
+# Admin Models Catalog API (Admin → Models)
+# Reads/writes the ``models`` table — the curated list of LLMs the application
+# offers. Each row is provider-anchored (system_api_keys or system-scoped
+# user_llm_endpoints). User authoring is not exposed.
+# =============================================================================
+
+
+def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a ``models`` row for API responses."""
+    return {
+        "id": str(row["id"]),
+        "provider_kind": row["provider_kind"],
+        "provider_ref": row["provider_ref"],
+        "model_id": row["model_id"],
+        "display_label": row["display_label"],
+        "role": row["role"],
+        "family": row["family"],
+        "context_window": row.get("context_window"),
+        "reasoning_level": row.get("reasoning_level"),
+        "params_json": row.get("params_json"),
+        "enabled": row.get("enabled", True),
+        "seeded_from": row.get("seeded_from"),
+        "notes": row.get("notes"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) -> None:
+    """Reject catalog inserts/updates pointing at a transport that doesn't
+    exist. Keeps the catalog from referencing stale rows after the admin
+    deletes a provider key or system endpoint.
+    """
+    if provider_kind == "system":
+        if provider_ref not in VALID_SYSTEM_API_KEY_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid system provider '{provider_ref}'. Valid: "
+                    f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+                ),
+            )
+        existing = await postgres_db.get_system_api_key(provider_ref)
+        if not existing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No system_api_keys row for provider '{provider_ref}'. "
+                    "Configure via Admin → Providers first."
+                ),
+            )
+    elif provider_kind == "endpoint":
+        endpoint = await postgres_db.get_system_llm_endpoint(provider_ref)
+        if endpoint is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No system endpoint with id '{provider_ref}'.",
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider_kind '{provider_kind}'. Valid: "
+                f"{list(VALID_CATALOG_PROVIDER_KINDS)}"
+            ),
+        )
+
+
+@app.get("/api/admin/providers/models")
+async def admin_list_catalog_models(
+    request: Request,
+    role: str | None = None,
+    provider_kind: str | None = None,
+    provider_ref: str | None = None,
+    enabled_only: bool = False,
+) -> list[dict[str, Any]]:
+    """List catalog rows with optional filters. Returns full row shape."""
+    await _require_admin(request)
+    if role is not None and role not in VALID_CATALOG_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{role}'. Valid: {list(VALID_CATALOG_ROLES)}",
+        )
+    rows = await postgres_db.list_models(
+        role=role,
+        provider_kind=provider_kind,
+        provider_ref=provider_ref,
+        enabled_only=enabled_only,
+    )
+    return [_serialize_catalog_model(r) for r in rows]
+
+
+@app.post("/api/admin/providers/models")
+async def admin_create_catalog_model(
+    request: Request, body: CatalogModelCreate
+) -> dict[str, Any]:
+    """Insert a new catalog row.
+
+    Validates that ``provider_ref`` resolves to an existing transport before
+    insert. Returns the created row; raises 409 on
+    ``(provider_kind, provider_ref, model_id, role)`` collision.
+    """
+    await _require_admin(request)
+    await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
+    try:
+        row = await postgres_db.create_model(
+            provider_kind=body.provider_kind,
+            provider_ref=body.provider_ref,
+            model_id=body.model_id,
+            display_label=body.display_label,
+            role=body.role,
+            family=body.family,
+            context_window=body.context_window,
+            reasoning_level=body.reasoning_level,
+            params_json=body.params_json,
+            enabled=body.enabled,
+            notes=body.notes,
+        )
+    except Exception as e:
+        if "uq_model_provider" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
+                    f"{body.model_id}, role={body.role}) already exists."
+                ),
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=500, detail="Catalog insert returned no row.")
+    return _serialize_catalog_model(row)
+
+
+@app.patch("/api/admin/providers/models/{catalog_id}")
+async def admin_update_catalog_model(
+    request: Request, catalog_id: str, body: CatalogModelUpdate
+) -> dict[str, Any]:
+    """Patch a catalog row. Only fields present in the body are written.
+
+    Pass ``null`` to clear an optional column. The validator re-checks the
+    transport when ``provider_kind`` or ``provider_ref`` changes.
+    """
+    await _require_admin(request)
+    fields = body.model_dump(exclude_unset=True)
+    if "provider_kind" in fields or "provider_ref" in fields:
+        existing = await postgres_db.get_model(catalog_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Catalog row not found")
+        new_kind = fields.get("provider_kind", existing["provider_kind"])
+        new_ref = fields.get("provider_ref", existing["provider_ref"])
+        await _validate_catalog_provider_ref(new_kind, new_ref)
+    try:
+        row = await postgres_db.update_model(catalog_id, **fields)
+    except Exception as e:
+        if "uq_model_provider" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="Update would collide with an existing catalog row.",
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+    return _serialize_catalog_model(row)
+
+
+@app.delete("/api/admin/providers/models/{catalog_id}")
+async def admin_delete_catalog_model(
+    request: Request, catalog_id: str
+) -> dict[str, Any]:
+    """Hard-delete a catalog row. Returns a warning when the row's model_id
+    is currently referenced by a ``default_llm_models`` pointer (the pin
+    becomes a dangling reference; the resolver's first-enabled-alphabetical
+    fallback handles it gracefully).
+    """
+    await _require_admin(request)
+    existing = await postgres_db.get_model(catalog_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+
+    referencing_kinds: list[str] = []
+    for kind in sorted(VALID_DEFAULT_MODEL_KINDS):
+        pin = await postgres_db.get_default_llm_model(kind)
+        if pin == existing["model_id"]:
+            referencing_kinds.append(kind)
+
+    deleted = await postgres_db.delete_model(catalog_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+    return {
+        "status": "deleted",
+        "id": catalog_id,
+        "warning": (
+            f"Default-model pin(s) referenced this row: {referencing_kinds}. "
+            "Resolver falls back to first-enabled-alphabetical until repinned."
+            if referencing_kinds
+            else None
+        ),
+    }
+
+
+@app.post("/api/admin/providers/models/{catalog_id}/test")
+async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[str, Any]:
+    """Probe a catalog row's transport.
+
+    For ``provider_kind='endpoint'``, calls ``GET {endpoint.base_url}/models``
+    via the existing endpoint-probe helper. For ``provider_kind='system'``,
+    confirms the ``system_api_keys`` row exists and returns ``ok=True``
+    without round-tripping the provider — vendor-specific health probes
+    are out of scope for v1.
+    """
+    await _require_admin(request)
+    row = await postgres_db.get_model(catalog_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+
+    if row["provider_kind"] == "endpoint":
+        endpoint = await postgres_db.get_system_llm_endpoint(row["provider_ref"])
+        if endpoint is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Catalog row references missing endpoint "
+                    f"'{row['provider_ref']}' — repoint or delete."
+                ),
+            )
+        result = await probe_endpoint_models(
+            base_url=endpoint["base_url"], api_key=endpoint.get("api_key")
+        )
+        return {
+            "ok": result.ok,
+            "status": result.status,
+            "error": result.error,
+            "probe_url": result.probe_url,
+        }
+
+    key = await postgres_db.get_system_api_key(row["provider_ref"])
+    if not key:
+        return {
+            "ok": False,
+            "status": None,
+            "error": (f"No system_api_keys row for provider '{row['provider_ref']}'."),
+            "probe_url": None,
+        }
+    return {"ok": True, "status": 200, "error": None, "probe_url": None}
+
+
+@app.get("/api/admin/families")
+async def admin_list_families(request: Request) -> dict[str, list[str]]:
+    """Return the family keys defined in ``settings_matrix.yaml``.
+
+    Powers the family dropdown on the *Admin → Models* form so adding a
+    family in the YAML doesn't require a frontend rebuild.
+    """
+    await _require_admin(request)
+    matrix = _load_settings_matrix(_get_config_dir())
+    families = sorted(k for k in matrix.keys() if isinstance(k, str))
+    return {"families": families}
 
 
 def _resolve_preference_defaults() -> dict[str, Any]:
@@ -12090,33 +12154,36 @@ _PROVIDER_ENV_KEYS: dict[str, list[str]] = {
     "codex": ["CODEX_API_KEY"],
 }
 
-# Cache the loaded catalog (reloaded on expert reload or manually)
-_model_catalog_cache: dict[str, Any] | None = None
+# Cache for the legacy YAML bits still surfaced through /api/models (presets,
+# whisper, tts — none of which are catalog roles in v1). Reset by
+# /api/models/reload.
+_model_catalog_yaml_cache: dict[str, Any] | None = None
 
 
-def _load_model_catalog() -> dict[str, Any]:
-    """Load config/models.yaml (cached after first load)."""
-    global _model_catalog_cache
-    if _model_catalog_cache is not None:
-        return _model_catalog_cache
+def _load_models_yaml_legacy() -> dict[str, Any]:
+    """Load the residual ``config/models.yaml`` bits the catalog table doesn't
+    cover yet (presets, whisper, tts). Cached after first load.
+
+    Catalog roles (chat / auxiliary / embedding / vision) come from the DB
+    via ``postgres_db.list_models``; this YAML reader only services the
+    transitional surface for the four bits Phase D leaves behind.
+    """
+    global _model_catalog_yaml_cache
+    if _model_catalog_yaml_cache is not None:
+        return _model_catalog_yaml_cache
 
     catalog_path = _get_config_dir() / "models.yaml"
     if not catalog_path.exists():
         logger.warning(
-            "models.yaml not found at %s — returning empty catalog", catalog_path
+            "models.yaml not found at %s — returning empty legacy bits",
+            catalog_path,
         )
-        return {"groups": [], "presets": [], "builder_models": []}
+        return {"presets": [], "whisper_models": [], "tts_models": []}
 
     with open(catalog_path) as f:
         data = yaml.safe_load(f) or {}
 
-    _model_catalog_cache = data
-    logger.info(
-        "Loaded model catalog: %d groups, %d presets, %d builder models",
-        len(data.get("groups", [])),
-        len(data.get("presets", [])),
-        len(data.get("builder_models", [])),
-    )
+    _model_catalog_yaml_cache = data
     return data
 
 
@@ -12152,240 +12219,123 @@ async def list_available_models(
     request: Request,
     project_id: str | None = None,
 ) -> dict[str, Any]:
-    """List all models from the catalog with provider availability annotations.
+    """List all models from the admin-curated catalog.
 
-    Returns the full model catalog. Each group, preset, builder model, and
-    helper model includes a ``configured`` boolean indicating whether the
-    provider has an API key available (system env vars, user keys, or
-    project keys). Unconfigured models are still returned so users can
-    discover them and add their own keys.
+    Returns the catalog grouped by provider for the four catalog roles
+    (chat → ``groups`` + ``builder_models``; auxiliary / vision / embedding
+    → sibling arrays). Whisper/TTS still come from ``config/models.yaml``
+    until they earn first-class catalog roles. Each row carries
+    ``configured: true`` because the catalog only contains rows whose
+    transport (system_api_keys row or system endpoint) is admin-managed.
 
     Query params:
-        project_id: optional project ID to include project-level API keys
+        project_id: kept for backward compatibility — no longer affects the
+            response shape now that the catalog is the source of truth.
     """
-    user = await require_approved_user(request, postgres_db)
-    user_id = str(user["id"])
+    await require_approved_user(request, postgres_db)
+    _ = project_id  # accepted but unused post-flip
 
-    # Collect configured providers: local is always available
-    configured_providers: set[str] = {"local"}
+    # Catalog rows joined to transport (only enabled rows surface).
+    catalog_rows = await postgres_db.list_models(enabled_only=True)
+    system_endpoints = await postgres_db.list_system_llm_endpoints()
+    endpoint_label_by_id: dict[str, str] = {
+        str(e["id"]): e["label"] for e in system_endpoints
+    }
 
-    # System-level env vars
-    configured_providers |= _get_system_providers()
+    # Build (provider_kind, provider_ref) → group payload.
+    groups_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    builder_models: list[dict[str, Any]] = []
+    auxiliary: list[dict[str, Any]] = []
+    vision: list[dict[str, Any]] = []
+    embedding: list[dict[str, Any]] = []
 
-    # User-level API keys
-    user_keys = await postgres_db.list_user_api_keys(user_id)
-    configured_providers |= {k["provider"] for k in user_keys}
+    configured_providers: set[str] = set()
 
-    # Project-level API keys (optional)
-    if project_id:
-        try:
-            project_keys = await postgres_db.list_project_api_keys(project_id)
-            configured_providers |= {k["provider"] for k in project_keys}
-        except Exception:
-            pass  # Project doesn't exist or no access — ignore
-
-    # Load full catalog (no filtering — all models returned)
-    catalog = _load_model_catalog()
-
-    # Build model_id -> provider lookup for preset annotation
-    model_provider: dict[str, str] = {}
-    for group in catalog.get("groups", []):
-        for m in group.get("models", []):
-            model_provider[m["id"]] = group["provider"]
-
-    groups = [
-        {
-            "group": group["name"],
-            "provider": group["provider"],
-            "configured": group["provider"] in configured_providers,
-            "models": [m["id"] for m in group.get("models", [])],
+    for row in catalog_rows:
+        kind = row["provider_kind"]
+        ref = row["provider_ref"]
+        role = row["role"]
+        helper_entry = {
+            "id": row["model_id"],
+            "label": row["display_label"],
+            "configured": True,
         }
-        for group in catalog.get("groups", [])
-    ]
+        if role == "auxiliary":
+            auxiliary.append(helper_entry)
+            continue
+        if role == "vision":
+            vision.append(helper_entry)
+            continue
+        if role == "embedding":
+            embedding.append(helper_entry)
+            continue
+        # role == 'chat'
+        key = (kind, ref)
+        group = groups_by_key.get(key)
+        if group is None:
+            if kind == "system":
+                group_name = ref.title() if ref.islower() else ref
+                provider_tag = ref
+                configured_providers.add(ref)
+                group = {
+                    "group": group_name,
+                    "provider": provider_tag,
+                    "configured": True,
+                    "models": [],
+                }
+            else:  # endpoint
+                label = endpoint_label_by_id.get(ref, f"endpoint:{ref[:8]}")
+                group = {
+                    "group": f"System: {label}",
+                    "provider": "system",
+                    "endpoint_id": ref,
+                    "configured": True,
+                    "models": [],
+                }
+            groups_by_key[key] = group
+        group["models"].append(row["model_id"])
+        builder_models.append(
+            {
+                "label": row["display_label"],
+                "id": row["model_id"],
+                "configured": True,
+            }
+        )
 
+    groups = list(groups_by_key.values())
+
+    # Legacy YAML bits — presets + whisper + tts — kept until they earn
+    # first-class catalog support. Configured-flag is checked against the
+    # provider set we built from the catalog.
+    legacy = _load_models_yaml_legacy()
+
+    catalog_model_ids: set[str] = {r["model_id"] for r in catalog_rows}
     presets = [
         {
             "label": p["label"],
             "strategic": p["strategic"],
             "tactical": p["tactical"],
             "configured": (
-                model_provider.get(p["strategic"], "local") in configured_providers
-                and model_provider.get(p["tactical"], "local") in configured_providers
+                p["strategic"] in catalog_model_ids
+                and p["tactical"] in catalog_model_ids
             ),
         }
-        for p in catalog.get("presets", [])
+        for p in legacy.get("presets", [])
     ]
 
-    builder_models = [
-        {
-            "label": m["label"],
-            "id": m["id"],
-            "configured": m.get("provider", "local") in configured_providers,
-        }
-        for m in catalog.get("builder_models", [])
-    ]
-
-    def _annotate_helper(
-        key: str, extra_fields: tuple[str, ...] = ()
-    ) -> list[dict[str, Any]]:
+    def _legacy_helper(key: str) -> list[dict[str, Any]]:
         return [
             {
                 "id": m["id"],
                 "label": m["label"],
-                "configured": m.get("provider", "local") in configured_providers,
-                **{f: m[f] for f in extra_fields if f in m},
+                "configured": m.get("provider", "local")
+                in (configured_providers | {"local"}),
             }
-            for m in catalog.get(key, [])
+            for m in legacy.get(key, [])
         ]
 
-    auxiliary = _annotate_helper("auxiliary_models")
-    vision = _annotate_helper("vision_models")
-    whisper = _annotate_helper("whisper_models")
-    tts = _annotate_helper("tts_models")
-    embedding = _annotate_helper("embedding_models", ("dimensions",))
-
-    # Codex subscription override: if the Codex proxy is connected and
-    # offers a model that also exists in the OpenAI API catalog, prefer the
-    # subscription-backed codex/ variant so the user isn't double-billed.
-    codex_sub_models = await _get_codex_subscription_models()
-    if codex_sub_models:
-        configured_providers.add("codex")
-
-        # Collect OpenAI model IDs that the subscription also offers
-        overrides: dict[str, str] = {}  # "gpt-5.4" -> "codex/gpt-5.4"
-        for group in groups:
-            if group["provider"] != "openai":
-                continue
-            kept = []
-            for mid in group["models"]:
-                if mid in codex_sub_models:
-                    overrides[mid] = f"codex/{mid}"
-                else:
-                    kept.append(mid)
-            group["models"] = kept
-
-        if overrides:
-            # Add overridden models to the Codex group
-            codex_group = next((g for g in groups if g["provider"] == "codex"), None)
-            new_codex_models = list(overrides.values())
-            if codex_group:
-                new_set = set(new_codex_models)
-                codex_group["models"] = new_codex_models + [
-                    m for m in codex_group["models"] if m not in new_set
-                ]
-                codex_group["configured"] = True
-            else:
-                groups.append(
-                    {
-                        "group": "Codex",
-                        "provider": "codex",
-                        "configured": True,
-                        "models": new_codex_models,
-                    }
-                )
-
-            # Update model_provider map so preset configured checks work
-            for old_id, new_id in overrides.items():
-                model_provider[new_id] = "codex"
-
-            # Update presets
-            for p in presets:
-                if p["strategic"] in overrides:
-                    p["strategic"] = overrides[p["strategic"]]
-                if p["tactical"] in overrides:
-                    p["tactical"] = overrides[p["tactical"]]
-                p["configured"] = (
-                    model_provider.get(p["strategic"], "local") in configured_providers
-                    and model_provider.get(p["tactical"], "local")
-                    in configured_providers
-                )
-
-            # Update builder models
-            for bm in builder_models:
-                if bm["id"] in overrides:
-                    bm["id"] = overrides[bm["id"]]
-                    bm["configured"] = True
-
-            # Update helper model lists
-            for helper_list in (auxiliary, vision, whisper, tts, embedding):
-                for hm in helper_list:
-                    if hm["id"] in overrides:
-                        hm["id"] = overrides[hm["id"]]
-                        hm["configured"] = True
-
-    # Merge endpoint-backed models into the catalog, split by capability:
-    # * 'chat'       → provider group + builder_models (chat catalog)
-    # * 'vision'     → vision_models sibling array
-    # * 'embedding'  → embedding_models sibling array
-    # * 'auxiliary'  → auxiliary_models sibling array (chat-compatible;
-    #                  surfacing it in the main catalog would duplicate the
-    #                  same model under two rows, so the auxiliary slot is
-    #                  the only place it shows up)
-    # * 'whisper'    → whisper_models sibling array
-    # * 'tts'        → tts_models sibling array
-    # Chat models never auto-appear in the auxiliary list — the UI resolves
-    # auxiliary slot dropdowns against chat + auxiliary combined.
-    def _merge_endpoint_models(
-        endpoint: dict[str, Any], group_prefix: str, provider_tag: str
-    ) -> None:
-        enabled_models = [
-            m for m in endpoint.get("models", []) if m.get("enabled", True)
-        ]
-        if not enabled_models:
-            return
-        chat_rows = [
-            m for m in enabled_models if (m.get("capability") or "chat") == "chat"
-        ]
-        if chat_rows:
-            groups.append(
-                {
-                    "group": f"{group_prefix}: {endpoint['label']}",
-                    "provider": provider_tag,
-                    "endpoint_id": str(endpoint["id"]),
-                    "configured": True,
-                    "models": [m["model_id"] for m in chat_rows],
-                }
-            )
-            builder_models.extend(
-                {
-                    "label": f"{m['display_name']} ({endpoint['label']})",
-                    "id": m["model_id"],
-                    "configured": True,
-                }
-                for m in chat_rows
-            )
-
-        for m in enabled_models:
-            cap = m.get("capability") or "chat"
-            if cap == "chat":
-                continue
-            row = {
-                "id": m["model_id"],
-                "label": f"{m['display_name']} ({endpoint['label']})",
-                "configured": True,
-            }
-            if cap == "vision":
-                vision.append(row)
-            elif cap == "embedding":
-                embedding.append(row)
-            elif cap == "auxiliary":
-                auxiliary.append(row)
-            elif cap == "whisper":
-                whisper.append(row)
-            elif cap == "tts":
-                tts.append(row)
-
-    # System-scoped LLM endpoints (seeded by helm or managed via Admin →
-    # Providers, visible to every user). Always configured because the key
-    # lives on the endpoint row, not in resolved_keys.
-    system_endpoints = await postgres_db.list_system_llm_endpoints()
-    for endpoint in system_endpoints:
-        _merge_endpoint_models(endpoint, "System", "system")
-
-    # The user's own custom LLM endpoints.
-    user_endpoints = await postgres_db.list_user_llm_endpoints(user_id)
-    for endpoint in user_endpoints:
-        _merge_endpoint_models(endpoint, "Custom", "custom")
+    whisper = _legacy_helper("whisper_models")
+    tts = _legacy_helper("tts_models")
 
     return {
         "groups": groups,
@@ -12396,19 +12346,22 @@ async def list_available_models(
         "whisper_models": whisper,
         "tts_models": tts,
         "embedding_models": embedding,
-        "configured_providers": sorted(configured_providers - {"local"}),
+        "configured_providers": sorted(configured_providers),
     }
 
 
 @app.post("/api/models/reload")
 async def reload_model_catalog(request: Request) -> dict[str, str]:
-    """Reload the model catalog from disk (admin-only)."""
+    """Drop the legacy YAML cache and reload the registry.
+
+    Catalog rows live in the DB and are read fresh on every ``/api/models``
+    call — no cache to invalidate. This endpoint stays in place to flush
+    the residual whisper/tts/presets YAML cache and to bounce the registry
+    in case the YAML fallback wants picked-up edits.
+    """
     await _require_admin(request)
-    global _model_catalog_cache
-    _model_catalog_cache = None
-    _load_model_catalog()
-    # Also reload the in-memory model registry so new YAML entries / removed
-    # entries / updated families are picked up without restarting.
+    global _model_catalog_yaml_cache
+    _model_catalog_yaml_cache = None
     from src.core.model_registry import reload_registry as _reload_registry
 
     _reload_registry()
@@ -15256,7 +15209,11 @@ async def _create_builder_llm(raw_model: str):
     except UnknownModelError:
         meta = None
 
-    if meta is not None and meta.origin in ("custom", "system") and meta.endpoint_id:
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
         endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
         if endpoint_row:
             base_url = endpoint_row.get("base_url")
