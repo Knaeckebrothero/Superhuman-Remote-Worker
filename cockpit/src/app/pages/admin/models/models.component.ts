@@ -19,15 +19,14 @@ interface ProviderOption {
   available: boolean;
 }
 
-/**
- * Maps the discover endpoint's capability hint onto a catalog role. Whisper /
- * tts hints fall back to 'chat' since v1 catalog roles don't cover them yet.
- */
+/** Maps the discover endpoint's capability hint onto a catalog role. */
 function hintToRole(hint: string | null | undefined): CatalogRole {
   switch (hint) {
     case 'auxiliary':
     case 'embedding':
     case 'vision':
+    case 'whisper':
+    case 'tts':
       return hint;
     default:
       return 'chat';
@@ -437,10 +436,13 @@ export class AdminModelsComponent implements OnInit {
     return this.formProviderKey.slice('endpoint:'.length);
   }
 
-  /** Provider dropdown options sourced from the keys + endpoints lists. */
+  /** Provider dropdown options sourced from the keys + endpoints lists.
+   * Non-LLM providers (`tavily`, `vision`) are filtered out — they live in
+   * `system_api_keys` for env injection but can't anchor a catalog row. */
   readonly providerOptions = computed<ProviderOption[]>(() => {
     const opts: ProviderOption[] = [];
     for (const key of this.providers.systemApiKeys()) {
+      if (key.provider === 'tavily' || key.provider === 'vision') continue;
       opts.push({
         kind: 'system',
         ref: key.provider,

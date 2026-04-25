@@ -226,9 +226,16 @@ async def _seed_endpoints(
                 )
                 continue
             role = (model.get("capability") or "chat").lower()
-            if role not in ("chat", "auxiliary", "embedding", "vision"):
+            if role not in (
+                "chat",
+                "auxiliary",
+                "embedding",
+                "vision",
+                "whisper",
+                "tts",
+            ):
                 logger.info(
-                    "skipping model %s under %s — capability %r is not a v1 catalog role",
+                    "skipping model %s under %s — capability %r is not a catalog role",
                     model_id,
                     label,
                     role,
