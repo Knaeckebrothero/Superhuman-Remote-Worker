@@ -65,6 +65,12 @@ spec:
           image: {{ .Values.reloader.image }}
           args:
             - --reload-strategy=annotations
+            - --namespaces-to-watch=$(POD_NAMESPACE)
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             {{- toYaml .Values.reloader.resources | nindent 12 }}
 {{- end }}
