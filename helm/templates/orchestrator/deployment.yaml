@@ -504,6 +504,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NTFY_TOKEN
+                  optional: true
             # VM lifecycle (optional)
             - name: NATS_URL
               valueFrom:
