@@ -15,8 +15,17 @@
 set -euo pipefail
 
 CONTEXT="${KUBE_CONTEXT:-main}"
-NS="headscale"
-POD="headscale-0"
+NS="${HEADSCALE_NAMESPACE:-headscale}"
+
+# Discover the headscale pod by label so this works regardless of how the
+# StatefulSet is named (legacy `headscale-0`, chart-rendered fullname-prefixed,
+# or whatever the standalone HomeLab bundle produces).
+POD=$(kubectl --context "$CONTEXT" -n "$NS" get pod \
+  -l app=headscale -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$POD" ]; then
+  echo "No pod with label app=headscale in namespace $NS on context $CONTEXT" >&2
+  exit 1
+fi
 
 echo "Waiting for $POD to be ready..."
 kubectl --context "$CONTEXT" -n "$NS" wait --for=condition=ready "pod/$POD" --timeout=120s

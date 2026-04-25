@@ -563,8 +563,6 @@ services:
       WORKSTATION_BASE_URL: http://vpn-workstation:8080/v1
       # Gitea
       GITEA_URL: http://gitea:3000
-      # Claude Code CLI auth (for coder-cc expert, uses Max/Pro plan)
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     cap_drop:

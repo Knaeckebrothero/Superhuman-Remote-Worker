@@ -76,6 +76,10 @@ class AgentProvisioner:
         )
         self._reserved_job_slots: int = int(os.environ.get("RESERVED_JOB_SLOTS", "0"))
         self._label_selector: str = "srw/managed-by=agent-provisioner"
+        self._tailscale_enabled: bool = os.environ.get(
+            "AGENT_TAILSCALE_ENABLED", "false"
+        ).strip().lower() in ("true", "1", "yes")
+        self._headscale_url: str = os.environ.get("HEADSCALE_URL", "").strip()
 
     # =========================================================================
     # Properties
@@ -757,6 +761,157 @@ class AgentProvisioner:
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
 
+        containers: list[dict] = [
+            {
+                "name": "agent",
+                "image": self._agent_image,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["sh", "-c", command],
+                "ports": [{"containerPort": 8001}],
+                # Inject all env from shared ConfigMap + Secret
+                "envFrom": [
+                    {"configMapRef": {"name": self._configmap_name}},
+                    {"secretRef": {"name": self._secret_name}},
+                ],
+                # Pod-specific overrides
+                "env": [
+                    {"name": "AGENT_CONFIG", "value": config_name},
+                    {"name": "AGENT_PORT", "value": "8001"},
+                ],
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "runAsUser": 999,
+                    "runAsGroup": 999,
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+                "volumeMounts": [
+                    {"name": "workspace", "mountPath": "/workspace"},
+                    {
+                        "name": "vm-ssh-key",
+                        "mountPath": "/run/secrets/vm-ssh-key",
+                        "subPath": "ssh-privatekey",
+                        "readOnly": True,
+                    },
+                    {"name": "tmp", "mountPath": "/tmp"},
+                    {"name": "run", "mountPath": "/run"},
+                    {"name": "home-srw", "mountPath": "/home/srw"},
+                ],
+                "livenessProbe": {
+                    "httpGet": {"path": "/health", "port": 8001},
+                    "initialDelaySeconds": 60,
+                    "periodSeconds": 30,
+                },
+                "readinessProbe": {
+                    "httpGet": {"path": "/ready", "port": 8001},
+                    "initialDelaySeconds": 30,
+                    "periodSeconds": 10,
+                },
+                "startupProbe": {
+                    "httpGet": {"path": "/health", "port": 8001},
+                    "failureThreshold": 10,
+                    "periodSeconds": 10,
+                },
+                "resources": {
+                    "requests": {
+                        "memory": memory_request,
+                        "cpu": cpu_request,
+                    },
+                    "limits": {
+                        "memory": memory_limit,
+                        "cpu": cpu_limit,
+                    },
+                },
+            },
+        ]
+
+        volumes: list[dict] = [
+            # Scratch workspace (agent connects to real workspace
+            # via SSH — this is just local temp storage)
+            {"name": "workspace", "emptyDir": {"sizeLimit": "10Gi"}},
+            {
+                "name": "vm-ssh-key",
+                "secret": {
+                    "secretName": self._ssh_secret_name,
+                    "defaultMode": 0o444,
+                },
+            },
+            {
+                "name": "tmp",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"},
+            },
+            {
+                "name": "run",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"},
+            },
+            {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
+        ]
+
+        if self._tailscale_enabled and self._headscale_url:
+            tailscale_args = (
+                "mkdir -p /dev/net; "
+                "[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; "
+                "tailscaled --state=mem: --tun=tailscale0 "
+                "--no-logs-no-support & "
+                "TSPID=$!; "
+                "for i in $(seq 1 30); do "
+                "[ -S /var/run/tailscale/tailscaled.sock ] && break; "
+                "sleep 1; done; "
+                "while true; do "
+                "if tailscale up "
+                '--auth-key="${TS_AUTHKEY}" '
+                f'--login-server="{self._headscale_url}" '
+                '--hostname="${POD_NAME}" '
+                "--accept-dns=false "
+                "--timeout=60s 2>&1; then "
+                'echo "Tailscale authenticated"; break; fi; '
+                'echo "Auth retry in 15s..."; sleep 15; done; '
+                "wait $TSPID"
+            )
+            containers.append(
+                {
+                    "name": "tailscale",
+                    "image": "ghcr.io/tailscale/tailscale:v1.82.5",
+                    "securityContext": {
+                        "capabilities": {"add": ["NET_ADMIN", "NET_RAW"]},
+                    },
+                    "command": ["/bin/sh", "-c"],
+                    "args": [tailscale_args],
+                    "env": [
+                        {
+                            "name": "TS_AUTHKEY",
+                            "valueFrom": {
+                                "secretKeyRef": {
+                                    "name": self._secret_name,
+                                    "key": "TAILSCALE_AUTH_KEY",
+                                    "optional": True,
+                                }
+                            },
+                        },
+                        {
+                            "name": "POD_NAME",
+                            "valueFrom": {
+                                "fieldRef": {"fieldPath": "metadata.name"}
+                            },
+                        },
+                    ],
+                    "volumeMounts": [
+                        {
+                            "name": "tailscale-state",
+                            "mountPath": "/var/lib/tailscale",
+                        }
+                    ],
+                    "resources": {
+                        "requests": {"memory": "64Mi", "cpu": "50m"},
+                        "limits": {"memory": "128Mi", "cpu": "200m"},
+                    },
+                }
+            )
+            volumes.append(
+                {"name": "tailscale-state", "emptyDir": {"sizeLimit": "16Mi"}}
+            )
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -783,158 +938,8 @@ class AgentProvisioner:
                         ],
                     }
                 ],
-                "containers": [
-                    {
-                        "name": "agent",
-                        "image": self._agent_image,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["sh", "-c", command],
-                        "ports": [{"containerPort": 8001}],
-                        # Inject all env from shared ConfigMap + Secret
-                        "envFrom": [
-                            {"configMapRef": {"name": self._configmap_name}},
-                            {"secretRef": {"name": self._secret_name}},
-                        ],
-                        # Pod-specific overrides
-                        "env": [
-                            {"name": "AGENT_CONFIG", "value": config_name},
-                            {"name": "AGENT_PORT", "value": "8001"},
-                        ],
-                        "securityContext": {
-                            "runAsNonRoot": True,
-                            "runAsUser": 999,
-                            "runAsGroup": 999,
-                            "allowPrivilegeEscalation": False,
-                            "readOnlyRootFilesystem": True,
-                            "capabilities": {"drop": ["ALL"]},
-                        },
-                        "volumeMounts": [
-                            {"name": "workspace", "mountPath": "/workspace"},
-                            {
-                                "name": "vm-ssh-key",
-                                "mountPath": "/run/secrets/vm-ssh-key",
-                                "subPath": "ssh-privatekey",
-                                "readOnly": True,
-                            },
-                            {"name": "tmp", "mountPath": "/tmp"},
-                            {"name": "run", "mountPath": "/run"},
-                            {"name": "home-srw", "mountPath": "/home/srw"},
-                        ],
-                        "livenessProbe": {
-                            "httpGet": {"path": "/health", "port": 8001},
-                            "initialDelaySeconds": 60,
-                            "periodSeconds": 30,
-                        },
-                        "readinessProbe": {
-                            "httpGet": {"path": "/ready", "port": 8001},
-                            "initialDelaySeconds": 30,
-                            "periodSeconds": 10,
-                        },
-                        "startupProbe": {
-                            "httpGet": {"path": "/health", "port": 8001},
-                            "failureThreshold": 10,
-                            "periodSeconds": 10,
-                        },
-                        "resources": {
-                            "requests": {
-                                "memory": memory_request,
-                                "cpu": cpu_request,
-                            },
-                            "limits": {
-                                "memory": memory_limit,
-                                "cpu": cpu_limit,
-                            },
-                        },
-                    },
-                    # Tailscale sidecar — mesh VPN for SSH access to
-                    # KubeVirt VMs. Creates tailscale0 tun in shared pod
-                    # network namespace so the agent container can route
-                    # directly to 100.64.x.y addresses.
-                    {
-                        "name": "tailscale",
-                        "image": "ghcr.io/tailscale/tailscale:v1.82.5",
-                        "securityContext": {
-                            "capabilities": {"add": ["NET_ADMIN", "NET_RAW"]},
-                        },
-                        "command": ["/bin/sh", "-c"],
-                        "args": [
-                            "mkdir -p /dev/net; "
-                            "[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; "
-                            "tailscaled --state=mem: --tun=tailscale0 "
-                            "--no-logs-no-support & "
-                            "TSPID=$!; "
-                            "for i in $(seq 1 30); do "
-                            "[ -S /var/run/tailscale/tailscaled.sock ] && break; "
-                            "sleep 1; done; "
-                            "while true; do "
-                            "if tailscale up "
-                            '--auth-key="${TS_AUTHKEY}" '
-                            "--login-server=https://headscale.superhuman-remote-worker.com "
-                            '--hostname="${POD_NAME}" '
-                            "--accept-dns=false "
-                            "--timeout=60s 2>&1; then "
-                            'echo "Tailscale authenticated"; break; fi; '
-                            'echo "Auth retry in 15s..."; sleep 15; done; '
-                            "wait $TSPID"
-                        ],
-                        "env": [
-                            {
-                                "name": "TS_AUTHKEY",
-                                "valueFrom": {
-                                    "secretKeyRef": {
-                                        "name": self._secret_name,
-                                        "key": "TAILSCALE_AUTH_KEY",
-                                        "optional": True,
-                                    }
-                                },
-                            },
-                            {
-                                "name": "POD_NAME",
-                                "valueFrom": {
-                                    "fieldRef": {"fieldPath": "metadata.name"}
-                                },
-                            },
-                        ],
-                        "volumeMounts": [
-                            {
-                                "name": "tailscale-state",
-                                "mountPath": "/var/lib/tailscale",
-                            }
-                        ],
-                        "resources": {
-                            "requests": {"memory": "64Mi", "cpu": "50m"},
-                            "limits": {"memory": "128Mi", "cpu": "200m"},
-                        },
-                    },
-                ],
-                "volumes": [
-                    # Scratch workspace (agent connects to real workspace
-                    # via SSH — this is just local temp storage)
-                    {
-                        "name": "workspace",
-                        "emptyDir": {"sizeLimit": "10Gi"},
-                    },
-                    {
-                        "name": "vm-ssh-key",
-                        "secret": {
-                            "secretName": self._ssh_secret_name,
-                            "defaultMode": 0o444,
-                        },
-                    },
-                    {
-                        "name": "tmp",
-                        "emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"},
-                    },
-                    {
-                        "name": "run",
-                        "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"},
-                    },
-                    {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
-                    {
-                        "name": "tailscale-state",
-                        "emptyDir": {"sizeLimit": "16Mi"},
-                    },
-                ],
+                "containers": containers,
+                "volumes": volumes,
             },
         }
 

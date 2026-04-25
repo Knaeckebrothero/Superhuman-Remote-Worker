@@ -185,6 +185,10 @@ data:
   # Headscale (mesh VPN coordination server)
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
 
+  # Agent tailscale sidecar gate (read by AgentProvisioner). When "false",
+  # dynamically provisioned agent pods skip the tailscale sidecar entirely.
+  AGENT_TAILSCALE_ENABLED: {{ .Values.agent.tailscale.enabled | quote }}
+
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
