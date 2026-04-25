@@ -476,17 +476,19 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIL_DOMAIN
-            # Notification — Webhooks
+            # Notification — Webhooks (optional; empty/missing → transport disabled)
             - name: SLACK_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SLACK_WEBHOOK_URL
+                  optional: true
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: DISCORD_WEBHOOK_URL
+                  optional: true
             - name: NTFY_URL
               valueFrom:
                 configMapKeyRef:
