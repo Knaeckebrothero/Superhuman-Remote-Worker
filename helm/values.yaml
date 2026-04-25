@@ -192,16 +192,14 @@ vpn:
     port: "443"
 
 # =============================================================================
-# Headscale — self-hosted Tailscale coordination (optional)
+# Headscale — external Tailscale coordination server (consumed, not deployed).
+# Headscale itself is deployed out of band (see HomeLab/deployments_managed/
+# headscale/) so its lifecycle is independent of the SRW release.
 # =============================================================================
 headscale:
-  enabled: false
-  image: headscale/headscale:0.28.0
-  storageClass: ""
-  storageSize: "1Gi"
-  stun:
-    # -- NodePort for STUN/UDP (cannot go through HTTP ingress)
-    enabled: true
+  # -- Full headscale server URL. When empty, falls back to
+  # https://headscale.<global.domain> via the srw.headscaleUrl helper.
+  url: ""
 
 # =============================================================================
 # Databases
