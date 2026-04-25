@@ -2431,7 +2431,7 @@ class AdminDefaultModelSet(BaseModel):
 # Locked enum for the admin-curated catalog. Adding a new role requires
 # touching every consumer (resolver, dispatcher, default-model fallback),
 # so the schema-level CHECK constraint and this Literal are kept in sync.
-VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision")
+VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
 VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
 
 
@@ -2450,7 +2450,7 @@ class CatalogModelCreate(BaseModel):
     )
     model_id: str = Field(..., min_length=1, max_length=500)
     display_label: str = Field(..., min_length=1, max_length=200)
-    role: Literal["chat", "auxiliary", "embedding", "vision"]
+    role: Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"]
     family: str = Field(
         ...,
         min_length=1,
@@ -2487,7 +2487,9 @@ class CatalogModelUpdate(BaseModel):
     provider_ref: str | None = Field(None, min_length=1)
     model_id: str | None = Field(None, min_length=1, max_length=500)
     display_label: str | None = Field(None, min_length=1, max_length=200)
-    role: Literal["chat", "auxiliary", "embedding", "vision"] | None = None
+    role: (
+        Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"] | None
+    ) = None
     family: str | None = Field(None, min_length=1)
     context_window: int | None = None
     reasoning_level: str | None = None
@@ -12221,10 +12223,11 @@ async def list_available_models(
 ) -> dict[str, Any]:
     """List all models from the admin-curated catalog.
 
-    Returns the catalog grouped by provider for the four catalog roles
-    (chat → ``groups`` + ``builder_models``; auxiliary / vision / embedding
-    → sibling arrays). Whisper/TTS still come from ``config/models.yaml``
-    until they earn first-class catalog roles. Each row carries
+    Returns the catalog grouped by provider for every catalog role
+    (chat → ``groups`` + ``builder_models``; auxiliary / vision / embedding /
+    whisper / tts → sibling arrays). The legacy ``config/models.yaml``
+    whisper/tts entries are merged in only when no catalog row covers the
+    same id, so admins can migrate at their own pace. Each row carries
     ``configured: true`` because the catalog only contains rows whose
     transport (system_api_keys row or system endpoint) is admin-managed.
 
@@ -12248,6 +12251,8 @@ async def list_available_models(
     auxiliary: list[dict[str, Any]] = []
     vision: list[dict[str, Any]] = []
     embedding: list[dict[str, Any]] = []
+    whisper_catalog: list[dict[str, Any]] = []
+    tts_catalog: list[dict[str, Any]] = []
 
     configured_providers: set[str] = set()
 
@@ -12268,6 +12273,12 @@ async def list_available_models(
             continue
         if role == "embedding":
             embedding.append(helper_entry)
+            continue
+        if role == "whisper":
+            whisper_catalog.append(helper_entry)
+            continue
+        if role == "tts":
+            tts_catalog.append(helper_entry)
             continue
         # role == 'chat'
         key = (kind, ref)
@@ -12334,8 +12345,19 @@ async def list_available_models(
             for m in legacy.get(key, [])
         ]
 
-    whisper = _legacy_helper("whisper_models")
-    tts = _legacy_helper("tts_models")
+    # Catalog rows take precedence; legacy YAML entries fill in if no catalog
+    # row covers the same model id. After admins migrate their whisper/tts
+    # entries into the catalog the YAML fallback drops out cleanly.
+    catalog_whisper_ids = {m["id"] for m in whisper_catalog}
+    catalog_tts_ids = {m["id"] for m in tts_catalog}
+    whisper = whisper_catalog + [
+        m
+        for m in _legacy_helper("whisper_models")
+        if m["id"] not in catalog_whisper_ids
+    ]
+    tts = tts_catalog + [
+        m for m in _legacy_helper("tts_models") if m["id"] not in catalog_tts_ids
+    ]
 
     return {
         "groups": groups,

@@ -1030,8 +1030,14 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
     skipped_unsupported_role = 0
     for row in rows:
         capability = (row["capability"] or "chat").lower()
-        if capability not in ("chat", "auxiliary", "embedding", "vision"):
-            # whisper/tts aren't catalog roles in v1 — drop with the table
+        if capability not in (
+            "chat",
+            "auxiliary",
+            "embedding",
+            "vision",
+            "whisper",
+            "tts",
+        ):
             skipped_unsupported_role += 1
             continue
         from src.core.model_registry import family_of  # local import: src/*

@@ -4169,9 +4169,11 @@ class PostgresDB:
         await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
 
     # Catalog roles that support a "first-enabled-alphabetical" fallback when
-    # the admin pin is missing or dangling. Other kinds (whisper, tts) have no
-    # catalog presence in v1, so they pass through unchanged.
-    _CATALOG_ROLES = frozenset({"chat", "auxiliary", "embedding", "vision"})
+    # the admin pin is missing or dangling. Whisper/tts gained catalog rows in
+    # v1.1; non-catalog kinds (none today) would pass through unchanged.
+    _CATALOG_ROLES = frozenset(
+        {"chat", "auxiliary", "embedding", "vision", "whisper", "tts"}
+    )
 
     async def resolve_default_for_role(self, kind: str) -> str | None:
         """Resolve the effective default model ID for a role.
@@ -4183,8 +4185,9 @@ class PostgresDB:
           ``enabled=false`` row is treated as absent, and the first
           enabled catalog row for the role (sorted alphabetically by
           ``display_label``) is returned instead.
-        - For non-catalog kinds (``whisper``, ``tts``), the pin is
-          returned verbatim — there's nothing to validate against in v1.
+        - For any kind not in ``_CATALOG_ROLES`` the pin is returned
+          verbatim. As of catalog v1.1 every role is catalog-backed, so
+          this branch is currently a no-op kept for forward compat.
         - Returns ``None`` only when no pin exists AND no enabled catalog
           row is available.
         """

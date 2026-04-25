@@ -3,8 +3,8 @@
 The resolver returns the admin pin when it points at an enabled catalog row,
 falls back to the first-enabled-alphabetical catalog row when the pin is
 missing or dangling, and returns None only when no pin exists AND no enabled
-catalog row is available. Non-catalog kinds (whisper, tts) bypass validation
-and return the pin verbatim.
+catalog row is available. Every catalog role — chat, auxiliary, embedding,
+vision, whisper, tts — goes through the same validation path.
 """
 
 from __future__ import annotations
@@ -87,26 +87,26 @@ async def test_each_catalog_role_resolves_independently():
         pin=None,
         alphabetical=[{"model_id": "alpha", "display_label": "Alpha"}],
     )
-    for role in ("chat", "auxiliary", "embedding", "vision"):
+    for role in ("chat", "auxiliary", "embedding", "vision", "whisper", "tts"):
         assert await db.resolve_default_for_role(role) == "alpha"
         db.list_models_by_role_alphabetical.assert_awaited_with(role)
 
 
 @pytest.mark.asyncio
-async def test_whisper_kind_returns_pin_verbatim():
-    """Whisper isn't in the v1 catalog role enum — pin passes through with
-    no validation and no fallback."""
-    db = _db(pin="whisper-1")
+async def test_whisper_pin_validates_against_catalog():
+    """Whisper joined the catalog in v1.1 — pin is now validated against
+    ``resolve_catalog_model`` like every other role."""
+    db = _db(
+        pin="whisper-1",
+        catalog_resolves_to={"model_id": "whisper-1", "enabled": True},
+    )
     assert await db.resolve_default_for_role("whisper") == "whisper-1"
-    db.resolve_catalog_model.assert_not_awaited()
-    db.list_models_by_role_alphabetical.assert_not_awaited()
+    db.resolve_catalog_model.assert_awaited_once_with("whisper-1", role="whisper")
 
 
 @pytest.mark.asyncio
-async def test_whisper_kind_returns_none_when_no_pin():
-    """Without a pin AND outside the catalog roles, the resolver has nothing
-    to fall back to and must return None."""
-    db = _db(pin=None)
+async def test_tts_returns_none_when_no_pin_and_no_catalog_rows():
+    """Without a pin and without catalog rows, tts resolves to None — same
+    contract as the other catalog roles."""
+    db = _db(pin=None, alphabetical=[])
     assert await db.resolve_default_for_role("tts") is None
-    db.resolve_catalog_model.assert_not_awaited()
-    db.list_models_by_role_alphabetical.assert_not_awaited()

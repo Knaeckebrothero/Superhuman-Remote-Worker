@@ -89,26 +89,30 @@ async def test_promotes_each_catalog_role():
         _row(model_id="aux-1", capability="auxiliary"),
         _row(model_id="emb-1", capability="embedding"),
         _row(model_id="vis-1", capability="vision"),
+        _row(model_id="whi-1", capability="whisper"),
+        _row(model_id="tts-1", capability="tts"),
     ]
     db = _make_db(exists=True, rows=rows)
     await init_mod._migrate_endpoint_models_to_catalog(db)
 
     roles_seen = {call.kwargs["role"] for call in db.create_model.await_args_list}
-    assert roles_seen == {"auxiliary", "embedding", "vision"}
+    assert roles_seen == {"auxiliary", "embedding", "vision", "whisper", "tts"}
 
 
 @pytest.mark.asyncio
-async def test_skips_whisper_and_tts_rows():
+async def test_skips_unknown_capability_rows():
+    """Rows whose capability isn't a recognized catalog role are dropped with
+    the legacy table rather than promoted."""
     rows = [
         _row(model_id="ok-chat", capability="chat"),
-        _row(model_id="skip-whisper", capability="whisper"),
-        _row(model_id="skip-tts", capability="tts"),
+        _row(model_id="skip-banana", capability="banana"),
+        _row(model_id="skip-blank", capability=""),  # falls to default 'chat'
     ]
     db = _make_db(exists=True, rows=rows)
     await init_mod._migrate_endpoint_models_to_catalog(db)
 
     promoted_ids = {call.kwargs["model_id"] for call in db.create_model.await_args_list}
-    assert promoted_ids == {"ok-chat"}
+    assert promoted_ids == {"ok-chat", "skip-blank"}
 
 
 @pytest.mark.asyncio
