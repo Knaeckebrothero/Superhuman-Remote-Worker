@@ -98,6 +98,14 @@ import {TranslocoPipe} from '@jsverse/transloco';
             </a>
             <a
               class="nav-link"
+              routerLink="/admin/models"
+              routerLinkActive="active"
+            >
+              <span class="nav-icon">smart_toy</span>
+              Admin · Models
+            </a>
+            <a
+              class="nav-link"
               routerLink="/admin/users"
               routerLinkActive="active"
             >

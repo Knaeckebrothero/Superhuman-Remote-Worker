@@ -212,25 +212,10 @@ export type LlmModelCapability =
   | 'tts';
 
 /**
- * A single model attached to an LLM endpoint.
- * Matches orchestrator `_serialize_endpoint_model`.
- */
-export interface LlmEndpointModel {
-  id: string;
-  endpoint_id: string;
-  model_id: string;
-  display_name: string;
-  family: string | null;
-  context_window: number | null;
-  reasoning_level: string | null;
-  enabled: boolean;
-  capability: LlmModelCapability;
-  created_at: string | null;
-}
-
-/**
- * A user-registered OpenAI-compatible LLM endpoint with its model rows.
- * Matches orchestrator `_serialize_endpoint`.
+ * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
+ * endpoint live in the catalog (`models` table) and are managed via Admin →
+ * Models, not nested here. The `models` field is kept for shape compat with
+ * the legacy serializer and is always an empty array.
  */
 export interface LlmEndpoint {
   id: string;
@@ -239,7 +224,7 @@ export interface LlmEndpoint {
   key_prefix: string | null;
   created_at: string | null;
   updated_at: string | null;
-  models: LlmEndpointModel[];
+  models: never[];
 }
 
 export interface LlmEndpointCreateRequest {
@@ -257,42 +242,6 @@ export interface LlmEndpointUpdateRequest {
   allow_insecure?: boolean;
 }
 
-export interface LlmEndpointModelCreateRequest {
-  model_id: string;
-  display_name: string;
-  family?: string | null;
-  context_window?: number | null;
-  reasoning_level?: string | null;
-  enabled?: boolean;
-  capability?: LlmModelCapability;
-}
-
-export interface LlmEndpointModelUpdateRequest {
-  display_name?: string | null;
-  family?: string | null;
-  context_window?: number | null;
-  reasoning_level?: string | null;
-  enabled?: boolean | null;
-  capability?: LlmModelCapability | null;
-}
-
-/**
- * Batch import body for the discovery → checkbox → import flow.
- * POSTs to /endpoints/{id}/models:batch. When skip_duplicates is true
- * (default), (model_id, capability) pairs that already exist are reported
- * under `skipped` rather than failing the whole request.
- */
-export interface LlmEndpointBatchModelCreateRequest {
-  models: LlmEndpointModelCreateRequest[];
-  skip_duplicates?: boolean;
-}
-
-export interface LlmEndpointBatchModelCreateResult {
-  created: number;
-  skipped: string[];
-  created_ids: string[];
-}
-
 /**
  * Response from the test-connection probe (POST /api/settings/llm-endpoints/{id}/test).
  */
@@ -304,9 +253,9 @@ export interface LlmEndpointTestResult {
 }
 
 /**
- * A single model surfaced by `GET {base_url}/models` via the discovery
- * endpoint. `capability_hint` is a server-side heuristic; the UI lets the
- * user override per-row before committing the batch import.
+ * A single model surfaced by `GET {base_url}/models` via the admin discovery
+ * endpoint. Used by Admin → Models as a quick-fill helper when the admin has
+ * picked a system endpoint as the catalog row's transport.
  */
 export interface LlmEndpointDiscoveredModel {
   id: string;
@@ -322,7 +271,6 @@ export interface LlmEndpointDiscoveryResult {
   error: string | null;
   probe_url: string;
   models: LlmEndpointDiscoveredModel[];
-  already_registered: string[];
 }
 
 // =============================================================================

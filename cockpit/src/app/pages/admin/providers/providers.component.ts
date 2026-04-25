@@ -1,5 +1,6 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {SidebarToggleComponent} from '../../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 import {
@@ -10,35 +11,8 @@ import {
 import {ModelService} from '../../../core/services/model.service';
 import {
   ApiKeyProvider,
-  LlmEndpointDiscoveryResult,
-  LlmEndpointModel,
   LlmEndpointTestResult,
-  LlmModelCapability,
 } from '../../../core/models/api.model';
-
-/** Capability values offered in the per-model dropdown. Order drives UI. */
-const CAPABILITY_VALUES: LlmModelCapability[] = [
-  'chat',
-  'vision',
-  'embedding',
-  'auxiliary',
-  'whisper',
-  'tts',
-];
-
-/**
- * Per-endpoint discovery state. Exists only while the admin has an active
- * discovery checklist open — nulled out after import completes or the user
- * collapses the pane.
- */
-interface DiscoveryState {
-  loading: boolean;
-  result: LlmEndpointDiscoveryResult | null;
-  // Per-row import selection: keyed by discovered model_id.
-  selected: Record<string, boolean>;
-  capabilities: Record<string, LlmModelCapability>;
-  error: string | null;
-}
 
 /** Providers the admin can seed/rotate — matches VALID_SYSTEM_API_KEY_PROVIDERS. */
 const SYSTEM_PROVIDERS: {value: Exclude<ApiKeyProvider, 'codex'>; label: string}[] = [
@@ -56,7 +30,7 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
 @Component({
   selector: 'app-admin-providers',
   standalone: true,
-  imports: [FormsModule, SidebarToggleComponent, TranslocoPipe],
+  imports: [FormsModule, RouterLink, SidebarToggleComponent, TranslocoPipe],
   template: `
     <div class="admin-page">
       <div class="admin-container">
@@ -193,205 +167,12 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                   </div>
                 }
 
-                <div class="models-subtable">
-                  @if (endpoint.models.length > 0) {
-                    <div class="model-row model-header">
-                      <span class="col-model-id">{{ 'admin.providers.endpoints.colModelId' | transloco }}</span>
-                      <span class="col-model-name">{{ 'admin.providers.endpoints.colDisplayName' | transloco }}</span>
-                      <span class="col-model-cap">{{ 'admin.providers.endpoints.colCapability' | transloco }}</span>
-                      <span class="col-model-family">{{ 'admin.providers.endpoints.colFamily' | transloco }}</span>
-                      <span class="col-model-ctx">{{ 'admin.providers.endpoints.colContext' | transloco }}</span>
-                      <span class="col-model-action"></span>
-                    </div>
-                    @for (model of endpoint.models; track model.id) {
-                      @if (editingModelDbId() === model.id) {
-                        <div class="model-row model-row-editing">
-                          <span class="col-model-id mono" [title]="model.model_id">{{ model.model_id }}</span>
-                          <input
-                            type="text"
-                            class="form-input form-input-sm"
-                            [placeholder]="'admin.providers.endpoints.displayNamePlaceholder' | transloco"
-                            [(ngModel)]="editModelDisplayName"
-                          />
-                          <span class="col-model-cap" [title]="'admin.providers.endpoints.editCapabilityReadonly' | transloco">
-                            <span class="badge">
-                              {{ ('admin.providers.endpoints.capability.' + (model.capability || 'chat')) | transloco }}
-                            </span>
-                          </span>
-                          <input
-                            type="text"
-                            class="form-input form-input-sm"
-                            [placeholder]="'admin.providers.endpoints.familyPlaceholder' | transloco"
-                            [(ngModel)]="editModelFamily"
-                          />
-                          <input
-                            type="number"
-                            class="form-input form-input-sm"
-                            [placeholder]="'admin.providers.endpoints.contextPlaceholder' | transloco"
-                            [(ngModel)]="editModelContext"
-                          />
-                          <span class="col-model-action edit-actions">
-                            <button
-                              class="test-btn"
-                              (click)="saveEditModel(endpoint.id, model)"
-                              [disabled]="savingEditModel() || !editModelDisplayName.trim()"
-                            >
-                              {{ savingEditModel() ? ('common.saving' | transloco) : ('common.save' | transloco) }}
-                            </button>
-                            <button
-                              class="link-btn"
-                              (click)="cancelEditModel()"
-                              [disabled]="savingEditModel()"
-                            >{{ 'common.cancel' | transloco }}</button>
-                          </span>
-                        </div>
-                      } @else {
-                        <div class="model-row">
-                          <span class="col-model-id mono">{{ model.model_id }}</span>
-                          <span class="col-model-name">{{ model.display_name }}</span>
-                          <span class="col-model-cap">
-                            <span class="badge">
-                              {{ ('admin.providers.endpoints.capability.' + (model.capability || 'chat')) | transloco }}
-                            </span>
-                          </span>
-                          <span class="col-model-family">{{ model.family || '-' }}</span>
-                          <span class="col-model-ctx">{{ model.context_window || '-' }}</span>
-                          <span class="col-model-action actions-pair">
-                            <button
-                              class="link-btn"
-                              (click)="startEditModel(model)"
-                            >{{ 'common.edit' | transloco }}</button>
-                            <button
-                              class="revoke-btn"
-                              (click)="deleteEndpointModel(endpoint.id, model.model_id, model.capability)"
-                            >{{ 'common.delete' | transloco }}</button>
-                          </span>
-                        </div>
-                      }
-                    }
-                  } @else {
-                    <p class="empty-state-inline">
-                      {{ 'admin.providers.endpoints.noModels' | transloco }}
-                    </p>
-                  }
-
-                  <!-- Discovery checklist (lazy — opened via the button) -->
-                  <div class="discovery-pane">
-                    @let disc = discoveryState()[endpoint.id];
-                    <div class="form-row">
-                      <button
-                        class="test-btn"
-                        (click)="discoverModels(endpoint.id)"
-                        [disabled]="disc?.loading"
-                      >
-                        {{ disc?.loading
-                            ? ('admin.providers.endpoints.discovering' | transloco)
-                            : ('admin.providers.endpoints.discoverButton' | transloco) }}
-                      </button>
-                      @if (disc?.result) {
-                        @if (disc!.result!.ok) {
-                          <span class="test-result ok" style="margin: 0; padding: 4px 10px;">
-                            {{ 'admin.providers.endpoints.discoverOk' | transloco: {count: disc!.result!.models.length} }}
-                          </span>
-                        } @else {
-                          <span class="test-result err" style="margin: 0; padding: 4px 10px;">
-                            {{ 'admin.providers.endpoints.discoverFail' | transloco: {error: disc!.result!.error ?? '-'} }}
-                          </span>
-                        }
-                      }
-                    </div>
-
-                    @if (disc?.result?.ok && disc!.result!.models.length > 0) {
-                      <div class="discovery-list">
-                        @for (m of disc!.result!.models; track m.id) {
-                          @let registered = disc!.result!.already_registered.includes(m.id);
-                          <div class="discovery-row" [class.disabled]="registered">
-                            <input
-                              type="checkbox"
-                              [checked]="!registered && !!disc!.selected[m.id]"
-                              [disabled]="registered"
-                              (change)="toggleDiscoverySelection(endpoint.id, m.id, $event)"
-                            />
-                            <span class="mono">{{ m.id }}</span>
-                            <select
-                              class="form-input form-input-sm"
-                              [ngModel]="discoveryCapabilityFor(endpoint.id, m.id, m.capability_hint)"
-                              (ngModelChange)="setDiscoveryCapability(endpoint.id, m.id, $event)"
-                              [disabled]="registered"
-                            >
-                              @for (cap of capabilityValues; track cap) {
-                                <option [value]="cap">
-                                  {{ ('admin.providers.endpoints.capability.' + cap) | transloco }}
-                                </option>
-                              }
-                            </select>
-                            @if (registered) {
-                              <span class="muted">{{ 'admin.providers.endpoints.alreadyRegistered' | transloco }}</span>
-                            }
-                          </div>
-                        }
-                        <button
-                          class="create-btn"
-                          (click)="importSelectedDiscoveredModels(endpoint.id)"
-                          [disabled]="!anyDiscoverySelected(endpoint.id) || importingEndpointId() === endpoint.id"
-                        >
-                          {{ importingEndpointId() === endpoint.id
-                              ? ('common.saving' | transloco)
-                              : ('admin.providers.endpoints.importSelected' | transloco) }}
-                        </button>
-                      </div>
-                    }
-                  </div>
-
-                  <div class="add-model-form">
-                    <div class="form-row four-col">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'admin.providers.endpoints.modelIdPlaceholder' | transloco"
-                        [(ngModel)]="newModelIds[endpoint.id]"
-                      />
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'admin.providers.endpoints.displayNamePlaceholder' | transloco"
-                        [(ngModel)]="newModelDisplayNames[endpoint.id]"
-                      />
-                      <select
-                        class="form-input"
-                        [ngModel]="newModelCapabilityFor(endpoint.id)"
-                        (ngModelChange)="newModelCapabilities[endpoint.id] = $event"
-                      >
-                        @for (cap of capabilityValues; track cap) {
-                          <option [value]="cap">
-                            {{ ('admin.providers.endpoints.capability.' + cap) | transloco }}
-                          </option>
-                        }
-                      </select>
-                      <input
-                        type="text"
-                        class="form-input"
-                        [placeholder]="'admin.providers.endpoints.familyPlaceholder' | transloco"
-                        [(ngModel)]="newModelFamilies[endpoint.id]"
-                      />
-                    </div>
-                    <div class="form-row two-col">
-                      <input
-                        type="number"
-                        class="form-input"
-                        [placeholder]="'admin.providers.endpoints.contextPlaceholder' | transloco"
-                        [(ngModel)]="newModelContexts[endpoint.id]"
-                      />
-                      <button
-                        class="create-btn"
-                        (click)="addEndpointModel(endpoint.id)"
-                        [disabled]="!newModelIds[endpoint.id]?.trim() || !newModelDisplayNames[endpoint.id]?.trim()"
-                      >
-                        {{ 'admin.providers.endpoints.addModelButton' | transloco }}
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                <p class="catalog-hint">
+                  {{ 'admin.providers.endpoints.catalogHint' | transloco }}
+                  <a routerLink="/admin/models" class="catalog-hint-link">
+                    {{ 'admin.providers.endpoints.catalogHintLink' | transloco }}
+                  </a>
+                </p>
               </div>
             }
           } @else {
@@ -631,14 +412,11 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
       background: rgba(243, 139, 168, 0.12);
       color: var(--red, #f38ba8);
     }
-    .empty-state, .empty-state-inline {
+    .empty-state {
       font-size: 13px;
       color: var(--text-muted, #6c7086);
       text-align: center;
       padding: 18px 12px;
-    }
-    .empty-state-inline {
-      padding: 10px 0;
     }
     .endpoint-card {
       border: 1px solid var(--border-color, #313244);
@@ -661,77 +439,20 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
     .endpoint-url, .endpoint-key {
       font-size: 11px;
     }
-    .models-subtable {
-      margin-top: 12px;
-      border-top: 1px dashed var(--border-color, #313244);
-      padding-top: 12px;
-    }
-    .model-row {
-      display: grid;
-      grid-template-columns: 2fr 1.5fr 0.9fr 1fr 0.8fr 130px;
-      gap: 8px;
-      align-items: center;
-      padding: 6px 0;
-      font-size: 12px;
-    }
-    .model-row.model-row-editing {
-      background: rgba(137, 180, 250, 0.06);
-      border-radius: 6px;
-      padding: 8px 6px;
-    }
-    .col-model-action.actions-pair,
-    .col-model-action.edit-actions {
-      display: flex;
-      gap: 6px;
-      justify-content: flex-end;
-      align-items: center;
-    }
-    .link-btn {
-      padding: 4px 8px;
-      background: transparent;
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 6px;
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .link-btn:hover:not(:disabled) {
-      border-color: var(--blue, #89b4fa);
-      color: var(--blue, #89b4fa);
-    }
-    .link-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    .form-row.four-col > * { flex: 1; }
-    .form-input-sm {
-      padding: 4px 8px;
-      font-size: 12px;
-    }
-    .discovery-pane {
+    .catalog-hint {
       margin-top: 12px;
       padding-top: 12px;
       border-top: 1px dashed var(--border-color, #313244);
-    }
-    .discovery-list {
-      margin-top: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .discovery-row {
-      display: grid;
-      grid-template-columns: 24px 2fr 140px 120px;
-      gap: 8px;
-      align-items: center;
       font-size: 12px;
-    }
-    .discovery-row.disabled { opacity: 0.55; }
-    .model-row.model-header {
-      font-weight: 600;
       color: var(--text-muted, #6c7086);
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      font-size: 11px;
     }
-    .add-model-form, .create-form {
+    .catalog-hint-link {
+      color: var(--blue, #89b4fa);
+      text-decoration: none;
+      margin-left: 4px;
+    }
+    .catalog-hint-link:hover { text-decoration: underline; }
+    .create-form {
       margin-top: 12px;
       padding-top: 12px;
       border-top: 1px dashed var(--border-color, #313244);
@@ -799,7 +520,6 @@ export class AdminProvidersComponent implements OnInit {
 
   readonly providers = SYSTEM_PROVIDERS;
   readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;
-  readonly capabilityValues = CAPABILITY_VALUES;
 
   readonly catalogEmpty = computed(() => this.modelService.models().length === 0);
 
@@ -818,24 +538,6 @@ export class AdminProvidersComponent implements OnInit {
   readonly endpointFormError = signal<string>('');
   readonly testingEndpointId = signal<string | null>(null);
   readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
-  readonly discoveryState = signal<Record<string, DiscoveryState>>({});
-  readonly importingEndpointId = signal<string | null>(null);
-
-  // Per-endpoint "add model" inputs, keyed by endpoint_id
-  newModelIds: Record<string, string> = {};
-  newModelDisplayNames: Record<string, string> = {};
-  newModelFamilies: Record<string, string> = {};
-  newModelContexts: Record<string, number | null> = {};
-  newModelCapabilities: Record<string, LlmModelCapability> = {};
-
-  // Inline edit-model state — only one model is edited at a time,
-  // keyed by the row's DB id. Capability is read-only (the backend
-  // uses it as a WHERE selector; changing slots means delete + re-add).
-  readonly editingModelDbId = signal<string | null>(null);
-  readonly savingEditModel = signal(false);
-  editModelDisplayName = '';
-  editModelFamily = '';
-  editModelContext: number | null = null;
 
   ngOnInit(): void {
     this.admin.loadSystemApiKeys();
@@ -939,201 +641,6 @@ export class AdminProvidersComponent implements OnInit {
       },
       error: () => this.testingEndpointId.set(null),
     });
-  }
-
-  addEndpointModel(endpointId: string): void {
-    const modelId = this.newModelIds[endpointId]?.trim();
-    const displayName = this.newModelDisplayNames[endpointId]?.trim();
-    if (!modelId || !displayName) return;
-
-    this.admin
-      .createSystemEndpointModel(endpointId, {
-        model_id: modelId,
-        display_name: displayName,
-        family: this.newModelFamilies[endpointId]?.trim() || null,
-        context_window: this.newModelContexts[endpointId] || null,
-        capability: this.newModelCapabilities[endpointId] ?? 'chat',
-      })
-      .subscribe(() => {
-        this.newModelIds[endpointId] = '';
-        this.newModelDisplayNames[endpointId] = '';
-        this.newModelFamilies[endpointId] = '';
-        this.newModelContexts[endpointId] = null;
-        this.newModelCapabilities[endpointId] = 'chat';
-      });
-  }
-
-  deleteEndpointModel(
-    endpointId: string,
-    modelId: string,
-    capability: LlmModelCapability = 'chat',
-  ): void {
-    if (!confirm(this.transloco.translate('admin.providers.endpoints.confirmDeleteModel'))) return;
-    this.admin.deleteSystemEndpointModel(endpointId, modelId, capability).subscribe();
-  }
-
-  startEditModel(model: LlmEndpointModel): void {
-    this.editingModelDbId.set(model.id);
-    this.editModelDisplayName = model.display_name;
-    this.editModelFamily = model.family ?? '';
-    this.editModelContext = model.context_window;
-  }
-
-  cancelEditModel(): void {
-    this.editingModelDbId.set(null);
-  }
-
-  saveEditModel(endpointId: string, model: LlmEndpointModel): void {
-    const displayName = this.editModelDisplayName.trim();
-    if (!displayName) return;
-    this.savingEditModel.set(true);
-    this.admin
-      .updateSystemEndpointModel(endpointId, model.model_id, {
-        display_name: displayName,
-        family: this.editModelFamily.trim() || null,
-        context_window:
-          typeof this.editModelContext === 'number' && this.editModelContext > 0
-            ? this.editModelContext
-            : null,
-        // capability is the WHERE selector on the backend — must match
-        // the current row's slot so PATCH targets the right row.
-        capability: model.capability || 'chat',
-      })
-      .subscribe({
-        next: () => {
-          this.editingModelDbId.set(null);
-          this.savingEditModel.set(false);
-        },
-        error: () => this.savingEditModel.set(false),
-      });
-  }
-
-  newModelCapabilityFor(endpointId: string): LlmModelCapability {
-    return this.newModelCapabilities[endpointId] ?? 'chat';
-  }
-
-  discoveryCapabilityFor(
-    endpointId: string,
-    modelId: string,
-    fallback: LlmModelCapability,
-  ): LlmModelCapability {
-    return this.discoveryState()[endpointId]?.capabilities[modelId] ?? fallback;
-  }
-
-  // ── Discovery ───────────────────────────────────────────────────
-
-  discoverModels(endpointId: string): void {
-    this.discoveryState.update((s) => ({
-      ...s,
-      [endpointId]: {
-        loading: true,
-        result: s[endpointId]?.result ?? null,
-        selected: s[endpointId]?.selected ?? {},
-        capabilities: s[endpointId]?.capabilities ?? {},
-        error: null,
-      },
-    }));
-    this.admin.discoverSystemEndpointModels(endpointId).subscribe({
-      next: (result) => {
-        const prefill: Record<string, LlmModelCapability> = {};
-        for (const m of result.models) {
-          prefill[m.id] = m.capability_hint;
-        }
-        this.discoveryState.update((s) => ({
-          ...s,
-          [endpointId]: {
-            loading: false,
-            result,
-            selected: {},
-            capabilities: prefill,
-            error: null,
-          },
-        }));
-      },
-      error: (err) => {
-        this.discoveryState.update((s) => ({
-          ...s,
-          [endpointId]: {
-            loading: false,
-            result: null,
-            selected: {},
-            capabilities: {},
-            error: err?.error?.detail ?? String(err),
-          },
-        }));
-      },
-    });
-  }
-
-  toggleDiscoverySelection(endpointId: string, modelId: string, event: Event): void {
-    const checked = (event.target as HTMLInputElement).checked;
-    this.discoveryState.update((s) => {
-      const state = s[endpointId];
-      if (!state) return s;
-      return {
-        ...s,
-        [endpointId]: {
-          ...state,
-          selected: {...state.selected, [modelId]: checked},
-        },
-      };
-    });
-  }
-
-  setDiscoveryCapability(endpointId: string, modelId: string, cap: LlmModelCapability): void {
-    this.discoveryState.update((s) => {
-      const state = s[endpointId];
-      if (!state) return s;
-      return {
-        ...s,
-        [endpointId]: {
-          ...state,
-          capabilities: {...state.capabilities, [modelId]: cap},
-        },
-      };
-    });
-  }
-
-  anyDiscoverySelected(endpointId: string): boolean {
-    const state = this.discoveryState()[endpointId];
-    if (!state) return false;
-    return Object.values(state.selected).some((v) => v);
-  }
-
-  importSelectedDiscoveredModels(endpointId: string): void {
-    const state = this.discoveryState()[endpointId];
-    if (!state?.result) return;
-
-    const already = new Set(state.result.already_registered);
-    const picked = state.result.models.filter(
-      (m) => state.selected[m.id] && !already.has(m.id),
-    );
-    if (picked.length === 0) return;
-
-    this.importingEndpointId.set(endpointId);
-    this.admin
-      .batchCreateSystemEndpointModels(endpointId, {
-        models: picked.map((m) => ({
-          model_id: m.id,
-          display_name: m.id, // the user can rename post-import
-          capability: state.capabilities[m.id] ?? m.capability_hint,
-          family: m.family ?? null,
-          context_window: m.context_window ?? null,
-        })),
-        skip_duplicates: true,
-      })
-      .subscribe({
-        next: () => {
-          this.importingEndpointId.set(null);
-          // Collapse the checklist after a successful import.
-          this.discoveryState.update((s) => {
-            const rest = {...s};
-            delete rest[endpointId];
-            return rest;
-          });
-        },
-        error: () => this.importingEndpointId.set(null),
-      });
   }
 
   // ── Defaults ────────────────────────────────────────────────────
