@@ -183,8 +183,10 @@ _builtin_registry: dict[str, ModelMeta] = _load_builtin_catalog()
 # resolve_model() skips straight to the built-in catalog.
 CustomLookup = Callable[..., Awaitable[Optional[dict[str, Any]]]]
 SystemLookup = Callable[..., Awaitable[Optional[dict[str, Any]]]]
+CatalogLookup = Callable[..., Awaitable[Optional[dict[str, Any]]]]
 _custom_lookup: Optional[CustomLookup] = None
 _system_lookup: Optional[SystemLookup] = None
+_catalog_lookup: Optional[CatalogLookup] = None
 
 
 def register_custom_lookup(fn: Optional[CustomLookup]) -> None:
@@ -210,6 +212,18 @@ def register_system_lookup(fn: Optional[SystemLookup]) -> None:
     """
     global _system_lookup
     _system_lookup = fn
+
+
+def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
+    """Install (or clear) the DB-backed catalog lookup callable.
+
+    The callable takes (model_id, role='chat') and returns either None or a
+    flattened row dict from the ``models`` table joined to its transport
+    (system_api_keys or user_llm_endpoints). Wired to
+    ``postgres_db.resolve_catalog_model`` at orchestrator startup.
+    """
+    global _catalog_lookup
+    _catalog_lookup = fn
 
 
 def reload_registry() -> None:
@@ -328,6 +342,48 @@ def _custom_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     return _endpoint_row_to_meta(row, origin="custom")
 
 
+def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
+    """Build a ModelMeta from a ``models`` catalog row joined to its transport.
+
+    Two shapes:
+    - ``provider_kind='endpoint'`` — inherits ``base_url`` + ``api_key``
+      from the joined ``user_llm_endpoints`` row. Routes through the
+      openai factory (OpenAI-compatible wire protocol).
+    - ``provider_kind='system'`` — sets ``api_key_ref`` to the provider
+      slug so the dispatcher resolves the key via ``system_api_keys``;
+      ``base_url`` stays None so the factory uses its hardcoded default.
+    """
+    provider_kind = row["provider_kind"]
+    provider_ref = row["provider_ref"]
+    role = row.get("role") or "chat"
+    if provider_kind == "endpoint":
+        return ModelMeta(
+            model_id=row["model_id"],
+            provider="openai",
+            family=row.get("family") or "default",
+            display_name=row.get("display_label") or row["model_id"],
+            base_url=row.get("endpoint_base_url"),
+            api_key_ref=None,
+            context_window=row.get("context_window"),
+            reasoning_level=row.get("reasoning_level"),
+            origin="catalog",
+            endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
+            capability=role,
+        )
+    return ModelMeta(
+        model_id=row["model_id"],
+        provider=_factory_provider(provider_ref),
+        family=row.get("family") or "default",
+        display_name=row.get("display_label") or row["model_id"],
+        base_url=None,
+        api_key_ref=provider_ref,
+        context_window=row.get("context_window"),
+        reasoning_level=row.get("reasoning_level"),
+        origin="catalog",
+        capability=role,
+    )
+
+
 async def resolve_model(
     model_id: str,
     user_id: Optional[str] = None,
@@ -341,8 +397,15 @@ async def resolve_model(
         2. System-scoped endpoints (when the system lookup hook has been
            registered). Shared across all users; seeded by helm or
            managed via Admin → Providers.
+        2.5. DB-backed catalog (``models`` table) — admin-curated offerings
+           anchored to a transport (system_api_keys or system endpoint).
+           When matched, the row's transport is joined inline so the
+           returned ModelMeta carries either ``base_url`` (endpoint) or
+           ``api_key_ref`` (system provider).
         3. Built-in catalog from config/models.yaml (chat-capability only;
-           the built-in catalog tracks only chat models today).
+           kept as a fallback during the catalog rollout window — every
+           hit logs at WARN so coverage gaps are visible before the YAML
+           is deleted).
         4. Miss → UnknownModelError.
 
     Args:
@@ -371,9 +434,19 @@ async def resolve_model(
         if row is not None:
             return _endpoint_row_to_meta(row, origin="system")
 
+    if _catalog_lookup is not None:
+        row = await _catalog_lookup(model_id, role=capability)
+        if row is not None:
+            return _catalog_row_to_meta(row)
+
     if capability == "chat":
         meta = _builtin_registry.get(model_id)
         if meta is not None:
+            logger.warning(
+                "Resolved model %s from YAML fallback — should be in catalog "
+                "(seed via _seed_models_from_yaml or add via Admin → Models)",
+                model_id,
+            )
             return meta
 
     raise UnknownModelError(model_id)

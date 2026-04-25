@@ -26,23 +26,29 @@ def _fake_db(*, existing_providers: list[str] | None = None):
     return db
 
 
-def _fake_db_with_defaults(
+def _fake_db_with_catalog(
     *,
     openrouter_key: str | None = None,
-    existing_defaults: dict[str, str] | None = None,
+    create_model_returns: dict | None = None,
 ):
-    """Mock for the openrouter-default path. Tracks set_default_llm_model
-    calls so tests can assert which slots got pinned."""
+    """Mock for the openrouter convenience path. Tracks ``create_model``
+    calls so tests can assert which catalog rows got inserted.
+
+    ``create_model_returns`` controls what the mock returns from each call:
+    ``None`` simulates ``ON CONFLICT DO NOTHING`` skipping an existing row;
+    a dict simulates a successful insert.
+    """
     db = MagicMock()
     db.get_system_api_key = AsyncMock(
         side_effect=lambda provider: openrouter_key
         if provider == "openrouter"
         else None
     )
-    defaults = dict(existing_defaults or {})
-    db.get_default_llm_model = AsyncMock(side_effect=defaults.get)
-    db.set_default_llm_model = AsyncMock()
-    db._defaults_track = defaults
+    db.create_model = AsyncMock(
+        return_value=create_model_returns
+        if create_model_returns is not None
+        else {"id": "00000000-0000-0000-0000-000000000001"}
+    )
     return db
 
 
@@ -125,40 +131,61 @@ async def test_multiple_providers_seeded(monkeypatch):
 
 
 class TestApplyOpenrouterDefaults:
+    """Post-catalog migration: this step inserts catalog rows for the
+    OpenRouter-routed auxiliary + embedding convenience models instead of
+    pinning ``default_llm_models`` entries. The default-resolver's
+    "first-enabled-alphabetical" fallback handles which one gets used.
+    """
+
     @pytest.mark.asyncio
     async def test_no_openrouter_key_is_noop(self):
-        db = _fake_db_with_defaults(openrouter_key=None)
+        db = _fake_db_with_catalog(openrouter_key=None)
         await init_mod._apply_openrouter_defaults(db)
-        db.set_default_llm_model.assert_not_awaited()
+        db.create_model.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_pins_auxiliary_and_embedding_when_slots_empty(self):
-        db = _fake_db_with_defaults(openrouter_key="sk-or-v1-xxx")
+    async def test_inserts_auxiliary_and_embedding_when_catalog_empty(self):
+        db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
         await init_mod._apply_openrouter_defaults(db)
-        assert db.set_default_llm_model.await_count == 2
-        kinds_pinned = {
-            call.args[0] for call in db.set_default_llm_model.await_args_list
+        assert db.create_model.await_count == 2
+        roles_inserted = {
+            call.kwargs["role"] for call in db.create_model.await_args_list
         }
-        assert kinds_pinned == {"auxiliary", "embedding"}
+        assert roles_inserted == {"auxiliary", "embedding"}
 
     @pytest.mark.asyncio
-    async def test_does_not_clobber_existing_default(self):
-        db = _fake_db_with_defaults(
-            openrouter_key="sk-or-v1-xxx",
-            existing_defaults={"auxiliary": "groq/admin-pinned"},
+    async def test_idempotent_when_rows_already_exist(self):
+        """When ON CONFLICT DO NOTHING skips both rows (create_model
+        returns None), the step still runs both inserts and exits clean."""
+        db = _fake_db_with_catalog(
+            openrouter_key="sk-or-v1-xxx", create_model_returns=None
         )
         await init_mod._apply_openrouter_defaults(db)
-        # Only embedding gets set — auxiliary already had a value.
-        assert db.set_default_llm_model.await_count == 1
-        only_call = db.set_default_llm_model.await_args_list[0]
-        assert only_call.args[0] == "embedding"
+        assert db.create_model.await_count == 2  # both attempted, both skipped
 
     @pytest.mark.asyncio
-    async def test_pinned_auxiliary_routes_through_openrouter(self):
-        db = _fake_db_with_defaults(openrouter_key="sk-or-v1-xxx")
+    async def test_inserted_rows_route_through_openrouter(self):
+        db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
         await init_mod._apply_openrouter_defaults(db)
-        for call in db.set_default_llm_model.await_args_list:
-            kind, model = call.args
-            assert model.startswith("openrouter/"), (
-                f"expected openrouter/ prefix on {kind} default, got {model}"
+        for call in db.create_model.await_args_list:
+            assert call.kwargs["provider_kind"] == "system"
+            assert call.kwargs["provider_ref"] == "openrouter"
+            assert call.kwargs["model_id"].startswith("openrouter/"), (
+                f"expected openrouter/ prefix, got {call.kwargs['model_id']}"
             )
+
+    @pytest.mark.asyncio
+    async def test_inserted_rows_use_on_conflict_do_nothing(self):
+        """Re-runs must not clobber admin edits — every insert sets
+        on_conflict_do_nothing=True."""
+        db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
+        await init_mod._apply_openrouter_defaults(db)
+        for call in db.create_model.await_args_list:
+            assert call.kwargs.get("on_conflict_do_nothing") is True
+
+    @pytest.mark.asyncio
+    async def test_inserted_rows_carry_helm_breadcrumb(self):
+        db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
+        await init_mod._apply_openrouter_defaults(db)
+        for call in db.create_model.await_args_list:
+            assert call.kwargs.get("seeded_from") == "helm:openrouter-defaults"

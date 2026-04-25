@@ -340,9 +340,10 @@
     },
     "llmEndpoints": {
       "title": "LLM Endpoints",
-      "desc": "Register your own OpenAI-compatible endpoints (vLLM, Ollama, private gateway). Models listed here appear in the model picker as a custom group.",
+      "desc": "Register your own OpenAI-compatible endpoints (vLLM, Ollama, private gateway). Models on these endpoints are added by an admin via Admin → Models.",
       "empty": "No custom endpoints. Add one to route models to your own server.",
       "noKey": "no key",
+      "catalogHint": "An admin curates which models on this endpoint are available — see Admin → Models.",
       "noModels": "No models attached yet. Add one below.",
       "addTitle": "Add Endpoint",
       "createButton": "Create Endpoint",

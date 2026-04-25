@@ -114,55 +114,10 @@ describe('SettingsService — LLM endpoints', () => {
     expect(http.get).toHaveBeenCalled();
   });
 
-  it('createLlmEndpointModel posts to the nested /models path', () => {
-    const http = {
-      get: vi.fn().mockReturnValue(of([])),
-      post: vi.fn().mockReturnValue(of({id: 'm-1'})),
-      patch: vi.fn(),
-      delete: vi.fn(),
-      put: vi.fn(),
-    };
-    const {service} = createService(http);
-    service
-      .createLlmEndpointModel('ep-1', {
-        model_id: 'my-org/my-model',
-        display_name: 'My Model',
-      })
-      .subscribe();
-    expect(http.post).toHaveBeenCalledWith(
-      expect.stringContaining('/settings/llm-endpoints/ep-1/models'),
-      expect.objectContaining({model_id: 'my-org/my-model', display_name: 'My Model'}),
-    );
-  });
-
-  it('updateLlmEndpointModel URL-encodes model_id with slashes', () => {
-    const http = {
-      get: vi.fn().mockReturnValue(of([])),
-      post: vi.fn(),
-      patch: vi.fn().mockReturnValue(of({})),
-      delete: vi.fn(),
-      put: vi.fn(),
-    };
-    const {service} = createService(http);
-    service.updateLlmEndpointModel('ep-1', 'my-org/model', {enabled: false}).subscribe();
-    const url = http.patch.mock.calls[0][0];
-    expect(url).toContain('/settings/llm-endpoints/ep-1/models/');
-    expect(url).toContain('my-org%2Fmodel');
-  });
-
-  it('deleteLlmEndpointModel URL-encodes model_id', () => {
-    const http = {
-      get: vi.fn().mockReturnValue(of([])),
-      post: vi.fn(),
-      patch: vi.fn(),
-      delete: vi.fn().mockReturnValue(of({status: 'deleted'})),
-      put: vi.fn(),
-    };
-    const {service} = createService(http);
-    service.deleteLlmEndpointModel('ep-1', 'my-org/model').subscribe();
-    const url = http.delete.mock.calls[0][0];
-    expect(url).toContain('my-org%2Fmodel');
-  });
+  // The user-side createLlmEndpointModel / updateLlmEndpointModel /
+  // deleteLlmEndpointModel methods were removed when the admin-curated
+  // models catalog became the single source of truth. Coverage for the
+  // catalog CRUD lives in admin-models.service.spec.ts (Phase C).
 
   it('testLlmEndpoint POSTs to the /test subpath', () => {
     const http = {
