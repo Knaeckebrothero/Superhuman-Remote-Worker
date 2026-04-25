@@ -260,7 +260,7 @@ class KeyRing:
 # =============================================================================
 
 _registry_lock = threading.Lock()
-_registry: Dict[str, KeyRing] = {}
+_registry: Dict[tuple, KeyRing] = {}
 
 
 def get_or_create_key_ring(
@@ -268,25 +268,29 @@ def get_or_create_key_ring(
     provider: str = "openai",
     cooldown_seconds: float = 1800.0,
 ) -> KeyRing:
-    """Get or create a shared KeyRing for a provider.
+    """Get or create a shared KeyRing for a provider + key set.
 
-    All phase LLMs (strategic, tactical, summarization) that use the same
-    provider share one KeyRing so rotation state is consistent.
+    Cache key is ``(provider, tuple(keys))`` so phase LLMs that share both
+    provider and keys share one ring (rotation state stays consistent), while
+    a different key set — e.g. an explicit ``api_key`` from a session
+    config_override — gets its own ring instead of being masked by an
+    earlier ring cached against the same provider with a different key.
 
     Args:
         keys: List of API keys
-        provider: Provider identifier (used as registry key)
+        provider: Provider identifier (part of registry key)
         cooldown_seconds: Cooldown duration for failed keys
 
     Returns:
-        Shared KeyRing instance for this provider
+        Shared KeyRing instance for this (provider, keys) pair
     """
+    cache_key = (provider, tuple(keys))
     with _registry_lock:
-        if provider in _registry:
-            return _registry[provider]
+        if cache_key in _registry:
+            return _registry[cache_key]
 
         ring = KeyRing(keys, cooldown_seconds=cooldown_seconds, provider=provider)
-        _registry[provider] = ring
+        _registry[cache_key] = ring
         return ring
 
 
