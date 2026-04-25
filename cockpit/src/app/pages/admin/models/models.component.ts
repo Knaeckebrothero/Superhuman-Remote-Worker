@@ -9,6 +9,7 @@ import {
   CatalogModelTestResult,
   CatalogProviderKind,
   CatalogRole,
+  LlmEndpointDiscoveredModel,
 } from '../../../core/models/api.model';
 
 interface ProviderOption {
@@ -16,6 +17,21 @@ interface ProviderOption {
   ref: string;
   label: string;
   available: boolean;
+}
+
+/**
+ * Maps the discover endpoint's capability hint onto a catalog role. Whisper /
+ * tts hints fall back to 'chat' since v1 catalog roles don't cover them yet.
+ */
+function hintToRole(hint: string | null | undefined): CatalogRole {
+  switch (hint) {
+    case 'auxiliary':
+    case 'embedding':
+    case 'vision':
+      return hint;
+    default:
+      return 'chat';
+  }
 }
 
 @Component({
@@ -112,6 +128,7 @@ interface ProviderOption {
                 <select
                   class="form-input"
                   [(ngModel)]="formProviderKey"
+                  (ngModelChange)="onProviderChange()"
                   [disabled]="creating()"
                 >
                   @for (p of providerOptions(); track p.kind + ':' + p.ref) {
@@ -133,6 +150,41 @@ interface ProviderOption {
                 </select>
               </div>
             </div>
+
+            @if (selectedEndpointRef(); as endpointRef) {
+              <div class="discover-pane">
+                <div class="discover-actions">
+                  <button
+                    class="link-btn"
+                    (click)="discoverFromEndpoint(endpointRef)"
+                    [disabled]="discovering()"
+                  >
+                    {{ discovering() ? 'Discovering…' : 'Discover available models' }}
+                  </button>
+                  @if (discoverError()) {
+                    <span class="test-result fail">{{ discoverError() }}</span>
+                  } @else if (discoveredModels().length > 0) {
+                    <span class="muted">
+                      Click a model to autofill ID and label:
+                    </span>
+                  }
+                </div>
+                @if (discoveredModels().length > 0) {
+                  <div class="discover-list">
+                    @for (m of discoveredModels(); track m.id) {
+                      <button
+                        type="button"
+                        class="discover-chip"
+                        (click)="applyDiscoveredModel(m)"
+                      >
+                        <span class="mono">{{ m.id }}</span>
+                        <span class="discover-cap">{{ m.capability_hint }}</span>
+                      </button>
+                    }
+                  </div>
+                }
+              </div>
+            }
 
             <div class="form-row two-col">
               <div>
@@ -313,6 +365,47 @@ interface ProviderOption {
       cursor: pointer;
     }
     .create-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .discover-pane {
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      background: var(--timeline-bg, #11111b);
+      border: 1px dashed var(--border-color, #313244);
+      border-radius: 6px;
+    }
+    .discover-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .discover-list {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .discover-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 10px;
+      background: var(--surface-0, #313244);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 14px;
+      font-size: 12px;
+      color: var(--text-primary, #cdd6f4);
+      cursor: pointer;
+    }
+    .discover-chip:hover {
+      border-color: var(--accent, #89b4fa);
+      color: var(--accent, #89b4fa);
+    }
+    .discover-cap {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted, #6c7086);
+    }
   `],
 })
 export class AdminModelsComponent implements OnInit {
@@ -332,6 +425,17 @@ export class AdminModelsComponent implements OnInit {
   formDisplayLabel = '';
   formFamily = 'default';
   formContextWindow: number | null = null;
+
+  // Discover-from-endpoint quick-fill state. Resets when the form provider
+  // changes (any non-endpoint provider clears the list).
+  readonly discovering = signal(false);
+  readonly discoveredModels = signal<LlmEndpointDiscoveredModel[]>([]);
+  readonly discoverError = signal<string>('');
+
+  selectedEndpointRef(): string | null {
+    if (!this.formProviderKey.startsWith('endpoint:')) return null;
+    return this.formProviderKey.slice('endpoint:'.length);
+  }
 
   /** Provider dropdown options sourced from the keys + endpoints lists. */
   readonly providerOptions = computed<ProviderOption[]>(() => {
@@ -444,5 +548,42 @@ export class AdminModelsComponent implements OnInit {
       },
       error: () => this.testing.set(null),
     });
+  }
+
+  discoverFromEndpoint(endpointId: string): void {
+    this.discovering.set(true);
+    this.discoverError.set('');
+    this.discoveredModels.set([]);
+    this.providers.discoverSystemEndpointModels(endpointId).subscribe({
+      next: (result) => {
+        this.discovering.set(false);
+        if (!result.ok) {
+          this.discoverError.set(result.error || 'Discovery failed.');
+          return;
+        }
+        this.discoveredModels.set(result.models);
+      },
+      error: (err) => {
+        this.discovering.set(false);
+        this.discoverError.set(err?.error?.detail ?? 'Discovery failed.');
+      },
+    });
+  }
+
+  applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {
+    this.formModelId = m.id;
+    if (!this.formDisplayLabel.trim()) {
+      this.formDisplayLabel = m.id;
+    }
+    this.formRole = hintToRole(m.capability_hint);
+    if (m.family) this.formFamily = m.family;
+    if (m.context_window) this.formContextWindow = m.context_window;
+  }
+
+  onProviderChange(): void {
+    // Clear the discover list whenever the provider changes — a system
+    // (API key) provider has no /v1/models endpoint to probe.
+    this.discoveredModels.set([]);
+    this.discoverError.set('');
   }
 }

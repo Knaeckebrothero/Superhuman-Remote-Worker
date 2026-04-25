@@ -92,7 +92,11 @@ charts/superhuman-remote-worker/
     nextcloud.yaml                   # StatefulSet + Service (conditional)
   templates/optional/
     vpn.yaml                         # VPN sidecar deployments (conditional)
-    headscale.yaml                   # Mesh VPN (conditional)
+    # Headscale is NOT bundled — it's deployed out of band as a separate
+    # Fleet bundle (HomeLab/deployments_managed/headscale/) so its
+    # lifecycle is independent of the SRW release. The chart only
+    # consumes its URL via .Values.headscale.url. See
+    # docs/features/external_headscale.md.
   ci/
     test-values.yaml                 # Minimal values for CI testing
 ```
@@ -229,9 +233,18 @@ vpn:
   workstation:
     enabled: false
 
-# --- Headscale mesh VPN (optional) ---
+# --- Headscale mesh VPN (external — chart consumes URL only) ---
+# Headscale itself is deployed out of band. Set the URL of an existing
+# server here; agent pre-auth key flows in via Vault as TAILSCALE_AUTH_KEY.
+# See docs/features/external_headscale.md.
 headscale:
-  enabled: false
+  url: ""
+
+# Agent tailscale sidecar gate. Off by default — enable when the agent
+# pods need to join a tailnet to reach KubeVirt VMs.
+agent:
+  tailscale:
+    enabled: false
 
 # --- Databases ---
 # Set enabled=true + internal=true to deploy StatefulSets within the chart.
@@ -394,8 +407,13 @@ vpn:
   workstation:
     enabled: true
 
+# External headscale — server is its own deployment in HomeLab/.
 headscale:
-  enabled: true
+  url: "https://headscale.h4ll.app"
+
+agent:
+  tailscale:
+    enabled: true
 
 databases:
   postgres:
@@ -473,8 +491,13 @@ vpn:
   workstation:
     enabled: false
 
+# External headscale — leave url empty to skip the sidecar entirely.
 headscale:
-  enabled: false
+  url: ""
+
+agent:
+  tailscale:
+    enabled: false
 
 email:
   enabled: false
@@ -539,7 +562,10 @@ vpn:
   workstation:
     enabled: false
 headscale:
-  enabled: false
+  url: ""
+agent:
+  tailscale:
+    enabled: false
 mcp:
   enabled: false
 ```
