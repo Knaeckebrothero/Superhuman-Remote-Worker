@@ -206,17 +206,17 @@ async def _seed_endpoints(
                 key_prefix=(api_key[:8] if api_key else None),
             )
             endpoint_id = str(created["id"])
-            existing_model_keys: set[tuple[str, str]] = set()
             report.endpoints_seeded.append(label)
             logger.info("seeded system endpoint %s (%s)", label, base_url)
         else:
             endpoint_id = str(existing["id"])
-            existing_model_keys = {
-                (m["model_id"], m.get("capability") or "chat")
-                for m in existing.get("models", [])
-            }
             report.endpoints_skipped.append(label)
             logger.info("endpoint %s already present — leaving untouched", label)
+
+        # Per-endpoint model entries become catalog rows with
+        # provider_kind='endpoint'. Capabilities outside the catalog enum
+        # (whisper, tts) are skipped — those don't surface in v1.
+        from src.core.model_registry import family_of  # local: src/* lazy load
 
         for model in models:
             model_id = model.get("id") or model.get("model_id")
@@ -225,30 +225,41 @@ async def _seed_endpoints(
                     "skipping model entry under %s — id missing: %r", label, model
                 )
                 continue
-            capability = model.get("capability", "chat")
-            if (model_id, capability) in existing_model_keys:
-                report.models_skipped.append((label, model_id))
+            role = (model.get("capability") or "chat").lower()
+            if role not in ("chat", "auxiliary", "embedding", "vision"):
+                logger.info(
+                    "skipping model %s under %s — capability %r is not a v1 catalog role",
+                    model_id,
+                    label,
+                    role,
+                )
                 continue
-            await db.create_system_llm_endpoint_model(
-                endpoint_id=endpoint_id,
+            display_label = (
+                model.get("displayName") or model.get("display_name") or model_id
+            )
+            inserted = await db.create_model(
+                provider_kind="endpoint",
+                provider_ref=endpoint_id,
                 model_id=model_id,
-                display_name=model.get("displayName")
-                or model.get("display_name")
-                or model_id,
-                family=model.get("family"),
+                display_label=display_label,
+                role=role,
+                family=model.get("family") or family_of(model_id),
                 context_window=model.get("contextWindow")
                 or model.get("context_window"),
                 reasoning_level=model.get("reasoningLevel")
                 or model.get("reasoning_level"),
                 enabled=model.get("enabled", True),
-                capability=capability,
+                seeded_from="helm:llm.seed",
+                on_conflict_do_nothing=True,
             )
-            existing_model_keys.add((model_id, capability))
+            if inserted is None:
+                report.models_skipped.append((label, model_id))
+                continue
             report.models_seeded.append((label, model_id))
             logger.info(
-                "seeded model %s (capability=%s) under endpoint %s",
+                "seeded catalog row %s (role=%s) under endpoint %s",
                 model_id,
-                capability,
+                role,
                 label,
             )
 

@@ -7,9 +7,6 @@ import {
   CodexStatus,
   LlmEndpoint,
   LlmEndpointCreateRequest,
-  LlmEndpointModel,
-  LlmEndpointModelCreateRequest,
-  LlmEndpointModelUpdateRequest,
   LlmEndpointTestResult,
   LlmEndpointUpdateRequest,
   ResolvedDefaults,
@@ -79,39 +76,6 @@ export class SettingsService {
   deleteLlmEndpoint(endpointId: string): Observable<{ status: string }> {
     return this.http
       .delete<{ status: string }>(`${this.baseUrl}/settings/llm-endpoints/${endpointId}`)
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  createLlmEndpointModel(
-    endpointId: string,
-    body: LlmEndpointModelCreateRequest,
-  ): Observable<LlmEndpointModel> {
-    return this.http
-      .post<LlmEndpointModel>(
-        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models`,
-        body,
-      )
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  updateLlmEndpointModel(
-    endpointId: string,
-    modelId: string,
-    body: LlmEndpointModelUpdateRequest,
-  ): Observable<LlmEndpointModel> {
-    return this.http
-      .patch<LlmEndpointModel>(
-        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models/${encodeURIComponent(modelId)}`,
-        body,
-      )
-      .pipe(tap(() => this.loadLlmEndpoints()));
-  }
-
-  deleteLlmEndpointModel(endpointId: string, modelId: string): Observable<{ status: string }> {
-    return this.http
-      .delete<{ status: string }>(
-        `${this.baseUrl}/settings/llm-endpoints/${endpointId}/models/${encodeURIComponent(modelId)}`,
-      )
       .pipe(tap(() => this.loadLlmEndpoints()));
   }
 

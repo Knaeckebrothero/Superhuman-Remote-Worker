@@ -19,7 +19,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 from main import (
     _get_system_providers,
-    _load_model_catalog,
+    _load_models_yaml_legacy,
     _PROVIDER_ENV_KEYS,
 )
 from src.core.model_registry import resolve_builtin
@@ -32,12 +32,12 @@ from src.core.model_registry import resolve_builtin
 
 @pytest.fixture(autouse=True)
 def clear_catalog_cache():
-    """Reset catalog cache between tests."""
+    """Reset YAML-legacy cache between tests."""
     import main as orchestrator_main
 
-    orchestrator_main._model_catalog_cache = None
+    orchestrator_main._model_catalog_yaml_cache = None
     yield
-    orchestrator_main._model_catalog_cache = None
+    orchestrator_main._model_catalog_yaml_cache = None
 
 
 @pytest.fixture
@@ -86,38 +86,62 @@ class TestGetSystemProviders:
 
 
 # =============================================================================
-# _load_model_catalog
+# _load_models_yaml_legacy
 # =============================================================================
 
 
-class TestLoadModelCatalog:
+class TestLoadModelsYamlLegacy:
+    """After the catalog flip, only presets / whisper / tts still come from
+    the YAML; the chat/auxiliary/vision/embedding sections live in the DB
+    catalog and the YAML reader returns whatever the file ships."""
+
     def test_loads_real_file(self):
         with patch.dict(
             os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
         ):
-            catalog = _load_model_catalog()
-            assert "groups" in catalog
-            assert "presets" in catalog
-            assert "builder_models" in catalog
-            assert "auxiliary_models" in catalog
-            assert "vision_models" in catalog
-            assert "whisper_models" in catalog
-            assert "embedding_models" in catalog
+            data = _load_models_yaml_legacy()
+            assert "presets" in data
+            # whisper_models / tts_models are optional in the YAML — the
+            # reader doesn't fabricate them.
+            assert isinstance(data.get("presets", []), list)
 
-    def test_groups_have_required_fields(self):
+    def test_caching(self):
         with patch.dict(
             os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
         ):
-            catalog = _load_model_catalog()
-            for group in catalog["groups"]:
-                assert "name" in group
-                assert "provider" in group
-                assert "models" in group
-                for model in group["models"]:
-                    assert "id" in model
-                    assert "display_name" in model
+            cat1 = _load_models_yaml_legacy()
+            cat2 = _load_models_yaml_legacy()
+            assert cat1 is cat2  # Same object — cached
 
-    def test_all_providers_are_known(self):
+    def test_missing_file_returns_legacy_skeleton(self, tmp_path):
+        with patch.dict(os.environ, {"CONFIG_DIR": str(tmp_path)}):
+            data = _load_models_yaml_legacy()
+            assert data == {
+                "presets": [],
+                "whisper_models": [],
+                "tts_models": [],
+            }
+
+
+# =============================================================================
+# YAML structural sanity checks (operate directly on the file)
+# =============================================================================
+
+
+class TestYamlShapeContract:
+    """Until config/models.yaml is deleted in Phase E, keep the shape
+    locked so the seeder + legacy bits don't silently drift."""
+
+    def test_groups_have_required_fields(self, catalog):
+        for group in catalog.get("groups", []):
+            assert "name" in group
+            assert "provider" in group
+            assert "models" in group
+            for model in group["models"]:
+                assert "id" in model
+                assert "display_name" in model
+
+    def test_all_providers_are_known(self, catalog):
         known_providers = {
             "local",
             "openai",
@@ -127,38 +151,15 @@ class TestLoadModelCatalog:
             "groq",
             "openrouter",
         }
-        with patch.dict(
-            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
-        ):
-            catalog = _load_model_catalog()
-            for group in catalog["groups"]:
-                assert group["provider"] in known_providers, (
-                    f"Unknown provider '{group['provider']}' in group '{group['name']}'"
-                )
+        for group in catalog.get("groups", []):
+            assert group["provider"] in known_providers, (
+                f"Unknown provider '{group['provider']}' in group '{group['name']}'"
+            )
 
-    def test_embedding_models_have_dimensions(self):
-        with patch.dict(
-            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
-        ):
-            catalog = _load_model_catalog()
-            for m in catalog["embedding_models"]:
-                assert "dimensions" in m, (
-                    f"Embedding model {m['id']} missing dimensions"
-                )
-                assert isinstance(m["dimensions"], int)
-
-    def test_caching(self):
-        with patch.dict(
-            os.environ, {"CONFIG_DIR": str(Path(__file__).parent.parent / "config")}
-        ):
-            cat1 = _load_model_catalog()
-            cat2 = _load_model_catalog()
-            assert cat1 is cat2  # Same object — cached
-
-    def test_missing_file_returns_empty(self, tmp_path):
-        with patch.dict(os.environ, {"CONFIG_DIR": str(tmp_path)}):
-            catalog = _load_model_catalog()
-            assert catalog == {"groups": [], "presets": [], "builder_models": []}
+    def test_embedding_models_have_dimensions(self, catalog):
+        for m in catalog.get("embedding_models", []):
+            assert "dimensions" in m, f"Embedding model {m['id']} missing dimensions"
+            assert isinstance(m["dimensions"], int)
 
 
 # =============================================================================

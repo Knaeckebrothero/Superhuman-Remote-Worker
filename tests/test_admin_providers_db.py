@@ -365,61 +365,10 @@ class TestSystemLlmEndpoints:
         assert "user_id IS NULL" in conn.execute.await_args.args[0]
 
 
-class TestSystemLlmEndpointModels:
-    @pytest.mark.asyncio
-    async def test_create_requires_existing_system_endpoint(self):
-        """When the parent endpoint isn't a system row, create returns None."""
-        conn = _conn()
-        # Fails the ownership check (get_system_llm_endpoint returns None).
-        conn.fetchrow = AsyncMock(return_value=None)
-        db = _make_db(conn)
-
-        result = await db.create_system_llm_endpoint_model(
-            endpoint_id="33333333-3333-3333-3333-333333333333",
-            model_id="any",
-            display_name="Any",
-        )
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_create_inserts_when_endpoint_exists(self):
-        conn = _conn()
-        # First fetchrow call is the ownership check; second is the insert.
-        conn.fetchrow = AsyncMock(
-            side_effect=[
-                {
-                    "id": UUID("33333333-3333-3333-3333-333333333333"),
-                    "label": "X",
-                    "base_url": "http://x/v1",
-                    "api_key": None,
-                    "key_prefix": None,
-                    "created_at": None,
-                    "updated_at": None,
-                },
-                {
-                    "id": UUID("44444444-4444-4444-4444-444444444444"),
-                    "endpoint_id": UUID("33333333-3333-3333-3333-333333333333"),
-                    "model_id": "gemma",
-                    "display_name": "Gemma",
-                    "family": "gemma",
-                    "context_window": 128000,
-                    "reasoning_level": None,
-                    "enabled": True,
-                    "created_at": None,
-                },
-            ]
-        )
-        db = _make_db(conn)
-
-        result = await db.create_system_llm_endpoint_model(
-            endpoint_id="33333333-3333-3333-3333-333333333333",
-            model_id="gemma",
-            display_name="Gemma",
-            family="gemma",
-            context_window=128000,
-        )
-        assert result is not None
-        assert result["model_id"] == "gemma"
+# Endpoint-model accessors (create/update/delete/resolve) and the
+# user_llm_endpoint_models table were retired when the admin-curated
+# `models` catalog became the single source of truth. Catalog accessor
+# tests live in tests/test_admin_models_api.py.
 
 
 # ---------------------------------------------------------------------------

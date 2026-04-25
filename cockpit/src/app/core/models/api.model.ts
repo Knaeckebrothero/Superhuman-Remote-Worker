@@ -325,6 +325,81 @@ export interface LlmEndpointDiscoveryResult {
   already_registered: string[];
 }
 
+// =============================================================================
+// Models Catalog (Admin → Models)
+// =============================================================================
+
+/** Locked enum for catalog rows. Adding a role requires schema + resolver work. */
+export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision';
+
+/** Provider anchor for a catalog row. */
+export type CatalogProviderKind = 'system' | 'endpoint';
+
+export const CATALOG_ROLES: CatalogRole[] = ['chat', 'auxiliary', 'embedding', 'vision'];
+
+/**
+ * A row in the admin-curated `models` table. Mirrors orchestrator
+ * `_serialize_catalog_model`.
+ */
+export interface CatalogModel {
+  id: string;
+  provider_kind: CatalogProviderKind;
+  provider_ref: string;
+  model_id: string;
+  display_label: string;
+  role: CatalogRole;
+  family: string;
+  context_window: number | null;
+  reasoning_level: string | null;
+  params_json: Record<string, unknown> | null;
+  enabled: boolean;
+  seeded_from: string | null;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CatalogModelCreateRequest {
+  provider_kind: CatalogProviderKind;
+  provider_ref: string;
+  model_id: string;
+  display_label: string;
+  role: CatalogRole;
+  family: string;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  params_json?: Record<string, unknown> | null;
+  enabled?: boolean;
+  notes?: string | null;
+}
+
+export interface CatalogModelUpdateRequest {
+  provider_kind?: CatalogProviderKind;
+  provider_ref?: string;
+  model_id?: string;
+  display_label?: string;
+  role?: CatalogRole;
+  family?: string;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  params_json?: Record<string, unknown> | null;
+  enabled?: boolean;
+  notes?: string | null;
+}
+
+export interface CatalogModelTestResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string | null;
+}
+
+export interface CatalogModelDeleteResult {
+  status: string;
+  id: string;
+  warning: string | null;
+}
+
 /**
  * Resolved default values for every user preference field.
  * Returned by the backend in the `_resolved` key of GET /api/settings/preferences.

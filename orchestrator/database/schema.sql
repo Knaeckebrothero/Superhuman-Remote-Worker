@@ -227,75 +227,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_user_llm_endpoint_label_system
     WHERE user_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_user_llm_endpoints_user ON user_llm_endpoints(user_id);
 
-CREATE TABLE IF NOT EXISTS user_llm_endpoint_models (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    endpoint_id UUID NOT NULL REFERENCES user_llm_endpoints(id) ON DELETE CASCADE,
-    model_id TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    family TEXT,
-    context_window INT,
-    reasoning_level TEXT,
-    enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT uq_endpoint_model UNIQUE (endpoint_id, model_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_endpoint ON user_llm_endpoint_models(endpoint_id);
-CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_id ON user_llm_endpoint_models(model_id);
-
--- Capability tagging: one endpoint row can back chat + embedding + vision etc.
--- via multiple model rows with distinct capability values. Idempotent upgrade
--- path for stacks already running the pre-capability schema.
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'user_llm_endpoint_models'
-           AND column_name = 'capability'
-    ) THEN
-        ALTER TABLE user_llm_endpoint_models
-            ADD COLUMN capability TEXT NOT NULL DEFAULT 'chat'
-                CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper', 'tts'));
-
-        ALTER TABLE user_llm_endpoint_models DROP CONSTRAINT IF EXISTS uq_endpoint_model;
-        ALTER TABLE user_llm_endpoint_models
-            ADD CONSTRAINT uq_endpoint_model_capability
-            UNIQUE (endpoint_id, model_id, capability);
-
-        CREATE INDEX IF NOT EXISTS idx_user_llm_endpoint_models_capability
-            ON user_llm_endpoint_models(capability);
-    END IF;
-END
-$$;
-
--- Idempotent widening of the capability CHECK constraint for stacks that
--- were migrated before 'tts' joined the enum. Looks the constraint up by
--- name (auto-named at column-add time), drops it, re-adds with the wider
--- list. Safe to re-run.
-DO $$
-DECLARE
-    cons_name TEXT;
-BEGIN
-    SELECT conname INTO cons_name
-      FROM pg_constraint
-     WHERE conrelid = 'user_llm_endpoint_models'::regclass
-       AND contype = 'c'
-       AND pg_get_constraintdef(oid) LIKE '%capability%';
-
-    IF cons_name IS NOT NULL THEN
-        EXECUTE format(
-            'ALTER TABLE user_llm_endpoint_models DROP CONSTRAINT %I',
-            cons_name
-        );
-    END IF;
-
-    ALTER TABLE user_llm_endpoint_models
-        ADD CONSTRAINT user_llm_endpoint_models_capability_check
-        CHECK (capability IN ('chat', 'vision', 'embedding', 'auxiliary', 'whisper', 'tts'));
-EXCEPTION WHEN duplicate_object THEN NULL;
-END
-$$;
+-- The legacy user_llm_endpoint_models table was retired in favour of the
+-- admin-curated `models` catalog (section 0k). The orchestrator's init step
+-- _migrate_endpoint_models_to_catalog promotes any remaining system-scoped
+-- rows into the catalog at startup and DROPs the table; fresh installs never
+-- create it.
 
 -- ============================================================================
 -- 0j. SYSTEM API KEYS
@@ -323,6 +259,40 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
 -- existing `system_settings` table defined in section 9d. Keys follow the
 -- convention ``llm.default_<kind>_model`` with JSONB value ``{"model": "..."}``.
 -- See db.get_default_llm_model() / db.set_default_llm_model().
+
+-- ============================================================================
+-- 0k. MODELS CATALOG
+-- Admin-curated catalog of LLM offerings. Each row is one (model, role)
+-- anchored to a transport — either a system_api_keys provider
+-- (provider_kind='system', provider_ref='anthropic') or a system-scoped
+-- user_llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
+-- Every model surfaced in builder/session/job pickers comes from here.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS models (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider_kind TEXT NOT NULL CHECK (provider_kind IN ('system', 'endpoint')),
+    provider_ref TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_label TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision')),
+    family TEXT NOT NULL,
+    context_window INT,
+    reasoning_level TEXT,
+    params_json JSONB,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    seeded_from TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_model_provider UNIQUE (provider_kind, provider_ref, model_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_models_role_enabled
+    ON models(role) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_models_provider
+    ON models(provider_kind, provider_ref);
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE

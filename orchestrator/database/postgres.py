@@ -98,6 +98,7 @@ REQUIRED_TABLES = [
     "builder_messages",
     "user_api_keys",
     "project_api_keys",
+    "models",
 ]
 
 # Tables in the vector DB (verified separately when VECTOR_DB_URL is set)
@@ -3509,28 +3510,11 @@ class PostgresDB:
             if not endpoint_rows:
                 return []
 
-            endpoint_ids = [r["id"] for r in endpoint_rows]
-            model_rows = await conn.fetch(
-                """
-                SELECT id, endpoint_id, model_id, display_name, family,
-                       context_window, reasoning_level, enabled, capability, created_at
-                FROM user_llm_endpoint_models
-                WHERE endpoint_id = ANY($1::uuid[])
-                ORDER BY endpoint_id, display_name
-                """,
-                endpoint_ids,
-            )
-
-        models_by_endpoint: Dict[Any, List[Dict[str, Any]]] = {}
-        for m in model_rows:
-            models_by_endpoint.setdefault(m["endpoint_id"], []).append(dict(m))
-
-        result = []
-        for e in endpoint_rows:
-            e_dict = dict(e)
-            e_dict["models"] = models_by_endpoint.get(e["id"], [])
-            result.append(e_dict)
-        return result
+        # Endpoint-model rows used to live on user_llm_endpoint_models; that
+        # table was retired when the admin-curated catalog became the
+        # single source of truth. The "models" key is kept on the response
+        # for shape compatibility with the Cockpit endpoints page.
+        return [dict(e, models=[]) for e in endpoint_rows]
 
     async def get_user_llm_endpoint(
         self, endpoint_id: str, user_id: str | None = None
@@ -3649,188 +3633,10 @@ class PostgresDB:
             )
             return result == "DELETE 1"
 
-    async def create_user_llm_endpoint_model(
-        self,
-        endpoint_id: str,
-        user_id: str,
-        model_id: str,
-        display_name: str,
-        family: str | None = None,
-        context_window: int | None = None,
-        reasoning_level: str | None = None,
-        enabled: bool = True,
-        capability: str = "chat",
-    ) -> Dict[str, Any] | None:
-        """Add a model row to an endpoint.
-
-        Returns None if the endpoint doesn't belong to the user. Raises
-        asyncpg.UniqueViolationError on duplicate
-        (endpoint_id, model_id, capability).
-        """
-        # Authorize: the endpoint must belong to the caller.
-        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
-        if owner is None:
-            return None
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO user_llm_endpoint_models
-                    (endpoint_id, model_id, display_name, family,
-                     context_window, reasoning_level, enabled, capability)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id, endpoint_id, model_id, display_name, family,
-                          context_window, reasoning_level, enabled, capability,
-                          created_at
-                """,
-                UUID(endpoint_id),
-                model_id,
-                display_name,
-                family,
-                context_window,
-                reasoning_level,
-                enabled,
-                capability,
-            )
-            return dict(row)
-
-    async def update_user_llm_endpoint_model(
-        self,
-        endpoint_id: str,
-        model_id: str,
-        user_id: str,
-        display_name: str | None = None,
-        family: str | None = None,
-        context_window: int | None = None,
-        reasoning_level: str | None = None,
-        enabled: bool | None = None,
-        capability: str = "chat",
-    ) -> Dict[str, Any] | None:
-        """Patch a model row. Only non-None fields are updated.
-
-        ``capability`` is a WHERE-selector (which capability variant of the
-        model row to patch), not a mutable field — defaults to 'chat' so
-        callers that never registered non-chat rows keep working unchanged.
-        Changing a row's capability is delete + re-create.
-        """
-        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
-        if owner is None:
-            return None
-
-        sets: List[str] = []
-        args: List[Any] = [UUID(endpoint_id), model_id, capability]
-        param_idx = 4
-        for name, value in (
-            ("display_name", display_name),
-            ("family", family),
-            ("context_window", context_window),
-            ("reasoning_level", reasoning_level),
-            ("enabled", enabled),
-        ):
-            if value is not None:
-                sets.append(f"{name} = ${param_idx}")
-                args.append(value)
-                param_idx += 1
-
-        if not sets:
-            async with self.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, endpoint_id, model_id, display_name, family,
-                           context_window, reasoning_level, enabled, capability,
-                           created_at
-                    FROM user_llm_endpoint_models
-                    WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-                    """,
-                    *args[:3],
-                )
-                return dict(row) if row else None
-
-        query = f"""
-            UPDATE user_llm_endpoint_models
-            SET {", ".join(sets)}
-            WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-            RETURNING id, endpoint_id, model_id, display_name, family,
-                      context_window, reasoning_level, enabled, capability,
-                      created_at
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(query, *args)
-            return dict(row) if row else None
-
-    async def delete_user_llm_endpoint_model(
-        self,
-        endpoint_id: str,
-        model_id: str,
-        user_id: str,
-        capability: str = "chat",
-    ) -> bool:
-        """Delete a model row from an endpoint.
-
-        ``capability`` selects which capability variant to delete; defaults
-        to 'chat' for back-compat with pre-capability callers.
-        """
-        owner = await self.get_user_llm_endpoint(endpoint_id, user_id)
-        if owner is None:
-            return False
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM user_llm_endpoint_models
-                WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-                """,
-                UUID(endpoint_id),
-                model_id,
-                capability,
-            )
-            return result == "DELETE 1"
-
-    async def resolve_user_llm_model(
-        self, user_id: str, model_id: str, capability: str = "chat"
-    ) -> Dict[str, Any] | None:
-        """Look up (endpoint + model) by (user_id, model_id, capability) for dispatch.
-
-        Returns a flat dict with the endpoint's base_url/api_key plus the
-        model row's metadata, or None if no match. Used by the registry
-        to resolve custom-endpoint models. Capability defaults to ``chat``
-        so existing callers routing through chat/completions keep working
-        unchanged; callers resolving embedding/vision/etc. pass explicitly.
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    e.id AS endpoint_id,
-                    e.label AS endpoint_label,
-                    e.base_url,
-                    e.api_key,
-                    m.model_id,
-                    m.display_name,
-                    m.family,
-                    m.context_window,
-                    m.reasoning_level,
-                    m.capability,
-                    m.enabled
-                FROM user_llm_endpoint_models m
-                JOIN user_llm_endpoints e ON e.id = m.endpoint_id
-                WHERE e.user_id = $1
-                  AND m.model_id = $2
-                  AND m.capability = $3
-                  AND m.enabled = TRUE
-                LIMIT 1
-                """,
-                UUID(user_id),
-                model_id,
-                capability,
-            )
-        if row is None:
-            return None
-        result = dict(row)
-        result["api_key"] = _decrypt_stored(
-            result.get("api_key"),
-            field=f"user_llm_endpoints[{result['endpoint_id']}].api_key",
-        )
-        return result
+    # The user-side endpoint-model accessors (create/update/delete/resolve)
+    # were removed when the admin-curated `models` catalog became the single
+    # source of truth. User-scoped endpoints survive as transports only;
+    # offerings are resolved via PostgresDB.resolve_catalog_model.
 
     # =========================================================================
     # SYSTEM API KEY OPERATIONS
@@ -3914,9 +3720,13 @@ class PostgresDB:
     # =========================================================================
 
     async def list_system_llm_endpoints(self) -> List[Dict[str, Any]]:
-        """List system-scoped endpoints with their model rows.
+        """List system-scoped endpoints (transport rows only).
 
-        API keys are never returned — only ``key_prefix`` for display.
+        API keys are never returned — only ``key_prefix`` for display. The
+        ``models`` key is kept on the response shape for Cockpit
+        compatibility but is always empty: model offerings live in the
+        admin-curated catalog (``models`` table) and are queried
+        independently via list_models.
         """
         async with self.acquire() as conn:
             endpoint_rows = await conn.fetch(
@@ -3927,77 +3737,7 @@ class PostgresDB:
                 ORDER BY label
                 """
             )
-            if not endpoint_rows:
-                return []
-
-            endpoint_ids = [r["id"] for r in endpoint_rows]
-            model_rows = await conn.fetch(
-                """
-                SELECT id, endpoint_id, model_id, display_name, family,
-                       context_window, reasoning_level, enabled, capability, created_at
-                FROM user_llm_endpoint_models
-                WHERE endpoint_id = ANY($1::uuid[])
-                ORDER BY endpoint_id, display_name
-                """,
-                endpoint_ids,
-            )
-
-        models_by_endpoint: Dict[Any, List[Dict[str, Any]]] = {}
-        for m in model_rows:
-            models_by_endpoint.setdefault(m["endpoint_id"], []).append(dict(m))
-
-        result = []
-        for e in endpoint_rows:
-            e_dict = dict(e)
-            e_dict["models"] = models_by_endpoint.get(e["id"], [])
-            result.append(e_dict)
-        return result
-
-    async def resolve_system_llm_model(
-        self, model_id: str, capability: str = "chat"
-    ) -> Dict[str, Any] | None:
-        """Look up a system-scoped (endpoint + model + capability) for dispatch.
-
-        Returns a flat dict with the endpoint's base_url/api_key plus the
-        model row's metadata, or None if no match. Registered as the
-        system-scope lookup in src/core/model_registry.py. Capability defaults
-        to ``chat`` to preserve existing chat-only resolution semantics;
-        embedding/vision/etc. resolvers pass the explicit value.
-        """
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    e.id AS endpoint_id,
-                    e.label AS endpoint_label,
-                    e.base_url,
-                    e.api_key,
-                    m.model_id,
-                    m.display_name,
-                    m.family,
-                    m.context_window,
-                    m.reasoning_level,
-                    m.capability,
-                    m.enabled
-                FROM user_llm_endpoint_models m
-                JOIN user_llm_endpoints e ON e.id = m.endpoint_id
-                WHERE e.user_id IS NULL
-                  AND m.model_id = $1
-                  AND m.capability = $2
-                  AND m.enabled = TRUE
-                LIMIT 1
-                """,
-                model_id,
-                capability,
-            )
-        if row is None:
-            return None
-        result = dict(row)
-        result["api_key"] = _decrypt_stored(
-            result.get("api_key"),
-            field=f"user_llm_endpoints[{result['endpoint_id']}].api_key",
-        )
-        return result
+        return [dict(e, models=[]) for e in endpoint_rows]
 
     async def get_system_llm_endpoint(self, endpoint_id: str) -> Dict[str, Any] | None:
         """Fetch a single system endpoint row (with decrypted api_key).
@@ -4118,212 +3858,271 @@ class PostgresDB:
             )
             return result == "DELETE 1"
 
-    async def create_system_llm_endpoint_model(
+    # The system endpoint-model accessors (create/update/delete/batch) and
+    # resolve_system_llm_model were removed when the admin-curated `models`
+    # catalog (below) became the single source of truth for offerings.
+    # System endpoints survive as transports; catalog rows reference them
+    # via provider_ref.
+
+    # =========================================================================
+    # MODELS CATALOG
+    # Admin-curated table of (model, role) offerings anchored to a transport
+    # (system_api_keys provider OR system-scoped user_llm_endpoints row).
+    # Reads feed every model picker (builder/session/job) and the resolver's
+    # catalog branch in src/core/model_registry.py.
+    # =========================================================================
+
+    _MODEL_FIELDS = (
+        "id, provider_kind, provider_ref, model_id, display_label, "
+        "role, family, context_window, reasoning_level, params_json, "
+        "enabled, seeded_from, notes, created_at, updated_at"
+    )
+
+    @staticmethod
+    def _row_to_model(row: Any) -> Dict[str, Any]:
+        """Normalize a models row: parse params_json from JSONB string."""
+        d = dict(row)
+        params = d.get("params_json")
+        if isinstance(params, str):
+            d["params_json"] = json.loads(params)
+        return d
+
+    async def list_models(
         self,
-        endpoint_id: str,
-        model_id: str,
-        display_name: str,
-        family: str | None = None,
-        context_window: int | None = None,
-        reasoning_level: str | None = None,
-        enabled: bool = True,
-        capability: str = "chat",
-    ) -> Dict[str, Any] | None:
-        """Add a model row to a system endpoint.
+        *,
+        role: str | None = None,
+        provider_kind: str | None = None,
+        provider_ref: str | None = None,
+        enabled_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List catalog rows with optional filters."""
+        clauses: list[str] = []
+        args: list[Any] = []
+        idx = 1
+        if role is not None:
+            clauses.append(f"role = ${idx}")
+            args.append(role)
+            idx += 1
+        if provider_kind is not None:
+            clauses.append(f"provider_kind = ${idx}")
+            args.append(provider_kind)
+            idx += 1
+        if provider_ref is not None:
+            clauses.append(f"provider_ref = ${idx}")
+            args.append(provider_ref)
+            idx += 1
+        if enabled_only:
+            clauses.append("enabled = TRUE")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {self._MODEL_FIELDS} FROM models {where} "
+                "ORDER BY provider_kind, provider_ref, role, display_label",
+                *args,
+            )
+        return [self._row_to_model(r) for r in rows]
 
-        Returns None if the endpoint does not exist or is user-scoped.
-        Raises asyncpg.UniqueViolationError on duplicate
-        (endpoint_id, model_id, capability).
-        """
-        owner = await self.get_system_llm_endpoint(endpoint_id)
-        if owner is None:
-            return None
-
+    async def get_model(self, model_id: str) -> Dict[str, Any] | None:
+        """Fetch a single catalog row by primary key (UUID)."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
-                INSERT INTO user_llm_endpoint_models
-                    (endpoint_id, model_id, display_name, family,
-                     context_window, reasoning_level, enabled, capability)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id, endpoint_id, model_id, display_name, family,
-                          context_window, reasoning_level, enabled, capability,
-                          created_at
+                f"SELECT {self._MODEL_FIELDS} FROM models WHERE id = $1",
+                UUID(model_id),
+            )
+        return self._row_to_model(row) if row else None
+
+    async def create_model(
+        self,
+        *,
+        provider_kind: str,
+        provider_ref: str,
+        model_id: str,
+        display_label: str,
+        role: str,
+        family: str,
+        context_window: int | None = None,
+        reasoning_level: str | None = None,
+        params_json: Dict[str, Any] | None = None,
+        enabled: bool = True,
+        seeded_from: str | None = None,
+        notes: str | None = None,
+        on_conflict_do_nothing: bool = False,
+    ) -> Dict[str, Any] | None:
+        """Insert a catalog row.
+
+        ``context_window=0`` and ``params_json={"temperature": 0}`` round-trip
+        as themselves — only literal ``None`` is treated as "use default"
+        (LiteLLM #14661 hazard).
+
+        When ``on_conflict_do_nothing`` is True and a row already exists for
+        ``(provider_kind, provider_ref, model_id, role)``, returns None so
+        the seed pipeline can count "newly inserted" cleanly.
+        """
+        on_conflict = (
+            "ON CONFLICT (provider_kind, provider_ref, model_id, role) DO NOTHING"
+            if on_conflict_do_nothing
+            else ""
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                INSERT INTO models
+                    (provider_kind, provider_ref, model_id, display_label,
+                     role, family, context_window, reasoning_level,
+                     params_json, enabled, seeded_from, notes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                {on_conflict}
+                RETURNING {self._MODEL_FIELDS}
                 """,
-                UUID(endpoint_id),
+                provider_kind,
+                provider_ref,
                 model_id,
-                display_name,
+                display_label,
+                role,
                 family,
                 context_window,
                 reasoning_level,
+                json.dumps(params_json) if params_json is not None else None,
                 enabled,
-                capability,
+                seeded_from,
+                notes,
             )
-            return dict(row)
+        return self._row_to_model(row) if row else None
 
-    async def update_system_llm_endpoint_model(
-        self,
-        endpoint_id: str,
-        model_id: str,
-        display_name: str | None = None,
-        family: str | None = None,
-        context_window: int | None = None,
-        reasoning_level: str | None = None,
-        enabled: bool | None = None,
-        capability: str = "chat",
-    ) -> Dict[str, Any] | None:
-        """Patch a system endpoint model row. Only non-None fields are updated.
+    async def update_model(self, model_id: str, **fields: Any) -> Dict[str, Any] | None:
+        """Patch a catalog row. Only keys present in ``fields`` are updated.
 
-        ``capability`` is a WHERE-selector for disambiguating model rows that
-        share a model_id across different capability slots; defaults to
-        'chat' so pre-capability callers keep working unchanged.
+        Pass ``context_window=0`` or ``params_json={...}`` to set those values
+        explicitly; pass ``None`` to write a SQL NULL (resets to default).
+        Use a sentinel-free pattern: only the keys the caller passes are
+        considered for the UPDATE.
         """
-        owner = await self.get_system_llm_endpoint(endpoint_id)
-        if owner is None:
-            return None
-
-        sets: List[str] = []
-        args: List[Any] = [UUID(endpoint_id), model_id, capability]
-        param_idx = 4
-        for name, value in (
-            ("display_name", display_name),
-            ("family", family),
-            ("context_window", context_window),
-            ("reasoning_level", reasoning_level),
-            ("enabled", enabled),
-        ):
-            if value is not None:
-                sets.append(f"{name} = ${param_idx}")
+        allowed = {
+            "provider_kind",
+            "provider_ref",
+            "model_id",
+            "display_label",
+            "role",
+            "family",
+            "context_window",
+            "reasoning_level",
+            "params_json",
+            "enabled",
+            "notes",
+        }
+        sets: list[str] = []
+        args: list[Any] = [UUID(model_id)]
+        idx = 2
+        for name, value in fields.items():
+            if name not in allowed:
+                continue
+            sets.append(f"{name} = ${idx}")
+            if name == "params_json" and value is not None:
+                args.append(json.dumps(value))
+            else:
                 args.append(value)
-                param_idx += 1
-
+            idx += 1
         if not sets:
-            async with self.acquire() as conn:
-                row = await conn.fetchrow(
-                    """
-                    SELECT id, endpoint_id, model_id, display_name, family,
-                           context_window, reasoning_level, enabled, capability,
-                           created_at
-                    FROM user_llm_endpoint_models
-                    WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-                    """,
-                    *args[:3],
-                )
-                return dict(row) if row else None
-
-        query = f"""
-            UPDATE user_llm_endpoint_models
-            SET {", ".join(sets)}
-            WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-            RETURNING id, endpoint_id, model_id, display_name, family,
-                      context_window, reasoning_level, enabled, capability,
-                      created_at
-        """
+            return await self.get_model(model_id)
+        sets.append("updated_at = CURRENT_TIMESTAMP")
         async with self.acquire() as conn:
-            row = await conn.fetchrow(query, *args)
-            return dict(row) if row else None
+            row = await conn.fetchrow(
+                f"UPDATE models SET {', '.join(sets)} WHERE id = $1 "
+                f"RETURNING {self._MODEL_FIELDS}",
+                *args,
+            )
+        return self._row_to_model(row) if row else None
 
-    async def delete_system_llm_endpoint_model(
-        self, endpoint_id: str, model_id: str, capability: str = "chat"
-    ) -> bool:
-        """Delete a model row from a system endpoint.
-
-        ``capability`` selects which capability variant to remove; defaults
-        to 'chat' for back-compat with pre-capability callers.
-        """
-        owner = await self.get_system_llm_endpoint(endpoint_id)
-        if owner is None:
-            return False
+    async def delete_model(self, model_id: str) -> bool:
+        """Hard-delete a catalog row. Callers warn on referenced rows."""
         async with self.acquire() as conn:
             result = await conn.execute(
-                """
-                DELETE FROM user_llm_endpoint_models
-                WHERE endpoint_id = $1 AND model_id = $2 AND capability = $3
-                """,
-                UUID(endpoint_id),
-                model_id,
-                capability,
+                "DELETE FROM models WHERE id = $1", UUID(model_id)
             )
-            return result == "DELETE 1"
+        return result == "DELETE 1"
 
-    async def batch_create_endpoint_models(
-        self,
-        endpoint_id: str,
-        models: list[Dict[str, Any]],
-        *,
-        skip_duplicates: bool = True,
-    ) -> Dict[str, Any]:
-        """Insert multiple model rows under an endpoint in one transaction.
+    async def resolve_catalog_model(
+        self, model_id: str, *, role: str = "chat"
+    ) -> Dict[str, Any] | None:
+        """Resolve a catalog row to a flat dict carrying the transport.
 
-        The caller is responsible for authorizing access to the endpoint —
-        this helper is shared by the user-scoped and admin discovery-import
-        handlers, each of which performs its own ownership check before
-        calling in.
+        JOINs the models row to its anchor:
+        - ``provider_kind='endpoint'`` → ``user_llm_endpoints`` row supplies
+          ``base_url`` and ``api_key`` (decrypted inline).
+        - ``provider_kind='system'`` → ``system_api_keys`` row supplies
+          ``api_key`` (decrypted inline); ``base_url`` is left None so the
+          dispatcher falls through to the provider's hardcoded base URL.
 
-        Each entry in ``models`` is a dict with keys:
-            model_id (required)
-            display_name (required)
-            family, context_window, reasoning_level, enabled (optional)
-            capability (optional; defaults to 'chat')
-
-        When ``skip_duplicates`` is True, rows whose
-        (endpoint_id, model_id, capability) already exist are silently
-        dropped and their ``model_id``s go into the returned ``skipped``
-        list. When False, the first duplicate aborts the transaction and
-        ``asyncpg.UniqueViolationError`` propagates to the caller.
-
-        Returns ``{created: int, skipped: list[str], created_ids: list[str]}``.
+        When multiple rows match (same ``model_id`` under both a system
+        provider and an endpoint), the system row wins — direct beats gateway.
         """
-        skipped: list[str] = []
-        created_ids: list[str] = []
-
         async with self.acquire() as conn:
-            existing_keys: set[tuple[str, str]] = set()
-            if skip_duplicates:
-                rows = await conn.fetch(
-                    """
-                    SELECT model_id, capability
-                    FROM user_llm_endpoint_models
-                    WHERE endpoint_id = $1
-                    """,
-                    UUID(endpoint_id),
-                )
-                existing_keys = {(r["model_id"], r["capability"]) for r in rows}
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    m.id AS catalog_id,
+                    m.provider_kind,
+                    m.provider_ref,
+                    m.model_id,
+                    m.display_label,
+                    m.role,
+                    m.family,
+                    m.context_window,
+                    m.reasoning_level,
+                    m.params_json,
+                    m.enabled,
+                    ska.api_key  AS system_api_key,
+                    ule.id       AS endpoint_id,
+                    ule.label    AS endpoint_label,
+                    ule.base_url AS endpoint_base_url,
+                    ule.api_key  AS endpoint_api_key
+                FROM models m
+                LEFT JOIN system_api_keys ska
+                    ON m.provider_kind = 'system' AND m.provider_ref = ska.provider
+                LEFT JOIN user_llm_endpoints ule
+                    ON m.provider_kind = 'endpoint'
+                   AND m.provider_ref = ule.id::text
+                   AND ule.user_id IS NULL
+                WHERE m.model_id = $1
+                  AND m.role = $2
+                  AND m.enabled = TRUE
+                ORDER BY (m.provider_kind = 'system') DESC, m.created_at ASC
+                LIMIT 1
+                """,
+                model_id,
+                role,
+            )
+        if row is None:
+            return None
+        result = self._row_to_model(row)
+        if result.get("provider_kind") == "system":
+            result["api_key"] = _decrypt_stored(
+                result.pop("system_api_key", None),
+                field=f"system_api_keys[{result['provider_ref']}]",
+            )
+            result.pop("endpoint_api_key", None)
+        else:
+            result["api_key"] = _decrypt_stored(
+                result.pop("endpoint_api_key", None),
+                field=f"user_llm_endpoints[{result.get('endpoint_id')}].api_key",
+            )
+            result.pop("system_api_key", None)
+        return result
 
-            async with conn.transaction():
-                for entry in models:
-                    model_id = entry["model_id"]
-                    capability = entry.get("capability", "chat")
-                    if skip_duplicates and (model_id, capability) in existing_keys:
-                        skipped.append(model_id)
-                        continue
-                    new_id = await conn.fetchval(
-                        """
-                        INSERT INTO user_llm_endpoint_models
-                            (endpoint_id, model_id, display_name, family,
-                             context_window, reasoning_level, enabled, capability)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                        RETURNING id
-                        """,
-                        UUID(endpoint_id),
-                        model_id,
-                        entry["display_name"],
-                        entry.get("family"),
-                        entry.get("context_window"),
-                        entry.get("reasoning_level"),
-                        entry.get("enabled", True),
-                        capability,
-                    )
-                    created_ids.append(str(new_id))
-                    # Track within-batch dupes so the same (id, cap) listed
-                    # twice in one payload still trips skip_duplicates.
-                    existing_keys.add((model_id, capability))
+    async def list_models_by_role_alphabetical(self, role: str) -> List[Dict[str, Any]]:
+        """Enabled catalog rows for ``role``, sorted by display_label.
 
-        return {
-            "created": len(created_ids),
-            "skipped": skipped,
-            "created_ids": created_ids,
-        }
+        Powers the "first-enabled-alphabetical" fallback used by the default-
+        model resolver when no admin pin (or a dangling pin) is set.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {self._MODEL_FIELDS} FROM models "
+                "WHERE role = $1 AND enabled = TRUE "
+                "ORDER BY display_label ASC, created_at ASC",
+                role,
+            )
+        return [self._row_to_model(r) for r in rows]
 
     # =========================================================================
     # DEFAULT LLM MODEL HELPERS
@@ -4368,6 +4167,38 @@ class PostgresDB:
             await self.delete_system_setting(key)
             return
         await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
+
+    # Catalog roles that support a "first-enabled-alphabetical" fallback when
+    # the admin pin is missing or dangling. Other kinds (whisper, tts) have no
+    # catalog presence in v1, so they pass through unchanged.
+    _CATALOG_ROLES = frozenset({"chat", "auxiliary", "embedding", "vision"})
+
+    async def resolve_default_for_role(self, kind: str) -> str | None:
+        """Resolve the effective default model ID for a role.
+
+        Behavior:
+        - Reads the admin pin via ``get_default_llm_model(kind)``.
+        - For catalog-supported roles, the pin is validated against
+          ``resolve_catalog_model``. A pin pointing at a missing or
+          ``enabled=false`` row is treated as absent, and the first
+          enabled catalog row for the role (sorted alphabetically by
+          ``display_label``) is returned instead.
+        - For non-catalog kinds (``whisper``, ``tts``), the pin is
+          returned verbatim — there's nothing to validate against in v1.
+        - Returns ``None`` only when no pin exists AND no enabled catalog
+          row is available.
+        """
+        pinned = await self.get_default_llm_model(kind)
+        if kind not in self._CATALOG_ROLES:
+            return pinned
+        if pinned:
+            catalog_row = await self.resolve_catalog_model(pinned, role=kind)
+            if catalog_row is not None and catalog_row.get("enabled"):
+                return pinned
+        candidates = await self.list_models_by_role_alphabetical(kind)
+        if candidates:
+            return candidates[0]["model_id"]
+        return None
 
     # =========================================================================
     # USER SETTINGS OPERATIONS
