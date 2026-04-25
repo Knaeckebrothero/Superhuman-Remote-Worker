@@ -25,7 +25,7 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-68a1c8b
+    tag: sha-9b1d478
   agent:
     tag: sha-68a1c8b
   cockpit:
@@ -102,7 +102,6 @@ nextcloud:
 # -----------------------------------------------------------------------------
 headscale:
   url: "https://headscale.h4ll.app"
-
 # Agent tailscale sidecar — joins the headscale tailnet for SSH to KubeVirt
 # VMs. Disable to skip the sidecar entirely (e.g. when VM workspaces aren't
 # in use or headscale is offline).
