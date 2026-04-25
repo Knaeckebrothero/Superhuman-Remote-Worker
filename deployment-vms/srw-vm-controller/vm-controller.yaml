@@ -216,7 +216,7 @@ spec:
               value: "20Gi"
             # Headscale mesh VPN (auth key generation for VMs)
             - name: HEADSCALE_URL
-              value: "https://headscale.superhuman-remote-worker.com"
+              value: "https://headscale.h4ll.app"
             - name: HEADSCALE_API_KEY
               valueFrom:
                 secretKeyRef:

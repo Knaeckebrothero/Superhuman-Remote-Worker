@@ -285,7 +285,6 @@ def _build_job_manifest(self, job_id, config_name, image, resources, timeout):
         "OPENROUTER_API_KEY", "GOOGLE_API_KEY", "TAVILY_API_KEY",
         "SEMANTIC_SCHOLAR_API_KEY", "VISION_API_KEY", "WHISPER_API_KEY",
         "CITATION_EMBEDDING_KEY", "EMBEDDING_API_KEY", "NEO4J_PASSWORD",
-        "CLAUDE_CODE_OAUTH_TOKEN",
     ]
 
     env = [

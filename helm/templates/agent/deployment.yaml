@@ -266,12 +266,6 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEO4J_PASSWORD
                   optional: true
-            # Claude Code CLI auth
-            - name: CLAUDE_CODE_OAUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: CLAUDE_CODE_OAUTH_TOKEN
             # Workstation API (embeddings, vision)
             - name: WORKSTATION_BASE_URL
               valueFrom:

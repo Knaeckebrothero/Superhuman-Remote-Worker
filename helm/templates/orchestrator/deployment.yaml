@@ -552,6 +552,19 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: PERSISTENT_AGENT_IMAGE
                   optional: true
+            # Agent tailscale sidecar gate (consumed by AgentProvisioner)
+            - name: AGENT_TAILSCALE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AGENT_TAILSCALE_ENABLED
+                  optional: true
+            - name: HEADSCALE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: HEADSCALE_URL
+                  optional: true
             # Codex OAuth Proxy
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"

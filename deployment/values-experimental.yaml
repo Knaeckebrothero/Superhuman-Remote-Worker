@@ -94,12 +94,21 @@ nextcloud:
 #     externalUrl: ""
 
 # -----------------------------------------------------------------------------
-# Headscale — NOT managed by the chart on this cluster.
-# Lives in its own `headscale` namespace, deployed out of band. Leave disabled
-# here so Fleet doesn't try to create a duplicate in the srw namespace.
+# Headscale — consumed as an external service. The headscale server is
+# deployed out of band by the homelab Fleet bundle in
+# HomeLab/deployments_managed/headscale/ (its own namespace, its own release
+# lifecycle). We only need the URL here; the agent pre-auth key comes from
+# Vault as TAILSCALE_AUTH_KEY in the srw secret.
 # -----------------------------------------------------------------------------
 headscale:
-  enabled: false
+  url: "https://headscale.h4ll.app"
+
+# Agent tailscale sidecar — joins the headscale tailnet for SSH to KubeVirt
+# VMs. Disable to skip the sidecar entirely (e.g. when VM workspaces aren't
+# in use or headscale is offline).
+agent:
+  tailscale:
+    enabled: true
 # -----------------------------------------------------------------------------
 # Email — routed through the shared ProtonMail Bridge in `protonmail-bridge` ns.
 # SMTP_USER / SMTP_PASSWORD come from Vault (srw-secrets). The bridgeCert init

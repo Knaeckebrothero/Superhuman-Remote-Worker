@@ -186,7 +186,11 @@ Falls back to externalUrl if externalServiceUrl is not set.
 {{- end }}
 
 {{- define "srw.headscaleUrl" -}}
+{{- if .Values.headscale.url }}
+{{- .Values.headscale.url }}
+{{- else }}
 {{- printf "https://headscale.%s" .Values.global.domain }}
+{{- end }}
 {{- end }}
 
 {{- define "srw.neo4jBoltHost" -}}
