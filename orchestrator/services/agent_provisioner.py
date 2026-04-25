@@ -891,9 +891,7 @@ class AgentProvisioner:
                         },
                         {
                             "name": "POD_NAME",
-                            "valueFrom": {
-                                "fieldRef": {"fieldPath": "metadata.name"}
-                            },
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
                         },
                     ],
                     "volumeMounts": [
