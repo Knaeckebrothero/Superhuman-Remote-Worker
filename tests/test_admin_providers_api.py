@@ -104,10 +104,11 @@ class TestDefaultModelKinds:
         # Non-chat slots added with the capability extension.
         assert {"embedding", "vision", "auxiliary"}.issubset(VALID_DEFAULT_MODEL_KINDS)
 
-    def test_whisper_is_not_a_system_default(self):
-        # Env-var path in audio_helper still covers whisper; no admin demand
-        # for cluster-wide override. Revisit when a consumer appears.
-        assert "whisper" not in VALID_DEFAULT_MODEL_KINDS
+    def test_audio_capability_kinds_present(self):
+        # Whisper + TTS join the cluster-wide-default set so admins can pin
+        # an audio model without each user setting their own preference.
+        # Dispatch injects WHISPER_*/TTS_* env vars for the agent at job-start.
+        assert {"whisper", "tts"}.issubset(VALID_DEFAULT_MODEL_KINDS)
 
 
 # ---------------------------------------------------------------------------

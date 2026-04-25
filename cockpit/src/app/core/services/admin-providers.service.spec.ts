@@ -217,5 +217,45 @@ describe('AdminProvidersService', () => {
         {model: 'qwen3-embedding-8b'},
       );
     });
+
+    it('PUTs a whisper default', () => {
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn().mockReturnValue(of({kind: 'whisper', model: 'whisper-large-v3'})),
+        post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.setDefault('whisper', 'whisper-large-v3').subscribe();
+      expect(http.put).toHaveBeenCalledWith(
+        expect.stringContaining('/admin/providers/defaults/whisper'),
+        {model: 'whisper-large-v3'},
+      );
+    });
+
+    it('PUTs a tts default', () => {
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn().mockReturnValue(of({kind: 'tts', model: 'tts-1'})),
+        post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.setDefault('tts', 'tts-1').subscribe();
+      expect(http.put).toHaveBeenCalledWith(
+        expect.stringContaining('/admin/providers/defaults/tts'),
+        {model: 'tts-1'},
+      );
+    });
+
+    it('exposes whisper and tts in EMPTY_DEFAULTS shape', () => {
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.loadDefaults();
+      // New slots default to null when the server omits them.
+      expect(service.defaults().whisper).toBeNull();
+      expect(service.defaults().tts).toBeNull();
+    });
   });
 });

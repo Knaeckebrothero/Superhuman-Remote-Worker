@@ -171,11 +171,10 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: COCKPIT_EXTERNAL_URL
             # Instruction Builder
-            - name: BUILDER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: BUILDER_API_KEY
+            # BUILDER_API_KEY removed — _create_builder_llm now resolves the
+            # provider key from system_api_keys (seeded via the llm-seed-job).
+            # See docs/api_key_resolution.md for the wire-format vs config-source
+            # split.
             # BUILDER_MODEL removed — resolved from system_settings
             # ('llm.default_builder_model') at request time.
             - name: BUILDER_LLM_PROVIDER

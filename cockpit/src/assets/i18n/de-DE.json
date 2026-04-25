@@ -289,7 +289,8 @@
           "vision": "Vision",
           "embedding": "Embedding",
           "auxiliary": "Hilfsmodell",
-          "whisper": "Whisper"
+          "whisper": "Whisper",
+          "tts": "Sprachsynthese"
         }
       },
       "defaults": {
@@ -304,7 +305,9 @@
           "citation": "Zitationsengine",
           "embedding": "Embedding (Memory / Zitationsvektoren)",
           "vision": "Vision (Bildbeschreibung)",
-          "auxiliary": "Hilfsmodell (Memory-Extraktion / Kuration / Titel)"
+          "auxiliary": "Hilfsmodell (Memory-Extraktion / Kuration / Titel)",
+          "whisper": "Whisper (Spracherkennung)",
+          "tts": "Sprachsynthese"
         }
       }
     }

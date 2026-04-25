@@ -43,7 +43,9 @@ export type DefaultModelKind =
   | 'citation'
   | 'embedding'
   | 'vision'
-  | 'auxiliary';
+  | 'auxiliary'
+  | 'whisper'
+  | 'tts';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'builder',
@@ -52,6 +54,8 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
   'embedding',
   'vision',
   'auxiliary',
+  'whisper',
+  'tts',
 ];
 
 const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
@@ -61,6 +65,8 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
   embedding: null,
   vision: null,
   auxiliary: null,
+  whisper: null,
+  tts: null,
 };
 
 /**

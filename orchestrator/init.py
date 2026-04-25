@@ -276,6 +276,14 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
 
+        # Seed system_api_keys from SEED_*_API_KEY env vars (idempotent;
+        # mirrors the helm seeder Job)
+        await _seed_llm_keys_from_env(db)
+
+        # When OpenRouter is the available gateway, pin sensible defaults for
+        # auxiliary + embedding slots that would otherwise be empty
+        await _apply_openrouter_defaults(db)
+
         # Backfill Nextcloud cloud folders for existing projects
         await _backfill_cloud_folders(db)
 
@@ -792,6 +800,103 @@ async def _seed_default_datasources(db) -> None:
         logger.info(
             "  No default datasources configured (DEFAULT_DS_* env vars not set)"
         )
+
+
+# =============================================================================
+# LLM API Key Seeding (mirrors helm/templates/orchestrator/llm-seed-job.yaml)
+# =============================================================================
+
+
+# Providers seeded from SEED_*_API_KEY env vars. Stays in sync with
+# orchestrator.main.VALID_SYSTEM_API_KEY_PROVIDERS minus the legacy
+# "vision" slot (vision keys ride along on a per-endpoint inline api_key
+# now). Inlined here rather than imported from main.py because importing
+# main.py at runtime triggers a fresh ``load_dotenv()`` that would undo
+# any test-time ``monkeypatch.delenv`` calls.
+_SEEDABLE_PROVIDERS = (
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "tavily",
+)
+
+
+async def _seed_llm_keys_from_env(db) -> None:
+    """Seed system_api_keys from SEED_<PROVIDER>_API_KEY env vars on first boot.
+
+    Mirrors the helm seeder Job so local dev with ``python init.py`` and a
+    ``.env`` file gets the same insert-only behavior. After first run,
+    rotating keys via Admin → Providers is never clobbered — re-runs report
+    all entries as "skipped" and exit clean.
+
+    Env var shape: ``SEED_OPENAI_API_KEY``, ``SEED_ANTHROPIC_API_KEY``, …
+    one per provider in ``_SEEDABLE_PROVIDERS``.
+    """
+    try:
+        from orchestrator.seed.llm_config import seed as llm_seed
+    except ImportError as e:
+        logger.warning(f"  Could not import seed.llm_config: {e}")
+        return
+
+    entries = []
+    for provider in _SEEDABLE_PROVIDERS:
+        env_name = f"SEED_{provider.upper()}_API_KEY"
+        if os.environ.get(env_name):
+            entries.append(
+                {
+                    "provider": provider,
+                    "apiKeyEnv": env_name,
+                    "label": f"Seeded from {env_name} at init.",
+                }
+            )
+
+    if not entries:
+        logger.info("  No SEED_*_API_KEY env vars set — skipping LLM key seed")
+        return
+
+    report = await llm_seed(db, {"systemApiKeys": entries})
+    if report.api_keys_seeded:
+        logger.info(f"  Seeded system_api_keys: {', '.join(report.api_keys_seeded)}")
+    if report.api_keys_skipped:
+        logger.info(
+            f"  Skipped existing system_api_keys: {', '.join(report.api_keys_skipped)}"
+        )
+
+
+async def _apply_openrouter_defaults(db) -> None:
+    """When OpenRouter is the seeded fallback, pin OpenRouter-routed models
+    as the cluster-wide defaults for slots without one already configured.
+
+    Rationale: OpenRouter is a single-key gateway for many provider stacks
+    (chat + embedding routes). When an admin only seeds an OpenRouter key,
+    the auxiliary and embedding slots would otherwise be empty and the
+    relevant features (memory extraction, recall search) would fail at
+    first use. Pinning a reasonable default removes the friction. Admins
+    override via Admin → Defaults; this step never clobbers an existing
+    default — it only fills empty slots.
+    """
+    openrouter_key = await db.get_system_api_key("openrouter")
+    if not openrouter_key:
+        return
+
+    # Conservative picks — fast, widely-available routes. Override via
+    # Admin → Defaults if a different model fits the workload better.
+    fallbacks = {
+        "auxiliary": "openrouter/google/gemini-2.5-flash",
+        "embedding": "openrouter/openai/text-embedding-3-large",
+    }
+
+    for kind, model in fallbacks.items():
+        existing = await db.get_default_llm_model(kind)
+        if existing:
+            logger.info(
+                f"  Default {kind} model already set ({existing}) — leaving alone"
+            )
+            continue
+        await db.set_default_llm_model(kind, model)
+        logger.info(f"  Pinned default {kind} model: {model} (openrouter fallback)")
 
 
 # =============================================================================
