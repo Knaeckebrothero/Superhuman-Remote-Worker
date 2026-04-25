@@ -74,7 +74,14 @@ class TestCatalogRoutesRegistered:
 
 class TestCatalogConstants:
     def test_role_enum_locked(self):
-        assert VALID_CATALOG_ROLES == ("chat", "auxiliary", "embedding", "vision")
+        assert VALID_CATALOG_ROLES == (
+            "chat",
+            "auxiliary",
+            "embedding",
+            "vision",
+            "whisper",
+            "tts",
+        )
 
     def test_provider_kinds_locked(self):
         assert VALID_CATALOG_PROVIDER_KINDS == ("system", "endpoint")

@@ -275,7 +275,7 @@ CREATE TABLE IF NOT EXISTS models (
     provider_ref TEXT NOT NULL,
     model_id TEXT NOT NULL,
     display_label TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision')),
+    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts')),
     family TEXT NOT NULL,
     context_window INT,
     reasoning_level TEXT,
@@ -293,6 +293,16 @@ CREATE INDEX IF NOT EXISTS idx_models_role_enabled
     ON models(role) WHERE enabled = TRUE;
 CREATE INDEX IF NOT EXISTS idx_models_provider
     ON models(provider_kind, provider_ref);
+
+-- Migration: widen models.role CHECK to include whisper/tts (catalog v1.1).
+-- Drops the implicit constraint name Postgres assigns to the inline CHECK and
+-- re-creates it with the wider set. Idempotent on fresh installs (no-op when
+-- the new constraint is already in place).
+DO $$ BEGIN
+    ALTER TABLE models DROP CONSTRAINT IF EXISTS models_role_check;
+    ALTER TABLE models ADD CONSTRAINT models_role_check
+        CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts'));
+END $$;
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE

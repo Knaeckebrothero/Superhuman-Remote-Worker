@@ -278,12 +278,14 @@ export interface LlmEndpointDiscoveryResult {
 // =============================================================================
 
 /** Locked enum for catalog rows. Adding a role requires schema + resolver work. */
-export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision';
+export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
-export const CATALOG_ROLES: CatalogRole[] = ['chat', 'auxiliary', 'embedding', 'vision'];
+export const CATALOG_ROLES: CatalogRole[] = [
+  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
+];
 
 /**
  * A row in the admin-curated `models` table. Mirrors orchestrator
