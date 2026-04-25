@@ -11,7 +11,7 @@ metadata:
     {{- include "srw.componentLabels" (dict "context" . "component" "reloader") | nindent 4 }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   name: {{ include "srw.fullname" . }}-reloader
   labels:
@@ -25,7 +25,7 @@ rules:
     verbs: ["list", "get", "watch", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
   name: {{ include "srw.fullname" . }}-reloader
   labels:
@@ -36,7 +36,7 @@ subjects:
     namespace: {{ .Release.Namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
+  kind: ClusterRole
   name: {{ include "srw.fullname" . }}-reloader
 ---
 apiVersion: apps/v1
@@ -65,12 +65,6 @@ spec:
           image: {{ .Values.reloader.image }}
           args:
             - --reload-strategy=annotations
-            - --namespaces-to-watch=$(POD_NAMESPACE)
-          env:
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
           resources:
             {{- toYaml .Values.reloader.resources | nindent 12 }}
 {{- end }}
