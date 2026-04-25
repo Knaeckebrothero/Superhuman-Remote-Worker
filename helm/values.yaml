@@ -517,6 +517,12 @@ llm:
     #       - id: "qwen3-embedding-8b"
     #         displayName: "Qwen3 Embedding 8B"
     #         capability: embedding
+    #       - id: "whisper-large-v3"
+    #         displayName: "Whisper Large v3"
+    #         capability: whisper
+    #       - id: "kokoro-tts"
+    #         displayName: "Kokoro TTS"
+    #         capability: tts
     systemEndpoints: []
 
     # -- Resource requests for the short-lived seed Job pod.

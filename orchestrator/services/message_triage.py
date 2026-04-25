@@ -9,22 +9,16 @@ endpoint, and system API key that drive the instruction-builder chat. Falls
 back to ``queue`` on any failure, since triage is advisory and never blocks
 delivery.
 
-Resolution order (mirrors ``services.builder_tools``):
-
-1. ``db.get_default_llm_model('builder')`` → registry-resolved base URL +
-   ``system_api_keys[provider]``.
-2. Env vars (``AUXILIARY_MODEL`` / ``TRIAGE_MODEL``, ``LLM_BASE_URL``,
-   ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / ``GROQ_API_KEY``) as a legacy
-   fallback for agents that have not been routed through the orchestrator's
-   DB-backed config.
+Resolution: ``db.get_default_llm_model('builder')`` → registry-resolved base
+URL + ``system_api_keys[provider]``. When the DB lookup yields nothing the
+caller falls back to ``queue`` — the env-var legacy path was removed once
+all call sites started passing ``db=postgres_db``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import warnings
 
 import httpx
 
@@ -73,7 +67,7 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
     """Pull model, base_url, and api_key from the DB-backed config.
 
     Returns None when the DB has no default configured or no usable key —
-    the caller falls back to env-var resolution.
+    the caller treats that as ``triage unavailable`` and queues the message.
     """
     if db is None:
         return None
@@ -112,30 +106,6 @@ async def _resolve_triage_config(db) -> tuple[str, str, str] | None:
     return model, base_url, api_key
 
 
-def _resolve_from_env() -> tuple[str, str, str] | None:
-    """Legacy env-var fallback. Emits a deprecation warning on hit."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        for var in ("ANTHROPIC_API_KEY", "GROQ_API_KEY"):
-            api_key = os.getenv(var, "")
-            if api_key:
-                break
-    if not api_key:
-        return None
-
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-    model = os.getenv("AUXILIARY_MODEL", os.getenv("TRIAGE_MODEL", "gpt-4o-mini"))
-
-    warnings.warn(
-        "message_triage falling back to env-var LLM config — configure a "
-        "default builder model via Admin → Providers so the DB-backed path "
-        "is used instead.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-    return model, base_url, api_key
-
-
 async def triage_message(
     message: str,
     job_status: str,
@@ -150,8 +120,9 @@ async def triage_message(
         job_status: Current job status (e.g., "processing")
         job_description: Job description for context
         phase_number: Current phase number (optional)
-        db: Optional ``PostgresDB`` for registry-backed config resolution.
-            When omitted, falls back to env vars.
+        db: ``PostgresDB`` handle for registry-backed config resolution.
+            When omitted (or when DB lookup yields no default), the
+            message is queued — the env-var legacy path was removed.
 
     Returns:
         Dict with "action" ("interrupt" or "queue") and "reason".
@@ -160,8 +131,6 @@ async def triage_message(
     fallback = {"action": "queue", "reason": "triage unavailable"}
 
     resolved = await _resolve_triage_config(db)
-    if resolved is None:
-        resolved = _resolve_from_env()
     if resolved is None:
         logger.debug("No LLM config available for message triage — defaulting to queue")
         return fallback

@@ -21,6 +21,8 @@ from typing import Any
 
 import httpx
 
+from src.core.model_registry import family_of
+
 
 @dataclass
 class ProbeResult:
@@ -48,6 +50,8 @@ def _capability_hint(model_id: str) -> str:
     name = model_id.lower()
     if "whisper" in name:
         return "whisper"
+    if "tts" in name or name.endswith("-speech") or "text-to-speech" in name:
+        return "tts"
     if "embed" in name or name.endswith("-embedding") or "rerank" in name:
         # rerank has no dedicated slot today; surfacing as 'embedding' keeps
         # it out of the chat catalog until we have a rerank consumer.
@@ -119,18 +123,39 @@ async def probe_endpoint_models(
         if isinstance(item, str):
             model_id = item
             owned_by = None
+            context_window = None
         elif isinstance(item, dict):
             model_id = item.get("id") or item.get("name")
             owned_by = item.get("owned_by") or item.get("owner")
+            # vLLM reports max_model_len; some Ollama/llama.cpp forks expose
+            # context_length. Both name the same thing — the model's max
+            # context in tokens. Fall back to None for servers that omit it.
+            raw_ctx = item.get("max_model_len") or item.get("context_length")
+            try:
+                context_window = int(raw_ctx) if raw_ctx is not None else None
+            except (TypeError, ValueError):
+                context_window = None
+            # The pydantic ge=1000 constraint on import would reject tiny
+            # values; drop them here so a partial pre-fill still validates.
+            if context_window is not None and context_window < 1000:
+                context_window = None
         else:
             continue
         if not model_id:
             continue
+        # Infer family from the model_id (gemma-4-31b → "gemma", gpt-oss-20b →
+        # "gpt-oss"). family_of returns "default" on miss; surface that as
+        # None so the runtime settings_matrix fallback kicks in instead of
+        # locking the row to the literal "default" family.
+        inferred_family = family_of(model_id)
+        family = inferred_family if inferred_family != "default" else None
         models.append(
             {
                 "id": model_id,
                 "owned_by": owned_by,
                 "capability_hint": _capability_hint(model_id),
+                "family": family,
+                "context_window": context_window,
             }
         )
 

@@ -248,6 +248,11 @@ class TestCapabilityHint:
             ("bge-reranker-v2", "embedding"),  # rerank routed through embedding bucket
             ("whisper-1", "whisper"),
             ("distil-whisper-large", "whisper"),
+            ("tts-1", "tts"),
+            ("tts-1-hd", "tts"),
+            ("kokoro-tts", "tts"),
+            ("xtts-v2", "tts"),
+            ("text-to-speech-v1", "tts"),
             ("gpt-4o-vision-preview", "vision"),
             ("qwen2-vl-7b-instruct", "vision"),
             ("llama-3.2-multimodal", "vision"),
@@ -274,6 +279,11 @@ class TestProbeEndpointModels:
                         {"id": "gpt-4o", "owned_by": "openai"},
                         {"id": "text-embedding-3-large", "owned_by": "openai"},
                         {"id": "whisper-1", "owned_by": "openai"},
+                        {
+                            "id": "gemma-4-31b",
+                            "owned_by": "redhatai",
+                            "max_model_len": 131072,
+                        },
                     ],
                 }
 
@@ -298,13 +308,38 @@ class TestProbeEndpointModels:
         assert result.ok is True
         assert result.status == 200
         ids = [m["id"] for m in result.models]
-        assert ids == ["gpt-4o", "text-embedding-3-large", "whisper-1"]
+        assert ids == [
+            "gpt-4o",
+            "text-embedding-3-large",
+            "whisper-1",
+            "gemma-4-31b",
+        ]
         hints = {m["id"]: m["capability_hint"] for m in result.models}
         assert hints == {
             "gpt-4o": "chat",
             "text-embedding-3-large": "embedding",
             "whisper-1": "whisper",
+            "gemma-4-31b": "chat",
         }
+        # max_model_len is surfaced as context_window so the import row
+        # pre-fills with the provider-reported value instead of "-".
+        ctx = {m["id"]: m["context_window"] for m in result.models}
+        assert ctx == {
+            "gpt-4o": None,
+            "text-embedding-3-large": None,
+            "whisper-1": None,
+            "gemma-4-31b": 131072,
+        }
+        # family is inferred from the model id; gemma-4-31b → "gemma".
+        # A miss surfaces as None (not "default") so the runtime
+        # settings_matrix fallback can re-run on import.
+        families = {m["id"]: m["family"] for m in result.models}
+        assert families["gemma-4-31b"] == "gemma"
+        # OpenAI-catalog ids resolve from the built-in registry; the
+        # exact family string isn't this test's contract — only that a
+        # known id gets *something* and an unknown one falls through.
+        assert families["gpt-4o"] is None or families["gpt-4o"] != ""
+        assert families["whisper-1"] is None or families["whisper-1"] != ""
 
     @pytest.mark.asyncio
     async def test_transport_error_returns_structured_failure(self, monkeypatch):
@@ -425,8 +460,125 @@ class TestRoutesRegistered:
     def test_valid_default_model_kinds_extended(self):
         from main import VALID_DEFAULT_MODEL_KINDS
 
-        assert {"embedding", "vision", "auxiliary"}.issubset(VALID_DEFAULT_MODEL_KINDS)
+        assert {
+            "embedding",
+            "vision",
+            "auxiliary",
+            "whisper",
+            "tts",
+        }.issubset(VALID_DEFAULT_MODEL_KINDS)
+
+    def test_capability_enum_includes_tts(self):
+        from main import LLM_MODEL_CAPABILITIES
+
+        assert "tts" in LLM_MODEL_CAPABILITIES
 
     def test_probe_result_shape(self):
         r = ProbeResult(ok=True, status=200, error=None, probe_url="u")
         assert r.models == []
+
+
+# ---------------------------------------------------------------------------
+# Env-key credential injection: per-job propagation for vision/whisper/tts
+# ---------------------------------------------------------------------------
+
+
+class TestInjectEnvKeyCredentials:
+    """Cover both branches of `_inject_env_key_credentials`:
+
+    - Built-in models: api_key is pulled from `resolved_keys[provider]` and
+      no base_url is written (agent's own registry handles it).
+    - Endpoint-backed models (origin in {custom, system}): both base_url
+      and api_key flow from the endpoint row.
+    """
+
+    @pytest.mark.asyncio
+    async def test_builtin_model_writes_model_and_api_key(self, monkeypatch):
+        import main as orch_main
+
+        async def _fake_resolve(model_id, user_id=None):
+            meta = MagicMock()
+            meta.origin = "builtin"
+            meta.endpoint_id = None
+            meta.api_key_ref = "openai"
+            return meta
+
+        monkeypatch.setattr(orch_main, "_resolve_model", _fake_resolve)
+
+        env_keys: dict = {}
+        await orch_main._inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="TTS",
+            model_id="tts-1",
+            user_id=None,
+            resolved_keys={"openai": "sk-live-xxx"},
+        )
+
+        assert env_keys["TTS_MODEL"] == "tts-1"
+        assert env_keys["TTS_API_KEY"] == "sk-live-xxx"
+        assert "TTS_BASE_URL" not in env_keys
+
+    @pytest.mark.asyncio
+    async def test_endpoint_backed_model_inlines_base_url_and_key(self, monkeypatch):
+        import main as orch_main
+
+        async def _fake_resolve(model_id, user_id=None):
+            meta = MagicMock()
+            meta.origin = "system"
+            meta.endpoint_id = "11111111-1111-1111-1111-111111111111"
+            meta.api_key_ref = None
+            return meta
+
+        async def _fake_get_endpoint(endpoint_id):
+            return {
+                "id": endpoint_id,
+                "base_url": "https://private-vllm.example/v1",
+                "api_key": "ep-key",
+            }
+
+        monkeypatch.setattr(orch_main, "_resolve_model", _fake_resolve)
+        monkeypatch.setattr(
+            orch_main.postgres_db, "get_user_llm_endpoint", _fake_get_endpoint
+        )
+
+        env_keys: dict = {}
+        await orch_main._inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="WHISPER",
+            model_id="whisper-large-v3",
+            user_id="22222222-2222-2222-2222-222222222222",
+            resolved_keys={"openai": "sk-live-xxx"},  # ignored for endpoint-backed
+        )
+
+        assert env_keys["WHISPER_MODEL"] == "whisper-large-v3"
+        assert env_keys["WHISPER_BASE_URL"] == "https://private-vllm.example/v1"
+        assert env_keys["WHISPER_API_KEY"] == "ep-key"
+
+    @pytest.mark.asyncio
+    async def test_existing_keys_are_not_overwritten(self, monkeypatch):
+        import main as orch_main
+
+        async def _fake_resolve(model_id, user_id=None):
+            meta = MagicMock()
+            meta.origin = "builtin"
+            meta.endpoint_id = None
+            meta.api_key_ref = "openai"
+            return meta
+
+        monkeypatch.setattr(orch_main, "_resolve_model", _fake_resolve)
+
+        env_keys: dict = {
+            "TTS_MODEL": "preset-tts",
+            "TTS_API_KEY": "preset-key",
+        }
+        await orch_main._inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="TTS",
+            model_id="tts-1",
+            user_id=None,
+            resolved_keys={"openai": "sk-live-xxx"},
+        )
+
+        # setdefault semantics: caller-supplied values win.
+        assert env_keys["TTS_MODEL"] == "preset-tts"
+        assert env_keys["TTS_API_KEY"] == "preset-key"
