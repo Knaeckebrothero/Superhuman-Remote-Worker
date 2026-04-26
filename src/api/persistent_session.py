@@ -363,6 +363,7 @@ class PersistentSession:
             datasources=self.datasources,
             config=tool_config,
             _job_id=self.thread_id,
+            _thread_id=self.thread_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
             shell_manager=self.shell_manager,  # Set before tool loading

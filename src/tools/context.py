@@ -102,6 +102,13 @@ class ToolContext:
         None  # Callable[[str], None] — pre-write file snapshot for undo
     )
     orchestrator_client: Optional[Any] = None  # OrchestratorClient for delegation
+    _thread_id: Optional[str] = (
+        None  # Persistent-session thread UUID. Set by persistent_session so
+        # session-spawned worker jobs (create_worker_job) can carry the
+        # session's thread back to the orchestrator, which derives the
+        # owning user_id + project_id and applies their model preferences
+        # during dispatch. Unset in worker-job mode.
+    )
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name
@@ -137,6 +144,15 @@ class ToolContext:
     def job_id(self, value: Optional[str]) -> None:
         """Set the job ID directly."""
         self._job_id = value
+
+    @property
+    def thread_id(self) -> Optional[str]:
+        """Persistent-session thread UUID (None outside session mode)."""
+        return self._thread_id
+
+    @thread_id.setter
+    def thread_id(self, value: Optional[str]) -> None:
+        self._thread_id = value
 
     def has_workspace(self) -> bool:
         """Check if workspace manager is available."""
