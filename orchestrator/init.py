@@ -899,9 +899,7 @@ async def _seed_codex_proxy_endpoint(db) -> None:
     """
     proxy_url = os.environ.get("CODEX_PROXY_URL")
     if not proxy_url:
-        logger.info(
-            "  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed"
-        )
+        logger.info("  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed")
         return
 
     try:
@@ -929,13 +927,9 @@ async def _seed_codex_proxy_endpoint(db) -> None:
     }
     report = await llm_seed(db, payload)
     if CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded:
-        logger.info(
-            f"  Seeded codex-proxy endpoint at {base_url}"
-        )
+        logger.info(f"  Seeded codex-proxy endpoint at {base_url}")
     elif CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_skipped:
-        logger.info(
-            "  codex-proxy endpoint already present — leaving untouched"
-        )
+        logger.info("  codex-proxy endpoint already present — leaving untouched")
 
 
 _YAML_GROUP_ROLE = {
