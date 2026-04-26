@@ -908,12 +908,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected auxiliary model override: {aux_model}"
                     )
 
-            # Worker chat model. Strategic phase pin wins because that's the
-            # role workers actually run in; falls back to the generic
-            # default_model setting for users who haven't split phase pins.
-            default_model = user_settings.get(
-                "default_strategic_model"
-            ) or user_settings.get("default_model")
+            # Worker chat model — top-level llm.model. Phase-specific pins
+            # (default_strategic_model / default_tactical_model) are handled
+            # separately below as PhaseLLMOverride fields on llm.{strategic,
+            # tactical} so they can be skipped softly when their provider
+            # is unreachable (stale pin to a removed provider).
+            default_model = user_settings.get("default_model")
             if default_model:
                 config_override = config_override or {}
                 llm_override = config_override.setdefault("llm", {})
@@ -928,6 +928,41 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     logger.info(
                         f"Dispatch: injected user default_model: {default_model}"
                     )
+
+            # Phase-specific model pins. These override only the named phase;
+            # the canonical model on llm.model still drives every other
+            # phase. Soft-skip when the provider has no resolvable
+            # credentials so a stale strategic/tactical pin to a removed
+            # provider doesn't break the whole job — the phase falls back
+            # to the canonical model instead.
+            for _phase, _setting_key in (
+                ("strategic", "default_strategic_model"),
+                ("tactical", "default_tactical_model"),
+            ):
+                _phase_model = user_settings.get(_setting_key)
+                if not _phase_model:
+                    continue
+                config_override = config_override or {}
+                llm_block = config_override.setdefault("llm", {})
+                if _phase in llm_block and llm_block[_phase].get("model"):
+                    continue
+                phase_section: dict = {}
+                await _inject_model_credentials(
+                    section=phase_section,
+                    model_id=_phase_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                if "api_key" not in phase_section and "base_url" not in phase_section:
+                    logger.warning(
+                        f"Dispatch: skipping {_phase} phase pin {_phase_model} — "
+                        f"no credentials resolvable; configure the provider key "
+                        f"in system_api_keys or clear the {_setting_key} preference."
+                    )
+                    continue
+                phase_section["model"] = _phase_model
+                llm_block[_phase] = phase_section
+                logger.info(f"Dispatch: injected {_phase} phase pin: {_phase_model}")
 
             default_autonomy = user_settings.get("default_autonomy")
             if default_autonomy:
