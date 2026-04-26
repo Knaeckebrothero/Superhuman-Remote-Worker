@@ -2,9 +2,10 @@
 # Keycloak SSO — Identity provider for all SRW services
 #
 # Secrets injected via env vars (Vault/ESO/manual → secret):
-#   GITEA_OIDC_CLIENT_SECRET, NEXTCLOUD_OIDC_CLIENT_SECRET,
-#   OPENCLOUD_KEYCLOAK_CLIENT_SECRET, PGADMIN_OIDC_CLIENT_SECRET,
-#   MCP_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
+#   GITEA_OIDC_CLIENT_SECRET, OPENCLOUD_KEYCLOAK_CLIENT_SECRET,
+#   PGADMIN_OIDC_CLIENT_SECRET, MCP_OIDC_CLIENT_SECRET,
+#   KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
+#   (NEXTCLOUD_OIDC_CLIENT_SECRET only when .Values.nextcloud.enabled)
 #
 # The realm-export JSON uses ${VAR} placeholders — Keycloak resolves them
 # from the container's environment at realm import time.
@@ -188,6 +189,7 @@ data:
             }
           ]
         },
+        {{- if .Values.nextcloud.enabled }}
         {
           "clientId": "nextcloud",
           "name": "Nextcloud",
@@ -215,6 +217,7 @@ data:
             "groups"
           ]
         },
+        {{- end }}
         {
           "clientId": "pgadmin",
           "name": "pgAdmin",
@@ -623,11 +626,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: GITEA_OIDC_CLIENT_SECRET
+            {{- if .Values.nextcloud.enabled }}
             - name: NEXTCLOUD_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_OIDC_CLIENT_SECRET
+            {{- end }}
             - name: PGADMIN_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -692,7 +697,9 @@ spec:
                     $KC set-password -r {{ .Values.keycloak.realm }} --username test --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
                     # --- Sync client secrets ---
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
+                                {{- if .Values.nextcloud.enabled }}
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
+                                {{- end }}
                                 "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
                                 "mcp-server:$MCP_OIDC_CLIENT_SECRET"; do
