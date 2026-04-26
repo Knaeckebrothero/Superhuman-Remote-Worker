@@ -5,7 +5,7 @@ API keys are referenced via `apiKeyEnv` and injected into the seed Job pod
 via envFrom on the referenced Secrets.
 
 The seeder is insert-only — re-applying an unchanged payload on `helm upgrade`
-is a no-op, and admin-UI edits to `system_api_keys` / `user_llm_endpoints`
+is a no-op, and admin-UI edits to `system_api_keys` / `llm_endpoints`
 survive subsequent runs. See docs/features/db_backed_llm_config.md for the
 seed semantics and orchestrator/seed/llm_config.py for the payload schema.
 */ -}}

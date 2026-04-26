@@ -480,7 +480,7 @@ class TestCatalogLookup:
     """resolve_model() consults the DB-backed catalog hook between the
     system-endpoint hook and the built-in YAML fallback. Catalog rows carry
     their transport: 'endpoint' rows inherit base_url+api_key from the joined
-    user_llm_endpoints row; 'system' rows carry api_key_ref so the dispatcher
+    llm_endpoints row; 'system' rows carry api_key_ref so the dispatcher
     resolves the key via system_api_keys.
     """
 

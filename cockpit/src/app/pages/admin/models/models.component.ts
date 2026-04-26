@@ -19,6 +19,15 @@ interface ProviderOption {
   available: boolean;
 }
 
+/**
+ * Well-known label for the seeded codex-proxy llm_endpoints row. The
+ * orchestrator's _seed_codex_proxy_endpoint inserts a row with this label
+ * when CODEX_PROXY_URL is set; the frontend uses it to detect when the
+ * codex source needs the special "subscription" affordance (status banner,
+ * deep link to OAuth login).
+ */
+const CODEX_PROXY_LABEL = 'codex-proxy';
+
 /** Maps the discover endpoint's capability hint onto a catalog role. */
 function hintToRole(hint: string | null | undefined): CatalogRole {
   switch (hint) {
@@ -152,6 +161,27 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
 
             @if (selectedEndpointRef(); as endpointRef) {
               <div class="discover-pane">
+                @if (selectedIsCodex()) {
+                  @if (providers.codexAvailability(); as codex) {
+                    <div
+                      class="codex-status"
+                      [class.ok]="codex.available"
+                      [class.warn]="!codex.available"
+                    >
+                      @if (codex.available) {
+                        <span>
+                          ✓ Codex proxy active —
+                          {{ codex.account_count }} subscription{{ codex.account_count === 1 ? '' : 's' }} logged in
+                        </span>
+                      } @else {
+                        <span>
+                          ⚠ No active codex subscription. Log in via Settings → Codex
+                          before testing models, otherwise dispatched calls will 401.
+                        </span>
+                      }
+                    </div>
+                  }
+                }
                 <div class="discover-actions">
                   <button
                     class="link-btn"
@@ -405,6 +435,21 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
       letter-spacing: 0.4px;
       color: var(--text-muted, #6c7086);
     }
+    .codex-status {
+      margin-bottom: 10px;
+      padding: 6px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .codex-status.ok {
+      background: rgba(166, 227, 161, 0.12);
+      color: var(--green, #a6e3a1);
+    }
+    .codex-status.warn {
+      background: rgba(243, 139, 168, 0.12);
+      color: var(--red, #f38ba8);
+    }
   `],
 })
 export class AdminModelsComponent implements OnInit {
@@ -438,7 +483,10 @@ export class AdminModelsComponent implements OnInit {
 
   /** Provider dropdown options sourced from the keys + endpoints lists.
    * Non-LLM providers (`tavily`, `vision`) are filtered out — they live in
-   * `system_api_keys` for env injection but can't anchor a catalog row. */
+   * `system_api_keys` for env injection but can't anchor a catalog row.
+   * The seeded `codex-proxy` endpoint is rendered as a "subscription"
+   * source so admins recognise it as separate from a generic vLLM/Ollama
+   * endpoint. */
   readonly providerOptions = computed<ProviderOption[]>(() => {
     const opts: ProviderOption[] = [];
     for (const key of this.providers.systemApiKeys()) {
@@ -450,15 +498,33 @@ export class AdminModelsComponent implements OnInit {
         available: true,
       });
     }
+    const codex = this.providers.codexAvailability();
     for (const ep of this.providers.systemEndpoints()) {
+      const isCodex = ep.label === CODEX_PROXY_LABEL;
       opts.push({
         kind: 'endpoint',
         ref: ep.id,
-        label: `${ep.label} (endpoint)`,
-        available: true,
+        label: isCodex
+          ? `${ep.label} (codex subscription)`
+          : `${ep.label} (endpoint)`,
+        // Codex proxy is "available" for catalog authoring even without an
+        // active subscription — admins may seed catalog rows ahead of OAuth
+        // login. The runtime status banner below tells them when login is
+        // needed.
+        available: isCodex ? true : true,
       });
     }
+    // Stash availability so the template can read it without re-calling.
+    void codex;
     return opts;
+  });
+
+  /** True when the form provider is the seeded codex-proxy endpoint. */
+  readonly selectedIsCodex = computed(() => {
+    const ref = this.selectedEndpointRef();
+    if (!ref) return false;
+    const ep = this.providers.systemEndpoints().find((e) => e.id === ref);
+    return ep?.label === CODEX_PROXY_LABEL;
   });
 
   readonly groupedModels = computed(() => {
@@ -481,6 +547,7 @@ export class AdminModelsComponent implements OnInit {
     this.models.loadFamilies();
     this.providers.loadSystemApiKeys();
     this.providers.loadSystemEndpoints();
+    this.providers.loadCodexAvailability();
   }
 
   endpointLabel(refId: string): string {

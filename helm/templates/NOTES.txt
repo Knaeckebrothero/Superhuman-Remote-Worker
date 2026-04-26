@@ -32,7 +32,7 @@ Set one of:
 Encryption key
 ==============
 API keys and LLM endpoint credentials (user_api_keys, system_api_keys,
-user_llm_endpoints.api_key) are encrypted at rest using APP_ENCRYPTION_KEY
+llm_endpoints.api_key) are encrypted at rest using APP_ENCRYPTION_KEY
 in Secret `{{ include "srw.secretName" . }}`. If this key is lost, all
 stored credentials become unrecoverable.
 
@@ -54,7 +54,7 @@ LLM seed
 ========
 Helm will run a one-shot seed Job (`{{ include "srw.fullname" . }}-llm-seed`)
 post-install and post-upgrade. It inserts rows into system_api_keys and
-user_llm_endpoints only when they are absent — existing rows, whether
+llm_endpoints only when they are absent — existing rows, whether
 previously seeded or created via Admin → Providers, are never overwritten.
 
 Inspect the run:

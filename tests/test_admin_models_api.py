@@ -305,7 +305,7 @@ class TestListModelsFilters:
 
 
 class TestResolveCatalogModelTransportJoin:
-    """resolve_catalog_model JOINs to system_api_keys or user_llm_endpoints
+    """resolve_catalog_model JOINs to system_api_keys or llm_endpoints
     depending on provider_kind, decrypts the api_key inline, and prefers the
     system row when both are present (ORDER BY provider_kind='system' DESC).
     """

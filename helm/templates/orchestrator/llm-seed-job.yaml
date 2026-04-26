@@ -1,6 +1,6 @@
 {{- if .Values.llm.seed.enabled }}
 {{- /*
-Short-lived Job that seeds system_api_keys and user_llm_endpoints from the
+Short-lived Job that seeds system_api_keys and llm_endpoints from the
 helm-rendered payload. Insert-only: `helm upgrade` re-runs this against an
 already-seeded stack and exits 0 after logging "skipped" for every entry.
 

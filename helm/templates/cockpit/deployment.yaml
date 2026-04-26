@@ -24,7 +24,7 @@ data:
       window['env']['keycloakClientId'] = '{{ .Values.keycloak.cockpitClientId }}';
 
       // Model catalog is sourced from GET /api/models (system_api_keys +
-      // user_llm_endpoints). Do not seed window.env.models here — an empty
+      // llm_endpoints). Do not seed window.env.models here — an empty
       // catalog triggers the role-aware "configure a provider" banner.
     })(this);
 ---

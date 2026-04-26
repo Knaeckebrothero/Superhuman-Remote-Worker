@@ -65,7 +65,7 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: LICENSE_TERMS_ACCEPTED
             # Encryption key for API keys stored at rest (user_api_keys,
-            # system_api_keys, user_llm_endpoints.api_key). Must be present
+            # system_api_keys, llm_endpoints.api_key). Must be present
             # before the orchestrator starts — see NOTES.txt for the
             # operator backup procedure.
             - name: APP_ENCRYPTION_KEY
