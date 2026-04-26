@@ -174,6 +174,13 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
             payload["instructions"] = instructions
         if project_id:
             payload["project_id"] = project_id
+        # When invoked from a persistent session, carry the thread back so
+        # the orchestrator can derive the owning user (and apply their model
+        # preferences during dispatch). No-op for worker-mode callers.
+        if context.thread_id:
+            payload["thread_id"] = context.thread_id
+        if not project_id and context.project_id:
+            payload["project_id"] = context.project_id
 
         async with _get_client() as client:
             try:

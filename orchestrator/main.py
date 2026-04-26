@@ -908,7 +908,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected auxiliary model override: {aux_model}"
                     )
 
-            default_model = user_settings.get("default_model")
+            # Worker chat model. Strategic phase pin wins because that's the
+            # role workers actually run in; falls back to the generic
+            # default_model setting for users who haven't split phase pins.
+            default_model = user_settings.get(
+                "default_strategic_model"
+            ) or user_settings.get("default_model")
             if default_model:
                 config_override = config_override or {}
                 llm_override = config_override.setdefault("llm", {})
@@ -999,6 +1004,29 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 logger.info(
                     f"Dispatch: injected embedding: "
                     f"provider={embedding_provider}, model={embedding_model}"
+                )
+
+        # System-default fallback for the worker chat model. Runs after the
+        # user-preference block (or whenever there's no user) so jobs that
+        # arrived without an llm.model still pick up the admin-curated
+        # default from the catalog instead of falling through to the agent's
+        # YAML default — which has no base_url/api_key for self-hosted models
+        # and silently routes to api.openai.com with "not-needed".
+        llm_override_check = (config_override or {}).get("llm") or {}
+        if "model" not in llm_override_check:
+            system_chat_model = await postgres_db.resolve_default_for_role("chat")
+            if system_chat_model:
+                config_override = config_override or {}
+                llm_override = config_override.setdefault("llm", {})
+                llm_override["model"] = system_chat_model
+                await _inject_model_credentials(
+                    section=llm_override,
+                    model_id=system_chat_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(
+                    f"Dispatch: injected system default chat model: {system_chat_model}"
                 )
 
         # Build job start request
@@ -2225,6 +2253,14 @@ class JobCreate(BaseModel):
     project_id: str | None = Field(
         None, description="Project UUID to associate this job with"
     )
+    thread_id: str | None = Field(
+        None,
+        description=(
+            "Persistent-session thread UUID. When provided and user_id "
+            "is unset, the owning user (and project) are inherited from "
+            "the thread row so dispatch can apply user preferences."
+        ),
+    )
     parent_job_id: str | None = Field(
         None, description="Parent job UUID for verification/follow-up jobs"
     )
@@ -3199,16 +3235,38 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         if job.kickoff_message:
             context["kickoff_message"] = job.kickoff_message
 
-        # Resolve project_id: use provided, or fall back to user's default
-        project_id = job.project_id
-        if not project_id and job.user_id:
+        # Inherit user_id (and optionally project_id) from the originating
+        # persistent-session thread when the caller didn't supply them.
+        # This is how session-spawned worker jobs (create_worker_job tool)
+        # get attributed to the right user; without it the dispatch path
+        # skips per-user model preferences and the worker boots with the
+        # YAML defaults pointing at api.openai.com with "not-needed".
+        effective_user_id = job.user_id
+        thread_project_id: str | None = None
+        if job.thread_id and not effective_user_id:
             try:
-                user = await postgres_db.get_user(job.user_id)
+                thread_row = await postgres_db.get_thread(job.thread_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load thread {job.thread_id} for user inheritance: {e}"
+                )
+                thread_row = None
+            if thread_row:
+                if thread_row.get("user_id"):
+                    effective_user_id = str(thread_row["user_id"])
+                if thread_row.get("project_id"):
+                    thread_project_id = str(thread_row["project_id"])
+
+        # Resolve project_id: use provided, fall back to thread's, then user's default
+        project_id = job.project_id or thread_project_id
+        if not project_id and effective_user_id:
+            try:
+                user = await postgres_db.get_user(effective_user_id)
                 if user and user.get("default_project_id"):
                     project_id = str(user["default_project_id"])
             except Exception as e:
                 logger.warning(
-                    f"Failed to resolve default project for user {job.user_id}: {e}"
+                    f"Failed to resolve default project for user {effective_user_id}: {e}"
                 )
 
         # Resolve project defaults (config name, config override)
@@ -3245,9 +3303,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         )
         if needs_vm:
             creator = None
-            if job.user_id:
+            if effective_user_id:
                 try:
-                    creator = await postgres_db.get_user(job.user_id)
+                    creator = await postgres_db.get_user(effective_user_id)
                 except Exception:
                     creator = None
             await _check_vm_permission(creator, job_needs_vm=True)
@@ -3259,7 +3317,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             config_name=config_name,
             config_override=config_override,
             context=context if context else None,
-            user_id=job.user_id,
+            user_id=effective_user_id,
             project_id=project_id,
             parent_job_id=job.parent_job_id,
             priority=job.priority,
