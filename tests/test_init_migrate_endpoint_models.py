@@ -3,7 +3,7 @@
 The Phase D one-shot promotes system-scoped ``user_llm_endpoint_models``
 rows into the admin-curated catalog and drops the legacy table. After it
 runs once the table is gone; subsequent runs are no-ops. User-scoped rows
-(``user_llm_endpoints.user_id IS NOT NULL``) are dropped without
+(``llm_endpoints.user_id IS NOT NULL``) are dropped without
 migration. ``whisper`` / ``tts`` capabilities don't map to v1 catalog
 roles and are skipped.
 """

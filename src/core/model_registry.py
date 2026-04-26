@@ -219,7 +219,7 @@ def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
 
     The callable takes (model_id, role='chat') and returns either None or a
     flattened row dict from the ``models`` table joined to its transport
-    (system_api_keys or user_llm_endpoints). Wired to
+    (system_api_keys or llm_endpoints). Wired to
     ``postgres_db.resolve_catalog_model`` at orchestrator startup.
     """
     global _catalog_lookup
@@ -347,7 +347,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
 
     Two shapes:
     - ``provider_kind='endpoint'`` — inherits ``base_url`` + ``api_key``
-      from the joined ``user_llm_endpoints`` row. Routes through the
+      from the joined ``llm_endpoints`` row. Routes through the
       openai factory (OpenAI-compatible wire protocol).
     - ``provider_kind='system'`` — sets ``api_key_ref`` to the provider
       slug so the dispatcher resolves the key via ``system_api_keys``;

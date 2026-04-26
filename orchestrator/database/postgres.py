@@ -3501,7 +3501,7 @@ class PostgresDB:
             endpoint_rows = await conn.fetch(
                 """
                 SELECT id, label, base_url, key_prefix, created_at, updated_at
-                FROM user_llm_endpoints
+                FROM llm_endpoints
                 WHERE user_id = $1
                 ORDER BY label
                 """,
@@ -3527,7 +3527,7 @@ class PostgresDB:
         query = """
             SELECT id, user_id, label, base_url, api_key, key_prefix,
                    created_at, updated_at
-            FROM user_llm_endpoints
+            FROM llm_endpoints
             WHERE id = $1
         """
         args: List[Any] = [UUID(endpoint_id)]
@@ -3541,7 +3541,7 @@ class PostgresDB:
             return None
         result = dict(row)
         result["api_key"] = _decrypt_stored(
-            result.get("api_key"), field=f"user_llm_endpoints[{result['id']}].api_key"
+            result.get("api_key"), field=f"llm_endpoints[{result['id']}].api_key"
         )
         return result
 
@@ -3557,7 +3557,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO user_llm_endpoints
+                INSERT INTO llm_endpoints
                     (user_id, label, base_url, api_key, key_prefix)
                 VALUES ($1, $2, $3, $4, $5)
                 RETURNING id, label, base_url, key_prefix, created_at, updated_at
@@ -3614,7 +3614,7 @@ class PostgresDB:
 
         sets.append("updated_at = CURRENT_TIMESTAMP")
         query = f"""
-            UPDATE user_llm_endpoints
+            UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id = $2
             RETURNING id, label, base_url, key_prefix, created_at, updated_at
@@ -3627,7 +3627,7 @@ class PostgresDB:
         """Delete an endpoint and cascade to its model rows."""
         async with self.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM user_llm_endpoints WHERE id = $1 AND user_id = $2",
+                "DELETE FROM llm_endpoints WHERE id = $1 AND user_id = $2",
                 UUID(endpoint_id),
                 UUID(user_id),
             )
@@ -3716,7 +3716,8 @@ class PostgresDB:
     # SYSTEM LLM ENDPOINT OPERATIONS
     # System-scoped endpoints (user_id IS NULL) are visible to every user.
     # They are seeded by helm on fresh install and edited via Admin → Providers.
-    # Schema is shared with user_llm_endpoints; only the scoping differs.
+    # Same llm_endpoints table as the user-scoped ops above; only the scoping
+    # filter (user_id IS NULL vs user_id = $1) differs.
     # =========================================================================
 
     async def list_system_llm_endpoints(self) -> List[Dict[str, Any]]:
@@ -3732,7 +3733,7 @@ class PostgresDB:
             endpoint_rows = await conn.fetch(
                 """
                 SELECT id, label, base_url, key_prefix, created_at, updated_at
-                FROM user_llm_endpoints
+                FROM llm_endpoints
                 WHERE user_id IS NULL
                 ORDER BY label
                 """
@@ -3749,7 +3750,7 @@ class PostgresDB:
                 """
                 SELECT id, label, base_url, api_key, key_prefix,
                        created_at, updated_at
-                FROM user_llm_endpoints
+                FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
                 UUID(endpoint_id),
@@ -3759,7 +3760,7 @@ class PostgresDB:
         result = dict(row)
         result["api_key"] = _decrypt_stored(
             result.get("api_key"),
-            field=f"user_llm_endpoints[{result['id']}].api_key",
+            field=f"llm_endpoints[{result['id']}].api_key",
         )
         return result
 
@@ -3774,7 +3775,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO user_llm_endpoints
+                INSERT INTO llm_endpoints
                     (user_id, label, base_url, api_key, key_prefix)
                 VALUES (NULL, $1, $2, $3, $4)
                 RETURNING id, label, base_url, key_prefix, created_at, updated_at
@@ -3828,7 +3829,7 @@ class PostgresDB:
                 row = await conn.fetchrow(
                     """
                     SELECT id, label, base_url, key_prefix, created_at, updated_at
-                    FROM user_llm_endpoints
+                    FROM llm_endpoints
                     WHERE id = $1 AND user_id IS NULL
                     """,
                     UUID(endpoint_id),
@@ -3837,7 +3838,7 @@ class PostgresDB:
 
         sets.append("updated_at = CURRENT_TIMESTAMP")
         query = f"""
-            UPDATE user_llm_endpoints
+            UPDATE llm_endpoints
             SET {", ".join(sets)}
             WHERE id = $1 AND user_id IS NULL
             RETURNING id, label, base_url, key_prefix, created_at, updated_at
@@ -3851,7 +3852,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
-                DELETE FROM user_llm_endpoints
+                DELETE FROM llm_endpoints
                 WHERE id = $1 AND user_id IS NULL
                 """,
                 UUID(endpoint_id),
@@ -3867,7 +3868,7 @@ class PostgresDB:
     # =========================================================================
     # MODELS CATALOG
     # Admin-curated table of (model, role) offerings anchored to a transport
-    # (system_api_keys provider OR system-scoped user_llm_endpoints row).
+    # (system_api_keys provider OR system-scoped llm_endpoints row).
     # Reads feed every model picker (builder/session/job) and the resolver's
     # catalog branch in src/core/model_registry.py.
     # =========================================================================
@@ -4047,7 +4048,7 @@ class PostgresDB:
         """Resolve a catalog row to a flat dict carrying the transport.
 
         JOINs the models row to its anchor:
-        - ``provider_kind='endpoint'`` → ``user_llm_endpoints`` row supplies
+        - ``provider_kind='endpoint'`` → ``llm_endpoints`` row supplies
           ``base_url`` and ``api_key`` (decrypted inline).
         - ``provider_kind='system'`` → ``system_api_keys`` row supplies
           ``api_key`` (decrypted inline); ``base_url`` is left None so the
@@ -4079,7 +4080,7 @@ class PostgresDB:
                 FROM models m
                 LEFT JOIN system_api_keys ska
                     ON m.provider_kind = 'system' AND m.provider_ref = ska.provider
-                LEFT JOIN user_llm_endpoints ule
+                LEFT JOIN llm_endpoints ule
                     ON m.provider_kind = 'endpoint'
                    AND m.provider_ref = ule.id::text
                    AND ule.user_id IS NULL
@@ -4104,7 +4105,7 @@ class PostgresDB:
         else:
             result["api_key"] = _decrypt_stored(
                 result.pop("endpoint_api_key", None),
-                field=f"user_llm_endpoints[{result.get('endpoint_id')}].api_key",
+                field=f"llm_endpoints[{result.get('endpoint_id')}].api_key",
             )
             result.pop("system_api_key", None)
         return result

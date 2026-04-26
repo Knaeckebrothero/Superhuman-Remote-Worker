@@ -452,7 +452,7 @@ reloader:
 # =============================================================================
 llm:
   # NOTE: builder/browser/citation model IDs and base URLs moved to the
-  # `system_api_keys` + `user_llm_endpoints` tables via the seed block below.
+  # `system_api_keys` + `llm_endpoints` tables via the seed block below.
   # The orchestrator resolves them at runtime through the model registry;
   # they are no longer read from env at startup. See
   # docs/features/db_backed_llm_config.md for the migration rationale.
@@ -466,7 +466,7 @@ llm:
   # ---------------------------------------------------------------------------
   # One-shot seed for system-scoped provider keys and LLM endpoints. Applied
   # by a post-install / post-upgrade Job. Insert-only: existing rows in
-  # system_api_keys and user_llm_endpoints (user_id IS NULL) are NEVER
+  # system_api_keys and llm_endpoints (user_id IS NULL) are NEVER
   # overwritten, so admin-UI edits survive `helm upgrade`. Leave enabled:false
   # to bring the stack up empty and configure providers via Admin → Providers.
   # ---------------------------------------------------------------------------

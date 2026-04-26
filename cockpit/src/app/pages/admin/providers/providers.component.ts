@@ -128,6 +128,9 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                 <div class="endpoint-head">
                   <div class="endpoint-title">
                     <strong>{{ endpoint.label }}</strong>
+                    @if (isCodexEndpoint(endpoint.label)) {
+                      <span class="codex-chip">codex subscription</span>
+                    }
                     <span class="endpoint-url mono">{{ endpoint.base_url }}</span>
                     @if (endpoint.key_prefix) {
                       <span class="endpoint-key mono">key {{ endpoint.key_prefix }}...</span>
@@ -172,6 +175,14 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                   <a routerLink="/admin/models" class="catalog-hint-link">
                     {{ 'admin.providers.endpoints.catalogHintLink' | transloco }}
                   </a>
+                  @if (isCodexEndpoint(endpoint.label)) {
+                    <span class="codex-aside">
+                      ·
+                      <a routerLink="/settings" class="catalog-hint-link">
+                        Manage subscriptions
+                      </a>
+                    </span>
+                  }
                 </p>
               </div>
             }
@@ -452,6 +463,19 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
       margin-left: 4px;
     }
     .catalog-hint-link:hover { text-decoration: underline; }
+    .codex-chip {
+      display: inline-block;
+      padding: 1px 8px;
+      margin-left: 6px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      border-radius: 10px;
+      background: rgba(137, 180, 250, 0.15);
+      color: var(--blue, #89b4fa);
+      vertical-align: middle;
+    }
+    .codex-aside { margin-left: 6px; }
     .create-form {
       margin-top: 12px;
       padding-top: 12px;
@@ -548,6 +572,10 @@ export class AdminProvidersComponent implements OnInit {
 
   providerLabel(p: string): string {
     return SYSTEM_PROVIDERS.find((x) => x.value === p)?.label ?? p;
+  }
+
+  isCodexEndpoint(label: string | null | undefined): boolean {
+    return label === 'codex-proxy';
   }
 
   formatDate(iso: string | null): string {

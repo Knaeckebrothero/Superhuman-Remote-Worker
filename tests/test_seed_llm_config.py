@@ -1,7 +1,7 @@
 """Tests for the stage-4 system LLM config seeder.
 
 The seeder is the glue between a helm-rendered YAML payload and the
-``system_api_keys`` / ``user_llm_endpoints`` tables. These tests drive it
+``system_api_keys`` / ``llm_endpoints`` tables. These tests drive it
 against a fake ``PostgresDB`` so we can assert idempotence (re-runs are
 no-ops) without standing up Postgres.
 """

@@ -48,7 +48,7 @@ data:
 
   # LLM routing
   # LLM_BASE_URL / BROWSER_LLM_* / BUILDER_MODEL moved to the DB-backed
-  # config (system_api_keys + user_llm_endpoints). See docs/features/
+  # config (system_api_keys + llm_endpoints). See docs/features/
   # db_backed_llm_config.md for the migration rationale.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 

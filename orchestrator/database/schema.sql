@@ -173,16 +173,46 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_keys_provider ON user_api_keys(use
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
 
 -- ============================================================================
--- 0i. USER LLM ENDPOINTS
--- Per-user OpenAI-compatible LLM endpoints (vLLM, Ollama, private gateways)
--- and the model IDs they serve. Replaces the single-LLM_BASE_URL mechanism.
--- Custom-endpoint keys travel inline on the endpoint row — they are not
--- merged into resolve_api_keys_for_job() which only covers named providers.
+-- 0i. LLM ENDPOINTS
+-- OpenAI-compatible LLM endpoints (vLLM, Ollama, codex-proxy, private
+-- gateways) and the model IDs they serve. Replaces the single-LLM_BASE_URL
+-- mechanism. Custom-endpoint keys travel inline on the endpoint row — they
+-- are not merged into resolve_api_keys_for_job() which only covers named
+-- providers.
 -- ============================================================================
+
+-- Idempotent rename of the legacy ``user_llm_endpoints`` table. The original
+-- name implied per-user scoping but the table has always held both per-user
+-- rows (user_id NOT NULL) and system-scoped rows (user_id NULL). Renaming to
+-- ``llm_endpoints`` removes the misleading prefix. Re-running this block on
+-- a fresh install or an already-renamed schema is a no-op.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'user_llm_endpoints')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables
+                       WHERE table_schema = 'public' AND table_name = 'llm_endpoints')
+    THEN
+        ALTER TABLE user_llm_endpoints RENAME TO llm_endpoints;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'uq_user_llm_endpoint_label_user') THEN
+        ALTER INDEX uq_user_llm_endpoint_label_user RENAME TO uq_llm_endpoint_label_user;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'uq_user_llm_endpoint_label_system') THEN
+        ALTER INDEX uq_user_llm_endpoint_label_system RENAME TO uq_llm_endpoint_label_system;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'idx_user_llm_endpoints_user') THEN
+        ALTER INDEX idx_user_llm_endpoints_user RENAME TO idx_llm_endpoints_user;
+    END IF;
+END$$;
 
 -- user_id is NULL for system-scoped rows (seeded by helm or created via
 -- Admin → Providers); non-NULL for per-user rows.
-CREATE TABLE IF NOT EXISTS user_llm_endpoints (
+CREATE TABLE IF NOT EXISTS llm_endpoints (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
     label TEXT NOT NULL,
@@ -201,9 +231,9 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'uq_user_llm_endpoint_label'
-          AND conrelid = 'user_llm_endpoints'::regclass
+          AND conrelid = 'llm_endpoints'::regclass
     ) THEN
-        ALTER TABLE user_llm_endpoints DROP CONSTRAINT uq_user_llm_endpoint_label;
+        ALTER TABLE llm_endpoints DROP CONSTRAINT uq_user_llm_endpoint_label;
     END IF;
 END$$;
 
@@ -211,21 +241,21 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM pg_attribute
-        WHERE attrelid = 'user_llm_endpoints'::regclass
+        WHERE attrelid = 'llm_endpoints'::regclass
           AND attname = 'user_id'
           AND attnotnull = TRUE
     ) THEN
-        ALTER TABLE user_llm_endpoints ALTER COLUMN user_id DROP NOT NULL;
+        ALTER TABLE llm_endpoints ALTER COLUMN user_id DROP NOT NULL;
     END IF;
 END$$;
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_user_llm_endpoint_label_user
-    ON user_llm_endpoints(user_id, label)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_endpoint_label_user
+    ON llm_endpoints(user_id, label)
     WHERE user_id IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS uq_user_llm_endpoint_label_system
-    ON user_llm_endpoints(label)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_endpoint_label_system
+    ON llm_endpoints(label)
     WHERE user_id IS NULL;
-CREATE INDEX IF NOT EXISTS idx_user_llm_endpoints_user ON user_llm_endpoints(user_id);
+CREATE INDEX IF NOT EXISTS idx_llm_endpoints_user ON llm_endpoints(user_id);
 
 -- The legacy user_llm_endpoint_models table was retired in favour of the
 -- admin-curated `models` catalog (section 0k). The orchestrator's init step
@@ -265,7 +295,7 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
 -- Admin-curated catalog of LLM offerings. Each row is one (model, role)
 -- anchored to a transport — either a system_api_keys provider
 -- (provider_kind='system', provider_ref='anthropic') or a system-scoped
--- user_llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
+-- llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
 -- Every model surfaced in builder/session/job pickers comes from here.
 -- ============================================================================
 
