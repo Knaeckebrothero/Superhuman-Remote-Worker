@@ -65,6 +65,27 @@ const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
 };
 
 /**
+ * Reported by `GET /api/admin/providers/codex/availability`. Used by Admin →
+ * Models to decide whether the seeded `codex-proxy` system endpoint is usable
+ * right now (proxy reachable + at least one active subscription).
+ */
+export interface CodexAvailability {
+  available: boolean;
+  account_count: number;
+  models: string[];
+  proxy_url: string | null;
+  endpoint_id: string | null;
+}
+
+const EMPTY_CODEX_AVAILABILITY: CodexAvailability = {
+  available: false,
+  account_count: 0,
+  models: [],
+  proxy_url: null,
+  endpoint_id: null,
+};
+
+/**
  * REST client for the `/api/admin/providers/*` surface. Every call is gated
  * by the `srw-admin` role server-side; the client does not re-check.
  */
@@ -76,6 +97,7 @@ export class AdminProvidersService {
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
   readonly systemEndpoints = signal<LlmEndpoint[]>([]);
   readonly defaults = signal<Record<DefaultModelKind, string | null>>({...EMPTY_DEFAULTS});
+  readonly codexAvailability = signal<CodexAvailability>({...EMPTY_CODEX_AVAILABILITY});
 
   // ── System API Keys ───────────────────────────────────────────────
 
@@ -162,5 +184,19 @@ export class AdminProvidersService {
         {model},
       )
       .pipe(tap(() => this.loadDefaults()));
+  }
+
+  // ── Codex Proxy Availability ──────────────────────────────────────
+
+  /**
+   * Refresh the codex-proxy availability signal. Admin → Models reads this
+   * to decide whether to surface a "log in via Settings → Codex" hint when
+   * the user picks the codex-proxy endpoint without an active subscription.
+   */
+  loadCodexAvailability(): void {
+    this.http
+      .get<CodexAvailability>(`${this.baseUrl}/admin/providers/codex/availability`)
+      .pipe(catchError(() => of({...EMPTY_CODEX_AVAILABILITY})))
+      .subscribe((info) => this.codexAvailability.set(info));
   }
 }

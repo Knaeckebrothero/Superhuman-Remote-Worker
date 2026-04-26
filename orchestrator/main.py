@@ -828,7 +828,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # Resolve the main LLM through the registry. Endpoint-backed
         # models (custom = per-user, system = helm-seeded / Admin →
         # Providers) carry their own inline base_url + api_key on the
-        # user_llm_endpoints row; built-ins look up their api_key via
+        # llm_endpoints row; built-ins look up their api_key via
         # resolved_keys.
         config_override = config_override or {}
         llm_over = config_override.setdefault("llm", {})
@@ -1637,7 +1637,7 @@ async def _inject_model_credentials(
     For endpoint-backed models (``origin`` in {``custom``, ``system``}):
     looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
     Custom endpoints are user-scoped; system endpoints are helm-seeded or
-    managed via Admin → Providers. Both live in user_llm_endpoints.
+    managed via Admin → Providers. Both live in llm_endpoints.
 
     For built-ins: injects the named provider's key from ``resolved_keys``
     (the user > project > env resolution chain). No base_url injection —
@@ -2515,7 +2515,7 @@ class CatalogModelCreate(BaseModel):
         min_length=1,
         description=(
             "system_api_keys.provider slug for provider_kind='system' "
-            "(e.g. 'anthropic'); user_llm_endpoints.id (UUID as text) for "
+            "(e.g. 'anthropic'); llm_endpoints.id (UUID as text) for "
             "provider_kind='endpoint'."
         ),
     )
@@ -11506,7 +11506,7 @@ async def create_llm_endpoint(
         )
     except Exception as e:
         # UniqueViolation on (user_id, label) — mirror the 409 style elsewhere
-        if "uq_user_llm_endpoint_label" in str(e):
+        if "uq_llm_endpoint_label" in str(e):
             raise HTTPException(
                 status_code=409,
                 detail=f"An endpoint labeled {body.label!r} already exists.",
@@ -11696,7 +11696,7 @@ async def admin_create_provider_endpoint(
             key_prefix=key_prefix,
         )
     except Exception as e:
-        if "uq_user_llm_endpoint_label_system" in str(e):
+        if "uq_llm_endpoint_label_system" in str(e):
             raise HTTPException(
                 status_code=409,
                 detail=f"A system endpoint labeled {body.label!r} already exists.",
@@ -11793,6 +11793,75 @@ async def admin_discover_provider_endpoint_models(
     }
 
 
+@app.get("/api/admin/providers/codex/availability")
+async def admin_codex_availability(request: Request) -> dict[str, Any]:
+    """Report whether the codex proxy is configured AND has an active account.
+
+    Used by Admin → Models to decide whether to surface "Codex proxy" as a
+    model source. ``available`` is true only when the proxy is reachable
+    AND at least one auth file is active (not disabled, not unavailable).
+    Catalog wiring is deliberate: when ``available`` is true and
+    ``endpoint_id`` is set, the frontend can route Discover/Add flows to
+    the existing /api/admin/providers/endpoints/{id} routes — no codex-
+    specific UI plumbing required.
+    """
+    await _require_admin(request)
+    proxy_url = os.getenv("CODEX_PROXY_URL")
+
+    # Locate the seeded codex-proxy endpoint (init.py creates it when
+    # CODEX_PROXY_URL is set; admins may also have deleted it).
+    endpoint_id: str | None = None
+    for row in await postgres_db.list_system_llm_endpoints():
+        if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
+            endpoint_id = str(row["id"])
+            break
+
+    if not proxy_url:
+        return {
+            "available": False,
+            "account_count": 0,
+            "models": [],
+            "proxy_url": None,
+            "endpoint_id": endpoint_id,
+        }
+
+    try:
+        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
+        auth_files = auth_resp.json()
+    except HTTPException:
+        return {
+            "available": False,
+            "account_count": 0,
+            "models": [],
+            "proxy_url": proxy_url,
+            "endpoint_id": endpoint_id,
+        }
+
+    accounts = (
+        auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
+    )
+    active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
+
+    models: list[str] = []
+    if active:
+        try:
+            models_resp = await _codex_proxy_request("GET", "/v1/models")
+            data = models_resp.json()
+            models = [
+                m["id"] if isinstance(m, dict) else m for m in data.get("data", [])
+            ]
+        except HTTPException:
+            pass
+
+    return {
+        "available": len(active) > 0,
+        "account_count": len(active),
+        "models": models,
+        "proxy_url": proxy_url,
+        "endpoint_id": endpoint_id,
+    }
+
+
 @app.get("/api/admin/providers/defaults")
 async def admin_list_provider_defaults(request: Request) -> dict[str, str | None]:
     """Return the currently-configured default model IDs for each workload kind."""
@@ -11826,7 +11895,7 @@ async def admin_set_provider_default(
 # Admin Models Catalog API (Admin → Models)
 # Reads/writes the ``models`` table — the curated list of LLMs the application
 # offers. Each row is provider-anchored (system_api_keys or system-scoped
-# user_llm_endpoints). User authoring is not exposed.
+# llm_endpoints). User authoring is not exposed.
 # =============================================================================
 
 
@@ -12289,6 +12358,12 @@ def _get_system_providers() -> set[str]:
         if any(os.getenv(var) for var in env_vars):
             providers.add(provider)
     return providers
+
+
+# Well-known label for the seeded codex-proxy llm_endpoints row. Kept in sync
+# with orchestrator.init._seed_codex_proxy_endpoint — duplicated here to avoid
+# importing init at runtime.
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
 
 async def _get_codex_subscription_models() -> set[str]:

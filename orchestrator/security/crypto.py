@@ -4,7 +4,7 @@ Used for:
 - user_api_keys.api_key
 - project_api_keys.api_key
 - system_api_keys.api_key
-- user_llm_endpoints.api_key
+- llm_endpoints.api_key
 
 Ciphertext format: ``v1:<nonce-b64>:<ct-b64>`` — the prefix lets a future
 version coexist with v1 ciphertexts during key rotation.

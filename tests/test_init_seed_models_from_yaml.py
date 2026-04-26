@@ -59,7 +59,7 @@ async def test_only_openai_seeded_only_openai_rows_inserted():
 
 @pytest.mark.asyncio
 async def test_local_provider_never_seeded():
-    """The 'local' YAML provider routes through user_llm_endpoints, not
+    """The 'local' YAML provider routes through llm_endpoints, not
     system_api_keys — it must never produce catalog rows even if 'local'
     somehow ends up in the seeded provider set."""
     db = _fake_db(seeded_providers=["local", "openai"])

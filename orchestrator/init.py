@@ -282,6 +282,10 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # mirrors the helm seeder Job)
         await _seed_llm_keys_from_env(db)
 
+        # Seed the codex-proxy system endpoint when CODEX_PROXY_URL is set
+        # (idempotent; matched by well-known label)
+        await _seed_codex_proxy_endpoint(db)
+
         # Seed the models catalog from config/models.yaml (idempotent —
         # admin edits via Cockpit are never clobbered)
         await _seed_models_from_yaml(db)
@@ -878,6 +882,62 @@ async def _seed_llm_keys_from_env(db) -> None:
         )
 
 
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+
+
+async def _seed_codex_proxy_endpoint(db) -> None:
+    """Seed a system-scoped llm_endpoints row for the codex proxy.
+
+    The proxy is an OpenAI-compatible front for ChatGPT subscriptions
+    (CLIProxyAPI). When CODEX_PROXY_URL is set in the orchestrator's env,
+    we insert one row with the well-known label ``codex-proxy`` so admins
+    can attach catalog models to it via Admin → Models.
+
+    Idempotent: re-runs short-circuit on label match. Admins who delete the
+    row will not see it recreated unless they wipe the table — matching the
+    existing seed-once contract.
+    """
+    proxy_url = os.environ.get("CODEX_PROXY_URL")
+    if not proxy_url:
+        logger.info(
+            "  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed"
+        )
+        return
+
+    try:
+        from orchestrator.seed.llm_config import seed as llm_seed
+    except ImportError as e:
+        logger.warning(f"  Could not import seed.llm_config: {e}")
+        return
+
+    # The proxy enforces Bearer auth on /v1/* (same model as /v0/management/*).
+    # apiKeyEnv defers secret resolution to seed time so the key never sits
+    # in this process between read and DB encryption.
+    base_url = proxy_url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+
+    payload = {
+        "systemEndpoints": [
+            {
+                "label": CODEX_PROXY_ENDPOINT_LABEL,
+                "baseUrl": base_url,
+                "apiKeyEnv": "CODEX_MANAGEMENT_KEY",
+                "models": [],
+            }
+        ]
+    }
+    report = await llm_seed(db, payload)
+    if CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded:
+        logger.info(
+            f"  Seeded codex-proxy endpoint at {base_url}"
+        )
+    elif CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_skipped:
+        logger.info(
+            "  codex-proxy endpoint already present — leaving untouched"
+        )
+
+
 _YAML_GROUP_ROLE = {
     "auxiliary_models": "auxiliary",
     "vision_models": "vision",
@@ -917,7 +977,7 @@ async def _seed_models_from_yaml(db) -> None:
     Rows whose inferred provider has no ``system_api_keys`` entry yet are
     skipped — they would not be reachable. The ``local`` provider (vLLM via
     a static endpoint) is also skipped: those models surface through the
-    ``user_llm_endpoints`` route, not as system rows.
+    ``llm_endpoints`` route, not as system rows.
     """
     catalog_path = Path(__file__).resolve().parent.parent / "config" / "models.yaml"
     if not catalog_path.exists():
@@ -1005,7 +1065,7 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
     rows into the catalog and drop the legacy table.
 
     Idempotent — bails out cleanly when the table no longer exists. User-
-    scoped rows (``user_llm_endpoints.user_id IS NOT NULL``) are *not*
+    scoped rows (``llm_endpoints.user_id IS NOT NULL``) are *not*
     migrated; the dual-scope complexity isn't worth carrying forward, and
     user-side authoring was unused in practice (per design doc §Decisions).
     """
@@ -1021,7 +1081,7 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
             SELECT m.endpoint_id, m.model_id, m.display_name, m.family,
                    m.context_window, m.reasoning_level, m.enabled, m.capability
               FROM user_llm_endpoint_models m
-              JOIN user_llm_endpoints e ON e.id = m.endpoint_id
+              JOIN llm_endpoints e ON e.id = m.endpoint_id
              WHERE e.user_id IS NULL
             """
         )
