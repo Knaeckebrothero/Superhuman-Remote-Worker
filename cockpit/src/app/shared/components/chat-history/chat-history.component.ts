@@ -3,6 +3,10 @@ import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { DataService } from '../../../core/services/data.service';
 import { RequestService } from '../../../debug/services/request.service';
 import { ChatEntry } from '../../../core/models/chat.model';
+import { AppButtonComponent } from '../../../ui/button';
+import { AppIconButtonComponent } from '../../../ui/icon-button';
+import { AppBadgeComponent, type BadgeTone } from '../../../ui/badge';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /** Parsed shell pane from <open_shells> block */
 interface ShellPane {
@@ -23,7 +27,13 @@ interface ShellPane {
 @Component({
   selector: 'app-chat-history',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="chat-container">
       <!-- Header -->
@@ -31,16 +41,22 @@ interface ShellPane {
         <span class="header-title">{{ 'chatHistory.title' | transloco }}</span>
         @if (data.currentJobId()) {
           <span class="entry-count">{{ entryCount() }}</span>
-          <button class="refresh-btn" (click)="data.refresh()" [title]="'chatHistory.refresh' | transloco">
-            &#x21BB;
-          </button>
+          <app-icon-button
+            variant="ghost"
+            size="sm"
+            [ariaLabel]="'chatHistory.refresh' | transloco"
+            [tooltip]="'chatHistory.refresh' | transloco"
+            (clicked)="data.refresh()"
+          >
+            ↻
+          </app-icon-button>
         }
       </div>
 
       <!-- Loading State -->
       @if (data.isLoading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
         </div>
       }
 
@@ -48,7 +64,9 @@ interface ShellPane {
       @if (data.error()) {
         <div class="error-state">
           <span>{{ data.error() }}</span>
-          <button (click)="data.refresh()">{{ 'chatHistory.retry' | transloco }}</button>
+          <app-button variant="danger" size="sm" (clicked)="data.refresh()">
+            {{ 'chatHistory.retry' | transloco }}
+          </app-button>
         </div>
       }
 
@@ -78,9 +96,9 @@ interface ShellPane {
               <!-- Turn Header -->
               <div class="turn-header">
                 <span class="turn-number">#{{ idx + 1 }}</span>
-                <span class="phase-badge" [class.strategic]="entry.phase === 'strategic'" [class.tactical]="entry.phase === 'tactical'">
+                <app-badge [tone]="phaseTone(entry.phase)" size="xs" [uppercase]="true">
                   {{ entry.phase || ('chatHistory.phaseUnknown' | transloco) }}
-                </span>
+                </app-badge>
                 <span class="iteration">{{ 'chatHistory.iter' | transloco: {n: entry.iteration} }}</span>
                 @if (entry.latency_ms) {
                   <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
@@ -132,10 +150,14 @@ interface ShellPane {
                             [class.idle]="pane.isIdle"
                             (click)="selectTab(entry._id, pane.name)"
                           >
-                            <span class="tab-type-badge" [attr.data-type]="pane.type">{{ pane.type }}</span>
+                            <app-badge [tone]="paneTypeTone(pane.type)" size="xs" [uppercase]="true">
+                              {{ pane.type }}
+                            </app-badge>
                             <span class="tab-name">{{ pane.name }}</span>
                             @if (pane.hasNewOutput) {
-                              <span class="new-output-badge">{{ 'chatHistory.newOutput' | transloco }}</span>
+                              <app-badge tone="warning" appearance="solid" size="xs" [uppercase]="true">
+                                {{ 'chatHistory.newOutput' | transloco }}
+                              </app-badge>
                             }
                             @if (pane.isIdle) {
                               <span class="idle-badge">{{ 'chatHistory.idle' | transloco }}</span>
@@ -252,22 +274,6 @@ interface ShellPane {
         color: var(--text-muted, #6c7086);
       }
 
-      .refresh-btn {
-        padding: 4px 8px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 14px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .refresh-btn:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-      }
-
       /* Loading Overlay */
       .loading-overlay {
         position: absolute;
@@ -282,21 +288,6 @@ interface ShellPane {
         z-index: 10;
       }
 
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
-      }
-
       /* Error State */
       .error-state {
         display: flex;
@@ -307,19 +298,6 @@ interface ShellPane {
         padding: 40px;
         color: #f38ba8;
         flex: 1;
-      }
-
-      .error-state button {
-        padding: 8px 16px;
-        border: 1px solid #f38ba8;
-        border-radius: 4px;
-        background: transparent;
-        color: #f38ba8;
-        cursor: pointer;
-      }
-
-      .error-state button:hover {
-        background: rgba(243, 139, 168, 0.1);
       }
 
       /* Empty State */
@@ -376,26 +354,6 @@ interface ShellPane {
       .turn-number {
         font-family: 'JetBrains Mono', monospace;
         color: var(--text-muted, #6c7086);
-      }
-
-      .phase-badge {
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        background: var(--surface-0, #313244);
-        color: var(--text-muted, #6c7086);
-      }
-
-      .phase-badge.strategic {
-        background: rgba(203, 166, 247, 0.2);
-        color: #cba6f7;
-      }
-
-      .phase-badge.tactical {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
       }
 
       .iteration {
@@ -687,40 +645,8 @@ interface ShellPane {
         background: rgba(148, 226, 213, 0.05);
       }
 
-      .tab-type-badge {
-        font-size: 9px;
-        padding: 1px 4px;
-        border-radius: 3px;
-        font-weight: 600;
-        text-transform: uppercase;
-      }
-
-      .tab-type-badge[data-type="shell"] {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .tab-type-badge[data-type="claude-code"] {
-        background: rgba(203, 166, 247, 0.2);
-        color: #cba6f7;
-      }
-
-      .tab-type-badge[data-type="ssh"] {
-        background: rgba(137, 180, 250, 0.2);
-        color: #89b4fa;
-      }
-
       .tab-name {
         font-weight: 600;
-      }
-
-      .new-output-badge {
-        font-size: 8px;
-        padding: 1px 4px;
-        border-radius: 3px;
-        background: rgba(250, 179, 135, 0.3);
-        color: #fab387;
-        font-weight: 700;
       }
 
       .idle-badge {
@@ -792,6 +718,30 @@ export class ChatHistoryComponent {
 
       this.previousEntryCount = currentCount;
     });
+  }
+
+  phaseTone(phase: string | null | undefined): BadgeTone {
+    switch (phase) {
+      case 'strategic':
+        return 'accent';
+      case 'tactical':
+        return 'success';
+      default:
+        return 'neutral';
+    }
+  }
+
+  paneTypeTone(type: string): BadgeTone {
+    switch (type) {
+      case 'shell':
+        return 'success';
+      case 'claude-code':
+        return 'accent';
+      case 'ssh':
+        return 'info';
+      default:
+        return 'neutral';
+    }
   }
 
   formatLatency(ms: number): string {

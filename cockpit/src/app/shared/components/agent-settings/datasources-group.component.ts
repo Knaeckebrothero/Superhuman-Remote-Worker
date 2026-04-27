@@ -1,5 +1,7 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 import {Datasource, DatasourceType} from '../../../core/models/api.model';
 
 /**
@@ -8,7 +10,7 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
 @Component({
   selector: 'app-datasources-group',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [TranslocoPipe, AppIconComponent, AppSpinnerComponent],
   template: `
     @if (!loading() && datasources().length > 0) {
       <div class="settings-group">
@@ -25,9 +27,7 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
                 (change)="toggle(ds.id)"
                 [disabled]="disabled()"
               >
-              <span class="ds-type-icon" [class]="'ds-type-' + ds.type">
-                {{ getTypeIcon(ds.type) }}
-              </span>
+              <app-icon size="md" class="ds-type-icon" [class]="'ds-type-' + ds.type">{{ getTypeIcon(ds.type) }}</app-icon>
               <span class="ds-info">
                 <span class="ds-name">{{ ds.name }}</span>
                 @if (ds.description) {
@@ -43,7 +43,8 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
       <div class="settings-group">
         <div class="group-label">{{ 'agentSettings.datasources.group' | transloco }}</div>
         <div class="ds-loading">
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
+
           {{ 'agentSettings.datasources.loading' | transloco }}
         </div>
       </div>
@@ -88,14 +89,12 @@ import {Datasource, DatasourceType} from '../../../core/models/api.model';
       flex-shrink: 0;
     }
     .ds-type-icon {
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 18px;
       color: var(--text-muted, #6c7086);
       flex-shrink: 0;
     }
-    .ds-type-postgresql { color: #89b4fa; }
-    .ds-type-neo4j { color: #a6e3a1; }
-    .ds-type-mongodb { color: #fab387; }
+    .ds-type-postgresql { color: var(--info); }
+    .ds-type-neo4j { color: var(--success); }
+    .ds-type-mongodb { color: var(--alert); }
     .ds-type-webdav { color: #89dceb; }
     .ds-info {
       display: flex;

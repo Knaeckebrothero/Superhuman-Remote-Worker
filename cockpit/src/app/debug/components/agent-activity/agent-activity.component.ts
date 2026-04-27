@@ -2,6 +2,7 @@ import {Component, computed, effect, ElementRef, inject, signal, viewChild, view
 import {DataService} from '../../../core/services/data.service';
 import {RequestService} from '../../services/request.service';
 import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/models/audit.model';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 /**
  * Agent Activity component that displays MongoDB audit trail.
@@ -13,6 +14,7 @@ import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/mode
 @Component({
   selector: 'app-agent-activity',
   standalone: true,
+  imports: [AppSpinnerComponent],
   template: `
     <div class="activity-container">
       <!-- Filter Bar -->
@@ -32,7 +34,7 @@ import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/mode
       <!-- Loading State -->
       @if (data.isLoading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           @if (data.loadingProgress() > 0) {
             <span class="progress">{{ data.loadingProgress() }}%</span>
           }
@@ -363,25 +365,10 @@ import {AuditEntry, AuditFilterCategory, AuditStepType} from '../../../core/mode
         z-index: 10;
       }
 
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
       .progress {
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
         color: var(--text-muted, #6c7086);
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
       }
 
       /* Error State */

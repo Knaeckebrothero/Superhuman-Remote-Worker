@@ -1,6 +1,7 @@
 import { Component, inject, signal, effect, computed } from '@angular/core';
 import { ApiService } from '../../../core/services/api.service';
 import { DataService } from '../../../core/services/data.service';
+import { AppIconButtonComponent } from '../../../ui/icon-button';
 
 interface RepoEntry {
   name: string;
@@ -18,14 +19,23 @@ interface RepoEntry {
 @Component({
   selector: 'app-workspace-browser',
   standalone: true,
+  imports: [AppIconButtonComponent],
   template: `
     <div class="browser-container">
       <!-- Header -->
       <div class="header">
         <span class="title">Workspace</span>
-        <button class="refresh-btn" (click)="loadDirectory(currentPath())" [disabled]="isLoadingTree()">
-          &#x21bb;
-        </button>
+        <app-icon-button
+          variant="ghost"
+          size="sm"
+          class="refresh-btn"
+          ariaLabel="Refresh"
+          tooltip="Refresh"
+          [disabled]="isLoadingTree()"
+          (clicked)="loadDirectory(currentPath())"
+        >
+          ↻
+        </app-icon-button>
       </div>
 
       @if (!currentJobId()) {
@@ -151,17 +161,6 @@ interface RepoEntry {
 
       .refresh-btn {
         margin-left: auto;
-        padding: 4px 8px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 14px;
-        cursor: pointer;
-      }
-
-      .refresh-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
       }
 
       .empty-state {

@@ -1,4 +1,5 @@
 import { Component, Input, Output, EventEmitter } from '@angular/core';
+import { AppIconComponent } from '../../../ui/icon';
 
 export type AgentStepType =
   | 'thought'
@@ -26,6 +27,7 @@ export interface IAgentStep {
 @Component({
   selector: 'app-agent-steps',
   standalone: true,
+  imports: [AppIconComponent],
   templateUrl: './agent-steps.component.html',
   styleUrls: ['./agent-steps.component.scss'],
 })

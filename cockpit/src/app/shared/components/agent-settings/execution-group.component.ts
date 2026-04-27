@@ -2,6 +2,7 @@ import {Component, computed, inject, input, output, signal} from '@angular/core'
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {toSignal} from '@angular/core/rxjs-interop';
+import {AppIconComponent} from '../../../ui/icon';
 import {
   AUTONOMY_LEVELS,
   CRITIC_ROUND_OPTIONS,
@@ -17,7 +18,7 @@ import {
 @Component({
   selector: 'app-execution-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.execution.group' | transloco }}</div>
@@ -39,7 +40,7 @@ import {
             </select>
             @if (autonomy() !== null) {
               <button type="button" class="reset-btn" (click)="autonomy.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
-                close
+                <app-icon size="xs">close</app-icon>
               </button>
             }
           </div>
@@ -61,7 +62,7 @@ import {
             </select>
             @if (permissionMode() !== null) {
               <button type="button" class="reset-btn" (click)="permissionMode.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
-                close
+                <app-icon size="xs">close</app-icon>
               </button>
             }
           </div>
@@ -83,7 +84,7 @@ import {
           </label>
           @if (scholar() !== null) {
             <button type="button" class="reset-btn" (click)="scholar.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
-              close
+              <app-icon size="xs">close</app-icon>
             </button>
           }
         </div>
@@ -115,7 +116,7 @@ import {
           }
           @if (critic() !== null || criticRounds() !== null) {
             <button type="button" class="reset-btn" (click)="resetCritic()" [title]="'agentSettings.common.resetToDefault' | transloco">
-              close
+              <app-icon size="xs">close</app-icon>
             </button>
           }
         </div>
@@ -135,7 +136,7 @@ import {
           </label>
           @if (projectMemory() !== null) {
             <button type="button" class="reset-btn" (click)="projectMemory.set(null)" [title]="'agentSettings.common.resetToDefault' | transloco">
-              close
+              <app-icon size="xs">close</app-icon>
             </button>
           }
         </div>
@@ -229,14 +230,12 @@ import {
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
       color: var(--text-muted, #6c7086);
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 14px;
       cursor: pointer;
       flex-shrink: 0;
     }
     .reset-btn:hover {
-      background: rgba(243, 139, 168, 0.2);
-      color: #f38ba8;
+      background: var(--danger-tint);
+      color: var(--danger);
     }
     .field-hint {
       display: block;

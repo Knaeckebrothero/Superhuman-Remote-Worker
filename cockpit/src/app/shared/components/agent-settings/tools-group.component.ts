@@ -1,6 +1,7 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../../ui/icon';
 import {
     JOB_TOOL_CATEGORIES,
     readConfigPath,
@@ -17,7 +18,7 @@ import {
 @Component({
   selector: 'app-tools-group',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe],
+  imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.tools.group' | transloco }}</div>
@@ -34,7 +35,7 @@ import {
               (change)="toggleCategory(cat.key)"
               [disabled]="disabled()"
             >
-            <span class="tool-toggle-icon">{{ cat.icon }}</span>
+            <app-icon size="md" class="tool-toggle-icon">{{ cat.icon }}</app-icon>
             <span class="tool-toggle-info">
               <span class="tool-toggle-name">{{ 'agentSettings.toolCategories.' + cat.key + '.label' | transloco }}</span>
               <span class="tool-toggle-desc">{{ 'agentSettings.toolCategories.' + cat.key + '.description' | transloco }}</span>
@@ -44,7 +45,7 @@ import {
                 class="reset-btn"
                 (click)="resetCategory(cat.key, $event)"
                 [title]="'agentSettings.common.resetToDefault' | transloco"
-              >close</button>
+              ><app-icon size="xs">close</app-icon></button>
             }
           </label>
           @if (cat.key === 'delegation' && isCategoryEnabled('delegation')) {
@@ -123,8 +124,6 @@ import {
       flex-shrink: 0;
     }
     .tool-toggle-icon {
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 18px;
       color: var(--text-muted, #6c7086);
       flex-shrink: 0;
     }
@@ -154,14 +153,12 @@ import {
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
       color: var(--text-muted, #6c7086);
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 14px;
       cursor: pointer;
       flex-shrink: 0;
     }
     .reset-btn:hover {
-      background: rgba(243, 139, 168, 0.2);
-      color: #f38ba8;
+      background: var(--danger-tint);
+      color: var(--danger);
     }
     .inline-params {
       display: flex;

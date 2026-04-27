@@ -3,6 +3,11 @@ import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
 import { TodoService } from '../../../core/services/todo.service';
 import { DataService } from '../../../core/services/data.service';
 import { TodoItem } from '../../../core/models/todo.model';
+import { AppButtonComponent } from '../../../ui/button';
+import { AppIconButtonComponent } from '../../../ui/icon-button';
+import { AppBadgeComponent } from '../../../ui/badge';
+import { AppSelectComponent } from '../../../ui/select';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
  * Todo list component that displays current and archived todos.
@@ -11,15 +16,23 @@ import { TodoItem } from '../../../core/models/todo.model';
 @Component({
   selector: 'app-todo-list',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppSelectComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="todo-container">
       <!-- Header with phase selector -->
       <div class="header">
-        <select
+        <app-select
+          size="sm"
           class="phase-selector"
           [value]="todo.selectedArchive() || 'current'"
-          (change)="onPhaseSelect($event)"
+          (changed)="onPhaseChange($event)"
         >
           <option value="current" [disabled]="!todo.currentTodos()">
             {{ 'todoList.phaseSelector.current' | transloco }}
@@ -39,15 +52,17 @@ import { TodoItem } from '../../../core/models/todo.model';
               }
             </optgroup>
           }
-        </select>
-        <button
-          class="refresh-btn"
-          (click)="todo.refresh()"
+        </app-select>
+        <app-icon-button
+          variant="ghost"
+          size="sm"
+          [ariaLabel]="'todoList.refreshTitle' | transloco"
+          [tooltip]="'todoList.refreshTitle' | transloco"
           [disabled]="todo.isLoading()"
-          [title]="'todoList.refreshTitle' | transloco"
+          (clicked)="todo.refresh()"
         >
-          &#x21bb;
-        </button>
+          ↻
+        </app-icon-button>
       </div>
 
       <!-- Progress bar -->
@@ -77,7 +92,7 @@ import { TodoItem } from '../../../core/models/todo.model';
       <!-- Loading state -->
       @if (todo.isLoading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
         </div>
       }
 
@@ -85,7 +100,9 @@ import { TodoItem } from '../../../core/models/todo.model';
       @if (todo.error()) {
         <div class="error-state">
           <span>{{ todo.error() }}</span>
-          <button (click)="todo.refresh()">{{ 'todoList.retry' | transloco }}</button>
+          <app-button variant="danger" size="sm" (clicked)="todo.refresh()">
+            {{ 'todoList.retry' | transloco }}
+          </app-button>
         </div>
       }
 
@@ -153,7 +170,9 @@ import { TodoItem } from '../../../core/models/todo.model';
                 }
               </div>
               @if (item.priority === 'high') {
-                <span class="priority-badge">{{ 'todoList.priorityHigh' | transloco }}</span>
+                <app-badge tone="danger" appearance="solid" size="xs" [uppercase]="true">
+                  {{ 'todoList.priorityHigh' | transloco }}
+                </app-badge>
               }
             </div>
           }
@@ -201,46 +220,8 @@ import { TodoItem } from '../../../core/models/todo.model';
       flex-shrink: 0;
     }
 
-    .phase-selector {
+    app-select.phase-selector {
       flex: 1;
-      padding: 6px 10px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 4px;
-      background: var(--panel-bg, #181825);
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      cursor: pointer;
-    }
-
-    .phase-selector:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
-    }
-
-    .phase-selector optgroup {
-      color: var(--text-muted, #6c7086);
-    }
-
-    .refresh-btn {
-      padding: 6px 10px;
-      border: none;
-      border-radius: 4px;
-      background: transparent;
-      color: var(--text-secondary, #a6adc8);
-      font-size: 14px;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .refresh-btn:hover:not(:disabled) {
-      background: var(--panel-header-bg, #1e1e2e);
-      color: var(--text-primary, #cdd6f4);
-    }
-
-    .refresh-btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
     }
 
     /* Progress section */
@@ -313,19 +294,6 @@ import { TodoItem } from '../../../core/models/todo.model';
       z-index: 10;
     }
 
-    .spinner {
-      width: 32px;
-      height: 32px;
-      border: 3px solid var(--surface-0, #313244);
-      border-top-color: var(--accent-color, #cba6f7);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
-    }
-
     /* Error state */
     .error-state {
       display: flex;
@@ -336,15 +304,6 @@ import { TodoItem } from '../../../core/models/todo.model';
       padding: 40px;
       color: #f38ba8;
       flex: 1;
-    }
-
-    .error-state button {
-      padding: 8px 16px;
-      border: 1px solid #f38ba8;
-      border-radius: 4px;
-      background: transparent;
-      color: #f38ba8;
-      cursor: pointer;
     }
 
     /* Empty state */
@@ -454,16 +413,6 @@ import { TodoItem } from '../../../core/models/todo.model';
       font-family: 'JetBrains Mono', monospace;
     }
 
-    .priority-badge {
-      padding: 2px 6px;
-      border-radius: 3px;
-      background: #f38ba8;
-      color: var(--timeline-bg, #11111b);
-      font-size: 9px;
-      font-weight: 600;
-      flex-shrink: 0;
-    }
-
     /* Summary bar */
     .summary-bar {
       display: flex;
@@ -513,9 +462,8 @@ export class TodoListComponent implements OnInit {
     }
   }
 
-  onPhaseSelect(event: Event): void {
-    const value = (event.target as HTMLSelectElement).value;
-    if (value === 'current') {
+  onPhaseChange(value: string | null): void {
+    if (!value || value === 'current') {
       this.todo.showCurrent();
     } else {
       this.todo.selectArchive(value);

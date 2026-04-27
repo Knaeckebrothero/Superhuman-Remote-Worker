@@ -3,6 +3,10 @@ import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {Agent, AgentStatus} from '../../../core/models/api.model';
 import {JobSummary} from '../../../core/models/audit.model';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppDialogComponent} from '../../../ui/dialog';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 /**
  * Agent List component that displays registered agents.
@@ -12,65 +16,70 @@ import {JobSummary} from '../../../core/models/audit.model';
 @Component({
   selector: 'app-agent-list',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppBadgeComponent,
+    AppDialogComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="agent-list-container">
       <!-- Header -->
       <div class="header-bar">
         <span class="title">{{ 'agentList.title' | transloco }}</span>
         <span class="agent-count">{{ 'agentList.count' | transloco: {n: agents().length} }}</span>
-        <button class="refresh-btn" (click)="refresh()" [disabled]="isLoading()">
+        <app-button variant="secondary" size="sm" [disabled]="isLoading()" (clicked)="refresh()">
           {{ (isLoading() ? 'agentList.loading' : 'agentList.refresh') | transloco }}
-        </button>
+        </app-button>
       </div>
 
       <!-- Assignment Dialog -->
-      @if (showAssignDialog()) {
-        <div class="dialog-overlay" (click)="closeAssignDialog()">
-          <div class="dialog-content" (click)="$event.stopPropagation()">
-            <div class="dialog-header">
-              <span class="dialog-title">{{ 'agentList.assign.title' | transloco }}</span>
-              <button class="close-btn" (click)="closeAssignDialog()">&times;</button>
-            </div>
-            <div class="dialog-body">
-              @if (availableJobs().length === 0) {
-                <div class="no-jobs">
-                  <span>{{ 'agentList.assign.noJobs' | transloco }}</span>
-                  <span class="hint">{{ 'agentList.assign.noJobsHint' | transloco }}</span>
-                </div>
-              } @else {
-                <div class="job-select-list">
-                  @for (job of availableJobs(); track job.id) {
-                    <div
-                      class="job-option"
-                      [class.selected]="selectedJobId() === job.id"
-                      (click)="selectJob(job.id)"
-                    >
-                      <span class="job-prompt">{{ truncatePrompt(job.description) }}</span>
-                      <span class="job-meta">{{ job.id.slice(0, 8) }}... | {{ formatDate(job.created_at) }}</span>
-                    </div>
-                  }
-                </div>
-              }
-            </div>
-            <div class="dialog-footer">
-              <button class="btn btn-secondary" (click)="closeAssignDialog()">{{ 'agentList.assign.cancel' | transloco }}</button>
-              <button
-                class="btn btn-primary"
-                [disabled]="!selectedJobId() || isAssigning()"
-                (click)="confirmAssignment()"
-              >
-                {{ (isAssigning() ? 'agentList.assign.assigning' : 'agentList.assign.confirm') | transloco }}
-              </button>
-            </div>
+      <app-dialog
+        [open]="showAssignDialog()"
+        size="md"
+        [title]="'agentList.assign.title' | transloco"
+        (closed)="closeAssignDialog()"
+      >
+        @if (availableJobs().length === 0) {
+          <div class="no-jobs">
+            <span>{{ 'agentList.assign.noJobs' | transloco }}</span>
+            <span class="hint">{{ 'agentList.assign.noJobsHint' | transloco }}</span>
           </div>
-        </div>
-      }
+        } @else {
+          <div class="job-select-list">
+            @for (job of availableJobs(); track job.id) {
+              <div
+                class="job-option"
+                [class.selected]="selectedJobId() === job.id"
+                (click)="selectJob(job.id)"
+              >
+                <span class="job-prompt">{{ truncatePrompt(job.description) }}</span>
+                <span class="job-meta">{{ job.id.slice(0, 8) }}... | {{ formatDate(job.created_at) }}</span>
+              </div>
+            }
+          </div>
+        }
+        <ng-container appDialogActions>
+          <app-button variant="secondary" size="sm" (clicked)="closeAssignDialog()">
+            {{ 'agentList.assign.cancel' | transloco }}
+          </app-button>
+          <app-button
+            variant="primary"
+            size="sm"
+            [disabled]="!selectedJobId() || isAssigning()"
+            [loading]="isAssigning()"
+            (clicked)="confirmAssignment()"
+          >
+            {{ (isAssigning() ? 'agentList.assign.assigning' : 'agentList.assign.confirm') | transloco }}
+          </app-button>
+        </ng-container>
+      </app-dialog>
 
       <!-- Loading State -->
       @if (isLoading() && agents().length === 0) {
         <div class="loading-state">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>{{ 'agentList.loadingAgents' | transloco }}</span>
         </div>
       }
@@ -102,9 +111,9 @@ import {JobSummary} from '../../../core/models/audit.model';
               @for (agent of agents(); track agent.id) {
                 <tr [class]="'status-' + agent.status">
                   <td>
-                    <span class="status-badge" [class]="'status-' + agent.status">
+                    <app-badge [tone]="agentStatusTone(agent.status)" size="sm">
                       {{ getStatusIcon(agent.status) }} {{ 'agentList.status.' + agent.status | transloco }}
-                    </span>
+                    </app-badge>
                   </td>
                   <td class="config-name">{{ agent.config_name }}</td>
                   <td class="hostname">{{ agent.hostname || agent.pod_ip || '-' }}</td>
@@ -120,18 +129,19 @@ import {JobSummary} from '../../../core/models/audit.model';
                   <td class="heartbeat">{{ formatTimestamp(agent.last_heartbeat) }}</td>
                   <td class="actions">
                     @if (agent.status === 'ready') {
-                      <button
-                        class="action-btn assign"
-                        (click)="openAssignDialog(agent.id)"
-                        [title]="'agentList.actions.assignTitle' | transloco"
+                      <app-button
+                        variant="success"
+                        size="sm"
+                        [ariaLabel]="'agentList.actions.assignTitle' | transloco"
+                        (clicked)="openAssignDialog(agent.id)"
                       >
                         {{ 'agentList.actions.assign' | transloco }}
-                      </button>
+                      </app-button>
                     }
                     @if (agent.status === 'offline' || agent.status === 'failed') {
-                      <button class="action-btn remove" (click)="removeAgent(agent.id)">
+                      <app-button variant="danger" size="sm" (clicked)="removeAgent(agent.id)">
                         {{ 'agentList.actions.remove' | transloco }}
-                      </button>
+                      </app-button>
                     }
                   </td>
                 </tr>
@@ -152,9 +162,9 @@ import {JobSummary} from '../../../core/models/audit.model';
             {{ (autoRefreshEnabled() ? 'agentList.footer.autoRefreshOn' : 'agentList.footer.autoRefreshOff') | transloco }}
           </span>
         }
-        <button class="toggle-btn" (click)="toggleAutoRefresh()">
+        <app-button variant="secondary" size="sm" (clicked)="toggleAutoRefresh()">
           {{ (autoRefreshEnabled() ? 'agentList.footer.disable' : 'agentList.footer.enable') | transloco }}
-        </button>
+        </app-button>
       </div>
     </div>
   `,
@@ -194,93 +204,6 @@ import {JobSummary} from '../../../core/models/audit.model';
         font-size: 12px;
         color: var(--text-muted, #6c7086);
         margin-left: auto;
-      }
-
-      .refresh-btn {
-        padding: 5px 12px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .refresh-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .refresh-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      /* Dialog Overlay */
-      .dialog-overlay {
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        background: rgba(0, 0, 0, 0.6);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 100;
-      }
-
-      .dialog-content {
-        background: var(--panel-bg, #181825);
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 8px;
-        width: 90%;
-        max-width: 400px;
-        max-height: 80%;
-        display: flex;
-        flex-direction: column;
-      }
-
-      .dialog-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 12px 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
-      }
-
-      .dialog-title {
-        font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .close-btn {
-        background: none;
-        border: none;
-        color: var(--text-muted, #6c7086);
-        font-size: 20px;
-        cursor: pointer;
-        padding: 0;
-        line-height: 1;
-      }
-
-      .close-btn:hover {
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .dialog-body {
-        flex: 1;
-        overflow: auto;
-        padding: 16px;
-      }
-
-      .dialog-footer {
-        display: flex;
-        justify-content: flex-end;
-        gap: 10px;
-        padding: 12px 16px;
-        border-top: 1px solid var(--border-color, #313244);
       }
 
       .no-jobs {
@@ -334,39 +257,6 @@ import {JobSummary} from '../../../core/models/audit.model';
         color: var(--text-muted, #6c7086);
       }
 
-      .btn {
-        padding: 8px 16px;
-        border: none;
-        border-radius: 6px;
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .btn-secondary {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-      }
-
-      .btn-secondary:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-      }
-
-      .btn-primary {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-      }
-
-      .btn-primary:hover:not(:disabled) {
-        filter: brightness(1.1);
-      }
-
       /* Loading State */
       .loading-state {
         display: flex;
@@ -376,19 +266,6 @@ import {JobSummary} from '../../../core/models/audit.model';
         gap: 12px;
         padding: 40px;
         flex: 1;
-      }
-
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
       }
 
       /* Empty State */
@@ -448,58 +325,6 @@ import {JobSummary} from '../../../core/models/audit.model';
         background: var(--surface-0, #313244);
       }
 
-      /* Status Badge */
-      .status-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 500;
-        text-transform: capitalize;
-      }
-
-      .status-badge.status-ready {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .status-badge.status-working {
-        background: rgba(249, 226, 175, 0.2);
-        color: #f9e2af;
-      }
-
-      .status-badge.status-booting {
-        background: rgba(137, 180, 250, 0.2);
-        color: #89b4fa;
-      }
-
-      .status-badge.status-completed {
-        background: rgba(148, 226, 213, 0.2);
-        color: #94e2d5;
-      }
-
-      .status-badge.status-failed {
-        background: rgba(243, 139, 168, 0.2);
-        color: #f38ba8;
-      }
-
-      .status-badge.status-offline {
-        background: rgba(108, 112, 134, 0.2);
-        color: #6c7086;
-      }
-
-      .status-badge.status-session {
-        background: rgba(116, 199, 236, 0.2);
-        color: #74c7ec;
-      }
-
-      .status-badge.status-draining {
-        background: rgba(250, 179, 135, 0.2);
-        color: #fab387;
-      }
-
       .config-name {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
@@ -535,30 +360,8 @@ import {JobSummary} from '../../../core/models/audit.model';
       /* Action Buttons */
       .actions {
         white-space: nowrap;
-      }
-
-      .action-btn {
-        padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .action-btn.assign {
-        color: #a6e3a1;
-        border-color: #a6e3a1;
-      }
-
-      .action-btn.remove {
-        color: #f38ba8;
-        border-color: #f38ba8;
-      }
-
-      .action-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
+        display: flex;
+        gap: 6px;
       }
 
       /* Footer */
@@ -586,19 +389,6 @@ import {JobSummary} from '../../../core/models/audit.model';
         color: #f38ba8;
       }
 
-      .toggle-btn {
-        padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
-      }
-
-      .toggle-btn:hover {
-        background: var(--panel-header-bg, #1e1e2e);
-      }
     `,
   ],
 })
@@ -742,6 +532,20 @@ export class AgentListComponent implements OnInit, OnDestroy {
         this.refresh();
       }
     });
+  }
+
+  agentStatusTone(status: AgentStatus): BadgeTone {
+    switch (status) {
+      case 'ready': return 'success';
+      case 'completed': return 'success';
+      case 'working':
+      case 'draining': return 'warning';
+      case 'booting':
+      case 'session': return 'info';
+      case 'failed': return 'danger';
+      case 'offline': return 'neutral';
+      default: return 'neutral';
+    }
   }
 
   getStatusIcon(status: AgentStatus): string {

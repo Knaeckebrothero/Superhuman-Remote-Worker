@@ -2,7 +2,7 @@ import {Component, inject, OnDestroy, OnInit} from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {PersistentChatComponent} from '../../../shared/components/persistent-chat/persistent-chat.component';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
-import {ToastService} from '../../../core/services/toast.service';
+import {AppToastService} from '../../../ui/toast';
 import {ErrorMessageService} from '../../../core/services/error-message.service';
 
 @Component({
@@ -23,7 +23,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
     private readonly route = inject(ActivatedRoute);
     private readonly router = inject(Router);
     private readonly chat = inject(PersistentChatService);
-    private readonly toast = inject(ToastService);
+    private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
 
     ngOnInit(): void {
@@ -36,7 +36,7 @@ export class ChatPageComponent implements OnInit, OnDestroy {
                 this.chat.createAndConnect(state.createBody).then(
                     id => this.router.navigate(['/sessions', id], {replaceUrl: true}),
                     err => {
-                        this.toast.error(this.errors.translate(err, 'errors.sessions.createFailed'));
+                        this.toast.danger(this.errors.translate(err, 'errors.sessions.createFailed'));
                         this.router.navigate(['/sessions']);
                     }
                 );

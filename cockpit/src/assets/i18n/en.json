@@ -295,6 +295,11 @@
   },
   "settings": {
     "title": "Settings",
+    "appearance": {
+      "title": "Appearance",
+      "desc": "Choose between light and dark mode, or follow your system setting. The choice is saved on this device.",
+      "themeLabel": "Theme"
+    },
     "language": {
       "title": "Language",
       "desc": "Your preferred interface language. Changes apply immediately.",

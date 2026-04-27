@@ -1,15 +1,16 @@
 import { Component, inject } from '@angular/core';
 import { SidebarService } from '../../../core/services/sidebar.service';
 import { TranslocoPipe } from '@jsverse/transloco';
+import { AppIconComponent } from '../../../ui/icon';
 
 @Component({
   selector: 'app-sidebar-toggle',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [TranslocoPipe, AppIconComponent],
   template: `
     @if (sidebar.collapsed()) {
       <button class="sidebar-toggle" (click)="sidebar.expand()" [title]="'nav.openSidebar' | transloco">
-        <span class="toggle-icon">menu</span>
+        <app-icon size="lg" class="toggle-icon">menu</app-icon>
       </button>
     }
   `,
@@ -42,10 +43,6 @@ import { TranslocoPipe } from '@jsverse/transloco';
         border-color: var(--accent-color, #cba6f7);
       }
 
-      .toggle-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-      }
     `,
   ],
 })

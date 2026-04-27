@@ -1,5 +1,7 @@
 import {Component, computed, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 /**
  * Instructions tab: full-height markdown textarea with clear and reset actions.
@@ -9,13 +11,13 @@ import {FormsModule} from '@angular/forms';
 @Component({
   selector: 'app-instructions-tab',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, AppIconComponent, AppSpinnerComponent],
   template: `
     <div class="instructions-container">
       <div class="instructions-header">
         <label class="instructions-label">Custom Instructions</label>
         @if (loadingExpert()) {
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
         }
       </div>
 
@@ -30,7 +32,7 @@ import {FormsModule} from '@angular/forms';
 
       @if (streaming()) {
         <span class="streaming-hint">
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
           AI is editing instructions...
         </span>
       }
@@ -55,7 +57,7 @@ import {FormsModule} from '@angular/forms';
       </div>
 
       <div class="instructions-hint">
-        <span class="hint-icon">info</span>
+        <app-icon size="xs" class="hint-icon">info</app-icon>
         Builder AI can edit instructions via the job builder chat.
       </div>
     </div>
@@ -137,22 +139,6 @@ import {FormsModule} from '@angular/forms';
       font-size: 11px;
       color: var(--text-muted, #6c7086);
       padding: 6px 0;
-    }
-    .hint-icon {
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 14px;
-    }
-    .spinner-small {
-      display: inline-block;
-      width: 14px;
-      height: 14px;
-      border: 2px solid rgba(205, 214, 244, 0.2);
-      border-top-color: var(--accent-color, #cba6f7);
-      border-radius: 50%;
-      animation: spin 0.6s linear infinite;
-    }
-    @keyframes spin {
-      to { transform: rotate(360deg); }
     }
   `],
 })

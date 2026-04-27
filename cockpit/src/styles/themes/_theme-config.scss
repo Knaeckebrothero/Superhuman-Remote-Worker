@@ -1,0 +1,115 @@
+// Semantic theme tokens. Each map entry becomes a CSS custom property under
+// the corresponding .theme-<name> body class via _themes.scss apply-app-theme.
+//
+// Token-naming convention: keep existing bare names (--app-bg, --text-primary,
+// --accent-color, etc.) so existing feature components continue to resolve.
+// New tokens for upcoming primitives go alongside without breaking anything.
+//
+// Dark = Catppuccin Mocha (current production look — values copied 1:1).
+// Light = Catppuccin Latte (paired light variant for future toggle).
+
+// --- Catppuccin Mocha (dark) ---
+$dark-theme: (
+  // Surfaces
+  'app-bg':          #1e1e2e, // base
+  'panel-bg':        #181825, // mantle
+  'panel-header-bg': #1e1e2e, // base
+  'timeline-bg':     #11111b, // crust
+  'surface-0':       #313244,
+  'surface-1':       #45475a,
+  'surface-2':       #585b70,
+
+  // Borders
+  'border-color': #313244,
+
+  // Text
+  'text-primary':   #cdd6f4,
+  'text-secondary': #a6adc8,
+  'text-muted':     #8b92a8,
+
+  // Accent (mauve)
+  'accent-color': #cba6f7,
+  'accent-hover': #b4befe,
+
+  // Track / gutter (split panes, sliders)
+  'track-bg':      #313244,
+  'gutter-color':  #313244,
+  'gutter-hover':  #45475a,
+
+  // Interactive overlays (new — for primitives)
+  'hover':  rgba(255, 255, 255, 0.04),
+  'active': rgba(255, 255, 255, 0.08),
+
+  // Semantic colors (Catppuccin Mocha green/yellow/peach/blue/red)
+  'success':      #a6e3a1,
+  'warning':      #f9e2af,
+  'alert':        #fab387,
+  'info':         #89b4fa,
+  'danger':       #f38ba8,
+  'success-tint': rgba(166, 227, 161, 0.2),
+  'warning-tint': rgba(249, 226, 175, 0.2),
+  'alert-tint':   rgba(250, 179, 135, 0.2),
+  'info-tint':    rgba(137, 180, 250, 0.2),
+  'danger-tint':  rgba(243, 139, 168, 0.2),
+
+  // Shadows (new — for primitives)
+  'shadow-sm':   '0 1px 2px 0 rgba(0, 0, 0, 0.3)',
+  'shadow-md':   '0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3)',
+  'shadow-glow': '0 0 20px rgba(203, 166, 247, 0.2)',
+);
+
+// --- Catppuccin Latte (light) ---
+$light-theme: (
+  // Surfaces
+  'app-bg':          #eff1f5, // base
+  'panel-bg':        #e6e9ef, // mantle
+  'panel-header-bg': #eff1f5, // base
+  'timeline-bg':     #dce0e8, // crust
+  'surface-0':       #ccd0da,
+  'surface-1':       #bcc0cc,
+  'surface-2':       #acb0be,
+
+  // Borders
+  'border-color': #ccd0da,
+
+  // Text
+  'text-primary':   #4c4f69,
+  'text-secondary': #5c5f77,
+  'text-muted':     #6c6f85,
+
+  // Accent (mauve)
+  'accent-color': #8839ef,
+  'accent-hover': #7287fd,
+
+  // Track / gutter
+  'track-bg':      #ccd0da,
+  'gutter-color':  #ccd0da,
+  'gutter-hover':  #bcc0cc,
+
+  // Interactive overlays
+  'hover':  rgba(0, 0, 0, 0.04),
+  'active': rgba(0, 0, 0, 0.08),
+
+  // Semantic colors (Catppuccin Latte green/yellow/peach/blue/red)
+  'success':      #40a02b,
+  'warning':      #df8e1d,
+  'alert':        #fe640b,
+  'info':         #1e66f5,
+  'danger':       #d20f39,
+  'success-tint': rgba(64, 160, 43, 0.15),
+  'warning-tint': rgba(223, 142, 29, 0.15),
+  'alert-tint':   rgba(254, 100, 11, 0.15),
+  'info-tint':    rgba(30, 102, 245, 0.15),
+  'danger-tint':  rgba(210, 15, 57, 0.15),
+
+  // Shadows
+  'shadow-sm':   '0 1px 2px 0 rgba(0, 0, 0, 0.05)',
+  'shadow-md':   '0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1)',
+  'shadow-glow': '0 0 20px rgba(136, 57, 239, 0.15)',
+);
+
+// Central registry. apply-app-theme($name) reads from this.
+$themes: (
+  'dark':  $dark-theme,
+  'light': $light-theme,
+);

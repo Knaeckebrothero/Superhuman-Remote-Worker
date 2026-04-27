@@ -9,11 +9,12 @@ import {
     InstructionBuilderComponent
 } from '../../../shared/components/instruction-builder/instruction-builder.component';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../../ui/icon';
 
 @Component({
   selector: 'app-shell-page',
   standalone: true,
-  imports: [SidebarToggleComponent, InstructionBuilderComponent, TranslocoDatePipe, TranslocoPipe],
+  imports: [SidebarToggleComponent, InstructionBuilderComponent, TranslocoDatePipe, TranslocoPipe, AppIconComponent],
   template: `
       <div class="page">
         <header class="page-header">
@@ -22,13 +23,13 @@ import {TranslocoPipe} from '@jsverse/transloco';
           <div class="session-controls">
             <button class="session-title-btn" (click)="toggleSessionDropdown()">
               <span class="session-title-text">{{ artifacts.sessionTitle() || ('shell.newSession' | transloco) }}</span>
-              <span class="dropdown-arrow">expand_more</span>
+              <app-icon size="lg" class="dropdown-arrow">expand_more</app-icon>
             </button>
 
             @if (showSessionDropdown()) {
               <div class="session-dropdown">
                 <button class="session-option new-option" (click)="startNewSession()">
-                  <span class="new-icon">add</span>
+                  <app-icon size="md" class="new-icon">add</app-icon>
                   <span>{{ 'shell.newSession' | transloco }}</span>
                 </button>
                 @for (s of sessions(); track s.id) {
@@ -50,7 +51,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
           <div class="model-controls">
             <button class="model-title-btn" (click)="toggleModelDropdown()">
               <span class="model-title-text">{{ artifacts.builderModel() || ('shell.selectModel' | transloco) }}</span>
-              <span class="dropdown-arrow">expand_more</span>
+              <app-icon size="lg" class="dropdown-arrow">expand_more</app-icon>
             </button>
 
             @if (showModelDropdown()) {
@@ -144,8 +145,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
 
       .dropdown-arrow {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
         color: var(--text-muted, #6c7086);
         flex-shrink: 0;
       }
@@ -195,10 +194,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         justify-content: flex-start;
       }
 
-      .new-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
 
       .session-option-title {
         flex: 1;

@@ -11,18 +11,19 @@ import {NotificationBellComponent} from '../../shared/components/notification-be
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../ui/icon';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
         <span class="sidebar-logo">SRW</span>
         <span class="sidebar-label">{{ 'nav.cockpit' | transloco }}</span>
         <button class="collapse-btn" (click)="sidebar.collapse()" [title]="'nav.collapseSidebar' | transloco">
-          <span class="collapse-icon">chevron_left</span>
+          <app-icon size="md" class="collapse-icon">chevron_left</app-icon>
         </button>
       </div>
 
@@ -34,7 +35,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             routerLinkActive="active"
             [routerLinkActiveOptions]="{ exact: true }"
           >
-            <span class="nav-icon">construction</span>
+            <app-icon size="md" class="nav-icon">construction</app-icon>
             {{ 'nav.builder' | transloco }}
           </a>
           <a
@@ -42,7 +43,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             [routerLink]="sessionsLink()"
             routerLinkActive="active"
           >
-            <span class="nav-icon">chat</span>
+            <app-icon size="md" class="nav-icon">chat</app-icon>
             {{ 'nav.sessions' | transloco }}
           </a>
           <a
@@ -50,7 +51,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             routerLink="/jobs"
             routerLinkActive="active"
           >
-            <span class="nav-icon">work</span>
+            <app-icon size="md" class="nav-icon">work</app-icon>
             {{ 'nav.jobs' | transloco }}
           </a>
           <a
@@ -58,7 +59,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             routerLink="/projects"
             routerLinkActive="active"
           >
-            <span class="nav-icon">folder_shared</span>
+            <app-icon size="md" class="nav-icon">folder_shared</app-icon>
             {{ 'nav.projects' | transloco }}
           </a>
           <a
@@ -66,7 +67,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             routerLink="/datasources"
             routerLinkActive="active"
           >
-            <span class="nav-icon">database</span>
+            <app-icon size="md" class="nav-icon">database</app-icon>
             {{ 'nav.datasources' | transloco }}
           </a>
           <a
@@ -74,7 +75,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             routerLink="/create"
             routerLinkActive="active"
           >
-            <span class="nav-icon">add_circle</span>
+            <app-icon size="md" class="nav-icon">add_circle</app-icon>
             {{ 'nav.create' | transloco }}
           </a>
           @if (!viewport.isMobile()) {
@@ -83,7 +84,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
               routerLink="/debug"
               routerLinkActive="active"
             >
-              <span class="nav-icon">bug_report</span>
+              <app-icon size="md" class="nav-icon">bug_report</app-icon>
               {{ 'nav.debug' | transloco }}
             </a>
           }
@@ -93,7 +94,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
               routerLink="/admin/providers"
               routerLinkActive="active"
             >
-              <span class="nav-icon">key</span>
+              <app-icon size="md" class="nav-icon">key</app-icon>
               Admin · Providers
             </a>
             <a
@@ -101,7 +102,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
               routerLink="/admin/models"
               routerLinkActive="active"
             >
-              <span class="nav-icon">smart_toy</span>
+              <app-icon size="md" class="nav-icon">smart_toy</app-icon>
               Admin · Models
             </a>
             <a
@@ -109,7 +110,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
               routerLink="/admin/users"
               routerLinkActive="active"
             >
-              <span class="nav-icon">group</span>
+              <app-icon size="md" class="nav-icon">group</app-icon>
               Admin · Users
             </a>
           }
@@ -258,10 +259,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         background: var(--surface-0, #313244);
       }
 
-      .collapse-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-      }
 
       .sidebar-body {
         flex: 1;
@@ -299,11 +296,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .nav-link.active {
         background: var(--surface-0, #313244);
         color: var(--accent-color, #cba6f7);
-      }
-
-      .nav-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
       }
 
       /* Debug sections */

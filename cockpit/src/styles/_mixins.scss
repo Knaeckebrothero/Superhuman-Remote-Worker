@@ -1,0 +1,76 @@
+@use 'variables' as v;
+
+// Centered flex container.
+@mixin flex-center($direction: row) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: $direction;
+}
+
+// Mobile-first responsive font size.
+@mixin responsive-font($size-mobile, $size-desktop) {
+  font-size: $size-mobile;
+
+  @media (min-width: v.$breakpoint-md) {
+    font-size: $size-desktop;
+  }
+}
+
+// Visible focus ring using the theme accent.
+// Use on :focus-visible — never on :focus alone (causes mouse-click rings).
+@mixin focus-ring($offset: 2px) {
+  outline: 2px solid var(--accent-color);
+  outline-offset: $offset;
+}
+
+// Keyboard-only focus ring.
+@mixin focus-visible-only {
+  &:focus {
+    outline: none;
+  }
+  &:focus-visible {
+    @include focus-ring;
+  }
+}
+
+// Enforce a minimum touch target on mobile.
+@mixin touch-target {
+  min-height: v.$touch-target-min;
+  min-width: v.$touch-target-min;
+}
+
+// Truncate single-line text with ellipsis.
+@mixin truncate {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+// Visually hidden but accessible to screen readers.
+@mixin visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+// Media query helpers.
+@mixin breakpoint-up($name) {
+  @if $name == sm { @media (min-width: v.$breakpoint-sm) { @content; } }
+  @else if $name == md { @media (min-width: v.$breakpoint-md) { @content; } }
+  @else if $name == lg { @media (min-width: v.$breakpoint-lg) { @content; } }
+  @else if $name == xl { @media (min-width: v.$breakpoint-xl) { @content; } }
+}
+
+@mixin breakpoint-down($name) {
+  @if $name == sm { @media (max-width: v.$breakpoint-sm - 0.02px) { @content; } }
+  @else if $name == md { @media (max-width: v.$breakpoint-md - 0.02px) { @content; } }
+  @else if $name == lg { @media (max-width: v.$breakpoint-lg - 0.02px) { @content; } }
+  @else if $name == xl { @media (max-width: v.$breakpoint-xl - 0.02px) { @content; } }
+}
