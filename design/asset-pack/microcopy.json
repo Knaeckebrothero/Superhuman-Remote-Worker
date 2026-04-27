@@ -1,0 +1,19 @@
+{
+  "splash": "Assembling legion…",
+  "install_title": "Garrison SRW on this device",
+  "install_body": "Pin SRW to your home screen for fast access.",
+  "install_cta": "Install",
+  "update_title": "A new standard is ready",
+  "update_body": "Reload to deploy the latest version.",
+  "update_cta": "Reload",
+  "offline_banner": "Off the road — working from cache.",
+  "offline_title": "Lost contact with the camp",
+  "offline_body": "Showing your most recent dispatches.",
+  "empty_inbox": "No dispatches waiting.",
+  "empty_jobs": "No jobs in the field.",
+  "empty_sessions": "No active sessions.",
+  "session_running": "Legion in the field",
+  "checkpoint": "Mile marker · review and proceed",
+  "sync_complete": "Reports filed.",
+  "error_generic": "The signal didn't reach. Try again."
+}

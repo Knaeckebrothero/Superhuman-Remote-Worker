@@ -88,10 +88,10 @@ export class ThemeService {
   }
 
   private readStoredPreference(): ThemePreference {
-    if (!this.isBrowser) return 'senate';
+    if (!this.isBrowser) return 'system';
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (!raw) return 'senate';
+      if (!raw) return 'system';
       // Migrate legacy Catppuccin keys in-place so subsequent reads stay quiet.
       if (raw in LEGACY_MIGRATIONS) {
         const migrated = LEGACY_MIGRATIONS[raw];
@@ -106,7 +106,7 @@ export class ThemeService {
     } catch {
       // ignore
     }
-    return 'senate';
+    return 'system';
   }
 
   private readSystemPrefersDark(): boolean {
