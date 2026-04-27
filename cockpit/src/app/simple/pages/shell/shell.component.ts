@@ -9,12 +9,13 @@ import {
     InstructionBuilderComponent
 } from '../../../shared/components/instruction-builder/instruction-builder.component';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {RouterLink} from '@angular/router';
 import {AppIconComponent} from '../../../ui/icon';
 
 @Component({
   selector: 'app-shell-page',
   standalone: true,
-  imports: [SidebarToggleComponent, InstructionBuilderComponent, TranslocoDatePipe, TranslocoPipe, AppIconComponent],
+  imports: [SidebarToggleComponent, InstructionBuilderComponent, TranslocoDatePipe, TranslocoPipe, RouterLink, AppIconComponent],
   template: `
       <div class="page">
         <header class="page-header">
@@ -56,17 +57,26 @@ import {AppIconComponent} from '../../../ui/icon';
 
             @if (showModelDropdown()) {
               <div class="model-dropdown">
-                @for (group of modelGroups(); track group.group) {
-                  <div class="model-group-header" [class.unconfigured]="!group.configured">
-                    {{ group.configured ? group.group : group.group + ' ' + ('shell.noKey' | transloco) }}
+                @if (modelGroups().length === 0) {
+                  <div class="model-empty">
+                    <span class="model-empty-title">{{ 'shell.noModelsTitle' | transloco }}</span>
+                    <a routerLink="/admin/providers" class="model-empty-link" (click)="showModelDropdown.set(false)">
+                      {{ 'shell.noModelsCta' | transloco }} →
+                    </a>
                   </div>
-                  @for (model of group.models; track model) {
-                    <button
-                      class="model-option"
-                      [class.active]="model === artifacts.builderModel()"
-                      [class.unconfigured]="!group.configured"
-                      (click)="selectModel(model)"
-                    >{{ model }}</button>
+                } @else {
+                  @for (group of modelGroups(); track group.group) {
+                    <div class="model-group-header" [class.unconfigured]="!group.configured">
+                      {{ group.configured ? group.group : group.group + ' ' + ('shell.noKey' | transloco) }}
+                    </div>
+                    @for (model of group.models; track model) {
+                      <button
+                        class="model-option"
+                        [class.active]="model === artifacts.builderModel()"
+                        [class.unconfigured]="!group.configured"
+                        (click)="selectModel(model)"
+                      >{{ model }}</button>
+                    }
                   }
                 }
               </div>
@@ -106,6 +116,13 @@ import {AppIconComponent} from '../../../ui/icon';
         background: var(--timeline-bg, #11111b);
         border-bottom: 1px solid var(--border-color, #313244);
         flex-shrink: 0;
+        position: relative;
+        z-index: 10;
+      }
+
+      .page-content {
+        flex: 1;
+        overflow: hidden;
       }
 
       .header-spacer {
@@ -297,6 +314,30 @@ import {AppIconComponent} from '../../../ui/icon';
         opacity: 0.5;
       }
 
+      .model-empty {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 14px 14px 12px;
+      }
+
+      .model-empty-title {
+        font-size: 12px;
+        color: var(--text-secondary, #a6adc8);
+        line-height: 1.4;
+      }
+
+      .model-empty-link {
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--accent-color, #cba6f7);
+        text-decoration: none;
+      }
+
+      .model-empty-link:hover {
+        text-decoration: underline;
+      }
+
       .streaming-badge {
         display: flex;
         align-items: center;
@@ -319,11 +360,6 @@ import {AppIconComponent} from '../../../ui/icon';
         50% {
           opacity: 0.3;
         }
-      }
-
-      .page-content {
-        flex: 1;
-        overflow: hidden;
       }
 
       @media (max-width: 768px) {
