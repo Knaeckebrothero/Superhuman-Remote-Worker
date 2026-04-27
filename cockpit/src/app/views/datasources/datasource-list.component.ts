@@ -497,7 +497,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       /* Header */
@@ -507,14 +507,14 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         gap: 12px;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
         flex-wrap: wrap;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .filter-chips {
@@ -542,21 +542,21 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .success-msg {
-        background: rgba(166, 227, 161, 0.15);
-        border: 1px solid rgba(166, 227, 161, 0.3);
-        color: #a6e3a1;
+        background: var(--success-tint);
+        border: 1px solid var(--success-tint);
+        color: var(--success);
       }
 
       .error-msg {
-        background: rgba(243, 139, 168, 0.15);
-        border: 1px solid rgba(243, 139, 168, 0.3);
-        color: #f38ba8;
+        background: var(--danger-tint);
+        border: 1px solid var(--danger-tint);
+        color: var(--danger);
       }
 
       /* Form Panel */
       .form-panel {
         margin: 8px 12px 0;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
         background: rgba(0, 0, 0, 0.2);
         flex-shrink: 0;
@@ -567,10 +567,10 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         justify-content: space-between;
         padding: 10px 14px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         font-weight: 600;
         font-size: 13px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .form-body {
@@ -612,11 +612,11 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       .form-hint {
         margin-top: 6px;
         padding: 8px 10px;
-        background: rgba(137, 180, 250, 0.08);
-        border: 1px solid rgba(137, 180, 250, 0.15);
+        background: var(--info-tint);
+        border: 1px solid var(--info-tint);
         border-radius: 4px;
         font-size: 11px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         line-height: 1.5;
       }
 
@@ -660,7 +660,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 6px;
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         cursor: pointer;
       }
 
@@ -681,13 +681,13 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .test-ok {
-        background: rgba(166, 227, 161, 0.1);
-        color: #a6e3a1;
+        background: var(--success-tint);
+        color: var(--success);
       }
 
       .test-error {
-        background: rgba(243, 139, 168, 0.1);
-        color: #f38ba8;
+        background: var(--danger-tint);
+        color: var(--danger);
       }
 
       /* Center States */
@@ -729,24 +729,24 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       .ds-table th {
         text-align: left;
         padding: 8px 10px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         color: var(--text-muted, #6c7086);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
         letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, #45475a);
+        border-bottom: 1px solid var(--border-color, var(--surface-1));
       }
 
       .ds-table td {
         padding: 10px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        color: var(--text-primary, #cdd6f4);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
         vertical-align: middle;
       }
 
       .ds-table tbody tr:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       app-badge app-icon {
@@ -777,7 +777,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       .url-cell {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         max-width: 220px;
         white-space: nowrap;
         overflow: hidden;

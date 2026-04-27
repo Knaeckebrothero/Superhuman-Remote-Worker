@@ -155,7 +155,7 @@ import {
       color: var(--text-muted, #6c7086);
       margin-bottom: 12px;
       padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
     }
     .field-row {
       margin-bottom: 12px;
@@ -164,13 +164,13 @@ import {
       transition: border-color 0.15s;
     }
     .field-row.modified {
-      border-left-color: var(--accent-color, #cba6f7);
+      border-left-color: var(--accent-color, var(--accent-color));
     }
     .field-label {
       display: block;
       font-size: 12px;
       font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       margin-bottom: 4px;
     }
     .field-control {
@@ -181,16 +181,16 @@ import {
     .form-input {
       flex: 1;
       padding: 7px 10px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+      background: var(--surface-0, var(--surface-0));
+      color: var(--text-primary, var(--text-primary));
       font-family: inherit;
       font-size: 13px;
     }
     .form-input:focus {
       outline: none;
-      border-color: var(--accent-color, #cba6f7);
+      border-color: var(--accent-color, var(--accent-color));
     }
     .form-input:disabled {
       opacity: 0.6;
@@ -214,11 +214,11 @@ import {
       align-items: center;
       gap: 6px;
       font-size: 13px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       cursor: pointer;
     }
     .toggle-label input[type="checkbox"] {
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
     }
     .reset-btn {
       display: inline-flex;

@@ -180,7 +180,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         position: relative;
       }
 
@@ -191,13 +191,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         gap: 12px;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .agent-count {
@@ -227,8 +227,8 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .job-option {
         padding: 10px 12px;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 6px;
         cursor: pointer;
         transition: all 0.15s ease;
@@ -239,13 +239,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       }
 
       .job-option.selected {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.1);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .job-prompt {
         display: block;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
         margin-bottom: 4px;
       }
@@ -306,23 +306,23 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       .agent-table th {
         text-align: left;
         padding: 8px 10px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         color: var(--text-muted, #6c7086);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
         letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, #45475a);
+        border-bottom: 1px solid var(--border-color, var(--surface-1));
       }
 
       .agent-table td {
         padding: 10px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        color: var(--text-primary, #cdd6f4);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
       }
 
       .agent-table tbody tr:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .config-name {
@@ -333,13 +333,13 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       .hostname {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       .job-link {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: #89b4fa;
+        color: var(--info);
         cursor: pointer;
       }
 
@@ -370,8 +370,8 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         align-items: center;
         justify-content: space-between;
         padding: 8px 12px;
-        background: var(--surface-0, #313244);
-        border-top: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, var(--surface-0));
+        border-top: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
@@ -382,11 +382,11 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
       .status-message {
         font-size: 11px;
-        color: #a6e3a1;
+        color: var(--success);
       }
 
       .status-message.error {
-        color: #f38ba8;
+        color: var(--danger);
       }
 
     `,

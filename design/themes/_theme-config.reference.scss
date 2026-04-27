@@ -1,13 +1,7 @@
-// Semantic theme tokens. Each map entry becomes a CSS custom property under
-// the corresponding .theme-<name> body class via _themes.scss apply-app-theme.
-//
-// Token-naming convention: keep existing bare names (--app-bg, --text-primary,
-// --accent-color, etc.) so existing feature components continue to resolve.
-//
-// Active themes: Travertine (light default), Senate (dark default), Praetorian
-// (high-contrast dark). The legacy Catppuccin dark/light maps were removed —
-// theme.service.ts migrates old `dark`/`light` localStorage values to the
-// Roman defaults on read.
+// New theme maps for SRW Cockpit. Adds Travertine (light), Senate (dark),
+// and Praetorian (high-contrast dark) alongside the existing Catppuccin
+// Mocha + Latte themes. Drop this file next to _theme-config.scss and
+// import it from there (see _theme-config.scss.patch.md).
 
 // =============================================================================
 // LEGION — TRAVERTINE (light)
@@ -61,7 +55,7 @@ $travertine-theme: (
   'shadow-md':   '0 1px 2px rgba(42,29,18,0.05), 0 12px 28px rgba(42,29,18,0.08)',
   'shadow-glow': '0 0 20px rgba(156, 31, 46, 0.12)',
 
-  // Chat bubble tokens
+  // New: chat bubble tokens (optional — see README mapping)
   'user-bubble':      #fbe4d4,
   'user-bubble-text': #7a2c12,
 );
@@ -176,11 +170,4 @@ $praetorian-theme: (
   // Chat bubbles
   'user-bubble':      #1a0608,
   'user-bubble-text': #f5d8d8,
-);
-
-// Central registry. apply-app-theme($name) reads from this.
-$themes: (
-  'travertine': $travertine-theme,
-  'senate':     $senate-theme,
-  'praetorian': $praetorian-theme,
 );

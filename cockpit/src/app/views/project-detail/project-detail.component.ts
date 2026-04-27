@@ -1298,7 +1298,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       background: var(--surface-0); color: var(--text-secondary);
     }
 
-    .kb-type-badge[data-type="decision"] { background: rgba(203, 166, 247, 0.2); color: var(--accent-color); }
+    .kb-type-badge[data-type="decision"] { background: color-mix(in srgb, var(--accent-color) 20%, transparent); color: var(--accent-color); }
     .kb-type-badge[data-type="learning"] { background: var(--success-tint); color: var(--success); }
     .kb-type-badge[data-type="goal"] { background: var(--warning-tint); color: var(--warning); }
 

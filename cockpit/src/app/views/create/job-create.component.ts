@@ -318,7 +318,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       /* Header */
@@ -327,13 +327,13 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       /* Form Container */
@@ -357,15 +357,15 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .success-message {
-        background: rgba(166, 227, 161, 0.15);
-        border: 1px solid rgba(166, 227, 161, 0.3);
-        color: #a6e3a1;
+        background: var(--success-tint);
+        border: 1px solid var(--success-tint);
+        color: var(--success);
       }
 
       .error-message {
-        background: rgba(243, 139, 168, 0.15);
-        border: 1px solid rgba(243, 139, 168, 0.3);
-        color: #f38ba8;
+        background: var(--danger-tint);
+        border: 1px solid var(--danger-tint);
+        color: var(--danger);
       }
 
       /* Form Groups */
@@ -378,11 +378,11 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         margin-bottom: 6px;
         font-size: 12px;
         font-weight: 500;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .required {
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .instructions-actions {
@@ -403,8 +403,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .btn-text:hover:not(:disabled) {
-        color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.1);
+        color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .btn-text:disabled {
@@ -427,10 +427,10 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       .preset-chip {
         padding: 6px 14px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 16px;
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
+        background: var(--surface-0, var(--surface-0));
+        color: var(--text-secondary, var(--text-secondary));
         font-size: 12px;
         font-family: inherit;
         cursor: pointer;
@@ -438,14 +438,14 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .preset-chip:hover:not(:disabled) {
-        border-color: var(--accent-color, #cba6f7);
-        color: var(--text-primary, #cdd6f4);
+        border-color: var(--accent-color, var(--accent-color));
+        color: var(--text-primary, var(--text-primary));
       }
 
       .preset-chip.active {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.15);
-        color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+        color: var(--accent-color, var(--accent-color));
       }
 
       .preset-chip:disabled {
@@ -472,7 +472,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         height: 4px;
         -webkit-appearance: none;
         appearance: none;
-        background: var(--border-color, #45475a);
+        background: var(--border-color, var(--surface-1));
         border-radius: 2px;
         outline: none;
       }
@@ -482,7 +482,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         width: 16px;
         height: 16px;
         border-radius: 50%;
-        background: var(--accent-color, #cba6f7);
+        background: var(--accent-color, var(--accent-color));
         cursor: pointer;
       }
 
@@ -490,7 +490,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         width: 16px;
         height: 16px;
         border-radius: 50%;
-        background: var(--accent-color, #cba6f7);
+        background: var(--accent-color, var(--accent-color));
         cursor: pointer;
         border: none;
       }
@@ -514,9 +514,9 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .phase-card {
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         padding: 14px;
         min-width: 0;
       }
@@ -527,7 +527,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         gap: 6px;
         font-size: 12px;
         font-weight: 600;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         margin-bottom: 12px;
       }
 
@@ -540,14 +540,14 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 8px;
         font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         cursor: pointer;
         padding: 4px 0;
       }
 
       .multimodal-toggle input[type="checkbox"] {
         margin: 0;
-        accent-color: var(--accent-color, #cba6f7);
+        accent-color: var(--accent-color, var(--accent-color));
       }
 
       .memory-toggle {
@@ -555,13 +555,13 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 8px;
         font-size: 13px;
-        color: var(--text, #cdd6f4);
+        color: var(--text, var(--text-primary));
         cursor: pointer;
       }
 
       .memory-toggle input[type="checkbox"] {
         margin: 0;
-        accent-color: var(--accent-color, #cba6f7);
+        accent-color: var(--accent-color, var(--accent-color));
       }
 
       .subjob-detail {
@@ -607,16 +607,16 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 10px;
         padding: 8px 10px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 6px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
       .tool-toggle:hover:not(.disabled) {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.05);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .tool-toggle.disabled {
@@ -626,7 +626,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       .tool-toggle input[type="checkbox"] {
         margin: 0;
-        accent-color: var(--accent-color, #cba6f7);
+        accent-color: var(--accent-color, var(--accent-color));
       }
 
       .tool-toggle-info {
@@ -638,7 +638,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         display: block;
         font-size: 12px;
         font-weight: 500;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .tool-toggle-desc {
@@ -658,14 +658,14 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         display: block;
         margin-top: 4px;
         font-size: 11px;
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .field-warning {
         display: block;
         margin-top: 4px;
         font-size: 11px;
-        color: var(--ctp-yellow, #f9e2af);
+        color: var(--ctp-yellow, var(--warning));
       }
 
       /* Expert Selector */
@@ -697,25 +697,25 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: flex-start;
         gap: 6px;
         padding: 14px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         text-align: left;
         transition: all 0.15s ease;
         font-family: inherit;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .expert-card:hover:not(:disabled) {
-        border-color: var(--expert-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.05);
+        border-color: var(--expert-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .expert-card.selected {
-        border-color: var(--expert-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.08);
-        box-shadow: 0 0 0 1px var(--expert-color, #cba6f7);
+        border-color: var(--expert-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+        box-shadow: 0 0 0 1px var(--expert-color, var(--accent-color));
       }
 
       .expert-card:disabled {
@@ -727,7 +727,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         position: absolute;
         top: 8px;
         right: 8px;
-        color: var(--expert-color, #cba6f7);
+        color: var(--expert-color, var(--accent-color));
       }
 
       .expert-icon {
@@ -737,7 +737,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       .expert-name {
         font-size: 13px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .expert-desc {
@@ -767,23 +767,23 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       /* Dropzone */
       .dropzone {
-        border: 2px dashed var(--border-color, #45475a);
+        border: 2px dashed var(--border-color, var(--surface-1));
         border-radius: 8px;
         padding: 20px;
         text-align: center;
         cursor: pointer;
         transition: all 0.2s ease;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .dropzone:hover:not(.disabled) {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.05);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .dropzone.dragover {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.1);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .dropzone.has-files {
@@ -810,7 +810,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       .dropzone-text {
         font-size: 14px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .dropzone-hint {
@@ -830,17 +830,17 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 10px;
         padding: 8px 10px;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         border-radius: 6px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
       }
 
       .file-item.uploading {
-        border-color: var(--ctp-yellow, #f9e2af);
+        border-color: var(--ctp-yellow, var(--warning));
       }
 
       .file-item.failed {
-        border-color: #f38ba8;
+        border-color: var(--danger);
       }
 
       .file-thumb {
@@ -867,7 +867,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       .file-name {
         font-size: 13px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -880,20 +880,20 @@ import {AppFormFieldComponent} from '../../ui/form-field';
 
       .file-error {
         font-size: 11px;
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .upload-progress {
         width: 60px;
         height: 4px;
-        background: var(--border-color, #313244);
+        background: var(--border-color, var(--surface-0));
         border-radius: 2px;
         overflow: hidden;
       }
 
       .progress-bar {
         height: 100%;
-        background: var(--ctp-yellow, #f9e2af);
+        background: var(--ctp-yellow, var(--warning));
         transition: width 0.2s ease;
       }
 
@@ -927,7 +927,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         width: 100%;
         padding: 10px;
         margin-bottom: 16px;
-        border: 1px dashed var(--border-color, #45475a);
+        border: 1px dashed var(--border-color, var(--surface-1));
         border-radius: 6px;
         background: transparent;
         color: var(--text-muted, #6c7086);
@@ -937,8 +937,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .toggle-advanced:hover:not(:disabled) {
-        border-color: var(--accent-color, #cba6f7);
-        color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color, var(--accent-color));
+        color: var(--accent-color, var(--accent-color));
       }
 
       .toggle-advanced:disabled {
@@ -951,7 +951,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         margin-bottom: 16px;
         background: rgba(0, 0, 0, 0.2);
         border-radius: 8px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
       }
 
       /* Datasource Picker */
@@ -976,26 +976,26 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
         gap: 10px;
         padding: 10px 12px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 6px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
       .ds-option:hover {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.05);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .ds-option.selected {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.08);
+        border-color: var(--accent-color, var(--accent-color));
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .ds-option input[type="checkbox"] {
         margin: 0;
-        accent-color: var(--accent-color, #cba6f7);
+        accent-color: var(--accent-color, var(--accent-color));
       }
 
 
@@ -1008,7 +1008,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         display: block;
         font-size: 13px;
         font-weight: 500;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .ds-desc {
@@ -1025,8 +1025,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         border-radius: 3px;
         font-size: 10px;
         font-weight: 600;
-        background: rgba(137, 180, 250, 0.15);
-        color: #89b4fa;
+        background: var(--info-tint);
+        color: var(--info);
       }
 
       /* Form Actions */
@@ -1036,7 +1036,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         gap: 10px;
         margin-top: 20px;
         padding-top: 16px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color, var(--surface-0));
       }
 
       /* Narrow panel responsive overrides */

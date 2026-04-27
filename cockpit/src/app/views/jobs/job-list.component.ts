@@ -355,7 +355,7 @@ interface JobRow {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       /* Header */
@@ -365,14 +365,14 @@ interface JobRow {
         gap: 12px;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
         flex-wrap: wrap;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .filter-chips {
@@ -447,13 +447,13 @@ interface JobRow {
       .job-table th {
         text-align: left;
         padding: 10px 12px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         color: var(--text-muted, #6c7086);
         font-weight: 500;
         text-transform: uppercase;
         font-size: 10px;
         letter-spacing: 0.5px;
-        border-bottom: 1px solid var(--border-color, #45475a);
+        border-bottom: 1px solid var(--border-color, var(--surface-1));
         position: sticky;
         top: 0;
         z-index: 1;
@@ -466,8 +466,8 @@ interface JobRow {
 
       .job-table td {
         padding: 10px 12px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        color: var(--text-primary, #cdd6f4);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
         vertical-align: middle;
       }
 
@@ -477,11 +477,11 @@ interface JobRow {
       }
 
       .job-table tbody tr:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .job-table tbody tr.selected {
-        background: rgba(203, 166, 247, 0.15);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       /* Hierarchy */
@@ -508,7 +508,7 @@ interface JobRow {
       }
 
       .expand-btn:hover {
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         background: rgba(127, 132, 156, 0.2);
         border-color: rgba(127, 132, 156, 0.4);
       }
@@ -644,8 +644,8 @@ interface JobRow {
         display: flex;
         align-items: center;
         padding: 8px 12px;
-        background: var(--surface-0, #313244);
-        border-top: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, var(--surface-0));
+        border-top: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
@@ -656,7 +656,7 @@ interface JobRow {
 
       .promote-row td {
         padding: 0 12px 10px !important;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
       }
 
       .promote-form {

@@ -249,7 +249,7 @@ interface Project {
     .page-header h2 {
       font-size: 18px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       margin: 0;
     }
 
@@ -264,23 +264,23 @@ interface Project {
       align-items: center;
       gap: 8px;
       padding: 10px 14px;
-      background: rgba(166, 227, 161, 0.08);
-      border: 1px solid #a6e3a1;
+      background: var(--success-tint);
+      border: 1px solid var(--success);
       border-radius: 8px;
       margin-bottom: 16px;
       cursor: pointer;
       font-size: 13px;
-      color: #a6e3a1;
+      color: var(--success);
       transition: background 0.15s ease;
     }
 
-    .active-banner:hover { background: rgba(166, 227, 161, 0.14); }
+    .active-banner:hover { background: var(--success-tint); }
 
     .active-dot {
       width: 8px;
       height: 8px;
       border-radius: 50%;
-      background: #a6e3a1;
+      background: var(--success);
       flex-shrink: 0;
       animation: pulse 1.5s infinite;
     }
@@ -304,8 +304,8 @@ interface Project {
     /* Create dialog */
     .create-dialog {
       padding: 16px;
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 8px;
       margin-bottom: 16px;
     }
@@ -313,7 +313,7 @@ interface Project {
     .create-dialog h3 {
       font-size: 14px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       margin: 0 0 12px;
     }
 
@@ -345,14 +345,14 @@ interface Project {
       display: flex;
       align-items: center;
       padding: 12px;
-      border: 1px solid var(--border-color, #313244);
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 8px;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
       margin-bottom: 8px;
       transition: border-color 0.15s ease;
     }
 
-    .session-card:hover { border-color: var(--accent-color, #cba6f7); }
+    .session-card:hover { border-color: var(--accent-color, var(--accent-color)); }
     .session-card.ended { opacity: 0.6; }
 
     .session-main {
@@ -375,14 +375,14 @@ interface Project {
       flex-shrink: 0;
     }
 
-    .session-status-dot.active, .session-status-dot.created { background: #a6e3a1; }
-    .session-status-dot.idle { background: #f9e2af; }
+    .session-status-dot.active, .session-status-dot.created { background: var(--success); }
+    .session-status-dot.idle { background: var(--warning); }
     .session-status-dot.ended { background: var(--surface-2, #585b70); }
 
     .session-title {
       font-size: 13px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -392,7 +392,7 @@ interface Project {
       font-size: 10px;
       padding: 1px 6px;
       border-radius: 3px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       color: var(--text-muted, #6c7086);
       flex-shrink: 0;
     }
