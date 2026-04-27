@@ -1584,5 +1584,34 @@
     "ide": {
       "stopped": "IDE-Sitzung beendet"
     }
+  },
+  "pwa": {
+    "splash": "Legion wird formiert…",
+    "install": {
+      "title": "SRW auf diesem Gerät stationieren",
+      "body": "Heften Sie SRW an den Startbildschirm für schnellen Zugriff.",
+      "cta": "Installieren"
+    },
+    "update": {
+      "title": "Ein neuer Standard ist bereit",
+      "body": "Neu laden, um die aktuelle Version zu beziehen.",
+      "cta": "Neu laden"
+    },
+    "offline": {
+      "banner": "Abseits der Straße — Arbeit aus dem Zwischenspeicher.",
+      "title": "Verbindung zum Lager verloren",
+      "body": "Anzeige der letzten Depeschen."
+    },
+    "empty": {
+      "inbox": "Keine Depeschen ausstehend.",
+      "jobs": "Keine Aufträge im Feld.",
+      "sessions": "Keine aktiven Sitzungen."
+    },
+    "session": {
+      "running": "Legion im Feld"
+    },
+    "checkpoint": "Meilenstein · prüfen und fortfahren",
+    "syncComplete": "Berichte eingereicht.",
+    "errorGeneric": "Das Signal kam nicht durch. Erneut versuchen."
   }
 }

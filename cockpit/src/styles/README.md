@@ -36,9 +36,11 @@ Token names are bare (`--accent-color`, `--panel-bg`, `--text-primary`) — no p
 
 | Key | Mode | Notes |
 |---|---|---|
-| `travertine` | Light | Default when `system` resolves to light. |
-| `senate` | Dark | **Overall default.** Default when `system` resolves to dark. |
+| `travertine` | Light | **Light default + initial paint fallback.** Default when `system` resolves to light. |
+| `senate` | Dark | Default when `system` resolves to dark. |
 | `praetorian` | Dark, high-contrast | Shadow-less. |
+
+First-run preference is `'system'` — the app respects the OS preference. A pre-paint script in `index.html` resolves the right body class before Angular hydrates so dark-OS users don't flash through the Travertine fallback.
 
 The legacy Catppuccin `dark` / `light` themes were removed; `theme.service.ts` migrates old localStorage values transparently (`dark` → `senate`, `light` → `travertine`).
 

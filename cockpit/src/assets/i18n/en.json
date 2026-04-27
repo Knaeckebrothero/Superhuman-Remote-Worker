@@ -1584,5 +1584,34 @@
     "ide": {
       "stopped": "IDE session stopped"
     }
+  },
+  "pwa": {
+    "splash": "Assembling legion…",
+    "install": {
+      "title": "Garrison SRW on this device",
+      "body": "Pin SRW to your home screen for fast access.",
+      "cta": "Install"
+    },
+    "update": {
+      "title": "A new standard is ready",
+      "body": "Reload to deploy the latest version.",
+      "cta": "Reload"
+    },
+    "offline": {
+      "banner": "Off the road — working from cache.",
+      "title": "Lost contact with the camp",
+      "body": "Showing your most recent dispatches."
+    },
+    "empty": {
+      "inbox": "No dispatches waiting.",
+      "jobs": "No jobs in the field.",
+      "sessions": "No active sessions."
+    },
+    "session": {
+      "running": "Legion in the field"
+    },
+    "checkpoint": "Mile marker · review and proceed",
+    "syncComplete": "Reports filed.",
+    "errorGeneric": "The signal didn't reach. Try again."
   }
 }

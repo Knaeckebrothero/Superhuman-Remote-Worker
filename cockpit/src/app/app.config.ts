@@ -1,5 +1,6 @@
 import {APP_INITIALIZER, ApplicationConfig, isDevMode, provideBrowserGlobalErrorListeners} from '@angular/core';
 import {provideRouter, withViewTransitions} from '@angular/router';
+import {provideServiceWorker} from '@angular/service-worker';
 import {provideHttpClient, withFetch, withInterceptors} from '@angular/common/http';
 import {registerLocaleData} from '@angular/common';
 import localeDe from '@angular/common/locales/de';
@@ -67,6 +68,14 @@ export const appConfig: ApplicationConfig = {
           useValue: citationExtension(),
         },
       ],
+    }),
+    provideServiceWorker('ngsw-worker.js', {
+      // Only register in production builds. Dev mode reloads frequently and
+      // a stale SW would shadow code changes.
+      enabled: !isDevMode(),
+      // Defer registration until the app stabilises so SW install doesn't
+      // contend with hydration / first-paint work.
+      registrationStrategy: 'registerWhenStable:30000',
     }),
   ]
 };

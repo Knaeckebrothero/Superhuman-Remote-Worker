@@ -2,11 +2,11 @@
 
 The SRW Cockpit ships three themes. They share token names so any component that resolves `var(--accent-color)`, `var(--panel-bg)`, etc. picks up whichever theme is active without per-component logic.
 
-## Travertine — Light
+## Travertine — Light (default for light OS, initial paint fallback)
 
 > Cream travertine + porphyry red + gold ochre. Daytime, formal.
 
-The light default. Built around the cream-and-red palette of Roman travertine stone and porphyry, with gold ochre as the warm semantic accent. Body text is a deep umber rather than near-black so the page reads as parchment, not paper.
+The light-mode default — picked when `system` resolves to light. Also the body class shipped in `index.html` as the no-JS fallback. Built around the cream-and-red palette of Roman travertine stone and porphyry, with gold ochre as the warm semantic accent. Body text is a deep umber rather than near-black so the page reads as parchment, not paper.
 
 | Token | Value | Usage |
 |---|---|---|
@@ -18,11 +18,11 @@ The light default. Built around the cream-and-red palette of Roman travertine st
 
 **When to use**: Daytime / well-lit environments, formal or print-adjacent contexts (reports, summaries).
 
-## Senate — Dark (default)
+## Senate — Dark (default for dark OS)
 
 > Pure blood red on charcoal. The standard dark.
 
-The overall default theme. Near-black charcoal with blood-red as the only saturated color — every other accent is muted. This is the "you're at your desk in the evening" theme; it should feel quiet, not flashy.
+The dark-mode default — picked when `system` resolves to dark. Near-black charcoal with blood-red as the only saturated color — every other accent is muted. This is the "you're at your desk in the evening" theme; it should feel quiet, not flashy.
 
 | Token | Value | Usage |
 |---|---|---|
