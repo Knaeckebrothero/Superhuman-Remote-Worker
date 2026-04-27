@@ -74,9 +74,17 @@ import {AppIconComponent} from './ui/icon';
 
       .content-area {
         flex: 1;
-        overflow-y: auto;
-        overflow-x: hidden;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
         position: relative;
+      }
+
+      .content-area > router-outlet ~ * {
+        flex: 1;
+        min-height: 0;
       }
 
       .pending-approval {

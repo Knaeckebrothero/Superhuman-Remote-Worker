@@ -184,7 +184,7 @@ import {AppIconComponent} from '../../ui/icon';
           <div class="footer-actions">
             <app-notification-bell />
             <a class="footer-link" routerLink="/settings" routerLinkActive="active" [title]="'nav.settings' | transloco">
-              <span class="nav-icon">settings</span>
+              <app-icon size="md" class="nav-icon">settings</app-icon>
             </a>
             <button class="logout-button" (click)="logout()">{{ 'nav.logout' | transloco }}</button>
           </div>
