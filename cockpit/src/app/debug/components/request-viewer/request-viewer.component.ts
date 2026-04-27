@@ -2,6 +2,7 @@ import { Component, inject } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { RequestService } from '../../services/request.service';
 import { LLMMessage } from '../../request.model';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
  * Request Viewer component that displays LLM request/response conversations.
@@ -10,7 +11,7 @@ import { LLMMessage } from '../../request.model';
 @Component({
   selector: 'app-request-viewer',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, AppSpinnerComponent],
   template: `
     <div class="viewer-container">
       <!-- Search Bar -->
@@ -41,7 +42,7 @@ import { LLMMessage } from '../../request.model';
       <!-- Loading State -->
       @if (requestService.isLoading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
         </div>
       }
 
@@ -295,21 +296,6 @@ import { LLMMessage } from '../../request.model';
         align-items: center;
         justify-content: center;
         z-index: 10;
-      }
-
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
       }
 
       /* Empty State */

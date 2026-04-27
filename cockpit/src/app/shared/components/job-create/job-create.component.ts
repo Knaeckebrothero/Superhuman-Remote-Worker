@@ -1,5 +1,4 @@
 import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {ActivatedRoute} from '@angular/router';
 import {ApiService} from '../../../core/services/api.service';
 import {FileHandlingService} from '../../../core/services/file-handling.service';
@@ -11,6 +10,13 @@ import {AgentSettingsComponent} from '../agent-settings/agent-settings.component
 import {PRIORITY_LEVELS} from '../agent-settings/agent-settings.types';
 import {ModelService} from '../../../core/services/model.service';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppSelectComponent} from '../../../ui/select';
+import {AppTextareaComponent} from '../../../ui/textarea';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppSpinnerComponent} from '../../../ui/spinner';
+import {AppFormFieldComponent} from '../../../ui/form-field';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -18,7 +24,17 @@ import {TranslocoPipe} from '@jsverse/transloco';
 @Component({
   selector: 'app-job-create',
   standalone: true,
-  imports: [FormsModule, AgentSettingsComponent, TranslocoPipe],
+  imports: [
+    AgentSettingsComponent,
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppSelectComponent,
+    AppTextareaComponent,
+    AppIconComponent,
+    AppSpinnerComponent,
+    AppFormFieldComponent,
+  ],
   template: `
     <div class="job-create-container">
       <div class="header-bar">
@@ -30,7 +46,9 @@ import {TranslocoPipe} from '@jsverse/transloco';
         @if (successMessage()) {
           <div class="success-message">
             <span>{{ successMessage() }}</span>
-            <button class="dismiss-btn" (click)="clearSuccess()">{{ 'jobs.create.dismiss' | transloco }}</button>
+            <app-button variant="ghost" size="sm" (clicked)="clearSuccess()">
+              {{ 'jobs.create.dismiss' | transloco }}
+            </app-button>
           </div>
         }
 
@@ -38,74 +56,60 @@ import {TranslocoPipe} from '@jsverse/transloco';
         @if (errorMessage()) {
           <div class="error-message">
             <span>{{ errorMessage() }}</span>
-            <button class="dismiss-btn" (click)="clearError()">{{ 'jobs.create.dismiss' | transloco }}</button>
+            <app-button variant="ghost" size="sm" (clicked)="clearError()">
+              {{ 'jobs.create.dismiss' | transloco }}
+            </app-button>
           </div>
         }
 
-        <form (ngSubmit)="onSubmit()" #jobForm="ngForm">
+        <form (submit)="$event.preventDefault(); onSubmit()">
           <!-- Project Selector -->
           @if (projects().length > 0) {
-            <div class="form-group">
-              <label for="project" class="form-label">{{ 'jobs.create.projectLabel' | transloco }}</label>
-              <select
-                id="project"
-                name="project"
-                class="form-input"
-                [ngModel]="selectedProjectId()"
-                (ngModelChange)="selectedProjectId.set($event)"
+            <app-form-field [label]="'jobs.create.projectLabel' | transloco" [hint]="'jobs.create.projectHint' | transloco">
+              <app-select
+                [value]="selectedProjectId() ?? ''"
+                (changed)="onProjectIdChange($event)"
                 [disabled]="isSubmitting()"
               >
-                <option [ngValue]="null">{{ 'jobs.create.projectNone' | transloco }}</option>
+                <option value="">{{ 'jobs.create.projectNone' | transloco }}</option>
                 @for (proj of projects(); track proj.id) {
                   <option [value]="proj.id">
                     {{ proj.name }}@if (proj.is_default) { {{ 'jobs.create.projectPersonal' | transloco }}}
                   </option>
                 }
-              </select>
-              <span class="field-hint">{{ 'jobs.create.projectHint' | transloco }}</span>
-            </div>
+              </app-select>
+            </app-form-field>
           }
 
           <!-- Description Field (Required) -->
-          <div class="form-group">
-            <label for="description" class="form-label">
-              {{ 'jobs.create.descriptionLabel' | transloco }} <span class="required">*</span>
-            </label>
-            <textarea
-              id="description"
-              name="description"
-              class="form-textarea"
-              [(ngModel)]="formData.description"
-              (ngModelChange)="onDescriptionEdit($event)"
-              required
-              rows="6"
+          <app-form-field [label]="'jobs.create.descriptionLabel' | transloco" [required]="true" [hint]="'jobs.create.descriptionHint' | transloco">
+            <app-textarea
+              [value]="formData.description"
+              (valueChange)="onDescriptionEdit($event)"
+              [required]="true"
+              [rows]="6"
               [placeholder]="'jobs.create.descriptionPlaceholder' | transloco"
               [disabled]="isSubmitting() || artifacts.streaming()"
-            ></textarea>
-            <span class="field-hint">{{ 'jobs.create.descriptionHint' | transloco }}</span>
-          </div>
+            />
+          </app-form-field>
 
           <!-- Kickoff Message (optional opening prompt) -->
-          <div class="form-group">
-            <label for="kickoff" class="form-label">{{ 'jobs.create.kickoffLabel' | transloco }}</label>
-            <textarea
-              id="kickoff"
-              name="kickoff"
-              class="form-textarea"
-              [(ngModel)]="kickoffMessage"
-              rows="3"
+          <app-form-field [label]="'jobs.create.kickoffLabel' | transloco" [hint]="'jobs.create.kickoffHint' | transloco">
+            <app-textarea
+              [value]="kickoffMessage"
+              (valueChange)="kickoffMessage = $event"
+              [rows]="3"
               [placeholder]="'jobs.create.kickoffPlaceholder' | transloco"
               [disabled]="isSubmitting() || artifacts.streaming()"
-            ></textarea>
-            <span class="field-hint">{{ 'jobs.create.kickoffHint' | transloco }}</span>
-          </div>
+            />
+          </app-form-field>
 
           <!-- Expert Selector -->
           <div class="form-group">
             <label class="form-label">{{ 'jobs.create.expertLabel' | transloco }}</label>
             @if (isLoadingExperts()) {
               <div class="expert-loading">
-                <span class="spinner-small"></span>
+                <app-spinner size="sm" />
                 {{ 'jobs.create.expertLoading' | transloco }}
               </div>
             } @else if (experts().length > 0) {
@@ -120,9 +124,9 @@ import {TranslocoPipe} from '@jsverse/transloco';
                     [disabled]="isSubmitting()"
                   >
                     @if (selectedExpert()?.id === expert.id) {
-                      <span class="expert-check">check_circle</span>
+                      <app-icon size="lg" class="expert-check">check_circle</app-icon>
                     }
-                    <span class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</span>
+                    <app-icon size="inherit" class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</app-icon>
                     <span class="expert-name">{{ expert.display_name }}</span>
                     <span class="expert-desc">{{ expert.description }}</span>
                     @if (expert.tags.length > 0) {
@@ -146,8 +150,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
           </div>
 
           <!-- File Upload Dropzone -->
-          <div class="form-group">
-            <label class="form-label">{{ 'jobs.create.documentsLabel' | transloco }}</label>
+          <app-form-field [label]="'jobs.create.documentsLabel' | transloco" [hint]="'jobs.create.documentsOptional' | transloco">
             <div
               class="dropzone"
               [class.dragover]="isDragOver()"
@@ -160,7 +163,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
             >
               @if (filePreviews().length === 0) {
                 <div class="dropzone-content">
-                  <span class="dropzone-icon">upload_file</span>
+                  <app-icon size="inherit" class="dropzone-icon">upload_file</app-icon>
                   <span class="dropzone-text">{{ 'jobs.create.dropHint' | transloco }}</span>
                   <span class="dropzone-hint">{{ 'jobs.create.maxHint' | transloco:{ maxFiles: fileService.getMaxFiles(), maxSizeMb: fileService.getMaxFileSizeMB() } }}</span>
                 </div>
@@ -171,7 +174,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
                       @if (file.type === 'image' && file.preview) {
                         <img [src]="file.preview" class="file-thumb" alt="">
                       } @else {
-                        <span class="file-icon">{{ fileService.getFileIcon(file.type) }}</span>
+                        <app-icon size="lg" class="file-icon">{{ fileService.getFileIcon(file.type) }}</app-icon>
                       }
                       <div class="file-info">
                         <span class="file-name">{{ file.name }}</span>
@@ -186,24 +189,38 @@ import {TranslocoPipe} from '@jsverse/transloco';
                         </div>
                       }
                       @if (file.uploadStatus === 'completed') {
-                        <span class="status-icon success">check_circle</span>
+                        <app-icon size="md" class="status-icon success">check_circle</app-icon>
                       }
                       @if (file.uploadStatus === 'failed') {
-                        <span class="status-icon error">error</span>
+                        <app-icon size="md" class="status-icon error">error</app-icon>
                       }
                       @if (file.uploadStatus === 'pending') {
-                        <span class="status-icon pending">schedule</span>
+                        <app-icon size="md" class="status-icon pending">schedule</app-icon>
                       }
-                      <button type="button" class="remove-btn" (click)="removeFile(file.id, $event)" [disabled]="isSubmitting()">
-                        close
-                      </button>
+                      <app-icon-button
+                        variant="danger"
+                        size="sm"
+                        type="button"
+                        [ariaLabel]="'jobs.create.removeFile' | transloco"
+                        [disabled]="isSubmitting()"
+                        (clicked)="removeFile(file.id, $event)"
+                      >
+                        <app-icon size="sm">close</app-icon>
+                      </app-icon-button>
                     </div>
                   }
                 </div>
                 @if (!isSubmitting()) {
-                  <button type="button" class="add-more-btn" (click)="triggerFileInput()">
+                  <app-button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    [fullWidth]="true"
+                    class="add-more-btn"
+                    (clicked)="triggerFileInput()"
+                  >
                     {{ 'jobs.create.addMore' | transloco }}
-                  </button>
+                  </app-button>
                 }
               }
             </div>
@@ -215,35 +232,34 @@ import {TranslocoPipe} from '@jsverse/transloco';
               (change)="onFilesSelected($event)"
               style="display: none"
             >
-            <span class="field-hint">{{ 'jobs.create.documentsOptional' | transloco }}</span>
-          </div>
+          </app-form-field>
 
           <!-- Priority -->
-          <div class="form-group">
-            <label for="priority" class="form-label">{{ 'jobs.create.priorityLabel' | transloco }}</label>
-            <select id="priority" name="priority" class="form-input"
-              [ngModel]="selectedPriority()" (ngModelChange)="selectedPriority.set($event)"
-              [disabled]="isSubmitting()">
+          <app-form-field [label]="'jobs.create.priorityLabel' | transloco" [hint]="'jobs.create.priorityHint' | transloco">
+            <app-select
+              [value]="selectedPriority()"
+              (changed)="onPriorityChange($event)"
+              [disabled]="isSubmitting()"
+            >
               @for (level of priorityLevels; track level.value) {
-                <option [ngValue]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
+                <option [value]="level.value">{{ getPriorityKey(level.value) | transloco }}</option>
               }
-            </select>
-            <span class="field-hint">{{ 'jobs.create.priorityHint' | transloco }}</span>
-          </div>
+            </app-select>
+          </app-form-field>
 
           <!-- Cloud Storage Access Override -->
           @if (selectedProjectHasCloudStorage()) {
-            <div class="form-group">
-              <label for="cloudStorage" class="form-label">{{ 'jobs.create.cloudStorageLabel' | transloco }}</label>
-              <select id="cloudStorage" name="cloudStorage" class="form-input"
-                [ngModel]="cloudStorageOverride()" (ngModelChange)="cloudStorageOverride.set($event)"
-                [disabled]="isSubmitting()">
+            <app-form-field [label]="'jobs.create.cloudStorageLabel' | transloco" [hint]="'jobs.create.cloudStorageHint' | transloco">
+              <app-select
+                [value]="cloudStorageOverride()"
+                (changed)="onCloudStorageChange($event)"
+                [disabled]="isSubmitting()"
+              >
                 <option value="inherit">{{ 'jobs.create.cloudStorageInherit' | transloco }}</option>
                 <option value="readonly">{{ 'jobs.create.cloudStorageReadonly' | transloco }}</option>
                 <option value="readwrite">{{ 'jobs.create.cloudStorageReadwrite' | transloco }}</option>
-              </select>
-              <span class="field-hint">{{ 'jobs.create.cloudStorageHint' | transloco }}</span>
-            </div>
+              </app-select>
+            </app-form-field>
           }
 
           <!-- Agent Settings (tabbed: Settings / Instructions / Advanced) -->
@@ -263,29 +279,28 @@ import {TranslocoPipe} from '@jsverse/transloco';
 
           <!-- Submit Button -->
           <div class="form-actions">
-            <button
+            <app-button
               type="button"
-              class="btn btn-secondary"
-              (click)="resetForm()"
+              variant="secondary"
               [disabled]="isSubmitting()"
+              (clicked)="resetForm()"
             >
               {{ 'jobs.create.reset' | transloco }}
-            </button>
-            <button
+            </app-button>
+            <app-button
               type="submit"
-              class="btn btn-primary"
-              [disabled]="!formData.description || isSubmitting() || isUploading() || artifacts.streaming()"
+              variant="primary"
+              [loading]="isSubmitting() || isUploading()"
+              [disabled]="!formData.description || artifacts.streaming()"
             >
               @if (isSubmitting()) {
-                <span class="spinner-small"></span>
                 {{ 'jobs.create.creating' | transloco }}
               } @else if (isUploading()) {
-                <span class="spinner-small"></span>
                 {{ 'jobs.create.uploading' | transloco }}
               } @else {
                 {{ 'jobs.create.submit' | transloco }}
               }
-            </button>
+            </app-button>
           </div>
         </form>
       </div>
@@ -353,20 +368,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         color: #f38ba8;
       }
 
-      .dismiss-btn {
-        padding: 4px 8px;
-        border: none;
-        border-radius: 4px;
-        background: rgba(255, 255, 255, 0.1);
-        color: inherit;
-        font-size: 11px;
-        cursor: pointer;
-      }
-
-      .dismiss-btn:hover {
-        background: rgba(255, 255, 255, 0.2);
-      }
-
       /* Form Groups */
       .form-group {
         margin-bottom: 16px;
@@ -382,47 +383,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
 
       .required {
         color: #f38ba8;
-      }
-
-      .form-input,
-      .form-textarea {
-        width: 100%;
-        padding: 10px 12px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 6px;
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-        font-family: inherit;
-        font-size: 13px;
-        transition: border-color 0.15s ease;
-      }
-
-      .form-input:focus,
-      .form-textarea:focus {
-        outline: none;
-        border-color: var(--accent-color, #cba6f7);
-      }
-
-      .form-input:disabled,
-      .form-textarea:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-
-      .form-input::placeholder,
-      .form-textarea::placeholder {
-        color: var(--text-muted, #6c7086);
-      }
-
-      .form-textarea {
-        resize: vertical;
-        min-height: 80px;
-      }
-
-      .form-textarea.mono {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        line-height: 1.5;
       }
 
       .instructions-actions {
@@ -571,11 +531,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         margin-bottom: 12px;
       }
 
-      .phase-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
-
       .form-group.compact {
         margin-bottom: 12px;
       }
@@ -672,14 +627,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .tool-toggle input[type="checkbox"] {
         margin: 0;
         accent-color: var(--accent-color, #cba6f7);
-      }
-
-      .tool-toggle-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-        color: var(--text-muted, #6c7086);
-        width: 24px;
-        text-align: center;
       }
 
       .tool-toggle-info {
@@ -780,13 +727,10 @@ import {TranslocoPipe} from '@jsverse/transloco';
         position: absolute;
         top: 8px;
         right: 8px;
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
         color: var(--expert-color, #cba6f7);
       }
 
       .expert-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 28px;
       }
 
@@ -860,7 +804,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
 
       .dropzone-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 48px;
         color: var(--text-muted, #6c7086);
       }
@@ -908,7 +851,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
 
       .file-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 28px;
         color: var(--text-muted, #6c7086);
         width: 36px;
@@ -956,61 +898,24 @@ import {TranslocoPipe} from '@jsverse/transloco';
       }
 
       .status-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 20px;
       }
 
       .status-icon.success {
-        color: #a6e3a1;
+        color: var(--success);
       }
 
       .status-icon.error {
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .status-icon.pending {
         color: var(--text-muted, #6c7086);
       }
 
-      .remove-btn {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-        padding: 4px;
-        border: none;
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-        cursor: pointer;
-        line-height: 1;
-      }
-
-      .remove-btn:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.1);
-        color: #f38ba8;
-      }
-
-      .remove-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .add-more-btn {
+      app-button.add-more-btn {
         display: block;
-        width: 100%;
         margin-top: 8px;
-        padding: 8px;
-        border: 1px dashed var(--border-color, #45475a);
-        border-radius: 6px;
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-        font-size: 12px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .add-more-btn:hover {
-        border-color: var(--accent-color, #cba6f7);
-        color: var(--accent-color, #cba6f7);
       }
 
       /* Advanced Section */
@@ -1039,11 +944,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       .toggle-advanced:disabled {
         opacity: 0.6;
         cursor: not-allowed;
-      }
-
-      .toggle-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
       }
 
       .advanced-section {
@@ -1098,17 +998,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         accent-color: var(--accent-color, #cba6f7);
       }
 
-      .ds-type-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-        width: 24px;
-        text-align: center;
-      }
-
-      .ds-type-postgresql { color: #89b4fa; }
-      .ds-type-neo4j { color: #a6e3a1; }
-      .ds-type-mongodb { color: #94e2d5; }
-      .ds-type-webdav { color: #fab387; }
 
       .ds-info {
         flex: 1;
@@ -1150,55 +1039,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
         border-top: 1px solid var(--border-color, #313244);
       }
 
-      .btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 10px 20px;
-        border: none;
-        border-radius: 6px;
-        font-size: 13px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-
-      .btn-secondary {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-      }
-
-      .btn-secondary:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-      }
-
-      .btn-primary {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-      }
-
-      .btn-primary:hover:not(:disabled) {
-        filter: brightness(1.1);
-      }
-
-      .spinner-small {
-        width: 14px;
-        height: 14px;
-        border: 2px solid rgba(0, 0, 0, 0.2);
-        border-top-color: currentColor;
-        border-radius: 50%;
-        animation: spin 0.6s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
-
       /* Narrow panel responsive overrides */
       @container (max-width: 360px) {
         .form-container {
@@ -1217,10 +1057,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
           padding: 6px 8px;
         }
 
-        .tool-toggle-icon {
-          display: none;
-        }
-
         .slider-row {
           gap: 6px;
         }
@@ -1229,9 +1065,8 @@ import {TranslocoPipe} from '@jsverse/transloco';
           flex-direction: column;
         }
 
-        .form-actions .btn {
+        .form-actions app-button {
           width: 100%;
-          justify-content: center;
         }
       }
     `,
@@ -1296,6 +1131,24 @@ export class JobCreateComponent implements OnInit {
     if (value === 0) return 'jobs.create.priorityLow';
     if (value === 10) return 'jobs.create.priorityHigh';
     return 'jobs.create.priorityNormal';
+  }
+
+  onPriorityChange(value: unknown): void {
+    if (value == null || value === '') return;
+    const num = typeof value === 'number' ? value : parseInt(String(value), 10);
+    if (!Number.isNaN(num)) {
+      this.selectedPriority.set(num);
+    }
+  }
+
+  onProjectIdChange(value: string | null): void {
+    this.selectedProjectId.set(value && value !== '' ? value : null);
+  }
+
+  onCloudStorageChange(value: string | null): void {
+    if (value === 'inherit' || value === 'readonly' || value === 'readwrite') {
+      this.cloudStorageOverride.set(value);
+    }
   }
 
   readonly projects = signal<Project[]>([]);

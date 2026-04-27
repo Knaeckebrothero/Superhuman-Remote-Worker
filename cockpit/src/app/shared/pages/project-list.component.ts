@@ -6,11 +6,12 @@ import {KeycloakService} from '../../core/services/keycloak.service';
 import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppSpinnerComponent} from '../../ui/spinner';
 
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
-  imports: [SidebarToggleComponent, TranslocoPipe],
+  imports: [SidebarToggleComponent, TranslocoPipe, AppSpinnerComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
@@ -69,7 +70,7 @@ import {TranslocoPipe} from '@jsverse/transloco';
       <!-- Loading -->
       @if (isLoading() && projects().length === 0) {
         <div class="loading-state">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>{{ 'projects.loading' | transloco }}</span>
         </div>
       }
@@ -205,16 +206,6 @@ import {TranslocoPipe} from '@jsverse/transloco';
       padding: 60px 20px;
       color: var(--text-muted, #6c7086);
     }
-
-    .spinner {
-      width: 32px; height: 32px;
-      border: 3px solid var(--surface-0, #313244);
-      border-top-color: var(--accent-color, #cba6f7);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin { to { transform: rotate(360deg); } }
 
     .empty-icon { font-size: 48px; opacity: 0.5; }
     .empty-hint { font-size: 12px; opacity: 0.6; }

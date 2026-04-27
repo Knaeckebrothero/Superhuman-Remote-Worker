@@ -1,6 +1,5 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
-import {FormsModule} from '@angular/forms';
 import {HttpClient} from '@angular/common/http';
 import {TitleCasePipe} from '@angular/common';
 import {TranslocoDatePipe} from '@jsverse/transloco-locale';
@@ -9,12 +8,20 @@ import {environment} from '../../../core/environment';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
-import {ToastService} from '../../../core/services/toast.service';
+import {AppToastService} from '../../../ui/toast';
 import {ErrorMessageService} from '../../../core/services/error-message.service';
 import {UserService} from '../../../core/services/user.service';
 import {Thread} from '../../../core/models/api.model';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppTabBarComponent, AppTabComponent} from '../../../ui/tab-bar';
+import {AppInputComponent} from '../../../ui/input';
+import {AppSelectComponent} from '../../../ui/select';
+import {AppChipComponent} from '../../../ui/chip';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppFormFieldComponent} from '../../../ui/form-field';
 
 interface Project {
     id: string;
@@ -27,7 +34,21 @@ interface Project {
 @Component({
     selector: 'app-sessions-page',
     standalone: true,
-    imports: [FormsModule, TranslocoDatePipe, TitleCasePipe, SidebarToggleComponent, TranslocoPipe],
+    imports: [
+        TranslocoDatePipe,
+        TitleCasePipe,
+        SidebarToggleComponent,
+        TranslocoPipe,
+        AppButtonComponent,
+        AppIconButtonComponent,
+        AppTabBarComponent,
+        AppTabComponent,
+        AppInputComponent,
+        AppSelectComponent,
+        AppChipComponent,
+        AppIconComponent,
+        AppFormFieldComponent,
+    ],
     template: `
     <div class="page-toggle">
       <app-sidebar-toggle />
@@ -36,9 +57,9 @@ interface Project {
       <div class="page-header">
         <h2>{{ 'sessions.title' | transloco }}</h2>
         <div class="header-actions">
-          <button class="btn btn-primary" (click)="goToCreate()">
-            <span class="icon">add</span> {{ 'sessions.newSession' | transloco }}
-          </button>
+          <app-button variant="primary" size="sm" (clicked)="goToCreate()">
+            <app-icon size="sm">add</app-icon> {{ 'sessions.newSession' | transloco }}
+          </app-button>
         </div>
       </div>
 
@@ -56,21 +77,18 @@ interface Project {
         <div class="create-dialog">
           <h3>{{ 'sessions.create.title' | transloco }}</h3>
           <p class="dialog-hint">{{ 'sessions.create.hint' | transloco }}</p>
-          <div class="form-group">
-            <label>{{ 'sessions.create.titleLabel' | transloco }}</label>
-            <input type="text" [(ngModel)]="newTitle" [placeholder]="'sessions.create.titlePlaceholder' | transloco" />
-          </div>
-          <div class="form-group">
-            <label>{{ 'sessions.create.configLabel' | transloco }}</label>
-            <select [(ngModel)]="newConfig">
+          <app-form-field [label]="'sessions.create.titleLabel' | transloco">
+            <app-input [(value)]="newTitle" [placeholder]="'sessions.create.titlePlaceholder' | transloco" />
+          </app-form-field>
+          <app-form-field [label]="'sessions.create.configLabel' | transloco">
+            <app-select [(value)]="newConfig">
               <option value="persistent_defaults">{{ 'sessions.create.configDefault' | transloco }}</option>
               <option value="developer">{{ 'sessions.create.configDeveloper' | transloco }}</option>
               <option value="scholar">{{ 'sessions.create.configScholar' | transloco }}</option>
-            </select>
-          </div>
-          <div class="form-group">
-            <label>{{ 'sessions.create.modelLabel' | transloco }}</label>
-            <select [(ngModel)]="newModel">
+            </app-select>
+          </app-form-field>
+          <app-form-field [label]="'sessions.create.modelLabel' | transloco">
+            <app-select [(value)]="newModel">
               <option value="">{{ 'sessions.create.modelConfigDefault' | transloco }}</option>
               @for (group of modelService.models(); track group.group) {
                 <optgroup [label]="group.group">
@@ -79,40 +97,37 @@ interface Project {
                   }
                 </optgroup>
               }
-            </select>
-          </div>
-          <div class="form-group">
-            <label>{{ 'sessions.create.projectsLabel' | transloco }}</label>
+            </app-select>
+          </app-form-field>
+          <app-form-field [label]="'sessions.create.projectsLabel' | transloco" [hint]="'sessions.create.projectsHint' | transloco">
             <div class="project-chips">
               @if (projects().length === 0) {
                 <span class="chip-hint">{{ 'sessions.create.projectsEmpty' | transloco }}</span>
               } @else {
                 @for (project of projects(); track project.id) {
-                  <button
-                    type="button"
-                    class="project-chip"
-                    [class.selected]="isProjectSelected(project.id)"
-                    (click)="toggleProject(project.id)"
-                    [title]="project.description || project.name"
-                  >{{ project.name }}</button>
+                  <app-chip
+                    [selected]="isProjectSelected(project.id)"
+                    [ariaLabel]="project.description || project.name"
+                    (clicked)="toggleProject(project.id)"
+                  >{{ project.name }}</app-chip>
                 }
               }
             </div>
-            <span class="chip-hint">{{ 'sessions.create.projectsHint' | transloco }}</span>
-          </div>
-          <div class="form-group">
-            <label>{{ 'sessions.create.permissionLabel' | transloco }}</label>
-            <select [(ngModel)]="newPermission">
+          </app-form-field>
+          <app-form-field [label]="'sessions.create.permissionLabel' | transloco">
+            <app-select [(value)]="newPermission">
               <option value="supervised">{{ 'sessions.create.permissionSupervised' | transloco }}</option>
               <option value="auto_accept">{{ 'sessions.create.permissionAutoAccept' | transloco }}</option>
               <option value="autonomous">{{ 'sessions.create.permissionAutonomous' | transloco }}</option>
-            </select>
-          </div>
+            </app-select>
+          </app-form-field>
           <div class="dialog-actions">
-            <button class="btn btn-primary" (click)="createSession()" [disabled]="creating()">
-              {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.create' | transloco) }}
-            </button>
-            <button class="btn btn-secondary" (click)="showCreate = false">{{ 'sessions.create.cancel' | transloco }}</button>
+            <app-button variant="primary" size="sm" [loading]="creating()" (clicked)="createSession()">
+              {{ 'sessions.create.create' | transloco }}
+            </app-button>
+            <app-button variant="secondary" size="sm" (clicked)="showCreate = false">
+              {{ 'sessions.create.cancel' | transloco }}
+            </app-button>
           </div>
         </div>
       }
@@ -123,36 +138,24 @@ interface Project {
           <div class="loading">{{ 'sessions.loading' | transloco }}</div>
         } @else if (threads().length === 0) {
           <div class="empty-state">
-            <span class="empty-icon">chat_bubble_outline</span>
+            <app-icon size="inherit" class="empty-icon">chat_bubble_outline</app-icon>
             <p>{{ 'sessions.empty' | transloco }}</p>
           </div>
         } @else {
           <!-- Filter tabs -->
-          <div class="filter-tabs">
-            <button
-              class="filter-tab"
-              [class.active]="statusFilter() === null"
-              (click)="statusFilter.set(null)"
-            >{{ 'sessions.filter.all' | transloco:{ count: threads().length } }}</button>
-            <button
-              class="filter-tab"
-              [class.active]="statusFilter() === 'active'"
-              (click)="statusFilter.set('active')"
-            >{{ 'sessions.filter.active' | transloco:{ count: activeCount() } }}</button>
-            <button
-              class="filter-tab"
-              [class.active]="statusFilter() === 'ended'"
-              (click)="statusFilter.set('ended')"
-            >{{ 'sessions.filter.ended' | transloco:{ count: endedCount() } }}</button>
-          </div>
+          <app-tab-bar class="filter-tabs" [value]="statusFilter()" (valueChange)="statusFilter.set($event)">
+            <app-tab [value]="null">{{ 'sessions.filter.all' | transloco:{ count: threads().length } }}</app-tab>
+            <app-tab [value]="'active'">{{ 'sessions.filter.active' | transloco:{ count: activeCount() } }}</app-tab>
+            <app-tab [value]="'ended'">{{ 'sessions.filter.ended' | transloco:{ count: endedCount() } }}</app-tab>
+          </app-tab-bar>
 
           @if (filteredThreads().length === 0) {
             <div class="filter-empty">
               @if (statusFilter() === 'active') {
-                <span class="empty-icon">check_circle</span>
+                <app-icon size="inherit" class="empty-icon">check_circle</app-icon>
                 <p>{{ 'sessions.emptyFilterActive' | transloco }}</p>
               } @else if (statusFilter() === 'ended') {
-                <span class="empty-icon">history</span>
+                <app-icon size="inherit" class="empty-icon">history</app-icon>
                 <p>{{ 'sessions.emptyFilterEnded' | transloco }}</p>
               }
             </div>
@@ -174,21 +177,38 @@ interface Project {
               </div>
               <div class="session-actions">
                 @if (thread.cloud_session_url || thread.nc_session_folder) {
-                  <button class="icon-btn" [title]="'sessions.tooltip.sessionFiles' | transloco" (click)="openSessionFiles(thread)">
-                    <span class="icon">cloud</span>
-                  </button>
+                  <app-icon-button
+                    [ariaLabel]="'sessions.tooltip.sessionFiles' | transloco"
+                    [tooltip]="'sessions.tooltip.sessionFiles' | transloco"
+                    (clicked)="openSessionFiles(thread)"
+                  >
+                    <app-icon size="sm">cloud</app-icon>
+                  </app-icon-button>
                 }
-                <button class="icon-btn" [title]="'sessions.tooltip.resume' | transloco" (click)="resumeSession(thread)">
-                  <span class="icon">play_arrow</span>
-                </button>
+                <app-icon-button
+                  [ariaLabel]="'sessions.tooltip.resume' | transloco"
+                  [tooltip]="'sessions.tooltip.resume' | transloco"
+                  (clicked)="resumeSession(thread)"
+                >
+                  <app-icon size="sm">play_arrow</app-icon>
+                </app-icon-button>
                 @if (thread.status !== 'ended') {
-                  <button class="icon-btn" [title]="'sessions.tooltip.end' | transloco" (click)="endSession(thread)">
-                    <span class="icon">stop</span>
-                  </button>
+                  <app-icon-button
+                    [ariaLabel]="'sessions.tooltip.end' | transloco"
+                    [tooltip]="'sessions.tooltip.end' | transloco"
+                    (clicked)="endSession(thread)"
+                  >
+                    <app-icon size="sm">stop</app-icon>
+                  </app-icon-button>
                 }
-                <button class="icon-btn danger" [title]="'sessions.tooltip.delete' | transloco" (click)="deleteSession(thread)">
-                  <span class="icon">delete</span>
-                </button>
+                <app-icon-button
+                  variant="danger"
+                  [ariaLabel]="'sessions.tooltip.delete' | transloco"
+                  [tooltip]="'sessions.tooltip.delete' | transloco"
+                  (clicked)="deleteSession(thread)"
+                >
+                  <app-icon size="sm">delete</app-icon>
+                </app-icon-button>
               </div>
             </div>
           }
@@ -236,39 +256,6 @@ interface Project {
     .header-actions {
       display: flex;
       gap: 8px;
-    }
-
-    .btn {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      padding: 6px 14px;
-      border-radius: 6px;
-      border: 1px solid var(--border-color, #313244);
-      font-size: 12px;
-      font-family: inherit;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .btn-sm { padding: 4px 10px; }
-
-    .btn-primary {
-      background: var(--accent-color, #cba6f7);
-      color: var(--timeline-bg, #11111b);
-      border-color: var(--accent-color, #cba6f7);
-    }
-
-    .btn-secondary {
-      background: transparent;
-      color: var(--text-muted, #6c7086);
-    }
-
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-    .icon {
-      font-family: 'Material Symbols Outlined';
-      font-size: 16px;
     }
 
     /* Active session banner */
@@ -330,56 +317,12 @@ interface Project {
       margin: 0 0 12px;
     }
 
-    .form-group {
-      margin-bottom: 10px;
-    }
-
-    .form-group label {
-      display: block;
-      font-size: 11px;
-      color: var(--text-muted, #6c7086);
-      margin-bottom: 4px;
-    }
-
-    .form-group input, .form-group select {
-      width: 100%;
-      padding: 6px 10px;
-      border-radius: 4px;
-      border: 1px solid var(--border-color, #313244);
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      font-family: inherit;
-    }
 
     .project-chips {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
       margin-bottom: 4px;
-    }
-
-    .project-chip {
-      padding: 4px 10px;
-      border-radius: 12px;
-      border: 1px solid var(--border-color, #313244);
-      background: transparent;
-      color: var(--text-muted, #6c7086);
-      font-size: 11px;
-      font-family: inherit;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-
-    .project-chip:hover {
-      border-color: var(--text-color, #cdd6f4);
-      color: var(--text-color, #cdd6f4);
-    }
-
-    .project-chip.selected {
-      background: var(--accent-color, #a6e3a1);
-      border-color: var(--accent-color, #a6e3a1);
-      color: var(--bg-color, #1e1e2e);
     }
 
     .chip-hint {
@@ -393,28 +336,8 @@ interface Project {
       margin-top: 12px;
     }
 
-    /* Filter tabs */
     .filter-tabs {
-      display: flex;
-      gap: 4px;
       margin-bottom: 12px;
-    }
-
-    .filter-tab {
-      padding: 4px 12px;
-      border-radius: 4px;
-      border: 1px solid var(--border-color, #313244);
-      background: transparent;
-      color: var(--text-muted, #6c7086);
-      font-size: 11px;
-      font-family: inherit;
-      cursor: pointer;
-    }
-
-    .filter-tab.active {
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      border-color: var(--accent-color, #cba6f7);
     }
 
     /* Session cards */
@@ -498,22 +421,6 @@ interface Project {
       margin-left: 8px;
     }
 
-    .icon-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 30px;
-      height: 30px;
-      border-radius: 4px;
-      border: none;
-      background: transparent;
-      color: var(--text-muted, #6c7086);
-      cursor: pointer;
-    }
-
-    .icon-btn:hover { background: var(--surface-0, #313244); color: var(--text-primary, #cdd6f4); }
-    .icon-btn.danger:hover { color: #f38ba8; }
-
     /* Empty / loading */
     .loading, .empty-state {
       text-align: center;
@@ -528,9 +435,8 @@ interface Project {
     }
 
     .empty-icon {
-      font-family: 'Material Symbols Outlined';
-      font-size: 48px;
       display: block;
+      font-size: 48px;
       margin-bottom: 12px;
       opacity: 0.3;
     }
@@ -571,7 +477,7 @@ interface Project {
 export class SessionsPageComponent implements OnInit {
     private readonly http = inject(HttpClient);
     private readonly router = inject(Router);
-    private readonly toast = inject(ToastService);
+    private readonly toast = inject(AppToastService);
     private readonly errors = inject(ErrorMessageService);
     private readonly userService = inject(UserService);
     private readonly settingsService = inject(SettingsService);
@@ -681,7 +587,7 @@ export class SessionsPageComponent implements OnInit {
                 );
                 thread.status = 'created';
             } catch (e: any) {
-                this.toast.error(this.errors.translate(e, 'errors.sessions.resumeFailed'));
+                this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
                 return;
             }
         }
@@ -708,7 +614,7 @@ export class SessionsPageComponent implements OnInit {
             );
             this.loadThreads();
         } catch (e: any) {
-            this.toast.error(this.errors.translate(e, 'errors.sessions.endFailed'));
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
         }
     }
 
@@ -720,7 +626,7 @@ export class SessionsPageComponent implements OnInit {
             );
             this.loadThreads();
         } catch (e: any) {
-            this.toast.error(this.errors.translate(e, 'errors.sessions.deleteFailed'));
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
         }
     }
 

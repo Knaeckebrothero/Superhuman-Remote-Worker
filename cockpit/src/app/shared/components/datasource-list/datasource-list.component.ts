@@ -1,5 +1,4 @@
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {
@@ -9,6 +8,16 @@ import {
     DatasourceType,
     DatasourceUpdateRequest,
 } from '../../../core/models/api.model';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppChipComponent} from '../../../ui/chip';
+import {AppInputComponent} from '../../../ui/input';
+import {AppSelectComponent} from '../../../ui/select';
+import {AppTextareaComponent} from '../../../ui/textarea';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppSpinnerComponent} from '../../../ui/spinner';
+import {AppFormFieldComponent} from '../../../ui/form-field';
 
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
@@ -16,7 +25,19 @@ import {
 @Component({
   selector: 'app-datasource-list',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppChipComponent,
+    AppInputComponent,
+    AppSelectComponent,
+    AppTextareaComponent,
+    AppIconComponent,
+    AppSpinnerComponent,
+    AppFormFieldComponent,
+  ],
   template: `
     <div class="ds-container">
       <!-- Header -->
@@ -24,22 +45,33 @@ import {
         <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
-            <button
-              class="filter-chip"
-              [class.active]="typeFilter() === filter.value"
-              (click)="typeFilter.set(filter.value)"
+            <app-chip
+              size="sm"
+              [selected]="typeFilter() === filter.value"
+              (clicked)="typeFilter.set(filter.value)"
             >
               {{ filter.labelKey | transloco }}
-            </button>
+            </app-chip>
           }
         </div>
         <div class="header-actions">
-          <button class="action-btn new-btn" (click)="openCreateForm()" [disabled]="showForm()">
-            <span class="mat-icon">add</span> {{ 'datasources.new' | transloco }}
-          </button>
-          <button class="action-btn" (click)="refresh()" [disabled]="isLoading()">
-            <span class="mat-icon">refresh</span>
-          </button>
+          <app-button
+            variant="success"
+            size="sm"
+            [disabled]="showForm()"
+            (clicked)="openCreateForm()"
+          >
+            <app-icon size="sm">add</app-icon> {{ 'datasources.new' | transloco }}
+          </app-button>
+          <app-icon-button
+            variant="ghost"
+            size="sm"
+            [ariaLabel]="'datasources.refresh' | transloco"
+            [disabled]="isLoading()"
+            (clicked)="refresh()"
+          >
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
         </div>
       </div>
 
@@ -47,13 +79,17 @@ import {
       @if (successMessage()) {
         <div class="msg success-msg">
           <span>{{ successMessage() }}</span>
-          <button class="dismiss-btn" (click)="successMessage.set(null)">{{ 'datasources.dismiss' | transloco }}</button>
+          <app-button variant="ghost" size="sm" (clicked)="successMessage.set(null)">
+            {{ 'datasources.dismiss' | transloco }}
+          </app-button>
         </div>
       }
       @if (errorMessage()) {
         <div class="msg error-msg">
           <span>{{ errorMessage() }}</span>
-          <button class="dismiss-btn" (click)="errorMessage.set(null)">{{ 'datasources.dismiss' | transloco }}</button>
+          <app-button variant="ghost" size="sm" (clicked)="errorMessage.set(null)">
+            {{ 'datasources.dismiss' | transloco }}
+          </app-button>
         </div>
       }
 
@@ -62,29 +98,33 @@ import {
         <div class="form-panel">
           <div class="form-header">
             <span>{{ (editingId() ? 'datasources.form.editTitle' : 'datasources.form.newTitle') | transloco }}</span>
-            <button class="close-btn" (click)="closeForm()">
-              <span class="mat-icon">close</span>
-            </button>
+            <app-icon-button
+              variant="ghost"
+              size="sm"
+              [ariaLabel]="'datasources.form.close' | transloco"
+              (clicked)="closeForm()"
+            >
+              <app-icon size="sm">close</app-icon>
+            </app-icon-button>
           </div>
 
           <div class="form-body">
             <div class="form-row">
-              <div class="form-group flex-1">
-                <label class="form-label">{{ 'datasources.form.nameLabel' | transloco }} <span class="required">*</span></label>
-                <input
-                  class="form-input"
-                  [(ngModel)]="formData.name"
+              <app-form-field class="flex-1" [label]="'datasources.form.nameLabel' | transloco" [required]="true">
+                <app-input
+                  size="sm"
+                  [value]="formData.name"
+                  (valueChange)="formData.name = $event"
                   [placeholder]="'datasources.form.namePlaceholder' | transloco"
                   [disabled]="isSaving()"
-                >
-              </div>
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.typeLabel' | transloco }} <span class="required">*</span></label>
-                <select
-                  class="form-input form-select"
-                  [(ngModel)]="formData.type"
+                />
+              </app-form-field>
+              <app-form-field [label]="'datasources.form.typeLabel' | transloco" [required]="true">
+                <app-select
+                  size="sm"
+                  [value]="formData.type"
+                  (changed)="onTypeSelect($event)"
                   [disabled]="isSaving() || !!editingId()"
-                  (ngModelChange)="onTypeChange()"
                 >
                   <optgroup [label]="'datasources.form.typeGroupCli' | transloco">
                     <option value="generic">{{ 'datasources.form.optGeneric' | transloco }}</option>
@@ -96,151 +136,169 @@ import {
                     <option value="mongodb">{{ 'datasources.form.optMongodb' | transloco }}</option>
                     <option value="webdav">{{ 'datasources.form.optWebdav' | transloco }}</option>
                   </optgroup>
-                </select>
-              </div>
+                </app-select>
+              </app-form-field>
             </div>
 
             <!-- Connection URL (required for non-generic types) -->
             @if (formData.type !== 'generic') {
-              <div class="form-group">
-                <label class="form-label">
-                  {{ (formData.type === 'repository' ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco }}
-                  <span class="required">*</span>
-                </label>
-                <input
-                  class="form-input mono"
-                  [(ngModel)]="formData.connection_url"
+              <app-form-field
+                [label]="(formData.type === 'repository' ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
+                [required]="true"
+              >
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="formData.connection_url"
+                  (valueChange)="formData.connection_url = $event"
                   [placeholder]="urlPlaceholder()"
                   [disabled]="isSaving()"
-                >
-              </div>
+                />
+              </app-form-field>
             }
 
             <!-- Generic: optional connection URL -->
             @if (formData.type === 'generic') {
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.connectionUrlLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
-                <input
-                  class="form-input mono"
-                  [(ngModel)]="formData.connection_url"
+              <app-form-field [label]="'datasources.form.connectionUrlLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="formData.connection_url"
+                  (valueChange)="formData.connection_url = $event"
                   [placeholder]="'datasources.form.genericUrlPlaceholder' | transloco"
                   [disabled]="isSaving()"
-                >
-              </div>
+                />
+              </app-form-field>
             }
 
-            <div class="form-group">
-              <label class="form-label">
-                {{ 'datasources.form.descriptionLabel' | transloco }}
-                @if (formData.type === 'generic') { <span class="required">*</span> }
-              </label>
-              <textarea
-                class="form-textarea"
-                [(ngModel)]="formData.description"
+            <app-form-field
+              [label]="'datasources.form.descriptionLabel' | transloco"
+              [required]="formData.type === 'generic'"
+            >
+              <app-textarea
+                size="sm"
+                [value]="formData.description"
+                (valueChange)="formData.description = $event"
                 [placeholder]="(formData.type === 'generic' ? 'datasources.form.descriptionPlaceholderGeneric' : 'datasources.form.descriptionPlaceholderManaged') | transloco"
                 [rows]="formData.type === 'generic' ? 3 : 2"
                 [disabled]="isSaving()"
-              ></textarea>
-            </div>
+              />
+            </app-form-field>
 
             <!-- Generic: CLI hint -->
             @if (formData.type === 'generic') {
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.cliHintLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
-                <input
-                  class="form-input mono"
-                  [(ngModel)]="formData.cli_hint"
+              <app-form-field [label]="'datasources.form.cliHintLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
+                <app-input
+                  size="sm"
+                  class="mono"
+                  [value]="formData.cli_hint"
+                  (valueChange)="formData.cli_hint = $event"
                   [placeholder]="'datasources.form.cliHintPlaceholder' | transloco"
                   [disabled]="isSaving()"
-                >
-              </div>
+                />
+              </app-form-field>
             }
 
             <!-- Generic: Environment Variables -->
             @if (formData.type === 'generic') {
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.envVarsLabel' | transloco }}</label>
+              <app-form-field [label]="'datasources.form.envVarsLabel' | transloco" [hint]="'datasources.form.envHint' | transloco">
                 <div class="env-vars-editor">
                   @for (envVar of envVars; track $index) {
                     <div class="env-var-row">
-                      <input
-                        class="form-input mono env-key"
-                        [(ngModel)]="envVar.key"
+                      <app-input
+                        size="sm"
+                        class="mono env-key"
+                        [value]="envVar.key"
+                        (valueChange)="envVar.key = $event"
                         [placeholder]="'datasources.form.envKeyPlaceholder' | transloco"
                         [disabled]="isSaving()"
-                      >
+                      />
                       <span class="env-eq">=</span>
-                      <input
-                        class="form-input mono env-val"
+                      <app-input
+                        size="sm"
                         type="password"
-                        [(ngModel)]="envVar.value"
+                        class="mono env-val"
+                        [value]="envVar.value"
+                        (valueChange)="envVar.value = $event"
                         [placeholder]="'datasources.form.envValuePlaceholder' | transloco"
                         [disabled]="isSaving()"
+                      />
+                      <app-icon-button
+                        variant="danger"
+                        size="sm"
+                        [ariaLabel]="'datasources.form.envRemoveTooltip' | transloco"
+                        [tooltip]="'datasources.form.envRemoveTooltip' | transloco"
+                        [disabled]="isSaving()"
+                        (clicked)="removeEnvVar($index)"
                       >
-                      <button class="icon-btn delete" (click)="removeEnvVar($index)" [disabled]="isSaving()" [title]="'datasources.form.envRemoveTooltip' | transloco">
-                        <span class="mat-icon">close</span>
-                      </button>
+                        <app-icon size="sm">close</app-icon>
+                      </app-icon-button>
                     </div>
                   }
-                  <button class="btn btn-add-env" (click)="addEnvVar()" [disabled]="isSaving()">
-                    <span class="mat-icon">add</span> {{ 'datasources.form.envAdd' | transloco }}
-                  </button>
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    class="btn-add-env"
+                    [disabled]="isSaving()"
+                    (clicked)="addEnvVar()"
+                  >
+                    <app-icon size="sm">add</app-icon> {{ 'datasources.form.envAdd' | transloco }}
+                  </app-button>
                 </div>
-                <div class="form-hint">
-                  {{ 'datasources.form.envHint' | transloco }}
-                </div>
-              </div>
+              </app-form-field>
             }
 
             <!-- Repository: default branch -->
             @if (formData.type === 'repository') {
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.defaultBranchLabel' | transloco }} <span class="hint-inline">{{ 'datasources.form.optional' | transloco }}</span></label>
-                <input
-                  class="form-input"
-                  [(ngModel)]="formData.default_branch"
+              <app-form-field [label]="'datasources.form.defaultBranchLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
+                <app-input
+                  size="sm"
+                  [value]="formData.default_branch"
+                  (valueChange)="formData.default_branch = $event"
                   [placeholder]="'datasources.form.defaultBranchPlaceholder' | transloco"
                   [disabled]="isSaving()"
-                >
-              </div>
+                />
+              </app-form-field>
             }
 
             <!-- Repository: auth method -->
             @if (formData.type === 'repository') {
-              <div class="form-group">
-                <label class="form-label">{{ 'datasources.form.authMethodLabel' | transloco }} <span class="required">*</span></label>
-                <select
-                  class="form-input form-select"
-                  [(ngModel)]="gitAuthMethod"
+              <app-form-field [label]="'datasources.form.authMethodLabel' | transloco" [required]="true">
+                <app-select
+                  size="sm"
+                  [value]="gitAuthMethod"
+                  (changed)="onGitAuthMethodChange($event)"
                   [disabled]="isSaving()"
                 >
                   <option value="token">{{ 'datasources.form.authToken' | transloco }}</option>
                   <option value="ssh">{{ 'datasources.form.authSsh' | transloco }}</option>
-                </select>
-              </div>
+                </app-select>
+              </app-form-field>
               @if (gitAuthMethod === 'token') {
-                <div class="form-group">
-                  <label class="form-label">{{ 'datasources.form.tokenLabel' | transloco }}</label>
-                  <input
-                    class="form-input mono"
+                <app-form-field [label]="'datasources.form.tokenLabel' | transloco">
+                  <app-input
+                    size="sm"
                     type="password"
-                    [(ngModel)]="formCredentials.password"
+                    class="mono"
+                    [value]="formCredentials.password"
+                    (valueChange)="formCredentials.password = $event"
                     [placeholder]="'datasources.form.tokenPlaceholder' | transloco"
                     [disabled]="isSaving()"
-                  >
-                </div>
+                  />
+                </app-form-field>
               }
               @if (gitAuthMethod === 'ssh') {
-                <div class="form-group">
-                  <label class="form-label">{{ 'datasources.form.sshKeyLabel' | transloco }}</label>
-                  <textarea
-                    class="form-textarea mono"
-                    [(ngModel)]="gitSshKey"
+                <app-form-field [label]="'datasources.form.sshKeyLabel' | transloco">
+                  <app-textarea
+                    size="sm"
+                    class="mono"
+                    [value]="gitSshKey"
+                    (valueChange)="gitSshKey = $event"
                     placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
-                    rows="5"
+                    [rows]="5"
                     [disabled]="isSaving()"
-                  ></textarea>
-                </div>
+                  />
+                </app-form-field>
               }
               <div class="form-hint">
                 {{ 'datasources.form.repoHint' | transloco }}
@@ -250,55 +308,66 @@ import {
             <!-- Managed connectors: credentials -->
             @if (formData.type === 'neo4j' || formData.type === 'webdav') {
               <div class="form-row">
-                <div class="form-group flex-1">
-                  <label class="form-label">{{ 'datasources.form.usernameLabel' | transloco }}</label>
-                  <input
-                    class="form-input"
-                    [(ngModel)]="formCredentials.username"
+                <app-form-field class="flex-1" [label]="'datasources.form.usernameLabel' | transloco">
+                  <app-input
+                    size="sm"
+                    [value]="formCredentials.username"
+                    (valueChange)="formCredentials.username = $event"
                     [placeholder]="'datasources.form.usernamePlaceholder' | transloco"
                     [disabled]="isSaving()"
-                  >
-                </div>
-                <div class="form-group flex-1">
-                  <label class="form-label">{{ 'datasources.form.passwordLabel' | transloco }}</label>
-                  <input
-                    class="form-input"
+                  />
+                </app-form-field>
+                <app-form-field class="flex-1" [label]="'datasources.form.passwordLabel' | transloco">
+                  <app-input
+                    size="sm"
                     type="password"
-                    [(ngModel)]="formCredentials.password"
+                    [value]="formCredentials.password"
+                    (valueChange)="formCredentials.password = $event"
                     [placeholder]="'datasources.form.passwordPlaceholder' | transloco"
                     [disabled]="isSaving()"
-                  >
-                </div>
+                  />
+                </app-form-field>
               </div>
             }
 
             <div class="form-row form-footer">
               <div class="form-actions">
                 @if (formData.type !== 'generic' && formData.type !== 'repository') {
-                  <button
-                    class="btn btn-test"
-                    (click)="testFromForm()"
-                    [disabled]="!formData.connection_url || isTesting()"
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [loading]="isTesting()"
+                    [disabled]="!formData.connection_url"
+                    (clicked)="testFromForm()"
                   >
                     @if (isTesting()) {
-                      <span class="spinner-small"></span> {{ 'datasources.form.testing' | transloco }}
+                      {{ 'datasources.form.testing' | transloco }}
                     } @else {
-                      <span class="mat-icon">cable</span> {{ 'datasources.form.test' | transloco }}
+                      <app-icon size="sm">cable</app-icon> {{ 'datasources.form.test' | transloco }}
                     }
-                  </button>
+                  </app-button>
                 }
-                <button class="btn btn-secondary" (click)="closeForm()" [disabled]="isSaving()">{{ 'datasources.form.cancel' | transloco }}</button>
-                <button
-                  class="btn btn-primary"
-                  (click)="saveForm()"
-                  [disabled]="!canSave() || isSaving()"
+                <app-button
+                  variant="secondary"
+                  size="sm"
+                  [disabled]="isSaving()"
+                  (clicked)="closeForm()"
+                >
+                  {{ 'datasources.form.cancel' | transloco }}
+                </app-button>
+                <app-button
+                  variant="primary"
+                  size="sm"
+                  [loading]="isSaving()"
+                  [disabled]="!canSave()"
+                  (clicked)="saveForm()"
                 >
                   @if (isSaving()) {
-                    <span class="spinner-small"></span> {{ 'datasources.form.saving' | transloco }}
+                    {{ 'datasources.form.saving' | transloco }}
                   } @else {
                     {{ (editingId() ? 'datasources.form.update' : 'datasources.form.create') | transloco }}
                   }
-                </button>
+                </app-button>
               </div>
             </div>
 
@@ -308,7 +377,7 @@ import {
                 [class.test-ok]="formTestResult()!.status === 'ok'"
                 [class.test-error]="formTestResult()!.status === 'error'"
               >
-                <span class="mat-icon">{{ formTestResult()!.status === 'ok' ? 'check_circle' : 'error' }}</span>
+                <app-icon size="sm">{{ formTestResult()!.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
                 {{ formTestResult()!.message }}
               </div>
             }
@@ -319,7 +388,7 @@ import {
       <!-- Loading State -->
       @if (isLoading() && filteredDatasources().length === 0 && !showForm()) {
         <div class="center-state">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>{{ 'datasources.table.loading' | transloco }}</span>
         </div>
       }
@@ -327,7 +396,7 @@ import {
       <!-- Empty State -->
       @if (!isLoading() && filteredDatasources().length === 0 && !showForm()) {
         <div class="center-state">
-          <span class="mat-icon empty-icon">database</span>
+          <app-icon size="inherit" class="empty-icon">database</app-icon>
           <span>{{ 'datasources.table.empty' | transloco }}</span>
           <span class="hint">{{ 'datasources.table.emptyHint' | transloco }}</span>
         </div>
@@ -350,10 +419,10 @@ import {
               @for (ds of filteredDatasources(); track ds.id) {
                 <tr>
                   <td>
-                    <span class="type-badge" [class]="'type-' + ds.type">
-                      <span class="mat-icon">{{ getTypeIcon(ds.type) }}</span>
+                    <app-badge [tone]="dsTypeTone(ds.type)" size="sm">
+                      <app-icon size="sm">{{ getTypeIcon(ds.type) }}</app-icon>
                       {{ 'datasources.filter.' + ds.type | transloco }}
-                    </span>
+                    </app-badge>
                   </td>
                   <td class="name-cell">
                     <span class="ds-name">{{ ds.name }}</span>
@@ -363,29 +432,39 @@ import {
                   </td>
                   <td class="url-cell mono">{{ ds.connection_url ? maskUrl(ds.connection_url) : '—' }}</td>
                   <td>
-                    <span class="scope-badge" [class.scope-global]="!ds.job_id" [class.scope-job]="!!ds.job_id">
+                    <app-badge [tone]="ds.job_id ? 'neutral' : 'accent'" size="xs">
                       {{ (ds.job_id ? 'datasources.table.scopeJob' : 'datasources.table.scopeGlobal') | transloco }}
-                    </span>
+                    </app-badge>
                   </td>
                   <td class="actions-cell">
-                    <button
-                      class="icon-btn test"
-                      (click)="testDatasource(ds.id)"
-                      [disabled]="testingIds().has(ds.id)"
-                      [title]="'datasources.table.testTooltip' | transloco"
+                    <app-icon-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'datasources.table.testTooltip' | transloco"
+                      [tooltip]="'datasources.table.testTooltip' | transloco"
+                      [loading]="testingIds().has(ds.id)"
+                      (clicked)="testDatasource(ds.id)"
                     >
-                      @if (testingIds().has(ds.id)) {
-                        <span class="spinner-tiny"></span>
-                      } @else {
-                        <span class="mat-icon">cable</span>
-                      }
-                    </button>
-                    <button class="icon-btn edit" (click)="openEditForm(ds)" [title]="'datasources.table.editTooltip' | transloco">
-                      <span class="mat-icon">edit</span>
-                    </button>
-                    <button class="icon-btn delete" (click)="deleteDatasource(ds)" [title]="'datasources.table.deleteTooltip' | transloco">
-                      <span class="mat-icon">delete</span>
-                    </button>
+                      <app-icon size="sm">cable</app-icon>
+                    </app-icon-button>
+                    <app-icon-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'datasources.table.editTooltip' | transloco"
+                      [tooltip]="'datasources.table.editTooltip' | transloco"
+                      (clicked)="openEditForm(ds)"
+                    >
+                      <app-icon size="sm">edit</app-icon>
+                    </app-icon-button>
+                    <app-icon-button
+                      variant="danger"
+                      size="sm"
+                      [ariaLabel]="'datasources.table.deleteTooltip' | transloco"
+                      [tooltip]="'datasources.table.deleteTooltip' | transloco"
+                      (clicked)="deleteDatasource(ds)"
+                    >
+                      <app-icon size="sm">delete</app-icon>
+                    </app-icon-button>
 
                     @if (testResults()[ds.id]; as result) {
                       <span
@@ -394,7 +473,7 @@ import {
                         [class.test-error]="result.status === 'error'"
                         title="{{ result.message }}"
                       >
-                        <span class="mat-icon">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</span>
+                        <app-icon size="sm">{{ result.status === 'ok' ? 'check_circle' : 'error' }}</app-icon>
                       </span>
                     }
                   </td>
@@ -421,13 +500,6 @@ import {
         background: var(--panel-bg, #181825);
       }
 
-      .mat-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-        line-height: 1;
-        vertical-align: middle;
-      }
-
       /* Header */
       .header-bar {
         display: flex;
@@ -450,66 +522,11 @@ import {
         gap: 4px;
       }
 
-      .filter-chip {
-        padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 12px;
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .filter-chip:hover {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .filter-chip.active {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-        border-color: var(--accent-color, #cba6f7);
-      }
-
       .header-actions {
         display: flex;
         gap: 6px;
         margin-left: auto;
-      }
-
-      .action-btn {
-        display: inline-flex;
         align-items: center;
-        gap: 4px;
-        padding: 5px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .action-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .action-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .new-btn {
-        color: #a6e3a1;
-        border-color: #a6e3a1;
-      }
-
-      .new-btn:hover:not(:disabled) {
-        background: rgba(166, 227, 161, 0.1);
-        color: #a6e3a1;
       }
 
       /* Messages */
@@ -536,20 +553,6 @@ import {
         color: #f38ba8;
       }
 
-      .dismiss-btn {
-        padding: 3px 8px;
-        border: none;
-        border-radius: 4px;
-        background: rgba(255, 255, 255, 0.1);
-        color: inherit;
-        font-size: 10px;
-        cursor: pointer;
-      }
-
-      .dismiss-btn:hover {
-        background: rgba(255, 255, 255, 0.2);
-      }
-
       /* Form Panel */
       .form-panel {
         margin: 8px 12px 0;
@@ -570,19 +573,6 @@ import {
         color: var(--text-primary, #cdd6f4);
       }
 
-      .close-btn {
-        background: none;
-        border: none;
-        color: var(--text-muted, #6c7086);
-        cursor: pointer;
-        padding: 2px;
-        line-height: 1;
-      }
-
-      .close-btn:hover {
-        color: var(--text-primary, #cdd6f4);
-      }
-
       .form-body {
         padding: 14px;
       }
@@ -597,71 +587,12 @@ import {
         flex: 1;
       }
 
-      .form-group {
-        margin-bottom: 12px;
-      }
-
-      .form-label {
-        display: block;
-        margin-bottom: 4px;
-        font-size: 11px;
-        font-weight: 500;
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .required {
-        color: #f38ba8;
-      }
-
-      .form-input,
-      .form-textarea,
-      .form-select {
-        width: 100%;
-        padding: 8px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 5px;
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-        font-family: inherit;
-        font-size: 12px;
-        transition: border-color 0.15s ease;
-      }
-
-      .form-input:focus,
-      .form-textarea:focus,
-      .form-select:focus {
-        outline: none;
-        border-color: var(--accent-color, #cba6f7);
-      }
-
-      .form-input:disabled,
-      .form-textarea:disabled,
-      .form-select:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-
-      .form-input::placeholder,
-      .form-textarea::placeholder {
-        color: var(--text-muted, #6c7086);
-      }
-
-      .form-input.mono {
+      app-input.mono,
+      app-textarea.mono {
         font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
       }
 
-      .form-textarea {
-        resize: vertical;
-        min-height: 40px;
-      }
-
-      .form-select {
-        appearance: auto;
-        max-width: 100%;
-      }
-
-      .form-row > .form-group:not(.flex-1) {
+      .form-row > app-form-field:not(.flex-1) {
         min-width: 0;
         max-width: 160px;
       }
@@ -702,8 +633,11 @@ import {
         gap: 6px;
       }
 
-      .env-key {
+      app-input.env-key {
         flex: 0 0 200px;
+      }
+
+      app-input.env-key ::ng-deep input {
         text-transform: uppercase;
       }
 
@@ -713,27 +647,12 @@ import {
         font-size: 12px;
       }
 
-      .env-val {
+      app-input.env-val {
         flex: 1;
       }
 
       .btn-add-env {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 5px 10px;
-        border: 1px dashed var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
         align-self: flex-start;
-      }
-
-      .btn-add-env:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
       }
 
       .toggle-label {
@@ -748,53 +667,7 @@ import {
       .form-actions {
         display: flex;
         gap: 8px;
-      }
-
-      .btn {
-        display: inline-flex;
         align-items: center;
-        gap: 5px;
-        padding: 7px 14px;
-        border: none;
-        border-radius: 5px;
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .btn-secondary {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-      }
-
-      .btn-secondary:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-      }
-
-      .btn-primary {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-      }
-
-      .btn-primary:hover:not(:disabled) {
-        filter: brightness(1.1);
-      }
-
-      .btn-test {
-        background: transparent;
-        border: 1px solid var(--border-color, #45475a);
-        color: var(--text-secondary, #a6adc8);
-      }
-
-      .btn-test:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
       }
 
       .test-result {
@@ -815,26 +688,6 @@ import {
       .test-error {
         background: rgba(243, 139, 168, 0.1);
         color: #f38ba8;
-      }
-
-      .spinner-small {
-        width: 12px;
-        height: 12px;
-        border: 2px solid rgba(0, 0, 0, 0.2);
-        border-top-color: currentColor;
-        border-radius: 50%;
-        animation: spin 0.6s linear infinite;
-        display: inline-block;
-      }
-
-      .spinner-tiny {
-        width: 14px;
-        height: 14px;
-        border: 2px solid var(--border-color, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.6s linear infinite;
-        display: inline-block;
       }
 
       /* Center States */
@@ -858,19 +711,6 @@ import {
       .hint {
         font-size: 11px;
         opacity: 0.7;
-      }
-
-      .spinner {
-        width: 28px;
-        height: 28px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
       }
 
       /* Table */
@@ -909,51 +749,8 @@ import {
         background: var(--surface-0, #313244);
       }
 
-      /* Type Badge */
-      .type-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 500;
-        text-transform: capitalize;
-        white-space: nowrap;
-      }
-
-      .type-badge .mat-icon {
-        font-size: 16px;
-      }
-
-      .type-postgresql {
-        background: rgba(137, 180, 250, 0.2);
-        color: #89b4fa;
-      }
-
-      .type-neo4j {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .type-mongodb {
-        background: rgba(148, 226, 213, 0.2);
-        color: #94e2d5;
-      }
-
-      .type-webdav {
-        background: rgba(250, 179, 135, 0.2);
-        color: #fab387;
-      }
-
-      .type-generic {
-        background: rgba(203, 166, 247, 0.2);
-        color: #cba6f7;
-      }
-
-      .type-repository {
-        background: rgba(137, 180, 250, 0.2);
-        color: #89b4fa;
+      app-badge app-icon {
+        margin-right: 4px;
       }
 
       /* Name cell */
@@ -991,81 +788,20 @@ import {
         font-family: 'JetBrains Mono', monospace;
       }
 
-      /* Read-only badge */
-      .ro-badge {
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 10px;
-        font-weight: 500;
-      }
-
-      .ro-true {
-        background: rgba(137, 180, 250, 0.15);
-        color: #89b4fa;
-      }
-
-      .ro-false {
-        background: rgba(249, 226, 175, 0.15);
-        color: #f9e2af;
-      }
-
-      /* Scope badge */
-      .scope-badge {
-        padding: 2px 6px;
-        border-radius: 3px;
-        font-size: 10px;
-        font-weight: 500;
-      }
-
-      .scope-global {
-        background: rgba(203, 166, 247, 0.15);
-        color: #cba6f7;
-      }
-
-      .scope-job {
-        background: rgba(108, 112, 134, 0.15);
-        color: #6c7086;
-      }
-
       /* Action Buttons */
       .actions-cell {
         white-space: nowrap;
+        display: flex;
+        gap: 2px;
+        align-items: center;
       }
-
-      .icon-btn {
-        padding: 4px;
-        border: none;
-        border-radius: 4px;
-        background: transparent;
-        cursor: pointer;
-        transition: all 0.15s ease;
-        line-height: 1;
-        color: var(--text-muted, #6c7086);
-      }
-
-      .icon-btn:hover:not(:disabled) {
-        background: rgba(255, 255, 255, 0.1);
-      }
-
-      .icon-btn:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .icon-btn.test:hover:not(:disabled) { color: #89b4fa; }
-      .icon-btn.edit:hover:not(:disabled) { color: #f9e2af; }
-      .icon-btn.delete:hover:not(:disabled) { color: #f38ba8; }
 
       .inline-test {
         margin-left: 4px;
       }
 
-      .inline-test .mat-icon {
-        font-size: 16px;
-      }
-
-      .inline-test.test-ok { color: #a6e3a1; }
-      .inline-test.test-error { color: #f38ba8; }
+      .inline-test.test-ok { color: var(--success); }
+      .inline-test.test-error { color: var(--danger); }
     `,
   ],
 })
@@ -1222,6 +958,35 @@ export class DatasourceListComponent implements OnInit {
   onTypeChange(): void {
     // Reset URL placeholder trigger
     this.formTestResult.set(null);
+  }
+
+  onTypeSelect(value: DatasourceType | null): void {
+    if (value) {
+      this.formData.type = value;
+      this.onTypeChange();
+    }
+  }
+
+  onGitAuthMethodChange(value: string | null): void {
+    this.gitAuthMethod = value === 'ssh' ? 'ssh' : 'token';
+  }
+
+  dsTypeTone(type: DatasourceType | string): BadgeTone {
+    switch (type) {
+      case 'generic':
+        return 'accent';
+      case 'repository':
+      case 'postgresql':
+        return 'info';
+      case 'neo4j':
+        return 'success';
+      case 'webdav':
+        return 'warning';
+      case 'mongodb':
+        return 'neutral';
+      default:
+        return 'neutral';
+    }
   }
 
   saveForm(): void {

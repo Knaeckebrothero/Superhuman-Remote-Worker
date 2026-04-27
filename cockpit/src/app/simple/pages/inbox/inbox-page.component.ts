@@ -12,7 +12,6 @@ import {
 } from '@angular/core';
 import {ActivatedRoute, Router} from '@angular/router';
 import {JsonPipe} from '@angular/common';
-import {FormsModule} from '@angular/forms';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ViewportService} from '../../../core/services/viewport.service';
@@ -21,6 +20,16 @@ import {SudoRequest, SudoService} from '../../../core/services/sudo.service';
 import {ApiService} from '../../../core/services/api.service';
 import {ActionItem, ActionItemType, ThreadDetail,} from '../../../core/models/action.model';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
+import {AppChipComponent} from '../../../ui/chip';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppDialogComponent} from '../../../ui/dialog';
+import {AppTextareaComponent} from '../../../ui/textarea';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppInputComponent} from '../../../ui/input';
+import {AppSelectComponent} from '../../../ui/select';
+import {AppCheckboxComponent} from '../../../ui/checkbox';
+import {AppIconComponent} from '../../../ui/icon';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -63,7 +72,22 @@ function relativeTime(iso: string, nowLabel: string): string {
 @Component({
   selector: 'app-inbox-page',
   standalone: true,
-  imports: [FormsModule, JsonPipe, MarkdownComponent, SidebarToggleComponent, TranslocoPipe],
+  imports: [
+    JsonPipe,
+    MarkdownComponent,
+    SidebarToggleComponent,
+    TranslocoPipe,
+    AppChipComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppDialogComponent,
+    AppTextareaComponent,
+    AppButtonComponent,
+    AppInputComponent,
+    AppSelectComponent,
+    AppCheckboxComponent,
+    AppIconComponent,
+  ],
   template: `
     <div class="inbox" (keydown)="onKeydown($event)">
       <!-- Header -->
@@ -71,68 +95,68 @@ function relativeTime(iso: string, nowLabel: string): string {
         <div class="header-left">
           <app-sidebar-toggle />
           @if (isMobileDetail()) {
-            <button class="back-btn" (click)="deselect()" [title]="'inbox.backBtn' | transloco">
-              <span class="icon">arrow_back</span>
-            </button>
+            <app-icon-button
+              size="sm"
+              [ariaLabel]="'inbox.backBtn' | transloco"
+              [tooltip]="'inbox.backBtn' | transloco"
+              (clicked)="deselect()"
+            >
+              <app-icon size="sm">arrow_back</app-icon>
+            </app-icon-button>
           }
           <h1 class="header-title">{{ 'inbox.title' | transloco }}</h1>
         </div>
 
         <div class="filter-chips">
-          <button
-            class="chip"
-            [class.active]="activeFilter() === null"
-            (click)="setFilter(null)"
+          <app-chip
+            [selected]="activeFilter() === null"
+            (clicked)="setFilter(null)"
           >
             {{ 'inbox.filters.all' | transloco }}
             @if (actionCenter.counts().total > 0) {
               <span class="chip-count">{{ actionCenter.counts().total }}</span>
             }
-          </button>
-          <button
-            class="chip"
-            [class.active]="activeFilter() === 'message'"
-            (click)="setFilter('message')"
+          </app-chip>
+          <app-chip
+            [selected]="activeFilter() === 'message'"
+            (clicked)="setFilter('message')"
           >
-            <span class="chip-icon">mail</span>
+            <app-icon size="sm">mail</app-icon>
             {{ 'inbox.filters.messages' | transloco }}
             @if (actionCenter.counts().messages > 0) {
               <span class="chip-count">{{ actionCenter.counts().messages }}</span>
             }
-          </button>
-          <button
-            class="chip"
-            [class.active]="activeFilter() === 'sudo'"
-            (click)="setFilter('sudo')"
+          </app-chip>
+          <app-chip
+            [selected]="activeFilter() === 'sudo'"
+            (clicked)="setFilter('sudo')"
           >
-            <span class="chip-icon">admin_panel_settings</span>
+            <app-icon size="sm">admin_panel_settings</app-icon>
             {{ 'inbox.filters.sudo' | transloco }}
             @if (actionCenter.counts().sudo > 0) {
               <span class="chip-count">{{ actionCenter.counts().sudo }}</span>
             }
-          </button>
-          <button
-            class="chip"
-            [class.active]="activeFilter() === 'review'"
-            (click)="setFilter('review')"
+          </app-chip>
+          <app-chip
+            [selected]="activeFilter() === 'review'"
+            (clicked)="setFilter('review')"
           >
-            <span class="chip-icon">rate_review</span>
+            <app-icon size="sm">rate_review</app-icon>
             {{ 'inbox.filters.reviews' | transloco }}
             @if (actionCenter.counts().reviews > 0) {
               <span class="chip-count">{{ actionCenter.counts().reviews }}</span>
             }
-          </button>
-          <button
-            class="chip"
-            [class.active]="activeFilter() === 'session'"
-            (click)="setFilter('session')"
+          </app-chip>
+          <app-chip
+            [selected]="activeFilter() === 'session'"
+            (clicked)="setFilter('session')"
           >
-            <span class="chip-icon">smart_toy</span>
+            <app-icon size="sm">smart_toy</app-icon>
             {{ 'inbox.filters.sessions' | transloco }}
             @if (actionCenter.counts().sessions > 0) {
               <span class="chip-count">{{ actionCenter.counts().sessions }}</span>
             }
-          </button>
+          </app-chip>
         </div>
 
         <div class="header-right">
@@ -141,9 +165,14 @@ function relativeTime(iso: string, nowLabel: string): string {
             [class.connected]="sudo.isConnected()"
             [title]="(sudo.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
           ></span>
-          <button class="icon-btn" (click)="refresh()" [title]="'inbox.refresh' | transloco">
-            <span class="icon">refresh</span>
-          </button>
+          <app-icon-button
+            size="sm"
+            [ariaLabel]="'inbox.refresh' | transloco"
+            [tooltip]="'inbox.refresh' | transloco"
+            (clicked)="refresh()"
+          >
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
         </div>
       </header>
 
@@ -153,7 +182,7 @@ function relativeTime(iso: string, nowLabel: string): string {
         <div class="list-panel" role="feed" [attr.aria-label]="'inbox.listAriaLabel' | transloco">
           @if (filteredItems().length === 0) {
             <div class="empty-list">
-              <span class="empty-icon">inbox</span>
+              <app-icon size="inherit" class="empty-icon">inbox</app-icon>
               <span class="empty-text">
                 @if (activeFilter()) {
                   {{ 'inbox.list.empty.' + activeFilter() | transloco }}
@@ -175,14 +204,14 @@ function relativeTime(iso: string, nowLabel: string): string {
                 (click)="selectItem(item)"
               >
                 <div class="item-urgency-bar" [class]="'urgency-' + urgencyColor(item)"></div>
-                <span class="item-type-icon" [class]="'type-' + item.type">
+                <app-icon size="lg" class="item-type-icon" [class]="'type-' + item.type">
                   @switch (item.type) {
                     @case ('message') { mail }
                     @case ('sudo') { admin_panel_settings }
                     @case ('review') { rate_review }
                     @case ('session') { smart_toy }
                   }
-                </span>
+                </app-icon>
                 <div class="item-content">
                   <div class="item-title-row">
                     <span class="item-title">{{ item.title }}</span>
@@ -198,16 +227,18 @@ function relativeTime(iso: string, nowLabel: string): string {
                   </div>
                   <div class="item-subtitle">
                     @if (item.type === 'message' && item.message?.mode === 'blocking') {
-                      <span class="mode-badge blocking">{{ 'inbox.list.modeBlocking' | transloco }}</span>
+                      <app-badge tone="danger" size="xs" [uppercase]="true">
+                        {{ 'inbox.list.modeBlocking' | transloco }}
+                      </app-badge>
                     }
                     @if (item.status === 'resolved') {
-                      <span class="resolved-badge">
+                      <app-badge tone="neutral" size="xs" [uppercase]="true">
                         @if (item.type === 'sudo' && item.sudo) {
                           {{ item.sudo.status }}
                         } @else {
                           {{ 'inbox.list.resolved' | transloco }}
                         }
-                      </span>
+                      </app-badge>
                     }
                     {{ item.subtitle }}
                   </div>
@@ -222,7 +253,7 @@ function relativeTime(iso: string, nowLabel: string): string {
           @if (!selectedItem()) {
             <!-- Empty state -->
             <div class="detail-empty">
-              <span class="detail-empty-icon">select_all</span>
+              <app-icon size="inherit" class="detail-empty-icon">select_all</app-icon>
               <span class="detail-empty-text">{{ 'inbox.detail.emptyText' | transloco }}</span>
               <span class="detail-empty-hint">
                 {{ 'inbox.detail.hintUse' | transloco }} <kbd>j</kbd>/<kbd>k</kbd> {{ 'inbox.detail.hintToNavigate' | transloco }} <kbd>Enter</kbd> {{ 'inbox.detail.hintToSelect' | transloco }}
@@ -233,24 +264,27 @@ function relativeTime(iso: string, nowLabel: string): string {
             <div class="detail-content sudo-detail">
               <div class="detail-header">
                 <span class="detail-type-badge sudo">
-                  <span class="icon">
-                    {{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'cloud_upload' : 'admin_panel_settings' }}
-                  </span>
+                  <app-icon size="sm">{{ selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'cloud_upload' : 'admin_panel_settings' }}</app-icon>
                   {{ (selectedItem()!.sudo!.request_type === 'vm_upgrade' ? 'inbox.sudoDetail.vmUpgradeRequest' : 'inbox.sudoDetail.sudoRequest') | transloco }}
                 </span>
                 @if (selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
-                  <span class="risk-badge" [class]="'risk-' + getRisk(selectedItem()!.sudo!)">
+                  <app-badge
+                    [tone]="riskTone(getRisk(selectedItem()!.sudo!))"
+                    appearance="solid"
+                    size="xs"
+                    [uppercase]="true"
+                  >
                     {{ getRisk(selectedItem()!.sudo!) }}
-                  </span>
+                  </app-badge>
                 }
                 @if (selectedItem()!.sudo!.status === 'pending' && selectedItem()!.sudo!.request_type !== 'vm_upgrade') {
                   <span class="detail-countdown" [class]="'ttl-' + ttlColor(selectedItem()!.sudo!)">
                     {{ 'inbox.sudoDetail.secondsRemaining' | transloco: {seconds: getSecondsLeft(selectedItem()!.sudo!)} }}
                   </span>
                 }
-                <span class="status-badge" [class]="'status-' + selectedItem()!.sudo!.status">
+                <app-badge [tone]="sudoStatusTone(selectedItem()!.sudo!.status)" size="xs" [uppercase]="true">
                   {{ selectedItem()!.sudo!.status }}
-                </span>
+                </app-badge>
               </div>
 
               <div class="command-block">
@@ -287,28 +321,28 @@ function relativeTime(iso: string, nowLabel: string): string {
                     {{ 'inbox.sudoDetail.upgradeHint' | transloco }}
                   </div>
                   <div class="action-bar">
-                    <button class="btn btn-upgrade" (click)="approveVmUpgrade()">
-                      <span class="icon">cloud_upload</span> {{ 'inbox.sudoDetail.upgradeToVm' | transloco }}
+                    <app-button variant="warning" size="sm" (clicked)="approveVmUpgrade()">
+                      <app-icon size="sm">cloud_upload</app-icon> {{ 'inbox.sudoDetail.upgradeToVm' | transloco }}
                       <kbd>u</kbd>
-                    </button>
-                    <button class="btn btn-resume" (click)="resumeWithoutVmSudo()">
-                      <span class="icon">play_arrow</span> {{ 'inbox.sudoDetail.resumeWithoutVm' | transloco }}
-                    </button>
-                    <button class="btn btn-deny" (click)="startDenySudo()">
-                      <span class="icon">close</span> {{ 'inbox.sudoDetail.deny' | transloco }}
+                    </app-button>
+                    <app-button variant="primary" size="sm" (clicked)="resumeWithoutVmSudo()">
+                      <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.sudoDetail.resumeWithoutVm' | transloco }}
+                    </app-button>
+                    <app-button variant="danger" size="sm" (clicked)="startDenySudo()">
+                      <app-icon size="sm">close</app-icon> {{ 'inbox.sudoDetail.deny' | transloco }}
                       <kbd>d</kbd>
-                    </button>
+                    </app-button>
                   </div>
                 } @else {
                   <div class="action-bar">
-                    <button class="btn btn-approve" (click)="approveSudo()">
-                      <span class="icon">check</span> {{ 'inbox.sudoDetail.approve' | transloco }}
+                    <app-button variant="success" size="sm" (clicked)="approveSudo()">
+                      <app-icon size="sm">check</app-icon> {{ 'inbox.sudoDetail.approve' | transloco }}
                       <kbd>a</kbd>
-                    </button>
-                    <button class="btn btn-deny" (click)="startDenySudo()">
-                      <span class="icon">close</span> {{ 'inbox.sudoDetail.deny' | transloco }}
+                    </app-button>
+                    <app-button variant="danger" size="sm" (clicked)="startDenySudo()">
+                      <app-icon size="sm">close</app-icon> {{ 'inbox.sudoDetail.deny' | transloco }}
                       <kbd>d</kbd>
-                    </button>
+                    </app-button>
                   </div>
                 }
               }
@@ -323,29 +357,41 @@ function relativeTime(iso: string, nowLabel: string): string {
               <!-- Rules section -->
               <details class="rules-section">
                 <summary class="rules-toggle">
-                  <span class="icon">settings</span>
+                  <app-icon size="sm">settings</app-icon>
                   {{ 'inbox.sudoDetail.rulesToggle' | transloco: {count: sudo.rules().length} }}
                 </summary>
                 <div class="rules-body">
                   <div class="rule-form">
-                    <input
-                      class="input"
+                    <app-input
+                      size="sm"
+                      [(value)]="newRulePattern"
                       [placeholder]="'inbox.sudoDetail.rulePatternPlaceholder' | transloco"
-                      [(ngModel)]="newRulePattern"
                     />
-                    <select class="select" [(ngModel)]="newRuleAction">
+                    <app-select size="sm" [(value)]="newRuleAction">
                       <option value="approve">{{ 'inbox.sudoDetail.ruleActionApprove' | transloco }}</option>
                       <option value="deny">{{ 'inbox.sudoDetail.ruleActionDeny' | transloco }}</option>
-                    </select>
-                    <button class="btn btn-sm" (click)="addRule()">{{ 'inbox.sudoDetail.ruleAdd' | transloco }}</button>
+                    </app-select>
+                    <app-button variant="primary" size="sm" (clicked)="addRule()">
+                      {{ 'inbox.sudoDetail.ruleAdd' | transloco }}
+                    </app-button>
                   </div>
                   @for (rule of sudo.rules(); track rule.id) {
                     <div class="rule-row">
-                      <span class="rule-action-badge" [class]="'action-' + rule.action">{{ rule.action }}</span>
+                      <app-badge
+                        [tone]="rule.action === 'approve' ? 'success' : 'danger'"
+                        appearance="solid"
+                        size="xs"
+                        [uppercase]="true"
+                      >{{ rule.action }}</app-badge>
                       <code class="rule-pattern">{{ rule.pattern }}</code>
-                      <button class="icon-btn-sm" (click)="deleteRule(rule.id)">
-                        <span class="icon">close</span>
-                      </button>
+                      <app-icon-button
+                        size="sm"
+                        variant="danger"
+                        [ariaLabel]="'inbox.sudoDetail.ruleDelete' | transloco"
+                        (clicked)="deleteRule(rule.id)"
+                      >
+                        <app-icon size="sm">close</app-icon>
+                      </app-icon-button>
                     </div>
                   }
                 </div>
@@ -357,13 +403,17 @@ function relativeTime(iso: string, nowLabel: string): string {
             <div class="detail-content message-detail">
               <div class="detail-header">
                 <span class="detail-type-badge message">
-                  <span class="icon">mail</span>
+                  <app-icon size="sm">mail</app-icon>
                   {{ selectedItem()!.message!.subject || ('inbox.messageDetail.messageLabel' | transloco) }}
                 </span>
                 @if (selectedItem()!.message!.mode === 'blocking') {
-                  <span class="mode-badge blocking">{{ 'inbox.messageDetail.modeBlocking' | transloco }}</span>
+                  <app-badge tone="danger" size="xs" [uppercase]="true">
+                    {{ 'inbox.messageDetail.modeBlocking' | transloco }}
+                  </app-badge>
                 } @else {
-                  <span class="mode-badge async">{{ 'inbox.messageDetail.modeAsync' | transloco }}</span>
+                  <app-badge tone="neutral" size="xs" [uppercase]="true">
+                    {{ 'inbox.messageDetail.modeAsync' | transloco }}
+                  </app-badge>
                 }
               </div>
 
@@ -412,29 +462,28 @@ function relativeTime(iso: string, nowLabel: string): string {
 
               <!-- Reply form -->
               <div class="reply-form">
-                <textarea
-                  class="reply-input"
+                <app-textarea
+                  #replyInput
+                  [(value)]="replyText"
                   [placeholder]="'inbox.messageDetail.replyPlaceholder' | transloco"
-                  [(ngModel)]="replyText"
+                  [rows]="2"
                   (keydown.control.enter)="sendReply()"
                   (keydown.meta.enter)="sendReply()"
-                  rows="2"
-                  #replyInput
-                ></textarea>
+                />
                 <div class="reply-actions">
-                  <label class="urgent-check">
-                    <input type="checkbox" [(ngModel)]="replyUrgent" />
+                  <app-checkbox [(checked)]="replyUrgent">
                     {{ 'inbox.messageDetail.markUrgent' | transloco }}
-                  </label>
-                  <button
-                    class="btn btn-send"
+                  </app-checkbox>
+                  <app-button
+                    variant="info"
+                    size="sm"
                     [disabled]="!replyText.trim() || replySending()"
-                    (click)="sendReply()"
+                    (clicked)="sendReply()"
                   >
-                    <span class="icon">send</span>
+                    <app-icon size="sm">send</app-icon>
                     {{ 'inbox.messageDetail.send' | transloco }}
                     <kbd>Ctrl+Enter</kbd>
-                  </button>
+                  </app-button>
                 </div>
               </div>
             </div>
@@ -444,16 +493,13 @@ function relativeTime(iso: string, nowLabel: string): string {
             <div class="detail-content review-detail">
               <div class="detail-header">
                 <span class="detail-type-badge review">
-                  <span class="icon">rate_review</span>
+                  <app-icon size="sm">rate_review</app-icon>
                   {{ 'inbox.reviewDetail.jobReview' | transloco }}
                 </span>
-                <span class="freeze-badge" [class]="
-                  frozenData()?.freeze_type === 'phase_boundary' ? 'phase' :
-                  frozenData()?.freeze_type === 'vm_upgrade_required' ? 'upgrade' : 'complete'
-                ">
+                <app-badge [tone]="freezeTone()" appearance="solid" size="xs" [uppercase]="true">
                   {{ (frozenData()?.freeze_type === 'phase_boundary' ? 'inbox.reviewDetail.freezePhase' :
                      frozenData()?.freeze_type === 'vm_upgrade_required' ? 'inbox.reviewDetail.freezeUpgrade' : 'inbox.reviewDetail.freezeComplete') | transloco }}
-                </span>
+                </app-badge>
               </div>
 
               <div class="review-job-info">
@@ -520,54 +566,56 @@ function relativeTime(iso: string, nowLabel: string): string {
                       {{ 'inbox.reviewDetail.upgradeHint' | transloco }}
                     </div>
                     <div class="upgrade-buttons">
-                      <button
-                        class="btn btn-upgrade"
+                      <app-button
+                        variant="warning"
+                        size="sm"
                         [disabled]="reviewActing()"
-                        (click)="upgradeToVm()"
+                        (clicked)="upgradeToVm()"
                       >
-                        <span class="icon">cloud_upload</span> {{ 'inbox.reviewDetail.upgradeToVm' | transloco }}
-                      </button>
-                      <button
-                        class="btn btn-resume"
+                        <app-icon size="sm">cloud_upload</app-icon> {{ 'inbox.reviewDetail.upgradeToVm' | transloco }}
+                      </app-button>
+                      <app-button
+                        variant="primary"
+                        size="sm"
                         [disabled]="reviewActing()"
-                        (click)="resumeWithoutVm()"
+                        (clicked)="resumeWithoutVm()"
                       >
-                        <span class="icon">play_arrow</span> {{ 'inbox.reviewDetail.resumeWithoutVm' | transloco }}
-                      </button>
+                        <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.reviewDetail.resumeWithoutVm' | transloco }}
+                      </app-button>
                     </div>
                   </div>
                 } @else if (frozenData()?.freeze_type === 'job_complete') {
                   <div class="review-action-group">
-                    <textarea
-                      class="input review-notes"
+                    <app-textarea
+                      [(value)]="reviewNotes"
                       [placeholder]="'inbox.reviewDetail.notesPlaceholder' | transloco"
-                      [(ngModel)]="reviewNotes"
-                      rows="2"
-                    ></textarea>
-                    <button
-                      class="btn btn-approve"
+                      [rows]="2"
+                    />
+                    <app-button
+                      variant="success"
+                      size="sm"
                       [disabled]="reviewActing()"
-                      (click)="approveReview()"
+                      (clicked)="approveReview()"
                     >
-                      <span class="icon">check_circle</span> {{ 'inbox.reviewDetail.approve' | transloco }}
+                      <app-icon size="sm">check_circle</app-icon> {{ 'inbox.reviewDetail.approve' | transloco }}
                       <kbd>a</kbd>
-                    </button>
+                    </app-button>
                   </div>
                 } @else {
                   <div class="review-action-group">
-                    <textarea
-                      class="input review-notes"
+                    <app-textarea
+                      [(value)]="reviewFeedback"
                       [placeholder]="'inbox.reviewDetail.feedbackPlaceholder' | transloco"
-                      [(ngModel)]="reviewFeedback"
-                      rows="2"
-                    ></textarea>
-                    <button
-                      class="btn btn-resume"
+                      [rows]="2"
+                    />
+                    <app-button
+                      variant="primary"
+                      size="sm"
                       [disabled]="reviewActing()"
-                      (click)="resumeReview()"
+                      (clicked)="resumeReview()"
                     >
-                      <span class="icon">play_arrow</span> {{ 'inbox.reviewDetail.resumeWithFeedback' | transloco }}
-                    </button>
+                      <app-icon size="sm">play_arrow</app-icon> {{ 'inbox.reviewDetail.resumeWithFeedback' | transloco }}
+                    </app-button>
                   </div>
                 }
               </div>
@@ -577,10 +625,12 @@ function relativeTime(iso: string, nowLabel: string): string {
             <div class="detail-content session-detail">
               <div class="detail-header">
                 <span class="detail-type-badge session">
-                  <span class="icon">smart_toy</span>
+                  <app-icon size="sm">smart_toy</app-icon>
                   {{ 'inbox.sessionDetail.agentSession' | transloco }}
                 </span>
-                <span class="status-badge status-pending">{{ 'inbox.sessionDetail.needsAttention' | transloco }}</span>
+                <app-badge tone="warning" size="xs" [uppercase]="true">
+                  {{ 'inbox.sessionDetail.needsAttention' | transloco }}
+                </app-badge>
               </div>
 
               <h3 class="session-title">{{ selectedItem()!.title }}</h3>
@@ -612,9 +662,9 @@ function relativeTime(iso: string, nowLabel: string): string {
               }
 
               <div class="session-actions">
-                <button class="btn btn-primary" (click)="goToSession(selectedItem()!.session!.threadId)">
-                  <span class="icon">open_in_new</span> {{ 'inbox.sessionDetail.goToSession' | transloco }}
-                </button>
+                <app-button variant="primary" size="sm" (clicked)="goToSession(selectedItem()!.session!.threadId)">
+                  <app-icon size="sm">open_in_new</app-icon> {{ 'inbox.sessionDetail.goToSession' | transloco }}
+                </app-button>
               </div>
             </div>
           }
@@ -622,58 +672,62 @@ function relativeTime(iso: string, nowLabel: string): string {
       </div>
     </div>
 
-    <!-- Deny dialog overlay -->
-    @if (denyTarget()) {
-      <div class="dialog-overlay" (click)="cancelDeny()">
-        <div class="dialog" (click)="$event.stopPropagation()">
-          <div class="dialog-title">
-            <span class="icon">block</span>
-            {{ 'inbox.denyDialog.titlePrefix' | transloco }} {{ denyTarget()!.command }}
-          </div>
-          <textarea
-            class="input deny-reason"
-            [placeholder]="'inbox.denyDialog.reasonPlaceholder' | transloco"
-            [(ngModel)]="denyReason"
-            rows="3"
-          ></textarea>
-          <div class="dialog-actions">
-            <button class="btn btn-ghost" (click)="cancelDeny()">{{ 'inbox.denyDialog.cancel' | transloco }}</button>
-            <button
-              class="btn btn-deny"
-              [disabled]="!denyReason.trim()"
-              (click)="confirmDeny()"
-            >
-              {{ 'inbox.denyDialog.deny' | transloco }}
-            </button>
-          </div>
-        </div>
-      </div>
-    }
+    <!-- Deny dialog -->
+    <app-dialog
+      [open]="!!denyTarget()"
+      size="md"
+      [closeOnBackdrop]="false"
+      [title]="('inbox.denyDialog.titlePrefix' | transloco) + ' ' + (denyTarget()?.command ?? '')"
+      (closed)="cancelDeny()"
+    >
+      <app-textarea
+        [(value)]="denyReason"
+        [placeholder]="'inbox.denyDialog.reasonPlaceholder' | transloco"
+        [rows]="3"
+      />
+      <ng-container appDialogActions>
+        <app-button variant="ghost" size="sm" (clicked)="cancelDeny()">
+          {{ 'inbox.denyDialog.cancel' | transloco }}
+        </app-button>
+        <app-button
+          variant="danger"
+          size="sm"
+          [disabled]="!denyReason.trim()"
+          (clicked)="confirmDeny()"
+        >
+          {{ 'inbox.denyDialog.deny' | transloco }}
+        </app-button>
+      </ng-container>
+    </app-dialog>
 
-    <!-- Keyboard shortcuts overlay -->
-    @if (showShortcuts()) {
-      <div class="dialog-overlay" (click)="showShortcuts.set(false)">
-        <div class="shortcuts-dialog" (click)="$event.stopPropagation()">
-          <div class="shortcuts-title">{{ 'inbox.shortcuts.title' | transloco }}</div>
-          <div class="shortcuts-grid">
-            <kbd>j</kbd><span>{{ 'inbox.shortcuts.nextItem' | transloco }}</span>
-            <kbd>k</kbd><span>{{ 'inbox.shortcuts.prevItem' | transloco }}</span>
-            <kbd>Enter</kbd><span>{{ 'inbox.shortcuts.selectItem' | transloco }}</span>
-            <kbd>Escape</kbd><span>{{ 'inbox.shortcuts.deselect' | transloco }}</span>
-            <kbd>a</kbd><span>{{ 'inbox.shortcuts.approveSudoReview' | transloco }}</span>
-            <kbd>d</kbd><span>{{ 'inbox.shortcuts.denySudo' | transloco }}</span>
-            <kbd>r</kbd><span>{{ 'inbox.shortcuts.focusReply' | transloco }}</span>
-            <kbd>Ctrl+Enter</kbd><span>{{ 'inbox.shortcuts.sendReply' | transloco }}</span>
-            <kbd>1</kbd><span>{{ 'inbox.shortcuts.filterMessages' | transloco }}</span>
-            <kbd>2</kbd><span>{{ 'inbox.shortcuts.filterSudo' | transloco }}</span>
-            <kbd>3</kbd><span>{{ 'inbox.shortcuts.filterReviews' | transloco }}</span>
-            <kbd>0</kbd><span>{{ 'inbox.shortcuts.clearFilter' | transloco }}</span>
-            <kbd>?</kbd><span>{{ 'inbox.shortcuts.toggleOverlay' | transloco }}</span>
-          </div>
-          <button class="btn btn-ghost shortcuts-close" (click)="showShortcuts.set(false)">{{ 'inbox.shortcuts.close' | transloco }}</button>
-        </div>
+    <!-- Keyboard shortcuts dialog -->
+    <app-dialog
+      [open]="showShortcuts()"
+      size="md"
+      [title]="'inbox.shortcuts.title' | transloco"
+      (closed)="showShortcuts.set(false)"
+    >
+      <div class="shortcuts-grid">
+        <kbd>j</kbd><span>{{ 'inbox.shortcuts.nextItem' | transloco }}</span>
+        <kbd>k</kbd><span>{{ 'inbox.shortcuts.prevItem' | transloco }}</span>
+        <kbd>Enter</kbd><span>{{ 'inbox.shortcuts.selectItem' | transloco }}</span>
+        <kbd>Escape</kbd><span>{{ 'inbox.shortcuts.deselect' | transloco }}</span>
+        <kbd>a</kbd><span>{{ 'inbox.shortcuts.approveSudoReview' | transloco }}</span>
+        <kbd>d</kbd><span>{{ 'inbox.shortcuts.denySudo' | transloco }}</span>
+        <kbd>r</kbd><span>{{ 'inbox.shortcuts.focusReply' | transloco }}</span>
+        <kbd>Ctrl+Enter</kbd><span>{{ 'inbox.shortcuts.sendReply' | transloco }}</span>
+        <kbd>1</kbd><span>{{ 'inbox.shortcuts.filterMessages' | transloco }}</span>
+        <kbd>2</kbd><span>{{ 'inbox.shortcuts.filterSudo' | transloco }}</span>
+        <kbd>3</kbd><span>{{ 'inbox.shortcuts.filterReviews' | transloco }}</span>
+        <kbd>0</kbd><span>{{ 'inbox.shortcuts.clearFilter' | transloco }}</span>
+        <kbd>?</kbd><span>{{ 'inbox.shortcuts.toggleOverlay' | transloco }}</span>
       </div>
-    }
+      <ng-container appDialogActions>
+        <app-button variant="ghost" size="sm" (clicked)="showShortcuts.set(false)">
+          {{ 'inbox.shortcuts.close' | transloco }}
+        </app-button>
+      </ng-container>
+    </app-dialog>
   `,
   styles: [`
     :host { display: block; height: 100%; }
@@ -712,20 +766,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       white-space: nowrap;
     }
 
-    .back-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 28px;
-      height: 28px;
-      background: transparent;
-      border: none;
-      border-radius: 6px;
-      color: var(--text-secondary, #a6adc8);
-      cursor: pointer;
-    }
-    .back-btn:hover { background: var(--surface-0, #313244); }
-
     .filter-chips {
       display: flex;
       gap: 4px;
@@ -734,37 +774,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       scrollbar-width: none;
     }
     .filter-chips::-webkit-scrollbar { display: none; }
-
-    .chip {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      padding: 4px 10px;
-      background: transparent;
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 14px;
-      color: var(--text-muted, #6c7086);
-      font-size: 11px;
-      font-family: inherit;
-      font-weight: 500;
-      cursor: pointer;
-      white-space: nowrap;
-      transition: all 0.12s ease;
-    }
-    .chip:hover {
-      border-color: var(--text-muted, #6c7086);
-      color: var(--text-secondary, #a6adc8);
-    }
-    .chip.active {
-      background: var(--surface-0, #313244);
-      border-color: var(--accent-color, #cba6f7);
-      color: var(--accent-color, #cba6f7);
-    }
-
-    .chip-icon {
-      font-family: 'Material Symbols Outlined';
-      font-size: 14px;
-    }
 
     .chip-count {
       background: var(--accent-color, #cba6f7);
@@ -793,29 +802,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       transition: background 0.3s;
     }
     .sse-dot.connected { background: #a6e3a1; }
-
-    .icon-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 28px;
-      height: 28px;
-      background: transparent;
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 6px;
-      color: var(--text-muted, #6c7086);
-      cursor: pointer;
-      transition: all 0.12s;
-    }
-    .icon-btn:hover {
-      color: var(--text-primary, #cdd6f4);
-      border-color: var(--text-muted, #6c7086);
-    }
-
-    .icon {
-      font-family: 'Material Symbols Outlined';
-      font-size: 16px;
-    }
 
     /* ===== BODY: TWO-PANEL ===== */
 
@@ -877,7 +863,6 @@ function relativeTime(iso: string, nowLabel: string): string {
     .urgency-muted { background: var(--border-color, #313244); }
 
     .item-type-icon {
-      font-family: 'Material Symbols Outlined';
       font-size: 18px;
       flex-shrink: 0;
       margin-top: 1px;
@@ -941,30 +926,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 4px;
     }
 
-    .mode-badge {
-      font-size: 9px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      padding: 0 4px;
-      border-radius: 3px;
-      flex-shrink: 0;
-    }
-    .mode-badge.blocking { background: rgba(243, 139, 168, 0.2); color: #f38ba8; }
-    .mode-badge.async { background: rgba(108, 112, 134, 0.2); color: var(--text-muted, #6c7086); }
-
-    .resolved-badge {
-      font-size: 9px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      padding: 0 4px;
-      border-radius: 3px;
-      background: rgba(108, 112, 134, 0.2);
-      color: var(--text-muted, #6c7086);
-      flex-shrink: 0;
-    }
-
     .ttl-green { color: #a6e3a1; }
     .ttl-amber { color: #f9e2af; }
     .ttl-red { color: #f38ba8; }
@@ -981,7 +942,6 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .empty-icon {
-      font-family: 'Material Symbols Outlined';
       font-size: 40px;
       color: var(--border-color, #313244);
     }
@@ -1001,7 +961,6 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .detail-empty-icon {
-      font-family: 'Material Symbols Outlined';
       font-size: 48px;
       color: var(--border-color, #313244);
     }
@@ -1083,56 +1042,12 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: flex;
       gap: 8px;
     }
-    .session-detail .btn-primary {
-      background: var(--accent-color, #cba6f7);
-      color: var(--panel-bg, #1e1e2e);
-      border: none;
-      padding: 8px 16px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 13px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .session-detail .btn-primary:hover {
-      opacity: 0.9;
-    }
-
     .detail-countdown {
       font-size: 12px;
       font-weight: 600;
       font-variant-numeric: tabular-nums;
       margin-left: auto;
     }
-
-    .risk-badge {
-      font-size: 9px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      padding: 2px 6px;
-      border-radius: 3px;
-      color: #11111b;
-    }
-    .risk-low { background: #a6e3a1; }
-    .risk-medium { background: #f9e2af; }
-    .risk-high { background: #fab387; }
-    .risk-critical { background: #f38ba8; }
-
-    .status-badge {
-      font-size: 9px;
-      font-weight: 600;
-      text-transform: uppercase;
-      padding: 2px 6px;
-      border-radius: 3px;
-      background: rgba(108, 112, 134, 0.15);
-      color: var(--text-muted, #6c7086);
-    }
-    .status-pending { color: #f9e2af; }
-    .status-approved, .status-auto_approved { color: #a6e3a1; }
-    .status-denied, .status-auto_denied, .status-expired { color: #f38ba8; }
 
     /* ===== SUDO DETAIL ===== */
 
@@ -1216,8 +1131,9 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 6px;
       padding: 8px;
       border-bottom: 1px solid var(--border-color, #313244);
+      align-items: center;
     }
-    .rule-form .input { flex: 1; }
+    .rule-form app-input { flex: 1; }
 
     .rule-row {
       display: flex;
@@ -1229,37 +1145,11 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
     .rule-row:last-child { border-bottom: none; }
 
-    .rule-action-badge {
-      font-size: 8px;
-      font-weight: 700;
-      text-transform: uppercase;
-      padding: 1px 4px;
-      border-radius: 2px;
-      color: #11111b;
-    }
-    .action-approve { background: #a6e3a1; }
-    .action-deny { background: #f38ba8; }
-
     .rule-pattern {
       flex: 1;
       font-size: 11px;
       color: var(--text-primary, #cdd6f4);
     }
-
-    .icon-btn-sm {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 20px;
-      height: 20px;
-      background: transparent;
-      border: none;
-      border-radius: 3px;
-      color: var(--text-muted, #6c7086);
-      cursor: pointer;
-    }
-    .icon-btn-sm:hover { color: #f38ba8; }
-    .icon-btn-sm .icon { font-size: 14px; }
 
     /* ===== MESSAGE DETAIL ===== */
 
@@ -1362,24 +1252,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       padding-top: 12px;
     }
 
-    .reply-input {
-      width: 100%;
-      padding: 8px 10px;
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 6px;
-      color: var(--text-primary, #cdd6f4);
-      font-size: 13px;
-      font-family: inherit;
-      resize: vertical;
-      min-height: 48px;
-      box-sizing: border-box;
-    }
-    .reply-input:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
-    }
-
     .reply-actions {
       display: flex;
       align-items: center;
@@ -1387,30 +1259,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin-top: 8px;
     }
 
-    .urgent-check {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      font-size: 11px;
-      color: var(--text-muted, #6c7086);
-      cursor: pointer;
-    }
-    .urgent-check input { accent-color: var(--accent-color, #cba6f7); }
-
     /* ===== REVIEW DETAIL ===== */
-
-    .freeze-badge {
-      font-size: 9px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      padding: 2px 6px;
-      border-radius: 3px;
-      color: #11111b;
-    }
-    .freeze-badge.complete { background: #a6e3a1; }
-    .freeze-badge.phase { background: var(--accent-color, #cba6f7); }
-    .freeze-badge.upgrade { background: #f9e2af; }
 
     .upgrade-command {
       display: block;
@@ -1432,15 +1281,6 @@ function relativeTime(iso: string, nowLabel: string): string {
     .upgrade-buttons {
       display: flex;
       gap: 8px;
-    }
-
-    .btn-upgrade {
-      background: rgba(249, 226, 175, 0.2);
-      color: #f9e2af;
-    }
-
-    .btn-upgrade:hover:not(:disabled) {
-      background: rgba(249, 226, 175, 0.3);
     }
 
     .review-job-info {
@@ -1539,14 +1379,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       width: 100%;
     }
 
-    .review-notes {
-      width: 100%;
-      resize: vertical;
-      min-height: 40px;
-      box-sizing: border-box;
-    }
-
-    /* ===== SHARED: BUTTONS & INPUTS ===== */
+    /* ===== SHARED: ACTION BAR LAYOUT + KBD HINTS ===== */
 
     .upgrade-hint {
       font-size: 12px;
@@ -1565,134 +1398,22 @@ function relativeTime(iso: string, nowLabel: string): string {
       flex-wrap: wrap;
     }
 
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 6px 14px;
-      border: none;
-      border-radius: 5px;
-      font-size: 12px;
-      font-family: inherit;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.12s;
-    }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn .icon { font-size: 15px; }
-    .btn kbd {
+    /* Kbd shortcut hints projected into <app-button>. Scoped to inbox view. */
+    app-button kbd {
       font-size: 9px;
       padding: 1px 4px;
       border-radius: 2px;
-      background: rgba(0,0,0,0.2);
+      background: rgba(0, 0, 0, 0.2);
       font-family: inherit;
       margin-left: 2px;
     }
 
-    .btn-approve { background: #a6e3a1; color: #11111b; }
-    .btn-approve:hover:not(:disabled) { background: #94e2d5; }
-
-    .btn-deny { background: #f38ba8; color: #11111b; }
-    .btn-deny:hover:not(:disabled) { background: #eba0ac; }
-
-    .btn-resume { background: var(--accent-color, #cba6f7); color: #11111b; }
-    .btn-resume:hover:not(:disabled) { background: #b4befe; }
-
-    .btn-send { background: #89b4fa; color: #11111b; }
-    .btn-send:hover:not(:disabled) { background: #74c7ec; }
-
-    .btn-ghost {
-      background: transparent;
-      color: var(--text-secondary, #a6adc8);
-      border: 1px solid var(--border-color, #313244);
-    }
-    .btn-ghost:hover { border-color: var(--text-muted, #6c7086); }
-
-    .btn-sm { padding: 3px 8px; font-size: 11px; background: var(--accent-color, #cba6f7); color: #11111b; }
-
-    .input, .select {
-      padding: 5px 8px;
-      background: var(--surface-0, #313244);
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 4px;
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      font-family: inherit;
-    }
-    .input:focus, .select:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
-    }
-
-    /* ===== DIALOG ===== */
-
-    .dialog-overlay {
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.6);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      z-index: 1000;
-    }
-
-    .dialog {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 10px;
-      padding: 20px;
-      width: 420px;
-      max-width: 90vw;
-    }
-
-    .dialog-title {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
-      margin-bottom: 12px;
-    }
-    .dialog-title .icon { color: #f38ba8; }
-
-    .deny-reason {
-      width: 100%;
-      resize: vertical;
-      min-height: 60px;
-      margin-bottom: 12px;
-      box-sizing: border-box;
-    }
-
-    .dialog-actions {
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-    }
-
-    /* Shortcuts dialog */
-
-    .shortcuts-dialog {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 10px;
-      padding: 24px;
-      width: 380px;
-      max-width: 90vw;
-    }
-
-    .shortcuts-title {
-      font-size: 15px;
-      font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
-      margin-bottom: 16px;
-    }
+    /* ===== SHORTCUTS DIALOG BODY ===== */
 
     .shortcuts-grid {
       display: grid;
       grid-template-columns: auto 1fr;
       gap: 6px 14px;
-      margin-bottom: 16px;
     }
 
     .shortcuts-grid kbd {
@@ -1713,8 +1434,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       padding-top: 2px;
     }
 
-    .shortcuts-close { width: 100%; justify-content: center; }
-
     /* ===== RESPONSIVE ===== */
 
     @media (max-width: 768px) {
@@ -1727,7 +1446,6 @@ function relativeTime(iso: string, nowLabel: string): string {
       .inbox-body.mobile-detail .list-panel { display: none; }
       .inbox-body.mobile-detail .detail-panel { display: block; }
       .filter-chips { gap: 3px; }
-      .chip { padding: 3px 7px; font-size: 10px; }
     }
   `],
 })
@@ -1741,7 +1459,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
   private readonly transloco = inject(TranslocoService);
 
   @ViewChild('threadBody') threadBodyRef?: ElementRef<HTMLElement>;
-  @ViewChild('replyInput') replyInputRef?: ElementRef<HTMLTextAreaElement>;
+  @ViewChild('replyInput') replyInputRef?: AppTextareaComponent;
 
   // --- State ---
   readonly activeFilter = signal<ActionItemType | null>(null);
@@ -2046,6 +1764,35 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     return 'green';
   }
 
+  sudoStatusTone(status: string | undefined): BadgeTone {
+    switch (status) {
+      case 'pending': return 'warning';
+      case 'approved':
+      case 'auto_approved': return 'success';
+      case 'denied':
+      case 'auto_denied':
+      case 'expired': return 'danger';
+      default: return 'neutral';
+    }
+  }
+
+  riskTone(risk: string): BadgeTone {
+    switch (risk) {
+      case 'low': return 'success';
+      case 'medium': return 'warning';
+      case 'high': return 'alert';
+      case 'critical': return 'danger';
+      default: return 'neutral';
+    }
+  }
+
+  freezeTone(): BadgeTone {
+    const t = this.frozenData()?.freeze_type;
+    if (t === 'phase_boundary') return 'accent';
+    if (t === 'vm_upgrade_required') return 'warning';
+    return 'success';
+  }
+
   urgencyColor(item: ActionItem): string {
     if (item.status === 'resolved') return 'muted';
     if (item.type === 'sudo' && item.sudo?.status === 'pending') {
@@ -2132,7 +1879,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
         break;
       case 'r':
         if (this.selectedItem()?.type === 'message') {
-          this.replyInputRef?.nativeElement?.focus();
+          this.replyInputRef?.focus();
         }
         break;
       case '0': this.setFilter(null); break;

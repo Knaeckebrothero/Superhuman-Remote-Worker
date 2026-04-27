@@ -1,0 +1,60 @@
+:host {
+  display: inline-block;
+  flex-shrink: 0;
+  border-style: solid;
+  border-color: currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: app-spinner-spin 0.7s linear infinite;
+
+  // --- Sizes ---
+  &[data-size='xs'] {
+    width: 10px;
+    height: 10px;
+    border-width: 1.5px;
+  }
+
+  &[data-size='sm'] {
+    width: 14px;
+    height: 14px;
+    border-width: 2px;
+  }
+
+  &[data-size='md'] {
+    width: 20px;
+    height: 20px;
+    border-width: 2px;
+  }
+
+  &[data-size='lg'] {
+    width: 32px;
+    height: 32px;
+    border-width: 3px;
+  }
+
+  // --- Tones ---
+  // 'inherit' (default) leaves border-color: currentColor so the spinner picks
+  // up the surrounding text color. 'accent' / 'muted' override explicitly.
+
+  &[data-tone='accent'] {
+    border-color: var(--accent-color);
+    border-right-color: transparent;
+  }
+
+  &[data-tone='muted'] {
+    border-color: var(--text-muted);
+    border-right-color: transparent;
+  }
+}
+
+@keyframes app-spinner-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :host {
+    animation-duration: 2s;
+  }
+}

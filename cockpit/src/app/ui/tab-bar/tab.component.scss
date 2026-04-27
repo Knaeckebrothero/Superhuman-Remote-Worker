@@ -1,0 +1,45 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: v.$space-xs v.$space-md;
+  border-radius: v.$radius-sm;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: v.$font-size-xs;
+  line-height: v.$line-height-tight;
+  cursor: pointer;
+  user-select: none;
+
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
+
+  &:hover:not([data-disabled]) {
+    color: var(--text-primary);
+  }
+
+  &:focus { outline: none; }
+
+  &.cdk-keyboard-focused,
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
+  &[data-active] {
+    background: var(--surface-0);
+    color: var(--text-primary);
+    border-color: var(--accent-color);
+  }
+
+  &[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}

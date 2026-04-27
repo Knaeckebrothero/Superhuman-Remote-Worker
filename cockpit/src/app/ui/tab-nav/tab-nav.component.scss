@@ -1,0 +1,20 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: flex;
+  background: var(--surface-0);
+
+  &[data-orientation='horizontal'] {
+    flex-direction: row;
+    gap: 0;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  &[data-orientation='vertical'] {
+    flex-direction: column;
+    gap: 2px;
+    padding: v.$space-sm 0;
+    border-right: 1px solid var(--border-color);
+    min-width: 130px;
+  }
+}

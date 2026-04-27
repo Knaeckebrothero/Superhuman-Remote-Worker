@@ -1,0 +1,96 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: contents;
+}
+
+.app-toast-container {
+  position: fixed;
+  z-index: v.$z-toast;
+  bottom: v.$space-md;
+  right: v.$space-md;
+  display: flex;
+  flex-direction: column;
+  gap: v.$space-sm;
+  pointer-events: none;
+  max-width: calc(100vw - #{v.$space-md} * 2);
+}
+
+.app-toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: v.$space-sm;
+  min-width: 240px;
+  max-width: 400px;
+  padding: 10px 12px;
+  border-radius: v.$radius-md;
+  background: var(--surface-2, var(--surface-1));
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
+  font-size: v.$font-size-sm;
+  line-height: v.$line-height-base;
+  color: var(--text-primary);
+  animation: app-toast-in 0.2s ease-out;
+
+  &[data-tone='success'] {
+    border-color: var(--success, #a6e3a1);
+    background: var(--success-tint, rgba(166, 227, 161, 0.12));
+  }
+  &[data-tone='warning'] {
+    border-color: var(--warning, #f9e2af);
+    background: var(--warning-tint, rgba(249, 226, 175, 0.12));
+  }
+  &[data-tone='danger'] {
+    border-color: var(--danger, #f38ba8);
+    background: var(--danger-tint, rgba(243, 139, 168, 0.12));
+  }
+  &[data-tone='info'] {
+    border-color: var(--info, #89b4fa);
+    background: var(--info-tint, rgba(137, 180, 250, 0.12));
+  }
+}
+
+.app-toast__message {
+  flex: 1;
+  word-wrap: break-word;
+}
+
+.app-toast__close {
+  appearance: none;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+  border-radius: v.$radius-sm;
+
+  &:hover { color: var(--text-primary); }
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 1px;
+  }
+}
+
+@keyframes app-toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-toast { animation: none; }
+}
+
+@media (max-width: v.$breakpoint-sm) {
+  .app-toast-container {
+    bottom: v.$space-sm;
+    right: v.$space-sm;
+    left: v.$space-sm;
+  }
+  .app-toast {
+    min-width: 0;
+    max-width: 100%;
+  }
+}

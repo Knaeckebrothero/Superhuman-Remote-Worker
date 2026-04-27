@@ -6,24 +6,6 @@
   margin-bottom: 4px;
 }
 
-.material-icon {
-  font-family: 'Material Symbols Outlined';
-  font-weight: normal;
-  font-style: normal;
-  font-size: 18px;
-  line-height: 1;
-  letter-spacing: normal;
-  text-transform: none;
-  display: inline-block;
-  white-space: nowrap;
-  word-wrap: normal;
-  direction: ltr;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  text-rendering: optimizeLegibility;
-  font-feature-settings: 'liga';
-}
-
 .header-spinner {
   width: 16px;
   height: 16px;
@@ -173,9 +155,8 @@
         justify-content: center;
         flex-shrink: 0;
 
-        .material-icon {
+        app-icon {
           color: white;
-          font-size: 13px;
           width: 13px;
           height: 13px;
         }

@@ -2,17 +2,19 @@ import { Component, inject } from '@angular/core';
 import { Router } from '@angular/router';
 import { TranslocoService } from '@jsverse/transloco';
 import { ActionCenterService } from '../../../core/services/action-center.service';
+import { AppIconComponent } from '../../../ui/icon';
 
 @Component({
   selector: 'app-notification-bell',
   standalone: true,
+  imports: [AppIconComponent],
   template: `
     <button
       class="bell-btn"
       (click)="goToInbox()"
       [title]="tooltipText()"
     >
-      <span class="bell-icon">inbox</span>
+      <app-icon size="lg">inbox</app-icon>
       @if (actionCenter.counts().total > 0) {
         <span class="badge">{{ actionCenter.counts().total > 99 ? '99+' : actionCenter.counts().total }}</span>
       }
@@ -40,11 +42,6 @@ import { ActionCenterService } from '../../../core/services/action-center.servic
     .bell-btn:hover {
       color: var(--text-primary, #cdd6f4);
       background: var(--surface-0, #313244);
-    }
-
-    .bell-icon {
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 20px;
     }
 
     .badge {

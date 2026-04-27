@@ -1,0 +1,60 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: block;
+
+  &[data-orientation='horizontal'] {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    column-gap: v.$space-md;
+    align-items: center;
+
+    .app-form-field__label {
+      margin-bottom: 0;
+    }
+
+    .app-form-field__hint,
+    .app-form-field__error {
+      grid-column: 2;
+    }
+  }
+}
+
+.app-form-field__label {
+  display: block;
+  margin-bottom: v.$space-xs;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+  color: var(--text-primary);
+  line-height: v.$line-height-tight;
+}
+
+.app-form-field__required {
+  margin-left: 2px;
+  color: var(--danger, #f38ba8);
+}
+
+.app-form-field__hint-inline {
+  margin-left: v.$space-xs;
+  font-weight: v.$font-weight-normal;
+  color: var(--text-muted);
+  font-size: v.$font-size-xs;
+}
+
+.app-form-field__control {
+  display: block;
+}
+
+.app-form-field__hint {
+  margin-top: 6px;
+  font-size: v.$font-size-xs;
+  color: var(--text-secondary);
+  line-height: v.$line-height-base;
+}
+
+.app-form-field__error {
+  margin-top: 6px;
+  font-size: v.$font-size-xs;
+  color: var(--danger, #f38ba8);
+  line-height: v.$line-height-base;
+}

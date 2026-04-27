@@ -1,0 +1,41 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: flex;
+  align-items: center;
+  gap: v.$space-sm;
+  padding: 8px 12px;
+  font-size: v.$font-size-sm;
+  line-height: v.$line-height-tight;
+  color: var(--text-primary);
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+  border-radius: v.$radius-sm;
+  transition: background-color 0.1s ease, color 0.1s ease;
+
+  &:hover:not([data-disabled]),
+  &:focus-visible:not([data-disabled]) {
+    background: var(--hover, var(--surface-1));
+  }
+
+  &[data-tone='danger'] {
+    color: var(--danger, #f38ba8);
+
+    &:hover:not([data-disabled]),
+    &:focus-visible:not([data-disabled]) {
+      background: var(--danger-tint, rgba(243, 139, 168, 0.12));
+    }
+  }
+
+  &[data-disabled] {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :host {
+    transition: none;
+  }
+}

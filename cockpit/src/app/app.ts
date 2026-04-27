@@ -1,7 +1,7 @@
 import {Component, computed, effect, inject, OnInit} from '@angular/core';
 import {RouterOutlet} from '@angular/router';
 import {SidebarComponent} from './layout/sidebar/sidebar.component';
-import {ToastComponent} from './core/components/toast/toast.component';
+import {AppToastContainerComponent} from './ui/toast';
 import {ComponentRegistryService} from './core/services/component-registry.service';
 import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
@@ -30,10 +30,11 @@ import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel
 import {InboxPageComponent} from './simple/pages/inbox/inbox-page.component';
 import {ConfigEditorComponent} from './shared/components/config-editor/config-editor.component';
 import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-banner/empty-catalog-banner.component';
+import {AppIconComponent} from './ui/icon';
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet, SidebarComponent, ToastComponent, EmptyCatalogBannerComponent],
+  imports: [RouterOutlet, SidebarComponent, AppToastContainerComponent, EmptyCatalogBannerComponent, AppIconComponent],
   template: `
     <div class="app-container">
       @if (showSidebar()) {
@@ -46,7 +47,7 @@ import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-ban
         @if (pendingApproval()) {
           <div class="pending-approval">
             <div class="pending-approval-card">
-              <span class="pending-icon">hourglass_empty</span>
+              <app-icon size="inherit" class="pending-icon">hourglass_empty</app-icon>
               <h2>Account Pending Approval</h2>
               <p>Your account has been created but an administrator needs to approve it before you can access the system.</p>
               <p class="pending-detail">You'll get full access once an admin assigns you the <strong>user</strong> role in Keycloak.</p>
@@ -97,7 +98,6 @@ import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-ban
       }
 
       .pending-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 3rem;
         color: var(--text-tertiary, #a6adc8);
         display: block;

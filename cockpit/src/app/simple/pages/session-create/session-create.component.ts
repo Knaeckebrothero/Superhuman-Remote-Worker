@@ -1,15 +1,18 @@
 import {Component, effect, inject, OnInit, signal, ViewChild} from '@angular/core';
 import {Router} from '@angular/router';
-import {FormsModule} from '@angular/forms';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../../../core/environment';
 import {UserService} from '../../../core/services/user.service';
-import {ToastService} from '../../../core/services/toast.service';
 import {AgentSettingsComponent} from '../../../shared/components/agent-settings/agent-settings.component';
 import {ModelService} from '../../../core/services/model.service';
 import {SidebarToggleComponent} from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppInputComponent} from '../../../ui/input';
+import {AppChipComponent} from '../../../ui/chip';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppFormFieldComponent} from '../../../ui/form-field';
 
 interface Project {
   id: string;
@@ -42,51 +45,54 @@ interface ExpertDetail extends Expert {
 @Component({
   selector: 'app-session-create',
   standalone: true,
-  imports: [FormsModule, AgentSettingsComponent, SidebarToggleComponent, TranslocoPipe],
+  imports: [
+    AgentSettingsComponent,
+    SidebarToggleComponent,
+    TranslocoPipe,
+    AppButtonComponent,
+    AppInputComponent,
+    AppChipComponent,
+    AppIconComponent,
+    AppFormFieldComponent,
+  ],
   template: `
     <div class="session-create-page">
       <div class="page-header">
         <app-sidebar-toggle />
         <h2>{{ 'sessions.create.title' | transloco }}</h2>
-        <button class="btn btn-secondary" (click)="cancel()">{{ 'sessions.create.cancel' | transloco }}</button>
+        <app-button variant="secondary" size="sm" (clicked)="cancel()">
+          {{ 'sessions.create.cancel' | transloco }}
+        </app-button>
       </div>
 
       <div class="form-container">
         <!-- Title -->
-        <div class="form-group">
-          <label class="form-label">{{ 'sessions.create.titleLabel' | transloco }}</label>
-          <input
-            type="text"
-            class="form-input"
-            [(ngModel)]="title"
+        <app-form-field [label]="'sessions.create.titleLabel' | transloco">
+          <app-input
+            [(value)]="title"
             [placeholder]="'sessions.create.titlePlaceholder' | transloco"
             [disabled]="creating()"
-          >
-        </div>
+          />
+        </app-form-field>
 
         <!-- Projects (multi-select chips) -->
         @if (projects().length > 0) {
-          <div class="form-group">
-            <label class="form-label">{{ 'sessions.create.projectsLabel' | transloco }}</label>
+          <app-form-field [label]="'sessions.create.projectsLabel' | transloco" [hint]="'sessions.create.projectsHint' | transloco">
             <div class="project-chips">
               @for (project of projects(); track project.id) {
-                <button
-                  type="button"
-                  class="project-chip"
-                  [class.selected]="selectedProjectIds().has(project.id)"
-                  (click)="toggleProject(project.id)"
-                  [title]="project.description || project.name"
+                <app-chip
+                  [selected]="selectedProjectIds().has(project.id)"
                   [disabled]="creating()"
-                >{{ project.name }}</button>
+                  [ariaLabel]="project.description || project.name"
+                  (clicked)="toggleProject(project.id)"
+                >{{ project.name }}</app-chip>
               }
             </div>
-            <span class="field-hint">{{ 'sessions.create.projectsHint' | transloco }}</span>
-          </div>
+          </app-form-field>
         }
 
         <!-- Expert selector -->
-        <div class="form-group">
-          <label class="form-label">{{ 'sessions.create.expertLabel' | transloco }}</label>
+        <app-form-field [label]="'sessions.create.expertLabel' | transloco">
           @if (loadingExperts()) {
             <div class="loading-hint">{{ 'sessions.create.expertLoading' | transloco }}</div>
           } @else if (experts().length > 0) {
@@ -101,16 +107,16 @@ interface ExpertDetail extends Expert {
                   [disabled]="creating()"
                 >
                   @if (selectedExpert()?.id === expert.id) {
-                    <span class="expert-check">check_circle</span>
+                    <app-icon size="lg" class="expert-check">check_circle</app-icon>
                   }
-                  <span class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</span>
+                  <app-icon size="inherit" class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</app-icon>
                   <span class="expert-name">{{ expert.display_name }}</span>
                   <span class="expert-desc">{{ expert.description }}</span>
                 </button>
               }
             </div>
           }
-        </div>
+        </app-form-field>
 
         <!-- Agent Settings (horizontal tabs: Settings / Advanced) -->
         <app-agent-settings
@@ -126,12 +132,12 @@ interface ExpertDetail extends Expert {
 
         <!-- Footer -->
         <div class="form-actions">
-          <button class="btn btn-secondary" (click)="cancel()" [disabled]="creating()">
+          <app-button variant="secondary" (clicked)="cancel()" [disabled]="creating()">
             {{ 'sessions.create.cancel' | transloco }}
-          </button>
-          <button class="btn btn-primary" (click)="createSession()" [disabled]="creating()">
+          </app-button>
+          <app-button variant="primary" [loading]="creating()" (clicked)="createSession()">
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
-          </button>
+          </app-button>
         </div>
       </div>
     </div>
@@ -171,34 +177,6 @@ interface ExpertDetail extends Expert {
       width: 100%;
       margin: 0 auto;
     }
-    .form-group {
-      margin-bottom: 16px;
-    }
-    .form-label {
-      display: block;
-      margin-bottom: 6px;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
-    }
-    .form-input {
-      width: 100%;
-      padding: 10px 12px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      font-family: inherit;
-      font-size: 13px;
-    }
-    .form-input:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
-    }
-    .form-input:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
     .field-hint {
       display: block;
       margin-top: 4px;
@@ -209,28 +187,6 @@ interface ExpertDetail extends Expert {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-    }
-    .project-chip {
-      padding: 6px 14px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 16px;
-      background: transparent;
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .project-chip:hover:not(:disabled) {
-      border-color: var(--accent-color, #cba6f7);
-    }
-    .project-chip.selected {
-      border-color: var(--accent-color, #cba6f7);
-      background: rgba(203, 166, 247, 0.15);
-      color: var(--accent-color, #cba6f7);
-    }
-    .project-chip:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
     }
     .loading-hint {
       font-size: 12px;
@@ -275,12 +231,9 @@ interface ExpertDetail extends Expert {
       position: absolute;
       top: 8px;
       right: 8px;
-      font-family: 'Material Symbols Outlined';
-      font-size: 18px;
       color: var(--expert-color, #cba6f7);
     }
     .expert-icon {
-      font-family: 'Material Symbols Outlined';
       font-size: 28px;
     }
     .expert-name {
@@ -304,47 +257,6 @@ interface ExpertDetail extends Expert {
       padding-top: 16px;
       border-top: 1px solid var(--border-color, #313244);
     }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 10px 20px;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .btn:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-    .btn-secondary {
-      background: var(--surface-0, #313244);
-      color: var(--text-secondary, #a6adc8);
-    }
-    .btn-secondary:hover:not(:disabled) {
-      background: var(--panel-header-bg, #1e1e2e);
-    }
-    .btn-primary {
-      background: var(--accent-color, #cba6f7);
-      color: var(--timeline-bg, #11111b);
-    }
-    .btn-primary:hover:not(:disabled) {
-      filter: brightness(1.1);
-    }
-
-    /* Select dropdown (reuse from job-create) */
-    select.form-input {
-      cursor: pointer;
-      -webkit-appearance: none;
-      appearance: none;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236c7086' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
-      background-repeat: no-repeat;
-      background-position: right 12px center;
-      padding-right: 32px;
-    }
 
     @media (max-width: 768px) {
       .form-container {
@@ -364,7 +276,7 @@ interface ExpertDetail extends Expert {
         flex-direction: column;
       }
 
-      .form-actions button {
+      .form-actions app-button {
         width: 100%;
       }
     }
@@ -374,7 +286,6 @@ export class SessionCreateComponent implements OnInit {
   private readonly http = inject(HttpClient);
   private readonly router = inject(Router);
   private readonly userService = inject(UserService);
-  private readonly toast = inject(ToastService);
   private readonly modelService = inject(ModelService);
 
   @ViewChild(AgentSettingsComponent) agentSettings!: AgentSettingsComponent;

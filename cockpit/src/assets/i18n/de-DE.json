@@ -295,6 +295,11 @@
   },
   "settings": {
     "title": "Einstellungen",
+    "appearance": {
+      "title": "Erscheinungsbild",
+      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung. Die Auswahl wird auf diesem Gerät gespeichert.",
+      "themeLabel": "Design"
+    },
     "language": {
       "title": "Sprache",
       "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",

@@ -7,6 +7,10 @@ import {ToolsGroupComponent} from './tools-group.component';
 import {DatasourcesGroupComponent} from './datasources-group.component';
 import {InstructionsTabComponent} from './instructions-tab.component';
 import {AdvancedAccordionComponent} from './advanced-accordion.component';
+import {AppTabNavComponent, AppTabNavItemComponent} from '../../../ui/tab-nav';
+import {AppBadgeComponent} from '../../../ui/badge';
+
+type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
 
 /**
  * Host component for agent settings. Composes all sub-components with a tabbed layout.
@@ -27,41 +31,34 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
     DatasourcesGroupComponent,
     InstructionsTabComponent,
     AdvancedAccordionComponent,
+    AppTabNavComponent,
+    AppTabNavItemComponent,
+    AppBadgeComponent,
   ],
   template: `
     <div class="settings-root" [class.vertical]="mode() === 'job'" [class.horizontal]="mode() === 'session'">
       <!-- Tab navigation -->
-      <div class="tab-nav" [class.tab-nav-vertical]="mode() === 'job'" [class.tab-nav-horizontal]="mode() === 'session'">
-        <button type="button"
-          class="tab-btn"
-          [class.active]="activeTab() === 'settings'"
-          (click)="activeTab.set('settings')"
-        >
+      <app-tab-nav
+        [orientation]="mode() === 'job' ? 'vertical' : 'horizontal'"
+        [value]="activeTab()"
+        (valueChange)="onTabChange($event)"
+      >
+        <app-tab-nav-item value="settings">
           Settings
           @if (settingsModifiedCount() > 0) {
-            <span class="tab-badge">{{ settingsModifiedCount() }}</span>
+            <app-badge tone="accent" size="xs" shape="pill">{{ settingsModifiedCount() }}</app-badge>
           }
-        </button>
+        </app-tab-nav-item>
         @if (mode() === 'job') {
-          <button type="button"
-            class="tab-btn"
-            [class.active]="activeTab() === 'instructions'"
-            (click)="activeTab.set('instructions')"
-          >
+          <app-tab-nav-item value="instructions">
             Instructions
             @if (instructionsTab?.isModified()) {
-              <span class="tab-badge-dot"></span>
+              <span class="tab-modified-dot" aria-hidden="true"></span>
             }
-          </button>
+          </app-tab-nav-item>
         }
-        <button type="button"
-          class="tab-btn"
-          [class.active]="activeTab() === 'advanced'"
-          (click)="activeTab.set('advanced')"
-        >
-          Advanced
-        </button>
-      </div>
+        <app-tab-nav-item value="advanced">Advanced</app-tab-nav-item>
+      </app-tab-nav>
 
       <!-- Tab content -->
       <div class="tab-content" #tabContent>
@@ -137,92 +134,15 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
       min-height: 300px;
     }
 
-    /* Vertical tabs (job creation) */
-    .settings-root.vertical {
-      flex-direction: row;
-    }
-    .tab-nav-vertical {
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
-      padding: 8px 0;
-      background: var(--surface-0, #313244);
-      border-right: 1px solid var(--border-color, #313244);
-      min-width: 130px;
-    }
-    .tab-nav-vertical .tab-btn {
-      text-align: left;
-      padding: 10px 16px;
-      border: none;
-      border-left: 3px solid transparent;
-      background: none;
-      color: var(--text-muted, #6c7086);
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .tab-nav-vertical .tab-btn:hover {
-      color: var(--text-primary, #cdd6f4);
-      background: rgba(255, 255, 255, 0.03);
-    }
-    .tab-nav-vertical .tab-btn.active {
-      color: var(--text-primary, #cdd6f4);
-      border-left-color: var(--accent-color, #cba6f7);
-      background: rgba(203, 166, 247, 0.06);
-    }
+    .settings-root.vertical { flex-direction: row; }
+    .settings-root.horizontal { flex-direction: column; }
 
-    /* Horizontal tabs (session creation) */
-    .settings-root.horizontal {
-      flex-direction: column;
-    }
-    .tab-nav-horizontal {
-      display: flex;
-      gap: 0;
-      background: var(--surface-0, #313244);
-      border-bottom: 1px solid var(--border-color, #313244);
-    }
-    .tab-nav-horizontal .tab-btn {
-      padding: 10px 20px;
-      border: none;
-      border-bottom: 2px solid transparent;
-      background: none;
-      color: var(--text-muted, #6c7086);
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .tab-nav-horizontal .tab-btn:hover {
-      color: var(--text-primary, #cdd6f4);
-      background: rgba(255, 255, 255, 0.03);
-    }
-    .tab-nav-horizontal .tab-btn.active {
-      color: var(--text-primary, #cdd6f4);
-      border-bottom-color: var(--accent-color, #cba6f7);
-    }
-
-    .tab-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 18px;
-      height: 18px;
-      padding: 0 5px;
-      border-radius: 9px;
-      background: rgba(203, 166, 247, 0.15);
-      color: var(--accent-color, #cba6f7);
-      font-size: 10px;
-      font-weight: 600;
-      margin-left: 6px;
-    }
-    .tab-badge-dot {
+    .tab-modified-dot {
       display: inline-block;
       width: 6px;
       height: 6px;
       border-radius: 50%;
       background: var(--accent-color, #cba6f7);
-      margin-left: 6px;
     }
 
     .tab-content {
@@ -283,7 +203,13 @@ export class AgentSettingsComponent {
   @ViewChild(AdvancedAccordionComponent) advancedAccordion?: AdvancedAccordionComponent;
   @ViewChild('tabContent') private tabContentEl?: ElementRef<HTMLElement>;
 
-  readonly activeTab = signal<'settings' | 'instructions' | 'advanced'>('settings');
+  readonly activeTab = signal<AgentSettingsTab>('settings');
+
+  protected onTabChange(value: AgentSettingsTab | null): void {
+    if (value === 'settings' || value === 'instructions' || value === 'advanced') {
+      this.activeTab.set(value);
+    }
+  }
 
   constructor() {
     effect(() => {
