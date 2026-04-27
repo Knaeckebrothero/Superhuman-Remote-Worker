@@ -1,0 +1,56 @@
+// Theme-invariant primitive scales.
+// Colors live in themes/_theme-config.scss and are emitted as CSS custom
+// properties — never read these as Sass variables for color.
+
+// --- Spacing (4-step scale) ---
+$space-xs: 0.25rem; //  4px
+$space-sm: 0.5rem;  //  8px
+$space-md: 1rem;    // 16px
+$space-lg: 1.5rem;  // 24px
+$space-xl: 3rem;    // 48px
+
+// --- Border radii ---
+$radius-sm: 0.25rem; //  4px
+$radius-md: 0.5rem;  //  8px
+$radius-lg: 0.75rem; // 12px
+$radius-xl: 1.5rem;  // 24px (pill / large surface)
+
+// --- Typography ---
+$font-family-base:
+  -apple-system,
+  BlinkMacSystemFont,
+  'Segoe UI',
+  Roboto,
+  Oxygen,
+  Ubuntu,
+  sans-serif;
+
+$font-size-xs:   0.75rem;  // 12px
+$font-size-sm:   0.875rem; // 14px
+$font-size-base: 1rem;     // 16px
+$font-size-lg:   1.125rem; // 18px
+$font-size-xl:   1.5rem;   // 24px
+
+$font-weight-normal: 400;
+$font-weight-medium: 500;
+$font-weight-bold:   700;
+
+$line-height-tight: 1.25;
+$line-height-base:  1.5;
+
+// --- Breakpoints ---
+$breakpoint-sm: 576px;
+$breakpoint-md: 768px;
+$breakpoint-lg: 992px;
+$breakpoint-xl: 1200px;
+
+// --- Z-index scale ---
+$z-base:    0;
+$z-sticky:  100;
+$z-overlay: 1000;
+$z-modal:   1100;
+$z-toast:   1200;
+$z-tooltip: 1300;
+
+// --- Touch target floor (mobile a11y) ---
+$touch-target-min: 44px;

@@ -1,0 +1,7 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: v.$space-xs;
+}

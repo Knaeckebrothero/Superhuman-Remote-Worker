@@ -14,10 +14,12 @@ import {
   MemorySource,
   MemorySortField,
 } from '../../../core/models/api.model';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 @Component({
   selector: 'app-memory-panel',
   standalone: true,
+  imports: [AppSpinnerComponent],
   template: `
     <div class="memory-container">
       <!-- Header -->
@@ -54,7 +56,7 @@ import {
         <!-- Loading -->
         @if (isLoading()) {
           <div class="loading-overlay">
-            <div class="spinner"></div>
+            <app-spinner size="lg" tone="accent" />
           </div>
         }
 
@@ -359,19 +361,6 @@ import {
         align-items: center;
         justify-content: center;
         z-index: 10;
-      }
-
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
       }
 
       .error-state {

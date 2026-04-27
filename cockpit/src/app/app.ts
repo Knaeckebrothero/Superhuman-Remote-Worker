@@ -1,7 +1,7 @@
 import {Component, computed, effect, inject, OnInit} from '@angular/core';
 import {RouterOutlet} from '@angular/router';
-import {SidebarComponent} from './layout/sidebar/sidebar.component';
-import {ToastComponent} from './core/components/toast/toast.component';
+import {SidebarComponent} from './shell/sidebar/sidebar.component';
+import {AppToastContainerComponent} from './ui/toast';
 import {ComponentRegistryService} from './core/services/component-registry.service';
 import {ViewportService} from './core/services/viewport.service';
 import {UserService} from './core/services/user.service';
@@ -15,25 +15,26 @@ import {AgentActivityComponent} from './debug/components/agent-activity/agent-ac
 import {RequestViewerComponent} from './debug/components/request-viewer/request-viewer.component';
 import {GraphTimelineComponent} from './debug/components/graph-timeline/graph-timeline.component';
 // Shared components
-import {TodoListComponent} from './shared/components/todo-list/todo-list.component';
-import {ChatHistoryComponent} from './shared/components/chat-history/chat-history.component';
-import {AgentListComponent} from './shared/components/agent-list/agent-list.component';
-import {JobListComponent} from './shared/components/job-list/job-list.component';
-import {JobCreateComponent} from './shared/components/job-create/job-create.component';
-import {StatisticsComponent} from './shared/components/statistics/statistics.component';
-import {DatasourceListComponent} from './shared/components/datasource-list/datasource-list.component';
-import {JobReviewComponent} from './shared/components/job-review/job-review.component';
-import {WorkspaceBrowserComponent} from './shared/components/workspace-browser/workspace-browser.component';
-import {InstructionBuilderComponent} from './shared/components/instruction-builder/instruction-builder.component';
-import {ProjectListPageComponent} from './shared/pages/project-list.component';
+import {TodoListComponent} from './views/todos/todo-list.component';
+import {ChatHistoryComponent} from './views/chat-history/chat-history.component';
+import {AgentListComponent} from './views/agents/agent-list.component';
+import {JobListComponent} from './views/jobs/job-list.component';
+import {JobCreateComponent} from './views/create/job-create.component';
+import {StatisticsComponent} from './views/statistics/statistics.component';
+import {DatasourceListComponent} from './views/datasources/datasource-list.component';
+import {JobReviewComponent} from './views/job-review/job-review.component';
+import {WorkspaceBrowserComponent} from './views/workspace-browser/workspace-browser.component';
+import {InstructionBuilderComponent} from './views/instruction-builder/instruction-builder.component';
+import {ProjectListPageComponent} from './views/projects/project-list.component';
 import {MemoryPanelComponent} from './debug/components/memory-panel/memory-panel.component';
-import {InboxPageComponent} from './simple/pages/inbox/inbox-page.component';
-import {ConfigEditorComponent} from './shared/components/config-editor/config-editor.component';
-import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-banner/empty-catalog-banner.component';
+import {InboxPageComponent} from './views/inbox/inbox-page.component';
+import {ConfigEditorComponent} from './views/config-editor/config-editor.component';
+import {EmptyCatalogBannerComponent} from './shell/empty-catalog-banner/empty-catalog-banner.component';
+import {AppIconComponent} from './ui/icon';
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet, SidebarComponent, ToastComponent, EmptyCatalogBannerComponent],
+  imports: [RouterOutlet, SidebarComponent, AppToastContainerComponent, EmptyCatalogBannerComponent, AppIconComponent],
   template: `
     <div class="app-container">
       @if (showSidebar()) {
@@ -46,7 +47,7 @@ import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-ban
         @if (pendingApproval()) {
           <div class="pending-approval">
             <div class="pending-approval-card">
-              <span class="pending-icon">hourglass_empty</span>
+              <app-icon size="inherit" class="pending-icon">hourglass_empty</app-icon>
               <h2>Account Pending Approval</h2>
               <p>Your account has been created but an administrator needs to approve it before you can access the system.</p>
               <p class="pending-detail">You'll get full access once an admin assigns you the <strong>user</strong> role in Keycloak.</p>
@@ -73,9 +74,17 @@ import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-ban
 
       .content-area {
         flex: 1;
-        overflow-y: auto;
-        overflow-x: hidden;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
         position: relative;
+      }
+
+      .content-area > router-outlet ~ * {
+        flex: 1;
+        min-height: 0;
       }
 
       .pending-approval {
@@ -97,7 +106,6 @@ import {EmptyCatalogBannerComponent} from './shared/components/empty-catalog-ban
       }
 
       .pending-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 3rem;
         color: var(--text-tertiary, #a6adc8);
         display: block;

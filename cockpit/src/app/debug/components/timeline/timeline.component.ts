@@ -2,6 +2,7 @@ import { Component, inject, computed, OnInit, OnDestroy } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { DataService } from '../../../core/services/data.service';
 import { JobContextService } from '../../../core/services/job-context.service';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
  * Timeline scrubber component for playback control.
@@ -12,7 +13,7 @@ import { JobContextService } from '../../../core/services/job-context.service';
  */
 @Component({
   selector: 'app-timeline',
-  imports: [FormsModule],
+  imports: [FormsModule, AppSpinnerComponent],
   template: `
     <div class="timeline">
       <select
@@ -90,7 +91,7 @@ import { JobContextService } from '../../../core/services/job-context.service';
       <!-- Loading indicator -->
       @if (data.isLoading()) {
         <div class="loading-indicator">
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
           @if (data.loadingProgress() > 0) {
             <span class="progress-text">{{ data.loadingProgress() }}%</span>
           }
@@ -329,21 +330,6 @@ import { JobContextService } from '../../../core/services/job-context.service';
         gap: 6px;
         font-size: 11px;
         color: var(--text-muted, #6c7086);
-      }
-
-      .spinner-small {
-        width: 14px;
-        height: 14px;
-        border: 2px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
       }
 
       .progress-text {

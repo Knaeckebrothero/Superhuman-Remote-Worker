@@ -1,0 +1,35 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: contents;
+}
+
+.app-menu__panel {
+  display: none;
+
+  &[data-open] {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    z-index: v.$z-overlay;
+    min-width: 160px;
+    max-width: 320px;
+    padding: v.$space-xs;
+    background: var(--surface-2, var(--surface-1));
+    border: 1px solid var(--border-color);
+    border-radius: v.$radius-md;
+    box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
+    animation: app-menu-fade 0.12s ease-out;
+  }
+}
+
+@keyframes app-menu-fade {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-menu__panel[data-open] {
+    animation: none;
+  }
+}

@@ -1,0 +1,213 @@
+// Agent Steps Component — collapsible thinking panel
+// Uses cockpit Catppuccin Mocha variables directly
+
+:host {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.header-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(203, 166, 247, 0.25);
+  border-top-color: var(--accent-color, #cba6f7);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.agent-steps-panel {
+  background: rgba(139, 92, 246, 0.06);
+  border: 1px solid rgba(139, 92, 246, 0.15);
+  border-radius: 8px;
+  overflow: hidden;
+
+  &.is-processing {
+    border-color: var(--accent-color, #cba6f7);
+  }
+
+  &.is-error {
+    border-color: #f38ba8;
+  }
+
+  &[open] > summary .chevron-icon {
+    transform: rotate(180deg);
+  }
+
+  > summary {
+    display: flex;
+    align-items: center;
+    padding: 8px 10px;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+
+    &::-webkit-details-marker {
+      display: none;
+    }
+
+    &:hover {
+      background: rgba(139, 92, 246, 0.08);
+    }
+  }
+
+  .steps-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+
+    .header-icon {
+      flex-shrink: 0;
+      font-size: 16px;
+      width: 16px;
+      height: 16px;
+
+      &.complete { color: #a6e3a1; }
+      &.error { color: #f38ba8; }
+    }
+
+    .header-text {
+      font-weight: 600;
+      font-size: 11px;
+      color: #a78bfa;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+
+  .step-count {
+    font-size: 11px;
+    color: #a78bfa;
+    opacity: 0.6;
+    font-weight: 400;
+    margin-left: 4px;
+    flex-shrink: 0;
+  }
+
+  .chevron-icon {
+    font-size: 16px;
+    color: #a78bfa;
+    margin-left: auto;
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+  }
+}
+
+.steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 6px 6px;
+  max-height: 250px;
+  overflow-y: auto;
+
+  .step-item {
+    border-radius: 6px;
+    overflow: hidden;
+
+    &.step-current {
+      background: rgba(203, 166, 247, 0.05);
+    }
+
+    // Step icon gradient backgrounds
+    &.step-thought .step-icon-wrapper { background: linear-gradient(135deg, #8b5cf6, #a78bfa); }
+    &.step-tool_call .step-icon-wrapper { background: linear-gradient(135deg, #f59e0b, #fbbf24); }
+    &.step-tool_result .step-icon-wrapper { background: linear-gradient(135deg, #10b981, #34d399); }
+    &.step-observation .step-icon-wrapper { background: linear-gradient(135deg, #06b6d4, #22d3ee); }
+    &.step-approval_request .step-icon-wrapper { background: linear-gradient(135deg, #f97316, #fb923c); }
+    &.step-file_change .step-icon-wrapper { background: linear-gradient(135deg, #14b8a6, #2dd4bf); }
+    &.step-inspection_result .step-icon-wrapper { background: linear-gradient(135deg, #06b6d4, #22d3ee); }
+    &.step-workspace_proposal .step-icon-wrapper { background: linear-gradient(135deg, #f97316, #fab387); }
+
+    .step-item-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      border-radius: 6px;
+      color: var(--text-primary, #cdd6f4);
+      font-size: 11px;
+
+      &::-webkit-details-marker {
+        display: none;
+      }
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .step-icon-wrapper {
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+
+        app-icon {
+          color: white;
+          width: 13px;
+          height: 13px;
+        }
+      }
+
+      .step-title {
+        font-weight: 500;
+        font-size: 11px;
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .step-duration {
+        font-size: 10px;
+        color: var(--text-muted, #6c7086);
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        flex-shrink: 0;
+      }
+    }
+
+    .step-content {
+      padding: 6px 8px 8px 36px;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--text-muted, #6c7086);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 200px;
+      overflow-y: auto;
+
+      .step-code {
+        background: var(--timeline-bg, #11111b);
+        padding: 8px;
+        border-radius: 6px;
+        overflow-x: auto;
+        font-size: 11px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        border: 1px solid var(--border-color, #313244);
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      .step-text {
+        margin: 0;
+      }
+    }
+  }
+}

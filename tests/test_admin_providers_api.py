@@ -47,6 +47,7 @@ ADMIN_ROUTES = {
     ("PATCH", "/api/admin/providers/endpoints/{endpoint_id}"),
     ("DELETE", "/api/admin/providers/endpoints/{endpoint_id}"),
     ("POST", "/api/admin/providers/endpoints/{endpoint_id}/test"),
+    ("GET", "/api/admin/providers/codex/availability"),
     ("GET", "/api/admin/providers/defaults"),
     ("PUT", "/api/admin/providers/defaults/{kind}"),
 }
