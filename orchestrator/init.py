@@ -882,53 +882,31 @@ async def _seed_llm_keys_from_env(db) -> None:
         )
 
 
-CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+from orchestrator.seed.llm_config import (  # noqa: E402, F401
+    CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
+    ensure_codex_proxy_endpoint,
+)
 
 
 async def _seed_codex_proxy_endpoint(db) -> None:
-    """Seed a system-scoped llm_endpoints row for the codex proxy.
+    """Boot-time seed for the system-scoped ``codex-proxy`` llm_endpoints row.
 
-    The proxy is an OpenAI-compatible front for ChatGPT subscriptions
-    (CLIProxyAPI). When CODEX_PROXY_URL is set in the orchestrator's env,
-    we insert one row with the well-known label ``codex-proxy`` so admins
-    can attach catalog models to it via Admin → Models.
-
-    Idempotent: re-runs short-circuit on label match. Admins who delete the
-    row will not see it recreated unless they wipe the table — matching the
-    existing seed-once contract.
+    Skips when ``CODEX_PROXY_URL`` is unset so a fresh stack with no codex
+    proxy configured doesn't carry a dangling transport row. Runtime paths
+    (OAuth callback, availability probe) call
+    :func:`ensure_codex_proxy_endpoint` directly with a fallback URL so a
+    user who connects a subscription via the cockpit gets wired up without
+    having to set the env var.
     """
     proxy_url = os.environ.get("CODEX_PROXY_URL")
     if not proxy_url:
         logger.info("  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed")
         return
 
-    try:
-        from orchestrator.seed.llm_config import seed as llm_seed
-    except ImportError as e:
-        logger.warning(f"  Could not import seed.llm_config: {e}")
-        return
-
-    # The proxy enforces Bearer auth on /v1/* (same model as /v0/management/*).
-    # apiKeyEnv defers secret resolution to seed time so the key never sits
-    # in this process between read and DB encryption.
-    base_url = proxy_url.rstrip("/")
-    if not base_url.endswith("/v1"):
-        base_url = f"{base_url}/v1"
-
-    payload = {
-        "systemEndpoints": [
-            {
-                "label": CODEX_PROXY_ENDPOINT_LABEL,
-                "baseUrl": base_url,
-                "apiKeyEnv": "CODEX_MANAGEMENT_KEY",
-                "models": [],
-            }
-        ]
-    }
-    report = await llm_seed(db, payload)
-    if CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded:
-        logger.info(f"  Seeded codex-proxy endpoint at {base_url}")
-    elif CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_skipped:
+    created = await ensure_codex_proxy_endpoint(db, proxy_url=proxy_url)
+    if created:
+        logger.info(f"  Seeded codex-proxy endpoint at {proxy_url}")
+    else:
         logger.info("  codex-proxy endpoint already present — leaving untouched")
 
 

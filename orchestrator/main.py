@@ -115,6 +115,7 @@ from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
+from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
 # them here so callers don't each do lazy imports.
@@ -11806,7 +11807,9 @@ async def admin_codex_availability(request: Request) -> dict[str, Any]:
     specific UI plumbing required.
     """
     await _require_admin(request)
-    proxy_url = os.getenv("CODEX_PROXY_URL")
+    # Same fallback as _codex_proxy_request and ensure_codex_proxy_endpoint —
+    # a local stack with CODEX_PROXY_URL unset is a fully supported config.
+    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
 
     # Locate the seeded codex-proxy endpoint (init.py creates it when
     # CODEX_PROXY_URL is set; admins may also have deleted it).
@@ -11815,15 +11818,6 @@ async def admin_codex_availability(request: Request) -> dict[str, Any]:
         if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
             endpoint_id = str(row["id"])
             break
-
-    if not proxy_url:
-        return {
-            "available": False,
-            "account_count": 0,
-            "models": [],
-            "proxy_url": None,
-            "endpoint_id": endpoint_id,
-        }
 
     try:
         auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
@@ -11852,6 +11846,16 @@ async def admin_codex_availability(request: Request) -> dict[str, Any]:
             ]
         except HTTPException:
             pass
+
+    # Self-heal: a live subscription with no transport row means a CLI login
+    # (or a previously-deleted row) bypassed the cockpit's wire-up path.
+    # Create the row now so the next Admin → Models render lists the proxy.
+    if endpoint_id is None and len(active) > 0:
+        await ensure_codex_proxy_endpoint(postgres_db, proxy_url=proxy_url)
+        for row in await postgres_db.list_system_llm_endpoints():
+            if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
+                endpoint_id = str(row["id"])
+                break
 
     return {
         "available": len(active) > 0,
@@ -12638,6 +12642,18 @@ async def codex_status(request: Request) -> dict[str, Any]:
     except HTTPException:
         pass
 
+    # Wire-up after a local login: the proxy's callback runs on localhost:1455
+    # so the orchestrator never sees /api/codex/callback for this flow. The
+    # cockpit hits /api/codex/status as soon as polling reports success, so
+    # ensure the transport row here when we see ≥1 active subscription.
+    if len(active) > 0:
+        try:
+            await ensure_codex_proxy_endpoint(postgres_db)
+        except Exception:
+            logger.warning(
+                "codex_status: ensure_codex_proxy_endpoint failed", exc_info=True
+            )
+
     return {
         "connected": len(active) > 0,
         "accounts": [
@@ -12731,6 +12747,17 @@ async def codex_callback(
         params={"code": code, "state": state},
         timeout=15.0,
     )
+
+    # OAuth completed — wire the codex-proxy as a system endpoint so the
+    # subscription is immediately selectable in Admin → Models. Idempotent;
+    # best-effort: a wiring failure must not block the callback response.
+    try:
+        await ensure_codex_proxy_endpoint(postgres_db)
+    except Exception:
+        logger.warning(
+            "codex_callback: ensure_codex_proxy_endpoint failed", exc_info=True
+        )
+
     if resp.content:
         return resp.json()
     return {"status": "ok"}
