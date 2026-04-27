@@ -1,0 +1,17 @@
+@use '../variables' as v;
+
+// Type scale used by primitives. Component-level overrides should reference
+// these tokens, not hardcode font sizes.
+$type-scale: (
+  'xs':   v.$font-size-xs,
+  'sm':   v.$font-size-sm,
+  'base': v.$font-size-base,
+  'lg':   v.$font-size-lg,
+  'xl':   v.$font-size-xl,
+);
+
+$type-weights: (
+  'normal': v.$font-weight-normal,
+  'medium': v.$font-weight-medium,
+  'bold':   v.$font-weight-bold,
+);

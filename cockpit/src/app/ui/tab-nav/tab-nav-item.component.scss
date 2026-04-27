@@ -1,0 +1,64 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: v.$font-size-sm;
+  font-weight: v.$font-weight-medium;
+  cursor: pointer;
+  user-select: none;
+
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease;
+
+  &:focus { outline: none; }
+
+  &.cdk-keyboard-focused,
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: -2px;
+  }
+
+  &:hover:not([data-disabled]):not([data-active]) {
+    color: var(--text-primary);
+    background: var(--hover);
+  }
+
+  &[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  // --- Horizontal orientation: bottom-border active indicator ---
+  &[data-orientation='horizontal'] {
+    padding: 10px 20px;
+    border-bottom: 2px solid transparent;
+
+    &[data-active] {
+      color: var(--text-primary);
+      border-bottom-color: var(--accent-color);
+    }
+  }
+
+  // --- Vertical orientation: left-border active indicator + tinted bg ---
+  &[data-orientation='vertical'] {
+    padding: 10px 16px;
+    border-left: 3px solid transparent;
+    text-align: left;
+    justify-content: flex-start;
+
+    &[data-active] {
+      color: var(--text-primary);
+      border-left-color: var(--accent-color);
+      background: var(--hover);
+    }
+  }
+}

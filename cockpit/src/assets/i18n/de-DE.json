@@ -31,7 +31,9 @@
     "newSession": "Neue Sitzung",
     "untitledSession": "Unbenannt",
     "selectModel": "Modell auswählen",
-    "noKey": "(kein Schlüssel)"
+    "noKey": "(kein Schlüssel)",
+    "noModelsTitle": "Noch keine Modelle verfügbar.",
+    "noModelsCta": "Provider konfigurieren"
   },
   "projects": {
     "title": "Projekte",
@@ -295,6 +297,11 @@
   },
   "settings": {
     "title": "Einstellungen",
+    "appearance": {
+      "title": "Erscheinungsbild",
+      "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung. Die Auswahl wird auf diesem Gerät gespeichert.",
+      "themeLabel": "Design"
+    },
     "language": {
       "title": "Sprache",
       "desc": "Ihre bevorzugte Oberflächensprache. Änderungen werden sofort angewendet.",

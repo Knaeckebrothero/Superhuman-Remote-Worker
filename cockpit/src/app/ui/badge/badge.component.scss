@@ -1,0 +1,123 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+
+  font-family: inherit;
+  font-weight: v.$font-weight-bold;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
+
+  // --- Sizes ---
+  &[data-size='xs'] {
+    height: 16px;
+    padding: 0 v.$space-xs;
+    font-size: 9px;
+  }
+
+  &[data-size='sm'] {
+    height: 20px;
+    padding: 0 v.$space-sm;
+    font-size: v.$font-size-xs;
+  }
+
+  &[data-size='md'] {
+    height: 24px;
+    padding: 0 v.$space-sm;
+    font-size: v.$font-size-sm;
+  }
+
+  // --- Shape ---
+  &[data-shape='rounded'] { border-radius: v.$radius-sm; }
+  &[data-shape='pill']    { border-radius: v.$radius-xl; }
+
+  // --- Uppercase modifier ---
+  &[data-uppercase] {
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  // --- Tones × appearance ---
+  // Subtle = tinted background + tone-colored text.
+  // Solid  = filled background + dark contrast text.
+
+  &[data-tone='neutral'] {
+    &[data-appearance='subtle'] {
+      background: var(--surface-0);
+      color: var(--text-muted);
+    }
+    &[data-appearance='solid'] {
+      background: var(--surface-2);
+      color: var(--text-primary);
+    }
+  }
+
+  &[data-tone='accent'] {
+    &[data-appearance='subtle'] {
+      background: var(--hover);
+      color: var(--accent-color);
+    }
+    &[data-appearance='solid'] {
+      background: var(--accent-color);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-tone='success'] {
+    &[data-appearance='subtle'] {
+      background: var(--success-tint);
+      color: var(--success);
+    }
+    &[data-appearance='solid'] {
+      background: var(--success);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-tone='warning'] {
+    &[data-appearance='subtle'] {
+      background: var(--warning-tint);
+      color: var(--warning);
+    }
+    &[data-appearance='solid'] {
+      background: var(--warning);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-tone='alert'] {
+    &[data-appearance='subtle'] {
+      background: var(--alert-tint);
+      color: var(--alert);
+    }
+    &[data-appearance='solid'] {
+      background: var(--alert);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-tone='info'] {
+    &[data-appearance='subtle'] {
+      background: var(--info-tint);
+      color: var(--info);
+    }
+    &[data-appearance='solid'] {
+      background: var(--info);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-tone='danger'] {
+    &[data-appearance='subtle'] {
+      background: var(--danger-tint);
+      color: var(--danger);
+    }
+    &[data-appearance='solid'] {
+      background: var(--danger);
+      color: var(--timeline-bg);
+    }
+  }
+}

@@ -1,0 +1,220 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+
+  &[data-full-width] {
+    display: block;
+    width: 100%;
+  }
+}
+
+.app-button__btn {
+  // Layout
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: v.$space-xs;
+  position: relative;
+
+  // Reset / typography
+  appearance: none;
+  border: 1px solid transparent;
+  font-family: inherit;
+  font-weight: v.$font-weight-medium;
+  line-height: v.$line-height-tight;
+  white-space: nowrap;
+  cursor: pointer;
+  text-decoration: none;
+
+  // Default state colors (overridden per variant)
+  background: transparent;
+  color: var(--text-primary);
+
+  // Animations
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease;
+
+  // Focus ring (driven by CDK FocusMonitor on the host)
+  &:focus { outline: none; }
+
+  // Disabled
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  // --- Sizes ---
+  &[data-size='sm'] {
+    height: 28px;
+    padding: 0 v.$space-sm;
+    font-size: v.$font-size-xs;
+    border-radius: v.$radius-sm;
+  }
+
+  &[data-size='md'] {
+    height: 36px;
+    padding: 0 v.$space-md;
+    font-size: v.$font-size-sm;
+    border-radius: v.$radius-md;
+  }
+
+  &[data-size='lg'] {
+    height: 44px;
+    padding: 0 v.$space-lg;
+    font-size: v.$font-size-base;
+    border-radius: v.$radius-md;
+  }
+
+  // Full-width takes the host's width.
+  :host[data-full-width] & { width: 100%; }
+
+  // --- Variants ---
+  &[data-variant='primary'] {
+    background: var(--accent-color);
+    color: var(--timeline-bg);
+    border-color: var(--accent-color);
+
+    &:hover:not(:disabled) {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    &:active:not(:disabled) {
+      filter: brightness(0.95);
+    }
+  }
+
+  &[data-variant='secondary'] {
+    background: var(--surface-0);
+    color: var(--text-primary);
+    border-color: var(--border-color);
+
+    &:hover:not(:disabled) {
+      background: var(--surface-1);
+    }
+
+    &:active:not(:disabled) {
+      background: var(--surface-2);
+    }
+  }
+
+  &[data-variant='ghost'] {
+    background: transparent;
+    color: var(--text-secondary);
+    border-color: transparent;
+
+    &:hover:not(:disabled) {
+      background: var(--hover);
+      color: var(--text-primary);
+    }
+
+    &:active:not(:disabled) {
+      background: var(--active);
+    }
+  }
+
+  &[data-variant='danger'] {
+    background: var(--danger);
+    color: var(--timeline-bg);
+    border-color: var(--danger);
+
+    &:hover:not(:disabled) {
+      filter: brightness(1.05);
+    }
+
+    &:active:not(:disabled) {
+      filter: brightness(0.95);
+    }
+  }
+
+  &[data-variant='success'] {
+    background: var(--success);
+    color: var(--timeline-bg);
+    border-color: var(--success);
+
+    &:hover:not(:disabled) {
+      filter: brightness(1.05);
+    }
+
+    &:active:not(:disabled) {
+      filter: brightness(0.95);
+    }
+  }
+
+  &[data-variant='warning'] {
+    background: var(--warning-tint);
+    color: var(--warning);
+    border-color: var(--warning-tint);
+
+    &:hover:not(:disabled) {
+      filter: brightness(1.15);
+    }
+
+    &:active:not(:disabled) {
+      filter: brightness(1.2);
+    }
+  }
+
+  &[data-variant='info'] {
+    background: var(--info);
+    color: var(--timeline-bg);
+    border-color: var(--info);
+
+    &:hover:not(:disabled) {
+      filter: brightness(1.05);
+    }
+
+    &:active:not(:disabled) {
+      filter: brightness(0.95);
+    }
+  }
+}
+
+// CDK FocusMonitor adds .cdk-keyboard-focused on the host when focused via
+// keyboard. Show the focus ring only then; mouse clicks stay clean.
+:host.cdk-keyboard-focused .app-button__btn {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+// --- Loading state ---
+.app-button__content {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+
+  &[data-loading] { visibility: hidden; }
+}
+
+.app-button__spinner {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: app-button-spin 0.7s linear infinite;
+}
+
+@keyframes app-button-spin {
+  to { transform: rotate(360deg); }
+}
+
+// Reduced motion: stop the spinner animation but keep it visible.
+@media (prefers-reduced-motion: reduce) {
+  .app-button__spinner {
+    animation-duration: 2s;
+  }
+}
+
+// Mobile touch-target floor.
+@media (max-width: v.$breakpoint-md) {
+  .app-button__btn {
+    min-height: v.$touch-target-min;
+  }
+}

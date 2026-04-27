@@ -472,7 +472,7 @@ class TestPhase3Integration:
         """Verify the project detail component has the Knowledge tab."""
         component_path = (
             project_root
-            / "cockpit/src/app/pages/project-detail/project-detail.component.ts"
+            / "cockpit/src/app/views/project-detail/project-detail.component.ts"
         )
         content = component_path.read_text()
 
