@@ -77,16 +77,16 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .instructions-label {
       font-size: 13px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .instructions-editor {
       flex: 1;
       min-height: 200px;
       padding: 12px 14px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+      background: var(--surface-0, var(--surface-0));
+      color: var(--text-primary, var(--text-primary));
       font-family: 'JetBrains Mono', monospace;
       font-size: 12px;
       line-height: 1.5;
@@ -95,7 +95,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     }
     .instructions-editor:focus {
       outline: none;
-      border-color: var(--accent-color, #cba6f7);
+      border-color: var(--accent-color, var(--accent-color));
     }
     .instructions-editor:disabled {
       opacity: 0.6;
@@ -109,7 +109,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       align-items: center;
       gap: 6px;
       font-size: 12px;
-      color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, var(--accent-color));
     }
     .instructions-actions {
       display: flex;
@@ -119,7 +119,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       padding: 4px 0;
       border: none;
       background: none;
-      color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, var(--accent-color));
       font-size: 12px;
       cursor: pointer;
       text-decoration: underline;

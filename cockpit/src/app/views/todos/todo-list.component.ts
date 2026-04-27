@@ -206,7 +206,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       display: flex;
       flex-direction: column;
       height: 100%;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
       position: relative;
     }
 
@@ -215,8 +215,8 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       display: flex;
       gap: 8px;
       padding: 8px;
-      background: var(--surface-0, #313244);
-      border-bottom: 1px solid var(--border-color, #313244);
+      background: var(--surface-0, var(--surface-0));
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
     }
 
@@ -231,21 +231,21 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       gap: 12px;
       padding: 8px 12px;
       background: var(--panel-header-bg, #1e1e2e);
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
     }
 
     .progress-bar {
       flex: 1;
       height: 6px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 3px;
       overflow: hidden;
     }
 
     .progress-fill {
       height: 100%;
-      background: linear-gradient(90deg, #a6e3a1, #94e2d5);
+      background: linear-gradient(90deg, var(--success), var(--info));
       border-radius: 3px;
       transition: width 0.3s ease;
     }
@@ -253,7 +253,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
     .progress-text {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       min-width: 80px;
       text-align: right;
     }
@@ -264,19 +264,19 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       align-items: flex-start;
       gap: 8px;
       padding: 8px 12px;
-      background: rgba(243, 139, 168, 0.1);
-      border-bottom: 1px solid rgba(243, 139, 168, 0.2);
+      background: var(--danger-tint);
+      border-bottom: 1px solid var(--danger-tint);
       flex-shrink: 0;
     }
 
     .failure-icon {
-      color: #f38ba8;
+      color: var(--danger);
       font-size: 14px;
     }
 
     .failure-text {
       font-size: 12px;
-      color: #f38ba8;
+      color: var(--danger);
       line-height: 1.4;
     }
 
@@ -302,7 +302,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       justify-content: center;
       gap: 12px;
       padding: 40px;
-      color: #f38ba8;
+      color: var(--danger);
       flex: 1;
     }
 
@@ -314,7 +314,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       justify-content: center;
       gap: 12px;
       padding: 40px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       flex: 1;
     }
 
@@ -343,8 +343,8 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       padding: 10px 12px;
       margin-bottom: 4px;
       border-radius: 4px;
-      background: var(--surface-0, #313244);
-      border-left: 3px solid var(--border-color, #45475a);
+      background: var(--surface-0, var(--surface-0));
+      border-left: 3px solid var(--border-color, var(--surface-1));
       transition: all 0.15s ease;
     }
 
@@ -353,25 +353,25 @@ import { AppSpinnerComponent } from '../../ui/spinner';
     }
 
     .todo-item.completed {
-      border-left-color: #a6e3a1;
+      border-left-color: var(--success);
       opacity: 0.7;
     }
 
     .todo-item.in-progress {
-      border-left-color: #f9e2af;
-      background: rgba(249, 226, 175, 0.05);
+      border-left-color: var(--warning);
+      background: var(--warning-tint);
     }
 
     .todo-item.pending {
-      border-left-color: #89b4fa;
+      border-left-color: var(--info);
     }
 
     .todo-item.high-priority {
-      border-left-color: #f38ba8;
+      border-left-color: var(--danger);
     }
 
     .todo-item.high-priority.pending {
-      background: rgba(243, 139, 168, 0.05);
+      background: var(--danger-tint);
     }
 
     .todo-status {
@@ -388,14 +388,14 @@ import { AppSpinnerComponent } from '../../ui/spinner';
 
     .todo-text {
       font-size: 12px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       line-height: 1.4;
       word-wrap: break-word;
     }
 
     .todo-item.completed .todo-text {
       text-decoration: line-through;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
     }
 
     .todo-notes {
@@ -404,12 +404,12 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       gap: 4px;
       margin-top: 6px;
       padding-left: 12px;
-      border-left: 2px solid var(--border-color, #45475a);
+      border-left: 2px solid var(--border-color, var(--surface-1));
     }
 
     .note {
       font-size: 11px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-family: 'JetBrains Mono', monospace;
     }
 
@@ -418,23 +418,23 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       display: flex;
       gap: 16px;
       padding: 8px 12px;
-      background: var(--surface-0, #313244);
-      border-top: 1px solid var(--border-color, #313244);
+      background: var(--surface-0, var(--surface-0));
+      border-top: 1px solid var(--border-color, var(--surface-0));
       font-size: 11px;
       flex-shrink: 0;
     }
 
     .summary-item {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       font-family: 'JetBrains Mono', monospace;
     }
 
     .summary-item.completed {
-      color: #a6e3a1;
+      color: var(--success);
     }
 
     .summary-item.pending {
-      color: #f9e2af;
+      color: var(--warning);
     }
   `],
 })

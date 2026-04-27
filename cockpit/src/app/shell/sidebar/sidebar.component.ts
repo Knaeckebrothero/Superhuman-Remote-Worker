@@ -12,16 +12,22 @@ import {PersistentChatService} from '../../core/services/persistent-chat.service
 import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
+import {LegionMarkComponent} from '../../ui/legion-mark';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
-        <span class="sidebar-logo">SRW</span>
-        <span class="sidebar-label">{{ 'nav.cockpit' | transloco }}</span>
+        <div class="sidebar-brand">
+          <srw-legion-mark [size]="22" />
+          <div class="sidebar-brand-stack">
+            <span class="sidebar-logo">SRW</span>
+            <span class="sidebar-label">{{ 'nav.cockpit' | transloco }}</span>
+          </div>
+        </div>
         <button class="collapse-btn" (click)="sidebar.collapse()" [title]="'nav.collapseSidebar' | transloco">
           <app-icon size="md" class="collapse-icon">chevron_left</app-icon>
         </button>
@@ -224,7 +230,22 @@ import {AppIconComponent} from '../../ui/icon';
         flex-shrink: 0;
       }
 
+      .sidebar-brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--accent-color, #cba6f7);
+      }
+
+      .sidebar-brand-stack {
+        display: flex;
+        flex-direction: column;
+        line-height: 1;
+        gap: 3px;
+      }
+
       .sidebar-logo {
+        font-family: var(--font-display, inherit);
         font-size: 18px;
         font-weight: 700;
         color: var(--accent-color, #cba6f7);
@@ -232,7 +253,10 @@ import {AppIconComponent} from '../../ui/icon';
       }
 
       .sidebar-label {
-        font-size: 13px;
+        font-family: var(--font-display, inherit);
+        font-size: 11px;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
         color: var(--text-muted, #6c7086);
       }
 

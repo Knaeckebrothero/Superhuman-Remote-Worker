@@ -96,7 +96,7 @@ interface MenuSection {
               <span class="item-icon">🎨</span>
               <div class="item-content">
                 <span class="item-label">Theme</span>
-                <span class="item-description">Dark (Catppuccin Mocha)</span>
+                <span class="item-description">Configure in Settings → Appearance</span>
               </div>
             </div>
             <button class="menu-item" (click)="resetLayout()">

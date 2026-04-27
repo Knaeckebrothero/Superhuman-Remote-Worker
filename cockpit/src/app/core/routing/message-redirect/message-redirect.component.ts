@@ -11,7 +11,7 @@ import { ActivatedRoute, Router } from '@angular/router';
 @Component({
   selector: 'app-message-redirect',
   standalone: true,
-  template: '<p style="padding: 20px; color: #6c7086;">Redirecting...</p>',
+  template: '<p style="padding: 20px; color: var(--text-muted);">Redirecting...</p>',
 })
 export class MessageRedirectComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);

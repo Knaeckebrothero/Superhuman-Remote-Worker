@@ -92,7 +92,7 @@ import {
       color: var(--text-muted, #6c7086);
       margin-bottom: 12px;
       padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
     }
     .tool-toggles {
       display: flex;
@@ -113,14 +113,14 @@ import {
       background: rgba(255, 255, 255, 0.03);
     }
     .tool-toggle.modified {
-      border-left-color: var(--accent-color, #cba6f7);
+      border-left-color: var(--accent-color, var(--accent-color));
     }
     .tool-toggle.disabled {
       opacity: 0.6;
       cursor: not-allowed;
     }
     .tool-toggle input[type="checkbox"] {
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
       flex-shrink: 0;
     }
     .tool-toggle-icon {
@@ -137,7 +137,7 @@ import {
     .tool-toggle-name {
       font-size: 13px;
       font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .tool-toggle-desc {
       font-size: 11px;
@@ -173,7 +173,7 @@ import {
       border-left: 2px solid transparent;
     }
     .inline-field.modified {
-      border-left-color: var(--accent-color, #cba6f7);
+      border-left-color: var(--accent-color, var(--accent-color));
     }
     .inline-label {
       font-size: 11px;
@@ -182,16 +182,16 @@ import {
     }
     .inline-input {
       padding: 4px 8px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 4px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+      background: var(--surface-0, var(--surface-0));
+      color: var(--text-primary, var(--text-primary));
       font-family: inherit;
       font-size: 12px;
     }
     .inline-input:focus {
       outline: none;
-      border-color: var(--accent-color, #cba6f7);
+      border-color: var(--accent-color, var(--accent-color));
     }
     .number-input {
       max-width: 80px;

@@ -746,7 +746,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       align-items: center;
       gap: 12px;
       padding: 8px 16px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
       min-height: 44px;
     }
@@ -762,7 +762,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin: 0;
       font-size: 15px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       white-space: nowrap;
     }
 
@@ -776,8 +776,8 @@ function relativeTime(iso: string, nowLabel: string): string {
     .filter-chips::-webkit-scrollbar { display: none; }
 
     .chip-count {
-      background: var(--accent-color, #cba6f7);
-      color: #11111b;
+      background: var(--accent-color, var(--accent-color));
+      color: var(--timeline-bg);
       font-size: 9px;
       font-weight: 700;
       padding: 0 5px;
@@ -801,7 +801,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       background: var(--text-muted, #6c7086);
       transition: background 0.3s;
     }
-    .sse-dot.connected { background: #a6e3a1; }
+    .sse-dot.connected { background: var(--success); }
 
     /* ===== BODY: TWO-PANEL ===== */
 
@@ -815,17 +815,17 @@ function relativeTime(iso: string, nowLabel: string): string {
       width: 360px;
       min-width: 280px;
       flex-shrink: 0;
-      border-right: 1px solid var(--border-color, #313244);
+      border-right: 1px solid var(--border-color, var(--surface-0));
       overflow-y: auto;
       scrollbar-width: thin;
-      scrollbar-color: var(--border-color, #313244) transparent;
+      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
     }
 
     .detail-panel {
       flex: 1;
       overflow-y: auto;
       scrollbar-width: thin;
-      scrollbar-color: var(--border-color, #313244) transparent;
+      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
     }
 
     /* ===== LIST ITEMS ===== */
@@ -838,16 +838,16 @@ function relativeTime(iso: string, nowLabel: string): string {
       padding: 10px 12px 10px 0;
       background: transparent;
       border: none;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       cursor: pointer;
       text-align: left;
       font-family: inherit;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       transition: background 0.1s;
       position: relative;
     }
     .list-item:hover { background: rgba(49, 50, 68, 0.4); }
-    .list-item.selected { background: var(--surface-0, #313244); }
+    .list-item.selected { background: var(--surface-0, var(--surface-0)); }
     .list-item.resolved { opacity: 0.55; }
 
     .item-urgency-bar {
@@ -856,11 +856,11 @@ function relativeTime(iso: string, nowLabel: string): string {
       border-radius: 0 2px 2px 0;
       flex-shrink: 0;
     }
-    .urgency-green { background: #a6e3a1; }
-    .urgency-amber { background: #f9e2af; }
-    .urgency-red { background: #f38ba8; }
-    .urgency-purple { background: var(--accent-color, #cba6f7); }
-    .urgency-muted { background: var(--border-color, #313244); }
+    .urgency-green { background: var(--success); }
+    .urgency-amber { background: var(--warning); }
+    .urgency-red { background: var(--danger); }
+    .urgency-purple { background: var(--accent-color, var(--accent-color)); }
+    .urgency-muted { background: var(--border-color, var(--surface-0)); }
 
     .item-type-icon {
       font-size: 18px;
@@ -868,10 +868,10 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin-top: 1px;
       color: var(--text-muted, #6c7086);
     }
-    .type-message { color: #89b4fa; }
-    .type-sudo { color: #fab387; }
-    .type-review { color: #a6e3a1; }
-    .type-session { color: #cba6f7; }
+    .type-message { color: var(--info); }
+    .type-sudo { color: var(--alert); }
+    .type-review { color: var(--success); }
+    .type-session { color: var(--accent-color); }
 
     .item-content { flex: 1; min-width: 0; }
 
@@ -884,7 +884,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .item-title {
       font-size: 12px;
       font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -896,7 +896,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: #89b4fa;
+      background: var(--info);
       flex-shrink: 0;
     }
 
@@ -926,9 +926,9 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 4px;
     }
 
-    .ttl-green { color: #a6e3a1; }
-    .ttl-amber { color: #f9e2af; }
-    .ttl-red { color: #f38ba8; }
+    .ttl-green { color: var(--success); }
+    .ttl-amber { color: var(--warning); }
+    .ttl-red { color: var(--danger); }
 
     /* ===== EMPTY STATES ===== */
 
@@ -943,7 +943,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .empty-icon {
       font-size: 40px;
-      color: var(--border-color, #313244);
+      color: var(--border-color, var(--surface-0));
     }
 
     .empty-text {
@@ -962,7 +962,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .detail-empty-icon {
       font-size: 48px;
-      color: var(--border-color, #313244);
+      color: var(--border-color, var(--surface-0));
     }
 
     .detail-empty-text {
@@ -979,7 +979,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .detail-empty-hint kbd {
       display: inline-block;
       padding: 1px 5px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 3px;
       font-size: 10px;
       font-family: inherit;
@@ -1007,13 +1007,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       gap: 4px;
       font-size: 13px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .detail-type-badge .icon { font-size: 18px; }
-    .detail-type-badge.sudo .icon { color: #fab387; }
-    .detail-type-badge.message .icon { color: #89b4fa; }
-    .detail-type-badge.review .icon { color: #a6e3a1; }
-    .detail-type-badge.session .icon { color: #cba6f7; }
+    .detail-type-badge.sudo .icon { color: var(--alert); }
+    .detail-type-badge.message .icon { color: var(--info); }
+    .detail-type-badge.review .icon { color: var(--success); }
+    .detail-type-badge.session .icon { color: var(--accent-color); }
 
     .session-detail .session-title {
       font-size: 16px;
@@ -1029,7 +1029,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin-bottom: 12px;
     }
     .session-detail .args-block {
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 6px;
       padding: 8px 12px;
       font-size: 12px;
@@ -1052,14 +1052,14 @@ function relativeTime(iso: string, nowLabel: string): string {
     /* ===== SUDO DETAIL ===== */
 
     .command-block {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       padding: 12px 14px;
     }
     .command-block code {
       font-size: 13px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       word-break: break-all;
       line-height: 1.5;
     }
@@ -1083,19 +1083,19 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .meta-value {
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
     }
     .meta-value.mono { font-family: monospace; font-size: 11px; }
 
     .decision-info {
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
       border-radius: 6px;
       padding: 10px 12px;
     }
 
     .decision-reason {
       font-size: 12px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-style: italic;
       display: block;
       margin-top: 4px;
@@ -1104,7 +1104,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     /* Rules */
 
     .rules-section {
-      border: 1px solid var(--border-color, #313244);
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       overflow: hidden;
     }
@@ -1123,14 +1123,14 @@ function relativeTime(iso: string, nowLabel: string): string {
     .rules-toggle .icon { font-size: 14px; }
 
     .rules-body {
-      border-top: 1px solid var(--border-color, #313244);
+      border-top: 1px solid var(--border-color, var(--surface-0));
     }
 
     .rule-form {
       display: flex;
       gap: 6px;
       padding: 8px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       align-items: center;
     }
     .rule-form app-input { flex: 1; }
@@ -1140,7 +1140,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       align-items: center;
       gap: 6px;
       padding: 5px 8px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       font-size: 11px;
     }
     .rule-row:last-child { border-bottom: none; }
@@ -1148,7 +1148,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .rule-pattern {
       flex: 1;
       font-size: 11px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
 
     /* ===== MESSAGE DETAIL ===== */
@@ -1168,7 +1168,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       overflow-y: auto;
       padding: 4px 0;
       scrollbar-width: thin;
-      scrollbar-color: var(--border-color, #313244) transparent;
+      scrollbar-color: var(--border-color, var(--surface-0)) transparent;
     }
 
     .thread-loading {
@@ -1181,7 +1181,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .msg-preview {
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-size: 12px;
       line-height: 1.5;
     }
@@ -1192,13 +1192,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       max-width: 85%;
     }
     .msg-outbound {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       align-self: flex-start;
     }
     .msg-inbound {
-      background: rgba(203, 166, 247, 0.08);
-      border: 1px solid rgba(203, 166, 247, 0.15);
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent-color) 20%, transparent);
       align-self: flex-end;
     }
 
@@ -1212,10 +1212,10 @@ function relativeTime(iso: string, nowLabel: string): string {
     .msg-sender {
       font-size: 11px;
       font-weight: 600;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
     }
-    .msg-outbound .msg-sender { color: #fab387; }
-    .msg-inbound .msg-sender { color: var(--accent-color, #cba6f7); }
+    .msg-outbound .msg-sender { color: var(--alert); }
+    .msg-inbound .msg-sender { color: var(--accent-color, var(--accent-color)); }
 
     .msg-time {
       font-size: 10px;
@@ -1225,20 +1225,20 @@ function relativeTime(iso: string, nowLabel: string): string {
     .msg-content {
       font-size: 13px;
       line-height: 1.55;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
 
     .msg-content ::ng-deep {
       p { margin: 0 0 8px; }
       p:last-child { margin-bottom: 0; }
       code {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         padding: 1px 4px;
         border-radius: 3px;
         font-size: 12px;
       }
       pre {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 4px;
         padding: 8px 10px;
         overflow-x: auto;
@@ -1248,7 +1248,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .reply-form {
-      border-top: 1px solid var(--border-color, #313244);
+      border-top: 1px solid var(--border-color, var(--surface-0));
       padding-top: 12px;
     }
 
@@ -1268,13 +1268,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       border-radius: 4px;
       font-family: monospace;
       font-size: 0.85em;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       word-break: break-all;
     }
 
     .upgrade-hint {
       font-size: 0.8em;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-style: italic;
     }
 
@@ -1284,15 +1284,15 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .review-job-info {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       padding: 12px;
     }
 
     .review-job-desc {
       font-size: 13px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       line-height: 1.5;
     }
 
@@ -1327,7 +1327,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .review-summary {
       font-size: 13px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       line-height: 1.55;
     }
     .review-summary ::ng-deep p { margin: 0 0 6px; }
@@ -1342,7 +1342,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .confidence-bar {
       flex: 1;
       height: 6px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 3px;
       overflow: hidden;
     }
@@ -1352,14 +1352,14 @@ function relativeTime(iso: string, nowLabel: string): string {
       border-radius: 3px;
       transition: width 0.3s ease;
     }
-    .confidence-fill.low { background: #f38ba8; }
-    .confidence-fill.medium { background: #f9e2af; }
-    .confidence-fill.high { background: #a6e3a1; }
+    .confidence-fill.low { background: var(--danger); }
+    .confidence-fill.medium { background: var(--warning); }
+    .confidence-fill.high { background: var(--success); }
 
     .confidence-label {
       font-size: 11px;
       font-weight: 600;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-variant-numeric: tabular-nums;
       min-width: 30px;
     }
@@ -1368,7 +1368,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       margin: 0;
       padding: 0 0 0 18px;
       font-size: 12px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       line-height: 1.6;
     }
 
@@ -1383,10 +1383,10 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .upgrade-hint {
       font-size: 12px;
-      color: #a6adc8;
+      color: var(--text-secondary);
       padding: 8px 12px;
-      background: rgba(249, 226, 175, 0.06);
-      border-left: 2px solid #f9e2af;
+      background: var(--warning-tint);
+      border-left: 2px solid var(--warning);
       border-radius: 4px;
       margin-bottom: 8px;
       line-height: 1.5;
@@ -1419,18 +1419,18 @@ function relativeTime(iso: string, nowLabel: string): string {
     .shortcuts-grid kbd {
       display: inline-block;
       padding: 2px 7px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 4px;
       font-size: 11px;
       font-family: inherit;
-      color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, var(--accent-color));
       text-align: center;
       min-width: 24px;
     }
 
     .shortcuts-grid span {
       font-size: 12px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       padding-top: 2px;
     }
 

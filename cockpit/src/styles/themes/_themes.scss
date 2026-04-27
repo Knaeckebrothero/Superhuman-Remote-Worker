@@ -8,8 +8,8 @@
 // land as legal CSS without the surrounding quotes.
 //
 // Usage:
-//   .theme-dark  { @include theme.apply-app-theme('dark'); }
-//   .theme-light { @include theme.apply-app-theme('light'); }
+//   .theme-senate     { @include theme.apply-app-theme('senate'); }
+//   .theme-travertine { @include theme.apply-app-theme('travertine'); }
 @mixin apply-app-theme($theme-name) {
   $theme-map: map.get(config.$themes, $theme-name);
 

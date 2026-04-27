@@ -113,8 +113,8 @@ import {AppIconComponent} from '../../ui/icon';
         gap: 8px;
         height: 48px;
         padding: 0 12px;
-        background: var(--timeline-bg, #11111b);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--timeline-bg, var(--timeline-bg));
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
         position: relative;
         z-index: 10;
@@ -139,10 +139,10 @@ import {AppIconComponent} from '../../ui/icon';
         align-items: center;
         gap: 4px;
         padding: 6px 10px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 6px;
         background: transparent;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
@@ -152,7 +152,7 @@ import {AppIconComponent} from '../../ui/icon';
 
       .session-title-btn:hover {
         background: rgba(255, 255, 255, 0.04);
-        border-color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color, var(--accent-color));
       }
 
       .session-title-text {
@@ -173,8 +173,8 @@ import {AppIconComponent} from '../../ui/icon';
         min-width: 280px;
         max-height: 300px;
         overflow-y: auto;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
         z-index: 100;
@@ -189,7 +189,7 @@ import {AppIconComponent} from '../../ui/icon';
         padding: 8px 12px;
         border: none;
         background: transparent;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
         cursor: pointer;
         text-align: left;
@@ -200,12 +200,12 @@ import {AppIconComponent} from '../../ui/icon';
       }
 
       .session-option.active {
-        background: rgba(203, 166, 247, 0.12);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .new-option {
-        border-bottom: 1px solid var(--border-color, #45475a);
-        color: var(--accent-color, #cba6f7);
+        border-bottom: 1px solid var(--border-color, var(--surface-1));
+        color: var(--accent-color, var(--accent-color));
         font-weight: 500;
         gap: 6px;
         justify-content: flex-start;
@@ -235,10 +235,10 @@ import {AppIconComponent} from '../../ui/icon';
         align-items: center;
         gap: 4px;
         padding: 6px 10px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 6px;
         background: transparent;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
@@ -248,7 +248,7 @@ import {AppIconComponent} from '../../ui/icon';
 
       .model-title-btn:hover {
         background: rgba(255, 255, 255, 0.04);
-        border-color: var(--accent-color, #cba6f7);
+        border-color: var(--accent-color, var(--accent-color));
       }
 
       .model-title-text {
@@ -264,8 +264,8 @@ import {AppIconComponent} from '../../ui/icon';
         min-width: 280px;
         max-height: 360px;
         overflow-y: auto;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #45475a);
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
         z-index: 100;
@@ -278,7 +278,7 @@ import {AppIconComponent} from '../../ui/icon';
         text-transform: uppercase;
         letter-spacing: 0.5px;
         color: var(--text-muted, #6c7086);
-        border-top: 1px solid var(--border-color, #45475a);
+        border-top: 1px solid var(--border-color, var(--surface-1));
       }
 
       .model-group-header:first-child {
@@ -295,7 +295,7 @@ import {AppIconComponent} from '../../ui/icon';
         padding: 7px 12px 7px 20px;
         border: none;
         background: transparent;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
         cursor: pointer;
         text-align: left;
@@ -306,8 +306,8 @@ import {AppIconComponent} from '../../ui/icon';
       }
 
       .model-option.active {
-        background: rgba(203, 166, 247, 0.12);
-        color: var(--accent-color, #cba6f7);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+        color: var(--accent-color, var(--accent-color));
       }
 
       .model-option.unconfigured {
@@ -323,14 +323,14 @@ import {AppIconComponent} from '../../ui/icon';
 
       .model-empty-title {
         font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         line-height: 1.4;
       }
 
       .model-empty-link {
         font-size: 12px;
         font-weight: 500;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         text-decoration: none;
       }
 
@@ -348,7 +348,7 @@ import {AppIconComponent} from '../../ui/icon';
         width: 8px;
         height: 8px;
         border-radius: 50%;
-        background: var(--accent-color, #cba6f7);
+        background: var(--accent-color, var(--accent-color));
         animation: pulse 1.5s ease-in-out infinite;
       }
 

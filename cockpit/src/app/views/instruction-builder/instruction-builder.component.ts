@@ -249,7 +249,7 @@ interface ChatMessage {
 
       .empty-icon {
         font-size: 48px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         opacity: 0.5;
       }
 
@@ -261,14 +261,14 @@ interface ChatMessage {
 
       .empty-desc {
         font-size: 13px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         max-width: 360px;
         line-height: 1.5;
       }
 
       .empty-hint {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         opacity: 0.7;
         margin-top: 8px;
       }
@@ -316,7 +316,7 @@ interface ChatMessage {
       }
 
       .message-assistant .message-avatar {
-        background: rgba(203, 166, 247, 0.15);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
         color: var(--accent-color, #cba6f7);
       }
 
@@ -339,7 +339,7 @@ interface ChatMessage {
       }
 
       .message-user .message-content {
-        background: rgba(137, 180, 250, 0.12);
+        background: var(--info-tint);
         color: var(--text-primary, #cdd6f4);
         border-bottom-right-radius: 4px;
       }
@@ -351,7 +351,7 @@ interface ChatMessage {
       }
 
       .message-content.streaming {
-        border: 1px solid rgba(203, 166, 247, 0.2);
+        border: 1px solid color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .cursor-blink {
@@ -386,7 +386,7 @@ interface ChatMessage {
 
       /* Inspection result rendering */
       .inspection-content {
-        border-left: 3px solid #94e2d5;
+        border-left: 3px solid var(--info);
         padding-left: 10px;
         font-family: 'JetBrains Mono', 'Fira Code', monospace;
         font-size: 12px;
@@ -408,7 +408,7 @@ interface ChatMessage {
         gap: 8px;
         padding: 8px 12px;
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         border-top: 1px solid var(--border-color, #313244);
       }
 
@@ -479,7 +479,7 @@ interface ChatMessage {
       }
 
       .chat-input::placeholder {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
 
@@ -558,7 +558,7 @@ interface ChatMessage {
         margin: 0.4em 0;
         padding: 0.3em 0 0.3em 0.8em;
         border-left: 3px solid var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.06);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
         border-radius: 0 6px 6px 0;
         color: var(--text-secondary, #a6adc8);
       }
@@ -617,7 +617,7 @@ interface ChatMessage {
         border: none;
         border-radius: 6px;
         background: var(--surface-0, #313244);
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         cursor: pointer;
         display: flex;
         align-items: center;
@@ -767,7 +767,7 @@ interface ChatMessage {
       }
 
       .diff-remove {
-        border: 1px solid rgba(243, 139, 168, 0.25);
+        border: 1px solid var(--danger-tint);
       }
 
       .diff-remove .diff-label {
@@ -803,7 +803,7 @@ interface ChatMessage {
 
       .diff-details-summary {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         cursor: pointer;
         padding: 4px 0;
         user-select: none;
@@ -816,8 +816,8 @@ interface ChatMessage {
       }
 
       .diff-new {
-        background: rgba(166, 227, 161, 0.05);
-        border: 1px solid rgba(166, 227, 161, 0.2);
+        background: var(--success-tint);
+        border: 1px solid var(--success-tint);
         border-radius: 6px;
       }
 

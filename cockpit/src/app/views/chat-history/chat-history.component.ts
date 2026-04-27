@@ -246,7 +246,7 @@ interface ShellPane {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         position: relative;
       }
 
@@ -257,21 +257,21 @@ interface ShellPane {
         gap: 8px;
         padding: 8px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .header-title {
         font-size: 12px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .entry-count {
         margin-left: auto;
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       /* Loading Overlay */
@@ -296,7 +296,7 @@ interface ShellPane {
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: #f38ba8;
+        color: var(--danger);
         flex: 1;
       }
 
@@ -308,7 +308,7 @@ interface ShellPane {
         justify-content: center;
         gap: 12px;
         padding: 40px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         flex: 1;
       }
 
@@ -334,7 +334,7 @@ interface ShellPane {
       .chat-turn {
         margin-bottom: 16px;
         padding-bottom: 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
       }
 
       .chat-turn:last-child {
@@ -353,22 +353,22 @@ interface ShellPane {
 
       .turn-number {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .iteration {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .latency {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .timestamp {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         margin-left: auto;
       }
 
@@ -380,14 +380,14 @@ interface ShellPane {
       }
 
       .input-message {
-        background: rgba(137, 180, 250, 0.1);
-        border-left: 3px solid #89b4fa;
+        background: var(--info-tint);
+        border-left: 3px solid var(--info);
         margin-right: 40px;
       }
 
       .response-message {
-        background: rgba(166, 227, 161, 0.1);
-        border-left: 3px solid #a6e3a1;
+        background: var(--success-tint);
+        border-left: 3px solid var(--success);
         margin-left: 40px;
       }
 
@@ -405,22 +405,22 @@ interface ShellPane {
       }
 
       .message-type.human {
-        color: #89b4fa;
+        color: var(--info);
       }
 
       .message-type.tool {
-        color: #cba6f7;
+        color: var(--accent-color);
       }
 
       .message-type.assistant {
-        color: #a6e3a1;
+        color: var(--success);
       }
 
       .message-content {
         padding: 10px;
         font-size: 12px;
         line-height: 1.5;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         white-space: pre-wrap;
         word-break: break-word;
         max-height: 300px;
@@ -433,8 +433,8 @@ interface ShellPane {
       }
 
       .tool-call-item {
-        background: rgba(203, 166, 247, 0.1);
-        border-left: 3px solid #cba6f7;
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+        border-left: 3px solid var(--accent-color);
         margin: 0;
       }
 
@@ -448,7 +448,7 @@ interface ShellPane {
         gap: 8px;
         padding: 8px 10px;
         font-size: 11px;
-        color: #cba6f7;
+        color: var(--accent-color);
         cursor: pointer;
         user-select: none;
         background: rgba(0, 0, 0, 0.1);
@@ -470,7 +470,7 @@ interface ShellPane {
       }
 
       .tool-args-preview {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
         overflow: hidden;
@@ -484,7 +484,7 @@ interface ShellPane {
         padding: 10px;
         font-size: 12px;
         line-height: 1.5;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         white-space: pre-wrap;
         word-break: break-word;
         max-height: 300px;
@@ -493,15 +493,15 @@ interface ShellPane {
       }
 
       .no-result {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-style: italic;
       }
 
       /* Reasoning */
       .reasoning-section {
         margin: 8px 40px 8px 0;
-        background: rgba(249, 226, 175, 0.1);
-        border-left: 3px solid #f9e2af;
+        background: var(--warning-tint);
+        border-left: 3px solid var(--warning);
         border-radius: 8px;
         overflow: hidden;
       }
@@ -513,7 +513,7 @@ interface ShellPane {
         padding: 8px 10px;
         font-size: 11px;
         font-weight: 600;
-        color: #f9e2af;
+        color: var(--warning);
         cursor: pointer;
         user-select: none;
         background: rgba(0, 0, 0, 0.1);
@@ -531,7 +531,7 @@ interface ShellPane {
         padding: 10px;
         font-size: 12px;
         line-height: 1.5;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         white-space: pre-wrap;
         word-break: break-word;
         max-height: 400px;
@@ -540,7 +540,7 @@ interface ShellPane {
 
       /* Request Link */
       .request-link {
-        color: #89b4fa;
+        color: var(--info);
         font-family: 'JetBrains Mono', monospace;
         cursor: pointer;
         text-decoration: underline;
@@ -549,7 +549,7 @@ interface ShellPane {
       }
 
       .request-link:hover {
-        color: #b4befe;
+        color: var(--accent-hover);
         text-decoration-style: solid;
       }
 
@@ -558,21 +558,21 @@ interface ShellPane {
         display: flex;
         align-items: center;
         padding: 8px 12px;
-        background: var(--surface-0, #313244);
-        border-top: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, var(--surface-0));
+        border-top: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .position-info {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       /* Shell State Widget */
       .shell-state-section {
         margin: 8px 0;
-        background: #11111b;
-        border: 1px solid #313244;
+        background: var(--timeline-bg);
+        border: 1px solid var(--surface-0);
         border-radius: 8px;
         overflow: hidden;
       }
@@ -584,7 +584,7 @@ interface ShellPane {
         padding: 8px 10px;
         font-size: 11px;
         font-weight: 600;
-        color: #94e2d5;
+        color: var(--info);
         cursor: pointer;
         user-select: none;
         background: rgba(0, 0, 0, 0.3);
@@ -602,7 +602,7 @@ interface ShellPane {
         margin-left: auto;
         font-size: 10px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .shell-widget {
@@ -613,8 +613,8 @@ interface ShellPane {
       .shell-tab-bar {
         display: flex;
         gap: 0;
-        background: #181825;
-        border-bottom: 1px solid #313244;
+        background: var(--panel-bg);
+        border-bottom: 1px solid var(--surface-0);
         overflow-x: auto;
       }
 
@@ -625,7 +625,7 @@ interface ShellPane {
         padding: 6px 12px;
         border: none;
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
         cursor: pointer;
@@ -636,12 +636,12 @@ interface ShellPane {
 
       .shell-tab:hover {
         background: rgba(255, 255, 255, 0.05);
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .shell-tab.active {
-        color: #94e2d5;
-        border-bottom-color: #94e2d5;
+        color: var(--info);
+        border-bottom-color: var(--info);
         background: rgba(148, 226, 213, 0.05);
       }
 
@@ -651,12 +651,12 @@ interface ShellPane {
 
       .idle-badge {
         font-size: 9px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-style: italic;
       }
 
       .shell-terminal-pane {
-        background: #11111b;
+        background: var(--timeline-bg);
         min-height: 60px;
         max-height: 250px;
         overflow: auto;
@@ -668,7 +668,7 @@ interface ShellPane {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         line-height: 1.5;
-        color: #a6e3a1;
+        color: var(--success);
         white-space: pre-wrap;
         word-break: break-word;
       }

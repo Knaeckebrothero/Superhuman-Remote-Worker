@@ -629,8 +629,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         justify-content: space-between;
         padding: 10px 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        background: var(--panel-bg, #181825);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        background: var(--panel-bg, var(--panel-bg));
         flex-shrink: 0;
       }
 
@@ -643,27 +643,27 @@ const CATEGORY_LABELS: Record<string, string> = {
       .back-link {
         display: flex;
         align-items: center;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         text-decoration: none;
         margin-right: 4px;
       }
 
-      .back-link:hover { color: var(--text-primary, #cdd6f4); }
+      .back-link:hover { color: var(--text-primary, var(--text-primary)); }
 
       .header-icon, .perm-icon, .error-icon {
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
       }
 
       .header-title {
         font-size: 14px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .header-session-id {
         font-family: var(--font-mono, monospace);
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .status-dot {
@@ -673,10 +673,10 @@ const CATEGORY_LABELS: Record<string, string> = {
         flex-shrink: 0;
       }
 
-      .status-dot.connected { background: #a6e3a1; }
-      .status-dot.connecting { background: #f9e2af; animation: pulse 1s infinite; }
+      .status-dot.connected { background: var(--success); }
+      .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
       .status-dot.disconnected { background: var(--surface-2, #585b70); }
-      .status-dot.error { background: #f38ba8; }
+      .status-dot.error { background: var(--danger); }
 
       @keyframes pulse {
         0%, 100% { opacity: 1; }
@@ -685,7 +685,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .status-label {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       /* Status bar */
@@ -695,8 +695,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         padding: 4px 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        background: var(--panel-bg, #181825);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        background: var(--panel-bg, var(--panel-bg));
         flex-shrink: 0;
       }
 
@@ -707,8 +707,8 @@ const CATEGORY_LABELS: Record<string, string> = {
       /* Task bar */
       .task-bar {
         padding: 6px 16px;
-        border-bottom: 1px solid #313244;
-        background: #181825;
+        border-bottom: 1px solid var(--surface-0);
+        background: var(--panel-bg);
         flex-shrink: 0;
       }
       .task-header {
@@ -716,7 +716,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         font-size: 11px;
-        color: #6c7086;
+        color: var(--text-muted);
         margin-bottom: 4px;
       }
       .task-list {
@@ -729,7 +729,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         font-size: 11px;
-        color: #cdd6f4;
+        color: var(--text-primary);
       }
       .task-item .task-check {
         color: var(--text-muted);
@@ -769,21 +769,21 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         padding: 4px 8px;
         border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
         background: transparent;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         cursor: pointer;
         transition: all 0.15s ease;
       }
       .settings-btn:hover, .settings-btn.active {
-        color: var(--accent-color, #cba6f7);
-        border-color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
+        border-color: var(--accent-color, var(--accent-color));
       }
 
       .settings-panel {
         padding: 10px 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
-        background: var(--panel-bg, #181825);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        background: var(--panel-bg, var(--panel-bg));
         display: flex;
         flex-wrap: wrap;
         gap: 12px;
@@ -797,12 +797,12 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
       .settings-label {
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         white-space: nowrap;
       }
       .settings-slider {
         width: 100px;
-        accent-color: var(--accent-color, #cba6f7);
+        accent-color: var(--accent-color, var(--accent-color));
       }
 
       .ide-btn {
@@ -811,9 +811,9 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 4px;
         padding: 4px 12px;
         border-radius: 4px;
-        border: 1px solid #89b4fa;
+        border: 1px solid var(--info);
         background: transparent;
-        color: #89b4fa;
+        color: var(--info);
         font-size: 11px;
         font-family: inherit;
         cursor: pointer;
@@ -821,7 +821,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .ide-btn:hover {
-        background: rgba(137, 180, 250, 0.1);
+        background: var(--info-tint);
       }
 
       .ide-btn:disabled {
@@ -830,20 +830,20 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .gitea-btn {
-        border-color: #a6e3a1;
-        color: #a6e3a1;
+        border-color: var(--success);
+        color: var(--success);
       }
 
       .gitea-btn:hover {
-        background: rgba(166, 227, 161, 0.1);
+        background: var(--success-tint);
       }
 
 
       .ide-spinner {
         width: 12px;
         height: 12px;
-        border: 2px solid rgba(137, 180, 250, 0.3);
-        border-top-color: #89b4fa;
+        border: 2px solid var(--info-tint);
+        border-top-color: var(--info);
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
       }
@@ -868,9 +868,9 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .empty-state-text {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-size: 14px;
-        scrollbar-color: var(--border-color, #313244) transparent;
+        scrollbar-color: var(--border-color, var(--surface-0)) transparent;
       }
 
       .startup-spinner-container {
@@ -883,14 +883,14 @@ const CATEGORY_LABELS: Record<string, string> = {
       .startup-spinner {
         width: 32px;
         height: 32px;
-        border: 3px solid var(--border-color, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
+        border: 3px solid var(--border-color, var(--surface-0));
+        border-top-color: var(--accent-color, var(--accent-color));
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
       }
 
       .startup-label {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-size: 13px;
       }
 
@@ -917,19 +917,19 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         justify-content: center;
         flex-shrink: 0;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .message-user .avatar {
-        background: var(--accent-color, #cba6f7);
+        background: var(--accent-color, var(--accent-color));
       }
 
       .avatar-icon {
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       .message-user .avatar-icon {
-        color: var(--timeline-bg, #11111b);
+        color: var(--timeline-bg, var(--timeline-bg));
       }
 
       .message-body {
@@ -941,14 +941,14 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-user .message-body {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        background: var(--accent-color, var(--accent-color));
+        color: var(--timeline-bg, var(--timeline-bg));
         border-bottom-right-radius: 4px;
       }
 
       .message-assistant .message-body {
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
         border-bottom-left-radius: 4px;
       }
 
@@ -964,9 +964,9 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         padding: 4px 12px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 6px;
         width: fit-content;
         margin: 0 auto;
@@ -1001,11 +1001,11 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 6px;
         padding: 2px 8px 2px 40px;  /* indent to align with message body (avatar 30px + gap 10px) */
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .tool-only-icon {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .tool-only-label {
@@ -1026,7 +1026,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 4px 8px;
         cursor: pointer;
         border-radius: 6px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         transition: background 0.15s;
         list-style: none;
       }
@@ -1051,10 +1051,10 @@ const CATEGORY_LABELS: Record<string, string> = {
         flex-shrink: 0;
       }
 
-      .tool-summary-dot.completed { background: #a6e3a1; }
-      .tool-summary-dot.running { background: #f9e2af; animation: pulse 1s infinite; }
-      .tool-summary-dot.denied { background: #f38ba8; }
-      .tool-summary-dot.mixed { background: #f9e2af; }
+      .tool-summary-dot.completed { background: var(--success); }
+      .tool-summary-dot.running { background: var(--warning); animation: pulse 1s infinite; }
+      .tool-summary-dot.denied { background: var(--danger); }
+      .tool-summary-dot.mixed { background: var(--warning); }
 
       /* Tool detail list (level 2) */
 
@@ -1074,7 +1074,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 3px 8px;
         cursor: pointer;
         border-radius: 4px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         list-style: none;
       }
 
@@ -1083,14 +1083,14 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .tool-detail-name {
         font-family: 'JetBrains Mono', monospace;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         font-weight: 500;
       }
 
       .tool-detail-args {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1103,13 +1103,13 @@ const CATEGORY_LABELS: Record<string, string> = {
         margin-left: auto;
       }
 
-      .tool-detail-status.status-completed { color: #a6e3a1; }
-      .tool-detail-status.status-running { color: #f9e2af; }
-      .tool-detail-status.status-denied { color: #f38ba8; }
-      .tool-detail-status.status-pending { color: var(--text-muted, #6c7086); }
+      .tool-detail-status.status-completed { color: var(--success); }
+      .tool-detail-status.status-running { color: var(--warning); }
+      .tool-detail-status.status-denied { color: var(--danger); }
+      .tool-detail-status.status-pending { color: var(--text-muted, var(--text-muted)); }
 
       .tool-icon {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         width: 16px;
         text-align: center;
         flex-shrink: 0;
@@ -1118,7 +1118,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-preview {
         padding: 2px 8px 2px 28px;
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         opacity: 0.6;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1131,7 +1131,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-detail-result {
         margin: 4px 0 4px 8px;
         padding: 8px 10px;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         border-radius: 6px;
         font-size: 11px;
         max-height: 200px;
@@ -1140,7 +1140,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         word-break: break-word;
         font-family: 'JetBrains Mono', monospace;
         line-height: 1.4;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       /* Inline tool progress (streaming) */
@@ -1151,15 +1151,15 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 8px;
         padding: 4px 8px;
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         margin-top: 6px;
       }
 
       .tool-progress-spinner {
         width: 12px;
         height: 12px;
-        border: 2px solid var(--border-color, #313244);
-        border-top-color: #f9e2af;
+        border: 2px solid var(--border-color, var(--surface-0));
+        border-top-color: var(--warning);
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
         flex-shrink: 0;
@@ -1181,12 +1181,12 @@ const CATEGORY_LABELS: Record<string, string> = {
       .divider-line {
         flex: 1;
         height: 1px;
-        background: var(--border-color, #313244);
+        background: var(--border-color, var(--surface-0));
       }
 
       .divider-text {
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         text-transform: uppercase;
         letter-spacing: 0.5px;
         white-space: nowrap;
@@ -1200,7 +1200,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .thinking-block {
         margin: 4px 0 8px;
-        border-left: 2px solid var(--border, #45475a);
+        border-left: 2px solid var(--border, var(--surface-1));
         border-radius: 4px;
       }
 
@@ -1211,7 +1211,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 6px 10px;
         cursor: pointer;
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         list-style: none;
         user-select: none;
       }
@@ -1221,7 +1221,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .thinking-block > .thinking-header:hover {
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
 
@@ -1233,7 +1233,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 4px 10px 10px;
         font-size: 12px;
         line-height: 1.5;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         white-space: pre-wrap;
         max-height: 300px;
         overflow-y: auto;
@@ -1255,7 +1255,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         width: 6px;
         height: 6px;
         border-radius: 50%;
-        background: var(--text-muted, #6c7086);
+        background: var(--text-muted, var(--text-muted));
         animation: bounce 1.4s infinite ease-in-out;
       }
 
@@ -1273,10 +1273,10 @@ const CATEGORY_LABELS: Record<string, string> = {
       .permission-request {
         margin: 0 auto;
         width: 80%;
-        border: 1px solid #f9e2af;
+        border: 1px solid var(--warning);
         border-radius: 8px;
         padding: 12px;
-        background: rgba(249, 226, 175, 0.05);
+        background: var(--warning-tint);
       }
 
       .perm-header {
@@ -1285,21 +1285,21 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 6px;
         font-size: 13px;
         font-weight: 600;
-        color: #f9e2af;
+        color: var(--warning);
         margin-bottom: 8px;
       }
 
-      .perm-header .perm-icon { color: #f9e2af; }
+      .perm-header .perm-icon { color: var(--warning); }
 
       .perm-body {
         font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       .perm-args {
         margin: 4px 0 8px;
         padding: 6px 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 4px;
         font-size: 11px;
         max-height: 120px;
@@ -1318,17 +1318,17 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         padding: 8px 16px;
-        background: rgba(243, 139, 168, 0.1);
-        border-top: 1px solid #f38ba8;
+        background: var(--danger-tint);
+        border-top: 1px solid var(--danger);
         font-size: 12px;
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .error-dismiss {
         margin-left: auto;
         background: transparent;
         border: none;
-        color: #f38ba8;
+        color: var(--danger);
         font-size: 11px;
         cursor: pointer;
         font-family: inherit;
@@ -1339,7 +1339,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .input-area {
         padding: 12px 16px 16px;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         flex-shrink: 0;
       }
 
@@ -1350,14 +1350,14 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 8px;
         padding: 8px 8px 8px 16px;
         border-radius: 20px;
-        border: 1px solid var(--border-color, #313244);
-        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
+        background: var(--surface-0, var(--surface-0));
         transition: border-color 0.2s ease, box-shadow 0.2s ease;
       }
 
       .input-card.focused {
-        border-color: var(--accent-color, #cba6f7);
-        box-shadow: 0 0 0 1px rgba(203, 166, 247, 0.15);
+        border-color: var(--accent-color, var(--accent-color));
+        box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .chat-input {
@@ -1365,7 +1365,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 6px 0;
         border: none;
         background: transparent;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 14px;
         font-family: inherit;
         resize: none;
@@ -1388,7 +1388,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .chat-input::placeholder {
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       /* Action button — send / stop / spinner in one spot */
@@ -1401,8 +1401,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         height: 36px;
         border-radius: 50%;
         border: none;
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        background: var(--accent-color, var(--accent-color));
+        color: var(--timeline-bg, var(--timeline-bg));
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.15s ease, opacity 0.15s ease;
@@ -1414,7 +1414,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .action-btn.stop {
-        background: #f38ba8;
+        background: var(--danger);
         opacity: 1;
       }
 
@@ -1425,14 +1425,14 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .action-btn.interrupting {
-        background: #f38ba8;
+        background: var(--danger);
       }
 
 
       .action-spinner {
         width: 16px;
         height: 16px;
-        border: 2px solid var(--timeline-bg, #11111b);
+        border: 2px solid var(--timeline-bg, var(--timeline-bg));
         border-top-color: transparent;
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
@@ -1450,8 +1450,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         left: 0;
         right: 0;
         margin-bottom: 8px;
-        background: var(--panel-bg, #181825);
-        border: 1px solid var(--border-color, #313244);
+        background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 12px;
         padding: 4px;
         box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
@@ -1469,32 +1469,32 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .slash-item:hover, .slash-item.selected {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .slash-cmd {
         font-weight: 600;
         font-size: 13px;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         min-width: 100px;
       }
 
       .slash-desc {
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       /* Markdown content styling */
 
       .message-body ::ng-deep pre {
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         border-radius: 8px;
         padding: 12px 16px;
         overflow-x: auto;
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
         line-height: 1.5;
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
         margin: 8px 0;
       }
 
@@ -1507,8 +1507,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         position: absolute;
         top: 6px;
         right: 6px;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 4px;
         padding: 2px 4px;
         cursor: pointer;
@@ -1526,11 +1526,11 @@ const CATEGORY_LABELS: Record<string, string> = {
       .message-body ::ng-deep .code-copy-icon {
         font-family: 'Material Symbols Outlined';
         font-size: 14px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .message-body ::ng-deep code {
-        background: rgba(203, 166, 247, 0.12);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
         padding: 1px 5px;
         border-radius: 4px;
         font-family: 'JetBrains Mono', monospace;
@@ -1539,7 +1539,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       /* Collapsible code blocks */
       .message-body ::ng-deep .code-collapse {
-        border: 1px solid var(--border-color, #313244);
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 8px;
         margin: 8px 0;
         overflow: hidden;
@@ -1560,10 +1560,10 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 6px;
         padding: 6px 12px;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         cursor: pointer;
         font-size: 12px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         user-select: none;
         list-style: none;
       }
@@ -1575,13 +1575,13 @@ const CATEGORY_LABELS: Record<string, string> = {
       .message-body ::ng-deep .code-collapse-icon {
         font-family: 'Material Symbols Outlined';
         font-size: 16px;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
       }
 
       .message-body ::ng-deep .code-collapse-label {
         font-family: 'JetBrains Mono', monospace;
         font-weight: 600;
-        color: var(--text-color, #cdd6f4);
+        color: var(--text-color, var(--text-primary));
       }
 
       .message-body ::ng-deep .code-collapse-hint {
@@ -1604,13 +1604,13 @@ const CATEGORY_LABELS: Record<string, string> = {
       .message-body ::ng-deep th,
       .message-body ::ng-deep td {
         padding: 6px 12px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         text-align: left;
       }
 
       .message-body ::ng-deep th {
         font-weight: 600;
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
@@ -1621,7 +1621,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-body ::ng-deep a {
-        color: #89b4fa;
+        color: var(--info);
         text-decoration: none;
       }
 
@@ -1630,10 +1630,10 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-body ::ng-deep blockquote {
-        border-left: 3px solid var(--accent-color, #cba6f7);
+        border-left: 3px solid var(--accent-color, var(--accent-color));
         margin: 8px 0;
         padding: 4px 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       .message-body ::ng-deep ul,
@@ -1661,7 +1661,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-body ::ng-deep .citation-web {
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
         text-decoration: underline dotted;
         text-underline-offset: 2px;
       }
@@ -1671,10 +1671,10 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-body ::ng-deep .citation-doc {
-        color: #89b4fa;
+        color: var(--info);
         font-style: italic;
         cursor: help;
-        border-bottom: 1px dashed #89b4fa;
+        border-bottom: 1px dashed var(--info);
       }
 
       @media (max-width: 768px) {

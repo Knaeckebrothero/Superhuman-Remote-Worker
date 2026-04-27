@@ -1,12 +1,26 @@
 import {computed, effect, inject, Injectable, PLATFORM_ID, signal} from '@angular/core';
 import {isPlatformBrowser} from '@angular/common';
 
-export type ThemePreference = 'dark' | 'light' | 'system';
-export type ResolvedTheme = 'dark' | 'light';
+/** Concrete theme keys — each maps to a body class `theme-<key>`. */
+export type ConcreteTheme = 'travertine' | 'senate' | 'praetorian';
+
+/** What the user picked. `system` follows OS dark/light preference. */
+export type ThemePreference = ConcreteTheme | 'system';
+
+/** Effective theme that's actually applied to <body>. */
+export type ResolvedTheme = ConcreteTheme;
 
 const STORAGE_KEY = 'cockpit:theme';
-const BODY_CLASS_DARK = 'theme-dark';
-const BODY_CLASS_LIGHT = 'theme-light';
+const VALID_PREFERENCES: ReadonlySet<ThemePreference> = new Set<ThemePreference>([
+  'travertine', 'senate', 'praetorian', 'system',
+]);
+
+// Legacy keys (Catppuccin era) → Roman replacements. Old localStorage values
+// are silently rewritten on first read so users keep a sensible look.
+const LEGACY_MIGRATIONS: Record<string, ThemePreference> = {
+  dark: 'senate',
+  light: 'travertine',
+};
 
 /**
  * Owns appearance-theme resolution and propagation.
@@ -15,7 +29,8 @@ const BODY_CLASS_LIGHT = 'theme-light';
  * users often want different themes on different devices (laptop vs phone) and
  * the body class is needed before the API responds for first paint.
  *
- * Resolution: stored preference → 'system' (which follows prefers-color-scheme).
+ * Resolution: stored preference → 'system' (which follows prefers-color-scheme,
+ * mapping to senate/travertine).
  * `setPreference` is the only mutation entry point; the body class swap happens
  * via an effect, so it stays in lockstep with the resolved signal.
  */
@@ -32,9 +47,8 @@ export class ThemeService {
   /** Effective theme that's actually applied to <body>. */
   readonly resolved = computed<ResolvedTheme>(() => {
     const pref = this.preference();
-    if (pref === 'dark') return 'dark';
-    if (pref === 'light') return 'light';
-    return this.systemPrefersDark() ? 'dark' : 'light';
+    if (pref === 'system') return this.systemPrefersDark() ? 'senate' : 'travertine';
+    return pref;
   });
 
   constructor() {
@@ -74,14 +88,25 @@ export class ThemeService {
   }
 
   private readStoredPreference(): ThemePreference {
-    if (!this.isBrowser) return 'dark';
+    if (!this.isBrowser) return 'senate';
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw === 'dark' || raw === 'light' || raw === 'system') return raw;
+      if (!raw) return 'senate';
+      // Migrate legacy Catppuccin keys in-place so subsequent reads stay quiet.
+      if (raw in LEGACY_MIGRATIONS) {
+        const migrated = LEGACY_MIGRATIONS[raw];
+        try {
+          window.localStorage.setItem(STORAGE_KEY, migrated);
+        } catch {
+          // ignore — migration is best-effort
+        }
+        return migrated;
+      }
+      if (VALID_PREFERENCES.has(raw as ThemePreference)) return raw as ThemePreference;
     } catch {
       // ignore
     }
-    return 'dark';
+    return 'senate';
   }
 
   private readSystemPrefersDark(): boolean {
@@ -92,12 +117,12 @@ export class ThemeService {
   private applyBodyClass(theme: ResolvedTheme): void {
     if (!this.isBrowser) return;
     const body = document.body;
-    if (theme === 'dark') {
-      body.classList.add(BODY_CLASS_DARK);
-      body.classList.remove(BODY_CLASS_LIGHT);
-    } else {
-      body.classList.add(BODY_CLASS_LIGHT);
-      body.classList.remove(BODY_CLASS_DARK);
-    }
+    // Strip every existing theme-* class then add the active one.
+    const toRemove: string[] = [];
+    body.classList.forEach((c) => {
+      if (c.startsWith('theme-')) toRemove.push(c);
+    });
+    toRemove.forEach((c) => body.classList.remove(c));
+    body.classList.add(`theme-${theme}`);
   }
 }

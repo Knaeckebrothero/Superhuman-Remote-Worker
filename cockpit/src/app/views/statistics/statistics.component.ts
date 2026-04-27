@@ -157,7 +157,7 @@ import {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       /* Header */
@@ -167,27 +167,27 @@ import {
         justify-content: space-between;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .refresh-btn {
         padding: 5px 12px;
-        border: 1px solid var(--border-color, #45475a);
+        border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 4px;
         background: transparent;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         font-size: 11px;
         cursor: pointer;
       }
 
       .refresh-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       /* Content */
@@ -201,7 +201,7 @@ import {
       .stats-section {
         margin-bottom: 20px;
         padding: 12px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 8px;
       }
 
@@ -209,7 +209,7 @@ import {
         margin: 0 0 12px 0;
         font-size: 13px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         display: flex;
         align-items: center;
         gap: 8px;
@@ -218,8 +218,8 @@ import {
       .alert-badge {
         padding: 2px 8px;
         border-radius: 10px;
-        background: #f38ba8;
-        color: var(--timeline-bg, #11111b);
+        background: var(--danger);
+        color: var(--timeline-bg, var(--timeline-bg));
         font-size: 11px;
         font-weight: 600;
       }
@@ -227,7 +227,7 @@ import {
       .loading-placeholder {
         padding: 20px;
         text-align: center;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         font-size: 12px;
       }
 
@@ -249,7 +249,7 @@ import {
         display: block;
         font-size: 24px;
         font-weight: 700;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-family: 'JetBrains Mono', monospace;
       }
 
@@ -257,20 +257,20 @@ import {
         display: block;
         margin-top: 4px;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         text-transform: uppercase;
       }
 
       /* Status Colors */
-      .metric-card.status-created .metric-value { color: #89b4fa; }
-      .metric-card.status-processing .metric-value { color: #f9e2af; }
-      .metric-card.status-completed .metric-value { color: #a6e3a1; }
-      .metric-card.status-failed .metric-value { color: #f38ba8; }
-      .metric-card.status-cancelled .metric-value { color: #6c7086; }
+      .metric-card.status-created .metric-value { color: var(--info); }
+      .metric-card.status-processing .metric-value { color: var(--warning); }
+      .metric-card.status-completed .metric-value { color: var(--success); }
+      .metric-card.status-failed .metric-value { color: var(--danger); }
+      .metric-card.status-cancelled .metric-value { color: var(--text-muted); }
 
-      .metric-card.agent-ready .metric-value { color: #a6e3a1; }
-      .metric-card.agent-working .metric-value { color: #f9e2af; }
-      .metric-card.agent-offline .metric-value { color: #6c7086; }
+      .metric-card.agent-ready .metric-value { color: var(--success); }
+      .metric-card.agent-working .metric-value { color: var(--warning); }
+      .metric-card.agent-offline .metric-value { color: var(--text-muted); }
 
       /* Daily Table */
       .daily-table {
@@ -280,9 +280,9 @@ import {
       .daily-header {
         display: flex;
         padding: 8px 0;
-        border-bottom: 1px solid var(--border-color, #45475a);
+        border-bottom: 1px solid var(--border-color, var(--surface-1));
         font-weight: 500;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
         text-transform: uppercase;
         font-size: 10px;
       }
@@ -290,8 +290,8 @@ import {
       .daily-row {
         display: flex;
         padding: 8px 0;
-        border-bottom: 1px solid var(--border-color, #313244);
-        color: var(--text-primary, #cdd6f4);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
       }
 
       .daily-row:last-child {
@@ -308,9 +308,9 @@ import {
         font-family: 'JetBrains Mono', monospace;
       }
 
-      .col-num.created { color: #89b4fa; }
-      .col-num.completed { color: #a6e3a1; }
-      .col-num.failed { color: #f38ba8; }
+      .col-num.created { color: var(--info); }
+      .col-num.completed { color: var(--success); }
+      .col-num.failed { color: var(--danger); }
 
       /* Stuck Jobs */
       .stuck-list {
@@ -321,8 +321,8 @@ import {
 
       .stuck-item {
         padding: 10px;
-        background: rgba(243, 139, 168, 0.1);
-        border: 1px solid rgba(243, 139, 168, 0.2);
+        background: var(--danger-tint);
+        border: 1px solid var(--danger-tint);
         border-radius: 6px;
       }
 
@@ -341,25 +341,25 @@ import {
       }
 
       .component-unknown {
-        background: rgba(108, 112, 134, 0.2);
-        color: #6c7086;
+        background: color-mix(in srgb, var(--text-muted) 25%, transparent);
+        color: var(--text-muted);
       }
 
       .stuck-id {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .stuck-reason {
         font-size: 12px;
-        color: #f38ba8;
+        color: var(--danger);
         margin-bottom: 4px;
       }
 
       .stuck-meta {
         font-size: 10px;
-        color: var(--text-muted, #6c7086);
+        color: var(--text-muted, var(--text-muted));
       }
 
       .no-stuck {
@@ -367,7 +367,7 @@ import {
         align-items: center;
         gap: 8px;
         padding: 16px;
-        color: #a6e3a1;
+        color: var(--success);
         font-size: 13px;
       }
 
