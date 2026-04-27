@@ -22,7 +22,7 @@ COPY cockpit/package.json cockpit/package-lock.json ./
 RUN npm ci
 
 # Copy source code
-COPY cockpit/tsconfig.json cockpit/tsconfig.app.json cockpit/angular.json ./
+COPY cockpit/tsconfig.json cockpit/tsconfig.app.json cockpit/angular.json cockpit/ngsw-config.json ./
 COPY cockpit/src/ ./src/
 COPY cockpit/public/ ./public/
 
