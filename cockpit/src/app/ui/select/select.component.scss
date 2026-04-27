@@ -44,21 +44,21 @@
   // --- Sizes (room for chevron on the right via padding-right) ---
   &[data-size='sm'] {
     height: 28px;
-    padding: 0 calc(v.$space-md + 12px) 0 v.$space-sm;
+    padding: 0 (v.$space-md + 12px) 0 v.$space-sm;
     font-size: v.$font-size-xs;
     border-radius: v.$radius-sm;
   }
 
   &[data-size='md'] {
     height: 36px;
-    padding: 0 calc(v.$space-lg + 4px) 0 v.$space-md;
+    padding: 0 (v.$space-lg + 4px) 0 v.$space-md;
     font-size: v.$font-size-sm;
     border-radius: v.$radius-md;
   }
 
   &[data-size='lg'] {
     height: 44px;
-    padding: 0 calc(v.$space-xl - 12px) 0 v.$space-lg;
+    padding: 0 (v.$space-xl - 12px) 0 v.$space-lg;
     font-size: v.$font-size-base;
     border-radius: v.$radius-md;
   }
