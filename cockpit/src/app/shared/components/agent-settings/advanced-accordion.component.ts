@@ -1,6 +1,7 @@
 import {Component, computed, effect, inject, input, output, signal} from '@angular/core';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe} from '@jsverse/transloco';
+import {AppIconComponent} from '../../../ui/icon';
 import {readConfigPath, resolveMatrixForModel, SettingsMode} from './agent-settings.types';
 import {getReasoningOptions} from './reasoning-options';
 import {UserService} from '../../../core/services/user.service';
@@ -12,13 +13,13 @@ import {UserService} from '../../../core/services/user.service';
 @Component({
   selector: 'app-advanced-accordion',
   standalone: true,
-    imports: [FormsModule, TranslocoPipe],
+    imports: [FormsModule, TranslocoPipe, AppIconComponent],
   template: `
     <div class="advanced-container">
       <!-- Inference Parameters -->
       <div class="accordion-section" [class.expanded]="expanded().has('inference')">
         <button type="button" class="accordion-header" (click)="toggleSection('inference')">
-          <span class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('inference') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.inference' | transloco }}
           @if (inferenceModifiedCount() > 0) {
             <span class="modified-badge">{{ inferenceModifiedCount() }}</span>
@@ -46,7 +47,7 @@ import {UserService} from '../../../core/services/user.service';
                       }
                     </select>
                     @if (strategicReasoning() !== null) {
-                      <button type="button" class="reset-btn" (click)="strategicReasoning.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="strategicReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                     }
                   </div>
                 </div>
@@ -62,7 +63,7 @@ import {UserService} from '../../../core/services/user.service';
                       [disabled]="disabled()">
                     <span class="slider-label">2</span>
                     @if (strategicTemperature() !== null) {
-                      <button type="button" class="reset-btn" (click)="strategicTemperature.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="strategicTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                     }
                   </div>
                 </div>
@@ -75,7 +76,7 @@ import {UserService} from '../../../core/services/user.service';
                     <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                   </label>
                   @if (strategicMultimodal() !== null) {
-                    <button type="button" class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="strategicMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -98,7 +99,7 @@ import {UserService} from '../../../core/services/user.service';
                       }
                     </select>
                     @if (tacticalReasoning() !== null) {
-                      <button type="button" class="reset-btn" (click)="tacticalReasoning.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="tacticalReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                     }
                   </div>
                 </div>
@@ -114,7 +115,7 @@ import {UserService} from '../../../core/services/user.service';
                       [disabled]="disabled()">
                     <span class="slider-label">2</span>
                     @if (tacticalTemperature() !== null) {
-                      <button type="button" class="reset-btn" (click)="tacticalTemperature.set(null); emitChange()">close</button>
+                      <button type="button" class="reset-btn" (click)="tacticalTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                     }
                   </div>
                 </div>
@@ -127,7 +128,7 @@ import {UserService} from '../../../core/services/user.service';
                     <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                   </label>
                   @if (tacticalMultimodal() !== null) {
-                    <button type="button" class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="tacticalMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -149,7 +150,7 @@ import {UserService} from '../../../core/services/user.service';
                     }
                   </select>
                   @if (sessionReasoning() !== null) {
-                    <button type="button" class="reset-btn" (click)="sessionReasoning.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="sessionReasoning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -165,7 +166,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()">
                   <span class="slider-label">2</span>
                   @if (sessionTemperature() !== null) {
-                    <button type="button" class="reset-btn" (click)="sessionTemperature.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="sessionTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -178,7 +179,7 @@ import {UserService} from '../../../core/services/user.service';
                   <span>{{ 'advanced.labels.multimodal' | transloco }}</span>
                 </label>
                 @if (sessionMultimodal() !== null) {
-                  <button type="button" class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="sessionMultimodal.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             }
@@ -194,7 +195,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()"
                     [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (topP() !== null) {
-                    <button type="button" class="reset-btn" (click)="topP.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="topP.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -207,7 +208,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()"
                     [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (topK() !== null) {
-                    <button type="button" class="reset-btn" (click)="topK.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="topK.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -220,7 +221,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()"
                     [placeholder]="'advanced.hints.autoPlaceholder' | transloco">
                   @if (maxOutputTokens() !== null) {
-                    <button type="button" class="reset-btn" (click)="maxOutputTokens.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="maxOutputTokens.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -233,7 +234,7 @@ import {UserService} from '../../../core/services/user.service';
                   <span>{{ 'advanced.labels.parallelToolCalls' | transloco }}</span>
                 </label>
                 @if (parallelToolCalls() !== null) {
-                  <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="parallelToolCalls.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -244,7 +245,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Limits & Safety -->
       <div class="accordion-section" [class.expanded]="expanded().has('limits')">
         <button type="button" class="accordion-header" (click)="toggleSection('limits')">
-          <span class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('limits') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.limits' | transloco }}
         </button>
         @if (expanded().has('limits')) {
@@ -257,7 +258,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="messageCountThreshold.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (messageCountThreshold() !== null) {
-                  <button type="button" class="reset-btn" (click)="messageCountThreshold.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="messageCountThreshold.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -269,7 +270,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="toolRetryCount.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (toolRetryCount() !== null) {
-                  <button type="button" class="reset-btn" (click)="toolRetryCount.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="toolRetryCount.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -281,7 +282,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="progressStallThreshold.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (progressStallThreshold() !== null) {
-                  <button type="button" class="reset-btn" (click)="progressStallThreshold.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="progressStallThreshold.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -293,7 +294,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="maxToolCallsPerPhase.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxToolCallsPerPhase() !== null) {
-                  <button type="button" class="reset-btn" (click)="maxToolCallsPerPhase.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxToolCallsPerPhase.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -304,7 +305,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Memory Tuning -->
       <div class="accordion-section" [class.expanded]="expanded().has('memory')">
         <button type="button" class="accordion-header" (click)="toggleSection('memory')">
-          <span class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('memory') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.memory' | transloco }}
         </button>
         @if (expanded().has('memory')) {
@@ -318,7 +319,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.memoryEnabled' | transloco }}</span>
               </label>
               @if (memoryEnabled() !== null) {
-                <button type="button" class="reset-btn" (click)="memoryEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="memoryEnabled.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             <div class="field-row" [class.modified]="memoryBudget() !== null">
@@ -329,7 +330,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="memoryBudget.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (memoryBudget() !== null) {
-                  <button type="button" class="reset-btn" (click)="memoryBudget.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="memoryBudget.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -340,7 +341,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Context Management -->
       <div class="accordion-section" [class.expanded]="expanded().has('context')">
         <button type="button" class="accordion-header" (click)="toggleSection('context')">
-          <span class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('context') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.context' | transloco }}
         </button>
         @if (expanded().has('context')) {
@@ -354,7 +355,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.compactOnArchive' | transloco }}</span>
               </label>
               @if (compactOnArchive() !== null) {
-                <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="compactOnArchive.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             <div class="field-row" [class.modified]="keepRecentToolResults() !== null">
@@ -365,7 +366,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="keepRecentToolResults.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (keepRecentToolResults() !== null) {
-                  <button type="button" class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="keepRecentToolResults.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -377,7 +378,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="keepRecentMessages.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (keepRecentMessages() !== null) {
-                  <button type="button" class="reset-btn" (click)="keepRecentMessages.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="keepRecentMessages.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -388,7 +389,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Workspace -->
       <div class="accordion-section" [class.expanded]="expanded().has('workspace')">
         <button type="button" class="accordion-header" (click)="toggleSection('workspace')">
-          <span class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('workspace') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.workspace' | transloco }}
         </button>
         @if (expanded().has('workspace')) {
@@ -406,7 +407,7 @@ import {UserService} from '../../../core/services/user.service';
                   }
                 </select>
                 @if (workspaceBackend() !== null) {
-                  <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="workspaceBackend.set(null); vmCpuCores.set(null); vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -419,7 +420,7 @@ import {UserService} from '../../../core/services/user.service';
                     (ngModelChange)="vmCpuCores.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (vmCpuCores() !== null) {
-                    <button type="button" class="reset-btn" (click)="vmCpuCores.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="vmCpuCores.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -431,7 +432,7 @@ import {UserService} from '../../../core/services/user.service';
                     (ngModelChange)="vmMemory.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (vmMemory() !== null) {
-                    <button type="button" class="reset-btn" (click)="vmMemory.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -444,7 +445,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="maxReadWords.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxReadWords() !== null) {
-                  <button type="button" class="reset-btn" (click)="maxReadWords.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxReadWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -456,7 +457,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="maxWriteWords.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (maxWriteWords() !== null) {
-                  <button type="button" class="reset-btn" (click)="maxWriteWords.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="maxWriteWords.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -469,7 +470,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.gitVersioning' | transloco }}</span>
               </label>
               @if (gitVersioning() !== null) {
-                <button type="button" class="reset-btn" (click)="gitVersioning.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="gitVersioning.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
           </div>
@@ -479,7 +480,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Shell -->
       <div class="accordion-section" [class.expanded]="expanded().has('shell')">
         <button type="button" class="accordion-header" (click)="toggleSection('shell')">
-          <span class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('shell') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.shell' | transloco }}
         </button>
         @if (expanded().has('shell')) {
@@ -495,7 +496,7 @@ import {UserService} from '../../../core/services/user.service';
                   <option value="persistent">{{ 'advanced.options.persistent' | transloco }}</option>
                 </select>
                 @if (shellMode() !== null) {
-                  <button type="button" class="reset-btn" (click)="shellMode.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="shellMode.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -508,7 +509,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.sandbox' | transloco }}</span>
               </label>
               @if (shellSandbox() !== null) {
-                <button type="button" class="reset-btn" (click)="shellSandbox.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="shellSandbox.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             <div class="field-row" [class.modified]="shellTimeout() !== null">
@@ -519,7 +520,7 @@ import {UserService} from '../../../core/services/user.service';
                   (ngModelChange)="shellTimeout.set($event); emitChange()"
                   [disabled]="disabled()">
                 @if (shellTimeout() !== null) {
-                  <button type="button" class="reset-btn" (click)="shellTimeout.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="shellTimeout.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -535,7 +536,7 @@ import {UserService} from '../../../core/services/user.service';
                   <option value="allow">{{ 'advanced.options.sudoAllow' | transloco }}</option>
                 </select>
                 @if (sudoAction() !== null) {
-                  <button type="button" class="reset-btn" (click)="sudoAction.set(null); emitChange()">close</button>
+                  <button type="button" class="reset-btn" (click)="sudoAction.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                 }
               </div>
             </div>
@@ -546,7 +547,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Research & Browser -->
       <div class="accordion-section" [class.expanded]="expanded().has('research')">
         <button type="button" class="accordion-header" (click)="toggleSection('research')">
-          <span class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('research') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.research' | transloco }}
         </button>
         @if (expanded().has('research')) {
@@ -560,7 +561,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.proxyEnabled' | transloco }}</span>
               </label>
               @if (proxyEnabled() !== null) {
-                <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="proxyEnabled.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             <div class="field-row toggle-row" [class.modified]="browserHeadless() !== null">
@@ -572,7 +573,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.browserHeadless' | transloco }}</span>
               </label>
               @if (browserHeadless() !== null) {
-                <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="browserHeadless.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             <div class="field-row toggle-row" [class.modified]="browserVision() !== null">
@@ -584,7 +585,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.browserVision' | transloco }}</span>
               </label>
               @if (browserVision() !== null) {
-                <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="browserVision.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
           </div>
@@ -594,7 +595,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Auxiliary LLM -->
       <div class="accordion-section" [class.expanded]="expanded().has('auxiliary')">
         <button type="button" class="accordion-header" (click)="toggleSection('auxiliary')">
-          <span class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ expanded().has('auxiliary') ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.auxiliary' | transloco }}
         </button>
         @if (expanded().has('auxiliary')) {
@@ -608,7 +609,7 @@ import {UserService} from '../../../core/services/user.service';
                 <span>{{ 'advanced.labels.auxEnabled' | transloco }}</span>
               </label>
               @if (auxEnabled() !== null) {
-                <button type="button" class="reset-btn" (click)="auxEnabled.set(null); emitChange()">close</button>
+                <button type="button" class="reset-btn" (click)="auxEnabled.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
               }
             </div>
             @if (effectiveAuxEnabled()) {
@@ -621,7 +622,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()"
                     placeholder="RedHatAI/gemma-4-31B-it-FP8-Dynamic">
                   @if (auxModel() !== null) {
-                    <button type="button" class="reset-btn" (click)="auxModel.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="auxModel.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -637,7 +638,7 @@ import {UserService} from '../../../core/services/user.service';
                     [disabled]="disabled()">
                   <span class="slider-label">2</span>
                   @if (auxTemperature() !== null) {
-                    <button type="button" class="reset-btn" (click)="auxTemperature.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="auxTemperature.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -650,7 +651,7 @@ import {UserService} from '../../../core/services/user.service';
       @if (mode() === 'session') {
         <div class="accordion-section" [class.expanded]="expanded().has('session')">
           <button type="button" class="accordion-header" (click)="toggleSection('session')">
-            <span class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</span>
+            <app-icon size="md" class="accordion-icon">{{ expanded().has('session') ? 'expand_less' : 'expand_more' }}</app-icon>
             {{ 'advanced.sections.session' | transloco }}
           </button>
           @if (expanded().has('session')) {
@@ -663,7 +664,7 @@ import {UserService} from '../../../core/services/user.service';
                     (ngModelChange)="idleTimeout.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (idleTimeout() !== null) {
-                    <button type="button" class="reset-btn" (click)="idleTimeout.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="idleTimeout.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
                 <span class="field-hint">{{ 'advanced.hints.idleDisabled' | transloco }}</span>
@@ -676,7 +677,7 @@ import {UserService} from '../../../core/services/user.service';
                     (ngModelChange)="greeting.set($event); emitChange()"
                     [disabled]="disabled()">
                   @if (greeting() !== null) {
-                    <button type="button" class="reset-btn" (click)="greeting.set(null); emitChange()">close</button>
+                    <button type="button" class="reset-btn" (click)="greeting.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
               </div>
@@ -688,7 +689,7 @@ import {UserService} from '../../../core/services/user.service';
       <!-- Resolved Config Viewer -->
       <div class="config-viewer-section">
         <button type="button" class="accordion-header" (click)="showResolvedConfig.set(!showResolvedConfig())">
-          <span class="accordion-icon">{{ showResolvedConfig() ? 'expand_less' : 'expand_more' }}</span>
+          <app-icon size="md" class="accordion-icon">{{ showResolvedConfig() ? 'expand_less' : 'expand_more' }}</app-icon>
           {{ 'advanced.sections.viewResolvedConfig' | transloco }}
         </button>
         @if (showResolvedConfig()) {
@@ -732,8 +733,6 @@ import {UserService} from '../../../core/services/user.service';
       background: rgba(255, 255, 255, 0.05);
     }
     .accordion-icon {
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 18px;
       color: var(--text-muted, #6c7086);
     }
     .modified-badge {
@@ -860,14 +859,12 @@ import {UserService} from '../../../core/services/user.service';
       border-radius: 50%;
       background: rgba(255, 255, 255, 0.08);
       color: var(--text-muted, #6c7086);
-      font-family: 'Material Symbols Outlined', sans-serif;
-      font-size: 14px;
       cursor: pointer;
       flex-shrink: 0;
     }
     .reset-btn:hover {
-      background: rgba(243, 139, 168, 0.2);
-      color: #f38ba8;
+      background: var(--danger-tint);
+      color: var(--danger);
     }
     .config-viewer-section {
       margin-top: 12px;

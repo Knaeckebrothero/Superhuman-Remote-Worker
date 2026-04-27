@@ -7,6 +7,11 @@ import {JobArtifactService, PendingWorkspaceEdit} from '../../../core/services/j
 import {BuilderSession, BuilderStreamService} from '../../../core/services/builder-stream.service';
 import {ApiService} from '../../../core/services/api.service';
 import {UserService} from '../../../core/services/user.service';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppIconComponent} from '../../../ui/icon';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 type BuilderStepStatus = 'active' | 'complete';
 
@@ -25,12 +30,22 @@ interface ChatMessage {
 @Component({
   selector: 'app-instruction-builder',
   standalone: true,
-  imports: [FormsModule, MarkdownComponent, AgentStepsComponent, TranslocoPipe],
+  imports: [
+    FormsModule,
+    MarkdownComponent,
+    AgentStepsComponent,
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppIconComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="builder-container">
       @if (!artifacts.sessionId()) {
         <div class="empty-state">
-          <span class="empty-icon">smart_toy</span>
+          <app-icon size="inherit" class="empty-icon">smart_toy</app-icon>
           <span class="empty-title">{{ 'builder.empty.title' | transloco }}</span>
           <span class="empty-desc">
             {{ 'builder.empty.desc' | transloco }}
@@ -44,7 +59,7 @@ interface ChatMessage {
           @for (msg of messages(); track $index) {
             <div class="message" [class]="'message-' + msg.role">
               <div class="message-avatar">
-                {{ msg.role === 'user' ? 'person' : 'smart_toy' }}
+                <app-icon size="sm">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</app-icon>
               </div>
               <div class="message-body">
                 @if (msg.steps && msg.steps.length > 0) {
@@ -62,7 +77,7 @@ interface ChatMessage {
                   <div class="tool-calls">
                     @for (tc of msg.toolCalls; track $index) {
                       <div class="tool-call-chip">
-                        <span class="tool-call-icon">build</span>
+                        <app-icon size="sm" class="tool-call-icon">build</app-icon>
                         <span class="tool-call-name">{{ formatToolName(tc.tool) }}</span>
                       </div>
                     }
@@ -74,7 +89,7 @@ interface ChatMessage {
 
           @if (streamingText() || streamingSteps().length > 0) {
             <div class="message message-assistant">
-              <div class="message-avatar">smart_toy</div>
+              <div class="message-avatar"><app-icon size="sm">smart_toy</app-icon></div>
               <div class="message-body">
                 @if (streamingSteps().length > 0) {
                   <app-agent-steps
@@ -95,12 +110,12 @@ interface ChatMessage {
           @for (edit of pendingEdits(); track edit.id) {
             <div class="workspace-proposal-card">
               <div class="proposal-header">
-                <span class="proposal-icon">edit_note</span>
+                <app-icon size="md" class="proposal-icon">edit_note</app-icon>
                 <span class="proposal-title">
                   {{ (edit.proposal.operation === 'write' ? 'builder.proposal.write' : 'builder.proposal.edit') | transloco }}:
                   <code>{{ edit.proposal.path }}</code>
                 </span>
-                <span class="proposal-badge" [class]="'badge-' + edit.status">{{ edit.status }}</span>
+                <app-badge [tone]="proposalStatusTone(edit.status)" size="xs" [uppercase]="true">{{ edit.status }}</app-badge>
               </div>
               @if (edit.status === 'pending') {
                 <div class="proposal-diff">
@@ -127,12 +142,12 @@ interface ChatMessage {
                   }
                 </div>
                 <div class="proposal-actions">
-                  <button type="button" class="proposal-btn apply-btn" (click)="applyWorkspaceEdit(edit)">
-                    <span class="btn-icon">check</span> {{ 'builder.proposal.apply' | transloco }}
-                  </button>
-                  <button type="button" class="proposal-btn dismiss-btn-ws" (click)="dismissWorkspaceEdit(edit)">
-                    <span class="btn-icon">close</span> {{ 'builder.proposal.dismiss' | transloco }}
-                  </button>
+                  <app-button variant="success" size="sm" (clicked)="applyWorkspaceEdit(edit)">
+                    <app-icon size="sm" class="btn-icon">check</app-icon> {{ 'builder.proposal.apply' | transloco }}
+                  </app-button>
+                  <app-button variant="ghost" size="sm" (clicked)="dismissWorkspaceEdit(edit)">
+                    <app-icon size="sm" class="btn-icon">close</app-icon> {{ 'builder.proposal.dismiss' | transloco }}
+                  </app-button>
                 </div>
               }
             </div>
@@ -142,14 +157,14 @@ interface ChatMessage {
 
       @if (isCreatingSession()) {
         <div class="session-loading">
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
           {{ 'builder.session.starting' | transloco }}
         </div>
       }
 
       @if (isRestoringSession()) {
         <div class="session-loading">
-          <span class="spinner-small"></span>
+          <app-spinner size="sm" />
           {{ 'builder.session.restoring' | transloco }}
         </div>
       }
@@ -160,9 +175,11 @@ interface ChatMessage {
             <span class="error-text">{{ error() }}</span>
             <div class="error-actions">
               @if (lastFailedMessage()) {
-                <button type="button" class="retry-btn" (click)="retryLastMessage()">{{ 'builder.input.retry' | transloco }}</button>
+                <app-button variant="danger" size="sm" (clicked)="retryLastMessage()">{{ 'builder.input.retry' | transloco }}</app-button>
               }
-              <button type="button" class="dismiss-btn" (click)="dismissError()">close</button>
+              <app-icon-button variant="ghost" size="sm" ariaLabel="Dismiss error" (clicked)="dismissError()">
+                <app-icon size="sm" class="error-dismiss-icon">close</app-icon>
+              </app-icon-button>
             </div>
           </div>
         }
@@ -178,21 +195,25 @@ interface ChatMessage {
             rows="1"
           ></textarea>
           @if (artifacts.streaming()) {
-            <button type="button"
-              class="stop-btn"
-              (click)="stopStreaming()"
-              [title]="'builder.input.stopTitle' | transloco"
+            <app-icon-button
+              variant="danger"
+              size="lg"
+              ariaLabel="Stop streaming"
+              [tooltip]="'builder.input.stopTitle' | transloco"
+              (clicked)="stopStreaming()"
             >
-              stop
-            </button>
+              <app-icon size="sm" class="input-action-icon">stop</app-icon>
+            </app-icon-button>
           } @else {
-            <button type="button"
-              class="send-btn"
-              (click)="sendMessage()"
+            <app-icon-button
+              variant="primary"
+              size="lg"
+              ariaLabel="Send message"
               [disabled]="!inputText.trim() || isCreatingSession()"
+              (clicked)="sendMessage()"
             >
-              send
-            </button>
+              <app-icon size="sm" class="input-action-icon">send</app-icon>
+            </app-icon-button>
           }
         </div>
       </div>
@@ -227,7 +248,6 @@ interface ChatMessage {
       }
 
       .empty-icon {
-        font-family: 'Material Symbols Outlined';
         font-size: 48px;
         color: var(--text-muted, #6c7086);
         opacity: 0.5;
@@ -288,13 +308,11 @@ interface ChatMessage {
         display: flex;
         align-items: center;
         justify-content: center;
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
       }
 
       .message-user .message-avatar {
-        background: rgba(137, 180, 250, 0.15);
-        color: #89b4fa;
+        background: var(--info-tint);
+        color: var(--info);
       }
 
       .message-assistant .message-avatar {
@@ -359,16 +377,12 @@ interface ChatMessage {
         gap: 4px;
         padding: 3px 8px;
         border-radius: 4px;
-        background: rgba(166, 227, 161, 0.1);
-        border: 1px solid rgba(166, 227, 161, 0.2);
+        background: var(--success-tint);
+        border: 1px solid var(--success-tint);
         font-size: 11px;
-        color: #a6e3a1;
+        color: var(--success);
       }
 
-      .tool-call-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 13px;
-      }
 
       /* Inspection result rendering */
       .inspection-content {
@@ -414,10 +428,10 @@ interface ChatMessage {
         padding: 6px 10px;
         margin-bottom: 8px;
         border-radius: 6px;
-        background: rgba(243, 139, 168, 0.12);
-        border: 1px solid rgba(243, 139, 168, 0.2);
+        background: var(--danger-tint);
+        border: 1px solid var(--danger-tint);
         font-size: 12px;
-        color: #f38ba8;
+        color: var(--danger);
       }
 
       .error-text {
@@ -432,36 +446,6 @@ interface ChatMessage {
         flex-shrink: 0;
       }
 
-      .retry-btn {
-        padding: 3px 8px;
-        border: 1px solid rgba(243, 139, 168, 0.3);
-        border-radius: 4px;
-        background: rgba(243, 139, 168, 0.1);
-        color: inherit;
-        font-size: 11px;
-        cursor: pointer;
-        white-space: nowrap;
-      }
-
-      .retry-btn:hover {
-        background: rgba(243, 139, 168, 0.2);
-      }
-
-      .dismiss-btn {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        padding: 2px;
-        border: none;
-        border-radius: 4px;
-        background: transparent;
-        color: inherit;
-        cursor: pointer;
-        line-height: 1;
-      }
-
-      .dismiss-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
-      }
 
       .input-row {
         display: flex;
@@ -498,66 +482,7 @@ interface ChatMessage {
         color: var(--text-muted, #6c7086);
       }
 
-      .send-btn {
-        flex-shrink: 0;
-        width: 40px;
-        height: 40px;
-        border: none;
-        border-radius: 8px;
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: all 0.15s ease;
-      }
 
-      .send-btn:hover:not(:disabled) {
-        filter: brightness(1.1);
-      }
-
-      .send-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .stop-btn {
-        flex-shrink: 0;
-        width: 40px;
-        height: 40px;
-        border: none;
-        border-radius: 8px;
-        background: rgba(243, 139, 168, 0.2);
-        color: #f38ba8;
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: all 0.15s ease;
-      }
-
-      .stop-btn:hover {
-        background: rgba(243, 139, 168, 0.35);
-      }
-
-      .spinner-small {
-        width: 14px;
-        height: 14px;
-        border: 2px solid rgba(167, 139, 250, 0.2);
-        border-top-color: #a78bfa;
-        border-radius: 50%;
-        animation: spin 0.6s linear infinite;
-        flex-shrink: 0;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
 
       /* Markdown content styling */
       :host ::ng-deep .markdown-body {
@@ -796,15 +721,13 @@ interface ChatMessage {
         align-items: center;
         gap: 8px;
         padding: 10px 12px;
-        border-bottom: 1px solid rgba(250, 179, 135, 0.15);
+        border-bottom: 1px solid var(--alert-tint);
         font-size: 12px;
         font-weight: 600;
-        color: #fab387;
+        color: var(--alert);
       }
 
       .proposal-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
         flex-shrink: 0;
       }
 
@@ -821,30 +744,6 @@ interface ChatMessage {
         padding: 1px 5px;
         border-radius: 3px;
         font-size: 11px;
-      }
-
-      .proposal-badge {
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        padding: 2px 6px;
-        border-radius: 4px;
-        flex-shrink: 0;
-      }
-
-      .badge-pending {
-        background: rgba(250, 179, 135, 0.2);
-        color: #fab387;
-      }
-
-      .badge-approved {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .badge-dismissed {
-        background: rgba(108, 112, 134, 0.2);
-        color: #6c7086;
       }
 
       .proposal-diff {
@@ -872,17 +771,17 @@ interface ChatMessage {
       }
 
       .diff-remove .diff-label {
-        background: rgba(243, 139, 168, 0.12);
-        color: #f38ba8;
+        background: var(--danger-tint);
+        color: var(--danger);
       }
 
       .diff-add {
-        border: 1px solid rgba(166, 227, 161, 0.25);
+        border: 1px solid var(--success-tint);
       }
 
       .diff-add .diff-label {
-        background: rgba(166, 227, 161, 0.12);
-        color: #a6e3a1;
+        background: var(--success-tint);
+        color: var(--success);
       }
 
       .diff-content {
@@ -929,40 +828,9 @@ interface ChatMessage {
         border-top: 1px solid rgba(250, 179, 135, 0.15);
       }
 
-      .proposal-btn {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 5px 12px;
-        border: none;
-        border-radius: 6px;
-        font-size: 12px;
-        font-weight: 600;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .proposal-btn .btn-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
-
-      .apply-btn {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .apply-btn:hover {
-        background: rgba(166, 227, 161, 0.35);
-      }
-
-      .dismiss-btn-ws {
-        background: rgba(108, 112, 134, 0.15);
-        color: var(--text-muted, #6c7086);
-      }
-
-      .dismiss-btn-ws:hover {
-        background: rgba(108, 112, 134, 0.3);
+      .proposal-actions app-button .btn-icon {
+        margin-right: 4px;
+        vertical-align: middle;
       }
 
       /* Remove white-space:pre-wrap on markdown rendered content */
@@ -1250,6 +1118,19 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
 
   dismissWorkspaceEdit(edit: PendingWorkspaceEdit): void {
     this.artifacts.resolveWorkspaceEdit(edit.id, 'dismissed');
+  }
+
+  proposalStatusTone(status: string): BadgeTone {
+    switch (status) {
+      case 'pending':
+        return 'alert';
+      case 'approved':
+        return 'success';
+      case 'dismissed':
+        return 'neutral';
+      default:
+        return 'neutral';
+    }
   }
 
   /** Toggle the session dropdown (lazy-loads sessions on first open). */

@@ -8,7 +8,7 @@ import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from '../../../core/services/persistent-chat.service';
 import {ModelService} from '../../../core/services/model.service';
 import {SettingsService} from '../../../core/services/settings.service';
-import {ToastService} from '../../../core/services/toast.service';
+import {AppToastService} from '../../../ui/toast';
 import {ErrorMessageService} from '../../../core/services/error-message.service';
 import {UserService} from '../../../core/services/user.service';
 
@@ -33,9 +33,12 @@ function createComponent() {
 
     const mockToast: any = {
         show: vi.fn(),
+        info: vi.fn(),
         success: vi.fn(),
-        error: vi.fn(),
+        warning: vi.fn(),
+        danger: vi.fn(),
         dismiss: vi.fn(),
+        dismissAll: vi.fn(),
     };
 
     const mockUserService: any = {
@@ -72,7 +75,7 @@ function createComponent() {
             {provide: HttpClient, useValue: mockHttp},
             {provide: Router, useValue: mockRouter},
             {provide: PersistentChatService, useValue: mockChat},
-            {provide: ToastService, useValue: mockToast},
+            {provide: AppToastService, useValue: mockToast},
             {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
             {provide: UserService, useValue: mockUserService},
             {provide: SettingsService, useValue: mockSettings},

@@ -20,6 +20,10 @@ import {ModelService} from '../../../core/services/model.service';
 import {I18nService} from '../../../core/services/i18n.service';
 import {environment} from '../../../core/environment';
 import {SidebarToggleComponent} from '../../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppBadgeComponent} from '../../../ui/badge';
+import {AppSelectComponent} from '../../../ui/select';
+import {AppIconComponent} from '../../../ui/icon';
 
 interface SlashCommand {
     command: string;
@@ -145,7 +149,19 @@ const CATEGORY_LABELS: Record<string, string> = {
 @Component({
     selector: 'app-persistent-chat',
     standalone: true,
-    imports: [FormsModule, JsonPipe, TitleCasePipe, RouterLink, MarkdownComponent, SidebarToggleComponent, TranslocoPipe],
+    imports: [
+        FormsModule,
+        JsonPipe,
+        TitleCasePipe,
+        RouterLink,
+        MarkdownComponent,
+        SidebarToggleComponent,
+        TranslocoPipe,
+        AppButtonComponent,
+        AppBadgeComponent,
+        AppSelectComponent,
+        AppIconComponent,
+    ],
     template: `
     <div class="chat-container">
       <!-- Header -->
@@ -153,9 +169,9 @@ const CATEGORY_LABELS: Record<string, string> = {
         <div class="header-left">
           <app-sidebar-toggle />
           <a class="back-link" routerLink="/sessions">
-            <span class="back-icon">arrow_back</span>
+            <app-icon size="md" class="back-icon">arrow_back</app-icon>
           </a>
-          <span class="header-icon">smart_toy</span>
+          <app-icon size="md" class="header-icon">smart_toy</app-icon>
           <span class="header-title">{{ chat.sessionTitle() || ('chat.defaultTitle' | transloco) }}</span>
           @if (chat.threadId(); as tid) {
             <span class="header-session-id" title="Session ID">{{ tid.slice(0, 8) }}</span>
@@ -167,27 +183,27 @@ const CATEGORY_LABELS: Record<string, string> = {
           @if (chat.isConnected()) {
             <button class="settings-btn" (click)="showSettings.update(v => !v)"
                     [class.active]="showSettings()" [title]="'chat.header.settingsTooltip' | transloco">
-              <span class="settings-icon">tune</span>
+              <app-icon size="sm" class="settings-icon">tune</app-icon>
             </button>
           }
 
           @if (chat.isConnected()) {
             @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
               <button class="ide-btn" (click)="openSessionFiles()" [title]="'chat.header.filesTooltip' | transloco">
-                <span class="ide-icon">cloud</span>
+                <app-icon size="sm" class="ide-icon">cloud</app-icon>
                 {{ 'chat.header.filesButton' | transloco }}
               </button>
             }
             @if (ideStatus(); as ide) {
               @if (ide.gitea_url) {
                 <button class="ide-btn gitea-btn" (click)="openIde(ide.gitea_url!)" [title]="'chat.header.gitTooltip' | transloco">
-                  <span class="ide-icon">history</span>
+                  <app-icon size="sm" class="ide-icon">history</app-icon>
                   {{ 'chat.header.gitButton' | transloco }}
                 </button>
               }
               @if (ide.status === 'active' && ide.code_server_url) {
                 <button class="ide-btn" (click)="openIde(ide.code_server_url!)" [title]="'chat.header.ideActiveTooltip' | transloco">
-                  <span class="ide-icon">code</span>
+                  <app-icon size="sm" class="ide-icon">code</app-icon>
                   {{ 'chat.header.ideButton' | transloco }}
                 </button>
               } @else if (ide.status === 'restoring') {
@@ -197,9 +213,9 @@ const CATEGORY_LABELS: Record<string, string> = {
                 </button>
               }
             }
-            <button class="disconnect-btn" (click)="chat.disconnect()">
+            <app-button variant="ghost" size="sm" (clicked)="chat.disconnect()">
               {{ 'chat.header.disconnect' | transloco }}
-            </button>
+            </app-button>
           }
         </div>
       </div>
@@ -208,13 +224,13 @@ const CATEGORY_LABELS: Record<string, string> = {
       @if (chat.isConnected()) {
         <div class="status-bar">
           @if (chat.modelName()) {
-            <span class="status-chip model-chip">{{ chat.modelName() }}</span>
+            <app-badge tone="accent" size="sm">{{ chat.modelName() }}</app-badge>
           }
           @if (chat.temperature()) {
-            <span class="status-chip">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</span>
+            <app-badge tone="neutral" size="sm">{{ 'chat.status.temp' | transloco:{ value: chat.temperature() } }}</app-badge>
           }
-          <span class="status-chip turn-chip">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</span>
-          <span class="status-chip mode-chip">{{ chat.permissionMode() | titlecase }}</span>
+          <app-badge tone="neutral" size="sm">{{ 'chat.status.turn' | transloco:{ count: chat.turnCount() } }}</app-badge>
+          <app-badge tone="accent" size="sm">{{ chat.permissionMode() | titlecase }}</app-badge>
         </div>
       }
 
@@ -223,40 +239,40 @@ const CATEGORY_LABELS: Record<string, string> = {
         <div class="settings-panel">
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.mode' | transloco }}</label>
-            <select class="settings-select"
-                    [value]="chat.permissionMode()"
-                    (change)="onModeChange($event)">
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chat.permissionMode()"
+                        (changed)="onPermissionModeChange($event)">
               <option value="supervised">{{ 'chat.settings.modeSupervised' | transloco }}</option>
               <option value="auto_accept">{{ 'chat.settings.modeAutoAccept' | transloco }}</option>
               <option value="autonomous">{{ 'chat.settings.modeAutonomous' | transloco }}</option>
-            </select>
+            </app-select>
           </div>
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.narration' | transloco }}</label>
-            <select class="settings-select"
-                    [value]="chat.narrationMode()"
-                    (change)="onNarrationModeChange($event)">
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chat.narrationMode()"
+                        (changed)="onNarrationModeSelect($event)">
               <option value="auto">{{ 'chat.settings.narrationAuto' | transloco }}</option>
               <option value="verbose">{{ 'chat.settings.narrationVerbose' | transloco }}</option>
               <option value="silent">{{ 'chat.settings.narrationSilent' | transloco }}</option>
-            </select>
+            </app-select>
           </div>
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.model' | transloco }}</label>
-            <select class="settings-select"
-                    [ngModel]="chat.modelName()"
-                    (ngModelChange)="onModelChange($event)">
+            <app-select size="sm" [fullWidth]="false"
+                        [value]="chat.modelName()"
+                        (changed)="onModelSelect($event)">
               @if (chat.modelName() && !hasModelInList(chat.modelName()!)) {
-                <option [ngValue]="chat.modelName()">{{ chat.modelName() }}</option>
+                <option [value]="chat.modelName()">{{ chat.modelName() }}</option>
               }
               @for (group of modelService.models(); track group.group) {
                 <optgroup [label]="group.group">
                   @for (model of group.models; track model) {
-                    <option [ngValue]="model">{{ model }}</option>
+                    <option [value]="model">{{ model }}</option>
                   }
                 </optgroup>
               }
-            </select>
+            </app-select>
           </div>
           <div class="settings-row">
             <label class="settings-label">{{ 'chat.settings.temperature' | transloco:{ value: chat.temperature() } }}</label>
@@ -273,29 +289,29 @@ const CATEGORY_LABELS: Record<string, string> = {
           <div class="task-header"
                [class.task-header-clickable]="chat.tasks().length > 1"
                (click)="chat.tasks().length > 1 ? toggleTasksCollapsed() : null">
-            <span class="task-header-icon">checklist</span>
+            <app-icon size="sm" class="task-header-icon">checklist</app-icon>
             {{ 'chat.tasks.header' | transloco:{ done: completedTaskCount(), total: chat.tasks().length } }}
             @if (chat.tasks().length > 1) {
-              <span class="task-chevron" [class.task-chevron-open]="!tasksCollapsed()">expand_more</span>
+              <app-icon size="sm" class="task-chevron" [class.task-chevron-open]="!tasksCollapsed()">expand_more</app-icon>
             }
           </div>
           <div class="task-list">
             @if (chat.tasks().length <= 1 || !tasksCollapsed()) {
               @for (task of chat.tasks(); track task.id) {
                 <div class="task-item" [class.task-completed]="task.status === 'completed'">
-                  <span class="task-check">{{ task.status === 'completed' ? 'check_circle' : 'radio_button_unchecked' }}</span>
+                  <app-icon size="sm" class="task-check">{{ task.status === 'completed' ? 'check_circle' : 'radio_button_unchecked' }}</app-icon>
                   <span class="task-desc">{{ task.description }}</span>
                 </div>
               }
             } @else {
               @if (nextPendingTask(); as task) {
                 <div class="task-item">
-                  <span class="task-check">radio_button_unchecked</span>
+                  <app-icon size="sm" class="task-check">radio_button_unchecked</app-icon>
                   <span class="task-desc">{{ task.description }}</span>
                 </div>
               } @else {
                 <div class="task-item task-completed">
-                  <span class="task-check" style="color: #a6e3a1">check_circle</span>
+                  <app-icon size="sm" class="task-check" style="color: var(--success)">check_circle</app-icon>
                   <span class="task-desc">{{ 'chat.tasks.allCompleted' | transloco }}</span>
                 </div>
               }
@@ -312,24 +328,27 @@ const CATEGORY_LABELS: Record<string, string> = {
                [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length">
             @if (msg.role === 'system') {
               <div class="system-message">
-                <span class="system-icon">info</span>
+                <app-icon size="sm" class="system-icon">info</app-icon>
                 {{ msg.content }}
               </div>
               @if (chat.isSessionPaused() && $last) {
-                <button class="resume-btn" (click)="resumeSession()" [disabled]="isResuming()">
-                  @if (isResuming()) {
-                    <span class="resume-btn-spinner"></span>
-                    {{ 'chat.system.resuming' | transloco }}
-                  } @else {
-                    <span class="resume-icon">play_arrow</span>
-                    {{ 'chat.system.resumeSession' | transloco }}
-                  }
-                </button>
+                <div class="resume-btn-wrapper">
+                  <app-button variant="primary" size="sm"
+                              [loading]="isResuming()"
+                              (clicked)="resumeSession()">
+                    @if (isResuming()) {
+                      {{ 'chat.system.resuming' | transloco }}
+                    } @else {
+                      <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
+                      {{ 'chat.system.resumeSession' | transloco }}
+                    }
+                  </app-button>
+                </div>
               }
             } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
               <!-- Tool-only message: compact inline indicator -->
               <div class="tool-only-row">
-                <span class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</span>
+                <app-icon size="sm" class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</app-icon>
                 <span class="tool-only-label">
                   {{ toolSummaryLabel(msg.toolCalls!) }}
                 </span>
@@ -337,7 +356,7 @@ const CATEGORY_LABELS: Record<string, string> = {
               </div>
             } @else {
               <div class="avatar">
-                <span class="avatar-icon">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</span>
+                <app-icon size="sm" class="avatar-icon">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</app-icon>
               </div>
               <div class="message-body">
                 @if (msg.role === 'user') {
@@ -346,7 +365,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                   @if (msg.thinking && chat.narrationMode() !== 'silent') {
                     <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="thinking-header">
-                        <span class="thinking-icon">psychology</span>
+                        <app-icon size="sm" class="thinking-icon">psychology</app-icon>
                         <span class="thinking-label">{{ 'chat.thinking.past' | transloco }}</span>
                       </summary>
                       <div class="thinking-content">{{ msg.thinking }}</div>
@@ -358,7 +377,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                   @if (msg.toolCalls?.length) {
                     <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="tool-summary-line">
-                        <span class="tool-summary-chevron">chevron_right</span>
+                        <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
                         <span class="tool-summary-text">
                           {{ (msg.toolCalls!.length === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: msg.toolCalls!.length } }}
                           {{ toolSummaryLabel(msg.toolCalls!) }}
@@ -369,7 +388,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                         @for (tc of msg.toolCalls; track tc.id) {
                           <details class="tool-detail-item" [attr.open]="tc.status === 'denied' ? '' : null">
                             <summary class="tool-detail-header">
-                              <span class="tool-icon">{{ toolIcon(tc.tool) }}</span>
+                              <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
                               <span class="tool-detail-name">{{ tc.tool }}</span>
                               <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
                               <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
@@ -447,13 +466,13 @@ const CATEGORY_LABELS: Record<string, string> = {
         @if (chat.isStreaming()) {
           <div class="message message-assistant">
             <div class="avatar">
-              <span class="avatar-icon">smart_toy</span>
+              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
             </div>
             <div class="message-body">
               @if (chat.streamingThinking() && chat.narrationMode() !== 'silent') {
                 <details class="thinking-block" open>
                   <summary class="thinking-header">
-                    <span class="thinking-icon">psychology</span>
+                    <app-icon size="sm" class="thinking-icon">psychology</app-icon>
                     <span class="thinking-label">{{ 'chat.thinking.now' | transloco }}</span>
                   </summary>
                   <div class="thinking-content">{{ chat.streamingThinking() }}</div>
@@ -472,7 +491,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                 @if (hasCompletedTools(chat.currentToolCalls())) {
                   <details class="tool-summary" open>
                     <summary class="tool-summary-line">
-                      <span class="tool-summary-chevron">chevron_right</span>
+                      <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
                       <span class="tool-summary-text">
                         {{ (completedToolCount(chat.currentToolCalls()) === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: completedToolCount(chat.currentToolCalls()) } }}
                         {{ toolSummaryLabel(completedOnly(chat.currentToolCalls())) }}
@@ -511,7 +530,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         @if (chat.pendingPermission(); as perm) {
           <div class="permission-request">
             <div class="perm-header">
-              <span class="perm-icon">shield</span>
+              <app-icon size="sm" class="perm-icon">shield</app-icon>
               {{ 'chat.permission.title' | transloco }}
             </div>
             <div class="perm-body">
@@ -519,9 +538,9 @@ const CATEGORY_LABELS: Record<string, string> = {
               <pre class="perm-args">{{ perm.args | json }}</pre>
             </div>
             <div class="perm-actions">
-              <button class="perm-btn approve" (click)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</button>
-              <button class="perm-btn auto-accept" (click)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</button>
-              <button class="perm-btn deny" (click)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</button>
+              <app-button variant="success" size="sm" (clicked)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</app-button>
+              <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
+              <app-button variant="danger" size="sm" (clicked)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</app-button>
             </div>
           </div>
         }
@@ -530,7 +549,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       <!-- Error banner -->
       @if (chat.error(); as err) {
         <div class="error-banner">
-          <span class="error-icon">error</span>
+          <app-icon size="sm" class="error-icon">error</app-icon>
           {{ err }}
           <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
         </div>
@@ -579,9 +598,9 @@ const CATEGORY_LABELS: Record<string, string> = {
             @if (isPendingSend() || chat.isInterrupting()) {
               <span class="action-spinner"></span>
             } @else if (chat.isStreaming()) {
-              <span class="action-icon">stop</span>
+              <app-icon size="sm" class="action-icon">stop</app-icon>
             } @else {
-              <span class="action-icon">arrow_upward</span>
+              <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
             }
           </button>
         </div>
@@ -631,14 +650,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .back-link:hover { color: var(--text-primary, #cdd6f4); }
 
-      .back-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-      }
-
       .header-icon, .perm-icon, .error-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
         color: var(--accent-color, #cba6f7);
       }
 
@@ -688,17 +700,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         flex-shrink: 0;
       }
 
-      .status-chip {
-        font-size: 10px;
-        padding: 2px 8px;
-        border-radius: 10px;
-        background: var(--surface-0, #313244);
-        color: var(--text-muted, #6c7086);
-      }
-
-      .model-chip {
-        color: var(--accent-color, #cba6f7);
-        font-family: 'JetBrains Mono', monospace;
+      .status-bar > app-badge {
+        flex-shrink: 0;
       }
 
       /* Task bar */
@@ -716,10 +719,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: #6c7086;
         margin-bottom: 4px;
       }
-      .task-header-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
-      }
       .task-list {
         display: flex;
         flex-direction: column;
@@ -733,16 +732,14 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: #cdd6f4;
       }
       .task-item .task-check {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
-        color: #6c7086;
+        color: var(--text-muted);
       }
       .task-completed {
-        color: #6c7086;
+        color: var(--text-muted);
         text-decoration: line-through;
       }
       .task-completed .task-check {
-        color: #a6e3a1;
+        color: var(--success);
       }
       .task-header-clickable {
         cursor: pointer;
@@ -754,8 +751,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         background: rgba(255, 255, 255, 0.04);
       }
       .task-chevron {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
         margin-left: auto;
         transition: transform 0.2s ease;
       }
@@ -767,17 +762,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         display: flex;
         align-items: center;
         gap: 8px;
-      }
-
-      .mode-select {
-        padding: 4px 8px;
-        border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        font-family: inherit;
-        cursor: pointer;
       }
 
       .settings-btn {
@@ -794,10 +778,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       .settings-btn:hover, .settings-btn.active {
         color: var(--accent-color, #cba6f7);
         border-color: var(--accent-color, #cba6f7);
-      }
-      .settings-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
       }
 
       .settings-panel {
@@ -820,46 +800,9 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-muted, #6c7086);
         white-space: nowrap;
       }
-      .settings-select {
-        padding: 3px 6px;
-        border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        font-family: inherit;
-        cursor: pointer;
-        max-width: 220px;
-      }
       .settings-slider {
         width: 100px;
         accent-color: var(--accent-color, #cba6f7);
-      }
-
-      .connect-btn, .disconnect-btn {
-        padding: 4px 12px;
-        border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
-        font-size: 11px;
-        font-family: inherit;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .connect-btn {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-        border-color: var(--accent-color, #cba6f7);
-      }
-
-      .disconnect-btn {
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-      }
-
-      .disconnect-btn:hover {
-        color: #f38ba8;
-        border-color: #f38ba8;
       }
 
       .ide-btn {
@@ -895,10 +838,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         background: rgba(166, 227, 161, 0.1);
       }
 
-      .ide-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
 
       .ide-spinner {
         width: 12px;
@@ -907,57 +846,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         border-top-color: #89b4fa;
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
-      }
-
-      /* Connect dialog */
-
-      .connect-dialog {
-        padding: 12px 16px;
-        background: var(--panel-bg, #181825);
-        border-bottom: 1px solid var(--border-color, #313244);
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-
-      .connect-field label {
-        font-size: 11px;
-        color: var(--text-muted, #6c7086);
-        display: block;
-        margin-bottom: 4px;
-      }
-
-      .connect-field input {
-        width: 100%;
-        padding: 6px 10px;
-        border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-        font-size: 12px;
-        font-family: inherit;
-      }
-
-      .connect-actions {
-        display: flex;
-        gap: 8px;
-      }
-
-      .action-btn {
-        padding: 5px 14px;
-        border-radius: 4px;
-        border: 1px solid var(--accent-color, #cba6f7);
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-        font-size: 12px;
-        font-family: inherit;
-        cursor: pointer;
-      }
-
-      .action-btn.secondary {
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-        border-color: var(--border-color, #313244);
       }
 
       /* Messages */
@@ -1037,8 +925,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .avatar-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
         color: var(--text-secondary, #a6adc8);
       }
 
@@ -1086,43 +972,16 @@ const CATEGORY_LABELS: Record<string, string> = {
         margin: 0 auto;
       }
 
-      .system-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
-      }
 
-      .resume-btn {
+      .resume-btn-wrapper {
         display: flex;
-        align-items: center;
-        gap: 6px;
-        margin: 8px auto 0;
-        padding: 6px 16px;
-        border-radius: 6px;
-        border: 1px solid var(--accent-color, #cba6f7);
-        background: var(--accent-color, #cba6f7);
-        color: var(--app-bg, #1e1e2e);
-        font-size: 12px;
-        font-family: inherit;
-        font-weight: 600;
-        cursor: pointer;
-        transition: opacity 0.15s ease;
+        justify-content: center;
+        margin-top: 8px;
       }
-
-      .resume-btn:hover { opacity: 0.85; }
-      .resume-btn:disabled { opacity: 0.5; cursor: wait; }
 
       .resume-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
-
-      .resume-btn-spinner {
-        width: 14px;
-        height: 14px;
-        border: 2px solid var(--app-bg, #1e1e2e);
-        border-top-color: transparent;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
+        margin-right: 4px;
+        vertical-align: middle;
       }
 
       .resume-spinner {
@@ -1146,8 +1005,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .tool-only-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
         color: var(--text-muted, #6c7086);
       }
 
@@ -1178,8 +1035,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-summary-line:hover { background: rgba(255, 255, 255, 0.04); }
 
       .tool-summary-chevron {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
         transition: transform 0.15s;
       }
 
@@ -1254,8 +1109,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-detail-status.status-pending { color: var(--text-muted, #6c7086); }
 
       .tool-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 12px;
         color: var(--text-muted, #6c7086);
         width: 16px;
         text-align: center;
@@ -1371,10 +1224,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-secondary, #a6adc8);
       }
 
-      .thinking-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
 
       .thinking-label {
         font-style: italic;
@@ -1460,31 +1309,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       .perm-actions {
         display: flex;
         gap: 8px;
-      }
-
-      .perm-btn {
-        padding: 5px 16px;
-        border-radius: 4px;
-        border: none;
-        font-size: 12px;
-        font-family: inherit;
-        cursor: pointer;
-        font-weight: 600;
-      }
-
-      .perm-btn.approve {
-        background: #a6e3a1;
-        color: var(--timeline-bg, #11111b);
-      }
-
-      .perm-btn.auto-accept {
-        background: #89b4fa;
-        color: var(--timeline-bg, #11111b);
-      }
-
-      .perm-btn.deny {
-        background: #f38ba8;
-        color: var(--timeline-bg, #11111b);
       }
 
       /* Error banner */
@@ -1604,11 +1428,6 @@ const CATEGORY_LABELS: Record<string, string> = {
         background: #f38ba8;
       }
 
-      .action-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 20px;
-        line-height: 1;
-      }
 
       .action-spinner {
         width: 16px;
@@ -1865,10 +1684,6 @@ const CATEGORY_LABELS: Record<string, string> = {
           padding: 6px 8px;
         }
 
-        .settings-select {
-          max-width: 140px;
-        }
-
         .messages {
           padding: 10px;
         }
@@ -2103,17 +1918,19 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.chat.setMode('auto_accept');
     }
 
-    onModeChange(event: Event): void {
-        const mode = (event.target as HTMLSelectElement).value as 'supervised' | 'auto_accept' | 'autonomous';
-        this.chat.setMode(mode);
+    onPermissionModeChange(value: string | null): void {
+        if (value === 'supervised' || value === 'auto_accept' || value === 'autonomous') {
+            this.chat.setMode(value);
+        }
     }
 
-    onNarrationModeChange(event: Event): void {
-        const mode = (event.target as HTMLSelectElement).value as 'silent' | 'verbose' | 'auto';
-        this.chat.setNarrationMode(mode);
+    onNarrationModeSelect(value: string | null): void {
+        if (value === 'silent' || value === 'verbose' || value === 'auto') {
+            this.chat.setNarrationMode(value);
+        }
     }
 
-    onModelChange(model: string): void {
+    onModelSelect(model: string | null): void {
         if (model) {
             this.chat.modelName.set(model);
             this.chat.updateConfig({llm: {model}});

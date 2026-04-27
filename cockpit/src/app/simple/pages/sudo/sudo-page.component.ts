@@ -6,9 +6,16 @@ import {
   OnInit,
   OnDestroy,
 } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { TranslocoPipe } from '@jsverse/transloco';
 import { SudoService, SudoRequest } from '../../../core/services/sudo.service';
+import { AppButtonComponent } from '../../../ui/button';
+import { AppIconButtonComponent } from '../../../ui/icon-button';
+import { AppInputComponent } from '../../../ui/input';
+import { AppSelectComponent } from '../../../ui/select';
+import { AppTextareaComponent } from '../../../ui/textarea';
+import { AppDialogComponent } from '../../../ui/dialog';
+import { AppBadgeComponent, type BadgeTone } from '../../../ui/badge';
+import { AppIconComponent } from '../../../ui/icon';
 
 /** Risk level for visual badging. */
 function riskLevel(req: SudoRequest): 'low' | 'medium' | 'high' | 'critical' {
@@ -29,23 +36,41 @@ function secondsLeft(req: SudoRequest): number {
 @Component({
   selector: 'app-sudo-page',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppInputComponent,
+    AppSelectComponent,
+    AppTextareaComponent,
+    AppDialogComponent,
+    AppBadgeComponent,
+    AppIconComponent,
+  ],
   template: `
     <div class="sudo-page">
       <div class="page-header">
         <h2>{{ 'sudo.title' | transloco }}</h2>
         <div class="header-controls">
           <span class="status-dot" [class.connected]="sudo.isConnected()"></span>
-          <select class="filter-select" (change)="setFilter($any($event.target).value)">
+          <app-select
+            size="sm"
+            [value]="activeFilter()"
+            (changed)="setFilter($event ?? 'all')"
+          >
             <option value="all">{{ 'sudo.filter.all' | transloco }}</option>
             <option value="pending">{{ 'sudo.filter.pending' | transloco }}</option>
             <option value="approved">{{ 'sudo.filter.approved' | transloco }}</option>
             <option value="denied">{{ 'sudo.filter.denied' | transloco }}</option>
             <option value="expired">{{ 'sudo.filter.expired' | transloco }}</option>
-          </select>
-          <button class="btn-refresh" (click)="refresh()">
-            <span class="icon">refresh</span>
-          </button>
+          </app-select>
+          <app-icon-button
+            size="sm"
+            [ariaLabel]="'sudo.refresh' | transloco"
+            (clicked)="refresh()"
+          >
+            <app-icon size="sm">refresh</app-icon>
+          </app-icon-button>
         </div>
       </div>
 
@@ -55,7 +80,9 @@ function secondsLeft(req: SudoRequest): number {
           <div class="panel-header">
             {{ 'sudo.panels.requests' | transloco }}
             @if (sudo.pendingCount() > 0) {
-              <span class="badge">{{ sudo.pendingCount() }}</span>
+              <app-badge tone="danger" appearance="solid" size="xs">
+                {{ sudo.pendingCount() }}
+              </app-badge>
             }
           </div>
 
@@ -68,12 +95,21 @@ function secondsLeft(req: SudoRequest): number {
               @for (req of filteredRequests(); track req.id) {
                 <div class="request-card" [class]="'risk-' + getRisk(req)">
                   <div class="card-header">
-                    <span class="risk-badge" [class]="'risk-' + getRisk(req)">
+                    <app-badge
+                      [tone]="riskTone(getRisk(req))"
+                      appearance="solid"
+                      size="xs"
+                      [uppercase]="true"
+                    >
                       {{ 'sudo.risk.' + getRisk(req) | transloco }}
-                    </span>
-                    <span class="status-badge" [class]="'status-' + req.status">
+                    </app-badge>
+                    <app-badge
+                      [tone]="sudoStatusTone(req.status)"
+                      size="xs"
+                      [uppercase]="true"
+                    >
                       {{ 'sudo.status.' + req.status | transloco }}
-                    </span>
+                    </app-badge>
                     @if (req.status === 'pending') {
                       <span class="countdown">{{ 'sudo.secondsLeft' | transloco: {n: getSecondsLeft(req)} }}</span>
                     }
@@ -93,18 +129,12 @@ function secondsLeft(req: SudoRequest): number {
 
                   @if (req.status === 'pending') {
                     <div class="card-actions">
-                      <button
-                        class="btn-approve"
-                        (click)="approve(req)"
-                      >
+                      <app-button variant="success" size="sm" (clicked)="approve(req)">
                         {{ 'sudo.actions.approve' | transloco }}
-                      </button>
-                      <button
-                        class="btn-deny"
-                        (click)="startDeny(req)"
-                      >
+                      </app-button>
+                      <app-button variant="danger" size="sm" (clicked)="startDeny(req)">
                         {{ 'sudo.actions.deny' | transloco }}
-                      </button>
+                      </app-button>
                     </div>
                   }
 
@@ -122,31 +152,43 @@ function secondsLeft(req: SudoRequest): number {
           <div class="panel-header">{{ 'sudo.panels.rules' | transloco }}</div>
 
           <div class="rule-form">
-            <input
-              class="input"
+            <app-input
+              size="sm"
+              [(value)]="newRulePattern"
               [placeholder]="'sudo.rule.patternPlaceholder' | transloco"
-              [(ngModel)]="newRulePattern"
             />
-            <select class="filter-select" [(ngModel)]="newRuleAction">
+            <app-select size="sm" [(value)]="newRuleAction">
               <option value="approve">{{ 'sudo.rule.actionApprove' | transloco }}</option>
               <option value="deny">{{ 'sudo.rule.actionDeny' | transloco }}</option>
               <option value="review">{{ 'sudo.rule.actionReview' | transloco }}</option>
-            </select>
-            <button class="btn-add" (click)="addRule()">{{ 'sudo.rule.add' | transloco }}</button>
+            </app-select>
+            <app-button variant="primary" size="sm" (clicked)="addRule()">
+              {{ 'sudo.rule.add' | transloco }}
+            </app-button>
           </div>
 
           @for (rule of sudo.rules(); track rule.id) {
             <div class="rule-row">
-              <span class="rule-action" [class]="'action-' + rule.action">
+              <app-badge
+                [tone]="ruleActionTone(rule.action)"
+                appearance="solid"
+                size="xs"
+                [uppercase]="true"
+              >
                 {{ 'sudo.rule.badge.' + rule.action | transloco }}
-              </span>
+              </app-badge>
               <code class="rule-pattern">{{ rule.pattern }}</code>
               @if (rule.description) {
                 <span class="rule-desc">{{ rule.description }}</span>
               }
-              <button class="btn-delete" (click)="deleteRule(rule.id)">
-                <span class="icon">close</span>
-              </button>
+              <app-icon-button
+                size="sm"
+                variant="danger"
+                [ariaLabel]="'sudo.rule.delete' | transloco"
+                (clicked)="deleteRule(rule.id)"
+              >
+                <app-icon size="sm">close</app-icon>
+              </app-icon-button>
             </div>
           }
 
@@ -158,29 +200,32 @@ function secondsLeft(req: SudoRequest): number {
     </div>
 
     <!-- Deny dialog -->
-    @if (denyTarget()) {
-      <div class="dialog-overlay" (click)="cancelDeny()">
-        <div class="dialog" (click)="$event.stopPropagation()">
-          <div class="dialog-title">{{ 'sudo.denyDialog.title' | transloco: {command: denyTarget()!.command} }}</div>
-          <textarea
-            class="input reason-input"
-            [placeholder]="'sudo.denyDialog.reasonPlaceholder' | transloco"
-            [(ngModel)]="denyReason"
-            rows="3"
-          ></textarea>
-          <div class="dialog-actions">
-            <button class="btn-cancel" (click)="cancelDeny()">{{ 'sudo.denyDialog.cancel' | transloco }}</button>
-            <button
-              class="btn-deny"
-              [disabled]="!denyReason.trim()"
-              (click)="confirmDeny()"
-            >
-              {{ 'sudo.denyDialog.confirm' | transloco }}
-            </button>
-          </div>
-        </div>
-      </div>
-    }
+    <app-dialog
+      [open]="!!denyTarget()"
+      size="md"
+      [closeOnBackdrop]="false"
+      [title]="'sudo.denyDialog.title' | transloco: {command: denyTarget()?.command ?? ''}"
+      (closed)="cancelDeny()"
+    >
+      <app-textarea
+        [(value)]="denyReason"
+        [placeholder]="'sudo.denyDialog.reasonPlaceholder' | transloco"
+        [rows]="3"
+      />
+      <ng-container appDialogActions>
+        <app-button variant="ghost" size="sm" (clicked)="cancelDeny()">
+          {{ 'sudo.denyDialog.cancel' | transloco }}
+        </app-button>
+        <app-button
+          variant="danger"
+          size="sm"
+          [disabled]="!denyReason.trim()"
+          (clicked)="confirmDeny()"
+        >
+          {{ 'sudo.denyDialog.confirm' | transloco }}
+        </app-button>
+      </ng-container>
+    </app-dialog>
   `,
   styles: [
     `
@@ -228,40 +273,6 @@ function secondsLeft(req: SudoRequest): number {
         background: #a6e3a1;
       }
 
-      .filter-select,
-      .input {
-        padding: 5px 8px;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 4px;
-        color: var(--text-primary, #cdd6f4);
-        font-size: 12px;
-        font-family: inherit;
-      }
-
-      .btn-refresh,
-      .btn-delete {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 28px;
-        height: 28px;
-        background: transparent;
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 4px;
-        color: var(--text-muted, #6c7086);
-        cursor: pointer;
-      }
-      .btn-refresh:hover,
-      .btn-delete:hover {
-        color: var(--text-primary, #cdd6f4);
-        border-color: var(--text-muted, #6c7086);
-      }
-
-      .icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-      }
 
       .content-area {
         display: flex;
@@ -299,15 +310,6 @@ function secondsLeft(req: SudoRequest): number {
         color: var(--text-muted, #6c7086);
         border-bottom: 1px solid var(--border-color, #313244);
         flex-shrink: 0;
-      }
-
-      .badge {
-        background: #f38ba8;
-        color: #11111b;
-        font-size: 10px;
-        font-weight: 700;
-        padding: 1px 6px;
-        border-radius: 10px;
       }
 
       .loading,
@@ -351,50 +353,6 @@ function secondsLeft(req: SudoRequest): number {
         margin-bottom: 6px;
       }
 
-      .risk-badge {
-        font-size: 9px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        padding: 1px 5px;
-        border-radius: 3px;
-        color: #11111b;
-      }
-      .risk-badge.risk-low {
-        background: #a6e3a1;
-      }
-      .risk-badge.risk-medium {
-        background: #f9e2af;
-      }
-      .risk-badge.risk-high {
-        background: #fab387;
-      }
-      .risk-badge.risk-critical {
-        background: #f38ba8;
-      }
-
-      .status-badge {
-        font-size: 9px;
-        font-weight: 600;
-        text-transform: uppercase;
-        padding: 1px 5px;
-        border-radius: 3px;
-        color: var(--text-muted, #6c7086);
-        background: var(--panel-bg, #181825);
-      }
-      .status-badge.status-pending {
-        color: #f9e2af;
-      }
-      .status-badge.status-approved,
-      .status-badge.status-auto_approved {
-        color: #a6e3a1;
-      }
-      .status-badge.status-denied,
-      .status-badge.status-auto_denied,
-      .status-badge.status-expired {
-        color: #f38ba8;
-      }
-
       .countdown {
         margin-left: auto;
         font-size: 11px;
@@ -429,49 +387,6 @@ function secondsLeft(req: SudoRequest): number {
         gap: 6px;
       }
 
-      .btn-approve,
-      .btn-deny,
-      .btn-add,
-      .btn-cancel {
-        padding: 4px 12px;
-        border: none;
-        border-radius: 4px;
-        font-size: 12px;
-        font-family: inherit;
-        font-weight: 600;
-        cursor: pointer;
-      }
-
-      .btn-approve {
-        background: #a6e3a1;
-        color: #11111b;
-      }
-      .btn-approve:hover {
-        background: #94e2d5;
-      }
-
-      .btn-deny {
-        background: #f38ba8;
-        color: #11111b;
-      }
-      .btn-deny:hover {
-        background: #eba0ac;
-      }
-      .btn-deny:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .btn-add {
-        background: var(--accent-color, #cba6f7);
-        color: #11111b;
-      }
-
-      .btn-cancel {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-      }
-
       .card-reason {
         margin-top: 6px;
         font-size: 11px;
@@ -488,7 +403,7 @@ function secondsLeft(req: SudoRequest): number {
         border-bottom: 1px solid var(--border-color, #313244);
       }
 
-      .rule-form .input {
+      .rule-form app-input {
         flex: 1;
       }
 
@@ -499,27 +414,6 @@ function secondsLeft(req: SudoRequest): number {
         padding: 6px 8px;
         border-bottom: 1px solid var(--border-color, #313244);
         font-size: 12px;
-      }
-
-      .rule-action {
-        font-size: 9px;
-        font-weight: 700;
-        text-transform: uppercase;
-        padding: 1px 5px;
-        border-radius: 3px;
-        flex-shrink: 0;
-      }
-      .action-approve {
-        background: #a6e3a1;
-        color: #11111b;
-      }
-      .action-deny {
-        background: #f38ba8;
-        color: #11111b;
-      }
-      .action-review {
-        background: #f9e2af;
-        color: #11111b;
       }
 
       .rule-pattern {
@@ -533,47 +427,6 @@ function secondsLeft(req: SudoRequest): number {
         font-size: 11px;
       }
 
-      /* Deny dialog */
-
-      .dialog-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.6);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 1000;
-      }
-
-      .dialog {
-        background: var(--panel-bg, #181825);
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 8px;
-        padding: 16px;
-        width: 400px;
-        max-width: 90vw;
-      }
-
-      .dialog-title {
-        font-size: 14px;
-        font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
-        margin-bottom: 12px;
-      }
-
-      .reason-input {
-        width: 100%;
-        resize: vertical;
-        min-height: 60px;
-        margin-bottom: 12px;
-        box-sizing: border-box;
-      }
-
-      .dialog-actions {
-        display: flex;
-        justify-content: flex-end;
-        gap: 8px;
-      }
     `,
   ],
 })
@@ -627,6 +480,37 @@ export class SudoPageComponent implements OnInit, OnDestroy {
 
   getSecondsLeft(req: SudoRequest): number {
     return secondsLeft(req);
+  }
+
+  sudoStatusTone(status: string | undefined): BadgeTone {
+    switch (status) {
+      case 'pending': return 'warning';
+      case 'approved':
+      case 'auto_approved': return 'success';
+      case 'denied':
+      case 'auto_denied':
+      case 'expired': return 'danger';
+      default: return 'neutral';
+    }
+  }
+
+  ruleActionTone(action: string): BadgeTone {
+    switch (action) {
+      case 'approve': return 'success';
+      case 'deny': return 'danger';
+      case 'review': return 'warning';
+      default: return 'neutral';
+    }
+  }
+
+  riskTone(risk: string): BadgeTone {
+    switch (risk) {
+      case 'low': return 'success';
+      case 'medium': return 'warning';
+      case 'high': return 'alert';
+      case 'critical': return 'danger';
+      default: return 'neutral';
+    }
   }
 
   approve(req: SudoRequest): void {

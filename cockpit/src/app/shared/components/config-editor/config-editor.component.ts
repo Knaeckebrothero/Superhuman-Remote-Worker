@@ -1,8 +1,14 @@
 import { Component, effect, inject, input, output, signal, OnInit } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { NgTemplateOutlet } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { TranslocoPipe, TranslocoService } from '@jsverse/transloco';
+import { AppIconButtonComponent } from '../../../ui/icon-button';
+import { AppBadgeComponent } from '../../../ui/badge';
+import { AppChipComponent } from '../../../ui/chip';
+import { AppInputComponent } from '../../../ui/input';
+import { AppSelectComponent } from '../../../ui/select';
+import { AppTextareaComponent } from '../../../ui/textarea';
+import { AppCheckboxComponent } from '../../../ui/checkbox';
 
 // =============================================================================
 // Schema Node Model
@@ -149,15 +155,37 @@ function getNestedValue(obj: unknown, path: string): unknown {
 @Component({
   selector: 'app-config-editor',
   standalone: true,
-  imports: [FormsModule, NgTemplateOutlet, TranslocoPipe],
+  imports: [
+    NgTemplateOutlet,
+    TranslocoPipe,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppChipComponent,
+    AppInputComponent,
+    AppSelectComponent,
+    AppTextareaComponent,
+    AppCheckboxComponent,
+  ],
   template: `
     @if (!schemaLoaded()) {
       <div class="loading">{{ 'configEditor.loading' | transloco }}</div>
     } @else {
       <!-- Mode toggle -->
       <div class="mode-toggle">
-        <button type="button" [class.active]="mode() === 'visual'" (click)="switchMode('visual')">{{ 'configEditor.modeVisual' | transloco }}</button>
-        <button type="button" [class.active]="mode() === 'json'" (click)="switchMode('json')">{{ 'configEditor.modeJson' | transloco }}</button>
+        <app-chip
+          size="sm"
+          [selected]="mode() === 'visual'"
+          (clicked)="switchMode('visual')"
+        >
+          {{ 'configEditor.modeVisual' | transloco }}
+        </app-chip>
+        <app-chip
+          size="sm"
+          [selected]="mode() === 'json'"
+          (clicked)="switchMode('json')"
+        >
+          {{ 'configEditor.modeJson' | transloco }}
+        </app-chip>
         <span class="override-count" [class.has-overrides]="overrideCount() > 0">
           {{ (overrideCount() === 1 ? 'configEditor.overrideSingle' : 'configEditor.overridePlural') | transloco: {n: overrideCount()} }}
         </span>
@@ -171,7 +199,9 @@ function getNestedValue(obj: unknown, path: string): unknown {
                 <button type="button" class="section-header" (click)="toggleSection(node.path)">
                   <span class="section-title">{{ node.title }}</span>
                   @if (sectionOverrideCount(node.path) > 0) {
-                    <span class="section-badge">{{ sectionOverrideCount(node.path) }}</span>
+                    <app-badge tone="accent" appearance="solid" size="xs" shape="pill">
+                      {{ sectionOverrideCount(node.path) }}
+                    </app-badge>
                   }
                   <span class="material-symbols-outlined toggle-icon">
                     {{ isSectionExpanded(node.path) ? 'expand_less' : 'expand_more' }}
@@ -225,13 +255,12 @@ function getNestedValue(obj: unknown, path: string): unknown {
       } @else {
         <!-- JSON mode -->
         <div class="json-mode">
-          <textarea
+          <app-textarea
             class="json-editor"
-            [ngModel]="jsonText()"
-            (ngModelChange)="onJsonEdit($event)"
-            rows="20"
-            spellcheck="false"
-          ></textarea>
+            [value]="jsonText()"
+            (valueChange)="onJsonEdit($event)"
+            [rows]="20"
+          />
           @if (jsonError()) {
             <div class="json-error">{{ jsonError() }}</div>
           }
@@ -250,16 +279,15 @@ function getNestedValue(obj: unknown, path: string): unknown {
             }
             <span>{{ node.title }}</span>
             @if (node.nullable) {
-              <span class="nullable-badge">{{ 'configEditor.nullable' | transloco }}</span>
+              <app-badge tone="neutral" size="xs">{{ 'configEditor.nullable' | transloco }}</app-badge>
             }
           </div>
 
           <!-- String with enum -->
           @if (node.type === 'string' && node.enumValues?.length) {
-            <select
-              class="form-input"
-              [ngModel]="getDisplayValue(node.path, node.defaultValue) ?? '__null__'"
-              (ngModelChange)="setSmartOverride(node.path, $event === '__null__' ? null : $event, node.defaultValue)"
+            <app-select
+              [value]="$any(getDisplayValue(node.path, node.defaultValue)) ?? '__null__'"
+              (changed)="setSmartOverride(node.path, $event === '__null__' ? null : $event, node.defaultValue)"
             >
               @if (node.nullable || node.defaultValue === undefined) {
                 <option value="__null__">{{ (node.nullable ? 'configEditor.defaultAutoDetect' : 'configEditor.defaultOption') | transloco }}</option>
@@ -267,16 +295,15 @@ function getNestedValue(obj: unknown, path: string): unknown {
               @for (opt of node.enumValues; track opt) {
                 <option [value]="opt">{{ opt }}</option>
               }
-            </select>
+            </app-select>
           }
 
           <!-- String (plain) -->
           @else if (node.type === 'string' && !node.enumValues?.length) {
-            <input
+            <app-input
               type="text"
-              class="form-input"
-              [ngModel]="getDisplayValue(node.path, node.defaultValue) ?? ''"
-              (ngModelChange)="setSmartOverride(node.path, $event || null, node.defaultValue)"
+              [value]="$any(getDisplayValue(node.path, node.defaultValue) ?? '')"
+              (valueChange)="setSmartOverride(node.path, $event || null, node.defaultValue)"
             />
           }
 
@@ -289,55 +316,62 @@ function getNestedValue(obj: unknown, path: string): unknown {
                 [min]="node.minimum"
                 [max]="node.maximum"
                 [step]="node.type === 'integer' ? 1 : 0.05"
-                [ngModel]="getDisplayValue(node.path, node.defaultValue) ?? node.minimum"
-                (ngModelChange)="setSmartOverride(node.path, +$event, node.defaultValue)"
+                [value]="$any(getDisplayValue(node.path, node.defaultValue) ?? node.minimum)"
+                (input)="setSmartOverride(node.path, +asInputValue($event), node.defaultValue)"
               />
               <span class="slider-value">{{ getDisplayValue(node.path, node.defaultValue) ?? '-' }}</span>
               @if (isModified(node.path)) {
-                <button type="button" class="clear-btn" (click)="clearOverride(node.path)" [title]="'configEditor.resetToDefault' | transloco">
+                <app-icon-button
+                  variant="danger"
+                  size="sm"
+                  type="button"
+                  [ariaLabel]="'configEditor.resetToDefault' | transloco"
+                  [tooltip]="'configEditor.resetToDefault' | transloco"
+                  (clicked)="clearOverride(node.path)"
+                >
                   <span class="material-symbols-outlined">close</span>
-                </button>
+                </app-icon-button>
               }
             </div>
           }
 
           <!-- Number/integer (plain) -->
           @else if (node.type === 'number' || node.type === 'integer') {
-            <input
+            <app-input
               type="number"
-              class="form-input"
-              [ngModel]="getDisplayValue(node.path, node.defaultValue) ?? ''"
-              (ngModelChange)="setSmartOverride(node.path, $event !== '' && $event != null ? +$event : null, node.defaultValue)"
-              [min]="node.minimum"
-              [max]="node.maximum"
-              [step]="node.type === 'integer' ? 1 : 'any'"
+              [value]="$any(getDisplayValue(node.path, node.defaultValue) ?? '')"
+              (valueChange)="setSmartOverride(node.path, $event !== '' && $event != null ? +$event : null, node.defaultValue)"
             />
           }
 
           <!-- Boolean -->
           @else if (node.type === 'boolean') {
-            <label class="toggle-field">
-              <input
-                type="checkbox"
-                [checked]="getDisplayValue(node.path, node.defaultValue) ?? false"
-                (change)="onBooleanChange(node.path, $event, node.defaultValue)"
+            <div class="toggle-field">
+              <app-checkbox
+                [checked]="$any(getDisplayValue(node.path, node.defaultValue) ?? false)"
+                (changed)="onBooleanValueChange(node.path, $event, node.defaultValue)"
               />
-              <span class="toggle-slider"></span>
               @if (isModified(node.path)) {
-                <button type="button" class="clear-btn" (click)="clearOverride(node.path); $event.preventDefault()" [title]="'configEditor.resetToDefault' | transloco">
+                <app-icon-button
+                  variant="danger"
+                  size="sm"
+                  type="button"
+                  [ariaLabel]="'configEditor.resetToDefault' | transloco"
+                  [tooltip]="'configEditor.resetToDefault' | transloco"
+                  (clicked)="clearOverride(node.path)"
+                >
                   <span class="material-symbols-outlined">close</span>
-                </button>
+                </app-icon-button>
               }
-            </label>
+            </div>
           }
 
           <!-- Array of strings -->
           @else if (node.type === 'array') {
-            <input
+            <app-input
               type="text"
-              class="form-input"
-              [ngModel]="getArrayDisplay(node.path, node.defaultValue)"
-              (ngModelChange)="setArrayOverride(node.path, $event, node.defaultValue)"
+              [value]="getArrayDisplay(node.path, node.defaultValue)"
+              (valueChange)="setArrayOverride(node.path, $event, node.defaultValue)"
             />
             <span class="field-hint">{{ 'configEditor.arrayHint' | transloco }}</span>
           }
@@ -363,32 +397,8 @@ function getNestedValue(obj: unknown, path: string): unknown {
     .mode-toggle {
       display: flex;
       align-items: center;
-      gap: 0;
+      gap: 6px;
       margin-bottom: 12px;
-      border: 1px solid var(--border-color, #313244);
-      border-radius: 6px;
-      overflow: hidden;
-    }
-
-    .mode-toggle button {
-      flex: 0 0 auto;
-      padding: 6px 16px;
-      background: transparent;
-      border: none;
-      border-right: 1px solid var(--border-color, #313244);
-      color: var(--text-muted, #6c7086);
-      font-size: 12px;
-      font-family: inherit;
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .mode-toggle button:hover { background: rgba(255, 255, 255, 0.03); }
-
-    .mode-toggle button.active {
-      background: var(--accent-color, #cba6f7);
-      color: var(--timeline-bg, #11111b);
-      font-weight: 600;
     }
 
     .override-count {
@@ -424,15 +434,6 @@ function getNestedValue(obj: unknown, path: string): unknown {
     }
 
     .section-header:hover { background: rgba(255, 255, 255, 0.05); }
-
-    .section-badge {
-      padding: 1px 6px;
-      border-radius: 10px;
-      background: var(--accent-color, #cba6f7);
-      color: var(--timeline-bg, #11111b);
-      font-size: 10px;
-      font-weight: 700;
-    }
 
     .toggle-icon {
       margin-left: auto;
@@ -504,50 +505,11 @@ function getNestedValue(obj: unknown, path: string): unknown {
       flex-shrink: 0;
     }
 
-    .nullable-badge {
-      font-size: 9px;
-      padding: 1px 4px;
-      border-radius: 3px;
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--text-muted, #6c7086);
-      font-weight: 400;
-    }
-
     .field-desc {
       font-size: 11px;
       color: var(--text-muted, #6c7086);
       margin-top: 3px;
       line-height: 1.4;
-    }
-
-    /* Form controls */
-    .form-input {
-      width: 100%;
-      padding: 7px 10px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
-      font-family: inherit;
-      font-size: 13px;
-      transition: border-color 0.15s ease;
-      box-sizing: border-box;
-    }
-
-    .form-input:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
-    }
-
-    .form-input::placeholder { color: var(--text-muted, #6c7086); }
-
-    select.form-input {
-      cursor: pointer;
-      appearance: auto;
-    }
-
-    input[type="number"].form-input {
-      max-width: 180px;
     }
 
     /* Slider */
@@ -572,43 +534,11 @@ function getNestedValue(obj: unknown, path: string): unknown {
       font-family: 'JetBrains Mono', monospace;
     }
 
-    .clear-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 22px;
-      height: 22px;
-      padding: 0;
-      border: none;
-      border-radius: 4px;
-      background: transparent;
-      color: var(--text-muted, #6c7086);
-      cursor: pointer;
-      transition: all 0.15s ease;
-    }
-
-    .clear-btn:hover {
-      background: rgba(243, 139, 168, 0.15);
-      color: var(--red, #f38ba8);
-    }
-
-    .clear-btn .material-symbols-outlined { font-size: 14px; }
-
     /* Toggle / checkbox */
     .toggle-field {
       display: flex;
       align-items: center;
       gap: 10px;
-      cursor: pointer;
-      font-size: 13px;
-      color: var(--text-secondary, #a6adc8);
-    }
-
-    .toggle-field input[type="checkbox"] {
-      accent-color: var(--accent-color, #cba6f7);
-      width: 16px;
-      height: 16px;
-      cursor: pointer;
     }
 
     .field-hint {
@@ -618,25 +548,8 @@ function getNestedValue(obj: unknown, path: string): unknown {
     }
 
     /* JSON editor */
-    .json-editor {
-      width: 100%;
-      min-height: 300px;
-      padding: 12px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+    app-textarea.json-editor {
       font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
-      line-height: 1.5;
-      resize: vertical;
-      box-sizing: border-box;
-      tab-size: 2;
-    }
-
-    .json-editor:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
     }
 
     .json-error {
@@ -774,6 +687,10 @@ export class ConfigEditorComponent implements OnInit {
 
   onBooleanChange(path: string, event: Event, schemaDefault: unknown): void {
     const checked = (event.target as HTMLInputElement).checked;
+    this.onBooleanValueChange(path, checked, schemaDefault);
+  }
+
+  onBooleanValueChange(path: string, checked: boolean, schemaDefault: unknown): void {
     const baseline = this.getBaselineValue(path, schemaDefault);
 
     if (checked === baseline) {
@@ -784,6 +701,10 @@ export class ConfigEditorComponent implements OnInit {
       this.overrides.set(current);
       this.emitValue();
     }
+  }
+
+  asInputValue(event: Event): string {
+    return (event.target as HTMLInputElement).value;
   }
 
   // ===== Array fields =====

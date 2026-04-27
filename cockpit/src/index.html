@@ -8,10 +8,27 @@
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block" rel="stylesheet">
   <script src="assets/env.js"></script>
+  <script>
+    // Reveal Material Symbols ligatures only after the icon font has loaded.
+    // Without this, the literal text (e.g. "settings") flashes before glyphs
+    // arrive — visible as broken `.notdef` boxes in the UI.
+    (function () {
+      function markLoaded() { document.body.classList.add('fonts-loaded'); }
+      if (document.fonts && document.fonts.load) {
+        document.fonts.load('1em "Material Symbols Outlined"')
+          .then(markLoaded)
+          .catch(markLoaded);
+        // Hard fallback so icons never stay invisible if the font fails.
+        setTimeout(markLoaded, 3000);
+      } else {
+        markLoaded();
+      }
+    })();
+  </script>
 </head>
-<body>
+<body class="theme-dark">
   <app-root></app-root>
 </body>
 </html>

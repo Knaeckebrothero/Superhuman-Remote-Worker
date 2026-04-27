@@ -12,15 +12,15 @@
           <span class="header-spinner"></span>
         }
         @if (!isProcessing && status !== 'error') {
-          <span class="material-icon header-icon complete">check_circle</span>
+          <app-icon size="md" class="header-icon complete">check_circle</app-icon>
         }
         @if (status === 'error') {
-          <span class="material-icon header-icon error">error_outline</span>
+          <app-icon size="md" class="header-icon error">error_outline</app-icon>
         }
         <span class="header-text">{{ headerText }}</span>
       </div>
       <span class="step-count">({{ steps.length }} {{ steps.length === 1 ? 'step' : 'steps' }})</span>
-      <span class="material-icon chevron-icon">expand_more</span>
+      <app-icon size="md" class="chevron-icon">expand_more</app-icon>
     </summary>
 
     <div class="steps-list">
@@ -33,7 +33,7 @@
 
           <summary class="step-item-header">
             <div class="step-icon-wrapper" [class]="'step-icon--' + step.type">
-              <span class="material-icon">{{ getStepIcon(step.type) }}</span>
+              <app-icon size="sm">{{ getStepIcon(step.type) }}</app-icon>
             </div>
             <span class="step-title">{{ step.title }}</span>
             @if (step.duration) {

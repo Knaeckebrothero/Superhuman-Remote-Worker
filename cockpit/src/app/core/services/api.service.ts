@@ -2,7 +2,7 @@ import {inject, Injectable} from '@angular/core';
 import {HttpClient, HttpParams} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
-import {ToastService} from './toast.service';
+import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
 import {
     Agent,
@@ -128,7 +128,7 @@ export interface SnapshotStorageStats {
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
-  private readonly toast = inject(ToastService);
+  private readonly toast = inject(AppToastService);
   private readonly transloco = inject(TranslocoService);
   private readonly errors = inject(ErrorMessageService);
   private readonly baseUrl = environment.apiUrl;
@@ -753,7 +753,7 @@ export class ApiService {
       tap(() => this.toast.success(this.t('toasts.jobs.created'))),
       catchError((error) => {
         console.error('Failed to create job:', error);
-        this.toast.error(this.errors.translate(error, 'errors.jobs.createFailed'));
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.createFailed'));
         return of(null);
       }),
     );
@@ -779,7 +779,7 @@ export class ApiService {
       tap(() => this.toast.success(this.t('toasts.jobs.deleted'))),
       catchError((error) => {
         console.error(`Failed to delete job ${jobId}:`, error);
-        this.toast.error(this.errors.translate(error, 'errors.jobs.deleteFailed'));
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.deleteFailed'));
         return of(null);
       }),
     );
@@ -793,7 +793,7 @@ export class ApiService {
       tap(() => this.toast.success(this.t('toasts.jobs.cancelled'))),
       catchError((error) => {
         console.error(`Failed to cancel job ${jobId}:`, error);
-        this.toast.error(this.errors.translate(error, 'errors.jobs.cancelFailed'));
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.cancelFailed'));
         return of(null);
       }),
     );
@@ -807,7 +807,7 @@ export class ApiService {
       tap(() => this.toast.success(this.t('toasts.jobs.paused'))),
       catchError((error) => {
         console.error(`Failed to pause job ${jobId}:`, error);
-        this.toast.error(this.errors.translate(error, 'errors.jobs.pauseFailed'));
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.pauseFailed'));
         return of(null);
       }),
     );
@@ -837,7 +837,7 @@ export class ApiService {
         tap(() => this.toast.success(this.t('toasts.jobs.resumed'))),
         catchError((error) => {
           console.error(`Failed to resume job ${jobId}:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.jobs.resumeFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.resumeFailed'));
           return of(null);
         }),
       );
@@ -881,7 +881,7 @@ export class ApiService {
       .pipe(
         catchError((error) => {
           console.error(`Failed to start IDE session for ${jobId}:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.ide.startFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.ide.startFailed'));
           return of(null);
         }),
       );
@@ -897,7 +897,7 @@ export class ApiService {
         tap(() => this.toast.success(this.t('toasts.ide.stopped'))),
         catchError((error) => {
           console.error(`Failed to stop IDE session for ${jobId}:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.ide.stopFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.ide.stopFailed'));
           return of(null);
         }),
       );
@@ -966,7 +966,7 @@ export class ApiService {
         tap(() => this.toast.success(this.t('toasts.jobs.approved'))),
         catchError((error) => {
           console.error(`Failed to approve job ${jobId}:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.jobs.approveFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.approveFailed'));
           return of(null);
         }),
       );
@@ -988,7 +988,7 @@ export class ApiService {
         tap(() => this.toast.success(this.t('toasts.jobs.vmUpgradeStarted'))),
         catchError((error) => {
           console.error(`Failed to upgrade job ${jobId} to VM:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.jobs.upgradeVmFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.upgradeVmFailed'));
           return of(null);
         }),
       );
@@ -1038,7 +1038,7 @@ export class ApiService {
         tap(() => this.toast.success(this.t('toasts.jobs.replySent'))),
         catchError((error) => {
           console.error(`Failed to reply to thread ${threadId}:`, error);
-          this.toast.error(this.errors.translate(error, 'errors.jobs.replyFailed'));
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.replyFailed'));
           return of(null);
         }),
       );

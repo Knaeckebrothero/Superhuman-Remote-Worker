@@ -6,6 +6,11 @@ import {environment} from '../../../core/environment';
 import {JobStatus} from '../../../core/models/api.model';
 import {JobSummary} from '../../../core/models/audit.model';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppChipComponent} from '../../../ui/chip';
+import {AppInputComponent} from '../../../ui/input';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 type StatusFilter = 'all' | 'mine' | JobStatus;
 
@@ -23,7 +28,14 @@ interface JobRow {
 @Component({
   selector: 'app-job-list',
   standalone: true,
-  imports: [TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppBadgeComponent,
+    AppChipComponent,
+    AppInputComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
@@ -31,21 +43,27 @@ interface JobRow {
         <span class="title">{{ 'jobs.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of statusFilters; track filter.value) {
-            <button
-              class="filter-chip"
-              [class.active]="activeFilter() === filter.value"
-              (click)="setFilter(filter.value)"
+            <app-chip
+              size="sm"
+              [selected]="activeFilter() === filter.value"
+              (clicked)="setFilter(filter.value)"
             >
               {{ filter.labelKey | transloco }}
               @if (filter.value !== 'all' && filter.value !== 'mine') {
                 <span class="count">({{ getStatusCount(filter.value) }})</span>
               }
-            </button>
+            </app-chip>
           }
         </div>
-        <button class="refresh-btn" (click)="refresh()" [disabled]="isLoading()">
+        <app-button
+          variant="secondary"
+          size="sm"
+          class="refresh-btn"
+          [disabled]="isLoading()"
+          (clicked)="refresh()"
+        >
           {{ 'jobs.refresh' | transloco }}
-        </button>
+        </app-button>
         @if (snapshotStats()?.available) {
           <span class="snapshot-stats" [title]="'jobs.tooltip.snapshotStats' | transloco">
             {{ 'jobs.snapshotsSummary' | transloco:{ count: snapshotStats()!.total_snapshots, size: formatBytes(snapshotStats()!.total_size_bytes) } }}
@@ -56,7 +74,7 @@ interface JobRow {
       <!-- Loading State -->
       @if (isLoading() && jobs().length === 0) {
         <div class="loading-state">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>{{ 'jobs.loading' | transloco }}</span>
         </div>
       }
@@ -128,9 +146,9 @@ interface JobRow {
                   </td>
                   <td>
                     <div class="status-cell-inner">
-                      <span class="status-badge" [class]="'status-' + row.job.status">
+                      <app-badge [tone]="jobStatusTone(row.job.status)" size="sm">
                         {{ 'jobs.status.' + row.job.status | transloco }}
-                      </span>
+                      </app-badge>
                       @if (row.job.status === 'waiting' && row.hasChildren) {
                         <span class="delegation-badge" [title]="'jobs.tooltip.delegationWaiting' | transloco">
                           {{ 'jobs.delegationChildren' | transloco:{ count: getChildCount(row.job.id) } }}
@@ -150,154 +168,123 @@ interface JobRow {
                     {{ formatDate(row.job.created_at) }}
                   </td>
                   <td class="actions-cell">
-                    <button
-                      class="action-btn view"
-                      (click)="viewJob(row.job.id); $event.stopPropagation()"
-                      [title]="'jobs.tooltip.view' | transloco"
+                    <app-button
+                      variant="info"
+                      size="sm"
+                      [ariaLabel]="'jobs.tooltip.view' | transloco"
+                      (clicked)="viewJob(row.job.id); $event.stopPropagation()"
                     >
                       {{ 'jobs.action.view' | transloco }}
-                    </button>
+                    </app-button>
                     @if (getWorkspaceUrl(row.job)) {
-                      <button
-                        class="action-btn workspace"
-                        (click)="openWorkspace(row.job); $event.stopPropagation()"
-                        [title]="'jobs.tooltip.workspace' | transloco"
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.workspace' | transloco"
+                        (clicked)="openWorkspace(row.job); $event.stopPropagation()"
                       >
                         {{ 'jobs.action.workspace' | transloco }}
-                      </button>
+                      </app-button>
                     }
                     @if (canOpenIde(row.job)) {
-                      @if (ideLoadingJobIds().has(row.job.id)) {
-                        <button
-                          class="action-btn ide loading"
-                          disabled
-                          (click)="$event.stopPropagation()"
-                          [title]="'jobs.tooltip.ideStarting' | transloco"
-                        >
-                          <span class="btn-spinner"></span>
+                      <app-button
+                        [variant]="!row.job.snapshot_status && !hasLiveVm(row.job) ? 'secondary' : 'info'"
+                        size="sm"
+                        [loading]="ideLoadingJobIds().has(row.job.id)"
+                        [ariaLabel]="(row.job.snapshot_status === 'available' ? 'jobs.tooltip.ideSnapshot' : 'jobs.tooltip.ideCode') | transloco"
+                        (clicked)="openIde(row.job.id); $event.stopPropagation()"
+                      >
+                        @if (ideLoadingJobIds().has(row.job.id)) {
                           {{ 'jobs.action.starting' | transloco }}
-                        </button>
-                      } @else {
-                        <button
-                          class="action-btn ide"
-                          [class.gitea-only]="!row.job.snapshot_status && !hasLiveVm(row.job)"
-                          (click)="openIde(row.job.id); $event.stopPropagation()"
-                          [title]="(row.job.snapshot_status === 'available' ? 'jobs.tooltip.ideSnapshot' : 'jobs.tooltip.ideCode') | transloco"
-                        >
+                        } @else {
                           {{ 'jobs.action.ide' | transloco }}
-                        </button>
-                      }
+                        }
+                      </app-button>
                     }
                     @if (row.job.status === 'processing') {
-                      @if (cancelingJobIds().has(row.job.id)) {
-                        <button
-                          class="action-btn canceling"
-                          disabled
-                          [title]="'jobs.tooltip.canceling' | transloco"
-                        >
-                          <span class="btn-spinner"></span>
-                          {{ 'jobs.action.canceling' | transloco }}
-                        </button>
-                      } @else {
-                        <button
-                          class="action-btn pause"
-                          (click)="pauseJob(row.job.id); $event.stopPropagation()"
-                          [title]="'jobs.tooltip.pauseJob' | transloco"
-                        >
-                          {{ 'jobs.action.pause' | transloco }}
-                        </button>
-                        @if (confirmingCancelId() === row.job.id) {
-                          <button
-                            class="action-btn cancel confirming"
-                            (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                            [title]="'jobs.tooltip.confirmCancel' | transloco"
-                          >
-                            {{ 'jobs.action.sure' | transloco }}
-                          </button>
-                        } @else {
-                          <button
-                            class="action-btn cancel"
-                            (click)="confirmCancel(row.job.id); $event.stopPropagation()"
-                            [title]="'jobs.tooltip.cancelJob' | transloco"
-                          >
-                            {{ 'jobs.action.cancel' | transloco }}
-                          </button>
-                        }
-                      }
+                      <app-button
+                        variant="secondary"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.pauseJob' | transloco"
+                        (clicked)="pauseJob(row.job.id); $event.stopPropagation()"
+                      >
+                        {{ 'jobs.action.pause' | transloco }}
+                      </app-button>
                     }
                     @if (row.job.status === 'pending_review') {
-                      <button
-                        class="action-btn review"
-                        (click)="reviewJob(row.job.id); $event.stopPropagation()"
-                        [title]="'jobs.tooltip.reviewJob' | transloco"
+                      <app-button
+                        variant="warning"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.reviewJob' | transloco"
+                        (clicked)="reviewJob(row.job.id); $event.stopPropagation()"
                       >
                         {{ 'jobs.action.review' | transloco }}
-                      </button>
+                      </app-button>
                     }
                     @if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
-                      <button
-                        class="action-btn resume"
-                        (click)="resumeJob(row.job.id); $event.stopPropagation()"
-                        [title]="'jobs.tooltip.resumeJob' | transloco"
+                      <app-button
+                        variant="success"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.resumeJob' | transloco"
+                        (clicked)="resumeJob(row.job.id); $event.stopPropagation()"
                       >
                         {{ 'jobs.action.resume' | transloco }}
-                      </button>
+                      </app-button>
                     }
-                    @if (row.job.status !== 'processing' && row.job.status !== 'completed' && row.job.status !== 'cancelled') {
-                      @if (cancelingJobIds().has(row.job.id)) {
-                        <button
-                          class="action-btn canceling"
-                          disabled
-                          [title]="'jobs.tooltip.canceling' | transloco"
+                    @if (row.job.status !== 'completed' && row.job.status !== 'cancelled') {
+                      @if (confirmingCancelId() === row.job.id) {
+                        <app-button
+                          variant="danger"
+                          size="sm"
+                          [loading]="cancelingJobIds().has(row.job.id)"
+                          [ariaLabel]="'jobs.tooltip.confirmCancel' | transloco"
+                          (clicked)="cancelJob(row.job.id); $event.stopPropagation()"
                         >
-                          <span class="btn-spinner"></span>
-                          {{ 'jobs.action.canceling' | transloco }}
-                        </button>
-                      } @else if (confirmingCancelId() === row.job.id) {
-                        <button
-                          class="action-btn cancel confirming"
-                          (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                          [title]="'jobs.tooltip.confirmCancel' | transloco"
-                        >
-                          {{ 'jobs.action.sure' | transloco }}
-                        </button>
+                          @if (cancelingJobIds().has(row.job.id)) {
+                            {{ 'jobs.action.canceling' | transloco }}
+                          } @else {
+                            {{ 'jobs.action.sure' | transloco }}
+                          }
+                        </app-button>
                       } @else {
-                        <button
-                          class="action-btn cancel"
-                          (click)="confirmCancel(row.job.id); $event.stopPropagation()"
-                          [title]="'jobs.tooltip.cancelJob' | transloco"
+                        <app-button
+                          variant="warning"
+                          size="sm"
+                          [loading]="cancelingJobIds().has(row.job.id)"
+                          [ariaLabel]="'jobs.tooltip.cancelJob' | transloco"
+                          (clicked)="confirmCancel(row.job.id); $event.stopPropagation()"
                         >
-                          {{ 'jobs.action.cancel' | transloco }}
-                        </button>
+                          @if (cancelingJobIds().has(row.job.id)) {
+                            {{ 'jobs.action.canceling' | transloco }}
+                          } @else {
+                            {{ 'jobs.action.cancel' | transloco }}
+                          }
+                        </app-button>
                       }
                     }
                     @if (row.job.status === 'completed' && !row.job.project_id) {
-                      <button
-                        class="action-btn promote"
-                        (click)="togglePromote(row.job.id); $event.stopPropagation()"
-                        [title]="'jobs.tooltip.promoteJob' | transloco"
+                      <app-button
+                        variant="info"
+                        size="sm"
+                        [ariaLabel]="'jobs.tooltip.promoteJob' | transloco"
+                        (clicked)="togglePromote(row.job.id); $event.stopPropagation()"
                       >
                         {{ 'jobs.action.promote' | transloco }}
-                      </button>
+                      </app-button>
                     }
                     @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
-                      @if (confirmingDeleteId() === row.job.id) {
-                        <button
-                          class="action-btn delete confirming"
-                          (click)="deleteJob(row.job.id); $event.stopPropagation()"
-                          [title]="'jobs.tooltip.confirmDelete' | transloco"
-                        >
+                      <app-button
+                        variant="danger"
+                        size="sm"
+                        [ariaLabel]="(confirmingDeleteId() === row.job.id ? 'jobs.tooltip.confirmDelete' : 'jobs.tooltip.deleteJob') | transloco"
+                        (clicked)="confirmingDeleteId() === row.job.id ? deleteJob(row.job.id) : confirmDelete(row.job.id); $event.stopPropagation()"
+                      >
+                        @if (confirmingDeleteId() === row.job.id) {
                           {{ 'jobs.action.confirmDelete' | transloco }}
-                        </button>
-                      } @else {
-                        <button
-                          class="action-btn delete"
-                          (click)="confirmDelete(row.job.id); $event.stopPropagation()"
-                          [title]="'jobs.tooltip.deleteJob' | transloco"
-                        >
+                        } @else {
                           {{ 'jobs.action.delete' | transloco }}
-                        </button>
-                      }
+                        }
+                      </app-button>
                     }
                   </td>
                 </tr>
@@ -305,37 +292,39 @@ interface JobRow {
                   <tr class="promote-row" (click)="$event.stopPropagation()">
                     <td colspan="5">
                       <div class="promote-form">
-                        <input
-                          class="promote-input"
+                        <app-input
+                          size="sm"
                           [placeholder]="'jobs.promote.namePlaceholder' | transloco"
                           [value]="promoteName()"
-                          (input)="promoteName.set(asInputValue($event))"
+                          (valueChange)="promoteName.set($event)"
                         />
-                        <input
-                          class="promote-input"
+                        <app-input
+                          size="sm"
                           [placeholder]="'jobs.promote.descriptionPlaceholder' | transloco"
                           [value]="promoteDescription()"
-                          (input)="promoteDescription.set(asInputValue($event))"
+                          (valueChange)="promoteDescription.set($event)"
                         />
-                        <input
-                          class="promote-input"
+                        <app-input
+                          size="sm"
                           [placeholder]="'jobs.promote.goalPlaceholder' | transloco"
                           [value]="promoteGoal()"
-                          (input)="promoteGoal.set(asInputValue($event))"
+                          (valueChange)="promoteGoal.set($event)"
                         />
-                        <button
-                          class="action-btn promote"
+                        <app-button
+                          variant="info"
+                          size="sm"
                           [disabled]="!promoteName().trim()"
-                          (click)="submitPromote(row.job.id)"
+                          (clicked)="submitPromote(row.job.id)"
                         >
                           {{ 'jobs.action.createProject' | transloco }}
-                        </button>
-                        <button
-                          class="action-btn cancel"
-                          (click)="promoteJobId.set(null)"
+                        </app-button>
+                        <app-button
+                          variant="secondary"
+                          size="sm"
+                          (clicked)="promoteJobId.set(null)"
                         >
                           {{ 'jobs.action.cancel' | transloco }}
-                        </button>
+                        </app-button>
                       </div>
                     </td>
                   </tr>
@@ -392,50 +381,19 @@ interface JobRow {
         flex-wrap: wrap;
       }
 
-      .filter-chip {
-        padding: 4px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .filter-chip:hover {
-        background: var(--surface-0, #313244);
-      }
-
-      .filter-chip.active {
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
-        border-color: var(--accent-color, #cba6f7);
-      }
-
-      .filter-chip .count {
+      .filter-chips .count {
         opacity: 0.7;
         font-size: 10px;
+        margin-left: 2px;
       }
 
       .refresh-btn {
         margin-left: auto;
-        padding: 5px 12px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 11px;
-        cursor: pointer;
-      }
-
-      .refresh-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
       }
 
       .snapshot-stats {
         font-size: 10px;
-        color: #6c7086;
+        color: var(--text-muted);
         margin-left: 8px;
         flex-shrink: 0;
       }
@@ -449,19 +407,6 @@ interface JobRow {
         gap: 12px;
         padding: 40px;
         flex: 1;
-      }
-
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
       }
 
       /* Empty State */
@@ -539,64 +484,6 @@ interface JobRow {
         background: rgba(203, 166, 247, 0.15);
       }
 
-      /* Status Badge */
-      .status-badge {
-        display: inline-block;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 500;
-        text-transform: capitalize;
-        white-space: nowrap;
-      }
-
-      .status-badge.status-created {
-        background: rgba(137, 180, 250, 0.2);
-        color: #89b4fa;
-      }
-
-      .status-badge.status-processing {
-        background: rgba(249, 226, 175, 0.2);
-        color: #f9e2af;
-      }
-
-      .status-badge.status-completed {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-      }
-
-      .status-badge.status-failed {
-        background: rgba(243, 139, 168, 0.2);
-        color: #f38ba8;
-      }
-
-      .status-badge.status-cancelled {
-        background: rgba(108, 112, 134, 0.2);
-        color: #6c7086;
-      }
-
-      .status-badge.status-pending_review {
-        background: rgba(250, 179, 135, 0.2);
-        color: #fab387;
-        font-weight: 600;
-      }
-
-      .status-badge.status-paused {
-        background: rgba(180, 190, 254, 0.2);
-        color: #b4befe;
-      }
-
-      .status-badge.status-reviewing {
-        background: rgba(203, 166, 247, 0.2);
-        color: #cba6f7;
-        font-weight: 600;
-      }
-
-      .status-badge.status-waiting {
-        background: rgba(116, 199, 236, 0.2);
-        color: #74c7ec;
-      }
-
       /* Hierarchy */
       .status-cell-inner {
         display: flex;
@@ -661,8 +548,8 @@ interface JobRow {
         font-weight: 500;
         text-transform: uppercase;
         letter-spacing: 0.3px;
-        background: rgba(203, 166, 247, 0.15);
-        color: #cba6f7;
+        background: color-mix(in srgb, var(--accent-color) 15%, transparent);
+        color: var(--accent-color);
         margin-left: 2px;
         flex-shrink: 0;
       }
@@ -674,8 +561,8 @@ interface JobRow {
         font-size: 9px;
         font-weight: 500;
         letter-spacing: 0.3px;
-        background: rgba(116, 199, 236, 0.15);
-        color: #74c7ec;
+        background: var(--info-tint);
+        color: var(--info);
         margin-left: 4px;
         flex-shrink: 0;
         cursor: help;
@@ -690,8 +577,8 @@ interface JobRow {
         font-weight: 600;
         line-height: 16px;
         text-align: center;
-        background: rgba(166, 227, 161, 0.15);
-        color: #a6e3a1;
+        background: var(--success-tint);
+        color: var(--success);
         margin-left: 4px;
         flex-shrink: 0;
         cursor: help;
@@ -746,127 +633,10 @@ interface JobRow {
       .actions-cell {
         white-space: nowrap;
         overflow: hidden;
-      }
-
-      .action-btn {
-        padding: 3px 6px;
-        margin-right: 3px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        font-size: 10px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .action-btn:last-child {
-        margin-right: 0;
-      }
-
-      .action-btn.view {
-        color: #89b4fa;
-        border-color: #89b4fa;
-      }
-
-      .action-btn.pause {
-        color: #b4befe;
-        border-color: #b4befe;
-      }
-
-      .action-btn.cancel {
-        color: #f9e2af;
-        border-color: #f9e2af;
-      }
-
-      .action-btn.canceling {
-        color: #6c7086;
-        border-color: #6c7086;
-        cursor: not-allowed;
-        opacity: 0.7;
-        display: inline-flex;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px;
         align-items: center;
-        gap: 4px;
-      }
-
-      .btn-spinner {
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        border: 1.5px solid #6c7086;
-        border-top-color: #f9e2af;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      .action-btn.delete {
-        color: #f38ba8;
-        border-color: #f38ba8;
-      }
-
-      .action-btn.resume {
-        color: #a6e3a1;
-        border-color: #a6e3a1;
-      }
-
-      .action-btn.review {
-        color: #fab387;
-        border-color: #fab387;
-        font-weight: 600;
-      }
-
-      .action-btn.workspace {
-        color: #94e2d5;
-        border-color: #94e2d5;
-        text-decoration: none;
-      }
-
-      .action-btn.ide {
-        color: #89b4fa;
-        border-color: #89b4fa;
-        text-decoration: none;
-        cursor: pointer;
-      }
-
-      .action-btn.ide.gitea-only {
-        color: #7f849c;
-        border-color: #7f849c;
-        opacity: 0.7;
-      }
-
-      .action-btn.ide.loading {
-        color: #6c7086;
-        border-color: #6c7086;
-        cursor: not-allowed;
-        opacity: 0.7;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-      }
-
-      .action-btn.promote {
-        color: #94e2d5;
-        border-color: #94e2d5;
-      }
-
-      .action-btn.promote:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .action-btn.confirming {
-        font-weight: 700;
-        animation: pulse-confirm 1s ease-in-out infinite;
-        color: #f38ba8;
-        border-color: #f38ba8;
-      }
-
-      @keyframes pulse-confirm {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.6; }
-      }
-
-      .action-btn:hover {
-        background: rgba(255, 255, 255, 0.1);
       }
 
       /* Footer */
@@ -897,19 +667,9 @@ interface JobRow {
         padding: 8px 0;
       }
 
-      .promote-input {
-        padding: 5px 8px;
-        background: var(--surface-0, #313244);
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        color: var(--text-primary, #cdd6f4);
-        font-size: 11px;
-        font-family: inherit;
-        outline: none;
-      }
-
-      .promote-input:focus {
-        border-color: var(--accent-color, #cba6f7);
+      .promote-form app-input {
+        flex: 1 1 160px;
+        min-width: 140px;
       }
 
       @media (max-width: 768px) {
@@ -953,14 +713,6 @@ interface JobRow {
           white-space: normal;
         }
 
-        .action-btn {
-          padding: 3px 5px;
-          font-size: 9px;
-          margin-right: 1px;
-          margin-bottom: 2px;
-          display: inline-block;
-        }
-
         .prompt-text {
           font-size: 11px;
         }
@@ -972,11 +724,6 @@ interface JobRow {
 
         .filter-chips {
           gap: 3px;
-        }
-
-        .filter-chip {
-          padding: 3px 7px;
-          font-size: 10px;
         }
 
         .table-container {
@@ -1148,6 +895,28 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   getStatusCount(status: string): number {
     return this.jobs().filter((job) => job.status === status).length;
+  }
+
+  jobStatusTone(status: string): BadgeTone {
+    switch (status) {
+      case 'completed':
+        return 'success';
+      case 'processing':
+      case 'pending_review':
+        return 'warning';
+      case 'failed':
+        return 'danger';
+      case 'created':
+      case 'waiting':
+        return 'info';
+      case 'reviewing':
+        return 'accent';
+      case 'cancelled':
+      case 'paused':
+        return 'neutral';
+      default:
+        return 'neutral';
+    }
   }
 
   selectJob(jobId: string): void {
@@ -1390,10 +1159,6 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.refresh();
       }
     });
-  }
-
-  asInputValue(event: Event): string {
-    return (event.target as HTMLInputElement).value;
   }
 
   getUserColor(userId?: string | null): string | null {

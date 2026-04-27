@@ -1,10 +1,14 @@
 import {Component, effect, inject, signal} from '@angular/core';
-import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../../core/services/api.service';
 import {DataService} from '../../../core/services/data.service';
 import {Job} from '../../../core/models/api.model';
 import {environment} from '../../../core/environment';
+import {AppButtonComponent} from '../../../ui/button';
+import {AppIconButtonComponent} from '../../../ui/icon-button';
+import {AppBadgeComponent, type BadgeTone} from '../../../ui/badge';
+import {AppTextareaComponent} from '../../../ui/textarea';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -30,14 +34,28 @@ interface FrozenJobData {
 @Component({
   selector: 'app-job-review',
   standalone: true,
-  imports: [FormsModule, TranslocoPipe],
+  imports: [
+    TranslocoPipe,
+    AppButtonComponent,
+    AppIconButtonComponent,
+    AppBadgeComponent,
+    AppTextareaComponent,
+    AppSpinnerComponent,
+  ],
   template: `
     <div class="review-container">
       <div class="header">
         <span class="title">{{ 'jobReview.title' | transloco }}</span>
-        <button class="refresh-btn" (click)="loadJob()" [disabled]="isLoading()">
-          &#x21bb;
-        </button>
+        <app-icon-button
+          variant="ghost"
+          size="sm"
+          class="refresh-btn"
+          [ariaLabel]="'jobReview.refresh' | transloco"
+          [disabled]="isLoading()"
+          (clicked)="loadJob()"
+        >
+          ↻
+        </app-icon-button>
       </div>
 
       @if (!currentJobId()) {
@@ -46,7 +64,7 @@ interface FrozenJobData {
         </div>
       } @else if (isLoading()) {
         <div class="loading-state">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>{{ 'jobReview.loading' | transloco }}</span>
         </div>
       } @else if (!job()) {
@@ -56,9 +74,9 @@ interface FrozenJobData {
       } @else if (job()!.status !== 'pending_review') {
         <div class="not-review-state">
           <div class="status-info">
-            <span class="status-badge" [class]="'status-' + job()!.status">
+            <app-badge [tone]="jobStatusTone(job()!.status)" size="sm">
               {{ job()!.status }}
-            </span>
+            </app-badge>
           </div>
           <span class="status-message">
             {{ 'jobReview.empty.notPending' | transloco }}
@@ -132,21 +150,23 @@ interface FrozenJobData {
           @if (getWorkspaceUrl() || hasSnapshot()) {
             <div class="section workspace-links">
               @if (getWorkspaceUrl()) {
-                <button class="workspace-link" (click)="openWorkspace()">
+                <app-button variant="secondary" size="sm" (clicked)="openWorkspace()">
                   {{ 'jobReview.links.browseWorkspace' | transloco }}
-                </button>
+                </app-button>
               }
               @if (hasSnapshot()) {
-                @if (ideLoading()) {
-                  <button class="workspace-link ide-link loading" disabled>
-                    <span class="ide-spinner"></span>
+                <app-button
+                  variant="info"
+                  size="sm"
+                  [loading]="ideLoading()"
+                  (clicked)="openIde()"
+                >
+                  @if (ideLoading()) {
                     {{ 'jobReview.links.startingIde' | transloco }}
-                  </button>
-                } @else {
-                  <button class="workspace-link ide-link" (click)="openIde()">
+                  } @else {
                     {{ 'jobReview.links.openIde' | transloco }}
-                  </button>
-                }
+                  }
+                </app-button>
               }
             </div>
           }
@@ -169,59 +189,59 @@ interface FrozenJobData {
                   </div>
                 </div>
                 <div class="action-group">
-                  <button
-                    class="btn upgrade-btn"
-                    (click)="upgradeToVm()"
-                    [disabled]="isUpgrading()"
+                  <app-button
+                    variant="warning"
+                    [loading]="isUpgrading()"
+                    (clicked)="upgradeToVm()"
                   >
-                    @if (isUpgrading()) { {{ 'jobReview.vmUpgrade.upgrading' | transloco }} } @else { {{ 'jobReview.vmUpgrade.upgradeToVm' | transloco }} }
-                  </button>
-                  <button
-                    class="btn continue-btn"
-                    (click)="continueJob()"
-                    [disabled]="isResuming()"
+                    @if (isUpgrading()) {
+                      {{ 'jobReview.vmUpgrade.upgrading' | transloco }}
+                    } @else {
+                      {{ 'jobReview.vmUpgrade.upgradeToVm' | transloco }}
+                    }
+                  </app-button>
+                  <app-button
+                    variant="secondary"
+                    [loading]="isResuming()"
+                    (clicked)="continueJob()"
                   >
-                    @if (isResuming()) { {{ 'jobReview.vmUpgrade.resuming' | transloco }} } @else { {{ 'jobReview.vmUpgrade.resumeWithoutVm' | transloco }} }
-                  </button>
+                    @if (isResuming()) {
+                      {{ 'jobReview.vmUpgrade.resuming' | transloco }}
+                    } @else {
+                      {{ 'jobReview.vmUpgrade.resumeWithoutVm' | transloco }}
+                    }
+                  </app-button>
                 </div>
               </div>
             } @else {
               <!-- Approve / Continue (depends on freeze type) -->
               <div class="action-group">
                 @if (frozenData()?.freeze_type === 'phase_boundary') {
-                  <button
-                    class="btn continue-btn"
-                    (click)="continueJob()"
-                    [disabled]="isResuming()"
+                  <app-button
+                    variant="warning"
+                    [loading]="isResuming()"
+                    (clicked)="continueJob()"
                   >
                     @if (isResuming()) {
                       {{ 'jobReview.actions.continuing' | transloco }}
                     } @else {
                       {{ 'jobReview.actions.continue' | transloco }}
                     }
-                  </button>
+                  </app-button>
                 } @else {
-                  @if (confirmingApprove()) {
-                    <button
-                      class="btn approve-btn confirming"
-                      (click)="approveJob()"
-                      [disabled]="isApproving()"
-                    >
+                  <app-button
+                    variant="success"
+                    [loading]="isApproving()"
+                    (clicked)="confirmingApprove() ? approveJob() : confirmApprove()"
+                  >
+                    @if (isApproving()) {
+                      {{ 'jobReview.actions.approving' | transloco }}
+                    } @else if (confirmingApprove()) {
                       {{ 'jobReview.actions.confirmApprove' | transloco }}
-                    </button>
-                  } @else {
-                    <button
-                      class="btn approve-btn"
-                      (click)="confirmApprove()"
-                      [disabled]="isApproving()"
-                    >
-                      @if (isApproving()) {
-                        {{ 'jobReview.actions.approving' | transloco }}
-                      } @else {
-                        {{ 'jobReview.actions.approve' | transloco }}
-                      }
-                    </button>
-                  }
+                    } @else {
+                      {{ 'jobReview.actions.approve' | transloco }}
+                    }
+                  </app-button>
                 }
               </div>
             }
@@ -233,23 +253,23 @@ interface FrozenJobData {
 
             <!-- Feedback + Continue -->
             <div class="action-group">
-              <textarea
-                class="feedback-input"
-                [(ngModel)]="feedbackText"
+              <app-textarea
+                [(value)]="feedbackText"
                 [placeholder]="'jobReview.actions.feedbackPlaceholder' | transloco"
-                rows="4"
-              ></textarea>
-              <button
-                class="btn continue-btn"
-                (click)="continueWithFeedback()"
-                [disabled]="isResuming() || !feedbackText.trim()"
+                [rows]="4"
+              />
+              <app-button
+                variant="warning"
+                [loading]="isResuming()"
+                [disabled]="!feedbackText.trim()"
+                (clicked)="continueWithFeedback()"
               >
                 @if (isResuming()) {
                   {{ 'jobReview.actions.resuming' | transloco }}
                 } @else {
                   {{ 'jobReview.actions.continueWithFeedback' | transloco }}
                 }
-              </button>
+              </app-button>
             </div>
           </div>
 
@@ -295,17 +315,6 @@ interface FrozenJobData {
 
       .refresh-btn {
         margin-left: auto;
-        padding: 4px 8px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 14px;
-        cursor: pointer;
-      }
-
-      .refresh-btn:hover:not(:disabled) {
-        background: var(--surface-0, #313244);
       }
 
       /* Empty / Loading States */
@@ -327,35 +336,6 @@ interface FrozenJobData {
         font-size: 12px;
         opacity: 0.7;
       }
-
-      .spinner {
-        width: 24px;
-        height: 24px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
-
-      .status-badge {
-        display: inline-block;
-        padding: 3px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 500;
-        text-transform: capitalize;
-      }
-
-      .status-badge.status-created { background: rgba(137, 180, 250, 0.2); color: #89b4fa; }
-      .status-badge.status-processing { background: rgba(249, 226, 175, 0.2); color: #f9e2af; }
-      .status-badge.status-completed { background: rgba(166, 227, 161, 0.2); color: #a6e3a1; }
-      .status-badge.status-failed { background: rgba(243, 139, 168, 0.2); color: #f38ba8; }
-      .status-badge.status-cancelled { background: rgba(108, 112, 134, 0.2); color: #6c7086; }
-      .status-badge.status-pending_review { background: rgba(250, 179, 135, 0.2); color: #fab387; }
 
       .status-message {
         font-size: 12px;
@@ -464,63 +444,10 @@ interface FrozenJobData {
         font-style: italic;
       }
 
-      /* Workspace Link */
-      .workspace-link {
-        display: inline-block;
-        padding: 6px 12px;
-        border: 1px solid #94e2d5;
-        border-radius: 4px;
-        color: #94e2d5;
-        text-decoration: none;
-        font-size: 12px;
-        text-align: center;
-        transition: background 0.15s ease;
-      }
-
-      .workspace-link:hover {
-        background: rgba(148, 226, 213, 0.1);
-      }
-
       .workspace-links {
         display: flex;
         gap: 8px;
         flex-wrap: wrap;
-      }
-
-      .workspace-link.ide-link {
-        border-color: #89b4fa;
-        color: #89b4fa;
-        cursor: pointer;
-        background: none;
-        font: inherit;
-      }
-
-      .workspace-link.ide-link:hover {
-        background: rgba(137, 180, 250, 0.1);
-      }
-
-      .workspace-link.ide-link.loading {
-        color: #6c7086;
-        border-color: #6c7086;
-        cursor: not-allowed;
-        opacity: 0.7;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-      }
-
-      .ide-spinner {
-        display: inline-block;
-        width: 10px;
-        height: 10px;
-        border: 1.5px solid #6c7086;
-        border-top-color: #89b4fa;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
       }
 
       /* Actions */
@@ -561,73 +488,6 @@ interface FrozenJobData {
         color: var(--text-muted, #6c7086);
         text-transform: uppercase;
         letter-spacing: 0.5px;
-      }
-
-      .btn {
-        padding: 8px 16px;
-        border: none;
-        border-radius: 4px;
-        font-size: 12px;
-        font-weight: 600;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-
-      .approve-btn {
-        background: rgba(166, 227, 161, 0.2);
-        color: #a6e3a1;
-        border: 1px solid #a6e3a1;
-      }
-
-      .approve-btn:hover:not(:disabled) {
-        background: rgba(166, 227, 161, 0.3);
-      }
-
-      .approve-btn.confirming {
-        animation: pulse-confirm 1s ease-in-out infinite;
-      }
-
-      @keyframes pulse-confirm {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.6; }
-      }
-
-      .continue-btn {
-        background: rgba(250, 179, 135, 0.2);
-        color: #fab387;
-        border: 1px solid #fab387;
-      }
-
-      .continue-btn:hover:not(:disabled) {
-        background: rgba(250, 179, 135, 0.3);
-      }
-
-      .feedback-input {
-        width: 100%;
-        padding: 8px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: var(--surface-0, #313244);
-        color: var(--text-primary, #cdd6f4);
-        font-size: 12px;
-        font-family: inherit;
-        resize: vertical;
-        min-height: 60px;
-        box-sizing: border-box;
-      }
-
-      .feedback-input::placeholder {
-        color: var(--text-muted, #6c7086);
-      }
-
-      .feedback-input:focus {
-        outline: none;
-        border-color: var(--accent-color, #cba6f7);
       }
 
       /* Result Message */
@@ -687,15 +547,6 @@ interface FrozenJobData {
         font-style: italic;
       }
 
-      .upgrade-btn {
-        background: rgba(249, 226, 175, 0.2) !important;
-        color: #f9e2af !important;
-        border: 1px solid #f9e2af !important;
-      }
-
-      .upgrade-btn:hover:not(:disabled) {
-        background: rgba(249, 226, 175, 0.3) !important;
-      }
     `,
   ],
 })
@@ -950,6 +801,28 @@ export class JobReviewComponent {
         this.resultIsError.set(true);
       }
     });
+  }
+
+  jobStatusTone(status: string): BadgeTone {
+    switch (status) {
+      case 'completed':
+        return 'success';
+      case 'processing':
+      case 'pending_review':
+        return 'warning';
+      case 'failed':
+        return 'danger';
+      case 'created':
+      case 'waiting':
+        return 'info';
+      case 'reviewing':
+        return 'accent';
+      case 'cancelled':
+      case 'paused':
+        return 'neutral';
+      default:
+        return 'neutral';
+    }
   }
 
   formatDate(dateString: string): string {

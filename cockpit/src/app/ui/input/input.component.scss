@@ -1,0 +1,88 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+
+  &[data-full-width] {
+    display: block;
+    width: 100%;
+  }
+}
+
+.app-input__field {
+  width: 100%;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+
+  font-family: inherit;
+  font-weight: v.$font-weight-normal;
+  line-height: v.$line-height-tight;
+  color: var(--text-primary);
+
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease;
+
+  &:focus { outline: none; }
+
+  &::placeholder {
+    color: var(--text-muted);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  &:read-only {
+    background: var(--panel-bg);
+    cursor: default;
+  }
+
+  &[data-invalid] {
+    border-color: var(--danger);
+  }
+
+  // --- Sizes ---
+  &[data-size='sm'] {
+    height: 28px;
+    padding: 0 v.$space-sm;
+    font-size: v.$font-size-xs;
+    border-radius: v.$radius-sm;
+  }
+
+  &[data-size='md'] {
+    height: 36px;
+    padding: 0 v.$space-md;
+    font-size: v.$font-size-sm;
+    border-radius: v.$radius-md;
+  }
+
+  &[data-size='lg'] {
+    height: 44px;
+    padding: 0 v.$space-lg;
+    font-size: v.$font-size-base;
+    border-radius: v.$radius-md;
+  }
+}
+
+// CDK FocusMonitor adds .cdk-keyboard-focused on the host when focused via
+// keyboard. Show the focus ring only then; mouse clicks stay clean.
+:host.cdk-keyboard-focused .app-input__field {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+  border-color: var(--accent-color);
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-input__field {
+    min-height: v.$touch-target-min;
+  }
+}

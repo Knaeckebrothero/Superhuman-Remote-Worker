@@ -1,0 +1,62 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+}
+
+.app-theme-toggle__group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border-color);
+  border-radius: v.$radius-md;
+  background: var(--surface-0);
+}
+
+.app-theme-toggle__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 32px;
+  height: 28px;
+  padding: 0 8px;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: v.$radius-sm;
+  cursor: pointer;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+
+  &:hover {
+    color: var(--text-primary);
+    background: var(--hover);
+  }
+
+  &[data-active] {
+    background: var(--surface-2);
+    color: var(--text-primary);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+}
+
+.app-theme-toggle__label {
+  line-height: 1;
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-theme-toggle__btn {
+    min-width: v.$touch-target-min;
+    height: v.$touch-target-min;
+  }
+}

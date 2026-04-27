@@ -1,0 +1,64 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: block;
+  border-radius: v.$radius-md;
+  border: 1px solid var(--border-color);
+  background: var(--surface-0);
+  color: var(--text-primary);
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease,
+    box-shadow 0.15s ease;
+
+  &[data-variant='panel'] {
+    background: var(--panel-bg);
+  }
+
+  &[data-variant='outlined'] {
+    background: transparent;
+  }
+
+  &[data-variant='ghost'] {
+    background: transparent;
+    border-color: transparent;
+  }
+
+  &[data-padding='none'] { padding: 0; }
+  &[data-padding='sm']   { padding: v.$space-sm; }
+  &[data-padding='md']   { padding: v.$space-md; }
+  &[data-padding='lg']   { padding: v.$space-lg; }
+
+  &[data-interactive] {
+    cursor: pointer;
+    user-select: none;
+
+    &:hover:not([data-disabled]) {
+      border-color: var(--accent-color);
+    }
+
+    &:focus { outline: none; }
+
+    &.cdk-keyboard-focused,
+    &:focus-visible {
+      outline: 2px solid var(--accent-color);
+      outline-offset: 2px;
+    }
+  }
+
+  &[data-selected] {
+    border-color: var(--accent-color);
+    background: var(--hover, var(--surface-1));
+  }
+
+  &[data-disabled] {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :host {
+    transition: none;
+  }
+}
