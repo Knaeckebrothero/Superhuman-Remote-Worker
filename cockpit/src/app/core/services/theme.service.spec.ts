@@ -55,77 +55,126 @@ describe('ThemeService', () => {
   }
 
   describe('initial state', () => {
-    it('defaults to dark when no stored preference', () => {
+    it('defaults to senate when no stored preference', () => {
       const service = makeService();
-      expect(service.preference()).toBe('dark');
-      expect(service.resolved()).toBe('dark');
-      expect(document.body.classList.contains('theme-dark')).toBe(true);
-      expect(document.body.classList.contains('theme-light')).toBe(false);
+      expect(service.preference()).toBe('senate');
+      expect(service.resolved()).toBe('senate');
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+      expect(document.body.classList.contains('theme-travertine')).toBe(false);
     });
 
     it('reads stored preference from localStorage', () => {
-      window.localStorage.setItem('cockpit:theme', 'light');
+      window.localStorage.setItem('cockpit:theme', 'travertine');
       const service = makeService();
-      expect(service.preference()).toBe('light');
-      expect(service.resolved()).toBe('light');
-      expect(document.body.classList.contains('theme-light')).toBe(true);
+      expect(service.preference()).toBe('travertine');
+      expect(service.resolved()).toBe('travertine');
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
     });
 
-    it('ignores invalid stored values and falls back to dark', () => {
+    it('ignores invalid stored values and falls back to senate', () => {
       window.localStorage.setItem('cockpit:theme', 'gibberish');
       const service = makeService();
-      expect(service.preference()).toBe('dark');
+      expect(service.preference()).toBe('senate');
+    });
+
+    it('reads stored Roman theme preference', () => {
+      window.localStorage.setItem('cockpit:theme', 'praetorian');
+      const service = makeService();
+      expect(service.preference()).toBe('praetorian');
+      expect(service.resolved()).toBe('praetorian');
+      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
+    });
+
+    it('migrates legacy "dark" preference to senate', () => {
+      window.localStorage.setItem('cockpit:theme', 'dark');
+      const service = makeService();
+      expect(service.preference()).toBe('senate');
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+      // Migration should rewrite the stored value so subsequent reads are clean.
+      expect(window.localStorage.getItem('cockpit:theme')).toBe('senate');
+    });
+
+    it('migrates legacy "light" preference to travertine', () => {
+      window.localStorage.setItem('cockpit:theme', 'light');
+      const service = makeService();
+      expect(service.preference()).toBe('travertine');
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
+      expect(window.localStorage.getItem('cockpit:theme')).toBe('travertine');
     });
   });
 
   describe('setPreference', () => {
-    it('applies dark class on body', () => {
+    it('applies senate class on body', () => {
       const service = makeService();
-      service.setPreference('dark');
+      service.setPreference('senate');
       TestBed.tick();
-      expect(document.body.classList.contains('theme-dark')).toBe(true);
-      expect(document.body.classList.contains('theme-light')).toBe(false);
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+      expect(document.body.classList.contains('theme-travertine')).toBe(false);
     });
 
-    it('applies light class on body', () => {
+    it('applies travertine class on body', () => {
       const service = makeService();
-      service.setPreference('light');
+      service.setPreference('travertine');
       TestBed.tick();
-      expect(document.body.classList.contains('theme-light')).toBe(true);
-      expect(document.body.classList.contains('theme-dark')).toBe(false);
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
+      expect(document.body.classList.contains('theme-senate')).toBe(false);
     });
 
     it('persists choice to localStorage', () => {
       const service = makeService();
-      service.setPreference('light');
-      expect(window.localStorage.getItem('cockpit:theme')).toBe('light');
+      service.setPreference('travertine');
+      expect(window.localStorage.getItem('cockpit:theme')).toBe('travertine');
 
       service.setPreference('system');
       expect(window.localStorage.getItem('cockpit:theme')).toBe('system');
     });
+
+    it('strips previous theme class when switching', () => {
+      const service = makeService();
+      service.setPreference('senate');
+      TestBed.tick();
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+
+      service.setPreference('praetorian');
+      TestBed.tick();
+      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
+      expect(document.body.classList.contains('theme-senate')).toBe(false);
+    });
+
+    it('switches between travertine and praetorian', () => {
+      const service = makeService();
+      service.setPreference('travertine');
+      TestBed.tick();
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
+
+      service.setPreference('praetorian');
+      TestBed.tick();
+      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
+      expect(document.body.classList.contains('theme-travertine')).toBe(false);
+    });
   });
 
   describe('system preference', () => {
-    it('resolves to dark when system prefers dark', () => {
+    it('resolves to senate when system prefers dark', () => {
       mql = makeMockMql(true);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).matchMedia = vi.fn().mockReturnValue(mql);
       const service = makeService();
       service.setPreference('system');
       TestBed.tick();
-      expect(service.resolved()).toBe('dark');
-      expect(document.body.classList.contains('theme-dark')).toBe(true);
+      expect(service.resolved()).toBe('senate');
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
     });
 
-    it('resolves to light when system prefers light', () => {
+    it('resolves to travertine when system prefers light', () => {
       mql = makeMockMql(false);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).matchMedia = vi.fn().mockReturnValue(mql);
       const service = makeService();
       service.setPreference('system');
       TestBed.tick();
-      expect(service.resolved()).toBe('light');
-      expect(document.body.classList.contains('theme-light')).toBe(true);
+      expect(service.resolved()).toBe('travertine');
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
     });
 
     it('flips body class when system preference changes (preference=system)', () => {
@@ -135,13 +184,13 @@ describe('ThemeService', () => {
       const service = makeService();
       service.setPreference('system');
       TestBed.tick();
-      expect(service.resolved()).toBe('dark');
+      expect(service.resolved()).toBe('senate');
 
       mql.fire(false);
       TestBed.tick();
-      expect(service.resolved()).toBe('light');
-      expect(document.body.classList.contains('theme-light')).toBe(true);
-      expect(document.body.classList.contains('theme-dark')).toBe(false);
+      expect(service.resolved()).toBe('travertine');
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
+      expect(document.body.classList.contains('theme-senate')).toBe(false);
     });
 
     it('does not flip when preference is explicit (system OS change ignored)', () => {
@@ -149,13 +198,13 @@ describe('ThemeService', () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (window as any).matchMedia = vi.fn().mockReturnValue(mql);
       const service = makeService();
-      service.setPreference('light');
+      service.setPreference('travertine');
       TestBed.tick();
-      expect(service.resolved()).toBe('light');
+      expect(service.resolved()).toBe('travertine');
 
       mql.fire(true);
       TestBed.tick();
-      expect(service.resolved()).toBe('light');
+      expect(service.resolved()).toBe('travertine');
     });
   });
 });

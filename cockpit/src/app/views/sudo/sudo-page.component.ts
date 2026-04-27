@@ -246,7 +246,7 @@ function secondsLeft(req: SudoRequest): number {
         align-items: center;
         justify-content: space-between;
         padding: 12px 16px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
@@ -254,7 +254,7 @@ function secondsLeft(req: SudoRequest): number {
         margin: 0;
         font-size: 16px;
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .header-controls {
@@ -270,7 +270,7 @@ function secondsLeft(req: SudoRequest): number {
         background: var(--text-muted, #6c7086);
       }
       .status-dot.connected {
-        background: #a6e3a1;
+        background: var(--success);
       }
 
 
@@ -278,14 +278,14 @@ function secondsLeft(req: SudoRequest): number {
         display: flex;
         flex: 1;
         gap: 1px;
-        background: var(--border-color, #313244);
+        background: var(--border-color, var(--surface-0));
         overflow: hidden;
       }
 
       .panel {
         display: flex;
         flex-direction: column;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         overflow-y: auto;
       }
 
@@ -308,7 +308,7 @@ function secondsLeft(req: SudoRequest): number {
         text-transform: uppercase;
         letter-spacing: 0.5px;
         color: var(--text-muted, #6c7086);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
@@ -328,22 +328,22 @@ function secondsLeft(req: SudoRequest): number {
       }
 
       .request-card {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 6px;
         padding: 10px 12px;
-        border-left: 3px solid var(--border-color, #313244);
+        border-left: 3px solid var(--border-color, var(--surface-0));
       }
       .request-card.risk-low {
-        border-left-color: #a6e3a1;
+        border-left-color: var(--success);
       }
       .request-card.risk-medium {
-        border-left-color: #f9e2af;
+        border-left-color: var(--warning);
       }
       .request-card.risk-high {
-        border-left-color: #fab387;
+        border-left-color: var(--alert);
       }
       .request-card.risk-critical {
-        border-left-color: #f38ba8;
+        border-left-color: var(--danger);
       }
 
       .card-header {
@@ -366,7 +366,7 @@ function secondsLeft(req: SudoRequest): number {
 
       .card-command code {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         word-break: break-all;
       }
 
@@ -400,7 +400,7 @@ function secondsLeft(req: SudoRequest): number {
         display: flex;
         gap: 6px;
         padding: 8px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
       }
 
       .rule-form app-input {
@@ -412,13 +412,13 @@ function secondsLeft(req: SudoRequest): number {
         align-items: center;
         gap: 8px;
         padding: 6px 8px;
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         font-size: 12px;
       }
 
       .rule-pattern {
         flex: 1;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         font-size: 12px;
       }
 

@@ -295,7 +295,7 @@ interface FrozenJobData {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       .header {
@@ -304,13 +304,13 @@ interface FrozenJobData {
         gap: 8px;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .refresh-btn {
@@ -373,7 +373,7 @@ interface FrozenJobData {
 
       .job-description {
         font-size: 13px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         line-height: 1.4;
       }
 
@@ -387,7 +387,7 @@ interface FrozenJobData {
 
       .summary-text {
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         line-height: 1.5;
         white-space: pre-wrap;
       }
@@ -400,7 +400,7 @@ interface FrozenJobData {
       /* Confidence */
       .confidence-bar {
         height: 6px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         border-radius: 3px;
         overflow: hidden;
       }
@@ -411,14 +411,14 @@ interface FrozenJobData {
         transition: width 0.3s ease;
       }
 
-      .confidence-fill.low { background: #f38ba8; }
-      .confidence-fill.medium { background: #f9e2af; }
-      .confidence-fill.high { background: #a6e3a1; }
+      .confidence-fill.low { background: var(--danger); }
+      .confidence-fill.medium { background: var(--warning); }
+      .confidence-fill.high { background: var(--success); }
 
       .confidence-label {
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
       }
 
       /* Deliverables */
@@ -426,7 +426,7 @@ interface FrozenJobData {
         margin: 0;
         padding-left: 20px;
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .deliverable-item {
@@ -438,7 +438,7 @@ interface FrozenJobData {
       /* Notes */
       .notes-text {
         font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         line-height: 1.4;
         white-space: pre-wrap;
         font-style: italic;
@@ -456,7 +456,7 @@ interface FrozenJobData {
         flex-direction: column;
         gap: 12px;
         padding-top: 8px;
-        border-top: 1px solid var(--border-color, #313244);
+        border-top: 1px solid var(--border-color, var(--surface-0));
       }
 
       .action-group {
@@ -477,13 +477,13 @@ interface FrozenJobData {
         right: 0;
         top: 50%;
         height: 1px;
-        background: var(--border-color, #313244);
+        background: var(--border-color, var(--surface-0));
       }
 
       .divider-text {
         position: relative;
         padding: 0 12px;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
         font-size: 10px;
         color: var(--text-muted, #6c7086);
         text-transform: uppercase;
@@ -495,15 +495,15 @@ interface FrozenJobData {
         padding: 8px 12px;
         border-radius: 4px;
         font-size: 12px;
-        background: rgba(166, 227, 161, 0.15);
-        color: #a6e3a1;
-        border: 1px solid rgba(166, 227, 161, 0.3);
+        background: var(--success-tint);
+        color: var(--success);
+        border: 1px solid var(--success-tint);
       }
 
       .result-message.error {
-        background: rgba(243, 139, 168, 0.15);
-        color: #f38ba8;
-        border-color: rgba(243, 139, 168, 0.3);
+        background: var(--danger-tint);
+        color: var(--danger);
+        border-color: var(--danger-tint);
       }
 
       /* VM Upgrade Section */
@@ -521,28 +521,28 @@ interface FrozenJobData {
 
       .upgrade-title {
         font-weight: 600;
-        color: #f9e2af;
+        color: var(--warning);
       }
 
       .upgrade-reason {
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         font-size: 0.85em;
       }
 
       .upgrade-command {
         display: block;
         padding: 8px 12px;
-        background: var(--code-bg, #11111b);
-        border: 1px solid var(--border-color, #313244);
+        background: var(--code-bg, var(--timeline-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
         border-radius: 4px;
         font-family: monospace;
         font-size: 0.9em;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         word-break: break-all;
       }
 
       .upgrade-hint {
-        color: var(--text-secondary, #a6adc8);
+        color: var(--text-secondary, var(--text-secondary));
         font-size: 0.8em;
         font-style: italic;
       }

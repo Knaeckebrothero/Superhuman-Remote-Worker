@@ -707,12 +707,12 @@ import {UserService} from '../../core/services/user.service';
       gap: 2px;
     }
     .accordion-section {
-      border: 1px solid var(--border-color, #313244);
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       overflow: hidden;
     }
     .accordion-section.expanded {
-      border-color: var(--border-color, #45475a);
+      border-color: var(--border-color, var(--surface-1));
     }
     .accordion-header {
       display: flex;
@@ -721,8 +721,8 @@ import {UserService} from '../../core/services/user.service';
       width: 100%;
       padding: 10px 12px;
       border: none;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+      background: var(--surface-0, var(--surface-0));
+      color: var(--text-primary, var(--text-primary));
       font-size: 13px;
       font-weight: 500;
       cursor: pointer;
@@ -739,19 +739,19 @@ import {UserService} from '../../core/services/user.service';
       margin-left: auto;
       padding: 1px 6px;
       border-radius: 8px;
-      background: rgba(203, 166, 247, 0.15);
-      color: var(--accent-color, #cba6f7);
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      color: var(--accent-color, var(--accent-color));
       font-size: 11px;
       font-weight: 600;
     }
     .accordion-body {
       padding: 12px 14px;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
     }
     .phase-section {
       margin-bottom: 16px;
       padding-bottom: 12px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
     }
     .phase-section:last-of-type {
       border-bottom: none;
@@ -768,7 +768,7 @@ import {UserService} from '../../core/services/user.service';
     }
     .shared-params {
       padding-top: 8px;
-      border-top: 1px solid var(--border-color, #313244);
+      border-top: 1px solid var(--border-color, var(--surface-0));
     }
     .field-row {
       margin-bottom: 10px;
@@ -777,13 +777,13 @@ import {UserService} from '../../core/services/user.service';
       transition: border-color 0.15s;
     }
     .field-row.modified {
-      border-left-color: var(--accent-color, #cba6f7);
+      border-left-color: var(--accent-color, var(--accent-color));
     }
     .field-label {
       display: block;
       font-size: 12px;
       font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       margin-bottom: 4px;
     }
     .field-control {
@@ -800,16 +800,16 @@ import {UserService} from '../../core/services/user.service';
     .form-input {
       flex: 1;
       padding: 7px 10px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 6px;
-      background: var(--surface-0, #313244);
-      color: var(--text-primary, #cdd6f4);
+      background: var(--surface-0, var(--surface-0));
+      color: var(--text-primary, var(--text-primary));
       font-family: inherit;
       font-size: 13px;
     }
     .form-input:focus {
       outline: none;
-      border-color: var(--accent-color, #cba6f7);
+      border-color: var(--accent-color, var(--accent-color));
     }
     .form-input:disabled {
       opacity: 0.6;
@@ -831,7 +831,7 @@ import {UserService} from '../../core/services/user.service';
     }
     .form-range {
       flex: 1;
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
     }
     .toggle-row {
       display: flex;
@@ -843,11 +843,11 @@ import {UserService} from '../../core/services/user.service';
       align-items: center;
       gap: 6px;
       font-size: 13px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       cursor: pointer;
     }
     .toggle-label input[type="checkbox"] {
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
     }
     .reset-btn {
       display: inline-flex;
@@ -868,14 +868,14 @@ import {UserService} from '../../core/services/user.service';
     }
     .config-viewer-section {
       margin-top: 12px;
-      border: 1px solid var(--border-color, #313244);
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       overflow: hidden;
     }
     .config-viewer {
       max-height: 300px;
       overflow: auto;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
     }
     .config-json {
       padding: 12px 14px;
@@ -883,7 +883,7 @@ import {UserService} from '../../core/services/user.service';
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       line-height: 1.5;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       white-space: pre-wrap;
       word-break: break-all;
     }

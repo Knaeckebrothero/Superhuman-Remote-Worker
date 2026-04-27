@@ -409,7 +409,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
     }
 
     .override-count.has-overrides {
-      color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, var(--accent-color));
       font-weight: 600;
     }
 
@@ -422,11 +422,11 @@ function getNestedValue(obj: unknown, path: string): unknown {
       gap: 8px;
       width: 100%;
       padding: 8px 12px;
-      background: var(--surface-0, #313244);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--surface-0, var(--surface-0));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 6px;
       cursor: pointer;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       font-size: 13px;
       font-weight: 600;
       font-family: inherit;
@@ -456,7 +456,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
     /* Nested subsection */
     .config-subsection {
       margin-bottom: 8px;
-      border-left: 2px solid var(--border-color, #313244);
+      border-left: 2px solid var(--border-color, var(--surface-0));
       padding-left: 12px;
     }
 
@@ -469,13 +469,13 @@ function getNestedValue(obj: unknown, path: string): unknown {
       background: transparent;
       border: none;
       cursor: pointer;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       font-size: 12px;
       font-weight: 600;
       font-family: inherit;
     }
 
-    .subsection-header:hover { color: var(--text-primary, #cdd6f4); }
+    .subsection-header:hover { color: var(--text-primary, var(--text-primary)); }
 
     .subsection-body { padding: 8px 0 4px; }
 
@@ -493,7 +493,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       gap: 6px;
       font-size: 12px;
       font-weight: 500;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       margin-bottom: 4px;
     }
 
@@ -501,7 +501,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: var(--accent-color, #cba6f7);
+      background: var(--accent-color, var(--accent-color));
       flex-shrink: 0;
     }
 
@@ -521,7 +521,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
 
     .form-range {
       flex: 1;
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
       cursor: pointer;
     }
 
@@ -530,7 +530,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       text-align: right;
       font-size: 13px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       font-family: 'JetBrains Mono', monospace;
     }
 
@@ -554,10 +554,10 @@ function getNestedValue(obj: unknown, path: string): unknown {
 
     .json-error {
       font-size: 12px;
-      color: var(--red, #f38ba8);
+      color: var(--red, var(--danger));
       margin-top: 4px;
       padding: 4px 8px;
-      background: rgba(243, 139, 168, 0.08);
+      background: var(--danger-tint);
       border-radius: 4px;
     }
   `],

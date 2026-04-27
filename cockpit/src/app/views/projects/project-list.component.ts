@@ -135,7 +135,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .page-title {
       font-size: 22px;
       font-weight: 700;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       margin: 0;
     }
 
@@ -147,14 +147,14 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       font-size: 13px;
       font-family: inherit;
       cursor: pointer;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       transition: all 0.15s ease;
     }
 
     .btn-primary {
-      background: var(--accent-color, #cba6f7);
-      color: var(--timeline-bg, #11111b);
-      border-color: var(--accent-color, #cba6f7);
+      background: var(--accent-color, var(--accent-color));
+      color: var(--timeline-bg, var(--timeline-bg));
+      border-color: var(--accent-color, var(--accent-color));
       font-weight: 600;
     }
 
@@ -163,15 +163,15 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
     .btn-ghost {
       background: transparent;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
     }
 
-    .btn-ghost:hover:not(:disabled) { background: var(--surface-0, #313244); }
+    .btn-ghost:hover:not(:disabled) { background: var(--surface-0, var(--surface-0)); }
 
     /* Create Form */
     .create-form {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 8px;
       padding: 16px;
       margin-bottom: 20px;
@@ -182,17 +182,17 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .form-input {
       width: 100%;
       padding: 10px 12px;
-      background: var(--surface-0, #313244);
-      border: 1px solid var(--border-color, #45475a);
+      background: var(--surface-0, var(--surface-0));
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 6px;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
       font-size: 13px;
       font-family: inherit;
       outline: none;
       box-sizing: border-box;
     }
 
-    .form-input:focus { border-color: var(--accent-color, #cba6f7); }
+    .form-input:focus { border-color: var(--accent-color, var(--accent-color)); }
 
     .form-actions { display: flex; justify-content: flex-end; }
 
@@ -204,7 +204,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       justify-content: center;
       gap: 12px;
       padding: 60px 20px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
     }
 
     .empty-icon { font-size: 48px; opacity: 0.5; }
@@ -218,8 +218,8 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     }
 
     .project-card {
-      background: var(--panel-bg, #181825);
-      border: 1px solid var(--border-color, #313244);
+      background: var(--panel-bg, var(--panel-bg));
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 8px;
       padding: 16px;
       cursor: pointer;
@@ -227,7 +227,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     }
 
     .project-card:hover {
-      border-color: var(--accent-color, #cba6f7);
+      border-color: var(--accent-color, var(--accent-color));
       transform: translateY(-1px);
     }
 
@@ -242,7 +242,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .card-name {
       font-size: 15px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
 
     .card-badges { display: flex; gap: 6px; flex-shrink: 0; }
@@ -255,14 +255,14 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       text-transform: capitalize;
     }
 
-    .badge-active { background: rgba(166, 227, 161, 0.2); color: #a6e3a1; }
-    .badge-archived { background: rgba(108, 112, 134, 0.2); color: #6c7086; }
-    .badge-deleted { background: rgba(243, 139, 168, 0.2); color: #f38ba8; }
-    .badge-personal { background: rgba(203, 166, 247, 0.2); color: #cba6f7; }
+    .badge-active { background: var(--success-tint); color: var(--success); }
+    .badge-archived { background: color-mix(in srgb, var(--text-muted) 25%, transparent); color: var(--text-muted); }
+    .badge-deleted { background: var(--danger-tint); color: var(--danger); }
+    .badge-personal { background: color-mix(in srgb, var(--accent-color) 20%, transparent); color: var(--accent-color); }
 
     .card-desc {
       font-size: 12px;
-      color: var(--text-secondary, #a6adc8);
+      color: var(--text-secondary, var(--text-secondary));
       margin: 0 0 12px;
       line-height: 1.4;
     }
@@ -271,10 +271,10 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
     .chip {
       padding: 3px 8px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       border-radius: 4px;
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
     }
 
     @media (max-width: 768px) {

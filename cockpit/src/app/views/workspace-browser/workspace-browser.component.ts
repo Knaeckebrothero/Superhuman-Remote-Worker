@@ -141,7 +141,7 @@ interface RepoEntry {
         display: flex;
         flex-direction: column;
         height: 100%;
-        background: var(--panel-bg, #181825);
+        background: var(--panel-bg, var(--panel-bg));
       }
 
       .header {
@@ -150,13 +150,13 @@ interface RepoEntry {
         gap: 8px;
         padding: 10px 12px;
         background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .title {
         font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
       }
 
       .refresh-btn {
@@ -182,7 +182,7 @@ interface RepoEntry {
       .tree-panel {
         width: 240px;
         min-width: 180px;
-        border-right: 1px solid var(--border-color, #313244);
+        border-right: 1px solid var(--border-color, var(--surface-0));
         display: flex;
         flex-direction: column;
         overflow: hidden;
@@ -193,7 +193,7 @@ interface RepoEntry {
         align-items: center;
         gap: 2px;
         padding: 6px 8px;
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
         overflow-x: auto;
@@ -213,12 +213,12 @@ interface RepoEntry {
       }
 
       .crumb:hover {
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         background: rgba(255, 255, 255, 0.05);
       }
 
       .crumb.active {
-        color: var(--accent-color, #cba6f7);
+        color: var(--accent-color, var(--accent-color));
       }
 
       .crumb-sep {
@@ -238,20 +238,20 @@ interface RepoEntry {
         padding: 4px 8px;
         cursor: pointer;
         font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         transition: background 0.1s ease;
       }
 
       .file-entry:hover {
-        background: var(--surface-0, #313244);
+        background: var(--surface-0, var(--surface-0));
       }
 
       .file-entry.selected {
-        background: rgba(203, 166, 247, 0.15);
+        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .file-entry.dir-entry {
-        color: #89b4fa;
+        color: var(--info);
       }
 
       .entry-icon {
@@ -306,15 +306,15 @@ interface RepoEntry {
         align-items: center;
         justify-content: space-between;
         padding: 6px 12px;
-        background: var(--surface-0, #313244);
-        border-bottom: 1px solid var(--border-color, #313244);
+        background: var(--surface-0, var(--surface-0));
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
         flex-shrink: 0;
       }
 
       .file-path {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -340,7 +340,7 @@ interface RepoEntry {
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         line-height: 1.5;
-        color: var(--text-primary, #cdd6f4);
+        color: var(--text-primary, var(--text-primary));
         white-space: pre-wrap;
         word-wrap: break-word;
         tab-size: 2;
@@ -363,8 +363,8 @@ interface RepoEntry {
       .spinner-sm {
         width: 14px;
         height: 14px;
-        border: 2px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
+        border: 2px solid var(--surface-0, var(--surface-0));
+        border-top-color: var(--accent-color, var(--accent-color));
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
       }

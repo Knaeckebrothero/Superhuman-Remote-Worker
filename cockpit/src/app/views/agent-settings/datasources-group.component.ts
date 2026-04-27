@@ -59,10 +59,10 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       margin-bottom: 12px;
       padding-bottom: 6px;
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
     }
     .ds-picker {
       display: flex;
@@ -82,20 +82,20 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       background: rgba(255, 255, 255, 0.03);
     }
     .ds-option.selected {
-      background: rgba(203, 166, 247, 0.06);
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
     }
     .ds-option input[type="checkbox"] {
-      accent-color: var(--accent-color, #cba6f7);
+      accent-color: var(--accent-color, var(--accent-color));
       flex-shrink: 0;
     }
     .ds-type-icon {
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;
     }
     .ds-type-postgresql { color: var(--info); }
     .ds-type-neo4j { color: var(--success); }
     .ds-type-mongodb { color: var(--alert); }
-    .ds-type-webdav { color: #89dceb; }
+    .ds-type-webdav { color: var(--info); }
     .ds-info {
       display: flex;
       flex-direction: column;
@@ -106,11 +106,11 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
     .ds-name {
       font-size: 13px;
       font-weight: 500;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .ds-desc {
       font-size: 11px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -123,7 +123,7 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       padding: 2px 6px;
       border-radius: 4px;
       background: rgba(255, 255, 255, 0.06);
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;
     }
     .ds-loading {
@@ -131,7 +131,7 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       align-items: center;
       gap: 8px;
       font-size: 12px;
-      color: var(--text-muted, #6c7086);
+      color: var(--text-muted, var(--text-muted));
       padding: 8px 0;
     }
   `],

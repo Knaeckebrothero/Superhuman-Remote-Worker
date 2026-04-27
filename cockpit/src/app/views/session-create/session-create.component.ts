@@ -152,7 +152,7 @@ interface ExpertDetail extends Expert {
       display: flex;
       flex-direction: column;
       height: 100%;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
     }
     .page-header {
       display: flex;
@@ -160,14 +160,14 @@ interface ExpertDetail extends Expert {
       justify-content: space-between;
       padding: 12px 16px;
       background: var(--panel-header-bg, #1e1e2e);
-      border-bottom: 1px solid var(--border-color, #313244);
+      border-bottom: 1px solid var(--border-color, var(--surface-0));
       flex-shrink: 0;
     }
     .page-header h2 {
       margin: 0;
       font-size: 16px;
       font-weight: 600;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .form-container {
       flex: 1;
@@ -205,23 +205,23 @@ interface ExpertDetail extends Expert {
       align-items: flex-start;
       gap: 6px;
       padding: 14px;
-      border: 1px solid var(--border-color, #45475a);
+      border: 1px solid var(--border-color, var(--surface-1));
       border-radius: 8px;
-      background: var(--surface-0, #313244);
+      background: var(--surface-0, var(--surface-0));
       cursor: pointer;
       text-align: left;
       transition: all 0.15s;
       font-family: inherit;
-      color: var(--text-primary, #cdd6f4);
+      color: var(--text-primary, var(--text-primary));
     }
     .expert-card:hover:not(:disabled) {
-      border-color: var(--expert-color, #cba6f7);
-      background: rgba(203, 166, 247, 0.05);
+      border-color: var(--expert-color, var(--accent-color));
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
     }
     .expert-card.selected {
-      border-color: var(--expert-color, #cba6f7);
-      background: rgba(203, 166, 247, 0.08);
-      box-shadow: 0 0 0 1px var(--expert-color, #cba6f7);
+      border-color: var(--expert-color, var(--accent-color));
+      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
+      box-shadow: 0 0 0 1px var(--expert-color, var(--accent-color));
     }
     .expert-card:disabled {
       opacity: 0.6;
@@ -231,7 +231,7 @@ interface ExpertDetail extends Expert {
       position: absolute;
       top: 8px;
       right: 8px;
-      color: var(--expert-color, #cba6f7);
+      color: var(--expert-color, var(--accent-color));
     }
     .expert-icon {
       font-size: 28px;
@@ -255,7 +255,7 @@ interface ExpertDetail extends Expert {
       gap: 10px;
       margin-top: 24px;
       padding-top: 16px;
-      border-top: 1px solid var(--border-color, #313244);
+      border-top: 1px solid var(--border-color, var(--surface-0));
     }
 
     @media (max-width: 768px) {

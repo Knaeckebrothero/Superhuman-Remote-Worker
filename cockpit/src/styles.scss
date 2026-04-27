@@ -1,11 +1,14 @@
+// Cinzel + Cormorant Garamond for Roman themes are loaded via index.html <link>.
 @use 'styles/variables' as v;
 @use 'styles/themes/themes' as theme;
+@use 'styles/themes/shape-overrides';
 
 // --- Theme classes (body-class swap) ---
-// Default look = dark. <body class="theme-dark"> applies these tokens.
+// Default look = senate (dark). <body class="theme-senate"> applies these tokens.
 // Switching is one class swap on <body>; no per-component theme logic.
-.theme-dark  { @include theme.apply-app-theme('dark'); }
-.theme-light { @include theme.apply-app-theme('light'); }
+.theme-travertine { @include theme.apply-app-theme('travertine'); }
+.theme-senate     { @include theme.apply-app-theme('senate'); }
+.theme-praetorian { @include theme.apply-app-theme('praetorian'); }
 
 // --- Reset ---
 *,

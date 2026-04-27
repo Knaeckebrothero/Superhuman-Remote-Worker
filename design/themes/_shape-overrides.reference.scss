@@ -1,0 +1,141 @@
+// Phase 2 — "Shape pass". Roman theme overrides scoped under the three new
+// body classes. Catppuccin themes (.theme-dark / .theme-light) are untouched.
+//
+// Drop this file at cockpit/src/styles/themes/_shape-overrides.scss and
+// add `@use 'styles/themes/shape-overrides';` to styles.scss AFTER the body
+// class block.
+//
+// Selectors target generic structural classes that exist in your codebase
+// (.app-frame, .sidebar, .session-message, .approval-card, etc). Verify the
+// class names match your actual templates and adjust selectors as needed —
+// these are guidance, not contract.
+
+// =============================================================================
+// SHARED — applies to all three new themes
+// =============================================================================
+.theme-travertine,
+.theme-senate,
+.theme-praetorian {
+  // Display font for headings, panel titles, brand mark
+  --font-display: 'Cinzel', 'Cormorant Garamond', 'Times New Roman', serif;
+
+  // Sharp Roman radii — override the global radius variables if your
+  // _variables.scss defines them. If your variables use SCSS (compile-time)
+  // values not CSS variables, you'll need to add CSS-variable equivalents
+  // and consume them in components — see notes at bottom of file.
+  --radius-sm: 0;
+  --radius-md: 0;
+  --radius-lg: 2px;
+
+  // Brand display treatments
+  .app-brand,
+  .sidebar-brand,
+  h1.panel-title,
+  .session-title {
+    font-family: var(--font-display);
+    letter-spacing: 0.10em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  // Section labels in sidebar (e.g. "Imperium")
+  .nav-section-label {
+    font-family: var(--font-display);
+    letter-spacing: 0.28em;
+    text-transform: uppercase;
+    font-size: 10px;
+  }
+
+  // Banded chat bubbles — subtle inset rule at top
+  .session-message .message-bubble,
+  .chat-message .bubble {
+    border-radius: 0;
+    background-image: linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--accent-color) 5%, transparent),
+      transparent 8px
+    );
+  }
+
+  // User bubble (uses new tokens — see README)
+  .session-message.user .message-bubble,
+  .chat-message.user .bubble {
+    background: var(--user-bubble, var(--surface-0));
+    color: var(--user-bubble-text, var(--text-primary));
+    border-color: color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+  }
+
+  // Approval card — porphyry-red 3px left rule
+  .approval-card,
+  .tool-approval {
+    border-radius: 0;
+    border-left: 3px solid var(--accent-color);
+  }
+
+  // Buttons & chips — sharp corners, uppercase Cinzel labels on primary
+  .btn,
+  .filter-chip,
+  .tab-button {
+    border-radius: 0;
+  }
+  .btn-primary {
+    font-family: var(--font-display);
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  // Avatars — square not round
+  .avatar,
+  .agent-avatar,
+  .user-avatar {
+    border-radius: 0;
+  }
+}
+
+// =============================================================================
+// TRAVERTINE — light-specific overrides
+// =============================================================================
+.theme-travertine {
+  // Topbar gold inlay — subtle warm rule under the panel header
+  .panel-header,
+  .session-topbar {
+    box-shadow: 0 1px 0 var(--warning); // gold ochre
+  }
+}
+
+// =============================================================================
+// PRAETORIAN — high-contrast specifics
+// =============================================================================
+.theme-praetorian {
+  // Hairline rules instead of shadows
+  .panel,
+  .card,
+  .approval-card {
+    box-shadow: none;
+  }
+
+  // Heavier letterspacing for the maximum-formality feel
+  .app-brand,
+  .sidebar-brand {
+    letter-spacing: 0.36em;
+  }
+}
+
+// =============================================================================
+// NOTES
+// =============================================================================
+//
+// - If --radius-sm/md/lg don't exist in your token system today, your
+//   components are likely using SCSS values from _variables.scss. Either:
+//     (a) Add `--radius-sm: #{v.$radius-sm};` etc. to apply-app-theme so the
+//         values become per-theme overridable, or
+//     (b) Add explicit CSS overrides per component class above (slower but
+//         lower risk).
+//
+// - The chat bubble selectors are best-guess based on the README. Verify
+//   against your `chat.component.html` / `session.component.html` templates
+//   and rename selectors if needed.
+//
+// - For `color-mix()` to work, you need a modern build target. If you support
+//   older browsers, replace each `color-mix(...)` with a precomputed hex.

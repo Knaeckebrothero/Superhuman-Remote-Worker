@@ -127,10 +127,10 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
   styles: [`
     .settings-root {
       display: flex;
-      border: 1px solid var(--border-color, #313244);
+      border: 1px solid var(--border-color, var(--surface-0));
       border-radius: 8px;
       overflow: hidden;
-      background: var(--panel-bg, #181825);
+      background: var(--panel-bg, var(--panel-bg));
       min-height: 300px;
     }
 
@@ -142,7 +142,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: var(--accent-color, #cba6f7);
+      background: var(--accent-color, var(--accent-color));
     }
 
     .tab-content {
@@ -165,9 +165,9 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
     .modified-summary {
       text-align: right;
       font-size: 11px;
-      color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, var(--accent-color));
       padding-top: 8px;
-      border-top: 1px solid var(--border-color, #313244);
+      border-top: 1px solid var(--border-color, var(--surface-0));
     }
   `],
 })
