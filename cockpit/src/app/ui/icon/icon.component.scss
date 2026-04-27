@@ -1,0 +1,45 @@
+:host {
+  display: inline-block;
+  font-family: 'Material Symbols Outlined';
+  font-style: normal;
+  font-weight: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'liga';
+  vertical-align: middle;
+  flex-shrink: 0;
+
+  // Hide raw ligature text until the icon font is ready (body.fonts-loaded
+  // is toggled in index.html). Reserves layout space without rendering the
+  // unstyled "settings" / "refresh" text that otherwise flashes on cold load.
+  visibility: hidden;
+
+  // --- Sizes ---
+  &[data-size='xs'] { font-size: 12px; }
+  &[data-size='sm'] { font-size: 14px; }
+  &[data-size='md'] { font-size: 16px; }
+  &[data-size='lg'] { font-size: 20px; }
+  &[data-size='xl'] { font-size: 24px; }
+  &[data-size='inherit'] { font-size: inherit; }
+
+  // --- Filled variant ---
+  // Material Symbols variable-font axes — FILL 1 switches to filled glyphs.
+  &[data-filled] {
+    font-variation-settings:
+      'FILL' 1,
+      'wght' 400,
+      'GRAD' 0,
+      'opsz' 24;
+  }
+}
+
+:host-context(body.fonts-loaded) {
+  visibility: visible;
+}

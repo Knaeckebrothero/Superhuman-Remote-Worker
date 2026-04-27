@@ -1,35 +1,13 @@
-/* Catppuccin Mocha Dark Theme */
-:root {
-  /* Base colors */
-  --app-bg: #1e1e2e;
-  --panel-bg: #181825;
-  --panel-header-bg: #1e1e2e;
-  --timeline-bg: #11111b;
-  --surface-0: #313244;
-  --surface-1: #45475a;
-  --surface-2: #585b70;
+@use 'styles/variables' as v;
+@use 'styles/themes/themes' as theme;
 
-  /* Border */
-  --border-color: #313244;
+// --- Theme classes (body-class swap) ---
+// Default look = dark. <body class="theme-dark"> applies these tokens.
+// Switching is one class swap on <body>; no per-component theme logic.
+.theme-dark  { @include theme.apply-app-theme('dark'); }
+.theme-light { @include theme.apply-app-theme('light'); }
 
-  /* Text */
-  --text-primary: #cdd6f4;
-  --text-secondary: #a6adc8;
-  --text-muted: #8b92a8;
-
-  /* Accent */
-  --accent-color: #cba6f7;
-  --accent-hover: #b4befe;
-
-  /* Track */
-  --track-bg: #313244;
-
-  /* Gutter */
-  --gutter-color: #313244;
-  --gutter-hover: #45475a;
-}
-
-/* Reset */
+// --- Reset ---
 *,
 *::before,
 *::after {
@@ -45,21 +23,14 @@ body {
   overflow: hidden;
   background: var(--app-bg);
   color: var(--text-primary);
-  font-family:
-    -apple-system,
-    BlinkMacSystemFont,
-    'Segoe UI',
-    Roboto,
-    Oxygen,
-    Ubuntu,
-    sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
+  font-family: v.$font-family-base;
+  font-size: v.$font-size-sm;
+  line-height: v.$line-height-base;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Angular-split gutter styling */
+// --- Angular-split gutter styling ---
 .as-split-gutter {
   background: var(--gutter-color) !important;
   transition: background 0.15s ease;
@@ -73,7 +44,7 @@ body {
   display: none !important;
 }
 
-/* Scrollbar styling */
+// --- Scrollbar styling ---
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
@@ -85,14 +56,14 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--surface-1);
-  border-radius: 4px;
+  border-radius: v.$radius-sm;
 }
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--surface-2);
 }
 
-/* Focus indicators — restore visible focus for keyboard navigation */
+// --- Focus indicators (keyboard navigation) ---
 :focus-visible {
   outline: 2px solid var(--accent-color);
   outline-offset: 2px;
@@ -106,43 +77,77 @@ textarea:focus-visible {
   box-shadow: 0 0 0 1px var(--accent-color);
 }
 
-/* Selection */
+// --- Selection ---
 ::selection {
   background: var(--accent-color);
   color: var(--timeline-bg);
 }
 
-/* Mobile touch adjustments */
-@media (max-width: 768px) {
+// --- Mobile touch adjustments ---
+@media (max-width: v.$breakpoint-md) {
   .app-frame {
     overflow: auto;
     -webkit-overflow-scrolling: touch;
   }
 
-  /* Enforce touch-target sizes on interactive elements */
+  // Enforce touch-target sizes on interactive elements.
   .send-btn,
   .stop-btn,
   button.btn-primary,
   .btn,
   .filter-chip,
   .tab-button {
-    min-height: 44px;
-    min-width: 44px;
+    min-height: v.$touch-target-min;
+    min-width: v.$touch-target-min;
   }
 }
 
-/* Route transition animations (progressive enhancement via withViewTransitions) */
+// --- Tooltip (rendered to document.body by [appTooltip] directive) ---
+.app-tooltip {
+  position: fixed;
+  z-index: 1300; // matches $z-tooltip
+  pointer-events: none;
+  max-width: 280px;
+  padding: 4px 8px;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: v.$radius-sm;
+  box-shadow: var(--shadow-md);
+  font-family: v.$font-family-base;
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+  line-height: v.$line-height-tight;
+  white-space: normal;
+  word-wrap: break-word;
+  animation: app-tooltip-fade 0.15s ease-out;
+}
+
+@keyframes app-tooltip-fade {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+// --- Route transition animations (progressive enhancement) ---
 ::view-transition-old(root) {
   animation: 150ms ease-out forwards vt-fade-out;
 }
+
 ::view-transition-new(root) {
   animation: 150ms ease-in forwards vt-fade-in;
 }
-@keyframes vt-fade-out { to { opacity: 0; } }
-@keyframes vt-fade-in { from { opacity: 0; } }
 
-/* Reduced motion — only suppress decorative transitions, not functional indicators
-   (spinners, thinking dots, progress pulses) which convey system status. */
+@keyframes vt-fade-out {
+  to { opacity: 0; }
+}
+
+@keyframes vt-fade-in {
+  from { opacity: 0; }
+}
+
+// --- Reduced motion ---
+// Suppress decorative transitions only; functional indicators (spinners,
+// thinking dots, progress pulses) keep moving — they convey system status.
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -151,7 +156,7 @@ textarea:focus-visible {
   }
 }
 
-/* Disable hover effects on touch devices */
+// --- Disable hover effects on touch devices ---
 @media (hover: none) {
   .interactive:hover {
     background: transparent;

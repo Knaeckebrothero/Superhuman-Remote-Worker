@@ -1,0 +1,27 @@
+@use 'sass:map';
+@use 'sass:meta';
+@use 'sass:string';
+@use 'theme-config' as config;
+
+// Emit each token in the named theme map as a CSS custom property.
+// Quoted string values (e.g. shadows) are unquoted on the way out so they
+// land as legal CSS without the surrounding quotes.
+//
+// Usage:
+//   .theme-dark  { @include theme.apply-app-theme('dark'); }
+//   .theme-light { @include theme.apply-app-theme('light'); }
+@mixin apply-app-theme($theme-name) {
+  $theme-map: map.get(config.$themes, $theme-name);
+
+  @if $theme-map == null {
+    @error "Unknown theme '#{$theme-name}'. Add it to $themes in _theme-config.scss.";
+  }
+
+  @each $token, $value in $theme-map {
+    @if meta.type-of($value) == 'string' {
+      --#{$token}: #{string.unquote($value)};
+    } @else {
+      --#{$token}: #{$value};
+    }
+  }
+}

@@ -31,7 +31,9 @@
     "newSession": "New session",
     "untitledSession": "Untitled",
     "selectModel": "Select model",
-    "noKey": "(no key)"
+    "noKey": "(no key)",
+    "noModelsTitle": "No models available yet.",
+    "noModelsCta": "Configure a provider"
   },
   "projects": {
     "title": "Projects",
@@ -295,6 +297,11 @@
   },
   "settings": {
     "title": "Settings",
+    "appearance": {
+      "title": "Appearance",
+      "desc": "Choose between light and dark mode, or follow your system setting. The choice is saved on this device.",
+      "themeLabel": "Theme"
+    },
     "language": {
       "title": "Language",
       "desc": "Your preferred interface language. Changes apply immediately.",
