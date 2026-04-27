@@ -570,6 +570,14 @@ export class AdminModelsComponent implements OnInit {
     this.formProviderKey.set(value ?? '');
     this.discoveredModels.set([]);
     this.discoverError.set('');
+    // Provider change invalidates any prior model-specific autofill — wiping
+    // the form fields prevents a stale model_id from being submitted under a
+    // different provider.
+    this.formModelId.set('');
+    this.formDisplayLabel.set('');
+    this.formFamily.set('default');
+    this.formContextWindow.set(null);
+    this.formError.set('');
   }
 
   onRoleChange(value: string | null): void {
@@ -665,11 +673,9 @@ export class AdminModelsComponent implements OnInit {
 
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {
     this.formModelId.set(m.id);
-    if (!this.formDisplayLabel().trim()) {
-      this.formDisplayLabel.set(m.id);
-    }
+    this.formDisplayLabel.set(m.id);
     this.formRole.set(hintToRole(m.capability_hint));
-    if (m.family) this.formFamily.set(m.family);
-    if (m.context_window) this.formContextWindow.set(m.context_window);
+    this.formFamily.set(m.family || 'default');
+    this.formContextWindow.set(m.context_window ?? null);
   }
 }

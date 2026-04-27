@@ -72,6 +72,16 @@ logger = logging.getLogger("orchestrator.seed.llm_config")
 
 SEEDED_FROM_TAG = "helm:llm.seed"
 
+# Well-known label for the codex-proxy system endpoint. Anything that wants
+# to locate the row (admin availability probe, runtime resolver, init seeder)
+# matches on this exact string.
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
+
+# Fallback used when CODEX_PROXY_URL is unset. Mirrors the runtime fallback
+# in ``orchestrator.main._get_codex_subscription_models`` so login flows that
+# work without the env var also wire up a transport row.
+_DEFAULT_CODEX_PROXY_URL = "http://localhost:8317"
+
 
 def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
     """Resolve an ``apiKey`` from an inline string or an ``apiKeyEnv`` reference.
@@ -283,6 +293,44 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     await _seed_api_keys(db, api_keys, report)
     await _seed_endpoints(db, endpoints, report)
     return report
+
+
+async def ensure_codex_proxy_endpoint(
+    db: PostgresDB, *, proxy_url: str | None = None
+) -> bool:
+    """Ensure a system-scoped ``codex-proxy`` row exists in ``llm_endpoints``.
+
+    Called from runtime paths (the OAuth callback, the admin availability
+    probe) so that connecting a ChatGPT subscription via the cockpit wires
+    the proxy as a provider without requiring an init re-run or the
+    ``CODEX_PROXY_URL`` env var to be set. Idempotent: re-runs short-circuit
+    on label match inside :func:`seed`.
+
+    Returns True if a new row was created, False otherwise (already
+    present, or the seed run failed). Failures are logged but never raised
+    — callers should never 500 on a transport-row wiring hiccup.
+    """
+    url = proxy_url or os.environ.get("CODEX_PROXY_URL") or _DEFAULT_CODEX_PROXY_URL
+    base_url = url.rstrip("/")
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+
+    payload = {
+        "systemEndpoints": [
+            {
+                "label": CODEX_PROXY_ENDPOINT_LABEL,
+                "baseUrl": base_url,
+                "apiKeyEnv": "CODEX_MANAGEMENT_KEY",
+                "models": [],
+            }
+        ]
+    }
+    try:
+        report = await seed(db, payload)
+    except Exception:
+        logger.exception("ensure_codex_proxy_endpoint: seed run failed")
+        return False
+    return CODEX_PROXY_ENDPOINT_LABEL in report.endpoints_seeded
 
 
 async def run(payload_path: Path) -> SeedReport:
