@@ -55,12 +55,23 @@ describe('ThemeService', () => {
   }
 
   describe('initial state', () => {
-    it('defaults to senate when no stored preference', () => {
+    it('defaults to system when no stored preference (resolves via OS)', () => {
       const service = makeService();
-      expect(service.preference()).toBe('senate');
+      expect(service.preference()).toBe('system');
+      // Default mock has prefers-color-scheme: dark → senate.
       expect(service.resolved()).toBe('senate');
       expect(document.body.classList.contains('theme-senate')).toBe(true);
       expect(document.body.classList.contains('theme-travertine')).toBe(false);
+    });
+
+    it('defaults to system and resolves to travertine on light OS', () => {
+      mql = makeMockMql(false);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (window as any).matchMedia = vi.fn().mockReturnValue(mql);
+      const service = makeService();
+      expect(service.preference()).toBe('system');
+      expect(service.resolved()).toBe('travertine');
+      expect(document.body.classList.contains('theme-travertine')).toBe(true);
     });
 
     it('reads stored preference from localStorage', () => {
@@ -71,10 +82,10 @@ describe('ThemeService', () => {
       expect(document.body.classList.contains('theme-travertine')).toBe(true);
     });
 
-    it('ignores invalid stored values and falls back to senate', () => {
+    it('ignores invalid stored values and falls back to system', () => {
       window.localStorage.setItem('cockpit:theme', 'gibberish');
       const service = makeService();
-      expect(service.preference()).toBe('senate');
+      expect(service.preference()).toBe('system');
     });
 
     it('reads stored Roman theme preference', () => {

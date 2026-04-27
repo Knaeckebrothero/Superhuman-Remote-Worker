@@ -7,6 +7,7 @@ This folder is the **design source of truth** for the SRW Cockpit UI. It capture
 | Path | What it holds |
 |---|---|
 | [`themes/`](./themes/) | Theme catalog: palette rationale, mockup reference SCSS, brand-mark component, when to use which theme. |
+| [`asset-pack/`](./asset-pack/) | PWA asset pack (favicons, icons, manifest, OG image, microcopy) — historical mockup. Shipped versions live in `cockpit/public/` and `cockpit/src/assets/`. The cockpit registers a service worker via `@angular/service-worker` with config in `cockpit/ngsw-config.json`; the offline + update-available banner lives at `cockpit/src/app/shell/pwa-banner/`. |
 
 ## Two-tier docs (this is by design)
 
@@ -23,11 +24,11 @@ The cockpit currently ships three Roman-themed appearances. The pre-Roman Catppu
 
 | Key | Mode | Personality | Default |
 |---|---|---|---|
-| **Travertine** | Light | Cream stone, porphyry red, gold ochre. Daytime, formal. | Light default |
-| **Senate** | Dark | Pure blood red on charcoal. The standard dark. | **Overall default** |
+| **Travertine** | Light | Cream stone, porphyry red, gold ochre. Daytime, formal. | **Light default + initial paint fallback** |
+| **Senate** | Dark | Pure blood red on charcoal. The standard dark. | Dark default |
 | **Praetorian** | Dark, high-contrast | Pure black, crimson, ivory. No mid-grays. | Accessibility / focus mode |
 
-`system` is also a valid preference — it resolves to **Senate** when the OS prefers dark and **Travertine** when it prefers light.
+First-run preference is `system` — the app follows OS dark/light. `system` resolves to **Senate** when the OS prefers dark and **Travertine** when it prefers light.
 
 See [`themes/README.md`](./themes/README.md) for the palette breakdown and the rationale behind each theme's color choices.
 
