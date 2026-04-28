@@ -134,7 +134,8 @@ chart/
     agent.yaml
     nats.yaml               # {{- if .Values.nats.enabled }}
     vpn.yaml                # {{- if .Values.vpn.enabled }}
-    headscale.yaml           # {{- if .Values.headscale.enabled }}
+    # Headscale is NOT in the chart — it's an external service.
+    # See docs/features/external_headscale.md.
     ...
 ```
 

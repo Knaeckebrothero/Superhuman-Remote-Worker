@@ -82,6 +82,14 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: per-user grant for VM workspace backend (default-deny).
+-- Admins bypass this check in code; kill-switch in system_settings['vm_workspaces']
+-- overrides everyone.
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN can_use_vm BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Migration: Add keycloak_sub for OIDC user linking (SSO Phase 2)
 DO $$ BEGIN
     ALTER TABLE users ADD COLUMN keycloak_sub TEXT UNIQUE;
@@ -163,6 +171,168 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_keys_provider ON user_api_keys(user_id, provider);
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
+
+-- ============================================================================
+-- 0i. LLM ENDPOINTS
+-- OpenAI-compatible LLM endpoints (vLLM, Ollama, codex-proxy, private
+-- gateways) and the model IDs they serve. Replaces the single-LLM_BASE_URL
+-- mechanism. Custom-endpoint keys travel inline on the endpoint row — they
+-- are not merged into resolve_api_keys_for_job() which only covers named
+-- providers.
+-- ============================================================================
+
+-- Idempotent rename of the legacy ``user_llm_endpoints`` table. The original
+-- name implied per-user scoping but the table has always held both per-user
+-- rows (user_id NOT NULL) and system-scoped rows (user_id NULL). Renaming to
+-- ``llm_endpoints`` removes the misleading prefix. Re-running this block on
+-- a fresh install or an already-renamed schema is a no-op.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'user_llm_endpoints')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables
+                       WHERE table_schema = 'public' AND table_name = 'llm_endpoints')
+    THEN
+        ALTER TABLE user_llm_endpoints RENAME TO llm_endpoints;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'uq_user_llm_endpoint_label_user') THEN
+        ALTER INDEX uq_user_llm_endpoint_label_user RENAME TO uq_llm_endpoint_label_user;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'uq_user_llm_endpoint_label_system') THEN
+        ALTER INDEX uq_user_llm_endpoint_label_system RENAME TO uq_llm_endpoint_label_system;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_indexes
+               WHERE schemaname = 'public' AND indexname = 'idx_user_llm_endpoints_user') THEN
+        ALTER INDEX idx_user_llm_endpoints_user RENAME TO idx_llm_endpoints_user;
+    END IF;
+END$$;
+
+-- user_id is NULL for system-scoped rows (seeded by helm or created via
+-- Admin → Providers); non-NULL for per-user rows.
+CREATE TABLE IF NOT EXISTS llm_endpoints (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_key TEXT,
+    key_prefix VARCHAR(12),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Drop the plain unique constraint if an older deployment still has it, and
+-- replace it with two partial indexes so user rows are unique-per-user while
+-- system rows (user_id IS NULL) are globally unique on label.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_user_llm_endpoint_label'
+          AND conrelid = 'llm_endpoints'::regclass
+    ) THEN
+        ALTER TABLE llm_endpoints DROP CONSTRAINT uq_user_llm_endpoint_label;
+    END IF;
+END$$;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_attribute
+        WHERE attrelid = 'llm_endpoints'::regclass
+          AND attname = 'user_id'
+          AND attnotnull = TRUE
+    ) THEN
+        ALTER TABLE llm_endpoints ALTER COLUMN user_id DROP NOT NULL;
+    END IF;
+END$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_endpoint_label_user
+    ON llm_endpoints(user_id, label)
+    WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_llm_endpoint_label_system
+    ON llm_endpoints(label)
+    WHERE user_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_llm_endpoints_user ON llm_endpoints(user_id);
+
+-- The legacy user_llm_endpoint_models table was retired in favour of the
+-- admin-curated `models` catalog (section 0k). The orchestrator's init step
+-- _migrate_endpoint_models_to_catalog promotes any remaining system-scoped
+-- rows into the catalog at startup and DROPs the table; fresh installs never
+-- create it.
+
+-- ============================================================================
+-- 0j. SYSTEM API KEYS
+-- Provider-level API keys not tied to a specific user. Consulted by the
+-- resolver after user and project keys; replaces the env-var fallback.
+-- Seeded by helm on fresh install; mutable via /api/admin/providers/keys.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS system_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider VARCHAR(50) NOT NULL UNIQUE,
+    api_key TEXT NOT NULL,
+    key_prefix VARCHAR(12) NOT NULL,
+    label TEXT,
+    seeded_from TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_system_api_key_provider CHECK (provider IN (
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+    ))
+);
+
+-- Default LLM model IDs (builder, browser, citation) piggy-back on the
+-- existing `system_settings` table defined in section 9d. Keys follow the
+-- convention ``llm.default_<kind>_model`` with JSONB value ``{"model": "..."}``.
+-- See db.get_default_llm_model() / db.set_default_llm_model().
+
+-- ============================================================================
+-- 0k. MODELS CATALOG
+-- Admin-curated catalog of LLM offerings. Each row is one (model, role)
+-- anchored to a transport — either a system_api_keys provider
+-- (provider_kind='system', provider_ref='anthropic') or a system-scoped
+-- llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
+-- Every model surfaced in builder/session/job pickers comes from here.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS models (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    provider_kind TEXT NOT NULL CHECK (provider_kind IN ('system', 'endpoint')),
+    provider_ref TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_label TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts')),
+    family TEXT NOT NULL,
+    context_window INT,
+    reasoning_level TEXT,
+    params_json JSONB,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    seeded_from TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_model_provider UNIQUE (provider_kind, provider_ref, model_id, role)
+);
+
+CREATE INDEX IF NOT EXISTS idx_models_role_enabled
+    ON models(role) WHERE enabled = TRUE;
+CREATE INDEX IF NOT EXISTS idx_models_provider
+    ON models(provider_kind, provider_ref);
+
+-- Migration: widen models.role CHECK to include whisper/tts (catalog v1.1).
+-- Drops the implicit constraint name Postgres assigns to the inline CHECK and
+-- re-creates it with the wider set. Idempotent on fresh installs (no-op when
+-- the new constraint is already in place).
+DO $$ BEGIN
+    ALTER TABLE models DROP CONSTRAINT IF EXISTS models_role_check;
+    ALTER TABLE models ADD CONSTRAINT models_role_check
+        CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts'));
+END $$;
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE

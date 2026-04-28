@@ -47,26 +47,19 @@ data:
   COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}
 
   # LLM routing
-  LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}
+  # LLM_BASE_URL / BROWSER_LLM_* / BUILDER_MODEL moved to the DB-backed
+  # config (system_api_keys + llm_endpoints). See docs/features/
+  # db_backed_llm_config.md for the migration rationale.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
   # Vision model
   VISION_MODEL: {{ .Values.llm.visionModel | quote }}
 
-  # Browser automation
-  BROWSER_LLM_MODEL: {{ .Values.llm.browserModel | quote }}
-  BROWSER_LLM_BASE_URL: {{ .Values.llm.browserBaseUrl | quote }}
-
-  # Research proxy (via VPN sidecar SOCKS5)
-  RESEARCH_PROXY_TYPE: {{ .Values.research.proxyType | quote }}
-  RESEARCH_PROXY_HOST: {{ .Values.research.proxyHost | quote }}
-  RESEARCH_PROXY_PORT: {{ .Values.research.proxyPort | quote }}
-
   # Citation Engine
-  # CITATION_DB_URL (with credentials) is in the Secret
-  CITATION_LLM_URL: {{ .Values.citation.llmUrl | quote }}
-  CITATION_LLM_MODEL: {{ .Values.citation.llmModel | quote }}
-  CITATION_REASONING_LEVEL: {{ .Values.citation.reasoningLevel | quote }}
+  # CITATION_DB_URL (with credentials) is in the Secret.
+  # CITATION_LLM_* values moved to the DB-backed config — the orchestrator
+  # injects them via job config_override at dispatch. Embedding model/URL
+  # stay as env-driven for now (not part of the LLM config feature).
   CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
   CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
 
@@ -82,7 +75,9 @@ data:
   CODEX_RAW_DUMP_DIR: {{ "/app/logs/codex-raw" | quote }}
 
   # Instruction Builder (Cockpit AI Chat)
-  BUILDER_MODEL: {{ .Values.llm.builderModel | quote }}
+  # BUILDER_MODEL moved to system_settings['llm.default_builder_model']
+  # (set via Admin → Providers or the llm.seed.defaultBuilderModel path).
+  # BUILDER_LLM_PROVIDER stays as a hint for provider dispatch logic.
   BUILDER_LLM_PROVIDER: {{ .Values.llm.builderProvider | quote }}
 
   # Orchestrator settings
@@ -167,23 +162,15 @@ data:
   {{- end }}
   {{- end }}
 
-  # Workstation API
-  {{- if .Values.vpn.workstation.enabled }}
-  WORKSTATION_BASE_URL: {{ printf "http://%s:%s/v1" (include "srw.serviceName" (dict "context" . "component" "vpn-workstation")) .Values.vpn.workstation.port | quote }}
-  {{- else }}
-  WORKSTATION_BASE_URL: {{ "" | quote }}
-  {{- end }}
-
-  # VPN — non-secret config (ports only)
-  VPN_CLUSTER_PORT: {{ .Values.vpn.cluster.port | quote }}
-  VPN_RESEARCH_PORT: {{ .Values.vpn.research.port | quote }}
-  VPN_WORKSTATION_PORT: {{ .Values.vpn.workstation.port | quote }}
-
   # NATS
   NATS_URL: {{ .Values.nats.url | quote }}
 
   # Headscale (mesh VPN coordination server)
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
+
+  # Agent tailscale sidecar gate (read by AgentProvisioner). When "false",
+  # dynamically provisioned agent pods skip the tailscale sidecar entirely.
+  AGENT_TAILSCALE_ENABLED: {{ .Values.agent.tailscale.enabled | quote }}
 
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}

@@ -1,0 +1,944 @@
+name: develop
+
+# Lightweight CI for the develop branch.
+#
+# Key differences from the main (Production) pipeline:
+#   - Lint is non-blocking — ruff format auto-commits fixes on push
+#   - Tests and builds are change-based (only run when relevant files change)
+#   - Images get SHA + :experimental tags (no version tags)
+#   - Helm chart published as "srw-dev" with 0.0.0-dev.sha.<hash> versions
+#   - deploy-experimental updates fleet.yaml chart version + image tags
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Auto-format + lint (non-blocking — failures don't gate builds)
+  # On push: auto-commits ruff format fixes so develop stays clean.
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff==0.14.10
+
+      - name: Auto-format and commit
+        if: github.event_name == 'push'
+        run: |
+          ruff format src/ orchestrator/ tests/
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add src/ orchestrator/ tests/
+            git commit -m "style: ruff auto-format"
+            git push
+          fi
+
+      - name: Ruff lint check
+        run: ruff check src/ orchestrator/ tests/
+        continue-on-error: true
+
+      - name: Ruff format check
+        run: ruff format --check src/ orchestrator/ tests/
+        continue-on-error: true
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Helm lint (home cluster scenario)
+        run: helm lint helm/ -f helm/ci/test-values.yaml
+        continue-on-error: true
+
+      - name: Helm lint (customer external-services scenario)
+        run: helm lint helm/ -f helm/ci/customer-external-values.yaml
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # CodeQL — static analysis for security vulnerabilities
+  # ---------------------------------------------------------------------------
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit — blocking (rarely fails, catches real CVEs)
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install pip-audit
+        run: uv pip install --system pip-audit
+      - name: Install Python dependencies
+        run: uv pip install --system -r requirements.txt
+      - name: Audit Python dependencies
+        # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
+        # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
+        #   arxiv pins requests<2.33.0 so we can't upgrade until arxiv releases a fix
+        # CVE-2026-3219: pip treats concatenated tar+ZIP files as ZIP — no fix released;
+        #   requires a maliciously crafted package, not exposed via our install flow
+        run: >-
+          pip-audit --desc
+          --ignore-vuln CVE-2026-4539
+          --ignore-vuln CVE-2026-25645
+          --ignore-vuln CVE-2026-3219
+      - name: Audit npm dependencies
+        working-directory: cockpit
+        # lodash-es 4.17.23 is the latest release; no fix available.
+        # Transitive via mermaid → langium → chevrotain → lodash-es.
+        # GHSA-r5fr-rjxr-66jc: Code Injection via _.template (high)
+        # GHSA-f23m-r3pf-42rh: Prototype Pollution via _.unset/_.omit (moderate)
+        run: |
+          npm audit --json | python3 -c "
+          import json, sys
+          IGNORE_ADVISORIES = {'GHSA-r5fr-rjxr-66jc', 'GHSA-f23m-r3pf-42rh'}
+          data = json.load(sys.stdin)
+          vulns = data.get('vulnerabilities', {})
+
+          # Mark packages whose only root-cause advisories are all ignored
+          ignored_pkgs = set()
+          changed = True
+          while changed:
+              changed = False
+              for name, vuln in vulns.items():
+                  if name in ignored_pkgs:
+                      continue
+                  dominated = True
+                  for v in vuln.get('via', []):
+                      if isinstance(v, dict):
+                          ghsa = v.get('url', '').split('/')[-1]
+                          if ghsa not in IGNORE_ADVISORIES:
+                              dominated = False
+                              break
+                      elif isinstance(v, str) and v not in ignored_pkgs:
+                          dominated = False
+                          break
+                  if dominated:
+                      ignored_pkgs.add(name)
+                      changed = True
+
+          found = 0
+          for name, vuln in vulns.items():
+              if name in ignored_pkgs:
+                  continue
+              if vuln.get('severity') in ('high', 'critical'):
+                  found += 1
+                  print(f'{name}: {vuln[\"severity\"]}')
+          if found:
+              print(f'{found} unignored high/critical vulnerabilities')
+              sys.exit(1)
+          print('npm audit passed (ignored advisories: ' + ', '.join(IGNORE_ADVISORIES) + ')')
+          "
+
+  # ---------------------------------------------------------------------------
+  # Detect which components changed — build jobs only run when needed
+  # ---------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      agent: ${{ steps.check.outputs.agent }}
+      orchestrator: ${{ steps.check.outputs.orchestrator }}
+      cockpit: ${{ steps.check.outputs.cockpit }}
+      mcp: ${{ steps.check.outputs.mcp }}
+      vm-base: ${{ steps.check.outputs.vm-base }}
+      vm-controller: ${{ steps.check.outputs.vm-controller }}
+      sudo-gate: ${{ steps.check.outputs.sudo-gate }}
+      workspace: ${{ steps.check.outputs.workspace }}
+      chart: ${{ steps.check.outputs.chart }}
+      python-changed: ${{ steps.test-paths.outputs.python }}
+      cockpit-changed: ${{ steps.test-paths.outputs.cockpit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect test-relevant changes
+        id: test-paths
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          elif git rev-parse HEAD~1 &>/dev/null; then
+            BASE="HEAD~1"
+          else
+            echo "python=true" >> "$GITHUB_OUTPUT"
+            echo "cockpit=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git diff --name-only "$BASE" HEAD -- \
+            'src/' 'orchestrator/' 'tests/' 'config/' 'agent.py' \
+            'requirements.txt' 'orchestrator/requirements.txt' \
+            | grep -q .; then
+            echo "python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --name-only "$BASE" HEAD -- 'cockpit/' | grep -q .; then
+            echo "cockpit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cockpit=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Test path detection: python=$(grep python "$GITHUB_OUTPUT" | tail -1) cockpit=$(grep cockpit "$GITHUB_OUTPUT" | tail -1)"
+
+      - name: Detect changes against last deployed SHA per component
+        id: check
+        run: |
+          extract_sha() {
+            local component="$1"
+            grep -A1 "^  ${component}:" deployment/values-experimental.yaml 2>/dev/null \
+              | grep -oP 'tag:\s*sha-\K[0-9a-f]{7}' | head -1 || echo ""
+          }
+
+          extract_sha_raw() {
+            local file="$1" component="$2"
+            grep -oP "superhuman-remote-worker-${component}:sha-\K[0-9a-f]{7}" "$file" 2>/dev/null | head -1 || echo ""
+          }
+
+          has_changes() {
+            local sha="$1"
+            shift
+            local paths=("$@")
+            if [ -z "$sha" ]; then
+              echo "true"
+              return
+            fi
+            if ! git cat-file -t "$sha" &>/dev/null; then
+              echo "true"
+              return
+            fi
+            for path in "${paths[@]}"; do
+              if [ -n "$(git diff --name-only "$sha" HEAD -- "$path")" ]; then
+                echo "true"
+                return
+              fi
+            done
+            echo "false"
+          }
+
+          SHA_AGENT=$(extract_sha agent)
+          SHA_ORCHESTRATOR=$(extract_sha orchestrator)
+          SHA_COCKPIT=$(extract_sha cockpit)
+          SHA_MCP=$(extract_sha mcp)
+          SHA_WORKSPACE=$(extract_sha workspace)
+          SHA_VM_CONTROLLER=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
+          SHA_VM_BASE=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
+
+          echo "Deployed SHAs:"
+          echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
+          echo "  mcp=$SHA_MCP  workspace=$SHA_WORKSPACE"
+          echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
+
+          AGENT=$(has_changes "$SHA_AGENT" \
+            src/ config/ agent.py requirements.txt docker/Dockerfile.agent)
+
+          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" \
+            orchestrator/ config/ docker/Dockerfile.orchestrator)
+
+          COCKPIT=$(has_changes "$SHA_COCKPIT" \
+            cockpit/ docker/Dockerfile.cockpit)
+
+          MCP=$(has_changes "$SHA_MCP" \
+            orchestrator/mcp/ orchestrator/services/formatters.py \
+            orchestrator/services/__init__.py docker/Dockerfile.mcp)
+
+          WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
+            docker/Dockerfile.workspace docker/workspace-entrypoint.sh)
+
+          VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
+            vm/controller/)
+
+          VM_BASE=$(has_changes "$SHA_VM_BASE" \
+            docker/agent-vm-base/)
+
+          SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
+            vm/sudo-daemon/ vm/sudo-plugin/)
+
+          # Chart changes (helm/ directory)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHART_BASE="${{ github.event.pull_request.base.sha }}"
+          elif git rev-parse HEAD~1 &>/dev/null; then
+            CHART_BASE="HEAD~1"
+          else
+            CHART_BASE=""
+          fi
+          if [ -z "$CHART_BASE" ] || [ -n "$(git diff --name-only "$CHART_BASE" HEAD -- 'helm/')" ]; then
+            CHART="true"
+          else
+            CHART="false"
+          fi
+
+          echo ""
+          echo "Change detection results:"
+          echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
+          echo "  mcp=$MCP  workspace=$WORKSPACE"
+          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  sudo-gate=$SUDO_GATE"
+          echo "  chart=$CHART"
+
+          {
+            echo "agent=$AGENT"
+            echo "orchestrator=$ORCHESTRATOR"
+            echo "cockpit=$COCKPIT"
+            echo "mcp=$MCP"
+            echo "workspace=$WORKSPACE"
+            echo "vm-controller=$VM_CONTROLLER"
+            echo "vm-base=$VM_BASE"
+            echo "sudo-gate=$SUDO_GATE"
+            echo "chart=$CHART"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Python tests (change-based)
+  # ---------------------------------------------------------------------------
+  test-python:
+    needs: [changes]
+    if: needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt pytest pytest-asyncio
+      - name: Run tests
+        run: pytest tests/ -x -q --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Cockpit (Angular) tests (change-based)
+  # ---------------------------------------------------------------------------
+  test-cockpit:
+    needs: [changes]
+    if: needs.changes.outputs.cockpit-changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
+      - name: Check i18n parity
+        working-directory: cockpit
+        run: npm run i18n:check
+      - name: Run tests
+        working-directory: cockpit
+        run: npm test
+
+  # ---------------------------------------------------------------------------
+  # Image builds — change-based, SHA + :experimental tags only
+  # Lint is NOT required (non-blocking on develop).
+  # ---------------------------------------------------------------------------
+  build-agent:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - id: short_sha
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.agent
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=max,ignore-error=true
+          build-args: |
+            BUILD_SHA=${{ steps.short_sha.outputs.sha }}
+
+  build-orchestrator:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.orchestrator
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
+
+  build-cockpit:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.cockpit
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
+
+  build-mcp:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.mcp
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
+
+  build-workspace:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.workspace == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.workspace
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=max,ignore-error=true
+
+  build-sudo-gate:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build sudo-gated (Go daemon)
+        working-directory: vm/sudo-daemon
+        run: |
+          go mod tidy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-s -w -X main.version=sha-${GITHUB_SHA::7}" \
+            -o sudo-gated ./cmd/sudo-gated/
+          file sudo-gated
+          ls -lh sudo-gated
+      - name: Build sudo_gate.so (C plugin)
+        working-directory: vm/sudo-plugin
+        run: |
+          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include \
+            -o sudo_gate.so sudo_gate.c json_util.c
+          file sudo_gate.so
+          ls -lh sudo_gate.so
+      - name: Upload sudo gate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-gate-binaries
+          path: |
+            vm/sudo-daemon/sudo-gated
+            vm/sudo-plugin/sudo_gate.so
+          retention-days: 7
+
+  build-agent-vm-base:
+    needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Fail if sudo-gate build failed
+        if: needs.build-sudo-gate.result == 'failure'
+        run: |
+          echo "::error::build-sudo-gate failed — refusing to build VM image without gate binaries"
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Download sudo gate artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sudo-gate-binaries
+          path: docker/agent-vm-base/files/
+        continue-on-error: true
+      - name: Prepare sudo gate binaries for Packer
+        working-directory: docker/agent-vm-base
+        run: |
+          if [ -f files/vm/sudo-daemon/sudo-gated ]; then
+            mv files/vm/sudo-daemon/sudo-gated files/sudo-gated-bin
+            echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
+          else
+            touch files/sudo-gated-bin
+            echo "sudo-gated binary not available — creating empty placeholder"
+          fi
+          if [ -f files/vm/sudo-plugin/sudo_gate.so ]; then
+            mv files/vm/sudo-plugin/sudo_gate.so files/sudo_gate.so
+            echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
+          else
+            touch files/sudo_gate.so
+            echo "sudo_gate.so not available — creating empty placeholder"
+          fi
+          ls -la files/
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/chromium \
+            /usr/share/swift /usr/local/julia* /opt/hostedtoolcache
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+      - name: Download Ubuntu cloud image
+        working-directory: docker/agent-vm-base
+        run: |
+          mkdir -p input
+          wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+            -O input/noble-server-cloudimg-amd64.img
+          qemu-img info input/noble-server-cloudimg-amd64.img
+      - name: Packer init
+        working-directory: docker/agent-vm-base
+        run: packer init agent-vm-base.pkr.hcl
+      - name: Packer build
+        working-directory: docker/agent-vm-base
+        run: packer build agent-vm-base.pkr.hcl
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push containerDisk image
+        working-directory: docker/agent-vm-base
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
+          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+          BUILD_ARGS=()
+          for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
+          for T in "${TAGS[@]}"; do docker push "$T"; done
+          printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
+
+  build-vm-controller:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' &&
+      (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=experimental
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./vm/controller
+          file: ./vm/controller/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
+
+  # ---------------------------------------------------------------------------
+  # Publish dev Helm chart + update deployment config for Fleet.
+  #
+  # Publishes the chart as "srw-dev" with a semver pre-release version
+  # (0.0.0-dev.sha.<hash>), then updates fleet.yaml with the chart version
+  # and values-experimental.yaml with the new image tags, all in one commit.
+  # ---------------------------------------------------------------------------
+  deploy-experimental:
+    needs:
+      - changes
+      - dependency-audit
+      - test-python
+      - test-cockpit
+      - build-agent
+      - build-orchestrator
+      - build-cockpit
+      - build-mcp
+      - build-workspace
+      - build-vm-controller
+      - build-agent-vm-base
+    if: >-
+      always() && !cancelled() &&
+      github.event_name == 'push' &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+
+      - name: Install tools
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tag
+        run: |
+          echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "chart_version=0.0.0-dev.sha.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      # -- Publish dev chart (only when helm/ changed or any build succeeded) --
+      - name: Package and push dev chart
+        if: >-
+          needs.changes.outputs.chart == 'true' ||
+          needs.build-agent.result == 'success' ||
+          needs.build-orchestrator.result == 'success' ||
+          needs.build-cockpit.result == 'success' ||
+          needs.build-mcp.result == 'success'
+        run: |
+          # Override chart name for dev channel
+          yq -i '.name = "srw-dev"' helm/Chart.yaml
+          mkdir -p dist
+          helm package helm/ \
+            --version "${{ steps.tag.outputs.chart_version }}" \
+            --app-version "${{ steps.tag.outputs.sha }}" \
+            --destination ./dist
+          helm push ./dist/srw-dev-${{ steps.tag.outputs.chart_version }}.tgz \
+            oci://ghcr.io/knaeckebrothero/charts
+          # Restore Chart.yaml (don't commit the name override)
+          git checkout helm/Chart.yaml
+
+      # -- Update fleet.yaml chart version --
+      - name: Update fleet.yaml chart version
+        if: >-
+          needs.changes.outputs.chart == 'true' ||
+          needs.build-agent.result == 'success' ||
+          needs.build-orchestrator.result == 'success' ||
+          needs.build-cockpit.result == 'success' ||
+          needs.build-mcp.result == 'success'
+        run: >-
+          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
+          deployment/fleet.yaml
+
+      # -- Update image tags in values-experimental.yaml --
+      - name: Update orchestrator tag
+        if: needs.build-orchestrator.result == 'success'
+        run: yq -i '.image.orchestrator.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update agent tag
+        if: needs.build-agent.result == 'success'
+        run: yq -i '.image.agent.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update cockpit tag
+        if: needs.build-cockpit.result == 'success'
+        run: yq -i '.image.cockpit.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update MCP tag
+        if: needs.build-mcp.result == 'success'
+        run: yq -i '.image.mcp.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update workspace tag
+        if: needs.build-workspace.result == 'success'
+        run: yq -i '.image.workspace.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
+
+      - name: Update VM controller image tag
+        if: needs.build-vm-controller.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-vm-controller:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vm-controller:${{ steps.tag.outputs.sha }}|g' \
+            deployment-vms/srw-vm-controller/vm-controller.yaml
+
+      - name: Update agent VM base image tag
+        if: needs.build-agent-vm-base.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-agent-vm-base:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}|g' \
+            deployment-vms/srw-vm-controller/vm-controller.yaml
+
+      - name: Commit and push
+        run: |
+          git diff --quiet && { echo "No changes to commit"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deployment/fleet.yaml deployment/values-experimental.yaml deployment-vms/ || true
+          git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
+          git push

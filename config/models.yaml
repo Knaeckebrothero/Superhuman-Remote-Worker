@@ -12,9 +12,9 @@ groups:
   - name: "Local"
     provider: local
     models:
-      - id: "openai/gpt-oss-120b"
-        display_name: "GPT OSS 120B"
-        family: gpt-oss
+      - id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+        display_name: "Gemma 4 31B"
+        family: gemma
 
   - name: "OpenAI"
     provider: openai
@@ -91,15 +91,15 @@ presets:
   - label: "K2 + OSS 120B (Groq)"
     strategic: "groq/moonshotai/kimi-k2-instruct-0905"
     tactical: "groq/gpt-oss-120b"
-  - label: "OSS 120B Local (both)"
-    strategic: "openai/gpt-oss-120b"
-    tactical: "openai/gpt-oss-120b"
+  - label: "Gemma 4 Local (both)"
+    strategic: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+    tactical: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
 # Models available in the instruction builder chat.
 # Filtered by provider availability, same as groups above.
 builder_models:
-  - label: "GPT OSS 120B (Local)"
-    id: "openai/gpt-oss-120b"
+  - label: "Gemma 4 31B (Local)"
+    id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
     provider: local
   - label: "MiniMax M2.7"
     id: "openrouter/minimax/minimax-m2.7"
@@ -125,8 +125,8 @@ builder_models:
 # Auxiliary LLM: memory extraction, knowledge curation, summarization.
 # Any chat model works. Smaller/faster models recommended for cost.
 auxiliary_models:
-  - id: "openai/gpt-oss-120b"
-    label: "GPT OSS 120B (Local)"
+  - id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+    label: "Gemma 4 31B (Local)"
     provider: local
   - id: "gpt-4o-mini"
     label: "GPT-4o Mini"
@@ -150,6 +150,9 @@ auxiliary_models:
 # Vision: multimodal model for describing images/charts when primary model
 # is text-only. Must support image input.
 vision_models:
+  - id: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+    label: "Gemma 4 31B (Local)"
+    provider: local
   - id: "gpt-4o"
     label: "GPT-4o"
     provider: openai

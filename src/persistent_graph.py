@@ -191,12 +191,6 @@ async def run_persistent_loop(
     )
 
     while True:
-        # Refresh tools if the session swapped them (e.g. plan mode toggle)
-        if get_current_tools:
-            new_llm, new_tools = get_current_tools()
-            llm_with_tools = new_llm
-            tool_map = {tool.name: tool for tool in new_tools}
-
         # --- Wait for user input ---
         try:
             user_input = await callbacks.get_user_input()
@@ -209,6 +203,15 @@ async def run_persistent_loop(
 
         if user_input == INTERRUPT_SENTINEL:
             continue
+
+        # Refresh after receiving input so config changes made during the wait
+        # (e.g. model hot-swap via config.update, plan mode toggle) are picked
+        # up before the turn executes. Refreshing before the wait captures a
+        # stale LLM reference when the user changes models while idle.
+        if get_current_tools:
+            new_llm, new_tools = get_current_tools()
+            llm_with_tools = new_llm
+            tool_map = {tool.name: tool for tool in new_tools}
 
         turn_count += 1
         turn_id = turn_count
@@ -271,7 +274,9 @@ async def run_persistent_loop(
         turn_metrics = result.metrics if result else None
         await callbacks.on_turn_complete(turn_id, turn_metrics)
 
-        # Auto-commit workspace changes after tool-executing turns
+        # Auto-commit workspace changes after tool-executing turns.
+        # Push is throttled to every 5th turn so the upstream gets a
+        # checkpoint without paying a network round-trip per turn.
         if tool_calls_this_turn > 0 and tool_context:
             ws_mgr = getattr(tool_context, "workspace_manager", None)
             git_mgr = getattr(ws_mgr, "git_manager", None) if ws_mgr else None
@@ -282,7 +287,7 @@ async def run_persistent_loop(
                     if turn_count % 5 == 0:
                         git_mgr.push()
                 except Exception as e:
-                    logger.debug(f"Git auto-commit failed (non-fatal): {e}")
+                    logger.debug(f"Git auto-commit/push failed (non-fatal): {e}")
 
         logger.info(
             f"Turn {turn_id} complete: {tool_calls_this_turn} tool calls, "

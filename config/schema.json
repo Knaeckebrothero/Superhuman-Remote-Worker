@@ -54,7 +54,7 @@
         "model": {
           "type": "string",
           "description": "Default model identifier (used when no phase override)",
-          "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
+          "examples": ["RedHatAI/gemma-4-31B-it-FP8-Dynamic", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
         },
         "provider": {
           "type": ["string", "null"],

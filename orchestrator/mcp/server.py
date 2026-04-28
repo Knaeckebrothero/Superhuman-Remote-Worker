@@ -2691,7 +2691,7 @@ async def create_persistent_thread(
         permission_mode: Tool approval mode (supervised, auto_accept, autonomous)
         project_id: Single project UUID to scope (legacy)
         project_ids: List of project UUIDs to scope
-        model: LLM model override (e.g. "openai/gpt-oss-120b")
+        model: LLM model override (e.g. "RedHatAI/gemma-4-31B-it-FP8-Dynamic")
         temperature: Temperature override
 
     Returns:

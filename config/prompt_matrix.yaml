@@ -30,6 +30,17 @@ gpt-oss:
   memory_assembler: memory_assembler_prompt_gpt_oss.txt
   curation: curation_prompt_gpt_oss.txt
 
+# Gemma 4 has native system role and strong instruction following — the default
+# Markdown prompts work well for systemprompt/persona/strategic/tactical/summarization.
+# Only the structured-output tasks get gemma-specific variants: they add explicit
+# anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON schema can trigger
+# infinite repetition loops). See gemma family block in settings_matrix.yaml for
+# the complementary repetition_penalty / frequency_penalty mitigation.
+gemma:
+  memory_extraction: memory_extraction_prompt_gemma.txt
+  memory_assembler: memory_assembler_prompt_gemma.txt
+  curation: curation_prompt_gemma.txt
+
 gpt-5:
   systemprompt: systemprompt_gpt_5.txt
   systemprompt_interactive: systemprompt_interactive_gpt_5.txt

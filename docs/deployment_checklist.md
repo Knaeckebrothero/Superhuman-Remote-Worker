@@ -55,7 +55,7 @@ See [`docs/docker_compose_mode.md`](docker_compose_mode.md) for the Docker Compo
 - ~~Polling model~~ → Orchestrator assigns jobs to agents, agents poll orchestrator API
 - ~~Workspace paths~~ → Shared PVC (`/workspace`) with Longhorn RWX in K8s, named volume in compose
 - ~~Job submission~~ → Cockpit has full job creation UI + instruction builder chat
-- ~~No compose for full stack~~ → Production compose with 20 services (databases, SSO, VPN, app, admin UIs)
+- ~~No compose for full stack~~ → Production compose with full stack (databases, SSO, app, admin UIs)
 - ~~Cockpit incomplete~~ → Keycloak SSO auth, job submission, agent management, conversation viewer
 
 ### Remaining Deployment Gaps
@@ -334,9 +334,9 @@ Three compose files cover different deployment scenarios:
 |------|---------|---------------|
 | [`docker-compose.yaml`](../docker-compose.yaml) | **Production** — full stack, pre-built GHCR images | Pulled from `ghcr.io/knaeckebrothero/superhuman-remote-worker-*` |
 | [`docker-compose.local.yaml`](../docker-compose.local.yaml) | **Local build** — same stack, builds from source | Built locally via `podman-compose build` |
-| [`docker-compose.dev.yaml`](../docker-compose.dev.yaml) | **Development** — infrastructure only, apps run locally | Only MCP + VPN built locally |
+| [`docker-compose.dev.yaml`](../docker-compose.dev.yaml) | **Development** — infrastructure only, apps run locally | Only MCP built locally |
 
-### Services in the production/local-build stack (20 services):
+### Services in the production/local-build stack:
 
 **Databases:**
 - **postgres** — PostgreSQL 15 (jobs, agents + Keycloak/Nextcloud DBs via `init_sso_dbs.sh`)
@@ -348,11 +348,6 @@ Three compose files cover different deployment scenarios:
 - **keycloak** — Keycloak 26.2 SSO (OIDC for cockpit, Gitea, Nextcloud, pgAdmin)
 - **gitea** — Gitea 1.22 (Git server, Keycloak OIDC login, admin auto-bootstrap in K8s)
 - **nextcloud** — Nextcloud 31 (WebDAV cloud storage, Keycloak OIDC)
-
-**VPN Sidecars:**
-- **vpn-cluster** — OpenFortiVPN + port forward to GPU cluster for LLM inference
-- **vpn-research** — OpenFortiVPN + SOCKS5 proxy for institutional research access
-- **vpn-workstation** — OpenFortiVPN + port forward to AI workstation (embeddings, vision)
 
 **Application:**
 - **orchestrator** — FastAPI backend (job management, agent coordination, SSO, notifications)
@@ -391,8 +386,7 @@ Database ports (postgres, vector, mongodb, neo4j) are internal-only in productio
 ### Prerequisites
 
 ```bash
-cp .env.example .env                                          # Configure API keys, VPN, SSO
-cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json  # Keycloak realm config
+cp .env.example .env                                          # Configure API keys, SSO, OIDC secrets
 ```
 
 ## Image Documentation
@@ -403,7 +397,6 @@ cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json  
 | `superhuman-remote-worker-orchestrator` | `docker/Dockerfile.orchestrator` | FastAPI backend API |
 | `superhuman-remote-worker-cockpit` | `docker/Dockerfile.cockpit` | Angular SSR frontend |
 | `superhuman-remote-worker-mcp` | `docker/Dockerfile.mcp` | MCP server (Claude Code) |
-| `superhuman-remote-worker-vpn` | `docker/vpn/Dockerfile` | OpenFortiVPN + microsocks sidecar |
 | `keycloak:26.2` | Official (Quay) | SSO identity provider |
 | `postgres:15` | Official | App database |
 | `pgvector/pgvector:pg15` | Official | Vector database (citations, embeddings) |

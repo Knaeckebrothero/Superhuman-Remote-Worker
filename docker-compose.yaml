@@ -2,11 +2,8 @@
 # Superhuman Remote Worker - Production Stack
 # =============================================================================
 #
-# Full-stack deployment: databases, SSO, VPN sidecars, orchestrator, agents,
+# Full-stack deployment: databases, SSO, orchestrator, agents,
 # and cockpit. All services run as containers with shared workspace volume.
-#
-# VPN sidecars route LLM and research traffic through the university network.
-# Agent containers reach VPN services over the Docker network (no host ports).
 #
 # Usage:
 #   podman-compose up -d                   # Start all services
@@ -17,8 +14,8 @@
 #   podman-compose logs -f agent           # Follow agent logs
 #
 # Prerequisites:
-#   - Copy .env.example to .env and configure API keys + VPN credentials
-#   - Copy docker/keycloak/realm-export.json.example to docker/keycloak/realm-export.json
+#   - Copy .env.example to .env and configure API keys
+#     (including the OIDC_CLIENT_SECRET values — compose fails fast if unset)
 #   - Ensure GHCR images are accessible (or use docker-compose.local.yaml)
 #
 # Exposed ports:
@@ -122,14 +119,26 @@ services:
       # Admin console credentials
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      # SMTP — realm JSON resolves ${env.SMTP_*} from these at import time.
-      # Default: Proton Bridge on host machine (Podman: host.containers.internal)
+      # SMTP — Proton Bridge on host machine (Podman: host.containers.internal).
+      # (Current realm-export.json has SMTP hardcoded; these are unused until
+      # the realm JSON is converted to ${SMTP_HOST}/${SMTP_USER}/${SMTP_PASSWORD}
+      # placeholders. Left here as forward-compat hooks.)
       SMTP_HOST: "${SMTP_HOST:-host.containers.internal}"
       SMTP_USER: "${SMTP_USER:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+      # OIDC client secrets — realm JSON references these as ${*_OIDC_CLIENT_SECRET}
+      # placeholders and Keycloak resolves them from these env vars at realm
+      # import time. (Keycloak 26's placeholder syntax is ${VAR}, NOT ${env.VAR}
+      # — the env. prefix is legacy and silently fails to substitute.)
+      # `:?` fails fast if any is unset so silent "invalid_client_credentials"
+      # / "client_not_found" misconfigurations surface at `up` time instead
+      # of at the first OAuth redirect.
+      GITEA_OIDC_CLIENT_SECRET: "${GITEA_OIDC_CLIENT_SECRET:?GITEA_OIDC_CLIENT_SECRET required for Keycloak realm import}"
+      NEXTCLOUD_OIDC_CLIENT_SECRET: "${NEXTCLOUD_OIDC_CLIENT_SECRET:?NEXTCLOUD_OIDC_CLIENT_SECRET required}"
+      PGADMIN_OIDC_CLIENT_SECRET: "${PGADMIN_OIDC_CLIENT_SECRET:?PGADMIN_OIDC_CLIENT_SECRET required}"
+      MCP_OIDC_CLIENT_SECRET: "${MCP_OIDC_CLIENT_SECRET:?MCP_OIDC_CLIENT_SECRET required}"
+      OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "${OPENCLOUD_KEYCLOAK_CLIENT_SECRET:?OPENCLOUD_KEYCLOAK_CLIENT_SECRET required}"
     volumes:
-      # Copy realm-export.json.example to realm-export.json and edit credentials.
-      # See docker/keycloak/realm-export.json.example for the template.
       - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
     ports:
       - "${KEYCLOAK_PORT:-8180}:8080"
@@ -267,85 +276,6 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # VPN Sidecars
-  # ---------------------------------------------------------------------------
-  vpn-cluster:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
-    container_name: srw-vpn-cluster
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    environment:
-      SOCKS_PORT: 1080
-      FORWARD_PORT: 8080
-      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
-      VPN_HOST: ${VPN_CLUSTER_HOST:-}
-      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
-      VPN_REALM: ${VPN_CLUSTER_REALM:-}
-      VPN_USER: ${VPN_CLUSTER_USER:-}
-      VPN_PASS: ${VPN_CLUSTER_PASS:-}
-      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  vpn-research:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
-    container_name: srw-vpn-research
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    environment:
-      SOCKS_PORT: 1080
-      VPN_HOST: ${VPN_RESEARCH_HOST:-}
-      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
-      VPN_REALM: ${VPN_RESEARCH_REALM:-}
-      VPN_USER: ${VPN_RESEARCH_USER:-}
-      VPN_PASS: ${VPN_RESEARCH_PASS:-}
-      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  vpn-workstation:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
-    container_name: srw-vpn-workstation
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    environment:
-      SOCKS_PORT: 1080
-      FORWARD_PORT: 8080
-      FORWARD_TARGET: ${VPN_WORKSTATION_ENDPOINT:-10.18.2.105:8090}
-      VPN_HOST: ${VPN_WORKSTATION_HOST:-${VPN_RESEARCH_HOST:-}}
-      VPN_PORT: ${VPN_WORKSTATION_PORT:-443}
-      VPN_REALM: ${VPN_WORKSTATION_REALM:-${VPN_RESEARCH_REALM:-}}
-      VPN_USER: ${VPN_WORKSTATION_USER:-${VPN_RESEARCH_USER:-}}
-      VPN_PASS: ${VPN_WORKSTATION_PASS:-${VPN_RESEARCH_PASS:-}}
-      VPN_TRUSTED_CERT: ${VPN_WORKSTATION_TRUSTED_CERT:-${VPN_RESEARCH_TRUSTED_CERT:-}}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
   # Application
   # ---------------------------------------------------------------------------
   orchestrator:
@@ -379,6 +309,9 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # MCP token verification
       MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      # AES-GCM encryption at rest for stored credentials
+      # (user_api_keys / project_api_keys / system_api_keys / llm_endpoints)
+      APP_ENCRYPTION_KEY: "${APP_ENCRYPTION_KEY:?APP_ENCRYPTION_KEY required — generate with: python -c 'import secrets,base64; print(base64.b64encode(secrets.token_bytes(32)).decode())'}"
       # Instruction Builder
       BUILDER_API_KEY: ${BUILDER_API_KEY:-${OPENAI_API_KEY:-}}
       BUILDER_MODEL: ${BUILDER_MODEL:-gpt-4o}
@@ -477,8 +410,8 @@ services:
       MONGODB_URL: mongodb://mongodb:27017/srw_logs
       ORCHESTRATOR_URL: http://orchestrator:8085
       WORKSPACE_PATH: /workspace
-      # LLM routing (via VPN sidecar)
-      LLM_BASE_URL: http://vpn-cluster:8080/v1
+      # LLM routing
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
       KEY_COOLDOWN_SECONDS: ${KEY_COOLDOWN_SECONDS:-3600}
       # LLM provider keys — set in .env
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -494,24 +427,20 @@ services:
       VISION_MODEL: ${VISION_MODEL:-gpt-4o-mini}
       # Audio transcription (Whisper)
       WHISPER_API_KEY: ${WHISPER_API_KEY:-}
-      # Browser automation (via VPN sidecar)
+      # Browser automation
       BROWSER_LLM_MODEL: ${BROWSER_LLM_MODEL:-gpt-4o-mini}
-      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
-      # Research proxy (via VPN sidecar SOCKS5)
-      RESEARCH_PROXY_TYPE: socks5
-      RESEARCH_PROXY_HOST: vpn-research
-      RESEARCH_PROXY_PORT: 1080
-      # Citation Engine (via VPN sidecar)
+      BROWSER_LLM_BASE_URL: ${BROWSER_LLM_BASE_URL:-}
+      # Citation Engine
       CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      CITATION_LLM_URL: http://vpn-cluster:8080/v1
+      CITATION_LLM_URL: ${CITATION_LLM_URL:-}
       CITATION_LLM_MODEL: ${CITATION_LLM_MODEL:-gpt-4o}
       CITATION_REASONING_LEVEL: ${CITATION_REASONING_LEVEL:-high}
       CITATION_EMBEDDING_MODEL: ${CITATION_EMBEDDING_MODEL:-qwen3-embedding-8b}
-      CITATION_EMBEDDING_URL: http://vpn-workstation:8080/v1
+      CITATION_EMBEDDING_URL: ${CITATION_EMBEDDING_URL:-}
       CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
-      # Embedding routing — workstation VPN hosts embedding models
+      # Embedding routing
       EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_BASE_URL: http://vpn-workstation:8080/v1
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
       # Research
       UNPAYWALL_EMAIL: ${UNPAYWALL_EMAIL:-}
@@ -519,12 +448,8 @@ services:
       NEO4J_URL: bolt://neo4j:7687
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
-      # Workstation API (embeddings, vision, whisper, TTS)
-      WORKSTATION_BASE_URL: http://vpn-workstation:8080/v1
       # Gitea
       GITEA_URL: http://gitea:3000
-      # Claude Code CLI auth (for coder-cc expert, uses Max/Pro plan)
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     cap_drop:
@@ -549,10 +474,6 @@ services:
         condition: service_healthy
       orchestrator:
         condition: service_healthy
-      vpn-cluster:
-        condition: service_started
-      vpn-workstation:
-        condition: service_started
       ssh-keygen:
         condition: service_completed_successfully
     healthcheck:

@@ -1,0 +1,85 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+
+  &[data-full-width] {
+    display: block;
+    width: 100%;
+  }
+}
+
+.app-textarea__field {
+  width: 100%;
+  appearance: none;
+  display: block;
+
+  font-family: inherit;
+  font-weight: v.$font-weight-normal;
+  line-height: v.$line-height-base;
+  color: var(--text-primary);
+
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease;
+
+  &:focus { outline: none; }
+
+  &::placeholder {
+    color: var(--text-muted);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  &:read-only {
+    background: var(--panel-bg);
+    cursor: default;
+  }
+
+  &[data-invalid] {
+    border-color: var(--danger);
+  }
+
+  // --- Resize behaviour ---
+  &[data-resize='none'] { resize: none; }
+  &[data-resize='vertical'] { resize: vertical; }
+  &[data-resize='horizontal'] { resize: horizontal; }
+  &[data-resize='both'] { resize: both; }
+
+  // --- Sizes ---
+  &[data-size='sm'] {
+    padding: v.$space-xs v.$space-sm;
+    font-size: v.$font-size-xs;
+    border-radius: v.$radius-sm;
+    min-height: 60px;
+  }
+
+  &[data-size='md'] {
+    padding: v.$space-sm v.$space-md;
+    font-size: v.$font-size-sm;
+    border-radius: v.$radius-md;
+    min-height: 72px;
+  }
+
+  &[data-size='lg'] {
+    padding: v.$space-md v.$space-lg;
+    font-size: v.$font-size-base;
+    border-radius: v.$radius-md;
+    min-height: 96px;
+  }
+}
+
+:host.cdk-keyboard-focused .app-textarea__field {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 1px;
+  border-color: var(--accent-color);
+}

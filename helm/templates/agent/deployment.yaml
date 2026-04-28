@@ -86,7 +86,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_PATH
-            # LLM routing (via VPN sidecar)
+            # LLM routing
             - name: LLM_BASE_URL
               valueFrom:
                 configMapKeyRef:
@@ -152,24 +152,20 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: CODEX_RAW_DUMP_DIR
                   optional: true
-            # Vision model
-            - name: VISION_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: VISION_API_KEY
+            # Vision model — VISION_API_KEY is injected per-job by the
+            # orchestrator (env_keys block) from the resolved provider key.
+            # Vault no longer carries it; vision_helper falls back to
+            # OPENAI_API_KEY when no vision model is configured.
             - name: VISION_MODEL
               valueFrom:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: VISION_MODEL
-            # Whisper
-            - name: WHISPER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: WHISPER_API_KEY
-            # Browser automation (via VPN sidecar)
+            # Whisper — WHISPER_API_KEY/WHISPER_BASE_URL are injected per-job
+            # by the orchestrator (env_keys block) when an admin / user has
+            # pinned a whisper model via Admin → Defaults or user_settings.
+            # audio_helper falls back to OPENAI_API_KEY when nothing is set.
+            # Browser automation
             - name: BROWSER_LLM_MODEL
               valueFrom:
                 configMapKeyRef:
@@ -180,23 +176,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: BROWSER_LLM_BASE_URL
-            # Research proxy (via VPN sidecar SOCKS5)
-            - name: RESEARCH_PROXY_TYPE
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_TYPE
-            - name: RESEARCH_PROXY_HOST
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_HOST
-            - name: RESEARCH_PROXY_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_PORT
-            # Citation Engine (via VPN sidecar)
+            # Citation Engine
             - name: CITATION_DB_URL
               valueFrom:
                 secretKeyRef:
@@ -237,11 +217,9 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: EMBEDDING_BASE_URL
-            - name: EMBEDDING_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: EMBEDDING_API_KEY
+            # EMBEDDING_API_KEY is injected per-job by the orchestrator
+            # (env_keys block) from the resolved provider key or the
+            # endpoint registry row.
             - name: CITATION_EMBEDDING_KEY
               valueFrom:
                 secretKeyRef:
@@ -272,18 +250,6 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEO4J_PASSWORD
                   optional: true
-            # Claude Code CLI auth
-            - name: CLAUDE_CODE_OAUTH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: CLAUDE_CODE_OAUTH_TOKEN
-            # Workstation API (embeddings, vision)
-            - name: WORKSTATION_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: WORKSTATION_BASE_URL
             # Gitea (for workspace git operations)
             - name: GITEA_URL
               valueFrom:

@@ -8,7 +8,7 @@ Lifecycle:
     provision_agent()        — pending job or new session → create agent pod
     delete_agent_pod()       — explicit cleanup by pod name
     delete_agent_pod_by_thread() — cleanup by thread_id label
-    cleanup_completed_pods() — periodic GC of Succeeded/Failed pods
+    reap_pods()              — periodic GC (completed / stale / unstartable)
     ensure_warm_pool()       — maintain MIN_AGENTS idle pods for responsiveness
 
 Docker Compose mode is unaffected — agents use the static container pool.
@@ -17,10 +17,27 @@ Docker Compose mode is unaffected — agents use the static container pool.
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+
+# Pending-phase container waiting reasons we treat as unrecoverable past grace.
+# All reflect bad configuration or missing dependencies that the kubelet will
+# retry forever without making progress — deleting the pod lets the scaler
+# recreate it with the current config.
+_TERMINAL_WAITING_REASONS: frozenset[str] = frozenset(
+    {
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "ImagePullBackOff",
+        "ErrImagePull",
+        "InvalidImageName",
+        "RunContainerError",
+    }
+)
 
 
 class AgentProvisioner:
@@ -47,7 +64,10 @@ class AgentProvisioner:
             ),
         )
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
-        self._secret_name: str = os.environ.get("AGENT_SECRET", "srw-secrets")
+        self._secret_name: str = os.environ.get("AGENT_SECRET", "srw")
+        self._ssh_secret_name: str = os.environ.get(
+            "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
         self._max_agents: int = int(os.environ.get("MAX_AGENTS", "10"))
         self._min_agents: int = int(os.environ.get("MIN_AGENTS", "0"))
         self._agent_buffer: int = int(os.environ.get("AGENT_BUFFER", "0"))
@@ -56,6 +76,10 @@ class AgentProvisioner:
         )
         self._reserved_job_slots: int = int(os.environ.get("RESERVED_JOB_SLOTS", "0"))
         self._label_selector: str = "srw/managed-by=agent-provisioner"
+        self._tailscale_enabled: bool = os.environ.get(
+            "AGENT_TAILSCALE_ENABLED", "false"
+        ).strip().lower() in ("true", "1", "yes")
+        self._headscale_url: str = os.environ.get("HEADSCALE_URL", "").strip()
 
     # =========================================================================
     # Properties
@@ -450,107 +474,105 @@ class AgentProvisioner:
             )
         return created
 
-    async def cleanup_completed_pods(self) -> int:
-        """Delete Succeeded/Failed agent pods and clean stale DB rows.
+    async def reap_pods(
+        self,
+        offline_threshold_minutes: int = 10,
+        unstartable_grace_seconds: int = 300,
+    ) -> dict[str, int]:
+        """Single-pass GC over managed agent pods.
 
-        Returns:
-            Number of pods cleaned up.
+        Lists the pod set once and dispatches each pod to one of three
+        policies with different SLOs:
+
+          - ``completed``: phase in {Succeeded, Failed} → delete immediately.
+          - ``stale``: phase == Running but the agent's heartbeat has been
+            offline in the DB for ``offline_threshold_minutes``.
+          - ``unstartable``: phase == Pending with a terminal
+            ``state.waiting.reason`` (e.g. CreateContainerConfigError,
+            ImagePullBackOff) older than ``unstartable_grace_seconds``.
+
+        Returns a per-category count dict.
         """
+        stats = {"completed": 0, "stale": 0, "unstartable": 0}
         if not self._k8s_available:
-            return 0
+            return stats
 
-        cleaned = 0
         try:
             pods = await asyncio.to_thread(
                 self._core_api.list_namespaced_pod,
                 namespace=self._namespace,
                 label_selector=self._label_selector,
             )
-
-            for pod in pods.items:
-                if pod.status.phase in ("Succeeded", "Failed"):
-                    try:
-                        await asyncio.to_thread(
-                            self._core_api.delete_namespaced_pod,
-                            name=pod.metadata.name,
-                            namespace=self._namespace,
-                            grace_period_seconds=0,
-                        )
-                        cleaned += 1
-                        logger.debug(
-                            "Cleaned up %s agent pod: %s",
-                            pod.status.phase,
-                            pod.metadata.name,
-                        )
-                    except Exception as e:
-                        if not (hasattr(e, "status") and e.status == 404):
-                            logger.warning(
-                                "Failed to clean up pod %s: %s",
-                                pod.metadata.name,
-                                e,
-                            )
-        except Exception as e:
-            logger.error("Failed to list agent pods for cleanup: %s", e)
-
-        if cleaned > 0:
-            logger.info("Cleaned up %d completed agent pod(s)", cleaned)
-        return cleaned
-
-    async def reap_stale_pods(self, offline_threshold_minutes: int = 10) -> int:
-        """Delete Running pods whose agents have been offline beyond threshold.
-
-        The stale-agent detector marks agents offline in the DB after 3 minutes
-        without a heartbeat, but leaves the K8s pod running.  This method
-        cross-references Running pods with offline DB records and terminates
-        the zombie pods so they stop consuming capacity.
-
-        Returns:
-            Number of pods reaped.
-        """
-        if not self._k8s_available or not self._db:
-            return 0
-
-        reaped = 0
-        try:
-            # 1. Collect hostnames of long-offline agents
-            offline_hostnames: set[str] = set()
-            try:
-                async with self._db.acquire() as conn:
-                    rows = await conn.fetch(
-                        """
-                        SELECT hostname FROM agents
-                        WHERE status = 'offline'
-                          AND hostname IS NOT NULL
-                          AND last_heartbeat < NOW() - make_interval(mins => $1)
-                        """,
-                        offline_threshold_minutes,
-                    )
-                offline_hostnames = {r["hostname"] for r in rows}
-            except Exception:
-                logger.exception("Failed to query offline agents for stale reaping")
-                return 0
-
-            if not offline_hostnames:
-                return 0
-
-            # 2. List managed Running pods and delete matches
-            pods = await asyncio.to_thread(
-                self._core_api.list_namespaced_pod,
-                namespace=self._namespace,
-                label_selector=self._label_selector,
-            )
-            for pod in pods.items:
-                if pod.status.phase in ("Succeeded", "Failed"):
-                    continue
-                if pod.metadata.name in offline_hostnames:
-                    if await self.delete_agent_pod(pod.metadata.name):
-                        reaped += 1
         except Exception:
-            logger.exception("Error during stale pod reaping")
+            logger.exception("Failed to list agent pods for reaping")
+            return stats
 
-        if reaped:
-            logger.info("Reaped %d stale agent pod(s)", reaped)
-        return reaped
+        offline_hostnames = await self._fetch_offline_hostnames(
+            offline_threshold_minutes
+        )
+
+        for pod in pods.items:
+            if self._is_completed(pod):
+                category = "completed"
+            elif self._is_stale_running(pod, offline_hostnames):
+                category = "stale"
+            elif self._is_unstartable(pod, unstartable_grace_seconds):
+                category = "unstartable"
+            else:
+                continue
+            if await self.delete_agent_pod(pod.metadata.name):
+                stats[category] += 1
+
+        if sum(stats.values()) > 0:
+            logger.info("Reaped agent pod(s): %s", stats)
+        return stats
+
+    @staticmethod
+    def _is_completed(pod) -> bool:
+        return pod.status.phase in ("Succeeded", "Failed")
+
+    @staticmethod
+    def _is_stale_running(pod, offline_hostnames: set[str]) -> bool:
+        return pod.status.phase == "Running" and pod.metadata.name in offline_hostnames
+
+    @staticmethod
+    def _is_unstartable(pod, grace_seconds: int) -> bool:
+        if pod.status.phase != "Pending":
+            return False
+        created = pod.metadata.creation_timestamp
+        if created is None:
+            return False
+        age = (datetime.now(timezone.utc) - created).total_seconds()
+        if age < grace_seconds:
+            return False
+        for attr in ("container_statuses", "init_container_statuses"):
+            for cs in getattr(pod.status, attr, None) or []:
+                state = getattr(cs, "state", None)
+                waiting = getattr(state, "waiting", None) if state else None
+                reason = getattr(waiting, "reason", None) if waiting else None
+                if reason in _TERMINAL_WAITING_REASONS:
+                    return True
+        return False
+
+    async def _fetch_offline_hostnames(self, threshold_minutes: int) -> set[str]:
+        """Return hostnames of agents whose heartbeat has been stale past threshold."""
+        if not self._db:
+            return set()
+        try:
+            async with self._db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT hostname FROM agents
+                    WHERE status = 'offline'
+                      AND hostname IS NOT NULL
+                      AND last_heartbeat < NOW() - make_interval(mins => $1)
+                    """,
+                    threshold_minutes,
+                )
+            return {r["hostname"] for r in rows}
+        except Exception:
+            logger.exception("Failed to query offline agents for reaping")
+            return set()
 
     async def scale_down_idle(self, max_terminate: int = 2) -> int:
         """Terminate excess idle agent pods above MIN_AGENTS floor.
@@ -739,6 +761,155 @@ class AgentProvisioner:
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
 
+        containers: list[dict] = [
+            {
+                "name": "agent",
+                "image": self._agent_image,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["sh", "-c", command],
+                "ports": [{"containerPort": 8001}],
+                # Inject all env from shared ConfigMap + Secret
+                "envFrom": [
+                    {"configMapRef": {"name": self._configmap_name}},
+                    {"secretRef": {"name": self._secret_name}},
+                ],
+                # Pod-specific overrides
+                "env": [
+                    {"name": "AGENT_CONFIG", "value": config_name},
+                    {"name": "AGENT_PORT", "value": "8001"},
+                ],
+                "securityContext": {
+                    "runAsNonRoot": True,
+                    "runAsUser": 999,
+                    "runAsGroup": 999,
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+                "volumeMounts": [
+                    {"name": "workspace", "mountPath": "/workspace"},
+                    {
+                        "name": "vm-ssh-key",
+                        "mountPath": "/run/secrets/vm-ssh-key",
+                        "subPath": "ssh-privatekey",
+                        "readOnly": True,
+                    },
+                    {"name": "tmp", "mountPath": "/tmp"},
+                    {"name": "run", "mountPath": "/run"},
+                    {"name": "home-srw", "mountPath": "/home/srw"},
+                ],
+                "livenessProbe": {
+                    "httpGet": {"path": "/health", "port": 8001},
+                    "initialDelaySeconds": 60,
+                    "periodSeconds": 30,
+                },
+                "readinessProbe": {
+                    "httpGet": {"path": "/ready", "port": 8001},
+                    "initialDelaySeconds": 30,
+                    "periodSeconds": 10,
+                },
+                "startupProbe": {
+                    "httpGet": {"path": "/health", "port": 8001},
+                    "failureThreshold": 10,
+                    "periodSeconds": 10,
+                },
+                "resources": {
+                    "requests": {
+                        "memory": memory_request,
+                        "cpu": cpu_request,
+                    },
+                    "limits": {
+                        "memory": memory_limit,
+                        "cpu": cpu_limit,
+                    },
+                },
+            },
+        ]
+
+        volumes: list[dict] = [
+            # Scratch workspace (agent connects to real workspace
+            # via SSH — this is just local temp storage)
+            {"name": "workspace", "emptyDir": {"sizeLimit": "10Gi"}},
+            {
+                "name": "vm-ssh-key",
+                "secret": {
+                    "secretName": self._ssh_secret_name,
+                    "defaultMode": 0o444,
+                },
+            },
+            {
+                "name": "tmp",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"},
+            },
+            {
+                "name": "run",
+                "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"},
+            },
+            {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
+        ]
+
+        if self._tailscale_enabled and self._headscale_url:
+            tailscale_args = (
+                "mkdir -p /dev/net; "
+                "[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; "
+                "tailscaled --state=mem: --tun=tailscale0 "
+                "--no-logs-no-support & "
+                "TSPID=$!; "
+                "for i in $(seq 1 30); do "
+                "[ -S /var/run/tailscale/tailscaled.sock ] && break; "
+                "sleep 1; done; "
+                "while true; do "
+                "if tailscale up "
+                '--auth-key="${TS_AUTHKEY}" '
+                f'--login-server="{self._headscale_url}" '
+                '--hostname="${POD_NAME}" '
+                "--accept-dns=false "
+                "--timeout=60s 2>&1; then "
+                'echo "Tailscale authenticated"; break; fi; '
+                'echo "Auth retry in 15s..."; sleep 15; done; '
+                "wait $TSPID"
+            )
+            containers.append(
+                {
+                    "name": "tailscale",
+                    "image": "ghcr.io/tailscale/tailscale:v1.82.5",
+                    "securityContext": {
+                        "capabilities": {"add": ["NET_ADMIN", "NET_RAW"]},
+                    },
+                    "command": ["/bin/sh", "-c"],
+                    "args": [tailscale_args],
+                    "env": [
+                        {
+                            "name": "TS_AUTHKEY",
+                            "valueFrom": {
+                                "secretKeyRef": {
+                                    "name": self._secret_name,
+                                    "key": "TAILSCALE_AUTH_KEY",
+                                    "optional": True,
+                                }
+                            },
+                        },
+                        {
+                            "name": "POD_NAME",
+                            "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                        },
+                    ],
+                    "volumeMounts": [
+                        {
+                            "name": "tailscale-state",
+                            "mountPath": "/var/lib/tailscale",
+                        }
+                    ],
+                    "resources": {
+                        "requests": {"memory": "64Mi", "cpu": "50m"},
+                        "limits": {"memory": "128Mi", "cpu": "200m"},
+                    },
+                }
+            )
+            volumes.append(
+                {"name": "tailscale-state", "emptyDir": {"sizeLimit": "16Mi"}}
+            )
+
         return {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -765,158 +936,8 @@ class AgentProvisioner:
                         ],
                     }
                 ],
-                "containers": [
-                    {
-                        "name": "agent",
-                        "image": self._agent_image,
-                        "imagePullPolicy": "IfNotPresent",
-                        "command": ["sh", "-c", command],
-                        "ports": [{"containerPort": 8001}],
-                        # Inject all env from shared ConfigMap + Secret
-                        "envFrom": [
-                            {"configMapRef": {"name": self._configmap_name}},
-                            {"secretRef": {"name": self._secret_name}},
-                        ],
-                        # Pod-specific overrides
-                        "env": [
-                            {"name": "AGENT_CONFIG", "value": config_name},
-                            {"name": "AGENT_PORT", "value": "8001"},
-                        ],
-                        "securityContext": {
-                            "runAsNonRoot": True,
-                            "runAsUser": 999,
-                            "runAsGroup": 999,
-                            "allowPrivilegeEscalation": False,
-                            "readOnlyRootFilesystem": True,
-                            "capabilities": {"drop": ["ALL"]},
-                        },
-                        "volumeMounts": [
-                            {"name": "workspace", "mountPath": "/workspace"},
-                            {
-                                "name": "vm-ssh-key",
-                                "mountPath": "/run/secrets/vm-ssh-key",
-                                "subPath": "ssh-privatekey",
-                                "readOnly": True,
-                            },
-                            {"name": "tmp", "mountPath": "/tmp"},
-                            {"name": "run", "mountPath": "/run"},
-                            {"name": "home-srw", "mountPath": "/home/srw"},
-                        ],
-                        "livenessProbe": {
-                            "httpGet": {"path": "/health", "port": 8001},
-                            "initialDelaySeconds": 60,
-                            "periodSeconds": 30,
-                        },
-                        "readinessProbe": {
-                            "httpGet": {"path": "/ready", "port": 8001},
-                            "initialDelaySeconds": 30,
-                            "periodSeconds": 10,
-                        },
-                        "startupProbe": {
-                            "httpGet": {"path": "/health", "port": 8001},
-                            "failureThreshold": 10,
-                            "periodSeconds": 10,
-                        },
-                        "resources": {
-                            "requests": {
-                                "memory": memory_request,
-                                "cpu": cpu_request,
-                            },
-                            "limits": {
-                                "memory": memory_limit,
-                                "cpu": cpu_limit,
-                            },
-                        },
-                    },
-                    # Tailscale sidecar — mesh VPN for SSH access to
-                    # KubeVirt VMs. Creates tailscale0 tun in shared pod
-                    # network namespace so the agent container can route
-                    # directly to 100.64.x.y addresses.
-                    {
-                        "name": "tailscale",
-                        "image": "ghcr.io/tailscale/tailscale:v1.82.5",
-                        "securityContext": {
-                            "capabilities": {"add": ["NET_ADMIN", "NET_RAW"]},
-                        },
-                        "command": ["/bin/sh", "-c"],
-                        "args": [
-                            "mkdir -p /dev/net; "
-                            "[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; "
-                            "tailscaled --state=mem: --tun=tailscale0 "
-                            "--no-logs-no-support & "
-                            "TSPID=$!; "
-                            "for i in $(seq 1 30); do "
-                            "[ -S /var/run/tailscale/tailscaled.sock ] && break; "
-                            "sleep 1; done; "
-                            "while true; do "
-                            "if tailscale up "
-                            '--auth-key="${TS_AUTHKEY}" '
-                            "--login-server=https://headscale.superhuman-remote-worker.com "
-                            '--hostname="${POD_NAME}" '
-                            "--accept-dns=false "
-                            "--timeout=60s 2>&1; then "
-                            'echo "Tailscale authenticated"; break; fi; '
-                            'echo "Auth retry in 15s..."; sleep 15; done; '
-                            "wait $TSPID"
-                        ],
-                        "env": [
-                            {
-                                "name": "TS_AUTHKEY",
-                                "valueFrom": {
-                                    "secretKeyRef": {
-                                        "name": self._secret_name,
-                                        "key": "TAILSCALE_AUTH_KEY",
-                                        "optional": True,
-                                    }
-                                },
-                            },
-                            {
-                                "name": "POD_NAME",
-                                "valueFrom": {
-                                    "fieldRef": {"fieldPath": "metadata.name"}
-                                },
-                            },
-                        ],
-                        "volumeMounts": [
-                            {
-                                "name": "tailscale-state",
-                                "mountPath": "/var/lib/tailscale",
-                            }
-                        ],
-                        "resources": {
-                            "requests": {"memory": "64Mi", "cpu": "50m"},
-                            "limits": {"memory": "128Mi", "cpu": "200m"},
-                        },
-                    },
-                ],
-                "volumes": [
-                    # Scratch workspace (agent connects to real workspace
-                    # via SSH — this is just local temp storage)
-                    {
-                        "name": "workspace",
-                        "emptyDir": {"sizeLimit": "10Gi"},
-                    },
-                    {
-                        "name": "vm-ssh-key",
-                        "secret": {
-                            "secretName": "vm-ssh-key",
-                            "defaultMode": 0o444,
-                        },
-                    },
-                    {
-                        "name": "tmp",
-                        "emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"},
-                    },
-                    {
-                        "name": "run",
-                        "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"},
-                    },
-                    {"name": "home-srw", "emptyDir": {"sizeLimit": "512Mi"}},
-                    {
-                        "name": "tailscale-state",
-                        "emptyDir": {"sizeLimit": "16Mi"},
-                    },
-                ],
+                "containers": containers,
+                "volumes": volumes,
             },
         }
 

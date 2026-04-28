@@ -3,12 +3,16 @@
 #
 # Separate PostgreSQL instance with pgvector extension for all vector operations.
 # Schema is applied by the orchestrator on startup (vector_schema.sql), not by initdb.
+#
+# NOTE: component label uses short name "pgvector" so the StatefulSet name stays
+# under 52 chars — the controller-revision-hash label adds "-<10char>" (11 chars),
+# and total label value must be <= 63 chars.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "srw.fullname" . }}-postgres-vector-data
+  name: {{ include "srw.fullname" . }}-pgvector-data
   labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
 spec:
   accessModes:
     - ReadWriteOnce
@@ -22,26 +26,26 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "srw.fullname" . }}-postgres-vector
+  name: {{ include "srw.fullname" . }}-pgvector
   labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
 spec:
-  serviceName: {{ include "srw.fullname" . }}-postgres-vector
+  serviceName: {{ include "srw.fullname" . }}-pgvector
   replicas: 1
   selector:
     matchLabels:
-      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 6 }}
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 8 }}
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 8 }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        - name: postgres-vector
+        - name: pgvector
           image: {{ .Values.databases.vector.image }}
           ports:
             - containerPort: 5432
@@ -79,19 +83,19 @@ spec:
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "srw.fullname" . }}-postgres-vector-data
+            claimName: {{ include "srw.fullname" . }}-pgvector-data
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "srw.fullname" . }}-postgres-vector
+  name: {{ include "srw.fullname" . }}-pgvector
   labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
 spec:
   type: ClusterIP
   ports:
     - port: 5432
       targetPort: 5432
   selector:
-    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 4 }}
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
 {{- end }}
