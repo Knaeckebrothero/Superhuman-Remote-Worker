@@ -194,7 +194,6 @@ jobs:
       orchestrator: ${{ steps.check.outputs.orchestrator }}
       cockpit: ${{ steps.check.outputs.cockpit }}
       mcp: ${{ steps.check.outputs.mcp }}
-      vpn: ${{ steps.check.outputs.vpn }}
       vm-base: ${{ steps.check.outputs.vm-base }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       sudo-gate: ${{ steps.check.outputs.sudo-gate }}
@@ -276,14 +275,13 @@ jobs:
           SHA_ORCHESTRATOR=$(extract_sha orchestrator)
           SHA_COCKPIT=$(extract_sha cockpit)
           SHA_MCP=$(extract_sha mcp)
-          SHA_VPN=$(extract_sha vpn)
           SHA_WORKSPACE=$(extract_sha workspace)
           SHA_VM_CONTROLLER=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
           SHA_VM_BASE=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
 
           echo "Deployed SHAs:"
           echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
-          echo "  mcp=$SHA_MCP  vpn=$SHA_VPN  workspace=$SHA_WORKSPACE"
+          echo "  mcp=$SHA_MCP  workspace=$SHA_WORKSPACE"
           echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
 
           AGENT=$(has_changes "$SHA_AGENT" \
@@ -298,9 +296,6 @@ jobs:
           MCP=$(has_changes "$SHA_MCP" \
             orchestrator/mcp/ orchestrator/services/formatters.py \
             orchestrator/services/__init__.py docker/Dockerfile.mcp)
-
-          VPN=$(has_changes "$SHA_VPN" \
-            docker/vpn/)
 
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
             docker/Dockerfile.workspace docker/workspace-entrypoint.sh)
@@ -331,7 +326,7 @@ jobs:
           echo ""
           echo "Change detection results:"
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
-          echo "  mcp=$MCP  vpn=$VPN  workspace=$WORKSPACE"
+          echo "  mcp=$MCP  workspace=$WORKSPACE"
           echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  sudo-gate=$SUDO_GATE"
           echo "  chart=$CHART"
 
@@ -340,7 +335,6 @@ jobs:
             echo "orchestrator=$ORCHESTRATOR"
             echo "cockpit=$COCKPIT"
             echo "mcp=$MCP"
-            echo "vpn=$VPN"
             echo "workspace=$WORKSPACE"
             echo "vm-controller=$VM_CONTROLLER"
             echo "vm-base=$VM_BASE"
@@ -582,52 +576,6 @@ jobs:
         with:
           context: .
           file: ./docker/Dockerfile.mcp
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
-
-  build-vpn:
-    needs: [changes, dependency-audit, test-python, test-cockpit]
-    if: >-
-      always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      (needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch') &&
-      needs.dependency-audit.result == 'success' &&
-      !contains(needs.test-python.result, 'failure') &&
-      !contains(needs.test-cockpit.result, 'failure')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn
-          tags: |
-            type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: ./docker/vpn
-          file: ./docker/vpn/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -877,7 +825,6 @@ jobs:
       - build-orchestrator
       - build-cockpit
       - build-mcp
-      - build-vpn
       - build-workspace
       - build-vm-controller
       - build-agent-vm-base
@@ -970,10 +917,6 @@ jobs:
       - name: Update MCP tag
         if: needs.build-mcp.result == 'success'
         run: yq -i '.image.mcp.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
-
-      - name: Update VPN tag
-        if: needs.build-vpn.result == 'success'
-        run: yq -i '.image.vpn.tag = "${{ steps.tag.outputs.sha }}"' deployment/values-experimental.yaml
 
       - name: Update workspace tag
         if: needs.build-workspace.result == 'success'
