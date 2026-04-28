@@ -13,7 +13,6 @@ data:
   config.yaml: |
     port: 8317
     auth-dir: /data/auth
-    remote-management: true
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -68,7 +67,7 @@ spec:
                   key: CODEX_MANAGEMENT_KEY
           volumeMounts:
             - name: config
-              mountPath: /app/config.yaml
+              mountPath: /CLIProxyAPI/config.yaml
               subPath: config.yaml
             - name: auth
               mountPath: /data/auth

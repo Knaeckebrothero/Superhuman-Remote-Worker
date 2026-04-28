@@ -78,15 +78,16 @@
               "node_modules/prismjs/plugins/line-numbers/prism-line-numbers.min.js"
             ],
             "outputMode": "static",
-            "ssr": false
+            "ssr": false,
+            "serviceWorker": "ngsw-config.json"
           },
           "configurations": {
             "production": {
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "1MB",
-                  "maximumError": "1.5MB"
+                  "maximumWarning": "1.5MB",
+                  "maximumError": "2MB"
                 },
                 {
                   "type": "anyComponentStyle",

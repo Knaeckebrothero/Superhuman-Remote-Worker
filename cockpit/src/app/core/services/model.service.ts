@@ -39,6 +39,7 @@ interface ModelsResponse {
   auxiliary_models: HelperModel[];
   vision_models: HelperModel[];
   whisper_models: HelperModel[];
+  tts_models: HelperModel[];
   embedding_models: EmbeddingModel[];
   configured_providers: string[];
 }
@@ -59,6 +60,7 @@ export class ModelService {
   readonly auxiliaryModels = signal<HelperModel[]>([]);
   readonly visionModels = signal<HelperModel[]>([]);
   readonly whisperModels = signal<HelperModel[]>([]);
+  readonly ttsModels = signal<HelperModel[]>([]);
   readonly embeddingModels = signal<EmbeddingModel[]>([]);
   readonly providers = signal<string[]>([]);
   readonly loading = signal(false);
@@ -84,6 +86,7 @@ export class ModelService {
         this.auxiliaryModels.set(resp.auxiliary_models ?? []);
         this.visionModels.set(resp.vision_models ?? []);
         this.whisperModels.set(resp.whisper_models ?? []);
+        this.ttsModels.set(resp.tts_models ?? []);
         this.embeddingModels.set(resp.embedding_models ?? []);
         this.providers.set(resp.configured_providers);
         this.loading.set(false);
@@ -91,11 +94,17 @@ export class ModelService {
         this.fetchInFlight = false;
       },
       error: () => {
-        // Fallback: use env.js static config if API fails
-        // Static config lacks API-only fields (configured, provider) — cast to match
-        this.models.set(environment.models as ModelGroup[]);
-        this.presets.set(environment.modelPresets as ModelPreset[]);
-        this.builderModels.set(environment.builderModels as BuilderModel[]);
+        // The DB is the source of truth — on failure, surface an empty
+        // catalog so the empty-state banner + disabled pickers render
+        // instead of stale, hard-coded fallbacks.
+        this.models.set([]);
+        this.presets.set([]);
+        this.builderModels.set([]);
+        this.auxiliaryModels.set([]);
+        this.visionModels.set([]);
+        this.whisperModels.set([]);
+        this.ttsModels.set([]);
+        this.embeddingModels.set([]);
         this.providers.set([]);
         this.loading.set(false);
         this.loaded.set(true);

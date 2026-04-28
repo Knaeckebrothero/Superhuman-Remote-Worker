@@ -5,13 +5,67 @@
   <title>Cockpit</title>
   <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" type="image/x-icon" href="favicon.ico">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#9c1f2e" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0c0c0d" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.ico" sizes="any">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon-16.png" sizes="16x16" type="image/png">
+  <link rel="icon" href="favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="SRW">
+  <meta name="msapplication-TileColor" content="#9c1f2e">
+  <meta property="og:title" content="SRW · Cockpit">
+  <meta property="og:description" content="Command center for remote AI workers.">
+  <meta property="og:image" content="assets/social/og-1200x630.png">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Cormorant+Garamond:wght@500;600;700&display=swap" rel="stylesheet">
   <script src="assets/env.js"></script>
+  <script>
+    // Reveal Material Symbols ligatures only after the icon font has loaded.
+    // Without this, the literal text (e.g. "settings") flashes before glyphs
+    // arrive — visible as broken `.notdef` boxes in the UI.
+    (function () {
+      function markLoaded() { document.body.classList.add('fonts-loaded'); }
+      if (document.fonts && document.fonts.load) {
+        document.fonts.load('1em "Material Symbols Outlined"')
+          .then(markLoaded)
+          .catch(markLoaded);
+        // Hard fallback so icons never stay invisible if the font fails.
+        setTimeout(markLoaded, 3000);
+      } else {
+        markLoaded();
+      }
+    })();
+  </script>
 </head>
-<body>
+<body class="theme-travertine">
+  <script>
+    // Pre-paint theme resolution: pick the body class before Angular hydrates so
+    // dark-OS users don't flash through the Travertine fallback class on first paint.
+    // Mirrors ThemeService.readStoredPreference() — keep in sync.
+    (function () {
+      try {
+        var raw = window.localStorage.getItem('cockpit:theme');
+        var migrate = {dark: 'senate', light: 'travertine'};
+        var pref = (raw && migrate[raw]) || raw || 'system';
+        var valid = {travertine: 1, senate: 1, praetorian: 1, system: 1};
+        if (!valid[pref]) pref = 'system';
+        var resolved = pref;
+        if (pref === 'system') {
+          resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'senate' : 'travertine';
+        }
+        document.body.classList.remove('theme-travertine', 'theme-senate', 'theme-praetorian');
+        document.body.classList.add('theme-' + resolved);
+      } catch (e) { /* leave fallback class in place */ }
+    })();
+  </script>
   <app-root></app-root>
 </body>
 </html>

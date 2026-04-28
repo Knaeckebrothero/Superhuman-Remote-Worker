@@ -23,26 +23,9 @@ data:
       window['env']['keycloakRealm'] = '{{ .Values.keycloak.realm }}';
       window['env']['keycloakClientId'] = '{{ .Values.keycloak.cockpitClientId }}';
 
-      // Available models (fallback — primary source is GET /api/models)
-      window['env']['models'] = [
-        {{- range $i, $group := .Values.cockpit.models }}
-        {{ if $i }},{{ end }}{ group: '{{ $group.group }}', models: [{{ range $j, $m := $group.models }}{{ if $j }}, {{ end }}'{{ $m }}'{{ end }}] }
-        {{- end }}
-      ];
-
-      // Quick-select presets for strategic + tactical model combinations
-      window['env']['modelPresets'] = [
-        {{- range $i, $preset := .Values.cockpit.modelPresets }}
-        {{ if $i }},{{ end }}{ label: '{{ $preset.label }}', strategic: '{{ $preset.strategic }}', tactical: '{{ $preset.tactical }}' }
-        {{- end }}
-      ];
-
-      // Models available in the instruction builder chat
-      window['env']['builderModels'] = [
-        {{- range $i, $model := .Values.cockpit.builderModels }}
-        {{ if $i }},{{ end }}{ label: '{{ $model.label }}', id: '{{ $model.id }}' }
-        {{- end }}
-      ];
+      // Model catalog is sourced from GET /api/models (system_api_keys +
+      // llm_endpoints). Do not seed window.env.models here — an empty
+      // catalog triggers the role-aware "configure a provider" banner.
     })(this);
 ---
 apiVersion: apps/v1

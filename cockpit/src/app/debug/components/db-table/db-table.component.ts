@@ -1,6 +1,7 @@
 import { Component, inject, OnInit, computed } from '@angular/core';
 import { StateService } from '../../../core/services/state.service';
 import { ColumnDef } from '../../../core/models/api.model';
+import { AppSpinnerComponent } from '../../../ui/spinner';
 
 /**
  * Database table viewer component.
@@ -9,6 +10,7 @@ import { ColumnDef } from '../../../core/models/api.model';
 @Component({
   selector: 'app-db-table',
   standalone: true,
+  imports: [AppSpinnerComponent],
   template: `
     <div class="db-table-container">
       <!-- Table Selector -->
@@ -33,7 +35,7 @@ import { ColumnDef } from '../../../core/models/api.model';
       <!-- Loading Overlay -->
       @if (state.isLoading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
         </div>
       }
 
@@ -224,21 +226,6 @@ import { ColumnDef } from '../../../core/models/api.model';
         align-items: center;
         justify-content: center;
         z-index: 10;
-      }
-
-      .spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--surface-0, #313244);
-        border-top-color: var(--accent-color, #cba6f7);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to {
-          transform: rotate(360deg);
-        }
       }
 
       /* Error State */

@@ -5,7 +5,7 @@ agent_id: default
 display_name: The General Secretary
 
 llm:
-  model: openai/gpt-oss-120b
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
   provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
   temperature: 0.0
   reasoning_level: high
@@ -227,7 +227,7 @@ memory:
 # See docs/features/auxiliary.md for full design.
 auxiliary:
   enabled: true
-  model: openai/gpt-oss-120b  # Free local model for all support tasks
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic  # Free local model for all support tasks
   base_url: null               # null = use LLM_BASE_URL (university vLLM endpoint)
   temperature: 0.0
   max_iterations: 15       # Cap for agent mode loops

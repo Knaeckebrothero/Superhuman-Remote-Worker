@@ -13,14 +13,17 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # SSH + CDP from agent pods (RemoteBackend + browser automation)
+    # SSH + CDP from agent pods (RemoteBackend + browser automation).
+    # Agent pods are created by the orchestrator's provisioners (not by Helm),
+    # so they carry the custom `app: srw-agent` / `app: srw-persistent-agent`
+    # labels rather than Helm's `app.kubernetes.io/component` labels.
     - from:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+              app: srw-agent
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "persistent-agent") | nindent 14 }}
+              app: srw-persistent-agent
       ports:
         - protocol: TCP
           port: 22
@@ -78,7 +81,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres-vector") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 5432

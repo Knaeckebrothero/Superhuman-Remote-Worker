@@ -344,3 +344,15 @@ class TestRegistry:
         clear_registry()
         ring2 = get_or_create_key_ring(["sk-1"], provider="test")
         assert ring1 is not ring2
+
+    def test_different_keys_same_provider_separate(self):
+        """Two different key sets under the same provider must NOT collapse
+        to the cached ring of the first caller. Otherwise a session that
+        attaches with an explicit ``api_key`` after the agent already
+        booted with ``not-needed`` would be silently overridden to send
+        ``Bearer not-needed`` (caused 401s on custom endpoints)."""
+        boot = get_or_create_key_ring(["not-needed"], provider="openai")
+        session = get_or_create_key_ring(["sk-real"], provider="openai")
+        assert boot is not session
+        assert boot.current_key == "not-needed"
+        assert session.current_key == "sk-real"

@@ -1,0 +1,130 @@
+# =============================================================================
+# Experimental cluster values (develop branch -> Fleet -> home cluster)
+# =============================================================================
+# CI updates the image tags on every push to `develop`. Fleet then rolls
+# out the chart to the homelab cluster. This file is the single source of
+# truth for cluster-specific config; the chart itself stays generic.
+#
+# To install manually (e.g. for local testing):
+#   helm install srw ./helm -f ./deployment/values-experimental.yaml
+#
+# =============================================================================
+
+license:
+  acceptTerms: true
+# Pin the chart fullname so service/resource names stay short (`srw-*`)
+# regardless of how Fleet derives the Helm release name. Keeps DNS names
+# under the 63-char label limit and matches the hostnames assumed in Vault.
+fullnameOverride: srw
+global:
+  domain: "superhuman-remote-worker.com"
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+# -----------------------------------------------------------------------------
+# Image tags — updated by CI on every push to develop
+# -----------------------------------------------------------------------------
+image:
+  orchestrator:
+    tag: sha-7731683
+  agent:
+    tag: sha-8060dcd
+  cockpit:
+    tag: sha-42c2f8c
+  mcp:
+    tag: sha-2dd8e7f
+  workspace:
+    tag: sha-5788dfd
+# -----------------------------------------------------------------------------
+# Secrets — External Secrets Operator (Vault-backed)
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: true
+  refreshInterval: "1h"
+  secretStoreRef: "vault-backend"
+  secretStoreKind: "ClusterSecretStore"
+  vaultPath: "homelab/superhuman-remote-worker/srw-secrets"
+  vmSshKeyVaultPath: "homelab/superhuman-remote-worker/vm-ssh-key"
+# -----------------------------------------------------------------------------
+# Ingress
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    issuerName: cloudflare-dns-issuer
+# -----------------------------------------------------------------------------
+# Admin UIs
+# -----------------------------------------------------------------------------
+pgadmin:
+  enabled: true
+mongoExpress:
+  enabled: true
+dozzle:
+  enabled: true
+codexProxy:
+  enabled: true
+# -----------------------------------------------------------------------------
+# Cloud storage — OpenCloud bundled (chart default)
+# -----------------------------------------------------------------------------
+opencloud:
+  enabled: true
+nextcloud:
+  enabled: false
+# -----------------------------------------------------------------------------
+# Databases — all internal (chart defaults), override here if you externalize
+# -----------------------------------------------------------------------------
+# databases:
+#   postgres:
+#     externalUrl: ""
+#   vector:
+#     externalUrl: ""
+#   mongodb:
+#     externalUrl: ""
+#   neo4j:
+#     externalUrl: ""
+
+# -----------------------------------------------------------------------------
+# Headscale — consumed as an external service. The headscale server is
+# deployed out of band by the homelab Fleet bundle in
+# HomeLab/deployments_managed/headscale/ (its own namespace, its own release
+# lifecycle). We only need the URL here; the agent pre-auth key comes from
+# Vault as TAILSCALE_AUTH_KEY in the srw secret.
+# -----------------------------------------------------------------------------
+headscale:
+  url: "https://headscale.h4ll.app"
+# Agent tailscale sidecar — joins the headscale tailnet for SSH to KubeVirt
+# VMs. Disable to skip the sidecar entirely (e.g. when VM workspaces aren't
+# in use or headscale is offline).
+agent:
+  tailscale:
+    enabled: true
+# -----------------------------------------------------------------------------
+# Email — routed through the shared ProtonMail Bridge in `protonmail-bridge` ns.
+# SMTP_USER / SMTP_PASSWORD come from Vault (srw-secrets). The bridgeCert init
+# container extracts the bridge's self-signed cert and adds it to Keycloak's
+# JVM truststore so Jakarta Mail accepts the STARTTLS handshake.
+# -----------------------------------------------------------------------------
+email:
+  enabled: true
+  smtp:
+    host: "protonmail-bridge.protonmail-bridge.svc"
+    port: "1025"
+    useTls: "true"
+    trustSelfSigned: "true"
+    from: "noreply@superhuman-remote-worker.com"
+  domain: "superhuman-remote-worker.com"
+keycloak:
+  bridgeCert:
+    enabled: true
+    smtpHost: "protonmail-bridge.protonmail-bridge.svc"
+# -----------------------------------------------------------------------------
+# LLM config — actual keys are in the Vault-backed secret (srw-secrets).
+# Only non-secret base URLs go here.
+# -----------------------------------------------------------------------------
+llm:
+  baseUrl: ""
+  browserBaseUrl: ""
+  embeddingBaseUrl: ""
+  codexBaseUrl: ""
+logLevel: "INFO"

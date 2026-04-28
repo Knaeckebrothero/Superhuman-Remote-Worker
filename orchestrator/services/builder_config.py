@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from src.core.model_registry import family_of
+
 logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
@@ -37,56 +39,6 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
         else:
             result[key] = value
     return result
-
-
-def detect_model_family(model: str) -> str:
-    """Detect model family from model name for matrix resolution.
-
-    Strips provider prefixes (openrouter/, groq/, openai/) and pattern-matches
-    the model name to a family string.  Returns ``"default"`` as fallback.
-
-    Kept in sync with src/core/loader.py:detect_model_family().
-    """
-    name = model.lower()
-
-    # Strip provider prefixes
-    for prefix in ("openrouter/", "groq/", "codex/"):
-        if name.startswith(prefix):
-            name = name[len(prefix) :]
-            if "/" in name:
-                name = name.split("/", 1)[1]
-            break
-
-    if name.startswith("openai/"):
-        name = name[len("openai/") :]
-
-    # Pattern match
-    if name.startswith("claude-opus"):
-        return "claude-opus"
-    if name.startswith("claude-sonnet"):
-        return "claude-sonnet"
-    if name.startswith("claude-haiku"):
-        return "claude-haiku"
-    if name.startswith("gpt-5"):
-        return "gpt-5"
-    if name.startswith("gpt-4o"):
-        return "gpt-4o"
-    if name.startswith(("o1", "o3", "o4")):
-        return "o-series"
-    if "deepseek" in name:
-        return "deepseek"
-    if "qwen" in name or "qwq" in name:
-        return "qwen"
-    if "llama" in name:
-        return "llama"
-    if name.startswith("gemini"):
-        return "gemini"
-    if name.startswith("gpt-oss"):
-        return "gpt-oss"
-    if "minimax" in name:
-        return "minimax"
-
-    return "default"
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +88,7 @@ def resolve_builder_settings(model: str) -> dict[str, Any]:
     can use ``settings.get("temperature")`` and get ``None`` for unset params.
     """
     matrix = _load_yaml("builder_settings_matrix.yaml")
-    family = detect_model_family(model)
+    family = family_of(model)
 
     base = dict(matrix.get("default", {}))
     if family != "default" and family in matrix:
@@ -160,7 +112,7 @@ def resolve_builder_prompt(model: str, prompt_type: str = "system_prompt") -> st
     Falls back to the ``default`` entry if no family-specific override exists.
     """
     matrix = _load_yaml("builder_prompt_matrix.yaml")
-    family = detect_model_family(model)
+    family = family_of(model)
 
     # Resolve filename: family-specific → default
     filename = None

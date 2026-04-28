@@ -2,12 +2,8 @@ defaultNamespace: agent-vms
 helm:
   takeOwnership: true
 dependsOn: []
-# Deploy only to the VMs cluster — targetRestrictions prevents GitRepo default merge
-targets:
-  - clusterSelector:
-      matchLabels:
-        management.cattle.io/cluster-display-name: vms
-targetRestrictions:
-  - clusterSelector:
-      matchLabels:
-        management.cattle.io/cluster-display-name: vms
+# Cluster targeting handled by the dedicated GitRepo
+# (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
+# pins to the vms cluster. Two GitRepos is the canonical Fleet pattern
+# for per-cluster monorepo dispatch — targetRestrictions in fleet.yaml
+# is additive with GitRepo targets and cannot narrow them.

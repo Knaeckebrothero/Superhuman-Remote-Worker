@@ -15,6 +15,7 @@ import {DataService} from '../../../core/services/data.service';
 import {cytoscapeStyles} from './graph-styles';
 import {TimelineRenderer} from './timeline-renderer';
 import type {Core} from 'cytoscape';
+import {AppSpinnerComponent} from '../../../ui/spinner';
 
 // Dynamic import for Cytoscape (loaded at runtime)
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -30,6 +31,7 @@ let cytoscape: any;
 @Component({
   selector: 'app-graph-timeline',
   standalone: true,
+  imports: [AppSpinnerComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="graph-timeline-container">
@@ -139,7 +141,7 @@ let cytoscape: any;
       <!-- Loading state -->
       @if (graph.loading()) {
         <div class="loading-overlay">
-          <div class="spinner"></div>
+          <app-spinner size="lg" tone="accent" />
           <span>Loading graph changes...</span>
         </div>
       }
@@ -441,19 +443,6 @@ let cytoscape: any;
       gap: 16px;
       z-index: 10;
       color: var(--text-secondary, #a6adc8);
-    }
-
-    .spinner {
-      width: 32px;
-      height: 32px;
-      border: 3px solid var(--surface-0, #313244);
-      border-top-color: var(--accent-color, #cba6f7);
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin {
-      to { transform: rotate(360deg); }
     }
 
     /* Error state */

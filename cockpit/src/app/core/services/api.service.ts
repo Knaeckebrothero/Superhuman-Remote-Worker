@@ -1,7 +1,9 @@
 import {inject, Injectable} from '@angular/core';
 import {HttpClient, HttpParams} from '@angular/common/http';
 import {catchError, Observable, of, tap} from 'rxjs';
-import {ToastService} from './toast.service';
+import {TranslocoService} from '@jsverse/transloco';
+import {AppToastService} from '../../ui/toast';
+import {ErrorMessageService} from './error-message.service';
 import {
     Agent,
     AgentStatistics,
@@ -126,8 +128,14 @@ export interface SnapshotStorageStats {
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
-  private readonly toast = inject(ToastService);
+  private readonly toast = inject(AppToastService);
+  private readonly transloco = inject(TranslocoService);
+  private readonly errors = inject(ErrorMessageService);
   private readonly baseUrl = environment.apiUrl;
+
+  private t(key: string, params?: Record<string, unknown>): string {
+    return this.transloco.translate(key, params);
+  }
 
   /**
    * Get list of available tables with row counts.
@@ -742,10 +750,10 @@ export class ApiService {
    */
   createJob(job: JobCreateRequest): Observable<Job | null> {
     return this.http.post<Job>(`${this.baseUrl}/jobs`, job).pipe(
-      tap(() => this.toast.success('Job created')),
+      tap(() => this.toast.success(this.t('toasts.jobs.created'))),
       catchError((error) => {
         console.error('Failed to create job:', error);
-        this.toast.error('Failed to create job');
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.createFailed'));
         return of(null);
       }),
     );
@@ -768,10 +776,10 @@ export class ApiService {
    */
   deleteJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}`).pipe(
-      tap(() => this.toast.success('Job deleted')),
+      tap(() => this.toast.success(this.t('toasts.jobs.deleted'))),
       catchError((error) => {
         console.error(`Failed to delete job ${jobId}:`, error);
-        this.toast.error('Failed to delete job');
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.deleteFailed'));
         return of(null);
       }),
     );
@@ -782,10 +790,10 @@ export class ApiService {
    */
   cancelJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/cancel`, {}).pipe(
-      tap(() => this.toast.success('Job cancelled')),
+      tap(() => this.toast.success(this.t('toasts.jobs.cancelled'))),
       catchError((error) => {
         console.error(`Failed to cancel job ${jobId}:`, error);
-        this.toast.error('Failed to cancel job');
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.cancelFailed'));
         return of(null);
       }),
     );
@@ -796,10 +804,10 @@ export class ApiService {
    */
   pauseJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/pause`, {}).pipe(
-      tap(() => this.toast.success('Job paused')),
+      tap(() => this.toast.success(this.t('toasts.jobs.paused'))),
       catchError((error) => {
         console.error(`Failed to pause job ${jobId}:`, error);
-        this.toast.error('Failed to pause job');
+        this.toast.danger(this.errors.translate(error, 'errors.jobs.pauseFailed'));
         return of(null);
       }),
     );
@@ -826,10 +834,10 @@ export class ApiService {
         body,
       )
       .pipe(
-        tap(() => this.toast.success('Job resumed')),
+        tap(() => this.toast.success(this.t('toasts.jobs.resumed'))),
         catchError((error) => {
           console.error(`Failed to resume job ${jobId}:`, error);
-          this.toast.error('Failed to resume job');
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.resumeFailed'));
           return of(null);
         }),
       );
@@ -873,7 +881,7 @@ export class ApiService {
       .pipe(
         catchError((error) => {
           console.error(`Failed to start IDE session for ${jobId}:`, error);
-          this.toast.error('Failed to start IDE session');
+          this.toast.danger(this.errors.translate(error, 'errors.ide.startFailed'));
           return of(null);
         }),
       );
@@ -886,10 +894,10 @@ export class ApiService {
     return this.http
       .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`)
       .pipe(
-        tap(() => this.toast.success('IDE session stopped')),
+        tap(() => this.toast.success(this.t('toasts.ide.stopped'))),
         catchError((error) => {
           console.error(`Failed to stop IDE session for ${jobId}:`, error);
-          this.toast.error('Failed to stop IDE session');
+          this.toast.danger(this.errors.translate(error, 'errors.ide.stopFailed'));
           return of(null);
         }),
       );
@@ -955,10 +963,10 @@ export class ApiService {
         body,
       )
       .pipe(
-        tap(() => this.toast.success('Job approved')),
+        tap(() => this.toast.success(this.t('toasts.jobs.approved'))),
         catchError((error) => {
           console.error(`Failed to approve job ${jobId}:`, error);
-          this.toast.error('Failed to approve job');
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.approveFailed'));
           return of(null);
         }),
       );
@@ -977,10 +985,10 @@ export class ApiService {
         {},
       )
       .pipe(
-        tap(() => this.toast.success('VM upgrade initiated')),
+        tap(() => this.toast.success(this.t('toasts.jobs.vmUpgradeStarted'))),
         catchError((error) => {
           console.error(`Failed to upgrade job ${jobId} to VM:`, error);
-          this.toast.error('Failed to upgrade to VM');
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.upgradeVmFailed'));
           return of(null);
         }),
       );
@@ -1027,10 +1035,10 @@ export class ApiService {
         { message, urgent },
       )
       .pipe(
-        tap(() => this.toast.success('Reply sent')),
+        tap(() => this.toast.success(this.t('toasts.jobs.replySent'))),
         catchError((error) => {
           console.error(`Failed to reply to thread ${threadId}:`, error);
-          this.toast.error('Failed to send reply');
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.replyFailed'));
           return of(null);
         }),
       );

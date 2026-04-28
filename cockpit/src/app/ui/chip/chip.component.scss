@@ -1,0 +1,96 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+}
+
+.app-chip__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-xs;
+
+  appearance: none;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-weight: v.$font-weight-medium;
+  line-height: v.$line-height-tight;
+  cursor: pointer;
+  white-space: nowrap;
+
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+
+  &:focus { outline: none; }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  // --- Sizes ---
+  &[data-size='sm'] {
+    height: 24px;
+    padding: 0 v.$space-sm;
+    font-size: v.$font-size-xs;
+    border-radius: v.$radius-xl; // pill
+  }
+
+  &[data-size='md'] {
+    height: 32px;
+    padding: 0 v.$space-md;
+    font-size: v.$font-size-sm;
+    border-radius: v.$radius-xl; // pill
+  }
+
+  // --- Hover (only when selectable & enabled) ---
+  &[data-selectable]:hover:not(:disabled):not([data-selected]) {
+    border-color: var(--text-primary);
+    color: var(--text-primary);
+  }
+
+  // --- Variants & selected states ---
+  &[data-variant='default'][data-selected] {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: var(--timeline-bg);
+  }
+
+  &[data-variant='accent'] {
+    color: var(--accent-color);
+    border-color: var(--accent-color);
+
+    &[data-selected] {
+      background: var(--accent-color);
+      color: var(--timeline-bg);
+    }
+  }
+
+  &[data-variant='danger'] {
+    color: var(--danger);
+    border-color: var(--danger);
+
+    &[data-selected] {
+      background: var(--danger);
+      color: var(--timeline-bg);
+    }
+  }
+}
+
+:host.cdk-keyboard-focused .app-chip__btn {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-chip__btn[data-size='sm'] {
+    min-height: 32px;
+  }
+  .app-chip__btn[data-size='md'] {
+    min-height: v.$touch-target-min;
+  }
+}

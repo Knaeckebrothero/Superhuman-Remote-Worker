@@ -1,13 +1,14 @@
 """Tests for orchestrator/services/agent_provisioner.py.
 
 Covers the new pool management and reservation-aware provisioning:
-  - reap_stale_pods(): delete Running pods with offline agents
+  - reap_pods(): unified GC of completed / stale / unstartable pods
   - scale_down_idle(): terminate excess idle pods above MIN_AGENTS
   - _try_evict_for_reservation(): evict idle other-purpose pod at capacity
   - provision_agent(): reservation-aware capacity check with eviction
   - Pool fallback paths are tested indirectly via the provisioner methods
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -51,8 +52,21 @@ def _make_provisioner(
     return p, mock_conn
 
 
-def _make_pod(name, phase="Running", purpose="job", thread_id=None):
-    """Create a mock K8s pod object."""
+def _make_pod(
+    name,
+    phase="Running",
+    purpose="job",
+    thread_id=None,
+    age_seconds=10,
+    waiting_reason=None,
+):
+    """Create a mock K8s pod object.
+
+    ``age_seconds`` controls ``metadata.creation_timestamp`` (now minus that).
+    ``waiting_reason`` attaches a single container_status with
+    ``state.waiting.reason``. When None, container_statuses is empty — which
+    matches the shape of pods that haven't progressed to container creation.
+    """
     pod = MagicMock()
     pod.metadata.name = name
     pod.metadata.labels = {
@@ -61,8 +75,18 @@ def _make_pod(name, phase="Running", purpose="job", thread_id=None):
     }
     if thread_id:
         pod.metadata.labels["srw/thread-id"] = thread_id[:12]
+    pod.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(
+        seconds=age_seconds
+    )
     pod.status.phase = phase
     pod.status.pod_ip = "10.0.0.1"
+    if waiting_reason is not None:
+        cs = MagicMock()
+        cs.state.waiting.reason = waiting_reason
+        pod.status.container_statuses = [cs]
+    else:
+        pod.status.container_statuses = []
+    pod.status.init_container_statuses = []
     return pod
 
 
@@ -72,72 +96,166 @@ async def _fake_to_thread(fn, *args, **kwargs):
 
 
 # =============================================================================
-# TestReapStalePods
+# TestReapPods
 # =============================================================================
 
 
-class TestReapStalePods:
-    """Tests for reap_stale_pods()."""
+class TestReapPods:
+    """Tests for reap_pods() — unified completed/stale/unstartable dispatcher."""
 
     @pytest.mark.asyncio
     async def test_noop_when_k8s_not_available(self):
         p, _ = _make_provisioner(k8s_available=False)
-        assert await p.reap_stale_pods() == 0
+        result = await p.reap_pods()
+        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
 
     @pytest.mark.asyncio
-    async def test_noop_when_no_offline_agents(self):
+    async def test_noop_when_no_reapable_pods(self):
         p, conn = _make_provisioner()
-        conn.fetch.return_value = []  # No offline agents
-        assert await p.reap_stale_pods() == 0
-
-    @pytest.mark.asyncio
-    async def test_reaps_pods_with_offline_agents(self):
-        p, conn = _make_provisioner()
-
-        # DB returns 2 offline agents
-        conn.fetch.return_value = [
-            {"hostname": "srw-agent-j-aaa"},
-            {"hostname": "srw-agent-s-bbb"},
-        ]
-
-        # K8s has 3 Running pods: 2 match offline agents, 1 healthy
+        conn.fetch.return_value = []
         pods_result = MagicMock()
-        pods_result.items = [
-            _make_pod("srw-agent-j-aaa"),
-            _make_pod("srw-agent-s-bbb", purpose="session"),
-            _make_pod("srw-agent-j-ccc"),  # healthy, not in offline list
-        ]
+        pods_result.items = [_make_pod("srw-agent-j-healthy")]
         p._core_api.list_namespaced_pod.return_value = pods_result
-
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
-            result = await p.reap_stale_pods()
+            result = await p.reap_pods()
+        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
+        assert p._core_api.delete_namespaced_pod.call_count == 0
 
-        assert result == 2
+    @pytest.mark.asyncio
+    async def test_reaps_completed_pods(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-ok", phase="Succeeded"),
+            _make_pod("srw-agent-j-bad", phase="Failed"),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["completed"] == 2
+        assert result["stale"] == 0
+        assert result["unstartable"] == 0
         assert p._core_api.delete_namespaced_pod.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_skips_succeeded_failed_pods(self):
+    async def test_reaps_stale_running_pods(self):
         p, conn = _make_provisioner()
-
-        conn.fetch.return_value = [{"hostname": "srw-agent-j-aaa"}]
-
-        # Pod exists but in Succeeded phase — should be skipped
+        conn.fetch.return_value = [
+            {"hostname": "srw-agent-j-stale"},
+        ]
         pods_result = MagicMock()
         pods_result.items = [
-            _make_pod("srw-agent-j-aaa", phase="Succeeded"),
+            _make_pod("srw-agent-j-stale"),
+            _make_pod("srw-agent-j-healthy"),
         ]
         p._core_api.list_namespaced_pod.return_value = pods_result
-
         with patch(
             "orchestrator.services.agent_provisioner.asyncio.to_thread",
             side_effect=_fake_to_thread,
         ):
-            result = await p.reap_stale_pods()
+            result = await p.reap_pods()
+        assert result["stale"] == 1
+        assert result["completed"] == 0
+        assert result["unstartable"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 1
 
-        assert result == 0
+    @pytest.mark.asyncio
+    async def test_reaps_unstartable_pending_pods_past_grace(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-stuck",
+                phase="Pending",
+                age_seconds=600,
+                waiting_reason="CreateContainerConfigError",
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["unstartable"] == 1
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_preserves_unstartable_pending_pods_within_grace(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-young",
+                phase="Pending",
+                age_seconds=30,
+                waiting_reason="CreateContainerConfigError",
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["unstartable"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_preserves_pending_pods_with_benign_waiting_reason(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-pulling",
+                phase="Pending",
+                age_seconds=600,
+                waiting_reason="ContainerCreating",
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
+        assert p._core_api.delete_namespaced_pod.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_mixed_pod_set_reaps_all_three_categories(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = [{"hostname": "srw-agent-j-zombie"}]
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-done", phase="Succeeded"),
+            _make_pod("srw-agent-j-zombie"),  # Running, in offline DB list
+            _make_pod(
+                "srw-agent-j-stuck",
+                phase="Pending",
+                age_seconds=600,
+                waiting_reason="ImagePullBackOff",
+            ),
+            _make_pod("srw-agent-j-fine"),  # Running, healthy — skip
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result == {"completed": 1, "stale": 1, "unstartable": 1}
+        assert p._core_api.delete_namespaced_pod.call_count == 3
 
 
 # =============================================================================
@@ -536,53 +654,3 @@ class TestActiveCountsByPurpose:
         p, _ = _make_provisioner(k8s_available=False)
         result = await p.active_counts_by_purpose()
         assert result == {"job": 0, "session": 0, "total": 0}
-
-
-# =============================================================================
-# TestCleanupCompletedPods
-# =============================================================================
-
-
-class TestCleanupCompletedPods:
-    """Tests for cleanup_completed_pods()."""
-
-    @pytest.mark.asyncio
-    async def test_deletes_succeeded_and_failed(self):
-        p, _ = _make_provisioner()
-
-        pods_result = MagicMock()
-        pods_result.items = [
-            _make_pod("done-1", phase="Succeeded"),
-            _make_pod("done-2", phase="Failed"),
-            _make_pod("alive", phase="Running"),
-        ]
-        p._core_api.list_namespaced_pod.return_value = pods_result
-
-        with patch(
-            "orchestrator.services.agent_provisioner.asyncio.to_thread",
-            side_effect=_fake_to_thread,
-        ):
-            result = await p.cleanup_completed_pods()
-
-        assert result == 2
-        # delete called for done-1 and done-2 but not alive
-        assert p._core_api.delete_namespaced_pod.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_skips_running_pods(self):
-        p, _ = _make_provisioner()
-
-        pods_result = MagicMock()
-        pods_result.items = [
-            _make_pod("alive-1"),
-            _make_pod("alive-2"),
-        ]
-        p._core_api.list_namespaced_pod.return_value = pods_result
-
-        with patch(
-            "orchestrator.services.agent_provisioner.asyncio.to_thread",
-            side_effect=_fake_to_thread,
-        ):
-            result = await p.cleanup_completed_pods()
-
-        assert result == 0

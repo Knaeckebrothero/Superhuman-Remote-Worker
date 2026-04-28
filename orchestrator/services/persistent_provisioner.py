@@ -42,7 +42,10 @@ class PersistentProvisioner:
             "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest",
         )
         self._configmap_name: str = os.environ.get("AGENT_CONFIGMAP", "srw-config")
-        self._secret_name: str = os.environ.get("AGENT_SECRET", "srw-secrets")
+        self._secret_name: str = os.environ.get("AGENT_SECRET", "srw")
+        self._ssh_secret_name: str = os.environ.get(
+            "WORKSPACE_SSH_SECRET", "vm-ssh-key"
+        )
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
@@ -536,7 +539,7 @@ class PersistentProvisioner:
                     {
                         "name": "vm-ssh-key",
                         "secret": {
-                            "secretName": "vm-ssh-key",
+                            "secretName": self._ssh_secret_name,
                             "defaultMode": 0o444,
                         },
                     },

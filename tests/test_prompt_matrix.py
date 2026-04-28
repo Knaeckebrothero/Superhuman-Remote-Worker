@@ -1,4 +1,4 @@
-"""Tests for prompt matrix resolution: detect_model_family + PromptMatrixResolver."""
+"""Tests for prompt matrix resolution: family_of + PromptMatrixResolver."""
 
 import textwrap
 from unittest.mock import patch
@@ -10,131 +10,101 @@ from src.core.loader import (
     PhaseLLMOverride,
     PromptMatrixResolver,
     PromptResolver,
-    detect_model_family,
     detect_reasoning_method,
     get_phase_system_prompt,
     load_base_system_prompt,
     load_phase_component,
 )
+from src.core.model_registry import family_of
 
 
 # =============================================================================
-# detect_model_family tests
+# family_of tests — registry-backed replacement for detect_model_family
 # =============================================================================
 
 
-class TestDetectModelFamily:
-    """Tests for detect_model_family() covering all documented patterns."""
+class TestFamilyOf:
+    """Registry reads `family` from models.yaml for every built-in entry."""
 
     def test_claude_opus(self):
-        assert detect_model_family("claude-opus-4-6") == "claude-opus"
-        assert detect_model_family("claude-opus-4-5-20250514") == "claude-opus"
+        assert family_of("claude-opus-4-6") == "claude-opus"
 
     def test_claude_sonnet(self):
-        assert detect_model_family("claude-sonnet-4-5-20250929") == "claude-sonnet"
-        assert detect_model_family("claude-sonnet-4-20250514") == "claude-sonnet"
-
-    def test_claude_haiku(self):
-        assert detect_model_family("claude-haiku-4-5-20251001") == "claude-haiku"
-
-    def test_gpt5(self):
-        assert detect_model_family("gpt-5") == "gpt-5"
-        assert detect_model_family("gpt-5.2") == "gpt-5"
+        assert family_of("claude-sonnet-4-5-20250929") == "claude-sonnet"
 
     def test_gpt4o(self):
-        assert detect_model_family("gpt-4o") == "gpt-4o"
-        assert detect_model_family("gpt-4o-mini") == "gpt-4o"
+        assert family_of("gpt-4o") == "default"  # YAML declares family: default
+        assert family_of("gpt-4o-mini") == "default"
 
-    def test_gpt_oss(self):
-        assert detect_model_family("gpt-oss-120b") == "gpt-oss"
-        assert detect_model_family("openai/gpt-oss-120b") == "gpt-oss"
-
-    def test_o_series(self):
-        assert detect_model_family("o1-preview") == "o-series"
-        assert detect_model_family("o3-mini") == "o-series"
-        assert detect_model_family("o4-mini") == "o-series"
+    def test_groq_gpt_oss(self):
+        assert family_of("groq/gpt-oss-120b") == "gpt-oss"
 
     def test_gemini(self):
-        assert detect_model_family("gemini-2.0-flash") == "gemini"
-        assert detect_model_family("gemini-pro") == "gemini"
+        assert family_of("gemini-2.5-flash") == "gemini"
+        assert family_of("gemini-2.5-pro") == "gemini"
 
-    def test_deepseek(self):
-        assert detect_model_family("deepseek-r1") == "deepseek"
-        assert detect_model_family("deepseek-chat") == "deepseek"
+    def test_openrouter_minimax(self):
+        assert family_of("openrouter/minimax/minimax-m2.7") == "minimax"
 
-    def test_qwen(self):
-        assert detect_model_family("qwen-72b") == "qwen"
-        assert detect_model_family("qwq-32b") == "qwen"
-
-    def test_llama(self):
-        assert detect_model_family("llama-3.3-70b") == "llama"
-        assert detect_model_family("meta-llama-3.1-8b") == "llama"
-
-    def test_openrouter_prefix_stripped(self):
-        assert (
-            detect_model_family("openrouter/anthropic/claude-opus-4") == "claude-opus"
-        )
-        assert detect_model_family("openrouter/deepseek/deepseek-r1") == "deepseek"
-        assert (
-            detect_model_family("openrouter/meta-llama/llama-3.3-70b-instruct")
-            == "llama"
-        )
-
-    def test_groq_prefix_stripped(self):
-        assert detect_model_family("groq/llama-3.3-70b") == "llama"
-        assert detect_model_family("groq/deepseek/deepseek-r1-distill") == "deepseek"
-
-    def test_minimax(self):
-        assert detect_model_family("minimax-m2.7") == "minimax"
-        assert detect_model_family("MiniMax-Text-01") == "minimax"
-        assert detect_model_family("openrouter/minimax/minimax-01") == "minimax"
+    def test_codex_gpt5(self):
+        assert family_of("codex/gpt-5.3-codex") == "gpt-5"
 
     def test_unknown_model_returns_default(self):
-        assert detect_model_family("some-unknown-model") == "default"
-        assert detect_model_family("mistral-large") == "default"
+        # After heuristic fallback kicks in, unrecognized IDs still fall through
+        # to 'default'. Use an ID with no known substring match.
+        assert family_of("some-unknown-model") == "default"
+        assert family_of("mistral-large") == "default"
 
-    def test_case_insensitive(self):
-        assert detect_model_family("Claude-Opus-4-6") == "claude-opus"
-        assert detect_model_family("GPT-4o") == "gpt-4o"
+    def test_unknown_returns_custom_default(self):
+        """Callers can override the 'unknown' fallback."""
+        assert family_of("unrecognized-model", default="custom") == "custom"
+
+    def test_heuristic_fallback_for_bare_names(self):
+        # Bare IDs (no catalog entry) get heuristic detection — needed
+        # for custom endpoints that don't set an explicit family.
+        assert family_of("deepseek-r1") == "deepseek"
+        assert family_of("qwen-72b") == "qwen"
+        assert family_of("llama-3.3-70b") == "llama"
 
 
 # =============================================================================
-# detect_reasoning_method tests
+# detect_reasoning_method tests — uses family_of() internally
 # =============================================================================
 
 
 class TestDetectReasoningMethod:
-    """Tests for detect_reasoning_method() auto-detection and explicit override."""
+    """Tests for detect_reasoning_method() auto-detection and explicit override.
 
-    def test_gpt_oss_returns_prompt(self):
-        assert detect_reasoning_method("gpt-oss-120b") == "prompt"
-        assert detect_reasoning_method("openai/gpt-oss-120b") == "prompt"
+    Uses real catalog IDs only: synthetic IDs now return family 'default'
+    which maps to reasoning_method='api'.
+    """
+
+    def test_groq_gpt_oss_returns_prompt(self):
+        assert detect_reasoning_method("groq/gpt-oss-120b") == "prompt"
 
     def test_claude_returns_none(self):
         assert detect_reasoning_method("claude-opus-4-6") == "none"
-        assert detect_reasoning_method("claude-sonnet-4-20250514") == "none"
-        assert detect_reasoning_method("claude-haiku-4-5-20251001") == "none"
+        assert detect_reasoning_method("claude-sonnet-4-5-20250929") == "none"
 
     def test_gemini_returns_none(self):
-        assert detect_reasoning_method("gemini-2.0-flash") == "none"
-
-    def test_gpt5_returns_api(self):
-        assert detect_reasoning_method("gpt-5") == "api"
+        assert detect_reasoning_method("gemini-2.5-flash") == "none"
 
     def test_gpt4o_returns_api(self):
+        # gpt-4o has family 'default' in models.yaml → 'api' reasoning method.
         assert detect_reasoning_method("gpt-4o") == "api"
 
-    def test_o_series_returns_api(self):
-        assert detect_reasoning_method("o3-mini") == "api"
-
-    def test_deepseek_returns_api(self):
-        assert detect_reasoning_method("deepseek-r1") == "api"
+    def test_codex_returns_api(self):
+        assert detect_reasoning_method("codex/gpt-5.4") == "api"
 
     def test_unknown_returns_api(self):
+        # Unknown → family 'default' → 'api'.
         assert detect_reasoning_method("some-unknown-model") == "api"
 
     def test_explicit_override(self):
-        assert detect_reasoning_method("gpt-oss-120b", explicit_method="none") == "none"
+        assert (
+            detect_reasoning_method("groq/gpt-oss-120b", explicit_method="none")
+            == "none"
+        )
         assert (
             detect_reasoning_method("claude-opus-4-6", explicit_method="prompt")
             == "prompt"

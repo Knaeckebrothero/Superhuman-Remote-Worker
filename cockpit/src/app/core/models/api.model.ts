@@ -152,7 +152,17 @@ export interface User {
   default_project_id?: string | null;
   is_admin?: boolean;
   is_approved?: boolean;
+  can_use_vm?: boolean;
   created_at: string;
+}
+
+/**
+ * Response body from /api/admin/system-settings/vm_workspaces (GET/PUT).
+ */
+export interface VmWorkspacesSetting {
+  enabled: boolean;
+  updated_at: string | null;
+  updated_by: string | null;
 }
 
 // =============================================================================
@@ -182,6 +192,162 @@ export interface ApiKeyEntry {
 export interface ApiKeySetRequest {
   api_key: string;
   label?: string | null;
+}
+
+// =============================================================================
+// LLM Endpoint Models
+// =============================================================================
+
+/**
+ * Which slot a model fills. Chat is the default; non-chat rows are routed
+ * to the matching Admin → Defaults selector (embedding/vision/whisper/tts)
+ * or used as auxiliary LLMs for memory extraction / curation / title gen.
+ */
+export type LlmModelCapability =
+  | 'chat'
+  | 'vision'
+  | 'embedding'
+  | 'auxiliary'
+  | 'whisper'
+  | 'tts';
+
+/**
+ * A user-registered OpenAI-compatible LLM endpoint. Models attached to this
+ * endpoint live in the catalog (`models` table) and are managed via Admin →
+ * Models, not nested here. The `models` field is kept for shape compat with
+ * the legacy serializer and is always an empty array.
+ */
+export interface LlmEndpoint {
+  id: string;
+  label: string;
+  base_url: string;
+  key_prefix: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  models: never[];
+}
+
+export interface LlmEndpointCreateRequest {
+  label: string;
+  base_url: string;
+  api_key?: string | null;
+  allow_insecure?: boolean;
+}
+
+export interface LlmEndpointUpdateRequest {
+  label?: string | null;
+  base_url?: string | null;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  allow_insecure?: boolean;
+}
+
+/**
+ * Response from the test-connection probe (POST /api/settings/llm-endpoints/{id}/test).
+ */
+export interface LlmEndpointTestResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string;
+}
+
+/**
+ * A single model surfaced by `GET {base_url}/models` via the admin discovery
+ * endpoint. Used by Admin → Models as a quick-fill helper when the admin has
+ * picked a system endpoint as the catalog row's transport.
+ */
+export interface LlmEndpointDiscoveredModel {
+  id: string;
+  owned_by: string | null;
+  capability_hint: LlmModelCapability;
+  family: string | null;
+  context_window: number | null;
+}
+
+export interface LlmEndpointDiscoveryResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string;
+  models: LlmEndpointDiscoveredModel[];
+}
+
+// =============================================================================
+// Models Catalog (Admin → Models)
+// =============================================================================
+
+/** Locked enum for catalog rows. Adding a role requires schema + resolver work. */
+export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
+
+/** Provider anchor for a catalog row. */
+export type CatalogProviderKind = 'system' | 'endpoint';
+
+export const CATALOG_ROLES: CatalogRole[] = [
+  'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
+];
+
+/**
+ * A row in the admin-curated `models` table. Mirrors orchestrator
+ * `_serialize_catalog_model`.
+ */
+export interface CatalogModel {
+  id: string;
+  provider_kind: CatalogProviderKind;
+  provider_ref: string;
+  model_id: string;
+  display_label: string;
+  role: CatalogRole;
+  family: string;
+  context_window: number | null;
+  reasoning_level: string | null;
+  params_json: Record<string, unknown> | null;
+  enabled: boolean;
+  seeded_from: string | null;
+  notes: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface CatalogModelCreateRequest {
+  provider_kind: CatalogProviderKind;
+  provider_ref: string;
+  model_id: string;
+  display_label: string;
+  role: CatalogRole;
+  family: string;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  params_json?: Record<string, unknown> | null;
+  enabled?: boolean;
+  notes?: string | null;
+}
+
+export interface CatalogModelUpdateRequest {
+  provider_kind?: CatalogProviderKind;
+  provider_ref?: string;
+  model_id?: string;
+  display_label?: string;
+  role?: CatalogRole;
+  family?: string;
+  context_window?: number | null;
+  reasoning_level?: string | null;
+  params_json?: Record<string, unknown> | null;
+  enabled?: boolean;
+  notes?: string | null;
+}
+
+export interface CatalogModelTestResult {
+  ok: boolean;
+  status: number | null;
+  error: string | null;
+  probe_url: string | null;
+}
+
+export interface CatalogModelDeleteResult {
+  status: string;
+  id: string;
+  warning: string | null;
 }
 
 /**
@@ -221,6 +387,7 @@ export interface UserSettings {
   default_tactical_model?: string | null;
   default_embedding_model?: string | null;
   embedding_provider?: string | null;
+  language?: 'en' | 'de-DE' | null;
   communication?: CommunicationSettings | null;
   persistent_agent?: PersistentAgentSettings | null;
   _resolved?: ResolvedDefaults;

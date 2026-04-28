@@ -30,9 +30,9 @@ spec:
           command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-postgres 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
-        - name: wait-for-postgres-vector
+        - name: wait-for-pgvector
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-postgres-vector 5432; do sleep 2; done"]
+          command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-pgvector 5432; do sleep 2; done"]
         {{- end }}
         {{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
         - name: wait-for-mongodb
@@ -64,6 +64,15 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: LICENSE_TERMS_ACCEPTED
+            # Encryption key for API keys stored at rest (user_api_keys,
+            # system_api_keys, llm_endpoints.api_key). Must be present
+            # before the orchestrator starts — see NOTES.txt for the
+            # operator backup procedure.
+            - name: APP_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: APP_ENCRYPTION_KEY
             # Core databases
             - name: DATABASE_URL
               valueFrom:
@@ -162,16 +171,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: COCKPIT_EXTERNAL_URL
             # Instruction Builder
-            - name: BUILDER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: BUILDER_API_KEY
-            - name: BUILDER_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: BUILDER_MODEL
+            # BUILDER_API_KEY removed — _create_builder_llm now resolves the
+            # provider key from system_api_keys (seeded via the llm-seed-job).
+            # See docs/api_key_resolution.md for the wire-format vs config-source
+            # split.
+            # BUILDER_MODEL removed — resolved from system_settings
+            # ('llm.default_builder_model') at request time.
             - name: BUILDER_LLM_PROVIDER
               valueFrom:
                 configMapKeyRef:
@@ -471,17 +476,19 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIL_DOMAIN
-            # Notification — Webhooks
+            # Notification — Webhooks (optional; empty/missing → transport disabled)
             - name: SLACK_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SLACK_WEBHOOK_URL
+                  optional: true
             - name: DISCORD_WEBHOOK_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: DISCORD_WEBHOOK_URL
+                  optional: true
             - name: NTFY_URL
               valueFrom:
                 configMapKeyRef:
@@ -497,6 +504,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NTFY_TOKEN
+                  optional: true
             # VM lifecycle (optional)
             - name: NATS_URL
               valueFrom:
@@ -530,7 +538,11 @@ spec:
                   key: WORKSPACE_NAMESPACE
                   optional: true
             - name: WORKSPACE_SSH_SECRET
-              value: "vm-ssh-key"
+              value: {{ include "srw.vmSshKeySecretName" . | quote }}
+            - name: AGENT_SECRET
+              value: {{ include "srw.secretName" . | quote }}
+            - name: AGENT_CONFIGMAP
+              value: {{ include "srw.configMapName" . | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
             # Persistent agent pods (on-demand provisioning)
@@ -539,6 +551,19 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: PERSISTENT_AGENT_IMAGE
+                  optional: true
+            # Agent tailscale sidecar gate (consumed by AgentProvisioner)
+            - name: AGENT_TAILSCALE_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: AGENT_TAILSCALE_ENABLED
+                  optional: true
+            - name: HEADSCALE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: HEADSCALE_URL
                   optional: true
             # Codex OAuth Proxy
             - name: CODEX_PROXY_URL

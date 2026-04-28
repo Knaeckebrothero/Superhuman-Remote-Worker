@@ -1,5 +1,6 @@
 import { inject, Injectable, PLATFORM_ID } from '@angular/core';
 import { isPlatformBrowser } from '@angular/common';
+import { TranslocoService } from '@jsverse/transloco';
 import Keycloak from 'keycloak-js';
 import { environment } from '../environment';
 
@@ -12,6 +13,7 @@ import { environment } from '../environment';
 @Injectable({ providedIn: 'root' })
 export class KeycloakService {
   private readonly platformId = inject(PLATFORM_ID);
+  private readonly transloco = inject(TranslocoService);
   private keycloak!: Keycloak;
   private _authenticated = false;
 
@@ -57,13 +59,28 @@ export class KeycloakService {
 
   /** Redirect to Keycloak login page. */
   login(): void {
-    this.keycloak.login({ redirectUri: window.location.href });
+    this.keycloak.login({
+      redirectUri: window.location.href,
+      locale: this.keycloakLocale(),
+    });
   }
 
   /** Redirect to Keycloak logout endpoint. */
   logout(): void {
     this._authenticated = false;
-    this.keycloak.logout({ redirectUri: window.location.origin });
+    this.keycloak.logout({
+      redirectUri: window.location.origin,
+    });
+  }
+
+  /**
+   * Map the cockpit's active language to the ui_locales value Keycloak expects.
+   * Keycloak ships DE out of the box under the short tag; everything else falls
+   * back to EN.
+   */
+  private keycloakLocale(): string {
+    const lang = this.transloco.getActiveLang();
+    return lang === 'de-DE' || lang === 'de' ? 'de' : 'en';
   }
 
   /**
@@ -78,6 +95,24 @@ export class KeycloakService {
     } catch {
       this._authenticated = false;
       return null;
+    }
+  }
+
+  /**
+   * Force-refresh the access token regardless of remaining lifetime.
+   *
+   * Needed after server-side changes to the user's Keycloak groups (e.g.
+   * project membership). OpenCloud reconciles its LibreGraph group memberships
+   * from the OIDC `groups` claim on every login, so the next OpenCloud request
+   * must carry a fresh token or the new membership won't take effect.
+   */
+  async forceRefreshToken(): Promise<void> {
+    if (!this._authenticated) return;
+    try {
+      await this.keycloak.updateToken(-1);
+    } catch {
+      // Non-fatal — the user will pick up the new membership on their next
+      // natural token refresh or login.
     }
   }
 }

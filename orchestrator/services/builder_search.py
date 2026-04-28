@@ -1,7 +1,6 @@
 """Tavily web search for the instruction builder."""
 
 import logging
-import os
 
 import httpx
 
@@ -10,15 +9,20 @@ logger = logging.getLogger(__name__)
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
-async def tavily_search(query: str, max_results: int = 5) -> str:
+async def tavily_search(
+    query: str, max_results: int = 5, *, api_key: str | None = None
+) -> str:
     """Search the web using Tavily API.
 
     Returns formatted text results for the LLM. On any error,
     returns an error string (never raises).
+
+    The caller is responsible for resolving the key from
+    ``system_api_keys.tavily`` and passing it in — keeping this helper
+    DB-agnostic.
     """
-    api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
-        return "Error: TAVILY_API_KEY not configured."
+        return "Error: no Tavily API key configured (system_api_keys.tavily empty)."
 
     payload = {
         "query": query,

@@ -208,6 +208,22 @@ async def lifespan(app: FastAPI):
     logger.info("Persistent agent shutdown complete")
 
 
+def _legacy_nc_cloud_cfg(nc_folder: str) -> Dict[str, Any]:
+    """Translate legacy ``nc_session_folder`` + env vars into the cloud_sync schema.
+
+    Used when the orchestrator is on a version that still returns the
+    pre-refactor flat field. Drops away once the orchestrator rolls.
+    """
+    nc_url = os.getenv("NEXTCLOUD_URL", "http://localhost:8800")
+    nc_user = os.getenv("NEXTCLOUD_AGENT_USER", "agent-service")
+    nc_pass = os.getenv("NEXTCLOUD_AGENT_PASSWORD", "agent-service-dev")
+    return {
+        "backend": "nextcloud",
+        "webdav_url": f"{nc_url.rstrip('/')}/remote.php/dav/files/{nc_user}/{nc_folder}/",
+        "auth": {"type": "basic", "username": nc_user, "password": nc_pass},
+    }
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -535,42 +551,41 @@ async def _attach_session(
         except Exception as e:
             logger.warning(f"Failed to inject datasource index: {e}")
 
-    # Initialize Nextcloud workspace sync if session has a session folder
+    # Initialize cloud workspace sync if the orchestrator gave us a config
+    cloud_cfg = workspace_override.get("cloud_sync") if workspace_override else None
     nc_folder = (
         workspace_override.get("nc_session_folder") if workspace_override else None
     )
-    if not nc_folder and _orchestrator_client and _thread_id:
+    if (not cloud_cfg or not nc_folder) and _orchestrator_client and _thread_id:
         try:
             ws_info = await _orchestrator_client.get_thread_workspace(_thread_id)
             if ws_info:
-                nc_folder = ws_info.get("nc_session_folder")
+                cloud_cfg = cloud_cfg or ws_info.get("cloud_sync")
+                nc_folder = nc_folder or ws_info.get("nc_session_folder")
         except Exception:
             pass
-    if nc_folder:
+    # Back-compat: translate a bare nc_session_folder into the new schema
+    if not cloud_cfg and nc_folder:
+        cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
+    if cloud_cfg:
         try:
-            from src.services.workspace_sync import WorkspaceSyncService
+            from src.services.cloud_sync import build_workspace_sync
 
-            nc_url = os.getenv("NEXTCLOUD_URL", "http://localhost:8800")
-            nc_user = os.getenv("NEXTCLOUD_AGENT_USER", "agent-service")
-            nc_pass = os.getenv("NEXTCLOUD_AGENT_PASSWORD", "agent-service-dev")
-            webdav_url = (
-                f"{nc_url.rstrip('/')}/remote.php/dav/files/{nc_user}/{nc_folder}/"
-            )
-
-            _session.workspace_sync = WorkspaceSyncService(
+            _session.workspace_sync = build_workspace_sync(
                 workspace_path=_session.workspace_manager.path,
-                webdav_url=webdav_url,
-                webdav_user=nc_user,
-                webdav_password=nc_pass,
+                cloud_cfg=cloud_cfg,
                 workspace_backend=_session.workspace_manager.backend,
             )
-            # Initial push of existing workspace files
-            await _session.workspace_sync.push()
-            # Start background pull for user uploads
-            await _session.workspace_sync.start_background_poll()
-            logger.info(f"Nextcloud workspace sync started for folder: {nc_folder}")
+            if _session.workspace_sync:
+                # Initial push of existing workspace files, then background pull
+                await _session.workspace_sync.push()
+                await _session.workspace_sync.start_background_poll()
+                logger.info(
+                    "Cloud workspace sync started (backend=%s)",
+                    cloud_cfg.get("backend"),
+                )
         except Exception as e:
-            logger.warning(f"Failed to start Nextcloud workspace sync: {e}")
+            logger.warning(f"Failed to start cloud workspace sync: {e}")
 
     # Restore message history from DB (for session resume)
     await _restore_session_messages()
@@ -601,13 +616,14 @@ async def _detach_session() -> None:
     # Mark thread as idle (NOT ended — resumable)
     await _update_thread_status("idle")
 
-    # Final Nextcloud sync + stop polling
+    # Final cloud sync + stop polling + drop secrets
     if _session.workspace_sync:
         try:
             await _session.workspace_sync.full_sync()
             await _session.workspace_sync.stop()
+            await _session.workspace_sync.aclose()
         except Exception as e:
-            logger.warning(f"Final Nextcloud sync failed (non-fatal): {e}")
+            logger.warning(f"Final cloud sync failed (non-fatal): {e}")
 
     # Final git commit + push
     if _session.workspace_manager:
@@ -1480,13 +1496,14 @@ async def _handle_archive(ws: WebSocket) -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
-        # 0. Final Nextcloud sync
+        # 0. Final cloud sync
         if _session.workspace_sync:
             try:
                 await _session.workspace_sync.full_sync()
                 await _session.workspace_sync.stop()
+                await _session.workspace_sync.aclose()
             except Exception as e:
-                logger.warning(f"Final Nextcloud sync failed (non-fatal): {e}")
+                logger.warning(f"Final cloud sync failed (non-fatal): {e}")
 
         # 1. Extract final memories
         recall_store = (

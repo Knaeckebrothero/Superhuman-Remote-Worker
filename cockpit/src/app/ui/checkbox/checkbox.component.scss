@@ -1,0 +1,96 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+}
+
+.app-checkbox__label {
+  display: inline-flex;
+  align-items: center;
+  gap: v.$space-sm;
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-secondary);
+  line-height: v.$line-height-tight;
+
+  &[data-size='sm'] {
+    font-size: v.$font-size-xs;
+  }
+
+  &[data-size='md'] {
+    font-size: v.$font-size-sm;
+  }
+
+  &[data-disabled] {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+}
+
+// Visually hide native checkbox but keep it focusable.
+.app-checkbox__input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+}
+
+.app-checkbox__box {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  background: var(--surface-0);
+  border: 1px solid var(--border-color);
+  color: var(--timeline-bg);
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+
+  [data-size='sm'] & {
+    width: 14px;
+    height: 14px;
+    border-radius: v.$radius-sm;
+    font-size: 10px;
+  }
+
+  [data-size='md'] & {
+    width: 18px;
+    height: 18px;
+    border-radius: v.$radius-sm;
+    font-size: 12px;
+  }
+}
+
+.app-checkbox__check {
+  font-weight: v.$font-weight-bold;
+  visibility: hidden;
+}
+
+.app-checkbox__input:checked + .app-checkbox__box {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+
+  .app-checkbox__check {
+    visibility: visible;
+  }
+}
+
+.app-checkbox__content {
+  display: inline-flex;
+  align-items: center;
+}
+
+:host.cdk-keyboard-focused .app-checkbox__box {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-checkbox__label {
+    min-height: v.$touch-target-min;
+  }
+}
