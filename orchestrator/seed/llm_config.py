@@ -2,7 +2,11 @@
 
 Invoked by the helm post-install/post-upgrade Job as::
 
-    python -m orchestrator.seed.llm_config --payload /seed/llm.yaml
+    python -m seed.llm_config --payload /seed/llm.yaml
+
+(The orchestrator container's Dockerfile flattens ``orchestrator/`` into
+``/app/`` with ``PYTHONPATH=/app``, so the package path is ``seed.*`` at
+runtime, not ``orchestrator.seed.*``.)
 
 The payload describes the providers and endpoints the operator wants present on
 a fresh stack. On each run:
@@ -66,7 +70,15 @@ from typing import Any, Iterable
 
 import yaml
 
-from orchestrator.database.postgres import PostgresDB
+try:
+    # Host-side: invoked from repo root (e.g. `python init.py`) where the
+    # orchestrator package is importable via its full path.
+    from orchestrator.database.postgres import PostgresDB
+except ImportError:
+    # In-container: Dockerfile.orchestrator copies orchestrator/ flat into
+    # /app with PYTHONPATH=/app, so the same module is reachable as a
+    # top-level `database` package.
+    from database.postgres import PostgresDB
 
 logger = logging.getLogger("orchestrator.seed.llm_config")
 
