@@ -56,7 +56,7 @@ spec:
         - name: seed
           image: "{{ .Values.image.orchestrator.repository }}:{{ .Values.image.orchestrator.tag }}"
           imagePullPolicy: {{ .Values.image.orchestrator.pullPolicy }}
-          command: ["python", "-m", "orchestrator.seed.llm_config"]
+          command: ["python", "-m", "seed.llm_config"]
           args: ["--payload", "/seed/llm.yaml"]
           env:
             - name: DATABASE_URL
