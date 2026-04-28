@@ -7,7 +7,7 @@
 #   ./deploy.sh sha-a1b2c3d orchestrator agent  # Deploy specific components only
 #   ./deploy.sh latest                       # Reset to :latest tag (e.g. for debugging)
 #
-# Components: orchestrator, agent, cockpit, mcp, vpn, vm-controller, vm-base
+# Components: orchestrator, agent, cockpit, mcp, vm-controller, vm-base
 #
 # Run from anywhere — the script finds its own directory.
 
@@ -46,7 +46,7 @@ shift || true
 
 # --- Resolve components ----------------------------------------------------
 
-ALL_COMPONENTS=(orchestrator agent cockpit mcp vpn vm-controller vm-base)
+ALL_COMPONENTS=(orchestrator agent cockpit mcp vm-controller vm-base)
 
 if [[ $# -gt 0 ]]; then
     COMPONENTS=("$@")
@@ -113,11 +113,6 @@ for component in "${COMPONENTS[@]}"; do
             update_image mcp \
                 "$MANIFEST_DIR/23-mcp.yaml" \
                 "superhuman-remote-worker-mcp"
-            ;;
-        vpn)
-            update_image vpn \
-                "$MANIFEST_DIR/15-vpn.yaml" \
-                "superhuman-remote-worker-vpn"
             ;;
         vm-controller)
             update_image vm-controller \

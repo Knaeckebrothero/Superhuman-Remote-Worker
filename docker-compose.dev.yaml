@@ -26,14 +26,6 @@
 # Agents SSH into them using the shared key at SSH_KEY_PATH — identical to
 # the production remote backend path.
 #
-# VPN services publish ports to the host so locally-running agents can reach
-# the LLM cluster and research proxy.  Set these in .env for local dev:
-#   LLM_BASE_URL=http://localhost:8080/v1
-#   WORKSTATION_BASE_URL=http://localhost:8090/v1  (embeddings, vision, whisper, TTS)
-#   RESEARCH_PROXY_TYPE=socks5
-#   RESEARCH_PROXY_HOST=localhost
-#   RESEARCH_PROXY_PORT=1080
-#
 # Start only databases (no workspaces):
 #   podman-compose -f docker-compose.dev.yaml up -d postgres postgres-vector mongodb
 #
@@ -403,97 +395,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  vpn-cluster:
-    build:
-      context: docker/vpn
-      dockerfile: Dockerfile
-    image: srw-vpn:dev
-    container_name: srw-vpn-cluster
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    ports:
-      - "${VPN_LLM_PORT:-8080}:8080"
-    environment:
-      SOCKS_PORT: 1080
-      FORWARD_PORT: 8080
-      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
-      VPN_HOST: ${VPN_CLUSTER_HOST:-}
-      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
-      VPN_REALM: ${VPN_CLUSTER_REALM:-}
-      VPN_USER: ${VPN_CLUSTER_USER:-}
-      VPN_PASS: ${VPN_CLUSTER_PASS:-}
-      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  vpn-research:
-    build:
-      context: docker/vpn
-      dockerfile: Dockerfile
-    image: srw-vpn:dev
-    container_name: srw-vpn-research
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    ports:
-      - "${VPN_SOCKS_PORT:-1080}:1080"
-    environment:
-      SOCKS_PORT: 1080
-      VPN_HOST: ${VPN_RESEARCH_HOST:-}
-      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
-      VPN_REALM: ${VPN_RESEARCH_REALM:-}
-      VPN_USER: ${VPN_RESEARCH_USER:-}
-      VPN_PASS: ${VPN_RESEARCH_PASS:-}
-      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  vpn-workstation:
-    build:
-      context: docker/vpn
-      dockerfile: Dockerfile
-    image: srw-vpn:dev
-    container_name: srw-vpn-workstation
-    cap_add:
-      - NET_ADMIN
-    security_opt:
-      - label:disable
-    devices:
-      - /dev/ppp:/dev/ppp
-    ports:
-      - "${VPN_WORKSTATION_PORT_HOST:-8090}:8080"
-    environment:
-      SOCKS_PORT: 1080
-      FORWARD_PORT: 8080
-      FORWARD_TARGET: ${VPN_WORKSTATION_ENDPOINT:-10.18.2.105:8090}
-      VPN_HOST: ${VPN_WORKSTATION_HOST:-}
-      VPN_PORT: ${VPN_WORKSTATION_PORT:-443}
-      VPN_REALM: ${VPN_WORKSTATION_REALM:-}
-      VPN_USER: ${VPN_WORKSTATION_USER:-}
-      VPN_PASS: ${VPN_WORKSTATION_PASS:-}
-      VPN_TRUSTED_CERT: ${VPN_WORKSTATION_TRUSTED_CERT:-}
-    healthcheck:
-      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
 
   # ---------------------------------------------------------------------------
   # S3-compatible object store (MinIO) — VM snapshots + IDE sessions
