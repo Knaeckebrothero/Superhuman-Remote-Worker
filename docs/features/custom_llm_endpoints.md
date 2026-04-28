@@ -12,7 +12,6 @@ The loader accepts `config.llm.base_url` and routes requests correctly, but noth
 Consequences:
 
 - A deployer of SRW cannot point `openai/gpt-oss-120b` at their own vLLM without patching manifests.
-- The app bundles a VPN sidecar to reach the project's own LLM cluster — infrastructure most clients neither want nor need. That sidecar will be extracted into a separate deployment so the SRW stack is self-contained; once removed, *every* off-cluster LLM call needs a user-supplied endpoint.
 - Model pickers in the Cockpit are driven by hardcoded lists in `cockpit/src/app/core/environment.ts:40-47` and `config/models.yaml:75-77`. Adding a model means a code change.
 
 Compounding all of this, provider selection today is derived from the **model string itself**: `_detect_provider()` at `src/core/loader.py:1615` (and its duplicate `_detect_provider_from_model()` at `orchestrator/main.py:1450`) does prefix matching — `openrouter/` → openrouter, `claude` → anthropic, default → openai. The same style drives `detect_model_family()` for prompt-matrix lookups and `_needs_custom_base_url()` for env-var routing. The approach is a recurring source of bugs: it breaks for model IDs that don't match a known prefix, can't express that a model ID belongs to a user's custom endpoint, and any addition means editing the detection functions in two places. Custom endpoints make this untenable — a user-configured model ID could be anything, with no lexical tell about which provider or base URL it belongs to.
@@ -222,16 +221,6 @@ New section in the settings page, sibling to the existing "API Keys" panel:
 - **Test connection** — runs the test endpoint, reports HTTP status + first error message if any; does not persist any state
 
 When a user deletes an endpoint that is in active use (referenced by a session's `config_override` or a running job), the delete succeeds but in-flight agents keep their already-injected base_url until restart. Acceptable — matches the existing behavior for API key rotation.
-
-## VPN sidecar extraction
-
-This feature is a prerequisite for removing the `srw-vpn-cluster` sidecar from the app stack. Once custom endpoints work from the UI:
-
-1. Any operator who wants to reach a private LLM cluster configures a custom endpoint pointing at their VPN-gateway URL — routing is their problem (WireGuard on the node, Tailscale, mesh VPN, cloud peering).
-2. The `deployment/` Helm chart drops the VPN sidecar + its secrets. Deployers who need it install it as a separate chart and point their endpoint at the internal service.
-3. `docker-compose.dev.yaml` keeps no VPN dependency; bring-your-own endpoint.
-
-The removal is a separate PR gated on this feature shipping. Track as a follow-up.
 
 ## Migration
 

@@ -55,11 +55,6 @@ data:
   # Vision model
   VISION_MODEL: {{ .Values.llm.visionModel | quote }}
 
-  # Research proxy (via VPN sidecar SOCKS5)
-  RESEARCH_PROXY_TYPE: {{ .Values.research.proxyType | quote }}
-  RESEARCH_PROXY_HOST: {{ .Values.research.proxyHost | quote }}
-  RESEARCH_PROXY_PORT: {{ .Values.research.proxyPort | quote }}
-
   # Citation Engine
   # CITATION_DB_URL (with credentials) is in the Secret.
   # CITATION_LLM_* values moved to the DB-backed config — the orchestrator
@@ -166,18 +161,6 @@ data:
   DEFAULT_DS_WEBDAV_READ_ONLY: {{ "false" | quote }}
   {{- end }}
   {{- end }}
-
-  # Workstation API
-  {{- if .Values.vpn.workstation.enabled }}
-  WORKSTATION_BASE_URL: {{ printf "http://%s:%s/v1" (include "srw.serviceName" (dict "context" . "component" "vpn-workstation")) .Values.vpn.workstation.port | quote }}
-  {{- else }}
-  WORKSTATION_BASE_URL: {{ "" | quote }}
-  {{- end }}
-
-  # VPN — non-secret config (ports only)
-  VPN_CLUSTER_PORT: {{ .Values.vpn.cluster.port | quote }}
-  VPN_RESEARCH_PORT: {{ .Values.vpn.research.port | quote }}
-  VPN_WORKSTATION_PORT: {{ .Values.vpn.workstation.port | quote }}
 
   # NATS
   NATS_URL: {{ .Values.nats.url | quote }}

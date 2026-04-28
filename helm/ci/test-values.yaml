@@ -10,14 +10,6 @@ externalSecrets:
   vaultPath: "test/secrets"
   vmSshKeyVaultPath: "test/vm-ssh-key"
 
-vpn:
-  cluster:
-    enabled: true
-  research:
-    enabled: true
-  workstation:
-    enabled: true
-
 headscale:
   enabled: true
 
@@ -73,9 +65,6 @@ llm:
 citation:
   llmUrl: "http://llm-server:8080/v1"
   embeddingUrl: "http://embedding-server:8080/v1"
-
-research:
-  proxyHost: "vpn-research"
 
 s3:
   endpoint: "http://minio:9000"

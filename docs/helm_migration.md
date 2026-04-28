@@ -91,7 +91,6 @@ charts/superhuman-remote-worker/
     keycloak.yaml                    # StatefulSet + Service (conditional)
     nextcloud.yaml                   # StatefulSet + Service (conditional)
   templates/optional/
-    vpn.yaml                         # VPN sidecar deployments (conditional)
     # Headscale is NOT bundled — it's deployed out of band as a separate
     # Fleet bundle (HomeLab/deployments_managed/headscale/) so its
     # lifecycle is independent of the SRW release. The chart only
@@ -162,10 +161,6 @@ image:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
     tag: latest
     pullPolicy: IfNotPresent
-  vpn:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn
-    tag: latest
-    pullPolicy: IfNotPresent
 
 orchestrator:
   replicas: 1
@@ -223,15 +218,6 @@ externalSecrets:
   refreshInterval: "1h"
   secretStoreRef: ""                  # ClusterSecretStore name
   vaultPath: ""                       # e.g. "homelab/superhuman-remote-worker/srw-secrets"
-
-# --- VPN sidecars (optional) ---
-vpn:
-  cluster:
-    enabled: false
-  research:
-    enabled: false
-  workstation:
-    enabled: false
 
 # --- Headscale mesh VPN (external — chart consumes URL only) ---
 # Headscale itself is deployed out of band. Set the URL of an existing
@@ -399,14 +385,6 @@ externalSecrets:
   secretStoreRef: vault-backend
   vaultPath: homelab/superhuman-remote-worker/srw-secrets
 
-vpn:
-  cluster:
-    enabled: true
-  research:
-    enabled: true
-  workstation:
-    enabled: true
-
 # External headscale — server is its own deployment in HomeLab/.
 headscale:
   url: "https://headscale.h4ll.app"
@@ -483,14 +461,6 @@ externalSecrets:
   secretStoreRef: vault-backend
   vaultPath: homelab/superhuman-remote-worker/srw-family-secrets
 
-vpn:
-  cluster:
-    enabled: false
-  research:
-    enabled: false
-  workstation:
-    enabled: false
-
 # External headscale — leave url empty to skip the sidecar entirely.
 headscale:
   url: ""
@@ -554,13 +524,6 @@ databases:
     enabled: false
 
 # Most optional components disabled
-vpn:
-  cluster:
-    enabled: false
-  research:
-    enabled: false
-  workstation:
-    enabled: false
 headscale:
   url: ""
 agent:

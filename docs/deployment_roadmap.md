@@ -145,9 +145,6 @@ Keycloak 26.2 in dev mode serves health endpoints on port 9000, not 8080, and re
 | MCP | 1 | Running |
 | Proton Bridge | 1 | Running |
 | Dozzle | 1 | Running |
-| VPN (cluster) | 1 | Running |
-| VPN (research) | 1 | Running |
-| VPN (workstation) | 1 | Running |
 | pgAdmin | 1 | Running |
 | Mongo Express | 1 | Running |
 
@@ -183,7 +180,6 @@ Keycloak 26.2 in dev mode serves health endpoints on port 9000, not 8080, and re
 - [ ] Verify JIT user provisioning (Keycloak login creates local user row)
 - [ ] Create a job, verify agents pick it up and execute
 - [ ] Test MCP server with API token (`X-MCP-Token` auth)
-- [ ] Verify VPN sidecars healthy (LLM routing works)
 - [ ] Test email notifications (send a test agent message)
 - [ ] Verify Nextcloud WebDAV access from agent
 

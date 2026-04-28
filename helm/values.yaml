@@ -52,10 +52,6 @@ image:
     repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace
     tag: latest
     pullPolicy: Always
-  vpn:
-    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn
-    tag: latest
-    pullPolicy: Always
 
 # =============================================================================
 # Orchestrator
@@ -176,20 +172,6 @@ externalSecrets:
   secretStoreKind: "ClusterSecretStore"
   vaultPath: ""
   vmSshKeyVaultPath: ""
-
-# =============================================================================
-# VPN Sidecars (optional)
-# =============================================================================
-vpn:
-  cluster:
-    enabled: false
-    port: "443"
-  research:
-    enabled: false
-    port: "443"
-  workstation:
-    enabled: false
-    port: "443"
 
 # =============================================================================
 # Headscale — external Tailscale coordination server (consumed, not deployed).
@@ -542,14 +524,6 @@ llm:
 citation:
   embeddingModel: "qwen3-embedding-8b"
   embeddingUrl: ""
-
-# =============================================================================
-# Research Proxy (SOCKS5 via VPN sidecar)
-# =============================================================================
-research:
-  proxyType: "socks5"
-  proxyHost: ""
-  proxyPort: "1080"
 
 # =============================================================================
 # Email / Notifications

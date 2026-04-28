@@ -2,7 +2,7 @@
 # - External Azure AD (or Google Workspace, Okta, etc.) for OIDC
 # - External managed PostgreSQL, MongoDB, Neo4j
 # - External git server (e.g., GitHub Enterprise, customer's own Gitea)
-# - No VPN sidecars, no headscale, no admin UIs
+# - No headscale, no admin UIs
 # - Customer manages secrets themselves
 
 license:
@@ -66,14 +66,7 @@ s3:
   bucket: "customer-srw-snapshots"
   region: "eu-central-1"
 
-# No VPN, no headscale, no admin UIs
-vpn:
-  cluster:
-    enabled: false
-  research:
-    enabled: false
-  workstation:
-    enabled: false
+# No headscale, no admin UIs
 headscale:
   enabled: false
 pgadmin:

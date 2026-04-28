@@ -86,7 +86,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_PATH
-            # LLM routing (via VPN sidecar)
+            # LLM routing
             - name: LLM_BASE_URL
               valueFrom:
                 configMapKeyRef:
@@ -165,7 +165,7 @@ spec:
             # by the orchestrator (env_keys block) when an admin / user has
             # pinned a whisper model via Admin → Defaults or user_settings.
             # audio_helper falls back to OPENAI_API_KEY when nothing is set.
-            # Browser automation (via VPN sidecar)
+            # Browser automation
             - name: BROWSER_LLM_MODEL
               valueFrom:
                 configMapKeyRef:
@@ -176,23 +176,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: BROWSER_LLM_BASE_URL
-            # Research proxy (via VPN sidecar SOCKS5)
-            - name: RESEARCH_PROXY_TYPE
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_TYPE
-            - name: RESEARCH_PROXY_HOST
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_HOST
-            - name: RESEARCH_PROXY_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: RESEARCH_PROXY_PORT
-            # Citation Engine (via VPN sidecar)
+            # Citation Engine
             - name: CITATION_DB_URL
               valueFrom:
                 secretKeyRef:
@@ -266,12 +250,6 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEO4J_PASSWORD
                   optional: true
-            # Workstation API (embeddings, vision)
-            - name: WORKSTATION_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: WORKSTATION_BASE_URL
             # Gitea (for workspace git operations)
             - name: GITEA_URL
               valueFrom:

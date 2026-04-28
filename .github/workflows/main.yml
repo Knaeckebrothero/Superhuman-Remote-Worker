@@ -416,50 +416,6 @@ jobs:
           cache-from: type=gha,ignore-error=true
           cache-to: type=gha,mode=min,ignore-error=true
 
-  build-vpn:
-    needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
-    if: >-
-      always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-        with:
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["mirror.gcr.io"]
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn
-          tags: |
-            type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: ./docker/vpn
-          file: ./docker/vpn/Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
-
   build-workspace:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
@@ -681,7 +637,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-workspace, build-vm-controller]
+    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
@@ -690,7 +646,6 @@ jobs:
       needs.build-orchestrator.result == 'success' &&
       needs.build-cockpit.result == 'success' &&
       needs.build-mcp.result == 'success' &&
-      !contains(needs.build-vpn.result, 'failure') &&
       !contains(needs.build-workspace.result, 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 10
