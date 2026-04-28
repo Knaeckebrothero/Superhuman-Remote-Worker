@@ -1,13 +1,24 @@
 defaultNamespace: superhuman-remote-worker
+# Render the Helm chart from the OCI registry. CI on the develop branch
+# publishes chart updates to "srw-dev" and updates the version below.
+# Fleet fetches the chart from GHCR and applies values-experimental.yaml.
+#
+# For OCI charts, the full oci:// URL goes in `chart` (no separate `repo`).
+#
+# NOTE: If the GHCR package is private, Fleet needs OCI pull credentials.
+# Create a dockerconfigjson secret in fleet-default and uncomment secretName.
 helm:
+  chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev"
+  version: "0.0.0-dev.sha.786d019"
+  valuesFiles:
+    - values-experimental.yaml
+  # secretName: ghcr-helm-auth
   takeOwnership: true
-dependsOn: []
 ignorePaths:
-  - "**/*secret*"
-  - "*secret*"
-  - "**/*secrets*"
-  - "*secrets*"
+  - "legacy/**"
+  - "nats/**"
   - "README.md"
   - "deploy.sh"
   - "fleet-gitrepo.yaml"
-  - "nats/**"
+  - "**/*secret*"
+  - "**/*secrets*"

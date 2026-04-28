@@ -1,0 +1,1617 @@
+{
+  "common": {
+    "save": "Save",
+    "saving": "Saving...",
+    "saved": "Saved",
+    "delete": "Delete",
+    "cancel": "Cancel",
+    "edit": "Edit",
+    "copy": "Copy",
+    "copied": "Copied",
+    "never": "Never",
+    "default": "default",
+    "noKey": "(no key)"
+  },
+  "nav": {
+    "cockpit": "Cockpit",
+    "builder": "Builder",
+    "sessions": "Sessions",
+    "jobs": "Jobs",
+    "projects": "Projects",
+    "datasources": "Data Sources",
+    "create": "Create",
+    "debug": "Debug",
+    "settings": "Settings",
+    "logout": "Logout",
+    "admin": "admin",
+    "collapseSidebar": "Collapse sidebar",
+    "openSidebar": "Open sidebar"
+  },
+  "shell": {
+    "newSession": "New session",
+    "untitledSession": "Untitled",
+    "selectModel": "Select model",
+    "noKey": "(no key)",
+    "noModelsTitle": "No models available yet.",
+    "noModelsCta": "Configure a provider"
+  },
+  "projects": {
+    "title": "Projects",
+    "newProject": "New Project",
+    "cancel": "Cancel",
+    "refresh": "Refresh",
+    "loading": "Loading projects...",
+    "empty": "No projects yet",
+    "emptyHint": "Create a new project to get started",
+    "createProject": "Create Project",
+    "creating": "Creating...",
+    "namePlaceholder": "Project name (required)",
+    "descriptionPlaceholder": "Description (optional)",
+    "goalPlaceholder": "Goal (optional)",
+    "badgePersonal": "Personal",
+    "jobsCount": "{{count}} jobs",
+    "reposCount": "{{count}} repos",
+    "membersCount": "{{count}} members",
+    "status": {
+      "active": "active",
+      "archived": "archived",
+      "deleted": "deleted"
+    }
+  },
+  "sessions": {
+    "title": "Sessions",
+    "newSession": "New Session",
+    "activeBanner": "Active session in progress",
+    "returnToChat": "Return to chat",
+    "loading": "Loading sessions...",
+    "empty": "No sessions yet. Create one to get started.",
+    "emptyFilterActive": "No active sessions.",
+    "emptyFilterEnded": "No ended sessions.",
+    "untitledSession": "Untitled Session",
+    "confirmEnd": "End this session? Work will be saved but the agent will stop.",
+    "confirmDelete": "Delete this session permanently?",
+    "turnsOne": "turn",
+    "turnsMany": "turns",
+    "filter": {
+      "all": "All ({{count}})",
+      "active": "Active ({{count}})",
+      "ended": "Ended ({{count}})"
+    },
+    "tooltip": {
+      "sessionFiles": "Session Files",
+      "resume": "Resume",
+      "end": "End",
+      "delete": "Delete"
+    },
+    "create": {
+      "title": "New Session",
+      "hint": "Creates a thread via the orchestrator and connects through its WebSocket proxy. Requires a persistent agent pod to be registered and bound to the thread.",
+      "titleLabel": "Title",
+      "titlePlaceholder": "Untitled Session",
+      "configLabel": "Config",
+      "configDefault": "Default",
+      "configDeveloper": "Developer",
+      "configScholar": "Scholar",
+      "modelLabel": "Model",
+      "modelConfigDefault": "Config default",
+      "projectsLabel": "Projects",
+      "projectsEmpty": "No projects available",
+      "projectsHint": "Select projects for shared knowledge access",
+      "permissionLabel": "Permission Mode",
+      "permissionSupervised": "Supervised",
+      "permissionAutoAccept": "Auto-accept",
+      "permissionAutonomous": "Autonomous",
+      "creating": "Creating...",
+      "create": "Create",
+      "cancel": "Cancel",
+      "expertLabel": "Expert",
+      "expertLoading": "Loading experts...",
+      "createSession": "Create Session"
+    }
+  },
+  "jobs": {
+    "title": "Jobs",
+    "loading": "Loading jobs...",
+    "refresh": "Refresh",
+    "noJobsFound": "No jobs found",
+    "noJobsHintFilter": "Try selecting a different filter",
+    "noJobsHintEmpty": "Create a new job to get started",
+    "snapshotsSummary": "{{count}} snapshots · {{size}}",
+    "count": "Showing {{filtered}} of {{total}} jobs",
+    "colJob": "Job",
+    "colStatus": "Status",
+    "colCreated": "Created",
+    "colActions": "Actions",
+    "filter": {
+      "all": "All",
+      "mine": "Mine",
+      "pending_review": "Review",
+      "reviewing": "Reviewing",
+      "waiting": "Waiting",
+      "created": "Created",
+      "processing": "Processing",
+      "completed": "Completed",
+      "paused": "Paused",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "status": {
+      "pending_review": "Pending Review",
+      "reviewing": "Reviewing",
+      "waiting": "Waiting",
+      "created": "Created",
+      "processing": "Processing",
+      "completed": "Completed",
+      "paused": "Paused",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "action": {
+      "view": "View",
+      "workspace": "Workspace",
+      "ide": "IDE",
+      "starting": "Starting",
+      "pause": "Pause",
+      "cancel": "Cancel",
+      "canceling": "Canceling",
+      "sure": "Sure?",
+      "resume": "Resume",
+      "review": "Review",
+      "delete": "Delete",
+      "confirmDelete": "Confirm?",
+      "promote": "Promote",
+      "createProject": "Create Project"
+    },
+    "tooltip": {
+      "collapse": "Collapse sub-jobs",
+      "expand": "Expand sub-jobs",
+      "view": "View in debug panels",
+      "workspace": "Browse workspace in Gitea",
+      "ideSnapshot": "Open workspace in Web IDE (from snapshot)",
+      "ideCode": "Open workspace in Web IDE (code only)",
+      "ideStarting": "Starting IDE session...",
+      "pauseJob": "Pause job",
+      "cancelJob": "Cancel job",
+      "canceling": "Canceling job...",
+      "confirmCancel": "Click again to confirm cancellation",
+      "reviewJob": "Review and approve/continue",
+      "resumeJob": "Resume from checkpoint",
+      "confirmDelete": "Click again to confirm deletion",
+      "deleteJob": "Delete job",
+      "promoteJob": "Promote to project",
+      "snapshotStats": "S3 snapshot storage",
+      "snapshotAvailable": "Environment snapshot available",
+      "delegationWaiting": "Waiting for delegation children to complete",
+      "delegationChild": "Delegation child (creation order {{order}})"
+    },
+    "delegationChildren": "{{count}} children",
+    "promote": {
+      "namePlaceholder": "Project name (required)",
+      "descriptionPlaceholder": "Description",
+      "goalPlaceholder": "Goal"
+    },
+    "create": {
+      "title": "Create New Job",
+      "dismiss": "Dismiss",
+      "projectLabel": "Project",
+      "projectNone": "No project",
+      "projectPersonal": "(Personal)",
+      "projectHint": "Select which project this job belongs to",
+      "descriptionLabel": "Description",
+      "descriptionPlaceholder": "Describe what the agent should accomplish...",
+      "descriptionHint": "Describe what you want the agent to do",
+      "kickoffLabel": "Opening Message",
+      "kickoffPlaceholder": "Say something to the AI... (e.g., 'Start by reviewing the document structure')",
+      "kickoffHint": "Optional opening prompt — gives the agent initial direction",
+      "expertLabel": "Agent Expert",
+      "expertLoading": "Loading experts...",
+      "expertSelectedPrefix": "Selected:",
+      "expertHintUnselected": "Select an expert profile or leave unselected for the default agent",
+      "documentsLabel": "Documents",
+      "dropHint": "Drop files here or click to browse",
+      "maxHint": "Max {{maxFiles}} files, {{maxSizeMb}}MB each",
+      "addMore": "+ Add more files",
+      "documentsOptional": "Optional: Upload documents for the agent to process",
+      "priorityLabel": "Priority",
+      "priorityHint": "Higher priority jobs run first and can preempt lower priority jobs",
+      "priorityLow": "Low (backfill)",
+      "priorityNormal": "Normal (default)",
+      "priorityHigh": "High (preempts lower)",
+      "cloudStorageLabel": "Cloud Storage Access",
+      "cloudStorageInherit": "Inherit from project",
+      "cloudStorageReadonly": "Read Only",
+      "cloudStorageReadwrite": "Read & Write",
+      "cloudStorageHint": "Override the project's default cloud storage access mode for this job",
+      "reset": "Reset",
+      "submit": "Create Job",
+      "creating": "Creating...",
+      "uploading": "Uploading..."
+    }
+  },
+  "admin": {
+    "providers": {
+      "title": "Providers",
+      "desc": "System-scoped LLM providers, custom endpoints, and default models. Changes apply to every user.",
+      "keys": {
+        "title": "Provider API Keys",
+        "desc": "System-wide API keys used when a user hasn't supplied their own. Stored encrypted at rest.",
+        "empty": "No system keys configured. Add one below, or seed via helm.llm.seed.systemApiKeys.",
+        "colProvider": "Provider",
+        "colKey": "Key",
+        "colLabel": "Label",
+        "colSource": "Source",
+        "colUpdated": "Updated",
+        "seededBadge": "Seeded",
+        "manualBadge": "Manual",
+        "addTitle": "Add / Update Key",
+        "labelPlaceholder": "Label (optional)",
+        "keyPlaceholder": "API key (e.g. sk-...)",
+        "saveButton": "Save Key",
+        "confirmDelete": "Remove this system-wide key? Users without their own key for this provider will lose access."
+      },
+      "endpoints": {
+        "title": "System Endpoints",
+        "desc": "Shared OpenAI-compatible endpoints (vLLM, Ollama, private gateways) visible to every user.",
+        "empty": "No system endpoints. Add one below, or seed via helm.llm.seed.systemEndpoints.",
+        "noKey": "no key",
+        "addTitle": "Add Endpoint",
+        "createButton": "Create Endpoint",
+        "labelPlaceholder": "Label (e.g. Local Gemma)",
+        "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
+        "apiKeyPlaceholder": "API key (optional)",
+        "allowInsecure": "Allow http:// (not recommended outside local dev)",
+        "confirmDelete": "Delete this system endpoint? Catalog rows pointing at it will return errors until you remove or re-target them in Admin · Models.",
+        "testButton": "Test",
+        "testing": "Testing...",
+        "testOk": "OK ({{status}})",
+        "testFail": "Failed ({{status}}): {{error}}",
+        "errorUrlScheme": "Base URL must start with http:// or https://",
+        "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox.",
+        "catalogHint": "Models served by this endpoint are managed in the catalog.",
+        "catalogHintLink": "Open Admin · Models →"
+      },
+      "defaults": {
+        "title": "Default Models",
+        "desc": "Which model to use when a job or tool doesn't specify one. Each kind applies to a different workload.",
+        "unset": "— not set —",
+        "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
+        "auxiliaryGroup": "Auxiliary (helper)",
+        "kind": {
+          "builder": "Builder (job authoring / UI helper)",
+          "browser": "Browser (research subagent)",
+          "citation": "Citation engine",
+          "embedding": "Embedding (memory / citation vectors)",
+          "vision": "Vision (image description)",
+          "auxiliary": "Auxiliary (memory extraction / curation / titles)",
+          "whisper": "Whisper (speech-to-text)",
+          "tts": "Text-to-speech"
+        }
+      }
+    }
+  },
+  "emptyCatalog": {
+    "bannerUser": "No LLMs configured yet — add an API key in Settings → API Keys, or register a custom LLM, to use the app.",
+    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Providers to use the app.",
+    "pickerCta": "Configure a provider to enable this picker.",
+    "dismiss": "Dismiss"
+  },
+  "settings": {
+    "title": "Settings",
+    "appearance": {
+      "title": "Appearance",
+      "desc": "Choose between light and dark mode, or follow your system setting. The choice is saved on this device.",
+      "themeLabel": "Theme"
+    },
+    "language": {
+      "title": "Language",
+      "desc": "Your preferred interface language. Changes apply immediately.",
+      "label": "Interface Language"
+    },
+    "apiKeys": {
+      "title": "API Keys",
+      "desc": "Set your own API keys for LLM providers and tools. These take priority over system-wide keys when running jobs.",
+      "empty": "No API keys configured. Add one to use your own provider keys.",
+      "colProvider": "Provider",
+      "colKey": "Key",
+      "colLabel": "Label",
+      "colUpdated": "Updated",
+      "addTitle": "Add / Update Key",
+      "labelPlaceholder": "Label (optional)",
+      "keyPlaceholder": "API key (e.g. sk-...)",
+      "saveButton": "Save Key"
+    },
+    "llmEndpoints": {
+      "title": "LLM Endpoints",
+      "desc": "Register your own OpenAI-compatible endpoints (vLLM, Ollama, private gateway). Models on these endpoints are added by an admin via Admin → Models.",
+      "empty": "No custom endpoints. Add one to route models to your own server.",
+      "noKey": "no key",
+      "catalogHint": "An admin curates which models on this endpoint are available — see Admin → Models.",
+      "noModels": "No models attached yet. Add one below.",
+      "addTitle": "Add Endpoint",
+      "createButton": "Create Endpoint",
+      "labelPlaceholder": "Label (e.g. My vLLM)",
+      "baseUrlPlaceholder": "Base URL (e.g. https://vllm.example/v1)",
+      "apiKeyPlaceholder": "API key (optional)",
+      "allowInsecure": "Allow http:// (not recommended outside local dev)",
+      "confirmDelete": "Delete this endpoint and all its model rows?",
+      "testButton": "Test",
+      "testing": "Testing...",
+      "testOk": "OK ({{status}})",
+      "testFail": "Failed ({{status}}): {{error}}",
+      "colModelId": "Model ID",
+      "colDisplayName": "Display name",
+      "colFamily": "Family",
+      "colContext": "Context",
+      "modelIdPlaceholder": "Model ID (e.g. my-org/my-model)",
+      "displayNamePlaceholder": "Display name",
+      "familyPlaceholder": "Family (optional)",
+      "contextPlaceholder": "Context window (tokens)",
+      "addModelButton": "Add Model",
+      "errorUrlScheme": "Base URL must start with http:// or https://",
+      "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox."
+    },
+    "preferences": {
+      "title": "Preferences",
+      "desc": "Default settings applied when creating new jobs. Can be overridden per-job.",
+      "helperModels": "Helper Models",
+      "defaultModel": "Default Model",
+      "auxModel": "Auxiliary Model",
+      "autonomy": "Default Autonomy",
+      "reasoning": "Default Reasoning Level",
+      "visionModel": "Vision Model",
+      "visionHint": "Multimodal model for describing images when primary model is text-only",
+      "whisperModel": "Whisper Model",
+      "whisperHint": "Speech-to-text for audio files in workspaces",
+      "embeddingModel": "Embedding Model",
+      "embeddingHint": "Vector embeddings for memory, knowledge, and citation search",
+      "embeddingProvider": "Embedding Provider",
+      "embeddingProviderHint": "Where embedding requests are routed",
+      "noApiKey": "(no API key)",
+      "autonomyFull": "Full",
+      "autonomyReview": "Review",
+      "autonomyPartial": "Partial",
+      "autonomyGuided": "Guided",
+      "autonomyDependent": "Dependent",
+      "reasoningLow": "Low",
+      "reasoningMedium": "Medium",
+      "reasoningHigh": "High",
+      "providerLocal": "Local",
+      "providerOpenrouter": "OpenRouter",
+      "save": "Save Preferences"
+    },
+    "persistent": {
+      "title": "Persistent Agent",
+      "desc": "Default settings for interactive persistent agent sessions. Can be overridden per-session.",
+      "model": "Model",
+      "modelPlaceholder": "e.g. claude-sonnet-4-6",
+      "defaultPrefix": "Default:",
+      "permissionMode": "Permission Mode",
+      "config": "Config",
+      "greeting": "Greeting",
+      "greetingPlaceholder": "Hello! I'm ready to help.",
+      "idleTimeout": "Idle Timeout (minutes)",
+      "commandAllowlist": "Command Allowlist",
+      "commandAllowlistPlaceholder": "pytest*, npm test, git status",
+      "permissionSupervised": "Supervised",
+      "permissionAutoAccept": "Auto-accept",
+      "permissionAutonomous": "Autonomous",
+      "configDefault": "Default",
+      "configDeveloper": "Developer",
+      "configScholar": "Scholar",
+      "save": "Save Persistent Agent Settings"
+    },
+    "communication": {
+      "title": "Communication",
+      "desc": "Configure how agent messages are delivered and when to suppress notifications.",
+      "replyDelivery": "Reply Delivery",
+      "deliveryNextStrategic": "Next strategic phase (default)",
+      "deliveryImmediate": "Immediate interrupt",
+      "deliveryLlmTriage": "LLM triage (auto-decide)",
+      "channels": "Notification Channels",
+      "quietHours": "Quiet Hours",
+      "start": "Start",
+      "end": "End",
+      "timezone": "Timezone",
+      "timezonePlaceholder": "e.g. Europe/Berlin",
+      "save": "Save Communication Settings"
+    },
+    "mcp": {
+      "title": "MCP Tokens",
+      "desc": "Generate API tokens for Claude Code or other MCP clients to access the orchestrator.",
+      "colName": "Name",
+      "colToken": "Token",
+      "colScope": "Scope",
+      "colOrigin": "Origin",
+      "colLastUsed": "Last Used",
+      "colExpires": "Expires",
+      "revoke": "Revoke",
+      "empty": "No tokens yet. Create one to connect your MCP client.",
+      "copyWarning": "Copy this token now — it won't be shown again.",
+      "createTitle": "Create New Token",
+      "namePlaceholder": "Token name (e.g. Claude Code - laptop)",
+      "scopeUser": "My Data Only",
+      "scopeProjectPrefix": "Project:",
+      "scopeAll": "Full Access",
+      "expiryNever": "Never expires",
+      "expiry30": "30 days",
+      "expiry90": "90 days",
+      "expiry365": "1 year",
+      "create": "Create Token",
+      "creating": "Creating...",
+      "claudeCodeTitle": "Claude Code / CLI",
+      "claudeCodeDesc": "Add this to your <code>.mcp.json</code> file:",
+      "webConnectorTitle": "Claude.ai / ChatGPT / Web Connectors",
+      "webConnectorDesc": "Add this URL as a custom MCP connector. OAuth login is handled automatically — no token or credentials needed.",
+      "webConnectorHint": "Works with any MCP client that supports OAuth 2.1 (Authorization Code + PKCE). Leave the Client ID and Client Secret fields empty — the server handles registration automatically."
+    },
+    "codex": {
+      "title": "Codex Proxy",
+      "desc": "Manage the Codex OAuth proxy for ChatGPT subscription-backed models",
+      "checking": "Checking proxy...",
+      "connected": "Connected",
+      "notConnected": "Not connected",
+      "refreshStatus": "Refresh status",
+      "disconnect": "Disconnect",
+      "availableModels": "Available Models",
+      "waiting": "Waiting for OAuth...",
+      "connectAccount": "Connect ChatGPT Account",
+      "completeSignIn": "Complete sign-in",
+      "step1": "Sign in with your OpenAI account in the tab that just opened.",
+      "step2": "After sign-in, the browser will try to redirect to localhost and show an error — this is expected.",
+      "step3": "Copy the full URL from your browser's address bar.",
+      "step4": "Paste it below and click Complete Login.",
+      "callbackPlaceholder": "Paste callback URL here...",
+      "submitting": "Submitting...",
+      "completeLogin": "Complete Login",
+      "portForwardHint": "If you have kubectl port-forward active, login will complete automatically.",
+      "errors": {
+        "urlMissingParams": "URL is missing required parameters. Please paste the complete URL from your browser address bar.",
+        "invalidUrl": "Invalid URL. Please paste the complete URL from your browser address bar.",
+        "completeFailed": "Failed to complete login. Please try again."
+      }
+    },
+    "cloud": {
+      "title": "Cloud Storage (Main Cloud)",
+      "desc": "Configure the main-cloud backend used for user home folders, project folders, and session folders. Secrets are managed via environment variables (Vault/ESO/.env) and are shown here as provenance only.",
+      "loading": "Loading…",
+      "active": "Active:",
+      "initialized": "initialized",
+      "notInitialized": "not initialized",
+      "refresh": "Refresh",
+      "backend": "Backend",
+      "baseUrl": "Base URL (internal)",
+      "publicUrl": "Public URL (browser)",
+      "keycloakIssuer": "Keycloak issuer",
+      "keycloakClientId": "Keycloak client id",
+      "adminRole": "Admin role / claim value",
+      "spaceQuota": "Default Space quota (bytes)",
+      "adminUser": "Admin user",
+      "agentUser": "Agent user",
+      "credentialsRef": "Credentials ref (optional)",
+      "secretProvenance": "Secret provenance",
+      "secretSet": "set ({{chars}} chars)",
+      "secretUnset": "unset",
+      "testing": "Testing…",
+      "test": "Test",
+      "saving": "Saving…",
+      "saveReload": "Save + Reload",
+      "resetEnv": "Reset to env defaults",
+      "persistedOverlayLastSaved": "Persisted overlay last saved",
+      "messages": {
+        "loadFailed": "Failed to load cloud settings",
+        "testOk": "Test OK ({{ms}} ms) — healthy",
+        "testFailed": "Test failed: {{error}}",
+        "testRequestFailed": "Test request failed",
+        "saved": "Saved — active backend is now {{backend}}",
+        "savedReloaded": "Saved — active backend is now {{backend}} (reloaded)",
+        "saveFailed": "Save failed",
+        "overlayCleared": "Overlay cleared — active backend rebuilt from env vars",
+        "resetFailed": "Reset failed"
+      }
+    },
+    "helpers": {
+      "scopeMyData": "My Data",
+      "scopeFullAccess": "Full Access",
+      "originManual": "Manual",
+      "timeJustNow": "Just now",
+      "timeMinutesAgo": "{{n}}m ago",
+      "timeHoursAgo": "{{n}}h ago"
+    }
+  },
+  "projectDetail": {
+    "loading": "Loading project...",
+    "badgePersonal": "Personal",
+    "tabs": {
+      "overview": "Overview",
+      "jobs": "Jobs",
+      "knowledge": "Knowledge",
+      "datasources": "Data Sources",
+      "repos": "Repos",
+      "experts": "Experts",
+      "members": "Members",
+      "settings": "Settings"
+    },
+    "overview": {
+      "description": "Description",
+      "goal": "Goal",
+      "noDescription": "No description",
+      "noGoal": "No goal set",
+      "statsJobs": "Jobs",
+      "statsDatasources": "Data Sources",
+      "statsRepos": "Repos",
+      "statsMembers": "Members",
+      "defaultConfig": "Default Config",
+      "created": "Created",
+      "edit": "Edit",
+      "openFolder": "Open Project Folder",
+      "save": "Save",
+      "cancel": "Cancel"
+    },
+    "jobs": {
+      "new": "+ New Job",
+      "empty": "No jobs in this project",
+      "colStatus": "Status",
+      "colDescription": "Description",
+      "colConfig": "Config",
+      "colBranch": "Branch",
+      "colMerge": "Merge"
+    },
+    "knowledge": {
+      "totalLabel": "Total",
+      "searchPlaceholder": "Search knowledge...",
+      "search": "Search",
+      "filterAllTypes": "All types",
+      "filterAllStatuses": "All statuses",
+      "typeDecision": "Decision",
+      "typeLearning": "Learning",
+      "typeGoal": "Goal",
+      "typePlan": "Plan",
+      "typeCode": "Code",
+      "typeQuestion": "Question",
+      "typeState": "State",
+      "typeSource": "Source",
+      "typeRetrospective": "Retrospective",
+      "statusActive": "Active",
+      "statusResolved": "Resolved",
+      "statusSuperseded": "Superseded",
+      "statusArchived": "Archived",
+      "clear": "Clear",
+      "export": "Export",
+      "back": "Back",
+      "delete": "Delete",
+      "phaseLabel": "Phase {{phase}}",
+      "relationships": "Relationships",
+      "loading": "Loading notes...",
+      "empty": "No knowledge notes found",
+      "loadMore": "Load more",
+      "pagination": "{{current}} of {{total}} notes",
+      "deleteConfirm": "Delete note \"{{noteId}}\" permanently? This cannot be undone.",
+      "exportedAlert": "Exported {{count}} notes to:\n{{path}}"
+    },
+    "datasources": {
+      "selectPlaceholder": "Select a datasource...",
+      "link": "Link",
+      "empty": "No datasources linked to this project",
+      "colName": "Name",
+      "colType": "Type",
+      "colDescription": "Project Description",
+      "colAccess": "Access",
+      "colActions": "Actions",
+      "descriptionPlaceholder": "Usage context for this project...",
+      "accessDefault": "Default (Read-write)",
+      "accessReadOnly": "Read-only",
+      "accessReadWrite": "Read-write",
+      "unlink": "Unlink"
+    },
+    "repos": {
+      "namePlaceholder": "Repo name",
+      "urlPlaceholder": "Repo URL",
+      "roleJobs": "jobs",
+      "roleSource": "source",
+      "roleReference": "reference",
+      "readOnlyLabel": "Read-only",
+      "managedLabel": "Managed",
+      "add": "Add",
+      "empty": "No repositories attached",
+      "colRole": "Role",
+      "colName": "Name",
+      "colUrl": "URL",
+      "colReadOnly": "Read Only",
+      "colManaged": "Managed",
+      "colActions": "Actions",
+      "yes": "Yes",
+      "no": "No",
+      "remove": "Remove"
+    },
+    "experts": {
+      "loading": "Loading experts...",
+      "emptyPrefix": "No project experts yet. Add expert configs to the",
+      "emptySuffix": "directory in the jobs repo."
+    },
+    "members": {
+      "selectUser": "Select user...",
+      "roleEditor": "Editor",
+      "roleViewer": "Viewer",
+      "roleOwner": "Owner",
+      "roleEditorLower": "editor",
+      "roleViewerLower": "viewer",
+      "roleOwnerLower": "owner",
+      "add": "Add",
+      "empty": "No members",
+      "colUser": "User",
+      "colRole": "Role",
+      "colJoined": "Joined",
+      "colActions": "Actions",
+      "remove": "Remove"
+    },
+    "settings": {
+      "general": "General",
+      "projectName": "Project Name",
+      "defaultConfig": "Default Config",
+      "configPlaceholder": "e.g. developer, scholar",
+      "save": "Save Changes",
+      "memory": "Memory",
+      "shareMemories": "Share memories across jobs",
+      "shareMemoriesDesc": "When enabled, automatic memories from any job in this project are visible to all other jobs.",
+      "cloudStorage": "Cloud Storage",
+      "folder": "Folder",
+      "readOnlyAgent": "Read-only agent access",
+      "readOnlyAgentDesc": "When enabled, agents can browse and download files but cannot upload, modify, or delete.",
+      "cloudUnavailable": "Cloud storage unavailable — not configured.",
+      "dangerZone": "Danger Zone",
+      "defaultProjectWarning": "This is your default personal project and cannot be archived or deleted.",
+      "archiveTitle": "Archive Project",
+      "archiveDesc": "Mark this project as archived. Jobs will no longer be created.",
+      "archive": "Archive",
+      "archiveConfirm": "Are you sure you want to archive this project?",
+      "deleteTitle": "Delete Project",
+      "deleteDesc": "Permanently delete this project and its managed repositories.",
+      "delete": "Delete",
+      "deleteConfirm": "Are you sure you want to permanently delete this project? This cannot be undone."
+    }
+  },
+  "chat": {
+    "defaultTitle": "Persistent Agent",
+    "connection": {
+      "connected": "Connected",
+      "connecting": "Connecting...",
+      "error": "Error",
+      "disconnected": "Disconnected"
+    },
+    "header": {
+      "settingsTooltip": "Session settings",
+      "filesButton": "Files",
+      "filesTooltip": "Open session files in Cloud",
+      "gitButton": "Git",
+      "gitTooltip": "View workspace in Gitea",
+      "ideButton": "IDE",
+      "ideActiveTooltip": "Open workspace in IDE",
+      "ideLoadingTooltip": "Workspace starting...",
+      "disconnect": "Disconnect"
+    },
+    "status": {
+      "temp": "temp {{value}}",
+      "turn": "Turn {{count}}"
+    },
+    "settings": {
+      "mode": "Mode",
+      "narration": "Narration",
+      "model": "Model",
+      "temperature": "Temperature: {{value}}",
+      "modeSupervised": "Supervised",
+      "modeAutoAccept": "Auto-accept",
+      "modeAutonomous": "Autonomous",
+      "narrationAuto": "Auto",
+      "narrationVerbose": "Verbose",
+      "narrationSilent": "Silent"
+    },
+    "tasks": {
+      "header": "Tasks {{done}}/{{total}}",
+      "allCompleted": "All tasks completed"
+    },
+    "system": {
+      "sessionResumed": "Session resumed",
+      "emptyPrompt": "Start a conversation...",
+      "resumeSession": "Resume Session",
+      "resuming": "Resuming...",
+      "resumeFailed": "Failed to resume session"
+    },
+    "startup": {
+      "creating": "Creating session...",
+      "provisioning": "Provisioning agent...",
+      "booting": "Agent starting...",
+      "connecting": "Connecting to agent...",
+      "starting": "Session starting...",
+      "reconnecting": "Reconnecting agent...",
+      "connectingFallback": "Connecting..."
+    },
+    "thinking": {
+      "past": "Thought for a moment",
+      "now": "Thinking..."
+    },
+    "tools": {
+      "usedOne": "Used 1 tool:",
+      "usedMany": "Used {{count}} tools:",
+      "statusCompleted": "completed",
+      "statusRunning": "running",
+      "statusDenied": "denied",
+      "statusPending": "pending"
+    },
+    "permission": {
+      "title": "Permission required",
+      "approve": "Approve",
+      "autoAccept": "Auto-accept",
+      "deny": "Deny"
+    },
+    "error": {
+      "dismiss": "dismiss"
+    },
+    "input": {
+      "connect": "Connect to start chatting...",
+      "sessionStarting": "Type your message while the session starts...",
+      "stopping": "Stopping...",
+      "working": "Agent is working...",
+      "default": "Type a message... (Enter to send, Shift+Enter for newline)"
+    },
+    "code": {
+      "expandHint": "Click to expand",
+      "copyTooltip": "Copy to clipboard"
+    },
+    "slash": {
+      "compact": "Compress conversation history to free up context",
+      "done": "End session — extract memories and archive",
+      "undo": "Undo file changes from the last turn",
+      "auto": "Switch to auto-accept mode (approve all except shell)",
+      "supervised": "Switch to supervised mode (approve all writes)",
+      "autonomous": "Switch to autonomous mode (approve nothing)",
+      "silent": "Hide reasoning and minimize tool detail",
+      "verbose": "Show full reasoning and tool detail"
+    },
+    "toolLabels": {
+      "read_file": "Reading",
+      "write_file": "Writing",
+      "edit_file": "Editing",
+      "list_files": "Exploring files",
+      "file_exists": "Checking file",
+      "delete_file": "Deleting file",
+      "search_files": "Searching files",
+      "move_file": "Moving file",
+      "rename_file": "Renaming file",
+      "copy_file": "Copying file",
+      "create_directory": "Creating directory",
+      "delete_directory": "Deleting directory",
+      "get_document_info": "Inspecting document",
+      "run_command": "Running command",
+      "shell_execute": "Running command",
+      "shell_read": "Reading output",
+      "git_log": "Viewing git history",
+      "git_show": "Viewing commit",
+      "git_diff": "Comparing changes",
+      "git_status": "Checking git status",
+      "git_tags": "Listing tags",
+      "git_merge_squash": "Merging changes",
+      "git_worktree_cleanup": "Cleaning worktree",
+      "web_search": "Searching the web",
+      "extract_webpage": "Extracting page content",
+      "crawl_website": "Crawling website",
+      "map_website": "Mapping website",
+      "browse_website": "Browsing website",
+      "download_from_website": "Downloading from web",
+      "research_topic": "Researching topic",
+      "search_papers": "Searching papers",
+      "download_paper": "Downloading paper",
+      "get_paper_info": "Getting paper info",
+      "browser_navigate": "Navigating to page",
+      "browser_snapshot": "Capturing page",
+      "browser_click": "Clicking element",
+      "browser_type": "Typing in browser",
+      "browser_select": "Selecting option",
+      "browser_scroll": "Scrolling page",
+      "browser_screenshot": "Taking screenshot",
+      "browser_back": "Going back",
+      "browser_close": "Closing browser",
+      "task_add": "Adding task",
+      "task_complete": "Completing task",
+      "task_list": "Listing tasks",
+      "next_phase_todos": "Planning next phase",
+      "todo_complete": "Completing todo",
+      "todo_list": "Listing todos",
+      "todo_rewind": "Rewinding todo",
+      "kb_write": "Writing to knowledge base",
+      "kb_update": "Updating knowledge",
+      "kb_read": "Reading knowledge",
+      "kb_list": "Listing knowledge",
+      "kb_search": "Searching knowledge",
+      "kb_related": "Finding related knowledge",
+      "cite_document": "Citing document",
+      "cite_web": "Citing web source",
+      "list_sources": "Listing sources",
+      "search_library": "Searching library",
+      "send_message": "Sending message",
+      "delegate_work": "Delegating work",
+      "mark_complete": "Marking complete",
+      "job_complete": "Completing job"
+    },
+    "toolCategories": {
+      "workspace": "Working with files",
+      "git": "Version control",
+      "shell": "Running commands",
+      "research": "Research & browsing",
+      "browser_direct": "Browsing",
+      "core": "Task management",
+      "session_task": "Task management",
+      "knowledge": "Knowledge base",
+      "citation": "Citations & sources",
+      "sql": "Database queries",
+      "mongodb": "Database queries",
+      "graph": "Knowledge graph",
+      "cloud": "Cloud storage",
+      "communication": "Communication",
+      "delegation": "Delegating work",
+      "orchestrator": "Orchestrator",
+      "evaluation": "Evaluation"
+    },
+    "toolContext": {
+      "searchFor": "for \"{{term}}\"",
+      "commandDash": "— {{cmd}}"
+    }
+  },
+  "datasources": {
+    "title": "Datasources",
+    "new": "New",
+    "dismiss": "Dismiss",
+    "filter": {
+      "all": "All",
+      "generic": "Generic",
+      "repository": "Repository",
+      "postgresql": "PostgreSQL",
+      "neo4j": "Neo4j",
+      "mongodb": "MongoDB",
+      "webdav": "WebDAV"
+    },
+    "form": {
+      "editTitle": "Edit Datasource",
+      "newTitle": "New Datasource",
+      "nameLabel": "Name",
+      "namePlaceholder": "e.g. Production Analytics DB",
+      "typeLabel": "Type",
+      "typeGroupCli": "CLI-based",
+      "typeGroupManaged": "Managed",
+      "optGeneric": "Generic",
+      "optRepository": "Repository",
+      "optPostgresql": "PostgreSQL",
+      "optNeo4j": "Neo4j",
+      "optMongodb": "MongoDB",
+      "optWebdav": "WebDAV",
+      "connectionUrlLabel": "Connection URL",
+      "repoUrlLabel": "Repository URL",
+      "optional": "(optional)",
+      "genericUrlPlaceholder": "e.g. postgresql://host:5432/db or https://api.example.com",
+      "descriptionLabel": "Description",
+      "descriptionPlaceholderGeneric": "Describe this resource for the AI — what it is, how to use it, what data it contains",
+      "descriptionPlaceholderManaged": "What this datasource contains (included in agent context)",
+      "cliHintLabel": "CLI Hint",
+      "cliHintPlaceholder": "e.g. psql $DATABASE_URL",
+      "envVarsLabel": "Environment Variables",
+      "envKeyPlaceholder": "ENV_VAR_NAME",
+      "envValuePlaceholder": "value",
+      "envRemoveTooltip": "Remove",
+      "envAdd": "Add variable",
+      "envHint": "Credentials are injected as environment variables into the agent workspace. Read-only access cannot be enforced — use a database account with restricted permissions if needed.",
+      "defaultBranchLabel": "Default Branch",
+      "defaultBranchPlaceholder": "main",
+      "authMethodLabel": "Auth Method",
+      "authToken": "HTTPS Token",
+      "authSsh": "SSH Key",
+      "tokenLabel": "Access Token",
+      "tokenPlaceholder": "ghp_xxxx or personal access token",
+      "sshKeyLabel": "SSH Private Key",
+      "repoHint": "The repository will be cloned into the workspace and git credentials configured automatically. The agent uses standard git commands — no credential setup required.",
+      "usernameLabel": "Username",
+      "usernamePlaceholder": "neo4j",
+      "passwordLabel": "Password",
+      "passwordPlaceholder": "password",
+      "testing": "Testing...",
+      "test": "Test",
+      "cancel": "Cancel",
+      "saving": "Saving...",
+      "update": "Update",
+      "create": "Create"
+    },
+    "table": {
+      "loading": "Loading datasources...",
+      "empty": "No datasources found",
+      "emptyHint": "Create a datasource to connect agents to external databases",
+      "colType": "Type",
+      "colName": "Name",
+      "colUrl": "URL",
+      "colScope": "Scope",
+      "colActions": "Actions",
+      "scopeJob": "Job",
+      "scopeGlobal": "Global",
+      "testTooltip": "Test connection",
+      "editTooltip": "Edit",
+      "deleteTooltip": "Delete"
+    },
+    "messages": {
+      "repoNoAuthConfirm": "No authentication credentials provided.\n\nThis repository will be cloned as read-only — the agent can browse and read the code but will not be able to push changes.\n\nContinue?",
+      "updated": "Datasource updated",
+      "updateFailed": "Failed to update datasource",
+      "updateError": "Error updating datasource",
+      "created": "Datasource \"{{name}}\" created",
+      "createFailed": "Failed to create datasource",
+      "createError": "Error creating datasource",
+      "createForTestFailed": "Failed to create datasource for testing",
+      "deleted": "Datasource \"{{name}}\" deleted",
+      "deleteFailed": "Failed to delete datasource",
+      "deleteError": "Error deleting datasource",
+      "testFailed": "Request failed",
+      "testRequestFailed": "Test request failed"
+    }
+  },
+  "inbox": {
+    "title": "Action Center",
+    "backBtn": "Back",
+    "sseConnected": "SSE connected",
+    "sseDisconnected": "SSE disconnected",
+    "refresh": "Refresh",
+    "listAriaLabel": "Action center items",
+    "filters": {
+      "all": "All",
+      "messages": "Messages",
+      "sudo": "Sudo",
+      "reviews": "Reviews",
+      "sessions": "Sessions"
+    },
+    "list": {
+      "empty": {
+        "message": "No message items",
+        "sudo": "No sudo items",
+        "review": "No review items",
+        "session": "No session items"
+      },
+      "emptyAll": "All clear — no items need your attention",
+      "resolved": "resolved",
+      "modeBlocking": "blocking",
+      "modeAsync": "async"
+    },
+    "time": {
+      "now": "now"
+    },
+    "detail": {
+      "emptyText": "Select an item to view details",
+      "hintUse": "Use",
+      "hintToNavigate": "to navigate,",
+      "hintToSelect": "to select"
+    },
+    "sudoDetail": {
+      "vmUpgradeRequest": "VM Upgrade Request",
+      "sudoRequest": "Sudo Request",
+      "secondsRemaining": "{{seconds}}s remaining",
+      "user": "User",
+      "vm": "VM",
+      "cwd": "CWD",
+      "workspace": "Workspace",
+      "upgradeHint": "Agent attempted sudo in a container workspace. Upgrade to a VM for full sudo access, or resume the job without a VM.",
+      "upgradeToVm": "Upgrade to VM",
+      "resumeWithoutVm": "Resume without VM",
+      "approve": "Approve",
+      "deny": "Deny",
+      "reason": "Reason",
+      "rulesToggle": "Auto-Approval Rules ({{count}})",
+      "rulePatternPlaceholder": "Pattern (e.g. apt-get install *)",
+      "ruleActionApprove": "Approve",
+      "ruleActionDeny": "Deny",
+      "ruleAdd": "Add"
+    },
+    "messageDetail": {
+      "messageLabel": "Message",
+      "modeBlocking": "blocking",
+      "modeAsync": "async",
+      "defaultAgent": "agent",
+      "jobPrefix": "job",
+      "threadLoading": "Loading thread...",
+      "noMessagesLoaded": "No messages loaded",
+      "senderAgent": "Agent",
+      "senderYou": "You",
+      "replyPlaceholder": "Type a reply...",
+      "markUrgent": "Mark as urgent",
+      "send": "Send"
+    },
+    "reviewDetail": {
+      "jobReview": "Job Review",
+      "freezePhase": "Phase Boundary",
+      "freezeUpgrade": "Sudo Required",
+      "freezeComplete": "Job Complete",
+      "defaultAgent": "agent",
+      "idPrefix": "ID:",
+      "phase": "Phase {{number}}",
+      "loadingFrozen": "Loading frozen data...",
+      "summary": "Summary",
+      "confidence": "Confidence",
+      "deliverables": "Deliverables",
+      "upgradeHint": "Upgrade to a VM for sudo access, or resume without a VM.",
+      "upgradeToVm": "Upgrade to VM",
+      "resumeWithoutVm": "Resume without VM",
+      "notesPlaceholder": "Optional notes...",
+      "approve": "Approve",
+      "feedbackPlaceholder": "Feedback for next phase...",
+      "resumeWithFeedback": "Resume with Feedback"
+    },
+    "sessionDetail": {
+      "agentSession": "Agent Session",
+      "needsAttention": "needs attention",
+      "tool": "Tool",
+      "arguments": "Arguments",
+      "command": "Command",
+      "reason": "Reason",
+      "goToSession": "Go to Session"
+    },
+    "denyDialog": {
+      "titlePrefix": "Deny:",
+      "reasonPlaceholder": "Reason for denial (required)",
+      "cancel": "Cancel",
+      "deny": "Deny"
+    },
+    "shortcuts": {
+      "title": "Keyboard Shortcuts",
+      "nextItem": "Next item",
+      "prevItem": "Previous item",
+      "selectItem": "Select item",
+      "deselect": "Deselect / close",
+      "approveSudoReview": "Approve (sudo / review)",
+      "denySudo": "Deny (sudo)",
+      "focusReply": "Focus reply (message)",
+      "sendReply": "Send reply",
+      "filterMessages": "Filter: Messages",
+      "filterSudo": "Filter: Sudo",
+      "filterReviews": "Filter: Reviews",
+      "clearFilter": "Clear filter",
+      "toggleOverlay": "Toggle this overlay",
+      "close": "Close"
+    }
+  },
+  "builder": {
+    "empty": {
+      "title": "AI Instruction Builder",
+      "desc": "Describe what you want the agent to do, and I'll help you write the instructions, configure settings, and set up the job.",
+      "hint": "Start typing below to begin a conversation."
+    },
+    "proposal": {
+      "write": "Write",
+      "edit": "Edit",
+      "diffRemove": "Remove",
+      "diffInsert": "Insert",
+      "currentContent": "Current content ({{length}} chars)",
+      "newContent": "New content ({{length}} chars)",
+      "apply": "Apply",
+      "dismiss": "Dismiss"
+    },
+    "session": {
+      "starting": "Starting session...",
+      "restoring": "Restoring conversation...",
+      "createFailed": "Failed to create builder session"
+    },
+    "input": {
+      "placeholder": "Describe what the agent should do...",
+      "retry": "Retry",
+      "stopTitle": "Stop generation"
+    },
+    "stream": {
+      "appliedChanges": "(applied changes)",
+      "searching": "Searching: {{query}}",
+      "running": "Running: {{tool}}",
+      "result": "Result: {{tool}}"
+    },
+    "errors": {
+      "writeFailed": "Failed to write {{path}}"
+    }
+  },
+  "advanced": {
+    "sections": {
+      "inference": "Inference Parameters",
+      "limits": "Limits & Safety",
+      "memory": "Memory Tuning",
+      "context": "Context Management",
+      "workspace": "Workspace",
+      "shell": "Shell",
+      "research": "Research & Browser",
+      "auxiliary": "Auxiliary LLM",
+      "session": "Session",
+      "viewResolvedConfig": "View resolved config (JSON)"
+    },
+    "phases": {
+      "strategic": "Strategic",
+      "tactical": "Tactical"
+    },
+    "labels": {
+      "reasoning": "Reasoning",
+      "temperature": "Temperature: {{value}}",
+      "multimodal": "Multimodal (images)",
+      "topP": "Top-p",
+      "topK": "Top-k",
+      "maxOutputTokens": "Max output tokens",
+      "parallelToolCalls": "Parallel tool calls",
+      "messageCountThreshold": "Message count threshold",
+      "toolRetryCount": "Tool retry count",
+      "progressStallThreshold": "Progress stall threshold",
+      "maxToolCallsPerPhase": "Max tool calls per phase",
+      "memoryEnabled": "Memory enabled",
+      "budgetTokens": "Budget tokens",
+      "compactOnArchive": "Compact on archive",
+      "keepRecentToolResults": "Keep recent tool results",
+      "keepRecentMessages": "Keep recent messages",
+      "backend": "Backend",
+      "vmCpuCores": "VM CPU cores",
+      "vmMemory": "VM memory",
+      "maxReadWords": "Max read words",
+      "maxWriteWords": "Max write words",
+      "gitVersioning": "Git versioning",
+      "mode": "Mode",
+      "sandbox": "Sandbox",
+      "defaultTimeout": "Default timeout (seconds)",
+      "sudoAction": "Sudo action",
+      "proxyEnabled": "Proxy enabled",
+      "browserHeadless": "Browser headless",
+      "browserVision": "Browser use vision",
+      "auxEnabled": "Auxiliary LLM enabled",
+      "model": "Model",
+      "idleTimeout": "Idle timeout (minutes)",
+      "greeting": "Greeting"
+    },
+    "options": {
+      "container": "Container",
+      "vmQemu": "VM (QEMU)",
+      "stateless": "Stateless",
+      "persistent": "Persistent",
+      "sudoFreeze": "Freeze (ask user)",
+      "sudoBlock": "Block (deny)",
+      "sudoAllow": "Allow"
+    },
+    "hints": {
+      "idleDisabled": "0 = disabled",
+      "autoPlaceholder": "auto"
+    }
+  },
+  "jobReview": {
+    "title": "Job Review",
+    "empty": {
+      "selectJob": "Select a job to review",
+      "notFound": "Job not found",
+      "notPending": "This job is not awaiting review."
+    },
+    "loading": "Loading...",
+    "sections": {
+      "job": "Job",
+      "summary": "Summary",
+      "confidence": "Confidence",
+      "deliverables": "Deliverables",
+      "agentNotes": "Agent Notes"
+    },
+    "meta": {
+      "id": "ID: {{id}}...",
+      "created": "Created: {{date}}"
+    },
+    "summaryEmpty": "No summary provided",
+    "noFrozenData": "No frozen job data available",
+    "links": {
+      "browseWorkspace": "Browse workspace in Gitea",
+      "startingIde": "Starting IDE...",
+      "openIde": "Open in Web IDE"
+    },
+    "vmUpgrade": {
+      "title": "Sudo Required",
+      "reason": "The agent attempted a privileged command in a hardened container:",
+      "hint": "Upgrade to a VM for full sudo access (gated by the approval system), or resume without a VM (the agent will adapt).",
+      "upgrading": "Upgrading...",
+      "upgradeToVm": "Upgrade to VM",
+      "resuming": "Resuming...",
+      "resumeWithoutVm": "Resume without VM"
+    },
+    "actions": {
+      "continuing": "Continuing...",
+      "continue": "Continue",
+      "confirmApprove": "Confirm Approve?",
+      "approving": "Approving...",
+      "approve": "Approve",
+      "orContinueFeedback": "or continue with feedback",
+      "feedbackPlaceholder": "Write feedback or additional instructions for the agent...",
+      "resuming": "Resuming...",
+      "continueWithFeedback": "Continue with Feedback"
+    },
+    "messages": {
+      "approved": "Job approved successfully.",
+      "approveFailed": "Failed to approve job. Check console for details.",
+      "upgradeInitiated": "VM upgrade initiated. The job will resume once the VM is ready.",
+      "upgradeFailed": "Failed to upgrade to VM. Check console for details.",
+      "continuing": "Job continuing. Agent will resume execution.",
+      "continueFailed": "Failed to continue job. Check console for details.",
+      "resumedWithFeedback": "Job resumed with feedback. Agent will continue working.",
+      "resumeFailed": "Failed to resume job. Check console for details."
+    }
+  },
+  "chatHistory": {
+    "title": "Chat History",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "empty": {
+      "noHistory": "No chat history for this job",
+      "noHistoryHint": "Chat entries are created when the agent runs",
+      "noJob": "Select a job to view chat history",
+      "noJobHint": "Use the job dropdown at the top to select a job"
+    },
+    "phaseUnknown": "unknown",
+    "iter": "iter {{n}}",
+    "human": "Human",
+    "assistant": "Assistant",
+    "reasoning": "Reasoning",
+    "shellState": "Shell State",
+    "paneSingle": "{{n}} pane",
+    "panePlural": "{{n}} panes",
+    "emptyPane": "(empty)",
+    "resultPending": "Result pending or not available",
+    "viewRequest": "View full request",
+    "showingTurns": "Showing {{n}} chat turns",
+    "newOutput": "NEW",
+    "idle": "idle",
+    "turnsCount": "{{n}} turns"
+  },
+  "configEditor": {
+    "loading": "Loading schema...",
+    "modeVisual": "Visual",
+    "modeJson": "JSON",
+    "overrideSingle": "{{n}} override",
+    "overridePlural": "{{n}} overrides",
+    "nullable": "nullable",
+    "defaultOption": "Default",
+    "defaultAutoDetect": "Default (auto-detect)",
+    "arrayHint": "Comma-separated values",
+    "jsonHint": "Full resolved config (expert defaults + your overrides). Edit any value — only changes are sent as overrides.",
+    "resetToDefault": "Reset to default",
+    "errors": {
+      "rootMustBeObject": "Root must be an object",
+      "invalidJson": "Invalid JSON"
+    }
+  },
+  "agentSettings": {
+    "common": {
+      "resetToDefault": "Reset to default",
+      "noApiKey": "no API key"
+    },
+    "datasources": {
+      "group": "Data Sources",
+      "loading": "Loading datasources..."
+    },
+    "execution": {
+      "group": "Execution",
+      "autonomy": "Autonomy",
+      "permissionMode": "Permission Mode",
+      "scholar": "Scholar (pre-research)",
+      "critic": "Critic (verification)",
+      "projectMemory": "Project memory",
+      "autonomyDefaultHint": "Controls when the agent pauses for human review"
+    },
+    "autonomy": {
+      "full": {
+        "label": "Full",
+        "description": "Never freezes, runs to completion autonomously"
+      },
+      "review": {
+        "label": "Review",
+        "description": "Freezes at job completion for human review"
+      },
+      "partial": {
+        "label": "Partial",
+        "description": "Freezes at phase boundaries and job completion"
+      },
+      "guided": {
+        "label": "Guided",
+        "description": "Freezes after every tactical phase"
+      },
+      "dependent": {
+        "label": "Dependent",
+        "description": "Freezes after every phase (strategic and tactical)"
+      }
+    },
+    "permissionModes": {
+      "supervised": {
+        "label": "Supervised",
+        "description": "Agent asks for approval before executing commands"
+      },
+      "auto_accept": {
+        "label": "Auto-accept",
+        "description": "Auto-approve most actions, flag risky ones"
+      },
+      "autonomous": {
+        "label": "Autonomous",
+        "description": "Agent runs without asking for approval"
+      }
+    },
+    "criticRounds": {
+      "1": "1 round",
+      "3": "3 rounds",
+      "5": "5 rounds (default)",
+      "10": "10 rounds",
+      "0": "Unlimited"
+    },
+    "tools": {
+      "group": "Tools",
+      "maxDepth": "Max depth",
+      "timeout": "Timeout (sec)"
+    },
+    "toolCategories": {
+      "research": {
+        "label": "Research",
+        "description": "Ability to search the web, find academic papers, and browse websites"
+      },
+      "browser_direct": {
+        "label": "Browser",
+        "description": "Direct browser control — navigate, click, type, screenshot, and visually verify pages"
+      },
+      "citation": {
+        "label": "Citation",
+        "description": "Ability to track sources, manage citations, and generate bibliographies"
+      },
+      "shell": {
+        "label": "Shell",
+        "description": "Ability to run shell commands in a sandboxed terminal"
+      },
+      "communication": {
+        "label": "Communication",
+        "description": "Ability to send email messages to you or your team"
+      },
+      "delegation": {
+        "label": "Delegation",
+        "description": "Ability to spawn subagents that work in parallel"
+      },
+      "knowledge": {
+        "label": "Knowledge",
+        "description": "Ability to read and write to the project knowledge base"
+      },
+      "git": {
+        "label": "Git",
+        "description": "Ability to inspect workspace version history"
+      }
+    },
+    "model": {
+      "group": "Model",
+      "preset": "Preset",
+      "strategic": "Strategic",
+      "tactical": "Tactical",
+      "single": "Model",
+      "default": "Default",
+      "presetUnconfigured": "One or both models lack an API key",
+      "providerNoKey": "{{provider}} (no API key)"
+    }
+  },
+  "agentList": {
+    "title": "Registered Agents",
+    "count": "{{n}} agents",
+    "refresh": "Refresh",
+    "loading": "Loading...",
+    "loadingAgents": "Loading agents...",
+    "empty": "No agents registered",
+    "emptyHint": "Agents will appear here when they connect to the orchestrator",
+    "table": {
+      "status": "Status",
+      "config": "Config",
+      "hostname": "Hostname",
+      "currentJob": "Current Job",
+      "lastHeartbeat": "Last Heartbeat",
+      "actions": "Actions"
+    },
+    "status": {
+      "booting": "Booting",
+      "ready": "Ready",
+      "working": "Working",
+      "session": "Session",
+      "draining": "Draining",
+      "completed": "Completed",
+      "failed": "Failed",
+      "offline": "Offline"
+    },
+    "actions": {
+      "assign": "Assign Job",
+      "assignTitle": "Assign a job to this agent",
+      "remove": "Remove"
+    },
+    "assign": {
+      "title": "Assign Job to Agent",
+      "cancel": "Cancel",
+      "assigning": "Assigning...",
+      "confirm": "Assign Job",
+      "noJobs": "No jobs available for assignment",
+      "noJobsHint": "Create a job first or wait for jobs with \"created\" status"
+    },
+    "footer": {
+      "autoRefreshOn": "Auto-refresh: ON (30s)",
+      "autoRefreshOff": "Auto-refresh: OFF",
+      "disable": "Disable",
+      "enable": "Enable"
+    },
+    "messages": {
+      "assigned": "Job assigned successfully!",
+      "assignFailed": "Failed to assign job",
+      "assignError": "Error assigning job"
+    },
+    "time": {
+      "secondsAgo": "{{n}}s ago",
+      "minutesAgo": "{{n}}m ago",
+      "hoursAgo": "{{n}}h ago"
+    }
+  },
+  "sudo": {
+    "title": "Sudo Approvals",
+    "filter": {
+      "all": "All",
+      "pending": "Pending",
+      "approved": "Approved",
+      "denied": "Denied",
+      "expired": "Expired"
+    },
+    "panels": {
+      "requests": "Requests",
+      "rules": "Auto-Approval Rules"
+    },
+    "loading": "Loading...",
+    "emptyRequests": "No requests",
+    "emptyRules": "No rules configured",
+    "secondsLeft": "{{n}}s",
+    "risk": {
+      "low": "low",
+      "medium": "medium",
+      "high": "high",
+      "critical": "critical"
+    },
+    "status": {
+      "pending": "pending",
+      "approved": "approved",
+      "auto_approved": "auto approved",
+      "denied": "denied",
+      "auto_denied": "auto denied",
+      "expired": "expired"
+    },
+    "actions": {
+      "approve": "Approve",
+      "deny": "Deny"
+    },
+    "rule": {
+      "patternPlaceholder": "Pattern (e.g. apt-get install *)",
+      "actionApprove": "Approve",
+      "actionDeny": "Deny",
+      "actionReview": "Review",
+      "add": "Add",
+      "badge": {
+        "approve": "approve",
+        "deny": "deny",
+        "review": "review"
+      }
+    },
+    "denyDialog": {
+      "title": "Deny: {{command}}",
+      "reasonPlaceholder": "Reason for denial (required)",
+      "cancel": "Cancel",
+      "confirm": "Deny"
+    }
+  },
+  "notificationBell": {
+    "title": "Action Center",
+    "messagesSingle": "{{n}} message",
+    "messagesPlural": "{{n}} messages",
+    "sudo": "{{n}} sudo",
+    "reviewsSingle": "{{n}} review",
+    "reviewsPlural": "{{n}} reviews",
+    "sessionsSingle": "{{n}} session",
+    "sessionsPlural": "{{n}} sessions"
+  },
+  "todoList": {
+    "phaseSelector": {
+      "current": "Current Phase",
+      "currentCount": "({{n}} todos)",
+      "archivedPhases": "Archived Phases",
+      "unnamedPhase": "Unnamed Phase"
+    },
+    "refreshTitle": "Refresh todos",
+    "retry": "Retry",
+    "empty": {
+      "noWorkspace": "No workspace found",
+      "noWorkspaceHint": "Job workspace may not exist yet",
+      "noJob": "Select a job from the timeline bar",
+      "noJobHint": "Todos will appear here",
+      "noTodos": "No todos in this phase",
+      "planningHint": "The agent may be in strategic planning",
+      "archiveHint": "This archive has no recorded todos"
+    },
+    "priorityHigh": "HIGH",
+    "summary": {
+      "total": "Total: {{n}}",
+      "completed": "Completed: {{n}}",
+      "remaining": "Remaining: {{n}}"
+    }
+  },
+  "errors": {
+    "unknown": "Something went wrong.",
+    "http": {
+      "network": "Can't reach the server. Check your connection and try again.",
+      "401": "You're signed out. Please sign in and try again.",
+      "403": "You don't have permission to do that.",
+      "404": "Not found.",
+      "409": "This action conflicts with the current state.",
+      "429": "Too many requests. Please wait a moment and try again.",
+      "timeout": "The server took too long to respond.",
+      "4xx": "The request couldn't be completed.",
+      "5xx": "The server encountered an error. Please try again."
+    },
+    "code": {
+      "job.not_found": "That job no longer exists.",
+      "agent.unavailable": "No agents are available right now.",
+      "agent.offline": "The assigned agent is offline.",
+      "project.not_found": "That project no longer exists.",
+      "permission.denied": "You don't have permission to do that."
+    },
+    "jobs": {
+      "createFailed": "Couldn't create the job.",
+      "deleteFailed": "Couldn't delete the job.",
+      "cancelFailed": "Couldn't cancel the job.",
+      "pauseFailed": "Couldn't pause the job.",
+      "resumeFailed": "Couldn't resume the job.",
+      "approveFailed": "Couldn't approve the job.",
+      "upgradeVmFailed": "Couldn't upgrade to a VM workspace.",
+      "replyFailed": "Couldn't send the reply."
+    },
+    "ide": {
+      "startFailed": "Couldn't start the IDE session.",
+      "stopFailed": "Couldn't stop the IDE session."
+    },
+    "sessions": {
+      "resumeFailed": "Couldn't resume the session.",
+      "endFailed": "Couldn't end the session.",
+      "deleteFailed": "Couldn't delete the session.",
+      "createFailed": "Couldn't create the session."
+    }
+  },
+  "toasts": {
+    "jobs": {
+      "created": "Job created",
+      "deleted": "Job deleted",
+      "cancelled": "Job cancelled",
+      "paused": "Job paused",
+      "resumed": "Job resumed",
+      "approved": "Job approved",
+      "vmUpgradeStarted": "VM upgrade initiated",
+      "replySent": "Reply sent"
+    },
+    "ide": {
+      "stopped": "IDE session stopped"
+    }
+  },
+  "pwa": {
+    "splash": "Assembling legion…",
+    "install": {
+      "title": "Garrison SRW on this device",
+      "body": "Pin SRW to your home screen for fast access.",
+      "cta": "Install"
+    },
+    "update": {
+      "title": "A new standard is ready",
+      "body": "Reload to deploy the latest version.",
+      "cta": "Reload"
+    },
+    "offline": {
+      "banner": "Off the road — working from cache.",
+      "title": "Lost contact with the camp",
+      "body": "Showing your most recent dispatches."
+    },
+    "empty": {
+      "inbox": "No dispatches waiting.",
+      "jobs": "No jobs in the field.",
+      "sessions": "No active sessions."
+    },
+    "session": {
+      "running": "Legion in the field"
+    },
+    "checkpoint": "Mile marker · review and proceed",
+    "syncComplete": "Reports filed.",
+    "errorGeneric": "The signal didn't reach. Try again."
+  }
+}

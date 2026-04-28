@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+import yaml
+
 # Add project root and orchestrator dir to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 ORCHESTRATOR_DIR = Path(__file__).parent
@@ -275,6 +277,29 @@ async def init_postgres(force_reset: bool = False) -> bool:
 
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
+
+        # Seed system_api_keys from SEED_*_API_KEY env vars (idempotent;
+        # mirrors the helm seeder Job)
+        await _seed_llm_keys_from_env(db)
+
+        # Seed the codex-proxy system endpoint when CODEX_PROXY_URL is set
+        # (idempotent; matched by well-known label)
+        await _seed_codex_proxy_endpoint(db)
+
+        # Seed the models catalog from config/models.yaml (idempotent —
+        # admin edits via Cockpit are never clobbered)
+        await _seed_models_from_yaml(db)
+
+        # One-shot migration: promote system-scoped user_llm_endpoint_models
+        # rows to the catalog and drop the legacy table. No-op once the
+        # table is gone.
+        await _migrate_endpoint_models_to_catalog(db)
+
+        # When OpenRouter is the seeded gateway, insert convenience catalog
+        # rows for the auxiliary + embedding routes that would otherwise be
+        # empty (idempotent; resolver picks first-enabled-alphabetical at
+        # call time)
+        await _apply_openrouter_defaults(db)
 
         # Backfill Nextcloud cloud folders for existing projects
         await _backfill_cloud_folders(db)
@@ -792,6 +817,340 @@ async def _seed_default_datasources(db) -> None:
         logger.info(
             "  No default datasources configured (DEFAULT_DS_* env vars not set)"
         )
+
+
+# =============================================================================
+# LLM API Key Seeding (mirrors helm/templates/orchestrator/llm-seed-job.yaml)
+# =============================================================================
+
+
+# Providers seeded from SEED_*_API_KEY env vars. Stays in sync with
+# orchestrator.main.VALID_SYSTEM_API_KEY_PROVIDERS minus the legacy
+# "vision" slot (vision keys ride along on a per-endpoint inline api_key
+# now). Inlined here rather than imported from main.py because importing
+# main.py at runtime triggers a fresh ``load_dotenv()`` that would undo
+# any test-time ``monkeypatch.delenv`` calls.
+_SEEDABLE_PROVIDERS = (
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "tavily",
+)
+
+
+async def _seed_llm_keys_from_env(db) -> None:
+    """Seed system_api_keys from SEED_<PROVIDER>_API_KEY env vars on first boot.
+
+    Mirrors the helm seeder Job so local dev with ``python init.py`` and a
+    ``.env`` file gets the same insert-only behavior. After first run,
+    rotating keys via Admin → Providers is never clobbered — re-runs report
+    all entries as "skipped" and exit clean.
+
+    Env var shape: ``SEED_OPENAI_API_KEY``, ``SEED_ANTHROPIC_API_KEY``, …
+    one per provider in ``_SEEDABLE_PROVIDERS``.
+    """
+    try:
+        from orchestrator.seed.llm_config import seed as llm_seed
+    except ImportError as e:
+        logger.warning(f"  Could not import seed.llm_config: {e}")
+        return
+
+    entries = []
+    for provider in _SEEDABLE_PROVIDERS:
+        env_name = f"SEED_{provider.upper()}_API_KEY"
+        if os.environ.get(env_name):
+            entries.append(
+                {
+                    "provider": provider,
+                    "apiKeyEnv": env_name,
+                    "label": f"Seeded from {env_name} at init.",
+                }
+            )
+
+    if not entries:
+        logger.info("  No SEED_*_API_KEY env vars set — skipping LLM key seed")
+        return
+
+    report = await llm_seed(db, {"systemApiKeys": entries})
+    if report.api_keys_seeded:
+        logger.info(f"  Seeded system_api_keys: {', '.join(report.api_keys_seeded)}")
+    if report.api_keys_skipped:
+        logger.info(
+            f"  Skipped existing system_api_keys: {', '.join(report.api_keys_skipped)}"
+        )
+
+
+from orchestrator.seed.llm_config import (  # noqa: E402, F401
+    CODEX_PROXY_ENDPOINT_LABEL,  # re-exported: tests reference init_mod.CODEX_PROXY_ENDPOINT_LABEL
+    ensure_codex_proxy_endpoint,
+)
+
+
+async def _seed_codex_proxy_endpoint(db) -> None:
+    """Boot-time seed for the system-scoped ``codex-proxy`` llm_endpoints row.
+
+    Skips when ``CODEX_PROXY_URL`` is unset so a fresh stack with no codex
+    proxy configured doesn't carry a dangling transport row. Runtime paths
+    (OAuth callback, availability probe) call
+    :func:`ensure_codex_proxy_endpoint` directly with a fallback URL so a
+    user who connects a subscription via the cockpit gets wired up without
+    having to set the env var.
+    """
+    proxy_url = os.environ.get("CODEX_PROXY_URL")
+    if not proxy_url:
+        logger.info("  CODEX_PROXY_URL not set — skipping codex-proxy endpoint seed")
+        return
+
+    created = await ensure_codex_proxy_endpoint(db, proxy_url=proxy_url)
+    if created:
+        logger.info(f"  Seeded codex-proxy endpoint at {proxy_url}")
+    else:
+        logger.info("  codex-proxy endpoint already present — leaving untouched")
+
+
+_YAML_GROUP_ROLE = {
+    "auxiliary_models": "auxiliary",
+    "vision_models": "vision",
+    "embedding_models": "embedding",
+}
+
+
+def _infer_provider_from_model_id(model_id: str) -> str | None:
+    """Best-effort provider inference for catalog seed rows lacking an explicit
+    ``provider`` field. Mirrors the prefix logic in
+    ``orchestrator.main._create_builder_llm``.
+    """
+    name = model_id.lower()
+    if name.startswith("claude"):
+        return "anthropic"
+    if name.startswith("openrouter/"):
+        return "openrouter"
+    if name.startswith("groq/"):
+        return "groq"
+    if name.startswith("codex/"):
+        return "codex"
+    if name.startswith("gemini") or name.startswith("google/"):
+        return "google"
+    if name.startswith("gpt-") or name.startswith("text-embedding-"):
+        return "openai"
+    return None
+
+
+async def _seed_models_from_yaml(db) -> None:
+    """Seed the ``models`` catalog from ``config/models.yaml`` on first boot.
+
+    For each entry in the YAML groups + the auxiliary/vision/embedding helper
+    lists, construct one catalog row per (model, role) and insert with
+    ``ON CONFLICT DO NOTHING`` so admin edits made via the Cockpit are never
+    clobbered by subsequent boots.
+
+    Rows whose inferred provider has no ``system_api_keys`` entry yet are
+    skipped — they would not be reachable. The ``local`` provider (vLLM via
+    a static endpoint) is also skipped: those models surface through the
+    ``llm_endpoints`` route, not as system rows.
+    """
+    catalog_path = Path(__file__).resolve().parent.parent / "config" / "models.yaml"
+    if not catalog_path.exists():
+        logger.info(f"  Catalog seed skipped — {catalog_path} not found")
+        return
+
+    try:
+        raw = yaml.safe_load(catalog_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        logger.warning(f"  Could not parse {catalog_path}: {e}")
+        return
+
+    seeded_keys = {k["provider"] for k in await db.list_system_api_keys()}
+
+    rows: list[dict] = []
+    skipped_provider_counts: dict[str, int] = {}
+
+    def _enqueue(
+        provider: str | None, model_id: str, display: str, role: str, family: str | None
+    ) -> None:
+        if not provider or provider == "local":
+            return
+        if provider not in seeded_keys:
+            skipped_provider_counts[provider] = (
+                skipped_provider_counts.get(provider, 0) + 1
+            )
+            return
+        from src.core.model_registry import family_of  # local import: avoids
+        # importing src/* during early startup before sys.path is set up
+
+        rows.append(
+            {
+                "provider_kind": "system",
+                "provider_ref": provider,
+                "model_id": model_id,
+                "display_label": display or model_id,
+                "role": role,
+                "family": family or family_of(model_id),
+                "seeded_from": "config/models.yaml",
+            }
+        )
+
+    for group in raw.get("groups", []):
+        provider = group.get("provider")
+        for entry in group.get("models", []):
+            _enqueue(
+                provider,
+                entry["id"],
+                entry.get("display_name") or entry["id"],
+                "chat",
+                entry.get("family"),
+            )
+
+    for yaml_key, role in _YAML_GROUP_ROLE.items():
+        for entry in raw.get(yaml_key, []):
+            provider = entry.get("provider") or _infer_provider_from_model_id(
+                entry["id"]
+            )
+            _enqueue(
+                provider,
+                entry["id"],
+                entry.get("label") or entry["id"],
+                role,
+                entry.get("family"),
+            )
+
+    inserted = 0
+    for row in rows:
+        result = await db.create_model(**row, on_conflict_do_nothing=True)
+        if result is not None:
+            inserted += 1
+
+    if inserted:
+        logger.info(f"  Seeded {inserted} catalog rows from config/models.yaml")
+    else:
+        logger.info("  No new catalog rows from config/models.yaml (all present)")
+    for provider, count in sorted(skipped_provider_counts.items()):
+        logger.info(
+            f"  Skipped {count} {provider} catalog rows — no system_api_keys row yet"
+        )
+
+
+async def _migrate_endpoint_models_to_catalog(db) -> None:
+    """One-shot migration: promote system-scoped ``user_llm_endpoint_models``
+    rows into the catalog and drop the legacy table.
+
+    Idempotent — bails out cleanly when the table no longer exists. User-
+    scoped rows (``llm_endpoints.user_id IS NOT NULL``) are *not*
+    migrated; the dual-scope complexity isn't worth carrying forward, and
+    user-side authoring was unused in practice (per design doc §Decisions).
+    """
+    async with db.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT to_regclass('public.user_llm_endpoint_models') IS NOT NULL"
+        )
+        if not exists:
+            return
+
+        rows = await conn.fetch(
+            """
+            SELECT m.endpoint_id, m.model_id, m.display_name, m.family,
+                   m.context_window, m.reasoning_level, m.enabled, m.capability
+              FROM user_llm_endpoint_models m
+              JOIN llm_endpoints e ON e.id = m.endpoint_id
+             WHERE e.user_id IS NULL
+            """
+        )
+
+    promoted = 0
+    skipped_unsupported_role = 0
+    for row in rows:
+        capability = (row["capability"] or "chat").lower()
+        if capability not in (
+            "chat",
+            "auxiliary",
+            "embedding",
+            "vision",
+            "whisper",
+            "tts",
+        ):
+            skipped_unsupported_role += 1
+            continue
+        from src.core.model_registry import family_of  # local import: src/*
+        # path may not be on sys.path until runtime is fully wired
+
+        result = await db.create_model(
+            provider_kind="endpoint",
+            provider_ref=str(row["endpoint_id"]),
+            model_id=row["model_id"],
+            display_label=row["display_name"],
+            role=capability,
+            family=row["family"] or family_of(row["model_id"]),
+            context_window=row["context_window"],
+            reasoning_level=row["reasoning_level"],
+            enabled=bool(row["enabled"]),
+            seeded_from="migration:user_llm_endpoint_models",
+            on_conflict_do_nothing=True,
+        )
+        if result is not None:
+            promoted += 1
+
+    async with db.acquire() as conn:
+        await conn.execute("DROP TABLE IF EXISTS user_llm_endpoint_models CASCADE")
+
+    logger.info(
+        "  Migrated user_llm_endpoint_models → models: %d promoted, "
+        "%d skipped (unsupported v1 role); table dropped",
+        promoted,
+        skipped_unsupported_role,
+    )
+
+
+async def _apply_openrouter_defaults(db) -> None:
+    """When OpenRouter is the seeded gateway, insert convenience catalog rows
+    for the OpenRouter-routed auxiliary and embedding models.
+
+    Rationale: OpenRouter is a single-key gateway for many provider stacks.
+    When an admin only seeds an OpenRouter key, the auxiliary and embedding
+    slots would otherwise be empty and dependent features (memory
+    extraction, recall search) would fail at first use. Inserting these
+    rows ensures the catalog has at least one entry per dependent role.
+
+    The default-model resolver's "first-enabled-alphabetical" fallback then
+    handles which one gets used. Admin edits/disables survive subsequent
+    boots via ``ON CONFLICT DO NOTHING``.
+    """
+    openrouter_key = await db.get_system_api_key("openrouter")
+    if not openrouter_key:
+        return
+
+    convenience_rows = [
+        {
+            "provider_kind": "system",
+            "provider_ref": "openrouter",
+            "model_id": "openrouter/google/gemini-2.5-flash",
+            "display_label": "Gemini 2.5 Flash (OpenRouter)",
+            "role": "auxiliary",
+            "family": "gemini",
+            "seeded_from": "helm:openrouter-defaults",
+        },
+        {
+            "provider_kind": "system",
+            "provider_ref": "openrouter",
+            "model_id": "openrouter/openai/text-embedding-3-large",
+            "display_label": "text-embedding-3-large (OpenRouter)",
+            "role": "embedding",
+            "family": "default",
+            "seeded_from": "helm:openrouter-defaults",
+        },
+    ]
+
+    inserted = 0
+    for row in convenience_rows:
+        result = await db.create_model(**row, on_conflict_do_nothing=True)
+        if result is not None:
+            inserted += 1
+            logger.info(
+                f"  Inserted openrouter convenience row: {row['model_id']} ({row['role']})"
+            )
+    if not inserted:
+        logger.info("  OpenRouter convenience catalog rows already present — no-op")
 
 
 # =============================================================================

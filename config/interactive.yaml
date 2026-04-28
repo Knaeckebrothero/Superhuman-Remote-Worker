@@ -5,8 +5,8 @@ agent_id: interactive
 display_name: Interactive Assistant
 
 llm:
-  model: openai/gpt-oss-120b
-  temperature: 1.0
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
+  temperature: 0.3
   reasoning_level: null
 
 # Simpler tool set for interactive testing

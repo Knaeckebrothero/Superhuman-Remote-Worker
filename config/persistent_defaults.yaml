@@ -12,7 +12,7 @@ agent_id: persistent
 display_name: Persistent Agent
 
 llm:
-  model: openai/gpt-oss-120b
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
   provider: null
   temperature: 0.0
   reasoning_level: high
@@ -156,7 +156,7 @@ memory:
 
 auxiliary:
   enabled: true
-  model: openai/gpt-oss-120b
+  model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
   base_url: null
   temperature: 0.0
   max_iterations: 15

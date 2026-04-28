@@ -1,0 +1,16 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-flex;
+
+  &[data-orientation='horizontal'] {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: v.$space-md;
+  }
+
+  &[data-orientation='vertical'] {
+    flex-direction: column;
+    gap: v.$space-sm;
+  }
+}

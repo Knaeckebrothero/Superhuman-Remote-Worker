@@ -15,6 +15,7 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -112,9 +113,17 @@ from services.builder_tools import (  # noqa: E402
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
-from services.builder_config import (  # noqa: E402
-    resolve_builder_settings,
-    detect_model_family as _detect_model_family,
+from services.builder_config import resolve_builder_settings  # noqa: E402
+from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
+from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
+
+# Registry helpers live in src/ and stay there — the orchestrator imports
+# them here so callers don't each do lazy imports.
+from src.core.model_registry import (  # noqa: E402
+    UnknownModelError,
+    family_of as _model_family,
+    resolve_builtin,
+    resolve_model as _resolve_model,
 )
 from langchain_core.messages import (  # noqa: E402
     AIMessage,
@@ -397,15 +406,14 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
 
     Runs every 60 seconds:
     - Ensures MIN_AGENTS warm pods exist (instant dispatch)
-    - Cleans up Succeeded/Failed pods from completed tasks
+    - Reaps completed / stale / unstartable agent pods (single dispatcher)
     """
     logger.info("Agent pool reconciler started")
     while not shutdown_event.is_set():
         try:
             if agent_provisioner.is_available:
                 await agent_provisioner.ensure_warm_pool()
-                await agent_provisioner.cleanup_completed_pods()
-                await agent_provisioner.reap_stale_pods()
+                await agent_provisioner.reap_pods()
                 await agent_provisioner.scale_down_idle()
                 # Drain idle agents running stale images so new pods
                 # with the current image can be provisioned.
@@ -811,20 +819,58 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: using worktree path {worktree_path} for job {job_id}"
                 )
 
-        # Resolve user/project API keys (user > project > env var fallback)
+        # Resolve user/project API keys (user > project > env var fallback).
+        user_id_str = str(job["user_id"]) if job.get("user_id") else None
         resolved_keys = await postgres_db.resolve_api_keys_for_job(
-            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            user_id=user_id_str,
             project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
+
+        # Resolve the main LLM through the registry. Endpoint-backed
+        # models (custom = per-user, system = helm-seeded / Admin →
+        # Providers) carry their own inline base_url + api_key on the
+        # llm_endpoints row; built-ins look up their api_key via
+        # resolved_keys.
+        config_override = config_override or {}
+        llm_over = config_override.setdefault("llm", {})
+        model_id = llm_over.get("model")
+        meta = None
+        if model_id:
+            try:
+                meta = await _resolve_model(model_id, user_id=user_id_str)
+            except UnknownModelError:
+                meta = None
+
+        if (
+            meta is not None
+            and meta.origin in ("custom", "system", "catalog")
+            and meta.endpoint_id
+        ):
+            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+            if endpoint_row:
+                if endpoint_row.get("base_url"):
+                    llm_over.setdefault("base_url", endpoint_row["base_url"])
+                if endpoint_row.get("api_key"):
+                    llm_over.setdefault("api_key", endpoint_row["api_key"])
+                logger.info(
+                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
+                    f"{endpoint_row.get('label') or meta.endpoint_id}"
+                )
+        elif resolved_keys:
+            # Built-in (or unknown): inject the right named-provider key.
+            if meta is not None and meta.api_key_ref:
+                provider_for_key: str | None = meta.api_key_ref
+            else:
+                provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
+            if (
+                provider_for_key
+                and provider_for_key in resolved_keys
+                and "api_key" not in llm_over
+            ):
+                llm_over["api_key"] = resolved_keys[provider_for_key]
+
+        # Non-LLM tool keys (tavily, vision) always travel as env_keys.
         if resolved_keys:
-            config_override = config_override or {}
-            # Detect main LLM provider and inject key
-            llm_provider = _detect_llm_provider_for_dispatch(job, config_override)
-            if llm_provider and llm_provider in resolved_keys:
-                config_override.setdefault("llm", {})["api_key"] = resolved_keys[
-                    llm_provider
-                ]
-            # Inject non-LLM tool keys as env_keys
             _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
             env_keys = {
                 _ENV_KEY_MAP[p]: resolved_keys[p]
@@ -838,39 +884,86 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
 
         # Inject user preferences as lowest-priority config overrides
-        # (only fill gaps not set by per-job or project-level overrides)
+        # (only fill gaps not set by per-job or project-level overrides).
+        # System-settings defaults fill any gap the user didn't set — they're
+        # the admin-controlled cluster-wide fallback, still shadowed by per-job
+        # / project / user overrides so individual users can pick their own
+        # model if they prefer.
         if job.get("user_id"):
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
+            if not aux_model:
+                aux_model = await postgres_db.resolve_default_for_role("auxiliary")
             if aux_model:
                 config_override = config_override or {}
                 aux_override = config_override.setdefault("auxiliary", {})
                 if "model" not in aux_override:
                     aux_override["model"] = aux_model
-                    aux_provider = _detect_provider_from_model(aux_model)
-                    if resolved_keys and aux_provider in resolved_keys:
-                        aux_override["api_key"] = resolved_keys[aux_provider]
+                    await _inject_model_credentials(
+                        section=aux_override,
+                        model_id=aux_model,
+                        user_id=user_id_str,
+                        resolved_keys=resolved_keys,
+                    )
                     logger.info(
-                        f"Dispatch: injected auxiliary model override: "
-                        f"{aux_model} (provider={aux_provider})"
+                        f"Dispatch: injected auxiliary model override: {aux_model}"
                     )
 
+            # Worker chat model — top-level llm.model. Phase-specific pins
+            # (default_strategic_model / default_tactical_model) are handled
+            # separately below as PhaseLLMOverride fields on llm.{strategic,
+            # tactical} so they can be skipped softly when their provider
+            # is unreachable (stale pin to a removed provider).
             default_model = user_settings.get("default_model")
             if default_model:
                 config_override = config_override or {}
                 llm_override = config_override.setdefault("llm", {})
                 if "model" not in llm_override:
                     llm_override["model"] = default_model
-                    model_provider = _detect_provider_from_model(default_model)
-                    if (
-                        resolved_keys
-                        and model_provider in resolved_keys
-                        and "api_key" not in llm_override
-                    ):
-                        llm_override["api_key"] = resolved_keys[model_provider]
+                    await _inject_model_credentials(
+                        section=llm_override,
+                        model_id=default_model,
+                        user_id=user_id_str,
+                        resolved_keys=resolved_keys,
+                    )
                     logger.info(
                         f"Dispatch: injected user default_model: {default_model}"
                     )
+
+            # Phase-specific model pins. These override only the named phase;
+            # the canonical model on llm.model still drives every other
+            # phase. Soft-skip when the provider has no resolvable
+            # credentials so a stale strategic/tactical pin to a removed
+            # provider doesn't break the whole job — the phase falls back
+            # to the canonical model instead.
+            for _phase, _setting_key in (
+                ("strategic", "default_strategic_model"),
+                ("tactical", "default_tactical_model"),
+            ):
+                _phase_model = user_settings.get(_setting_key)
+                if not _phase_model:
+                    continue
+                config_override = config_override or {}
+                llm_block = config_override.setdefault("llm", {})
+                if _phase in llm_block and llm_block[_phase].get("model"):
+                    continue
+                phase_section: dict = {}
+                await _inject_model_credentials(
+                    section=phase_section,
+                    model_id=_phase_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                if "api_key" not in phase_section and "base_url" not in phase_section:
+                    logger.warning(
+                        f"Dispatch: skipping {_phase} phase pin {_phase_model} — "
+                        f"no credentials resolvable; configure the provider key "
+                        f"in system_api_keys or clear the {_setting_key} preference."
+                    )
+                    continue
+                phase_section["model"] = _phase_model
+                llm_block[_phase] = phase_section
+                logger.info(f"Dispatch: injected {_phase} phase pin: {_phase_model}")
 
             default_autonomy = user_settings.get("default_autonomy")
             if default_autonomy:
@@ -891,34 +984,45 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                     )
 
-            # Vision model override (injected as env var)
-            vision_model = user_settings.get("default_vision_model")
-            if vision_model:
+            # Helper-capability env-var injection (vision / whisper / tts).
+            # Each routes through _inject_env_key_credentials which handles
+            # both built-in models (api_key from resolved_keys[provider]) and
+            # endpoint-registry-backed models (base_url + api_key inlined
+            # from the endpoint row). User preference wins; otherwise the
+            # admin-controlled system_settings default fills the gap.
+            for _kind, _prefix, _user_key in (
+                ("vision", "VISION", "default_vision_model"),
+                ("whisper", "WHISPER", "default_whisper_model"),
+                ("tts", "TTS", "default_tts_model"),
+            ):
+                _model = user_settings.get(_user_key)
+                if not _model:
+                    _model = await postgres_db.resolve_default_for_role(_kind)
+                if not _model:
+                    continue
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
-                if "VISION_MODEL" not in env_keys_block:
-                    env_keys_block["VISION_MODEL"] = vision_model
-                    vision_provider = _detect_provider_from_model(vision_model)
-                    if resolved_keys and vision_provider in resolved_keys:
-                        env_keys_block["VISION_API_KEY"] = resolved_keys[
-                            vision_provider
-                        ]
-                    logger.info(f"Dispatch: injected user vision model: {vision_model}")
+                if f"{_prefix}_MODEL" in env_keys_block:
+                    continue
+                await _inject_env_key_credentials(
+                    env_keys=env_keys_block,
+                    prefix=_prefix,
+                    model_id=_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(f"Dispatch: injected {_kind} model: {_model}")
 
-            # Whisper model override (injected as env var)
-            whisper_model = user_settings.get("default_whisper_model")
-            if whisper_model:
-                config_override = config_override or {}
-                env_keys_block = config_override.setdefault("env_keys", {})
-                if "WHISPER_MODEL" not in env_keys_block:
-                    env_keys_block["WHISPER_MODEL"] = whisper_model
-                    logger.info(
-                        f"Dispatch: injected user whisper model: {whisper_model}"
-                    )
-
-            # Embedding provider and model (per-account)
+            # Embedding provider and model (per-account). The model and
+            # provider fall back to system_settings independently — some
+            # deployments set a default model without pinning the provider,
+            # leaving it up to the agent's existing env-var resolution.
             embedding_provider = user_settings.get("embedding_provider")
             embedding_model = user_settings.get("default_embedding_model")
+            if not embedding_model:
+                embedding_model = await postgres_db.resolve_default_for_role(
+                    "embedding"
+                )
             if embedding_provider or embedding_model:
                 config_override = config_override or {}
                 env_keys_block = config_override.setdefault("env_keys", {})
@@ -934,8 +1038,31 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 ):
                     env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
                 logger.info(
-                    f"Dispatch: injected user embedding: "
+                    f"Dispatch: injected embedding: "
                     f"provider={embedding_provider}, model={embedding_model}"
+                )
+
+        # System-default fallback for the worker chat model. Runs after the
+        # user-preference block (or whenever there's no user) so jobs that
+        # arrived without an llm.model still pick up the admin-curated
+        # default from the catalog instead of falling through to the agent's
+        # YAML default — which has no base_url/api_key for self-hosted models
+        # and silently routes to api.openai.com with "not-needed".
+        llm_override_check = (config_override or {}).get("llm") or {}
+        if "model" not in llm_override_check:
+            system_chat_model = await postgres_db.resolve_default_for_role("chat")
+            if system_chat_model:
+                config_override = config_override or {}
+                llm_override = config_override.setdefault("llm", {})
+                llm_override["model"] = system_chat_model
+                await _inject_model_credentials(
+                    section=llm_override,
+                    model_id=system_chat_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(
+                    f"Dispatch: injected system default chat model: {system_chat_model}"
                 )
 
         # Build job start request
@@ -1371,6 +1498,44 @@ def _get_container_context(job: dict) -> dict:
     return ctx.get("workspace_container", {})
 
 
+async def _check_vm_permission(
+    user: dict | None,
+    *,
+    job_needs_vm: bool,
+) -> None:
+    """Enforce admin VM-workspace controls.
+
+    Raises HTTPException(403) when either:
+      - The global kill-switch `system_settings['vm_workspaces']` is set
+        to `{"enabled": false}` (blocks everyone, including admins).
+      - The user is a non-admin without `can_use_vm=True`.
+
+    No-op when ``job_needs_vm`` is False. Absent/malformed setting row is
+    treated as enabled (fail-open for fresh installs).
+    """
+    if not job_needs_vm:
+        return
+    row: dict | None = None
+    try:
+        row = await postgres_db.get_system_setting("vm_workspaces")
+    except Exception:
+        # DB read failure is non-fatal for the gate — defer to per-user check.
+        logger.exception("Failed to read vm_workspaces kill-switch; fail-open")
+    value = (row or {}).get("value") or {}
+    if isinstance(value, dict) and value.get("enabled") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="VM workspaces are globally disabled by the administrator",
+        )
+    if user and user.get("is_admin"):
+        return
+    if not user or not user.get("can_use_vm"):
+        raise HTTPException(
+            status_code=403,
+            detail="User is not permitted to use VM workspaces",
+        )
+
+
 async def _archive_and_cleanup_workspace(
     entity_id: str,
     entity_type: str = "jobs",
@@ -1448,42 +1613,136 @@ async def _archive_and_cleanup_workspace(
     return actions
 
 
-def _detect_provider_from_model(model: str) -> str:
-    """Detect LLM provider from a model name string.
+def _provider_of_model(model: str) -> str | None:
+    """Registry-backed provider lookup. Returns None for unknown IDs.
 
-    Must stay in sync with src/core/loader.py:_detect_provider().
+    Used at dispatch for the legacy code paths that need only the factory
+    name (aux-model key injection, vision-model key lookup). Custom
+    endpoints resolve to ``openai`` here (the factory name); their inline
+    api_key travels via a separate code path that consults the endpoint row.
     """
-    model_lower = model.lower()
-    if model_lower.startswith("openrouter/"):
-        return "openrouter"
-    if model_lower.startswith("groq/"):
-        return "groq"
-    if model_lower.startswith("codex/"):
-        return "codex"
-    if model_lower.startswith("claude"):
-        return "anthropic"
-    if model_lower.startswith("gemini"):
-        return "google"
-    return "openai"
+    meta = resolve_builtin(model)
+    return meta.provider if meta is not None else None
 
 
-def _detect_llm_provider_for_dispatch(
+async def _inject_model_credentials(
+    *,
+    section: dict,
+    model_id: str,
+    user_id: str | None,
+    resolved_keys: dict[str, str] | None,
+) -> None:
+    """Populate a config-override section with the right base_url + api_key
+    for a given model ID.
+
+    For endpoint-backed models (``origin`` in {``custom``, ``system``}):
+    looks up the endpoint row and inlines its ``base_url`` + ``api_key``.
+    Custom endpoints are user-scoped; system endpoints are helm-seeded or
+    managed via Admin → Providers. Both live in llm_endpoints.
+
+    For built-ins: injects the named provider's key from ``resolved_keys``
+    (the user > project > env resolution chain). No base_url injection —
+    the agent's own registry handles env-driven base URLs for local models.
+
+    Never overwrites fields that are already set; this helper is always
+    additive so caller-supplied overrides win.
+    """
+    if "base_url" in section and "api_key" in section:
+        return
+
+    meta = None
+    try:
+        meta = await _resolve_model(model_id, user_id=user_id)
+    except UnknownModelError:
+        meta = None
+
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                section.setdefault("base_url", endpoint_row["base_url"])
+            if endpoint_row.get("api_key"):
+                section.setdefault("api_key", endpoint_row["api_key"])
+        return
+
+    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    if (
+        provider
+        and resolved_keys
+        and provider in resolved_keys
+        and "api_key" not in section
+    ):
+        section["api_key"] = resolved_keys[provider]
+
+
+async def _inject_env_key_credentials(
+    *,
+    env_keys: dict,
+    prefix: str,
+    model_id: str,
+    user_id: str | None,
+    resolved_keys: dict[str, str] | None,
+) -> None:
+    """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
+
+    Sibling of ``_inject_model_credentials`` for capabilities that travel as
+    flat env vars (vision, whisper, tts, ...) rather than structured config
+    sections. Endpoint-backed models (origin in {'custom','system','catalog'}
+    with an endpoint_id) contribute the inline base_url+api_key from the
+    endpoint row; built-ins and system-anchored catalog rows resolve the
+    api_key via ``resolved_keys[provider]``. All writes are setdefault so
+    caller / earlier overrides win.
+    """
+    env_keys.setdefault(f"{prefix}_MODEL", model_id)
+
+    meta = None
+    try:
+        meta = await _resolve_model(model_id, user_id=user_id)
+    except UnknownModelError:
+        meta = None
+
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                env_keys.setdefault(f"{prefix}_BASE_URL", endpoint_row["base_url"])
+            if endpoint_row.get("api_key"):
+                env_keys.setdefault(f"{prefix}_API_KEY", endpoint_row["api_key"])
+        return
+
+    provider = meta.api_key_ref if meta is not None else _provider_of_model(model_id)
+    if provider and resolved_keys and provider in resolved_keys:
+        env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
+
+
+def _dispatch_llm_provider_fallback(
     job: dict, config_override: dict | None
 ) -> str | None:
-    """Detect the LLM provider for a job from its config override or config name.
+    """Legacy dispatcher provider detection, used only when the model ID
+    can't be resolved through the registry.
 
-    Uses _detect_provider_from_model() for consistent prefix matching.
+    Mirrors the pre-registry behavior: explicit ``llm.provider`` wins,
+    then the known built-in model catalog, then a config-name heuristic
+    (only ``anthropic`` today), finally ``openai``.
     """
-    # Check config_override for explicit provider or model
     if config_override:
         llm = config_override.get("llm", {})
         if llm.get("provider"):
             return llm["provider"].lower()
         model = llm.get("model")
         if model:
-            return _detect_provider_from_model(model)
+            prov = _provider_of_model(model)
+            if prov is not None:
+                return prov
 
-    # Fall back to config_name heuristic (most configs use openai-compatible default)
     config_name = job.get("config_name", "default")
     if config_name and "anthropic" in config_name.lower():
         return "anthropic"
@@ -1515,6 +1774,32 @@ async def _try_dispatch_pending_jobs() -> None:
             for job in pending_jobs:
                 job_id = str(job["id"])
                 if _job_needs_vm(job):
+                    # Admin-gated permission check (kill-switch + per-user grant).
+                    # Re-verified here in case a grant was revoked or the
+                    # kill-switch flipped after the job was submitted. Already
+                    # running VMs aren't torn down by this check — the gate
+                    # only blocks jobs that haven't been dispatched yet.
+                    creator = None
+                    creator_id = job.get("user_id")
+                    if creator_id:
+                        try:
+                            creator = await postgres_db.get_user(str(creator_id))
+                        except Exception:
+                            creator = None
+                    try:
+                        await _check_vm_permission(creator, job_needs_vm=True)
+                    except HTTPException as permission_error:
+                        logger.error(
+                            "Dispatcher: job %s denied VM workspace: %s",
+                            job_id,
+                            permission_error.detail,
+                        )
+                        await postgres_db.update_job_status(
+                            job_id,
+                            status="failed",
+                            error_message=str(permission_error.detail),
+                        )
+                        continue
                     vm_ctx = _get_vm_context(job)
                     if not vm_ctx.get("status"):
                         # VM needed but not provisioned yet
@@ -2004,6 +2289,14 @@ class JobCreate(BaseModel):
     project_id: str | None = Field(
         None, description="Project UUID to associate this job with"
     )
+    thread_id: str | None = Field(
+        None,
+        description=(
+            "Persistent-session thread UUID. When provided and user_id "
+            "is unset, the owning user (and project) are inherited from "
+            "the thread row so dispatch can apply user preferences."
+        ),
+    )
     parent_job_id: str | None = Field(
         None, description="Parent job UUID for verification/follow-up jobs"
     )
@@ -2100,6 +2393,13 @@ class UserUpdate(BaseModel):
     email: str | None = None
 
 
+class AdminUserUpdate(BaseModel):
+    """Admin-only update body for toggling privileged user flags."""
+
+    is_admin: bool | None = None
+    can_use_vm: bool | None = None
+
+
 class McpTokenCreate(BaseModel):
     """Request body for creating an MCP API token."""
 
@@ -2150,6 +2450,154 @@ class ApiKeySet(BaseModel):
     )
 
 
+class LlmEndpointCreate(BaseModel):
+    """Request body for registering a new LLM endpoint.
+
+    The endpoint must be OpenAI-compatible (vLLM, Ollama, private gateway).
+    ``base_url`` should be the full OpenAI path prefix, e.g.
+    ``https://my-vllm.example/v1``. ``api_key`` is optional — some local
+    servers don't require auth.
+    """
+
+    label: str = Field(..., min_length=1, max_length=200)
+    base_url: str = Field(..., min_length=1)
+    api_key: str | None = None
+    allow_insecure: bool = Field(
+        False,
+        description=(
+            "Opt-in for http:// URLs. Default rejects non-HTTPS to guard "
+            "against copy-paste accidents."
+        ),
+    )
+
+
+class LlmEndpointUpdate(BaseModel):
+    """Partial update — only non-None fields are applied.
+
+    ``clear_api_key=True`` nulls the stored key (for endpoints that
+    transition from authenticated to anonymous). Ignored when ``api_key``
+    is also set.
+    """
+
+    label: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    clear_api_key: bool = False
+    allow_insecure: bool = False
+
+
+LLM_MODEL_CAPABILITIES = ("chat", "vision", "embedding", "auxiliary", "whisper", "tts")
+
+
+class AdminDefaultModelSet(BaseModel):
+    """Request body for setting a default LLM model on the system.
+
+    ``model`` is the model ID to resolve via the registry (e.g.
+    ``RedHatAI/gemma-4-31B-it-FP8-Dynamic``, ``gpt-4o``). Pass an empty
+    string to clear the default.
+    """
+
+    model: str = Field(..., description="Model ID; empty string clears the default")
+
+
+# Locked enum for the admin-curated catalog. Adding a new role requires
+# touching every consumer (resolver, dispatcher, default-model fallback),
+# so the schema-level CHECK constraint and this Literal are kept in sync.
+VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
+VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
+
+
+class CatalogModelCreate(BaseModel):
+    """Request body for inserting a catalog row (Admin → Models)."""
+
+    provider_kind: Literal["system", "endpoint"]
+    provider_ref: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "system_api_keys.provider slug for provider_kind='system' "
+            "(e.g. 'anthropic'); llm_endpoints.id (UUID as text) for "
+            "provider_kind='endpoint'."
+        ),
+    )
+    model_id: str = Field(..., min_length=1, max_length=500)
+    display_label: str = Field(..., min_length=1, max_length=200)
+    role: Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"]
+    family: str = Field(
+        ...,
+        min_length=1,
+        description="settings_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
+    )
+    context_window: int | None = Field(
+        None,
+        description=(
+            "Optional override; falls back to settings_matrix family default. "
+            "Pass null (the default) to use the matrix; pass an explicit int "
+            "to override (zero is allowed and round-trips as zero)."
+        ),
+    )
+    reasoning_level: str | None = None
+    params_json: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Optional inference param overrides (e.g. {'temperature': 0.0}). "
+            "Null means 'use family defaults'; explicit zero/false values "
+            "round-trip as themselves (LiteLLM #14661 hazard guarded by "
+            "create_model accessor)."
+        ),
+    )
+    enabled: bool = True
+    notes: str | None = None
+
+
+class CatalogModelUpdate(BaseModel):
+    """Partial update — only fields explicitly set in the request body are
+    applied. Pass ``null`` to clear an optional column to NULL.
+    """
+
+    provider_kind: Literal["system", "endpoint"] | None = None
+    provider_ref: str | None = Field(None, min_length=1)
+    model_id: str | None = Field(None, min_length=1, max_length=500)
+    display_label: str | None = Field(None, min_length=1, max_length=200)
+    role: (
+        Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"] | None
+    ) = None
+    family: str | None = Field(None, min_length=1)
+    context_window: int | None = None
+    reasoning_level: str | None = None
+    params_json: dict[str, Any] | None = None
+    enabled: bool | None = None
+    notes: str | None = None
+
+
+# Slots admins can pin cluster-wide via Admin → Providers → Defaults. The
+# system_settings key pattern is ``llm.default_<kind>_model``. ``tts`` is
+# present even without a current consumer in src/services/ — landing the
+# plumbing keeps the registry path uniform across audio capabilities.
+VALID_DEFAULT_MODEL_KINDS = {
+    "builder",
+    "browser",
+    "citation",
+    "embedding",
+    "vision",
+    "auxiliary",
+    "whisper",
+    "tts",
+}
+
+# System-scoped API keys only cover shared providers. Codex auth is
+# user-bound through the proxy and isn't appropriate for a system key.
+VALID_SYSTEM_API_KEY_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "tavily",
+    "vision",
+}
+
+
 class UserSettingsUpdate(BaseModel):
     """Request body for updating user preferences. Null values remove the key."""
 
@@ -2159,6 +2607,7 @@ class UserSettingsUpdate(BaseModel):
     default_auxiliary_model: str | None = None
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
+    default_tts_model: str | None = None
     default_builder_model: str | None = None
     default_session_model: str | None = None
     default_strategic_model: str | None = None
@@ -2325,6 +2774,14 @@ async def lifespan(app: FastAPI):
     _vector_schema = _Path(__file__).parent / "database" / "vector_schema.sql"
     await vector_db.ensure_schema(schema_file=_vector_schema)
     logger.info("Database schemas verified")
+
+    # Wire the model registry's catalog lookup to the DB. The registry lives
+    # in src/core/ and must not import orchestrator/, so the hook is injected
+    # here (and unset on shutdown below). custom/system lookups were retired
+    # along with user_llm_endpoint_models — the catalog covers both scopes.
+    from src.core.model_registry import register_catalog_lookup
+
+    register_catalog_lookup(postgres_db.resolve_catalog_model)
 
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
@@ -2505,6 +2962,12 @@ async def lifespan(app: FastAPI):
     await nats_bridge.disconnect()
     await gitea_client.close()
 
+    # Unregister the registry's DB hook before disconnecting the pool so
+    # any stragglers don't hit a closed connection.
+    from src.core.model_registry import register_catalog_lookup
+
+    register_catalog_lookup(None)
+
     # Disconnect from databases
     await mongodb.disconnect()
     await vector_db.disconnect()
@@ -2533,6 +2996,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(UnknownModelError)
+async def _unknown_model_handler(
+    request: Request, exc: UnknownModelError
+) -> JSONResponse:
+    """Translate registry misses into a helpful 400 instead of a 500.
+
+    Fires whenever a request references a model ID that isn't in the
+    built-in catalog or any of the user's custom endpoints. Points users
+    at the settings UI where they can register the model.
+    """
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": str(exc),
+            "model_id": exc.model_id,
+            "hint": (
+                "Register this model under a custom endpoint at "
+                "/api/settings/llm-endpoints, or pick an ID from /api/models."
+            ),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Return a CORS-friendly 500 for any otherwise-unhandled exception.
+
+    Without this, Starlette's outermost ServerErrorMiddleware produces a
+    bare 500 that skips the CORSMiddleware on the way out. Browsers then
+    drop the response (no Access-Control-Allow-Origin header) and Angular
+    surfaces it as a status-0 "network failure" instead of a real 5xx,
+    which makes server-side bugs look like client-side connectivity
+    issues. Handling here keeps the response inside the middleware stack
+    so CORS headers are attached.
+
+    HTTPException / RequestValidationError / UnknownModelError are
+    dispatched to their own handlers first, so they don't reach here.
+    """
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+    )
+
 
 # Request logging middleware — replaces uvicorn's shallow access log with
 # app-level logging that includes response timing and error tracebacks.
@@ -2760,16 +3271,38 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         if job.kickoff_message:
             context["kickoff_message"] = job.kickoff_message
 
-        # Resolve project_id: use provided, or fall back to user's default
-        project_id = job.project_id
-        if not project_id and job.user_id:
+        # Inherit user_id (and optionally project_id) from the originating
+        # persistent-session thread when the caller didn't supply them.
+        # This is how session-spawned worker jobs (create_worker_job tool)
+        # get attributed to the right user; without it the dispatch path
+        # skips per-user model preferences and the worker boots with the
+        # YAML defaults pointing at api.openai.com with "not-needed".
+        effective_user_id = job.user_id
+        thread_project_id: str | None = None
+        if job.thread_id and not effective_user_id:
             try:
-                user = await postgres_db.get_user(job.user_id)
+                thread_row = await postgres_db.get_thread(job.thread_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load thread {job.thread_id} for user inheritance: {e}"
+                )
+                thread_row = None
+            if thread_row:
+                if thread_row.get("user_id"):
+                    effective_user_id = str(thread_row["user_id"])
+                if thread_row.get("project_id"):
+                    thread_project_id = str(thread_row["project_id"])
+
+        # Resolve project_id: use provided, fall back to thread's, then user's default
+        project_id = job.project_id or thread_project_id
+        if not project_id and effective_user_id:
+            try:
+                user = await postgres_db.get_user(effective_user_id)
                 if user and user.get("default_project_id"):
                     project_id = str(user["default_project_id"])
             except Exception as e:
                 logger.warning(
-                    f"Failed to resolve default project for user {job.user_id}: {e}"
+                    f"Failed to resolve default project for user {effective_user_id}: {e}"
                 )
 
         # Resolve project defaults (config name, config override)
@@ -2797,6 +3330,22 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 else:
                     config_override = project_default_override
 
+        # VM permission gate: refuse at submit time so the user gets a clear
+        # 403 instead of a silent failure later in the dispatcher. The
+        # dispatcher re-checks too (in case the grant is revoked after
+        # submission) — defense in depth.
+        needs_vm = _job_needs_vm(
+            {"context": context, "config_override": config_override}
+        )
+        if needs_vm:
+            creator = None
+            if effective_user_id:
+                try:
+                    creator = await postgres_db.get_user(effective_user_id)
+                except Exception:
+                    creator = None
+            await _check_vm_permission(creator, job_needs_vm=True)
+
         result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
@@ -2804,7 +3353,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             config_name=config_name,
             config_override=config_override,
             context=context if context else None,
-            user_id=job.user_id,
+            user_id=effective_user_id,
             project_id=project_id,
             parent_job_id=job.parent_job_id,
             priority=job.priority,
@@ -3907,6 +4456,7 @@ async def _route_inbound_reply(
                 job_status=job.get("status", ""),
                 job_description=job.get("description", ""),
                 phase_number=job.get("phase_number"),
+                db=postgres_db,
             )
             if decision.get("action") == "interrupt":
                 await _internal_resume_job(job_id, feedback=message)
@@ -8579,8 +9129,11 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
         "project_ids": metadata.get("project_ids"),
         # Resolved datasources for the thread
         "datasources": await _resolve_thread_datasources(metadata),
-        # Nextcloud session folder (for workspace sync)
+        # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": thread.get("nc_session_folder"),
+        # Structured cloud-sync config (backend + webdav URL + auth).
+        # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
+        "cloud_sync": _build_agent_cloud_sync(thread),
     }
 
 
@@ -8626,14 +9179,41 @@ async def agent_update_thread_config(
     column is updated as well for query consistency.
     """
     try:
-        ok = await postgres_db.merge_thread_config_override(
-            thread_id, request.config_override
-        )
+        # Enrich endpoint-backed model swaps with base_url + api_key so the
+        # persisted override is complete. Without this, a hot-swap to a
+        # custom-endpoint model leaves the next session attach pointing at
+        # the default OpenAI base.
+        config_override = dict(request.config_override or {})
+        llm_section = config_override.get("llm")
+        if llm_section and llm_section.get("model"):
+            thread_row = await postgres_db.get_thread(thread_id)
+            if thread_row:
+                user_id = (
+                    str(thread_row["user_id"]) if thread_row.get("user_id") else None
+                )
+                project_id = (
+                    str(thread_row["project_id"])
+                    if thread_row.get("project_id")
+                    else None
+                )
+                resolved_keys = await postgres_db.resolve_api_keys_for_job(
+                    user_id=user_id, project_id=project_id
+                )
+                llm_section = dict(llm_section)
+                await _inject_model_credentials(
+                    section=llm_section,
+                    model_id=llm_section["model"],
+                    user_id=user_id,
+                    resolved_keys=resolved_keys,
+                )
+                config_override["llm"] = llm_section
+
+        ok = await postgres_db.merge_thread_config_override(thread_id, config_override)
         if not ok:
             raise HTTPException(status_code=404, detail="Thread not found")
 
         # Keep top-level permission_mode column in sync
-        pm = (request.config_override.get("interactive") or {}).get("permission_mode")
+        pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -8859,7 +9439,8 @@ class ThreadCreateRequest(BaseModel):
     permission_mode: str = Field("supervised", description="Initial permission mode")
     title: str = Field("Untitled Session", description="Session title")
     model: str | None = Field(
-        None, description="LLM model override (e.g. openai/gpt-oss-120b)"
+        None,
+        description="LLM model override (e.g. RedHatAI/gemma-4-31B-it-FP8-Dynamic)",
     )
     temperature: float | None = Field(None, description="Temperature override")
 
@@ -8911,6 +9492,25 @@ async def create_thread(
         effective_project_ids = request_body.project_ids or (
             [request_body.project_id] if request_body.project_id else []
         )
+
+        # Resolve endpoint-backed model credentials so the agent gets the
+        # right base_url + api_key. Without this, custom/system endpoints
+        # (per-user vLLM, helm-seeded providers) silently route to the
+        # default OpenAI base and 404. Mirrors the dispatch path used for
+        # jobs at the dispatch_job site above.
+        llm_section = config_override.get("llm") or {}
+        if llm_section.get("model"):
+            resolved_keys = await postgres_db.resolve_api_keys_for_job(
+                user_id=str(user["id"]),
+                project_id=effective_project_ids[0] if effective_project_ids else None,
+            )
+            await _inject_model_credentials(
+                section=llm_section,
+                model_id=llm_section["model"],
+                user_id=str(user["id"]),
+                resolved_keys=resolved_keys,
+            )
+            config_override["llm"] = llm_section
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
@@ -8992,7 +9592,91 @@ async def create_thread(
                 thread_id,
             )
 
-        # Provision agent pod / assign from pool
+        # Run Gitea + Nextcloud setup in parallel, and AWAIT both before
+        # assigning an agent. The workspace container is already provisioning
+        # in the background above. If we fired the agent-attach first, the
+        # agent could see `status=ready` on the workspace before _setup_gitea
+        # had written `git_remote_url`, so WorkspaceManager would init a
+        # local-only repo with no origin — commits would accumulate but
+        # never push. Blocking on gather here is cheap (Gitea create_repo is
+        # ~50ms) and makes the workspace→remote wiring race-free.
+        async def _setup_gitea() -> None:
+            if not gitea_client.is_initialized and gitea_client.is_configured:
+                await gitea_client.ensure_initialized()
+            if not gitea_client.is_initialized:
+                return
+            repo_name = f"thread-{thread_id[:8]}"
+            git_remote_url = await gitea_client.create_repo(repo_name)
+            if git_remote_url:
+                await postgres_db.merge_thread_workspace_context(
+                    thread_id,
+                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
+                )
+                if user.get("email"):
+                    try:
+                        # Pass username + full_name + sub so grant_user_repo_access
+                        # can pre-provision the Gitea user if they haven't
+                        # visited Gitea directly yet. sub is used as login_name
+                        # so Gitea's OIDC matches this account on first direct
+                        # login instead of creating a duplicate.
+                        email_local = user["email"].split("@")[0]
+                        await gitea_client.grant_user_repo_access(
+                            user["email"],
+                            repo_name,
+                            username=user.get("preferred_username") or email_local,
+                            full_name=user.get("display_name"),
+                            sub=user.get("keycloak_sub"),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to grant Gitea access for thread %s: %s",
+                            thread_id,
+                            e,
+                        )
+
+        async def _setup_main_cloud() -> None:
+            backend = main_cloud_router.active
+            if not backend.is_initialized and backend.is_configured:
+                await backend.ensure_initialized()
+            if not backend.is_initialized:
+                return
+            try:
+                session_handle = await backend.ensure_session_folder(
+                    session_id=thread_id[:8]
+                )
+                share_handle = None
+                # ensure_user (not just resolve_user_identity) so we synchronously
+                # provision the cloud user record here — otherwise we race the
+                # fire-and-forget JIT task from auth.get_current_user and the
+                # share gets skipped on a user's very first session.
+                resolved_user_id = await backend.ensure_user(
+                    sub=user.get("keycloak_sub") or "",
+                    issuer=getattr(backend, "_keycloak_issuer", "") or "",
+                    email=user.get("email"),
+                    display_name=user.get("display_name"),
+                    preferred_username=user.get("preferred_username"),
+                )
+                if resolved_user_id:
+                    share_handle = await backend.share_session_folder(
+                        session_handle, resolved_user_id
+                    )
+                await postgres_db.update_thread_main_cloud(
+                    thread_id,
+                    backend_id=backend.backend_id,
+                    session_handle=session_handle.to_db(),
+                    share_handle=share_handle.to_db() if share_handle else None,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to provision main-cloud session folder for thread %s: %s",
+                    thread_id,
+                    e,
+                )
+
+        await asyncio.gather(_setup_gitea(), _setup_main_cloud())
+
+        # Provision agent pod / assign from pool (fires AFTER Gitea setup so
+        # the agent's workspace-readiness poll sees git_remote_url).
         # Priority: unified provisioner (K8s) → Docker Compose pool → manual
         use_k8s_agent = agent_provisioner.is_available and (
             agent_provisioner.in_cluster or not docker_provisioner.is_available
@@ -9100,67 +9784,6 @@ async def create_thread(
                 thread_id,
             )
 
-        # Run Gitea + Nextcloud setup in parallel (non-blocking services,
-        # independent of each other). This runs AFTER the workspace/agent
-        # tasks are already fired so image pull happens concurrently.
-        async def _setup_gitea() -> None:
-            if not gitea_client.is_initialized and gitea_client.is_configured:
-                await gitea_client.ensure_initialized()
-            if not gitea_client.is_initialized:
-                return
-            repo_name = f"thread-{thread_id[:8]}"
-            git_remote_url = await gitea_client.create_repo(repo_name)
-            if git_remote_url:
-                await postgres_db.merge_thread_workspace_context(
-                    thread_id,
-                    {"git_remote_url": git_remote_url, "repo_name": repo_name},
-                )
-                if user.get("email"):
-                    try:
-                        await gitea_client.grant_user_repo_access(
-                            user["email"], repo_name
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to grant Gitea access for thread %s: %s",
-                            thread_id,
-                            e,
-                        )
-
-        async def _setup_main_cloud() -> None:
-            backend = main_cloud_router.active
-            if not backend.is_initialized and backend.is_configured:
-                await backend.ensure_initialized()
-            if not backend.is_initialized:
-                return
-            try:
-                session_handle = await backend.ensure_session_folder(
-                    session_id=thread_id[:8]
-                )
-                share_handle = None
-                resolved_user_id = await backend.resolve_user_identity(
-                    user.get("email"),
-                    user.get("display_name", "").lower(),
-                )
-                if resolved_user_id:
-                    share_handle = await backend.share_session_folder(
-                        session_handle, resolved_user_id
-                    )
-                await postgres_db.update_thread_main_cloud(
-                    thread_id,
-                    backend_id=backend.backend_id,
-                    session_handle=session_handle.to_db(),
-                    share_handle=share_handle.to_db() if share_handle else None,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to provision main-cloud session folder for thread %s: %s",
-                    thread_id,
-                    e,
-                )
-
-        await asyncio.gather(_setup_gitea(), _setup_main_cloud())
-
         return {"thread_id": thread_id, "status": "created"}
     except HTTPException:
         raise
@@ -9207,6 +9830,64 @@ def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
         return backend.get_session_folder_browser_url(handle)
     except Exception:
         return None
+
+
+def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Build the ``cloud_sync`` payload the agent uses to push/pull session files.
+
+    Shape mirrors ``src/services/cloud_sync/__init__.py::build_workspace_sync``.
+    Returns ``None`` when there's no session folder or the backend is offline.
+    Never logs the auth payload.
+    """
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if not handle_str:
+        return None
+    backend_id = thread.get("main_cloud_backend") or None
+    backend = main_cloud_router.for_backend(backend_id)
+    if not backend.is_initialized:
+        return None
+    try:
+        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+        webdav_url = backend.get_session_folder_webdav_url(handle)
+    except Exception:
+        return None
+    if not webdav_url:
+        return None
+
+    if backend.backend_id == "nextcloud":
+        creds = backend.webdav_credentials or {}
+        if not creds.get("username") or not creds.get("password"):
+            return None
+        return {
+            "backend": "nextcloud",
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "basic",
+                "username": creds["username"],
+                "password": creds["password"],
+            },
+        }
+    if backend.backend_id == "opencloud":
+        settings = getattr(backend, "_settings", None)
+        if settings is None:
+            return None
+        try:
+            client_secret = settings.keycloak_client_secret.get_secret_value()
+        except Exception:
+            return None
+        return {
+            "backend": "opencloud",
+            "webdav_url": webdav_url,
+            "auth": {
+                "type": "keycloak_client_credentials",
+                "issuer": str(settings.keycloak_issuer).rstrip("/"),
+                "client_id": settings.keycloak_client_id,
+                "client_secret": client_secret,
+            },
+        }
+    return None
 
 
 @app.get("/api/persistent/threads/{thread_id}")
@@ -9262,30 +9943,33 @@ async def end_thread(
         await persistent_provisioner.delete_agent_pod(thread_id)
         await persistent_provisioner.delete_agent_pvc(thread_id)
 
-    # Clean up Gitea repo
-    repo_name = ws_ctx.get("repo_name")
-    if repo_name and gitea_client.is_initialized:
-        await gitea_client.delete_repo(repo_name)
-
-    # Clean up main-cloud session folder (and its share, if any)
-    session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
-        "nc_session_folder"
-    )
-    if session_handle_str:
-        backend = main_cloud_router.for_thread(thread)
-        if backend.is_initialized:
-            try:
-                session_handle = SessionFolderHandle.from_db(
-                    session_handle_str, backend=backend.backend_id
-                )
-                await backend.delete_session_folder(session_handle)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to delete main-cloud session folder for "
-                    f"thread {thread_id}: {e}"
-                )
-
+    # Destructive cleanup of user-visible resources runs ONLY on permanent
+    # delete. A soft "end" keeps the Gitea repo and the cloud session folder
+    # around so resume restores the thread with its data intact — the workspace
+    # container is already snapshotted to S3 above, so the file tree survives
+    # there either way.
     if permanent:
+        repo_name = ws_ctx.get("repo_name")
+        if repo_name and gitea_client.is_initialized:
+            await gitea_client.delete_repo(repo_name)
+
+        session_handle_str = thread.get("main_cloud_session_handle") or thread.get(
+            "nc_session_folder"
+        )
+        if session_handle_str:
+            backend = main_cloud_router.for_thread(thread)
+            if backend.is_initialized:
+                try:
+                    session_handle = SessionFolderHandle.from_db(
+                        session_handle_str, backend=backend.backend_id
+                    )
+                    await backend.delete_session_folder(session_handle)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to delete main-cloud session folder for "
+                        f"thread {thread_id}: {e}"
+                    )
+
         await postgres_db.delete_thread(thread_id)
         return {"status": "deleted"}
 
@@ -9318,19 +10002,38 @@ async def resume_thread(
     await postgres_db.resume_thread(thread_id)
 
     # Provision cloud session folder if missing (e.g. session was created
-    # before the cloud backend was initialized).
-    if not thread.get("main_cloud_session_handle") and not thread.get(
+    # before the cloud backend was initialized), or retry the share alone
+    # if the folder exists but no share_handle was recorded — this unstucks
+    # threads where folder creation raced the user's first browser login.
+    existing_session_handle = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
-    ):
+    )
+    needs_share_only = bool(existing_session_handle) and not thread.get(
+        "main_cloud_share_handle"
+    )
+    needs_full_provision = not existing_session_handle and not thread.get(
+        "nc_session_folder"
+    )
 
-        async def _late_cloud_setup(tid: str, usr: dict) -> None:
+    if needs_full_provision or needs_share_only:
+
+        async def _late_cloud_setup(
+            tid: str, usr: dict, existing_handle: str | None
+        ) -> None:
             backend = main_cloud_router.active
             if not backend.is_initialized and backend.is_configured:
                 await backend.ensure_initialized()
             if not backend.is_initialized:
                 return
             try:
-                session_handle = await backend.ensure_session_folder(session_id=tid[:8])
+                if existing_handle:
+                    session_handle = SessionFolderHandle.from_db(
+                        existing_handle, backend=backend.backend_id
+                    )
+                else:
+                    session_handle = await backend.ensure_session_folder(
+                        session_id=tid[:8]
+                    )
                 share_handle = None
                 resolved_user_id = await backend.resolve_user_identity(
                     usr.get("email"),
@@ -9340,19 +10043,30 @@ async def resume_thread(
                     share_handle = await backend.share_session_folder(
                         session_handle, resolved_user_id
                     )
+                if not share_handle and existing_handle:
+                    # Share still failed (user hasn't signed into cloud yet).
+                    # Don't persist — leaving share_handle NULL lets the next
+                    # resume retry once autoprovision has materialised them.
+                    return
                 await postgres_db.update_thread_main_cloud(
                     tid,
                     backend_id=backend.backend_id,
                     session_handle=session_handle.to_db(),
                     share_handle=share_handle.to_db() if share_handle else None,
                 )
-                logger.info("Thread %s: late-provisioned cloud session folder", tid)
+                logger.info(
+                    "Thread %s: %s cloud session folder",
+                    tid,
+                    "shared previously-unshared"
+                    if existing_handle
+                    else "late-provisioned",
+                )
             except Exception as e:
                 logger.warning(
                     "Thread %s: late cloud folder provisioning failed: %s", tid, e
                 )
 
-        asyncio.create_task(_late_cloud_setup(thread_id, user))
+        asyncio.create_task(_late_cloud_setup(thread_id, user, existing_session_handle))
 
     # Re-provision agent pod and restore workspace if suspended
     if agent_provisioner.is_available:
@@ -10163,7 +10877,7 @@ def _apply_settings_matrix_to_config(
 
     llm_data = merged.get("llm", {})
     model = llm_data.get("model", "gpt-4o")
-    family = _detect_model_family(model)
+    family = _model_family(model)
 
     default_settings = matrix.get("default", {})
     family_settings = matrix.get(family, {}) if family != "default" else {}
@@ -10471,6 +11185,7 @@ def _user_dict(user: dict) -> dict:
         else None,
         "is_admin": user.get("is_admin", False),
         "is_approved": user.get("is_approved", False),
+        "can_use_vm": bool(user.get("can_use_vm", False)),
         "created_at": user["created_at"],
     }
 
@@ -10710,6 +11425,736 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
     return {"status": "deleted"}
 
 
+# =============================================================================
+# User-defined LLM Endpoints
+# OpenAI-compatible endpoints a user has registered (vLLM, Ollama, private
+# gateways). Models served by these endpoints appear in every model picker
+# and are routed to via dispatcher injection of base_url + api_key.
+# =============================================================================
+
+
+def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
+    """Basic URL sanity check. Raises HTTPException(400) on malformed input.
+
+    Rejects non-http(s) schemes (file://, javascript:), empty hosts, and
+    http:// URLs unless the caller explicitly opts in via allow_insecure.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(base_url.strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed base_url")
+
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"base_url scheme must be http or https, got {parsed.scheme!r}",
+        )
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="base_url must include a host")
+    if parsed.scheme == "http" and not allow_insecure:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "base_url uses http:// — set allow_insecure=true to override "
+                "(not recommended outside local development)."
+            ),
+        )
+    return parsed.geturl()
+
+
+def _serialize_endpoint(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape an endpoint row for the API response (key_prefix only, no full key).
+
+    The ``models`` key is kept on the response shape for Cockpit
+    compatibility but is always empty after the catalog flip — model
+    offerings live in the admin-curated ``models`` table now.
+    """
+    return {
+        "id": str(row["id"]),
+        "label": row["label"],
+        "base_url": row["base_url"],
+        "key_prefix": row.get("key_prefix"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        "models": [],
+    }
+
+
+@app.get("/api/settings/llm-endpoints")
+async def list_llm_endpoints(request: Request) -> list[dict[str, Any]]:
+    """List the user's registered LLM endpoints with their model rows."""
+    user = await require_approved_user(request, postgres_db)
+    rows = await postgres_db.list_user_llm_endpoints(str(user["id"]))
+    return [_serialize_endpoint(r) for r in rows]
+
+
+@app.post("/api/settings/llm-endpoints")
+async def create_llm_endpoint(
+    request: Request, body: LlmEndpointCreate
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+    try:
+        row = await postgres_db.create_user_llm_endpoint(
+            user_id=str(user["id"]),
+            label=body.label,
+            base_url=base_url,
+            api_key=body.api_key,
+            key_prefix=key_prefix,
+        )
+    except Exception as e:
+        # UniqueViolation on (user_id, label) — mirror the 409 style elsewhere
+        if "uq_llm_endpoint_label" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=f"An endpoint labeled {body.label!r} already exists.",
+            )
+        raise
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.patch("/api/settings/llm-endpoints/{endpoint_id}")
+async def update_llm_endpoint(
+    request: Request, endpoint_id: str, body: LlmEndpointUpdate
+) -> dict[str, Any]:
+    user = await require_approved_user(request, postgres_db)
+    base_url = None
+    if body.base_url is not None:
+        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+
+    row = await postgres_db.update_user_llm_endpoint(
+        endpoint_id=endpoint_id,
+        user_id=str(user["id"]),
+        label=body.label,
+        base_url=base_url,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        clear_api_key=body.clear_api_key and body.api_key is None,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.delete("/api/settings/llm-endpoints/{endpoint_id}")
+async def delete_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, str]:
+    user = await require_approved_user(request, postgres_db)
+    deleted = await postgres_db.delete_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/test")
+async def test_llm_endpoint(request: Request, endpoint_id: str) -> dict[str, Any]:
+    """Probe an endpoint by calling ``GET {base_url}/models`` server-side.
+
+    Runs from the orchestrator pod (not the browser) so the api_key is
+    never exposed to the client. Returns the HTTP status plus the first
+    error message if the probe fails.
+    """
+    user = await require_approved_user(request, postgres_db)
+    endpoint = await postgres_db.get_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+    }
+
+
+@app.post("/api/settings/llm-endpoints/{endpoint_id}/discover")
+async def discover_llm_endpoint_models(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Return the model list served by ``GET {base_url}/models``.
+
+    Read-only — the user-side surface only exposes discovery for browsing;
+    actual catalog authoring is admin-only via Admin → Models.
+    """
+    user = await require_approved_user(request, postgres_db)
+    endpoint = await postgres_db.get_user_llm_endpoint(
+        endpoint_id=endpoint_id, user_id=str(user["id"])
+    )
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+        "models": result.models,
+    }
+
+
+# =============================================================================
+# Admin Provider Endpoints
+# System-scoped provider keys, LLM endpoints, and default-model settings.
+# Gated by the srw-admin role via _require_admin.
+# =============================================================================
+
+
+def _serialize_system_api_key(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a system_api_keys row for API responses (prefix only)."""
+    return {
+        "id": str(row["id"]),
+        "provider": row["provider"],
+        "key_prefix": row.get("key_prefix"),
+        "label": row.get("label"),
+        "seeded_from": row.get("seeded_from"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+@app.get("/api/admin/providers/keys")
+async def admin_list_provider_keys(request: Request) -> list[dict[str, Any]]:
+    """List system-scoped provider API keys (prefix only, no full keys)."""
+    await _require_admin(request)
+    rows = await postgres_db.list_system_api_keys()
+    return [_serialize_system_api_key(r) for r in rows]
+
+
+@app.put("/api/admin/providers/keys/{provider}")
+async def admin_set_provider_key(
+    request: Request, provider: str, body: ApiKeySet
+) -> dict[str, Any]:
+    """Set or rotate the system-level API key for a provider."""
+    await _require_admin(request)
+    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider '{provider}'. Valid: "
+                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+            ),
+        )
+    row = await postgres_db.upsert_system_api_key(
+        provider=provider,
+        api_key=body.api_key,
+        key_prefix=body.api_key[:8],
+        label=body.label,
+    )
+    return _serialize_system_api_key(row)
+
+
+@app.delete("/api/admin/providers/keys/{provider}")
+async def admin_delete_provider_key(request: Request, provider: str) -> dict[str, str]:
+    """Remove the system-level key for a provider."""
+    await _require_admin(request)
+    deleted = await postgres_db.delete_system_api_key(provider)
+    if not deleted:
+        raise HTTPException(
+            status_code=404, detail=f"No system key for provider '{provider}'"
+        )
+    return {"status": "deleted"}
+
+
+@app.get("/api/admin/providers/endpoints")
+async def admin_list_provider_endpoints(request: Request) -> list[dict[str, Any]]:
+    """List system-scoped LLM endpoints with their models."""
+    await _require_admin(request)
+    rows = await postgres_db.list_system_llm_endpoints()
+    return [_serialize_endpoint(r) for r in rows]
+
+
+@app.post("/api/admin/providers/endpoints")
+async def admin_create_provider_endpoint(
+    request: Request, body: LlmEndpointCreate
+) -> dict[str, Any]:
+    """Create a new system-scoped LLM endpoint (visible to every user)."""
+    await _require_admin(request)
+    base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+    try:
+        row = await postgres_db.create_system_llm_endpoint(
+            label=body.label,
+            base_url=base_url,
+            api_key=body.api_key,
+            key_prefix=key_prefix,
+        )
+    except Exception as e:
+        if "uq_llm_endpoint_label_system" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A system endpoint labeled {body.label!r} already exists.",
+            )
+        raise
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.patch("/api/admin/providers/endpoints/{endpoint_id}")
+async def admin_update_provider_endpoint(
+    request: Request, endpoint_id: str, body: LlmEndpointUpdate
+) -> dict[str, Any]:
+    await _require_admin(request)
+    base_url = None
+    if body.base_url is not None:
+        base_url = _validate_llm_endpoint_url(body.base_url, body.allow_insecure)
+    key_prefix = body.api_key[:8] if body.api_key else None
+
+    row = await postgres_db.update_system_llm_endpoint(
+        endpoint_id=endpoint_id,
+        label=body.label,
+        base_url=base_url,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        clear_api_key=body.clear_api_key and body.api_key is None,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+    row["models"] = []
+    return _serialize_endpoint(row)
+
+
+@app.delete("/api/admin/providers/endpoints/{endpoint_id}")
+async def admin_delete_provider_endpoint(
+    request: Request, endpoint_id: str
+) -> dict[str, str]:
+    await _require_admin(request)
+    deleted = await postgres_db.delete_system_llm_endpoint(endpoint_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+    return {"status": "deleted"}
+
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/test")
+async def admin_test_provider_endpoint(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Probe a system endpoint by calling ``GET {base_url}/models`` server-side."""
+    await _require_admin(request)
+    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+    }
+
+
+@app.post("/api/admin/providers/endpoints/{endpoint_id}/discover")
+async def admin_discover_provider_endpoint_models(
+    request: Request, endpoint_id: str
+) -> dict[str, Any]:
+    """Return the model list served by ``GET {base_url}/models`` (admin).
+
+    Discovery is read-only — admins author catalog rows via Admin → Models
+    using the endpoint as the transport reference. The legacy
+    ``already_registered`` field is gone (the endpoint itself no longer
+    owns model rows after the catalog flip).
+    """
+    await _require_admin(request)
+    endpoint = await postgres_db.get_system_llm_endpoint(endpoint_id)
+    if endpoint is None:
+        raise HTTPException(status_code=404, detail="System endpoint not found")
+
+    result = await probe_endpoint_models(
+        base_url=endpoint["base_url"],
+        api_key=endpoint.get("api_key"),
+    )
+
+    return {
+        "ok": result.ok,
+        "status": result.status,
+        "error": result.error,
+        "probe_url": result.probe_url,
+        "models": result.models,
+    }
+
+
+@app.get("/api/admin/providers/codex/availability")
+async def admin_codex_availability(request: Request) -> dict[str, Any]:
+    """Report whether the codex proxy is configured AND has an active account.
+
+    Used by Admin → Models to decide whether to surface "Codex proxy" as a
+    model source. ``available`` is true only when the proxy is reachable
+    AND at least one auth file is active (not disabled, not unavailable).
+    Catalog wiring is deliberate: when ``available`` is true and
+    ``endpoint_id`` is set, the frontend can route Discover/Add flows to
+    the existing /api/admin/providers/endpoints/{id} routes — no codex-
+    specific UI plumbing required.
+    """
+    await _require_admin(request)
+    # Same fallback as _codex_proxy_request and ensure_codex_proxy_endpoint —
+    # a local stack with CODEX_PROXY_URL unset is a fully supported config.
+    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
+
+    # Locate the seeded codex-proxy endpoint (init.py creates it when
+    # CODEX_PROXY_URL is set; admins may also have deleted it).
+    endpoint_id: str | None = None
+    for row in await postgres_db.list_system_llm_endpoints():
+        if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
+            endpoint_id = str(row["id"])
+            break
+
+    try:
+        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
+        auth_files = auth_resp.json()
+    except HTTPException:
+        return {
+            "available": False,
+            "account_count": 0,
+            "models": [],
+            "proxy_url": proxy_url,
+            "endpoint_id": endpoint_id,
+        }
+
+    accounts = (
+        auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
+    )
+    active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
+
+    models: list[str] = []
+    if active:
+        try:
+            models_resp = await _codex_proxy_request("GET", "/v1/models")
+            data = models_resp.json()
+            models = [
+                m["id"] if isinstance(m, dict) else m for m in data.get("data", [])
+            ]
+        except HTTPException:
+            pass
+
+    # Self-heal: a live subscription with no transport row means a CLI login
+    # (or a previously-deleted row) bypassed the cockpit's wire-up path.
+    # Create the row now so the next Admin → Models render lists the proxy.
+    if endpoint_id is None and len(active) > 0:
+        await ensure_codex_proxy_endpoint(postgres_db, proxy_url=proxy_url)
+        for row in await postgres_db.list_system_llm_endpoints():
+            if row.get("label") == CODEX_PROXY_ENDPOINT_LABEL:
+                endpoint_id = str(row["id"])
+                break
+
+    return {
+        "available": len(active) > 0,
+        "account_count": len(active),
+        "models": models,
+        "proxy_url": proxy_url,
+        "endpoint_id": endpoint_id,
+    }
+
+
+@app.get("/api/admin/providers/defaults")
+async def admin_list_provider_defaults(request: Request) -> dict[str, str | None]:
+    """Return the currently-configured default model IDs for each workload kind."""
+    await _require_admin(request)
+    return {
+        kind: await postgres_db.get_default_llm_model(kind)
+        for kind in sorted(VALID_DEFAULT_MODEL_KINDS)
+    }
+
+
+@app.put("/api/admin/providers/defaults/{kind}")
+async def admin_set_provider_default(
+    request: Request, kind: str, body: AdminDefaultModelSet
+) -> dict[str, str | None]:
+    """Set or clear (empty string) the default model for a workload kind."""
+    admin = await _require_admin(request)
+    if kind not in VALID_DEFAULT_MODEL_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid kind '{kind}'. Valid: {sorted(VALID_DEFAULT_MODEL_KINDS)}"
+            ),
+        )
+    await postgres_db.set_default_llm_model(
+        kind, body.model or None, updated_by=str(admin.get("id"))
+    )
+    return {"kind": kind, "model": await postgres_db.get_default_llm_model(kind)}
+
+
+# =============================================================================
+# Admin Models Catalog API (Admin → Models)
+# Reads/writes the ``models`` table — the curated list of LLMs the application
+# offers. Each row is provider-anchored (system_api_keys or system-scoped
+# llm_endpoints). User authoring is not exposed.
+# =============================================================================
+
+
+def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
+    """Shape a ``models`` row for API responses."""
+    return {
+        "id": str(row["id"]),
+        "provider_kind": row["provider_kind"],
+        "provider_ref": row["provider_ref"],
+        "model_id": row["model_id"],
+        "display_label": row["display_label"],
+        "role": row["role"],
+        "family": row["family"],
+        "context_window": row.get("context_window"),
+        "reasoning_level": row.get("reasoning_level"),
+        "params_json": row.get("params_json"),
+        "enabled": row.get("enabled", True),
+        "seeded_from": row.get("seeded_from"),
+        "notes": row.get("notes"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) -> None:
+    """Reject catalog inserts/updates pointing at a transport that doesn't
+    exist. Keeps the catalog from referencing stale rows after the admin
+    deletes a provider key or system endpoint.
+    """
+    if provider_kind == "system":
+        if provider_ref not in VALID_SYSTEM_API_KEY_PROVIDERS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid system provider '{provider_ref}'. Valid: "
+                    f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+                ),
+            )
+        existing = await postgres_db.get_system_api_key(provider_ref)
+        if not existing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No system_api_keys row for provider '{provider_ref}'. "
+                    "Configure via Admin → Providers first."
+                ),
+            )
+    elif provider_kind == "endpoint":
+        endpoint = await postgres_db.get_system_llm_endpoint(provider_ref)
+        if endpoint is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No system endpoint with id '{provider_ref}'.",
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider_kind '{provider_kind}'. Valid: "
+                f"{list(VALID_CATALOG_PROVIDER_KINDS)}"
+            ),
+        )
+
+
+@app.get("/api/admin/providers/models")
+async def admin_list_catalog_models(
+    request: Request,
+    role: str | None = None,
+    provider_kind: str | None = None,
+    provider_ref: str | None = None,
+    enabled_only: bool = False,
+) -> list[dict[str, Any]]:
+    """List catalog rows with optional filters. Returns full row shape."""
+    await _require_admin(request)
+    if role is not None and role not in VALID_CATALOG_ROLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{role}'. Valid: {list(VALID_CATALOG_ROLES)}",
+        )
+    rows = await postgres_db.list_models(
+        role=role,
+        provider_kind=provider_kind,
+        provider_ref=provider_ref,
+        enabled_only=enabled_only,
+    )
+    return [_serialize_catalog_model(r) for r in rows]
+
+
+@app.post("/api/admin/providers/models")
+async def admin_create_catalog_model(
+    request: Request, body: CatalogModelCreate
+) -> dict[str, Any]:
+    """Insert a new catalog row.
+
+    Validates that ``provider_ref`` resolves to an existing transport before
+    insert. Returns the created row; raises 409 on
+    ``(provider_kind, provider_ref, model_id, role)`` collision.
+    """
+    await _require_admin(request)
+    await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
+    try:
+        row = await postgres_db.create_model(
+            provider_kind=body.provider_kind,
+            provider_ref=body.provider_ref,
+            model_id=body.model_id,
+            display_label=body.display_label,
+            role=body.role,
+            family=body.family,
+            context_window=body.context_window,
+            reasoning_level=body.reasoning_level,
+            params_json=body.params_json,
+            enabled=body.enabled,
+            notes=body.notes,
+        )
+    except Exception as e:
+        if "uq_model_provider" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
+                    f"{body.model_id}, role={body.role}) already exists."
+                ),
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=500, detail="Catalog insert returned no row.")
+    return _serialize_catalog_model(row)
+
+
+@app.patch("/api/admin/providers/models/{catalog_id}")
+async def admin_update_catalog_model(
+    request: Request, catalog_id: str, body: CatalogModelUpdate
+) -> dict[str, Any]:
+    """Patch a catalog row. Only fields present in the body are written.
+
+    Pass ``null`` to clear an optional column. The validator re-checks the
+    transport when ``provider_kind`` or ``provider_ref`` changes.
+    """
+    await _require_admin(request)
+    fields = body.model_dump(exclude_unset=True)
+    if "provider_kind" in fields or "provider_ref" in fields:
+        existing = await postgres_db.get_model(catalog_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Catalog row not found")
+        new_kind = fields.get("provider_kind", existing["provider_kind"])
+        new_ref = fields.get("provider_ref", existing["provider_ref"])
+        await _validate_catalog_provider_ref(new_kind, new_ref)
+    try:
+        row = await postgres_db.update_model(catalog_id, **fields)
+    except Exception as e:
+        if "uq_model_provider" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail="Update would collide with an existing catalog row.",
+            )
+        raise
+    if row is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+    return _serialize_catalog_model(row)
+
+
+@app.delete("/api/admin/providers/models/{catalog_id}")
+async def admin_delete_catalog_model(
+    request: Request, catalog_id: str
+) -> dict[str, Any]:
+    """Hard-delete a catalog row. Returns a warning when the row's model_id
+    is currently referenced by a ``default_llm_models`` pointer (the pin
+    becomes a dangling reference; the resolver's first-enabled-alphabetical
+    fallback handles it gracefully).
+    """
+    await _require_admin(request)
+    existing = await postgres_db.get_model(catalog_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+
+    referencing_kinds: list[str] = []
+    for kind in sorted(VALID_DEFAULT_MODEL_KINDS):
+        pin = await postgres_db.get_default_llm_model(kind)
+        if pin == existing["model_id"]:
+            referencing_kinds.append(kind)
+
+    deleted = await postgres_db.delete_model(catalog_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+    return {
+        "status": "deleted",
+        "id": catalog_id,
+        "warning": (
+            f"Default-model pin(s) referenced this row: {referencing_kinds}. "
+            "Resolver falls back to first-enabled-alphabetical until repinned."
+            if referencing_kinds
+            else None
+        ),
+    }
+
+
+@app.post("/api/admin/providers/models/{catalog_id}/test")
+async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[str, Any]:
+    """Probe a catalog row's transport.
+
+    For ``provider_kind='endpoint'``, calls ``GET {endpoint.base_url}/models``
+    via the existing endpoint-probe helper. For ``provider_kind='system'``,
+    confirms the ``system_api_keys`` row exists and returns ``ok=True``
+    without round-tripping the provider — vendor-specific health probes
+    are out of scope for v1.
+    """
+    await _require_admin(request)
+    row = await postgres_db.get_model(catalog_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Catalog row not found")
+
+    if row["provider_kind"] == "endpoint":
+        endpoint = await postgres_db.get_system_llm_endpoint(row["provider_ref"])
+        if endpoint is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Catalog row references missing endpoint "
+                    f"'{row['provider_ref']}' — repoint or delete."
+                ),
+            )
+        result = await probe_endpoint_models(
+            base_url=endpoint["base_url"], api_key=endpoint.get("api_key")
+        )
+        return {
+            "ok": result.ok,
+            "status": result.status,
+            "error": result.error,
+            "probe_url": result.probe_url,
+        }
+
+    key = await postgres_db.get_system_api_key(row["provider_ref"])
+    if not key:
+        return {
+            "ok": False,
+            "status": None,
+            "error": (f"No system_api_keys row for provider '{row['provider_ref']}'."),
+            "probe_url": None,
+        }
+    return {"ok": True, "status": 200, "error": None, "probe_url": None}
+
+
+@app.get("/api/admin/families")
+async def admin_list_families(request: Request) -> dict[str, list[str]]:
+    """Return the family keys defined in ``settings_matrix.yaml``.
+
+    Powers the family dropdown on the *Admin → Models* form so adding a
+    family in the YAML doesn't require a frontend rebuild.
+    """
+    await _require_admin(request)
+    matrix = _load_settings_matrix(_get_config_dir())
+    families = sorted(k for k in matrix.keys() if isinstance(k, str))
+    return {"families": families}
+
+
 def _resolve_preference_defaults() -> dict[str, Any]:
     """Compute resolved default values for all user preference fields.
 
@@ -10748,6 +12193,7 @@ def _resolve_preference_defaults() -> dict[str, Any]:
         # (src/services/vision_helper.py, audio_helper.py, embedding_service.py)
         "default_vision_model": os.environ.get("VISION_MODEL", "gpt-4o"),
         "default_whisper_model": os.environ.get("WHISPER_MODEL", "whisper-1"),
+        "default_tts_model": os.environ.get("TTS_MODEL", "tts-1"),
         "default_embedding_model": os.environ.get(
             "EMBEDDING_MODEL", "qwen3-embedding-8b"
         ),
@@ -10876,33 +12322,36 @@ _PROVIDER_ENV_KEYS: dict[str, list[str]] = {
     "codex": ["CODEX_API_KEY"],
 }
 
-# Cache the loaded catalog (reloaded on expert reload or manually)
-_model_catalog_cache: dict[str, Any] | None = None
+# Cache for the legacy YAML bits still surfaced through /api/models (presets,
+# whisper, tts — none of which are catalog roles in v1). Reset by
+# /api/models/reload.
+_model_catalog_yaml_cache: dict[str, Any] | None = None
 
 
-def _load_model_catalog() -> dict[str, Any]:
-    """Load config/models.yaml (cached after first load)."""
-    global _model_catalog_cache
-    if _model_catalog_cache is not None:
-        return _model_catalog_cache
+def _load_models_yaml_legacy() -> dict[str, Any]:
+    """Load the residual ``config/models.yaml`` bits the catalog table doesn't
+    cover yet (presets, whisper, tts). Cached after first load.
+
+    Catalog roles (chat / auxiliary / embedding / vision) come from the DB
+    via ``postgres_db.list_models``; this YAML reader only services the
+    transitional surface for the four bits Phase D leaves behind.
+    """
+    global _model_catalog_yaml_cache
+    if _model_catalog_yaml_cache is not None:
+        return _model_catalog_yaml_cache
 
     catalog_path = _get_config_dir() / "models.yaml"
     if not catalog_path.exists():
         logger.warning(
-            "models.yaml not found at %s — returning empty catalog", catalog_path
+            "models.yaml not found at %s — returning empty legacy bits",
+            catalog_path,
         )
-        return {"groups": [], "presets": [], "builder_models": []}
+        return {"presets": [], "whisper_models": [], "tts_models": []}
 
     with open(catalog_path) as f:
         data = yaml.safe_load(f) or {}
 
-    _model_catalog_cache = data
-    logger.info(
-        "Loaded model catalog: %d groups, %d presets, %d builder models",
-        len(data.get("groups", [])),
-        len(data.get("presets", [])),
-        len(data.get("builder_models", [])),
-    )
+    _model_catalog_yaml_cache = data
     return data
 
 
@@ -10913,6 +12362,12 @@ def _get_system_providers() -> set[str]:
         if any(os.getenv(var) for var in env_vars):
             providers.add(provider)
     return providers
+
+
+# Well-known label for the seeded codex-proxy llm_endpoints row. Kept in sync
+# with orchestrator.init._seed_codex_proxy_endpoint — duplicated here to avoid
+# importing init at runtime.
+CODEX_PROXY_ENDPOINT_LABEL = "codex-proxy"
 
 
 async def _get_codex_subscription_models() -> set[str]:
@@ -10938,165 +12393,143 @@ async def list_available_models(
     request: Request,
     project_id: str | None = None,
 ) -> dict[str, Any]:
-    """List all models from the catalog with provider availability annotations.
+    """List all models from the admin-curated catalog.
 
-    Returns the full model catalog. Each group, preset, builder model, and
-    helper model includes a ``configured`` boolean indicating whether the
-    provider has an API key available (system env vars, user keys, or
-    project keys). Unconfigured models are still returned so users can
-    discover them and add their own keys.
+    Returns the catalog grouped by provider for every catalog role
+    (chat → ``groups`` + ``builder_models``; auxiliary / vision / embedding /
+    whisper / tts → sibling arrays). The legacy ``config/models.yaml``
+    whisper/tts entries are merged in only when no catalog row covers the
+    same id, so admins can migrate at their own pace. Each row carries
+    ``configured: true`` because the catalog only contains rows whose
+    transport (system_api_keys row or system endpoint) is admin-managed.
 
     Query params:
-        project_id: optional project ID to include project-level API keys
+        project_id: kept for backward compatibility — no longer affects the
+            response shape now that the catalog is the source of truth.
     """
-    user = await require_approved_user(request, postgres_db)
-    user_id = str(user["id"])
+    await require_approved_user(request, postgres_db)
+    _ = project_id  # accepted but unused post-flip
 
-    # Collect configured providers: local is always available
-    configured_providers: set[str] = {"local"}
+    # Catalog rows joined to transport (only enabled rows surface).
+    catalog_rows = await postgres_db.list_models(enabled_only=True)
+    system_endpoints = await postgres_db.list_system_llm_endpoints()
+    endpoint_label_by_id: dict[str, str] = {
+        str(e["id"]): e["label"] for e in system_endpoints
+    }
 
-    # System-level env vars
-    configured_providers |= _get_system_providers()
+    # Build (provider_kind, provider_ref) → group payload.
+    groups_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    builder_models: list[dict[str, Any]] = []
+    auxiliary: list[dict[str, Any]] = []
+    vision: list[dict[str, Any]] = []
+    embedding: list[dict[str, Any]] = []
+    whisper_catalog: list[dict[str, Any]] = []
+    tts_catalog: list[dict[str, Any]] = []
 
-    # User-level API keys
-    user_keys = await postgres_db.list_user_api_keys(user_id)
-    configured_providers |= {k["provider"] for k in user_keys}
+    configured_providers: set[str] = set()
 
-    # Project-level API keys (optional)
-    if project_id:
-        try:
-            project_keys = await postgres_db.list_project_api_keys(project_id)
-            configured_providers |= {k["provider"] for k in project_keys}
-        except Exception:
-            pass  # Project doesn't exist or no access — ignore
-
-    # Load full catalog (no filtering — all models returned)
-    catalog = _load_model_catalog()
-
-    # Build model_id -> provider lookup for preset annotation
-    model_provider: dict[str, str] = {}
-    for group in catalog.get("groups", []):
-        for m in group.get("models", []):
-            model_provider[m["id"]] = group["provider"]
-
-    groups = [
-        {
-            "group": group["name"],
-            "provider": group["provider"],
-            "configured": group["provider"] in configured_providers,
-            "models": [m["id"] for m in group.get("models", [])],
+    for row in catalog_rows:
+        kind = row["provider_kind"]
+        ref = row["provider_ref"]
+        role = row["role"]
+        helper_entry = {
+            "id": row["model_id"],
+            "label": row["display_label"],
+            "configured": True,
         }
-        for group in catalog.get("groups", [])
-    ]
+        if role == "auxiliary":
+            auxiliary.append(helper_entry)
+            continue
+        if role == "vision":
+            vision.append(helper_entry)
+            continue
+        if role == "embedding":
+            embedding.append(helper_entry)
+            continue
+        if role == "whisper":
+            whisper_catalog.append(helper_entry)
+            continue
+        if role == "tts":
+            tts_catalog.append(helper_entry)
+            continue
+        # role == 'chat'
+        key = (kind, ref)
+        group = groups_by_key.get(key)
+        if group is None:
+            if kind == "system":
+                group_name = ref.title() if ref.islower() else ref
+                provider_tag = ref
+                configured_providers.add(ref)
+                group = {
+                    "group": group_name,
+                    "provider": provider_tag,
+                    "configured": True,
+                    "models": [],
+                }
+            else:  # endpoint
+                label = endpoint_label_by_id.get(ref, f"endpoint:{ref[:8]}")
+                group = {
+                    "group": f"System: {label}",
+                    "provider": "system",
+                    "endpoint_id": ref,
+                    "configured": True,
+                    "models": [],
+                }
+            groups_by_key[key] = group
+        group["models"].append(row["model_id"])
+        builder_models.append(
+            {
+                "label": row["display_label"],
+                "id": row["model_id"],
+                "configured": True,
+            }
+        )
 
+    groups = list(groups_by_key.values())
+
+    # Legacy YAML bits — presets + whisper + tts — kept until they earn
+    # first-class catalog support. Configured-flag is checked against the
+    # provider set we built from the catalog.
+    legacy = _load_models_yaml_legacy()
+
+    catalog_model_ids: set[str] = {r["model_id"] for r in catalog_rows}
     presets = [
         {
             "label": p["label"],
             "strategic": p["strategic"],
             "tactical": p["tactical"],
             "configured": (
-                model_provider.get(p["strategic"], "local") in configured_providers
-                and model_provider.get(p["tactical"], "local") in configured_providers
+                p["strategic"] in catalog_model_ids
+                and p["tactical"] in catalog_model_ids
             ),
         }
-        for p in catalog.get("presets", [])
+        for p in legacy.get("presets", [])
     ]
 
-    builder_models = [
-        {
-            "label": m["label"],
-            "id": m["id"],
-            "configured": m.get("provider", "local") in configured_providers,
-        }
-        for m in catalog.get("builder_models", [])
-    ]
-
-    def _annotate_helper(
-        key: str, extra_fields: tuple[str, ...] = ()
-    ) -> list[dict[str, Any]]:
+    def _legacy_helper(key: str) -> list[dict[str, Any]]:
         return [
             {
                 "id": m["id"],
                 "label": m["label"],
-                "configured": m.get("provider", "local") in configured_providers,
-                **{f: m[f] for f in extra_fields if f in m},
+                "configured": m.get("provider", "local")
+                in (configured_providers | {"local"}),
             }
-            for m in catalog.get(key, [])
+            for m in legacy.get(key, [])
         ]
 
-    auxiliary = _annotate_helper("auxiliary_models")
-    vision = _annotate_helper("vision_models")
-    whisper = _annotate_helper("whisper_models")
-    embedding = _annotate_helper("embedding_models", ("dimensions",))
-
-    # Codex subscription override: if the Codex proxy is connected and
-    # offers a model that also exists in the OpenAI API catalog, prefer the
-    # subscription-backed codex/ variant so the user isn't double-billed.
-    codex_sub_models = await _get_codex_subscription_models()
-    if codex_sub_models:
-        configured_providers.add("codex")
-
-        # Collect OpenAI model IDs that the subscription also offers
-        overrides: dict[str, str] = {}  # "gpt-5.4" -> "codex/gpt-5.4"
-        for group in groups:
-            if group["provider"] != "openai":
-                continue
-            kept = []
-            for mid in group["models"]:
-                if mid in codex_sub_models:
-                    overrides[mid] = f"codex/{mid}"
-                else:
-                    kept.append(mid)
-            group["models"] = kept
-
-        if overrides:
-            # Add overridden models to the Codex group
-            codex_group = next((g for g in groups if g["provider"] == "codex"), None)
-            new_codex_models = list(overrides.values())
-            if codex_group:
-                new_set = set(new_codex_models)
-                codex_group["models"] = new_codex_models + [
-                    m for m in codex_group["models"] if m not in new_set
-                ]
-                codex_group["configured"] = True
-            else:
-                groups.append(
-                    {
-                        "group": "Codex",
-                        "provider": "codex",
-                        "configured": True,
-                        "models": new_codex_models,
-                    }
-                )
-
-            # Update model_provider map so preset configured checks work
-            for old_id, new_id in overrides.items():
-                model_provider[new_id] = "codex"
-
-            # Update presets
-            for p in presets:
-                if p["strategic"] in overrides:
-                    p["strategic"] = overrides[p["strategic"]]
-                if p["tactical"] in overrides:
-                    p["tactical"] = overrides[p["tactical"]]
-                p["configured"] = (
-                    model_provider.get(p["strategic"], "local") in configured_providers
-                    and model_provider.get(p["tactical"], "local")
-                    in configured_providers
-                )
-
-            # Update builder models
-            for bm in builder_models:
-                if bm["id"] in overrides:
-                    bm["id"] = overrides[bm["id"]]
-                    bm["configured"] = True
-
-            # Update helper model lists
-            for helper_list in (auxiliary, vision, whisper, embedding):
-                for hm in helper_list:
-                    if hm["id"] in overrides:
-                        hm["id"] = overrides[hm["id"]]
-                        hm["configured"] = True
+    # Catalog rows take precedence; legacy YAML entries fill in if no catalog
+    # row covers the same model id. After admins migrate their whisper/tts
+    # entries into the catalog the YAML fallback drops out cleanly.
+    catalog_whisper_ids = {m["id"] for m in whisper_catalog}
+    catalog_tts_ids = {m["id"] for m in tts_catalog}
+    whisper = whisper_catalog + [
+        m
+        for m in _legacy_helper("whisper_models")
+        if m["id"] not in catalog_whisper_ids
+    ]
+    tts = tts_catalog + [
+        m for m in _legacy_helper("tts_models") if m["id"] not in catalog_tts_ids
+    ]
 
     return {
         "groups": groups,
@@ -11105,18 +12538,27 @@ async def list_available_models(
         "auxiliary_models": auxiliary,
         "vision_models": vision,
         "whisper_models": whisper,
+        "tts_models": tts,
         "embedding_models": embedding,
-        "configured_providers": sorted(configured_providers - {"local"}),
+        "configured_providers": sorted(configured_providers),
     }
 
 
 @app.post("/api/models/reload")
 async def reload_model_catalog(request: Request) -> dict[str, str]:
-    """Reload the model catalog from disk (admin-only)."""
+    """Drop the legacy YAML cache and reload the registry.
+
+    Catalog rows live in the DB and are read fresh on every ``/api/models``
+    call — no cache to invalidate. This endpoint stays in place to flush
+    the residual whisper/tts/presets YAML cache and to bounce the registry
+    in case the YAML fallback wants picked-up edits.
+    """
     await _require_admin(request)
-    global _model_catalog_cache
-    _model_catalog_cache = None
-    _load_model_catalog()
+    global _model_catalog_yaml_cache
+    _model_catalog_yaml_cache = None
+    from src.core.model_registry import reload_registry as _reload_registry
+
+    _reload_registry()
     return {"status": "reloaded"}
 
 
@@ -11199,6 +12641,18 @@ async def codex_status(request: Request) -> dict[str, Any]:
         model_count = len(models_data.get("data", []))
     except HTTPException:
         pass
+
+    # Wire-up after a local login: the proxy's callback runs on localhost:1455
+    # so the orchestrator never sees /api/codex/callback for this flow. The
+    # cockpit hits /api/codex/status as soon as polling reports success, so
+    # ensure the transport row here when we see ≥1 active subscription.
+    if len(active) > 0:
+        try:
+            await ensure_codex_proxy_endpoint(postgres_db)
+        except Exception:
+            logger.warning(
+                "codex_status: ensure_codex_proxy_endpoint failed", exc_info=True
+            )
 
     return {
         "connected": len(active) > 0,
@@ -11293,6 +12747,17 @@ async def codex_callback(
         params={"code": code, "state": state},
         timeout=15.0,
     )
+
+    # OAuth completed — wire the codex-proxy as a system endpoint so the
+    # subscription is immediately selectable in Admin → Models. Idempotent;
+    # best-effort: a wiring failure must not block the callback response.
+    try:
+        await ensure_codex_proxy_endpoint(postgres_db)
+    except Exception:
+        logger.warning(
+            "codex_callback: ensure_codex_proxy_endpoint failed", exc_info=True
+        )
+
     if resp.content:
         return resp.json()
     return {"status": "ok"}
@@ -11684,6 +13149,59 @@ async def delete_main_cloud_settings(request: Request) -> dict[str, Any]:
     }
 
 
+def _vm_workspaces_response(row: dict | None) -> dict[str, Any]:
+    """Shape the vm_workspaces system_settings row for API responses."""
+    value = (row or {}).get("value") or {}
+    enabled = True
+    if isinstance(value, dict) and value.get("enabled") is False:
+        enabled = False
+    updated_at = (row or {}).get("updated_at")
+    return {
+        "enabled": enabled,
+        "updated_at": updated_at.isoformat() if updated_at is not None else None,
+        "updated_by": (row or {}).get("updated_by"),
+    }
+
+
+@app.get("/api/admin/system-settings/vm_workspaces")
+async def get_vm_workspaces_settings(request: Request) -> dict[str, Any]:
+    """Return the global VM-workspaces kill-switch.
+
+    Admin-only. Absent row is reported as enabled (fail-open default).
+    """
+    await _require_admin(request)
+    try:
+        row = await postgres_db.get_system_setting("vm_workspaces")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _vm_workspaces_response(row)
+
+
+@app.put("/api/admin/system-settings/vm_workspaces")
+async def put_vm_workspaces_settings(
+    body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Toggle the global VM-workspaces kill-switch.
+
+    Admin-only. When disabled, every VM workspace request is denied,
+    including those from admin users. Already-running VMs are not torn
+    down — the switch only blocks new dispatches.
+    """
+    admin = await _require_admin(request)
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="`enabled` must be a boolean")
+    try:
+        row = await postgres_db.upsert_system_setting(
+            "vm_workspaces",
+            {"enabled": enabled},
+            updated_by=admin.get("email") or str(admin.get("id", "")),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return _vm_workspaces_response(row)
+
+
 # =============================================================================
 # User Endpoints
 # =============================================================================
@@ -11783,9 +13301,196 @@ async def delete_user(user_id: str, request: Request) -> dict[str, str]:
     return {"status": "deleted"}
 
 
+@app.get("/api/admin/users")
+async def admin_list_users(request: Request) -> list[dict[str, Any]]:
+    """List all users including admin/VM flags (admin-only)."""
+    await _require_admin(request)
+    try:
+        return await postgres_db.list_users()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_patch_user(
+    user_id: str, body: AdminUserUpdate, request: Request
+) -> dict[str, str]:
+    """Toggle privileged user flags (admin-only).
+
+    Accepts partial updates of ``is_admin`` and ``can_use_vm``. Refuses
+    to let an admin clear their own ``is_admin`` flag — lockout prevention.
+    """
+    admin = await _require_admin(request)
+    if body.is_admin is False and str(admin.get("id")) == user_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Admins cannot clear their own is_admin flag",
+        )
+    success = await postgres_db.update_user(
+        user_id=user_id,
+        is_admin=body.is_admin,
+        can_use_vm=body.can_use_vm,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return {"status": "updated"}
+
+
 # =============================================================================
 # Project Endpoints
 # =============================================================================
+
+
+# Per-project locks prevent concurrent heal attempts from creating duplicate
+# Spaces (ensure_project_folder is not idempotent — each call makes a new drive).
+_project_heal_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _sync_project_member_to_groups(
+    project_id_str: str,
+    group_name: str,
+    user: dict[str, Any],
+    backend: Any,
+) -> None:
+    """Add one member to the Keycloak group and the LibreGraph group.
+
+    Both writes are needed: Keycloak carries the `groups` token claim (durable
+    across OpenCloud re-logins), the direct backend add makes the Space visible
+    in the user's currently-active OpenCloud session without waiting for them
+    to re-authenticate.
+    """
+    if keycloak_groups.is_initialized and user.get("keycloak_sub"):
+        await keycloak_groups.add_user_to_project_group(
+            user["keycloak_sub"], project_id_str
+        )
+    if backend.is_initialized:
+        try:
+            resolved = await backend.resolve_user_identity(
+                user.get("email"),
+                (user.get("display_name") or "").lower(),
+            )
+            if resolved:
+                await backend.add_user_to_group(resolved, group_name)
+        except Exception as e:
+            logger.debug(
+                f"Failed to add user {user.get('id')} to backend group "
+                f"{group_name}: {e}"
+            )
+
+
+async def _ensure_project_cloud_resources(
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    """Ensure a project has its Keycloak group, main-cloud Space and WebDAV
+    datasource — and that every current member is in both groups.
+
+    Two conditional steps:
+
+    * **Folder creation** runs only when `main_cloud_folder_handle` is missing
+      (protected by a per-project lock because `ensure_project_folder` is not
+      idempotent — each call creates a new Space).
+    * **Member sync** runs unconditionally (the Keycloak and LibreGraph adds
+      are idempotent). This repairs the common case where the Space already
+      exists but the user was never added to the groups — e.g. project created
+      while Keycloak admin auth was broken, or a Space adopted out-of-band.
+
+    Returns the (possibly updated) project dict.
+    """
+    project_id_str = str(project["id"])
+    project_name = project["name"]
+    group_name = f"project-{project_id_str}"
+    backend = main_cloud_router.for_project(project)
+
+    handle_str = project.get("main_cloud_folder_handle")
+    legacy_folder_id = project.get("nextcloud_folder_id")
+    needs_folder = not (handle_str or legacy_folder_id)
+
+    if needs_folder and backend.is_initialized:
+        lock = _project_heal_locks.setdefault(project_id_str, asyncio.Lock())
+        async with lock:
+            fresh = await postgres_db.get_project(project_id_str)
+            if fresh:
+                project = fresh
+            if not (
+                project.get("main_cloud_folder_handle")
+                or project.get("nextcloud_folder_id")
+            ):
+                try:
+                    if keycloak_groups.is_initialized:
+                        await keycloak_groups.ensure_project_group(
+                            project_id_str, project_name
+                        )
+                    await backend.ensure_group(group_name)
+                    folder_handle = await backend.ensure_project_folder(
+                        project_name=project_name,
+                        group_id=group_name,
+                    )
+                    legacy_id: int | None = None
+                    if backend.backend_id == "nextcloud":
+                        try:
+                            legacy_id = int(folder_handle.native_id)
+                        except ValueError:
+                            legacy_id = None
+                    await postgres_db.update_project(
+                        project_id_str,
+                        main_cloud_backend=backend.backend_id,
+                        main_cloud_folder_handle=folder_handle.to_db(),
+                        nextcloud_folder_id=legacy_id,
+                    )
+                    project["main_cloud_backend"] = backend.backend_id
+                    project["main_cloud_folder_handle"] = folder_handle.to_db()
+                    project["nextcloud_folder_id"] = legacy_id
+
+                    webdav_url = backend.get_project_folder_webdav_url(folder_handle)
+                    if webdav_url:
+                        ds = await postgres_db.create_datasource(
+                            name=f"Cloud Storage ({project_name})",
+                            ds_type="webdav",
+                            connection_url=webdav_url,
+                            description=(
+                                f"Shared file storage for project '{project_name}'"
+                            ),
+                            credentials=backend.webdav_credentials,
+                        )
+                        await postgres_db.link_datasource_to_project(
+                            project_id=project_id_str,
+                            datasource_id=str(ds["id"]),
+                            read_only=False,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create cloud resources for project "
+                        f"{project_id_str}: {e}"
+                    )
+
+    # Member sync — always runs. Idempotent add in both Keycloak and the
+    # backend; cheap enough to include in every GET and essential for
+    # self-healing projects whose Space exists but whose members were never
+    # added to the groups.
+    if keycloak_groups.is_initialized or backend.is_initialized:
+        try:
+            if keycloak_groups.is_initialized:
+                await keycloak_groups.ensure_project_group(project_id_str, project_name)
+            members = await postgres_db.get_project_members(project_id_str)
+            if members:
+                users = await asyncio.gather(
+                    *[postgres_db.get_user(str(m["user_id"])) for m in members],
+                    return_exceptions=False,
+                )
+                await asyncio.gather(
+                    *[
+                        _sync_project_member_to_groups(
+                            project_id_str, group_name, u, backend
+                        )
+                        for u in users
+                        if u
+                    ],
+                    return_exceptions=True,
+                )
+        except Exception as e:
+            logger.debug(f"Member sync failed for project {project_id_str}: {e}")
+
+    return project
 
 
 @app.post("/api/projects")
@@ -11832,80 +13537,14 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                             f"Failed to grant Gitea access for project creator: {e}"
                         )
 
-        # Create Keycloak group and add creator
-        if keycloak_groups.is_initialized:
-            project_id_str = str(project["id"])
-            group_id = await keycloak_groups.ensure_project_group(
-                project_id_str, body.name
-            )
-            if group_id and body.user_id:
-                user = await postgres_db.get_user(body.user_id)
-                if user and user.get("keycloak_sub"):
-                    await keycloak_groups.add_user_to_project_group(
-                        user["keycloak_sub"], project_id_str
-                    )
-
-        # Provision main-cloud project folder + WebDAV datasource
-        backend = main_cloud_router.active
-        if backend.is_initialized:
-            project_id_str = str(project["id"])
-            group_name = f"project-{project_id_str}"
-            try:
-                # Pre-create the backend group (so it exists before folder assignment)
-                await backend.ensure_group(group_name)
-
-                # Add the creator to the backend group so they can see the Space.
-                if body.user_id:
-                    creator = await postgres_db.get_user(body.user_id)
-                    if creator:
-                        resolved = await backend.resolve_user_identity(
-                            creator.get("email"),
-                            creator.get("display_name", "").lower(),
-                        )
-                        if resolved:
-                            await backend.add_user_to_group(resolved, group_name)
-
-                # Create the project folder and grant access
-                folder_handle = await backend.ensure_project_folder(
-                    project_name=body.name,
-                    group_id=group_name,
-                )
-                # Persist the backend id + serialized handle; also write
-                # the legacy column for dual-read safety during the
-                # legacy-column deprecation window (§9 of the design doc).
-                legacy_folder_id: int | None = None
-                if backend.backend_id == "nextcloud":
-                    try:
-                        legacy_folder_id = int(folder_handle.native_id)
-                    except ValueError:
-                        legacy_folder_id = None
-                await postgres_db.update_project(
-                    project_id_str,
-                    main_cloud_backend=backend.backend_id,
-                    main_cloud_folder_handle=folder_handle.to_db(),
-                    nextcloud_folder_id=legacy_folder_id,
-                )
-
-                # Create project-scoped WebDAV datasource + link to project
-                webdav_url = backend.get_project_folder_webdav_url(folder_handle)
-                if webdav_url:
-                    ds = await postgres_db.create_datasource(
-                        name=f"Cloud Storage ({body.name})",
-                        ds_type="webdav",
-                        connection_url=webdav_url,
-                        description=(f"Shared file storage for project '{body.name}'"),
-                        credentials=backend.webdav_credentials,
-                    )
-                    await postgres_db.link_datasource_to_project(
-                        project_id=project_id_str,
-                        datasource_id=str(ds["id"]),
-                        read_only=False,
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to provision main-cloud folder for project "
-                    f"{project_id_str}: {e}"
-                )
+        # Provision Keycloak group + main-cloud Space + WebDAV datasource,
+        # then sync the creator into both the Keycloak and LibreGraph groups.
+        # The dual group write is intentional: Keycloak carries the `groups`
+        # token claim (durable — OpenCloud's proxy reconciles LibreGraph
+        # memberships from it on every login), while the direct backend add
+        # makes the Space visible in the creator's currently-active OpenCloud
+        # session without waiting for them to re-authenticate.
+        project = await _ensure_project_cloud_resources(project)
 
         return project
     except Exception as e:
@@ -11936,6 +13575,10 @@ async def get_project(project_id: str) -> dict[str, Any]:
     project = await postgres_db.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    # Lazy-heal: projects created before the cloud-resource fix have no
+    # folder handle. The helper is a no-op if the Space already exists.
+    project = await _ensure_project_cloud_resources(project)
 
     # Compute cloud_storage_url for cockpit deep-links
     project["cloud_storage_url"] = None
@@ -12085,65 +13728,28 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
             role=body.role,
         )
 
-        # Sync to Keycloak group
-        if keycloak_groups.is_initialized:
-            user = await postgres_db.get_user(body.user_id)
-            if user and user.get("keycloak_sub"):
-                await keycloak_groups.add_user_to_project_group(
-                    user["keycloak_sub"], project_id
-                )
+        # Sync to Keycloak project group AND the main-cloud LibreGraph group.
+        # Both writes are load-bearing — see _sync_project_member_to_groups.
+        user = await postgres_db.get_user(body.user_id)
+        if user:
+            backend = main_cloud_router.for_project(project)
+            await _sync_project_member_to_groups(
+                project_id, f"project-{project_id}", user, backend
+            )
 
         # Grant Gitea access to all managed project repos
         if gitea_client.is_initialized:
             try:
-                member_user = await postgres_db.get_user(body.user_id)
-                if member_user and member_user.get("email"):
+                if user and user.get("email"):
                     repos = await postgres_db.get_project_repositories(project_id)
                     for repo in repos:
                         if repo.get("is_managed"):
                             await gitea_client.grant_user_repo_access(
-                                member_user["email"], repo["name"]
+                                user["email"], repo["name"]
                             )
             except Exception as e:
                 logger.warning(
                     f"Failed to grant Gitea access for member {body.user_id}: {e}"
-                )
-
-        # Sync to the project's main-cloud backend (immediate access — do not
-        # wait for OIDC login). Uses for_project so legacy-backend rows still
-        # dispatch correctly after a deployment-wide backend switch.
-        backend = main_cloud_router.for_project(project)
-        if backend.is_initialized:
-            try:
-                nc_user = await postgres_db.get_user(body.user_id)
-                resolved_user_id = (
-                    await backend.resolve_user_identity(
-                        nc_user.get("email"),
-                        nc_user.get("display_name", "").lower(),
-                    )
-                    if nc_user
-                    else None
-                )
-                if resolved_user_id:
-                    group_name = f"project-{project_id}"
-                    await backend.add_user_to_group(resolved_user_id, group_name)
-                    # Workaround for Nextcloud server#57445 — no-op on
-                    # backends that propagate group membership automatically.
-                    handle_str = project.get("main_cloud_folder_handle") or (
-                        str(project["nextcloud_folder_id"])
-                        if project.get("nextcloud_folder_id")
-                        else None
-                    )
-                    if handle_str:
-                        handle = ProjectFolderHandle.from_db(
-                            handle_str,
-                            backend=project.get("main_cloud_backend")
-                            or backend.backend_id,
-                        )
-                        await backend.refresh_project_folder_access(handle, group_name)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to sync main-cloud group for member {body.user_id}: {e}"
                 )
 
         return result
@@ -12205,30 +13811,10 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
         except Exception as e:
             logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
-    # Remove from the project's main-cloud group
-    project = await postgres_db.get_project(project_id)
-    backend = (
-        main_cloud_router.for_project(project) if project else main_cloud_router.active
-    )
-    if backend.is_initialized:
-        try:
-            nc_user = await postgres_db.get_user(user_id)
-            resolved_user_id = (
-                await backend.resolve_user_identity(
-                    nc_user.get("email"),
-                    nc_user.get("display_name", "").lower(),
-                )
-                if nc_user
-                else None
-            )
-            if resolved_user_id:
-                await backend.remove_user_from_group(
-                    resolved_user_id, f"project-{project_id}"
-                )
-        except Exception as e:
-            logger.warning(
-                f"Failed to remove main-cloud group membership for {user_id}: {e}"
-            )
+    # Main-cloud group removal flows through Keycloak — OpenCloud reconciles
+    # LibreGraph memberships from the OIDC `groups` claim on login, so the
+    # Keycloak-side remove above is sufficient. No direct backend.remove call
+    # needed.
 
     return {"status": "removed"}
 
@@ -13550,7 +15136,15 @@ async def send_builder_message(
 
     # Build context
     messages = await postgres_db.get_builder_messages(session_id)
-    raw_model_for_prompt = body.model or get_builder_model()
+    raw_model_for_prompt = body.model or await get_builder_model(postgres_db)
+    if not raw_model_for_prompt:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No default builder model configured. Set one in Admin → "
+                "Providers, or pass `model` explicitly."
+            ),
+        )
     system_prompt = build_system_prompt(
         model=raw_model_for_prompt,
         instructions_content=body.instructions,
@@ -13582,8 +15176,13 @@ async def send_builder_message(
         final_steps = []
 
         try:
-            raw_model = body.model or get_builder_model()
-            llm = _create_builder_llm(raw_model)
+            raw_model = body.model or await get_builder_model(postgres_db)
+            if not raw_model:
+                raise RuntimeError(
+                    "No default builder model configured. Set one in "
+                    "Admin → Providers, or pass `model` explicitly."
+                )
+            llm = await _create_builder_llm(raw_model)
             llm_with_tools = llm.bind_tools(BUILDER_TOOLS)
 
             # Convert dict messages to LangChain types
@@ -13778,11 +15377,16 @@ async def _execute_server_tool(
     user_id: str | None = None,
     active_project_id: str | None = None,
 ) -> tuple[str, str | None]:
-    """Execute a server-side builder tool via the shared dispatch module."""
+    """Execute a server-side builder tool via the shared dispatch module.
+
+    Resolves the Tavily key from system_api_keys at call time so the
+    builder_search helper stays DB-agnostic.
+    """
+    tavily_key = await postgres_db.get_system_api_key("tavily")
     return await _dispatch_server_tool(
         tool_name,
         args,
-        tavily_search_fn=tavily_search,
+        tavily_search_fn=partial(tavily_search, api_key=tavily_key),
         user_id=user_id,
         active_project_id=active_project_id,
     )
@@ -13793,11 +15397,16 @@ async def _execute_server_tool(
 # =============================================================================
 
 
-def _create_builder_llm(raw_model: str):
+async def _create_builder_llm(raw_model: str):
     """Create a LangChain LLM for the builder using the shared factory.
 
-    Maps builder env vars and settings matrix into an LLMConfig, then
-    delegates to ``create_llm()`` from ``src/core/loader``.
+    Routes through the model registry so DB-backed endpoints (custom or
+    system-scoped, managed via Admin → Providers or helm seed) carry
+    their own base_url and api_key. For built-in catalog models the key
+    is resolved from ``system_api_keys`` by inferred provider (claude →
+    anthropic, openrouter/* → openrouter, else openai). Codex stays on
+    ``CODEX_API_KEY`` because codex auth is user-bound via the proxy and
+    is intentionally absent from ``VALID_SYSTEM_API_KEY_PROVIDERS``.
     """
     import sys
 
@@ -13809,25 +15418,52 @@ def _create_builder_llm(raw_model: str):
 
     settings = resolve_builder_settings(raw_model)
 
-    # Resolve API key from builder-specific env vars
+    base_url: str | None = None
     api_key: str | None = None
-    provider_lower = raw_model.lower()
-    if provider_lower.startswith("claude"):
-        api_key = (
-            os.getenv("BUILDER_ANTHROPIC_API_KEY")
-            or os.getenv("BUILDER_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
-    elif provider_lower.startswith("codex/"):
-        api_key = os.getenv("CODEX_API_KEY", "not-needed")
-    elif provider_lower.startswith("openrouter/"):
-        api_key = os.getenv("OPENROUTER_API_KEY")
-    else:
-        api_key = (
-            os.getenv("BUILDER_OPENAI_API_KEY")
-            or os.getenv("BUILDER_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
+
+    try:
+        meta = await _resolve_model(raw_model)
+    except UnknownModelError:
+        meta = None
+
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            base_url = endpoint_row.get("base_url")
+            # Keyless local endpoints (vLLM, Ollama) still need a
+            # placeholder; do not fall through to env vars, or a stray
+            # OPENAI_API_KEY would leak into a local-only endpoint.
+            api_key = endpoint_row.get("api_key") or "not-needed"
+            logger.info(
+                f"Builder: routed {raw_model} to {meta.origin} endpoint "
+                f"{endpoint_row.get('label') or meta.endpoint_id}"
+            )
+
+    if base_url is None:
+        base_url = await get_builder_base_url(raw_model)
+
+    if api_key is None:
+        provider_lower = raw_model.lower()
+        if provider_lower.startswith("codex/"):
+            api_key = os.getenv("CODEX_API_KEY", "not-needed")
+        else:
+            if provider_lower.startswith("claude"):
+                provider = "anthropic"
+            elif provider_lower.startswith("openrouter/"):
+                provider = "openrouter"
+            else:
+                provider = "openai"
+            api_key = await postgres_db.get_system_api_key(provider)
+            if not api_key:
+                raise RuntimeError(
+                    f"Builder LLM unavailable: no system_api_keys row for "
+                    f"provider '{provider}'. Configure via Admin → Providers "
+                    f"or seed via SEED_{provider.upper()}_API_KEY."
+                )
 
     config = LLMConfig(
         model=raw_model,
@@ -13835,7 +15471,7 @@ def _create_builder_llm(raw_model: str):
         top_p=settings.get("top_p"),
         top_k=settings.get("top_k"),
         reasoning_level=settings.get("reasoning_effort", "none"),
-        base_url=get_builder_base_url(),
+        base_url=base_url,
         api_key=api_key,
         max_output_tokens=settings.get("max_tokens"),
     )
@@ -13939,7 +15575,13 @@ async def _summarize_builder_session(
     summary_prompt = build_summarization_prompt(to_summarize)
 
     try:
-        llm = _create_builder_llm(get_builder_model())
+        model = await get_builder_model(postgres_db)
+        if not model:
+            logger.info(
+                "Skipping builder summarization: no default builder model configured"
+            )
+            return
+        llm = await _create_builder_llm(model)
         lc_messages = [
             SystemMessage(content=summary_prompt[0]["content"]),
             HumanMessage(content=summary_prompt[1]["content"]),
@@ -13965,7 +15607,7 @@ async def _generate_builder_title(
 
     Uses the user's auxiliary model if configured, otherwise the builder model.
     """
-    model = get_builder_model()
+    model = await get_builder_model(postgres_db)
     if user_id:
         try:
             user_settings = await postgres_db.get_user_settings(user_id)
@@ -13975,7 +15617,11 @@ async def _generate_builder_title(
         except Exception:
             pass
 
-    llm = _create_builder_llm(model)
+    if not model:
+        logger.debug("Skipping title generation: no builder model configured")
+        return None
+
+    llm = await _create_builder_llm(model)
 
     prompt_messages = [
         SystemMessage(

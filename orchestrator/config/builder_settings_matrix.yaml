@@ -1,6 +1,7 @@
 # Builder Settings Matrix — model-family-specific inference params for the builder agent.
 # Resolution: default → family-specific (deep merge).
-# Keys match detect_model_family() output in orchestrator/services/builder_config.py.
+# Keys match family_of() output in src/core/model_registry.py
+# (which reads the `family` field from config/models.yaml entries).
 #
 # Keys with null values are not passed to the API (use provider defaults).
 # Absent keys inherit from "default".

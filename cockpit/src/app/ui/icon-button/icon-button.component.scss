@@ -1,0 +1,126 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+}
+
+.app-icon-button__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    opacity 0.15s ease;
+
+  &:focus { outline: none; }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  // --- Sizes (square) ---
+  &[data-size='sm'] {
+    width: 24px;
+    height: 24px;
+    border-radius: v.$radius-sm;
+    font-size: 14px;
+  }
+
+  &[data-size='md'] {
+    width: 32px;
+    height: 32px;
+    border-radius: v.$radius-sm;
+    font-size: 16px;
+  }
+
+  &[data-size='lg'] {
+    width: 40px;
+    height: 40px;
+    border-radius: v.$radius-md;
+    font-size: 20px;
+  }
+
+  // --- Variants ---
+  &[data-variant='ghost'] {
+    &:hover:not(:disabled) {
+      background: var(--surface-0);
+      color: var(--text-primary);
+    }
+
+    &:active:not(:disabled) {
+      background: var(--surface-1);
+    }
+  }
+
+  &[data-variant='primary'] {
+    color: var(--accent-color);
+
+    &:hover:not(:disabled) {
+      background: var(--hover);
+      color: var(--accent-hover);
+    }
+
+    &:active:not(:disabled) {
+      background: var(--active);
+    }
+  }
+
+  &[data-variant='danger'] {
+    &:hover:not(:disabled) {
+      background: var(--surface-0);
+      color: var(--danger);
+    }
+
+    &:active:not(:disabled) {
+      background: var(--surface-1);
+    }
+  }
+}
+
+:host.cdk-keyboard-focused .app-icon-button__btn {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+.app-icon-button__content {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.app-icon-button__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: app-icon-button-spin 0.7s linear infinite;
+}
+
+@keyframes app-icon-button-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-icon-button__spinner { animation-duration: 2s; }
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-icon-button__btn[data-size='sm'],
+  .app-icon-button__btn[data-size='md'] {
+    min-width: v.$touch-target-min;
+    min-height: v.$touch-target-min;
+  }
+}

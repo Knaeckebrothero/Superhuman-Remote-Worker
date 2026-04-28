@@ -1,7 +1,7 @@
 import { Component, inject } from '@angular/core';
 import { TimelineComponent } from '../components/timeline/timeline.component';
 import { SplitPanelComponent } from '../layout/split-panel/split-panel.component';
-import { SidebarToggleComponent } from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import { SidebarToggleComponent } from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import { LayoutService } from '../services/layout.service';
 
 @Component({

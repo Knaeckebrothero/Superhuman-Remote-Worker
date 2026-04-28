@@ -1,0 +1,53 @@
+{{- if .Values.llm.seed.enabled }}
+{{- /*
+Payload for `python -m seed.llm_config`. Stays plaintext-free:
+API keys are referenced via `apiKeyEnv` and injected into the seed Job pod
+via envFrom on the referenced Secrets.
+
+The seeder is insert-only — re-applying an unchanged payload on `helm upgrade`
+is a no-op, and admin-UI edits to `system_api_keys` / `llm_endpoints`
+survive subsequent runs. See docs/features/db_backed_llm_config.md for the
+seed semantics and orchestrator/seed/llm_config.py for the payload schema.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-llm-seed
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "llm-seed") | nindent 4 }}
+  annotations:
+    # Render the ConfigMap before the seed Job runs (hook-weight 0 < Job's 10).
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  llm.yaml: |
+    systemApiKeys:
+      {{- range $provider, $ref := .Values.llm.seed.systemApiKeys }}
+      - provider: {{ $provider | quote }}
+        apiKeyEnv: {{ printf "SEED_%s_API_KEY" ($provider | upper | replace "-" "_") | quote }}
+      {{- end }}
+    systemEndpoints:
+      {{- range $i, $ep := .Values.llm.seed.systemEndpoints }}
+      - label: {{ required "llm.seed.systemEndpoints[].label is required" $ep.label | quote }}
+        baseUrl: {{ required "llm.seed.systemEndpoints[].baseUrl is required" $ep.baseUrl | quote }}
+        {{- if $ep.apiKeyRef }}
+        apiKeyEnv: {{ printf "SEED_ENDPOINT_%d_API_KEY" $i | quote }}
+        {{- end }}
+        models:
+          {{- range $ep.models }}
+          - id: {{ required "model.id is required" .id | quote }}
+            displayName: {{ default .id .displayName | quote }}
+            {{- with .family }}
+            family: {{ . | quote }}
+            {{- end }}
+            {{- with .contextWindow }}
+            contextWindow: {{ . }}
+            {{- end }}
+            {{- if hasKey . "reasoningLevel" }}
+            reasoningLevel: {{ .reasoningLevel | quote }}
+            {{- end }}
+            enabled: {{ default true .enabled }}
+          {{- end }}
+      {{- end }}
+{{- end }}

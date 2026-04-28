@@ -29,24 +29,31 @@ The adapter authenticates via Keycloak's `client_credentials` grant (NOT OpenClo
 |---|---|---|
 | `opencloud-web` | Public OIDC client | Browser login for end users on the OpenCloud Web UI |
 | `opencloud-orchestrator` | Confidential service-account client | Orchestrator → LibreGraph admin calls |
-| `opencloud-admin` | Realm group | Membership grants the orchestrator admin privileges in OpenCloud |
+| `opencloudAdmin` | Realm group | Membership grants the orchestrator admin privileges in OpenCloud. Name is baked into the OpenCloud proxy binary — must match exactly. |
 
-The bundled `docker/keycloak/realm-export.json.example` pre-registers both clients and the group. If you imported the realm from that template, the **only** remaining step is to assign the orchestrator's service-account user to the `opencloud-admin` group. Do this one of two ways:
+`docker/keycloak/realm-export.json` pre-registers both clients, the `opencloudAdmin` group, and the service-account-to-group binding. On a fresh Compose stack, Keycloak imports all of this on first boot and no manual setup is needed — just:
 
-### Option A: automated (recommended)
+```bash
+podman-compose down -v     # if Keycloak's DB already has a stale realm
+podman-compose up -d
+```
+
+### Drift repair on a persisted Keycloak DB
+
+If you're running against a Keycloak DB that already imported an older realm (missing clients, wrong group name, etc.), run the idempotent seeder:
 
 ```bash
 ./docker/keycloak/setup-opencloud-client.sh
 ```
 
-This script is idempotent. It verifies both clients exist (creating them if they don't), ensures the `opencloud-admin` group exists, and adds the service-account user to the group. Runs against the live `srw-keycloak` container via `kcadm.sh`.
+It verifies both clients exist (creating them if they don't), ensures the `opencloudAdmin` group exists, and adds the service-account user to the group. Runs against the live `srw-keycloak` container via `kcadm.sh`.
 
-### Option B: manual via the Keycloak admin UI
+### Alternative: manual via the Keycloak admin UI
 
 1. Log in to Keycloak at `http://localhost:8180` as `admin` / `admin`.
 2. Switch to the `srw` realm.
 3. Go to **Clients → opencloud-orchestrator → Service account roles**.
-4. Click **Groups** tab → **Join Group** → select `opencloud-admin`.
+4. Click **Groups** tab → **Join Group** → select `opencloudAdmin`.
 5. Save.
 
 ## 3. Orchestrator env vars

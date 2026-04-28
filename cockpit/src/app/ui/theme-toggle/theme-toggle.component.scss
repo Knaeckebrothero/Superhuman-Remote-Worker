@@ -1,0 +1,80 @@
+@use '../../../styles/variables' as v;
+
+:host {
+  display: inline-block;
+}
+
+.app-theme-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  min-width: 200px;
+  height: 32px;
+  padding: 0 32px 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: v.$radius-md;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-size: v.$font-size-xs;
+  font-weight: v.$font-weight-medium;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+
+  &:hover {
+    background: var(--surface-1);
+  }
+
+  &:focus-within {
+    border-color: var(--accent-color);
+    box-shadow: 0 0 0 1px var(--accent-color);
+    outline: none;
+  }
+}
+
+.app-theme-toggle__select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0 32px 0 12px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+
+  // Native option list inherits OS chrome — only the closed selector is themable.
+  &:focus {
+    outline: none;
+  }
+
+  // Optgroup label rendering is browser-defined; this gives a hint where supported.
+  optgroup {
+    font-weight: v.$font-weight-bold;
+    font-style: normal;
+    color: var(--text-primary);
+    background: var(--panel-bg);
+  }
+
+  option {
+    color: var(--text-primary);
+    background: var(--surface-0);
+  }
+}
+
+.app-theme-toggle__chevron {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+@media (max-width: v.$breakpoint-md) {
+  .app-theme-toggle {
+    height: v.$touch-target-min;
+  }
+}

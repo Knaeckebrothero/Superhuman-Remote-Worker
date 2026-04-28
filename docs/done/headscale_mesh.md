@@ -10,7 +10,17 @@ tags:
 
 Design document for replacing NodePort-based SSH access with a Headscale (self-hosted Tailscale) mesh VPN, enabling agent pods on the main cluster to SSH into KubeVirt VMs on any remote cluster regardless of network topology.
 
-**Status:** Planned.
+**Status:** Implemented, then re-architected.
+
+> **Note (current architecture):** The mesh VPN is in production, but the
+> headscale server is no longer bundled into the SRW Helm chart. It is
+> deployed as an independent Fleet bundle in
+> `HomeLab/deployments_managed/headscale/` and the chart consumes it via
+> the `headscale.url` value. The chart-embedded sections below
+> (`Headscale Deployment` → `Kubernetes Manifest`, the `headscale.enabled`
+> toggle, etc.) are preserved for design context but no longer reflect
+> what's deployed. See **[`docs/features/external_headscale.md`](../features/external_headscale.md)**
+> for the current setup.
 
 ## Problem
 
