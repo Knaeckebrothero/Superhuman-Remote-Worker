@@ -10,11 +10,11 @@ data:
       window['env'] = window['env'] || {};
       window['env']['apiUrl'] = '{{ include "srw.apiUrl" . }}/api';
       window['env']['giteaUrl'] = '{{ include "srw.gitUrl" . }}/srw';
-      window['env']['dozzleUrl'] = 'https://dozzle.{{ .Values.global.domain }}';
-      window['env']['minioConsoleUrl'] = 'https://minio.{{ .Values.global.domain }}';
-      window['env']['neo4jUrl'] = 'https://neo4j.{{ .Values.global.domain }}';
-      window['env']['pgadminUrl'] = 'https://pgadmin.{{ .Values.global.domain }}';
-      window['env']['mongoExpressUrl'] = 'https://mongo.{{ .Values.global.domain }}';
+      window['env']['dozzleUrl'] = 'https://{{ include "srw.dozzleHost" . }}';
+      window['env']['minioConsoleUrl'] = 'https://{{ include "srw.minioHost" . }}';
+      window['env']['neo4jUrl'] = 'https://{{ include "srw.neo4jBrowserHost" . }}';
+      window['env']['pgadminUrl'] = 'https://{{ include "srw.pgadminHost" . }}';
+      window['env']['mongoExpressUrl'] = 'https://{{ include "srw.mongoHost" . }}';
       window['env']['mcpUrl'] = '{{ include "srw.mcpUrl" . }}/mcp';
       window['env']['cloudUrl'] = '{{ include "srw.cloudUrl" . }}';
 

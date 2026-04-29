@@ -1,6 +1,15 @@
 {{- if .Values.ingress.enabled }}
 {{- $fullName := include "srw.fullname" . -}}
-{{- $domain := .Values.global.domain -}}
+{{- $cockpitHost := include "srw.host" (dict "context" . "key" "cockpit" "default" "") -}}
+{{- $apiHost     := include "srw.urlHost" (include "srw.apiUrl" .) -}}
+{{- $authHost    := include "srw.urlHost" (include "srw.authUrl" .) -}}
+{{- $gitHost     := include "srw.urlHost" (include "srw.gitUrl" .) -}}
+{{- $cloudHost   := include "srw.urlHost" (include "srw.cloudUrl" .) -}}
+{{- $mcpHost     := include "srw.urlHost" (include "srw.mcpUrl" .) -}}
+{{- $neo4jHost   := include "srw.neo4jBrowserHost" . -}}
+{{- $pgadminHost := include "srw.pgadminHost" . -}}
+{{- $mongoHost   := include "srw.mongoHost" . -}}
+{{- $dozzleHost  := include "srw.dozzleHost" . -}}
 # Cockpit web UI
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -22,11 +31,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - {{ $domain }}
+        - {{ $cockpitHost }}
       secretName: {{ $fullName }}-cockpit-tls
   {{- end }}
   rules:
-    - host: {{ $domain }}
+    - host: {{ $cockpitHost }}
       http:
         paths:
           - path: /
@@ -61,11 +70,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - api.{{ $domain }}
+        - {{ $apiHost }}
       secretName: {{ $fullName }}-api-tls
   {{- end }}
   rules:
-    - host: api.{{ $domain }}
+    - host: {{ $apiHost }}
       http:
         paths:
           - path: /
@@ -98,11 +107,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - auth.{{ $domain }}
+        - {{ $authHost }}
       secretName: {{ $fullName }}-keycloak-tls
   {{- end }}
   rules:
-    - host: auth.{{ $domain }}
+    - host: {{ $authHost }}
       http:
         paths:
           - path: /
@@ -136,11 +145,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - cloud.{{ $domain }}
+        - {{ $cloudHost }}
       secretName: {{ $fullName }}-opencloud-tls
   {{- end }}
   rules:
-    - host: cloud.{{ $domain }}
+    - host: {{ $cloudHost }}
       http:
         paths:
           - path: /
@@ -174,11 +183,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - neo4j.{{ $domain }}
+        - {{ $neo4jHost }}
       secretName: {{ $fullName }}-neo4j-tls
   {{- end }}
   rules:
-    - host: neo4j.{{ $domain }}
+    - host: {{ $neo4jHost }}
       http:
         paths:
           - path: /
@@ -212,11 +221,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - git.{{ $domain }}
+        - {{ $gitHost }}
       secretName: {{ $fullName }}-gitea-tls
   {{- end }}
   rules:
-    - host: git.{{ $domain }}
+    - host: {{ $gitHost }}
       http:
         paths:
           - path: /
@@ -250,11 +259,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - pgadmin.{{ $domain }}
+        - {{ $pgadminHost }}
       secretName: {{ $fullName }}-pgadmin-tls
   {{- end }}
   rules:
-    - host: pgadmin.{{ $domain }}
+    - host: {{ $pgadminHost }}
       http:
         paths:
           - path: /
@@ -288,11 +297,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - mongo.{{ $domain }}
+        - {{ $mongoHost }}
       secretName: {{ $fullName }}-mongo-tls
   {{- end }}
   rules:
-    - host: mongo.{{ $domain }}
+    - host: {{ $mongoHost }}
       http:
         paths:
           - path: /
@@ -326,11 +335,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - mcp.{{ $domain }}
+        - {{ $mcpHost }}
       secretName: {{ $fullName }}-mcp-tls
   {{- end }}
   rules:
-    - host: mcp.{{ $domain }}
+    - host: {{ $mcpHost }}
       http:
         paths:
           - path: /
@@ -364,11 +373,11 @@ spec:
   {{- if .Values.ingress.tls.enabled }}
   tls:
     - hosts:
-        - dozzle.{{ $domain }}
+        - {{ $dozzleHost }}
       secretName: {{ $fullName }}-dozzle-tls
   {{- end }}
   rules:
-    - host: dozzle.{{ $domain }}
+    - host: {{ $dozzleHost }}
       http:
         paths:
           - path: /

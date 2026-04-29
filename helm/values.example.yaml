@@ -23,6 +23,12 @@ global:
   # Pull credentials for private GHCR images. Omit if images are public.
   imagePullSecrets:
     - name: ghcr-pull-secret
+  # Override individual subdomain hostnames when the flat default is already
+  # taken in the parent zone. Anything left empty falls back to
+  # <subdomain>.<domain>. See helm/values.yaml for the full key list.
+  # hostnames:
+  #   git: "git-srw.example.com"   # if git.example.com is already in use
+  #   auth: "login.example.com"    # share an existing IdP hostname
 
 # -----------------------------------------------------------------------------
 # Secrets — pre-create a K8s Secret named "srw-secrets" with the keys listed
