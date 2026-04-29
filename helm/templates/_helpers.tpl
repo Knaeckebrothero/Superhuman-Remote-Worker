@@ -83,6 +83,41 @@ ConfigMap name (used by all deployments that read from the shared configmap).
 {{- end }}
 
 {{/*
+VM controller — resource names + URLs. The controller can run in the same
+namespace as the orchestrator (vmController.namespace = .Release.Namespace)
+or in a dedicated namespace (the typical case). When enabled, the controller
+exposes an HTTP API on Service `srw.vmControllerServiceName` port
+`vmController.service.port`.
+*/}}
+{{- define "srw.vmControllerName" -}}
+{{- printf "%s-vm-controller" (include "srw.fullname" .) }}
+{{- end }}
+
+{{- define "srw.vmControllerServiceName" -}}
+{{- include "srw.vmControllerName" . }}
+{{- end }}
+
+{{- define "srw.vmControllerNamespace" -}}
+{{- default .Release.Namespace .Values.vmController.namespace }}
+{{- end }}
+
+{{/*
+URL the orchestrator uses to reach the controller's HTTP API. Empty when
+vmController.enabled is false or transport=nats — orchestrator falls back
+to NATS / direct K8s in those cases. When transport=both, the URL is
+exported so the orchestrator's HTTP transport is available even though
+NATS takes priority.
+*/}}
+{{- define "srw.vmControllerUrl" -}}
+{{- if and .Values.vmController.enabled (ne .Values.vmController.transport "nats") }}
+{{- printf "http://%s.%s.svc.cluster.local:%d"
+    (include "srw.vmControllerServiceName" .)
+    (include "srw.vmControllerNamespace" .)
+    (int .Values.vmController.service.port) }}
+{{- end }}
+{{- end }}
+
+{{/*
 Component labels — extends common labels with a component identifier.
 Usage: {{ include "srw.componentLabels" (dict "context" . "component" "orchestrator") }}
 */}}

@@ -1,4 +1,11 @@
 {{- if .Values.workspace.networkPolicy.enabled }}
+# Unified workspace NetworkPolicy — covers BOTH container workspaces (pods)
+# and VM workspaces (KubeVirt virt-launcher pods). KubeVirt propagates labels
+# from VMI.spec.template.metadata.labels to the virt-launcher pod, so a
+# single podSelector matches both implementations.
+#
+# See docs/features/workspace_network_policy_unification.md for the full
+# design rationale, CNI compatibility caveats, and Tailscale-in-VM notes.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -8,7 +15,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: srw-workspace
+      srw.io/component: agent-workspace
   policyTypes:
     - Ingress
     - Egress
@@ -56,11 +63,23 @@ spec:
         - protocol: TCP
           port: 53
     # HTTP/HTTPS for browser automation (agent-controlled browsing via CDP)
+    # and the Tailscale DERP-relay fallback when UDP is blocked.
     - ports:
         - protocol: TCP
           port: 80
         - protocol: TCP
           port: 443
+    # Tailscale mesh — direct WireGuard peer (UDP/41641) and STUN (UDP/3478).
+    # If UDP is blocked end-to-end, Tailscale falls back to DERP-over-443
+    # transparently (still works, just relayed). Applies equally to container
+    # workspaces (Tailscale runs in the pod netns) and VM workspaces (Tailscale
+    # runs inside the VM, NAT'd through virt-launcher's veth — pod-level
+    # policy sees only the encrypted envelope).
+    - ports:
+        - protocol: UDP
+          port: 41641
+        - protocol: UDP
+          port: 3478
     # Gitea (workspace git repos)
     - to:
         - podSelector:
@@ -101,5 +120,7 @@ spec:
       ports:
         - protocol: TCP
           port: 27017
-    # No external internet — workspace containers are sandboxed
+    # No general internet beyond TCP 80/443 + Tailscale UDP. Workspaces
+    # cannot reach each other (no podSelector matchLabels srw.io/component:
+    # agent-workspace in any allowed source).
 {{- end }}

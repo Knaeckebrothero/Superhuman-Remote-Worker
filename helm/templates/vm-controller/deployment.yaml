@@ -1,0 +1,119 @@
+{{- if .Values.vmController.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srw.vmControllerName" . }}
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "srw.vmControllerName" . }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: vm-controller
+          image: "{{ .Values.vmController.image.repository }}:{{ .Values.vmController.image.tag }}"
+          imagePullPolicy: {{ .Values.vmController.image.pullPolicy }}
+          env:
+            - name: TRANSPORT
+              value: {{ .Values.vmController.transport | quote }}
+            - name: LISTEN_PORT
+              value: {{ .Values.vmController.service.port | quote }}
+            {{- if eq .Values.vmController.transport "nats" }}
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NATS_URL
+            {{- else if eq .Values.vmController.transport "both" }}
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NATS_URL
+                  optional: true
+            {{- end }}
+            - name: VM_TEMPLATE_PATH
+              value: "/config/vm-template.yaml"
+            - name: VM_NAMESPACE
+              value: {{ include "srw.vmControllerNamespace" . | quote }}
+            - name: DEFAULT_VM_IMAGE
+              value: {{ .Values.vmController.defaultVmImage | quote }}
+            - name: DEFAULT_CPU
+              value: {{ .Values.vmController.defaultCpu | quote }}
+            - name: DEFAULT_MEMORY
+              value: {{ .Values.vmController.defaultMemory | quote }}
+            - name: VM_STORAGE_CLASS
+              value: {{ .Values.vmController.vmStorageClass | quote }}
+            - name: VM_DISK_SIZE
+              value: {{ .Values.vmController.vmDiskSize | quote }}
+            - name: HEADSCALE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: HEADSCALE_URL
+                  optional: true
+            {{- if .Values.vmController.headscale.apiKeySecretName }}
+            - name: HEADSCALE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.vmController.headscale.apiKeySecretName }}
+                  key: {{ .Values.vmController.headscale.apiKeySecretKey | default "api-key" }}
+                  optional: true
+            - name: HEADSCALE_USER
+              value: {{ .Values.vmController.headscale.user | quote }}
+            {{- end }}
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: LOG_LEVEL
+                  optional: true
+          ports:
+            {{- if ne .Values.vmController.transport "nats" }}
+            - name: http
+              containerPort: {{ .Values.vmController.service.port }}
+              protocol: TCP
+            {{- end }}
+          volumeMounts:
+            - name: vm-template
+              mountPath: /config
+              readOnly: true
+          resources:
+            {{- toYaml .Values.vmController.resources | nindent 12 }}
+          {{- if ne .Values.vmController.transport "nats" }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- else }}
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import os; os.getpid()"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          {{- end }}
+      volumes:
+        - name: vm-template
+          configMap:
+            name: {{ include "srw.vmControllerName" . }}-template
+{{- end }}

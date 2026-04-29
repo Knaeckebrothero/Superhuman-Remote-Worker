@@ -384,7 +384,12 @@ workspace:
   storageSize: "20Gi"
   # -- Storage class for ephemeral per-job workspace PVCs
   ephemeralStorageClass: ""
-  # -- NetworkPolicy restricting workspace pod traffic
+  # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
+  # workspaces and same-cluster KubeVirt VM workspaces (selector
+  # srw.io/component=agent-workspace matches both). Disabling removes the
+  # policy for both implementations. Requires a CNI that enforces
+  # NetworkPolicy (Calico, Cilium, OVN-Kubernetes, Antrea — Flannel does
+  # not enforce it). See docs/features/workspace_network_policy_unification.md.
   networkPolicy:
     enabled: true
 
@@ -593,8 +598,69 @@ ide:
 # =============================================================================
 # NATS Messaging (optional)
 # =============================================================================
+# When set, the orchestrator and (optionally) the in-cluster VM controller
+# use NATS for VM lifecycle commands. This is the cross-cluster transport —
+# leave empty for same-cluster deployments that use vmController.transport=http.
 nats:
   url: ""
+
+# =============================================================================
+# VM Controller (optional, same-cluster KubeVirt)
+# =============================================================================
+# Co-locates the VM Controller in the orchestrator's cluster so VMs can be
+# created without standing up a second Kubernetes cluster + NATS.
+#
+# Prerequisites the chart does NOT install (operator must do this first):
+#   - KubeVirt operator + KubeVirt CR (cluster-scoped)
+#   - CDI operator (DataVolume support — used by the VM template)
+#   - Nodes with hardware virtualization (vmx/svm) and KubeVirt feature gates
+#
+# Trade-offs vs. the cross-cluster (NATS) path:
+#   - Blast radius is namespace-scoped instead of cluster-scoped (weaker isolation)
+#   - HTTP transport carries lifecycle (create/delete/query) only. In-VM daemon
+#     events (register, heartbeat, freeze, resume) still need NATS — set
+#     vmController.transport=both and configure nats.url if you need them.
+vmController:
+  # -- Deploy the VM controller into the same cluster as the orchestrator.
+  enabled: false
+  # -- Transport: "http" (no NATS, lifecycle only) | "nats" (cross-cluster,
+  # full feature set) | "both" (HTTP for lifecycle + NATS for daemon events).
+  transport: http
+  # -- Namespace for the controller and VMs. Defaults to the release namespace
+  # when empty. A dedicated namespace is recommended so the controller's RBAC
+  # (kubevirt.io verbs) stays scoped away from the orchestrator's namespace.
+  namespace: agent-vms
+  image:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
+    tag: latest
+    pullPolicy: Always
+  service:
+    port: 8080
+  # -- Default VM image — override per-job via the orchestrator API.
+  defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest
+  defaultCpu: 2
+  defaultMemory: 4Gi
+  # -- CDI DataVolume storage class + size for the VM root disk.
+  vmStorageClass: local-path
+  vmDiskSize: 20Gi
+  # -- SSH public key injected into the VM's authorized_keys (cloud-init).
+  # The matching private key lives in the chart's vm-ssh-key secret and is
+  # mounted into orchestrator/agent pods. Required for HTTP/lifecycle mode
+  # since there's no external Headscale to dial — agents SSH directly to the
+  # VM's pod IP.
+  vmSshPublicKey: ""
+  headscale:
+    # -- Existing Secret with a Headscale API key. Empty disables the mesh.
+    apiKeySecretName: ""
+    apiKeySecretKey: api-key
+    user: srw
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
 
 # =============================================================================
 # Logging
