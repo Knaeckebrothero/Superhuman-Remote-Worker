@@ -88,9 +88,7 @@ class VMProvisioner:
         # HTTP controller transport (same-cluster, no NATS).
         self._controller_url: str = os.environ.get("VM_CONTROLLER_URL", "").rstrip("/")
         self._http_client: Optional[httpx.AsyncClient] = None
-        self._http_timeout: float = float(
-            os.environ.get("VM_CONTROLLER_TIMEOUT", "30")
-        )
+        self._http_timeout: float = float(os.environ.get("VM_CONTROLLER_TIMEOUT", "30"))
 
     @property
     def is_available(self) -> bool:
@@ -624,9 +622,7 @@ class VMProvisioner:
             payload["vm_image"] = vm_image
 
         try:
-            await self._set_context(
-                entity_type, job_id, {"status": "provisioning"}
-            )
+            await self._set_context(entity_type, job_id, {"status": "provisioning"})
             resp = await self._http_client.post("/vms", json=payload)
             resp.raise_for_status()
             data = resp.json()
@@ -699,9 +695,7 @@ class VMProvisioner:
             logger.error("HTTP delete failed for %s %s: %s", entity_type, job_id, e)
             return False
 
-    async def _query_http(
-        self, job_id: str, timeout: float = 5.0
-    ) -> Optional[dict]:
+    async def _query_http(self, job_id: str, timeout: float = 5.0) -> Optional[dict]:
         """Query VM status via the co-located VM controller."""
         if self._http_client is None:
             return None
