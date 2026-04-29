@@ -513,7 +513,11 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return False
 
-        pvc_labels = {"app": "srw-workspace", "srw/component": "workspace-pvc"}
+        pvc_labels = {
+            "app": "srw-workspace",
+            "srw/component": "workspace-pvc",
+            "srw.io/component": "agent-workspace",
+        }
         if labels:
             pvc_labels.update(labels)
 
@@ -591,6 +595,9 @@ class ContainerProvisioner:
                     "app": "srw-workspace",
                     "srw/job-id": job_id,
                     "srw/component": "workspace",
+                    # Fleet-wide selector shared with KubeVirt VM workspaces.
+                    # See docs/features/workspace_network_policy_unification.md
+                    "srw.io/component": "agent-workspace",
                 },
             },
             "spec": {

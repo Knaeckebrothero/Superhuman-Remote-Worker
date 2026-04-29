@@ -151,3 +151,20 @@ agent:
     reservedJobSlots: "2"
 
 logLevel: "INFO"
+
+# -----------------------------------------------------------------------------
+# VM Controller — uncomment to run KubeVirt VMs in this cluster instead of a
+# separate agent cluster. Requires KubeVirt + CDI installed beforehand and
+# nodes with hardware virtualization enabled.
+#
+# transport=http carries lifecycle (create/delete/query) only — in-VM daemon
+# events (heartbeat, freeze/resume) require NATS. Use transport=both with a
+# nats.url if you need those signals.
+# -----------------------------------------------------------------------------
+# vmController:
+#   enabled: true
+#   transport: http
+#   namespace: agent-vms
+#   vmStorageClass: longhorn
+#   vmDiskSize: 30Gi
+#   vmSshPublicKey: "ssh-ed25519 AAAA... agent@srw"

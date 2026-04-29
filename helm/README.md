@@ -34,6 +34,7 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
 | `pgadmin`, `mongoExpress`, `dozzle` | Admin UIs (off by default) | `*.enabled` |
 | `reloader` | Watches Secret/ConfigMap changes, triggers rolling restarts | `reloader.enabled` |
+| `vmController` | KubeVirt VM lifecycle controller (HTTP or NATS transport) | `vmController.enabled` |
 
 ---
 
@@ -247,6 +248,92 @@ CLOUD_SERVICE_PASSWORD=changeme
 Generate `APP_ENCRYPTION_KEY` with: `openssl rand -base64 32`
 
 ---
+
+## Same-cluster VMs (optional)
+
+By default the chart does not deploy any VM infrastructure — VMs live on a
+separate `vms` cluster managed by the Fleet bundles in `deployment-vms/`,
+and the orchestrator reaches them via NATS. To run KubeVirt VMs in the same
+cluster as the orchestrator, enable the bundled VM controller:
+
+```yaml
+vmController:
+  enabled: true
+  transport: http       # http | nats | both
+  namespace: agent-vms
+  vmStorageClass: longhorn
+  vmDiskSize: 30Gi
+  vmSshPublicKey: "ssh-ed25519 AAAA... agent@srw"
+```
+
+Prerequisites the chart does **not** install (the cluster operator must
+provide these before enabling the toggle):
+
+- **KubeVirt** operator + `KubeVirt` CR (cluster-scoped)
+- **CDI** operator (the bundled VM template uses `DataVolume`)
+- **Nodes with hardware virtualization** (`vmx`/`svm`) and the relevant
+  KubeVirt feature gates enabled
+
+The `transport` choice trades off features:
+
+- `http` (default for same-cluster) — orchestrator → controller over a
+  ClusterIP Service. Carries lifecycle only (create / delete / query).
+  Does **not** support in-VM daemon events (register, heartbeat, freeze,
+  resume) because those use NATS subjects. Use this when you only need
+  workspace VMs and your jobs don't pause/resume.
+- `nats` — same path as the cross-cluster bundle, but with the controller
+  co-located. Requires `nats.url` set to a reachable NATS server. Full
+  feature set.
+- `both` — controller listens on both transports. Useful while migrating
+  or when only some clients have been moved to HTTP.
+
+When `vmController.enabled=false`, none of these resources render and the
+orchestrator's behavior is identical to today (NATS / direct K8s / docker
+selection).
+
+### Network isolation
+
+Same-cluster VMs are covered by the **same NetworkPolicy** as workspace
+containers (`workspace.networkPolicy.enabled`, default `true`). KubeVirt
+propagates labels from `VMI.spec.template.metadata.labels` to the
+virt-launcher pod, so a single `podSelector` on
+`srw.io/component: agent-workspace` matches both pod and VM workspaces.
+Disabling the flag removes the policy for both — there is no separate
+VM-only toggle.
+
+The unified policy enforces:
+
+- **Ingress**: SSH/CDP only from the agent, IDE only from the orchestrator
+  / Traefik.
+- **Egress**: DNS, TCP 80/443, Tailscale (UDP/41641 + UDP/3478), in-cluster
+  database services. No general internet beyond HTTP/S.
+- **VM↔VM and container↔container lateral isolation**: the policy does not
+  list the workspace label as an allowed source.
+
+**CNI requirement.** NetworkPolicy on KubeVirt VMs is only enforced by CNIs
+that implement the standard policy resource on virt-launcher pods:
+
+| CNI                | NetworkPolicy enforced? |
+|--------------------|-------------------------|
+| Calico             | yes                     |
+| Cilium             | yes                     |
+| OVN-Kubernetes     | yes                     |
+| Antrea             | yes                     |
+| **Flannel**        | **no** (any policy)     |
+| Kube-OVN           | partial (KubeVirt bugs) |
+
+Operators on Flannel without a policy add-on see the resource applied with
+no effect — the YAML is accepted but does nothing. Verify your CNI before
+relying on the isolation guarantee.
+
+A note on Tailscale: VMs run their own `tailscaled` inside the guest, and
+KubeVirt's masquerade networking NATs the VM's NIC through virt-launcher's
+veth. Pod-level NetworkPolicy therefore only sees the encrypted WireGuard
+envelope (UDP/41641 + DERP/443), not the in-VM traffic. Egress restriction
+on virt-launcher pods is meaningful for boot-time + tunnel handshake
+traffic and meaningless for everything inside the tunnel — Headscale ACLs
+are the right layer for tailnet-source filtering. See
+`docs/features/workspace_network_policy_unification.md` for details.
 
 ## Post-install verification
 

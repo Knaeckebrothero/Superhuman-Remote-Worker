@@ -2960,6 +2960,7 @@ async def lifespan(app: FastAPI):
 
     # Cleanup clients
     await nats_bridge.disconnect()
+    await vm_provisioner.disconnect()
     await gitea_client.close()
 
     # Unregister the registry's DB hook before disconnecting the pool so
