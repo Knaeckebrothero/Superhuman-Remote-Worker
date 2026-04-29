@@ -98,6 +98,29 @@ Edit at minimum:
 - `cloud.externalBackend` + `cloud.externalUrl` → your cloud storage endpoint
 - `ingress.className` and `ingress.tls.issuerName` → your cluster's ingress + cert-manager issuer
 
+### Per-component hostname overrides
+
+By default every subservice ingress is `<subdomain>.<global.domain>` (`api`,
+`auth`, `git`, `cloud`, `mcp`, `neo4j`, …). When one of those flat names is
+already in use in the parent zone — e.g. you already run a Gitea at
+`git.example.com` and want SRW's bundled Gitea on a separate host — override
+just that hostname:
+
+```yaml
+global:
+  domain: srw.example.com
+  hostnames:
+    git: git-srw.example.com   # takes precedence over the default git.srw.example.com
+```
+
+The override propagates to the Ingress host + TLS SAN, the `GITEA_URL`
+ConfigMap entry, the cockpit deep-link, and the Keycloak gitea-client
+redirect URI. TLS Secret names stay tied to the release name, so two
+SRW installs in the same cluster never collide on cert storage. See
+`global.hostnames` in `values.yaml` for the full key list (cockpit, api,
+auth, git, cloud, mcp, neo4j, neo4jBolt, pgadmin, mongo, dozzle, headscale,
+minio).
+
 Pre-create the secret with all required keys (see [Secret schema](#secret-schema)):
 
 ```bash

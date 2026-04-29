@@ -27,6 +27,27 @@ global:
   # -- Pull secrets for private container registries (e.g. GHCR)
   imagePullSecrets: []
   #   - name: ghcr-pull-secret
+  # -- Per-component hostname overrides. When unset, each defaults to
+  # <subdomain>.<global.domain>. Set when a flat subdomain is already taken
+  # by another service in the same parent zone (e.g. an existing
+  # git.example.com forces using git-srw.example.com here). Each override
+  # is a full hostname (no scheme, no path) and propagates to Ingress hosts,
+  # ConfigMap URLs, OIDC redirect URIs, and the cockpit env-init script.
+  # TLS Secret names stay tied to the release name, not the host.
+  hostnames:
+    cockpit: ""        # default: <domain>             (cockpit root)
+    api: ""            # default: api.<domain>
+    auth: ""           # default: auth.<domain>        (overridden by keycloak.externalIssuerUrl when keycloak.internal=false)
+    git: ""            # default: git.<domain>         (overridden by gitea.externalUrl when gitea.internal=false)
+    cloud: ""          # default: cloud.<domain>       (overridden by cloud.externalUrl when using external cloud)
+    mcp: ""            # default: mcp.<domain>
+    neo4j: ""          # default: neo4j.<domain>       (Neo4j browser UI)
+    neo4jBolt: ""      # default: bolt-neo4j.<domain>  (Bolt TLS SAN + LoadBalancer host)
+    pgadmin: ""        # default: pgadmin.<domain>
+    mongo: ""          # default: mongo.<domain>       (mongo-express UI)
+    dozzle: ""         # default: dozzle.<domain>
+    headscale: ""      # default: headscale.<domain>   (overridden by headscale.url when set)
+    minio: ""          # default: minio.<domain>       (cockpit deep-link only — chart does not deploy MinIO)
 
 # =============================================================================
 # Container Images
