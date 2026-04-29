@@ -102,6 +102,10 @@ data:
           labels:
             vm.kubevirt.io/name: agent-vm-${JOB_ID}
             job-id: ${JOB_ID}
+            # Fleet-wide selector for the unified workspace NetworkPolicy.
+            # MUST live here (VMI template), not on the top-level VM metadata
+            # — only template labels propagate to the virt-launcher pod.
+            srw.io/component: agent-workspace
         spec:
           domain:
             cpu:

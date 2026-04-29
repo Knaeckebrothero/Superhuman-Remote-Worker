@@ -6,7 +6,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: srw-workspace
+      srw.io/component: agent-workspace
   policyTypes:
     - Ingress
     - Egress
@@ -51,11 +51,18 @@ spec:
         - protocol: TCP
           port: 53
     # HTTP/HTTPS for browser automation (agent-controlled browsing via CDP)
+    # and Tailscale DERP-relay fallback when UDP is blocked.
     - ports:
         - protocol: TCP
           port: 80
         - protocol: TCP
           port: 443
+    # Tailscale mesh — direct WireGuard peer + STUN (NAT discovery).
+    - ports:
+        - protocol: UDP
+          port: 41641
+        - protocol: UDP
+          port: 3478
     # Gitea (workspace git repos)
     - to:
         - podSelector:

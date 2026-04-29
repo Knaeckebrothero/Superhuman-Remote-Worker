@@ -524,6 +524,12 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_NAMESPACE
                   optional: true
+            - name: VM_CONTROLLER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VM_CONTROLLER_URL
+                  optional: true
             # Workspace containers
             - name: WORKSPACE_IMAGE
               valueFrom:

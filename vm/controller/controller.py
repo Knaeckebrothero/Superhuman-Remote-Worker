@@ -1,14 +1,18 @@
 """
 VM Controller — KubeVirt VM Lifecycle Manager
 
-Runs on the agent cluster. Subscribes to NATS subjects for VM lifecycle
-management and creates/deletes KubeVirt VirtualMachine resources via the
-Kubernetes API.
+Manages KubeVirt VirtualMachine resources on behalf of the orchestrator.
+Two transports, selected by TRANSPORT env (nats|http|both):
 
-Subjects:
-  vm.lifecycle.create   Orchestrator requests a new VM for a job
-  vm.lifecycle.delete   Orchestrator requests VM teardown
-  vm.lifecycle.status   Controller publishes creation/deletion results
+  nats  — cross-cluster: subscribe to vm.lifecycle.{create,delete,get},
+          publish results on vm.lifecycle.status. Default for the
+          deployment-vms/ Fleet bundle.
+  http  — same-cluster: serve POST /vms, DELETE /vms/{id}, GET /vms/{id}
+          on LISTEN_PORT (default 8080). Returns the result synchronously
+          so the orchestrator's HTTP client can update job context itself
+          — no separate status channel needed for lifecycle events.
+  both  — run both. Useful when migrating, or when the in-VM management
+          daemon still uses NATS while the orchestrator dials HTTP.
 
 SSH connectivity uses a Headscale mesh VPN (self-hosted Tailscale). The
 controller generates short-lived auth keys via the Headscale API and injects
@@ -57,6 +61,12 @@ DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
 VM_STORAGE_CLASS = os.environ.get("VM_STORAGE_CLASS", "local-path")
 VM_DISK_SIZE = os.environ.get("VM_DISK_SIZE", "20Gi")
 
+# Transport selection: nats | http | both. Defaults to nats so existing
+# deployment-vms/ Fleet bundles keep working without overrides.
+TRANSPORT = os.environ.get("TRANSPORT", "nats").lower()
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+
 # KubeVirt API coordinates
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
@@ -67,7 +77,8 @@ class VMController:
     """Manages KubeVirt VM lifecycle via NATS commands."""
 
     def __init__(self):
-        self.nc = None  # NATS client
+        self.nc = None  # NATS client (when transport includes nats)
+        self.http_runner = None  # aiohttp AppRunner (when transport includes http)
         self.k8s_client = None  # kubernetes CustomObjectsApi
         self.template_text: str = ""  # Raw YAML template (for string substitution)
         self.headscale = HeadscaleClient()
@@ -158,216 +169,164 @@ class VMController:
         )
         log.info("Connected to NATS at %s", NATS_URL)
 
-    async def handle_create(self, msg):
-        """Handle vm.lifecycle.create — create a KubeVirt VirtualMachine.
+    # =========================================================================
+    # Transport-agnostic core
+    #
+    # Each `_do_*` method takes a plain dict, performs the K8s work, and
+    # returns a result dict shaped the same as the historical NATS status
+    # payload. Both NATS and HTTP transports wrap these.
+    # =========================================================================
 
-        Expected payload:
-        {
-            "job_id": "uuid",
-            "agent_config": "developer",
-            "vm_image": "ghcr.io/.../agent-vm-base:latest",
-            "cpu_cores": 2,
-            "memory": "4Gi",
-            "nats_url": "nats://...",
-            "description": "Task description"
-        }
-        """
+    async def _do_create(self, job_config: dict) -> dict:
+        """Create a KubeVirt VirtualMachine for a job."""
         from kubernetes.client.exceptions import ApiException
 
-        try:
-            job_config = json.loads(msg.data.decode())
-            job_id = job_config.get("job_id", "unknown")
-            log.info("Creating VM for job %s", job_id)
+        job_id = job_config.get("job_id", "unknown")
+        log.info("Creating VM for job %s", job_id)
 
-            # Generate a Headscale pre-auth key so the VM joins the tailnet
-            tailscale_auth_key = ""
-            if self.headscale.is_available:
-                tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
-                if not tailscale_auth_key:
-                    log.warning(
-                        "Failed to get Headscale auth key for job %s — "
-                        "VM will boot without mesh VPN",
-                        job_id,
-                    )
+        tailscale_auth_key = ""
+        if self.headscale.is_available:
+            tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
+            if not tailscale_auth_key:
+                log.warning(
+                    "Failed to get Headscale auth key for job %s — "
+                    "VM will boot without mesh VPN",
+                    job_id,
+                )
 
-            manifest = self.render_template(job_config, tailscale_auth_key)
-            vm_name = manifest["metadata"]["name"]
+        manifest = self.render_template(job_config, tailscale_auth_key)
+        vm_name = manifest["metadata"]["name"]
 
-            # Retry loop: if the old VM is still being deleted (409 Conflict),
-            # wait for the finalizer to clear before creating the new one.
-            max_retries = 12  # ~60s total
-            for attempt in range(max_retries + 1):
-                try:
-                    self.k8s_client.create_namespaced_custom_object(
-                        group=KUBEVIRT_GROUP,
-                        version=KUBEVIRT_VERSION,
-                        namespace=VM_NAMESPACE,
-                        plural=KUBEVIRT_PLURAL,
-                        body=manifest,
-                    )
-                    break  # Success
-                except ApiException as e:
-                    if e.status == 409 and "is being deleted" in (e.body or ""):
-                        if attempt < max_retries:
-                            log.info(
-                                "VM %s still being deleted, waiting... (attempt %d/%d)",
-                                vm_name,
-                                attempt + 1,
-                                max_retries,
-                            )
-                            await asyncio.sleep(5)
-                            continue
-                        log.error(
-                            "VM %s still being deleted after %d retries, giving up",
-                            vm_name,
-                            max_retries,
-                        )
-                    raise
-
-            log.info("VM created: %s (job %s)", vm_name, job_id)
-
-            await self._publish_status(
-                job_id,
-                {
-                    "job_id": job_id,
-                    "status": "created",
-                    "vm_name": vm_name,
-                    "namespace": VM_NAMESPACE,
-                },
-            )
-
-        except Exception as e:
-            job_id = "unknown"
+        max_retries = 12  # ~60s total
+        for attempt in range(max_retries + 1):
             try:
-                job_id = json.loads(msg.data.decode()).get("job_id", "unknown")
-            except Exception:
-                pass
-
-            log.exception("Failed to create VM for job %s", job_id)
-            await self._publish_status(
-                job_id,
-                {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": str(e),
-                },
-            )
-
-    async def handle_delete(self, msg):
-        """Handle vm.lifecycle.delete — delete a KubeVirt VirtualMachine.
-
-        Expected payload:
-        {
-            "job_id": "uuid"
-        }
-        """
-        from kubernetes.client.exceptions import ApiException
-
-        try:
-            data = json.loads(msg.data.decode())
-            job_id = data["job_id"]
-            vm_name = f"agent-vm-{job_id}"
-            log.info("Deleting VM %s (job %s)", vm_name, job_id)
-
-            try:
-                self.k8s_client.delete_namespaced_custom_object(
+                self.k8s_client.create_namespaced_custom_object(
                     group=KUBEVIRT_GROUP,
                     version=KUBEVIRT_VERSION,
                     namespace=VM_NAMESPACE,
                     plural=KUBEVIRT_PLURAL,
-                    name=vm_name,
+                    body=manifest,
                 )
+                break
             except ApiException as e:
-                if e.status == 404:
-                    log.info("VM %s already gone (404), treating as deleted", vm_name)
-                else:
-                    raise
+                if e.status == 409 and "is being deleted" in (e.body or ""):
+                    if attempt < max_retries:
+                        log.info(
+                            "VM %s still being deleted, waiting... (attempt %d/%d)",
+                            vm_name,
+                            attempt + 1,
+                            max_retries,
+                        )
+                        await asyncio.sleep(5)
+                        continue
+                    log.error(
+                        "VM %s still being deleted after %d retries, giving up",
+                        vm_name,
+                        max_retries,
+                    )
+                raise
 
-            # Remove the VM's node from Headscale (ephemeral nodes auto-expire,
-            # but explicit cleanup is faster and avoids stale entries)
-            if self.headscale.is_available:
-                await self.headscale.delete_node(job_id)
-
-            log.info("VM deleted: %s (job %s)", vm_name, job_id)
-
-            await self._publish_status(
-                job_id,
-                {
-                    "job_id": job_id,
-                    "status": "deleted",
-                    "vm_name": vm_name,
-                },
-            )
-
-        except Exception as e:
-            job_id = "unknown"
-            try:
-                job_id = json.loads(msg.data.decode()).get("job_id", "unknown")
-            except Exception:
-                pass
-
-            log.exception("Failed to delete VM for job %s", job_id)
-            await self._publish_status(
-                job_id,
-                {
-                    "job_id": job_id,
-                    "status": "delete_failed",
-                    "error": str(e),
-                },
-            )
-
-    async def handle_status_query(self, msg):
-        """Handle vm.lifecycle.get — query the status of a VM.
-
-        Expected payload:
-        {
-            "job_id": "uuid"
+        log.info("VM created: %s (job %s)", vm_name, job_id)
+        return {
+            "job_id": job_id,
+            "status": "created",
+            "vm_name": vm_name,
+            "namespace": VM_NAMESPACE,
         }
 
-        Responds with the VirtualMachine's status from the Kubernetes API.
-        """
-        try:
-            data = json.loads(msg.data.decode())
-            job_id = data["job_id"]
-            vm_name = f"agent-vm-{job_id}"
+    async def _do_delete(self, job_id: str) -> dict:
+        """Delete a KubeVirt VirtualMachine for a job."""
+        from kubernetes.client.exceptions import ApiException
 
-            vm = self.k8s_client.get_namespaced_custom_object(
+        vm_name = f"agent-vm-{job_id}"
+        log.info("Deleting VM %s (job %s)", vm_name, job_id)
+
+        try:
+            self.k8s_client.delete_namespaced_custom_object(
                 group=KUBEVIRT_GROUP,
                 version=KUBEVIRT_VERSION,
                 namespace=VM_NAMESPACE,
                 plural=KUBEVIRT_PLURAL,
                 name=vm_name,
             )
+        except ApiException as e:
+            if e.status == 404:
+                log.info("VM %s already gone (404), treating as deleted", vm_name)
+            else:
+                raise
 
-            # Extract status fields
-            status = vm.get("status", {})
-            conditions = status.get("conditions", [])
-            ready = any(
-                c.get("type") == "Ready" and c.get("status") == "True"
-                for c in conditions
+        if self.headscale.is_available:
+            await self.headscale.delete_node(job_id)
+
+        log.info("VM deleted: %s (job %s)", vm_name, job_id)
+        return {"job_id": job_id, "status": "deleted", "vm_name": vm_name}
+
+    async def _do_status(self, job_id: str) -> dict:
+        """Query KubeVirt for a VM's current status."""
+        vm_name = f"agent-vm-{job_id}"
+        vm = self.k8s_client.get_namespaced_custom_object(
+            group=KUBEVIRT_GROUP,
+            version=KUBEVIRT_VERSION,
+            namespace=VM_NAMESPACE,
+            plural=KUBEVIRT_PLURAL,
+            name=vm_name,
+        )
+        status = vm.get("status", {})
+        conditions = status.get("conditions", [])
+        ready = any(
+            c.get("type") == "Ready" and c.get("status") == "True"
+            for c in conditions
+        )
+        return {
+            "job_id": job_id,
+            "vm_name": vm_name,
+            "ready": ready,
+            "phase": status.get("printableStatus", "Unknown"),
+            "created": status.get("created", False),
+        }
+
+    # =========================================================================
+    # NATS transport
+    # =========================================================================
+
+    async def handle_create(self, msg):
+        """vm.lifecycle.create → _do_create + publish vm.lifecycle.status."""
+        try:
+            job_config = json.loads(msg.data.decode())
+            result = await self._do_create(job_config)
+            await self._publish_status(result["job_id"], result)
+        except Exception as e:
+            job_id = _safe_job_id(msg.data)
+            log.exception("Failed to create VM for job %s", job_id)
+            await self._publish_status(
+                job_id, {"job_id": job_id, "status": "failed", "error": str(e)}
             )
 
-            response = {
-                "job_id": job_id,
-                "vm_name": vm_name,
-                "ready": ready,
-                "phase": status.get("printableStatus", "Unknown"),
-                "created": status.get("created", False),
-            }
+    async def handle_delete(self, msg):
+        """vm.lifecycle.delete → _do_delete + publish vm.lifecycle.status."""
+        try:
+            data = json.loads(msg.data.decode())
+            result = await self._do_delete(data["job_id"])
+            await self._publish_status(result["job_id"], result)
+        except Exception as e:
+            job_id = _safe_job_id(msg.data)
+            log.exception("Failed to delete VM for job %s", job_id)
+            await self._publish_status(
+                job_id,
+                {"job_id": job_id, "status": "delete_failed", "error": str(e)},
+            )
 
-            # Use request-reply if available
+    async def handle_status_query(self, msg):
+        """vm.lifecycle.get → _do_status (request/reply or status publish)."""
+        try:
+            data = json.loads(msg.data.decode())
+            response = await self._do_status(data["job_id"])
             if msg.reply:
                 await self.nc.publish(msg.reply, json.dumps(response).encode())
             else:
-                await self._publish_status(job_id, response)
-
+                await self._publish_status(response["job_id"], response)
         except Exception as e:
-            job_id = "unknown"
-            try:
-                job_id = json.loads(msg.data.decode()).get("job_id", "unknown")
-            except Exception:
-                pass
-
+            job_id = _safe_job_id(msg.data)
             error_response = {
                 "job_id": job_id,
                 "status": "query_failed",
@@ -378,8 +337,88 @@ class VMController:
             else:
                 await self._publish_status(job_id, error_response)
 
+    # =========================================================================
+    # HTTP transport (aiohttp)
+    # =========================================================================
+
+    async def http_create(self, request):
+        """POST /vms — body is the create payload, returns the result dict."""
+        from aiohttp import web
+
+        try:
+            payload = await request.json()
+        except Exception as e:
+            return web.json_response({"error": f"invalid json: {e}"}, status=400)
+
+        if not payload.get("job_id"):
+            return web.json_response({"error": "job_id required"}, status=400)
+
+        try:
+            result = await self._do_create(payload)
+            return web.json_response(result, status=200)
+        except Exception as e:
+            log.exception("HTTP create failed for job %s", payload.get("job_id"))
+            return web.json_response(
+                {
+                    "job_id": payload.get("job_id", "unknown"),
+                    "status": "failed",
+                    "error": str(e),
+                },
+                status=500,
+            )
+
+    async def http_delete(self, request):
+        """DELETE /vms/{job_id} — returns the result dict."""
+        from aiohttp import web
+
+        job_id = request.match_info.get("job_id")
+        if not job_id:
+            return web.json_response({"error": "job_id required"}, status=400)
+
+        try:
+            result = await self._do_delete(job_id)
+            return web.json_response(result, status=200)
+        except Exception as e:
+            log.exception("HTTP delete failed for job %s", job_id)
+            return web.json_response(
+                {"job_id": job_id, "status": "delete_failed", "error": str(e)},
+                status=500,
+            )
+
+    async def http_status(self, request):
+        """GET /vms/{job_id} — returns the result dict."""
+        from aiohttp import web
+
+        job_id = request.match_info.get("job_id")
+        if not job_id:
+            return web.json_response({"error": "job_id required"}, status=400)
+
+        try:
+            result = await self._do_status(job_id)
+            return web.json_response(result, status=200)
+        except Exception as e:
+            from kubernetes.client.exceptions import ApiException
+
+            if isinstance(e, ApiException) and e.status == 404:
+                return web.json_response(
+                    {"job_id": job_id, "status": "not_found"}, status=404
+                )
+            log.debug("HTTP status query failed for job %s: %s", job_id, e)
+            return web.json_response(
+                {"job_id": job_id, "status": "query_failed", "error": str(e)},
+                status=500,
+            )
+
+    async def http_health(self, _request):
+        """GET /healthz — liveness probe target."""
+        from aiohttp import web
+
+        return web.json_response({"status": "ok"})
+
     async def _publish_status(self, job_id: str, payload: dict):
-        """Publish a status message on vm.lifecycle.status."""
+        """Publish a status message on vm.lifecycle.status (NATS only)."""
+        if not self.nc:
+            return
         try:
             await self.nc.publish(
                 "vm.lifecycle.status",
@@ -388,30 +427,55 @@ class VMController:
         except Exception:
             log.exception("Failed to publish status for job %s", job_id)
 
+    async def start_http_server(self) -> None:
+        """Start the aiohttp HTTP server. Runs alongside other transports."""
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post("/vms", self.http_create)
+        app.router.add_delete("/vms/{job_id}", self.http_delete)
+        app.router.add_get("/vms/{job_id}", self.http_status)
+        app.router.add_get("/healthz", self.http_health)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
+        await site.start()
+        self.http_runner = runner
+        log.info("HTTP server listening on %s:%d", LISTEN_HOST, LISTEN_PORT)
+
     async def run(self):
-        """Main entry point — connect, subscribe, wait for shutdown."""
-        log.info("VM Controller starting")
+        """Main entry point — connect transports, wait for shutdown."""
+        log.info("VM Controller starting (transport=%s)", TRANSPORT)
+
+        if TRANSPORT not in ("nats", "http", "both"):
+            log.error("Invalid TRANSPORT=%s (expected nats|http|both)", TRANSPORT)
+            sys.exit(1)
 
         self.load_template()
         self.init_k8s()
         await self.headscale.init()
-        await self.connect_nats()
 
-        # Subscribe to lifecycle subjects
-        await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
-        await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
-        await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
-        log.info(
-            "Subscribed to vm.lifecycle.{create,delete,get} — waiting for requests"
-        )
+        if TRANSPORT in ("nats", "both"):
+            await self.connect_nats()
+            await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
+            await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
+            await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
+            log.info(
+                "Subscribed to vm.lifecycle.{create,delete,get} — waiting for NATS requests"
+            )
+
+        if TRANSPORT in ("http", "both"):
+            await self.start_http_server()
 
         # Wait for shutdown signal
         await self._shutdown.wait()
 
-        # Drain and disconnect
         log.info("Shutting down...")
         if self.nc and self.nc.is_connected:
             await self.nc.drain()
+        if self.http_runner is not None:
+            await self.http_runner.cleanup()
         await self.headscale.close()
 
         log.info("VM Controller stopped")
@@ -419,6 +483,14 @@ class VMController:
     def request_shutdown(self):
         """Signal the controller to shut down gracefully."""
         self._shutdown.set()
+
+
+def _safe_job_id(data: bytes) -> str:
+    """Extract job_id from a NATS payload without raising."""
+    try:
+        return json.loads(data.decode()).get("job_id", "unknown")
+    except Exception:
+        return "unknown"
 
 
 def main():
