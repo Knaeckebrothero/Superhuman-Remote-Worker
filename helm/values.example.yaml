@@ -1,0 +1,147 @@
+# =============================================================================
+# values.example.yaml — starter overlay for production / customer installs
+# =============================================================================
+# This is a customer-friendly template assuming you bring your own external
+# services (managed Postgres, OIDC provider, git server, cloud storage). Every
+# field in this file MUST be reviewed before install.
+#
+# For all configurable options and defaults, see values.yaml or run:
+#   helm show values oci://ghcr.io/knaeckebrothero/charts/superhuman-remote-worker
+#
+# For evaluation with everything bundled in-cluster, see the README's
+# "Quick start" section instead — most of this file does not apply.
+# =============================================================================
+
+# REQUIRED: accept the license terms (see LICENSE in the source repository).
+license:
+  acceptTerms: false
+
+global:
+  # REQUIRED: base domain. All subdomains (api, auth, git, cloud, mcp) are
+  # derived from this. DNS records must point at your ingress controller.
+  domain: "srw.example.com"
+  # Pull credentials for private GHCR images. Omit if images are public.
+  imagePullSecrets:
+    - name: ghcr-pull-secret
+
+# -----------------------------------------------------------------------------
+# Secrets — pre-create a K8s Secret named "srw-secrets" with the keys listed
+# in the chart README ("Secret schema") and reference it here.
+# Alternative modes: secrets.create (chart-managed, dev only) or
+# externalSecrets.enabled (Vault via ESO). See README.
+# -----------------------------------------------------------------------------
+secrets:
+  existingSecret: srw-secrets
+
+# -----------------------------------------------------------------------------
+# OIDC — point at your existing IdP (Azure AD, Google Workspace, Okta, etc.)
+# -----------------------------------------------------------------------------
+keycloak:
+  enabled: true
+  internal: false  # do not deploy the bundled Keycloak
+  externalIssuerUrl: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+  cockpitClientId: "srw-cockpit"
+  adminApiDisabled: true  # required when using a non-Keycloak IdP
+
+# -----------------------------------------------------------------------------
+# Git server — your existing Gitea / GitHub Enterprise / GitLab.
+# -----------------------------------------------------------------------------
+gitea:
+  enabled: true
+  internal: false
+  internalUrl: "https://git.internal.example.com"
+  externalUrl: "https://git.internal.example.com"
+
+# -----------------------------------------------------------------------------
+# Databases — external managed instances. See README for required Secret keys.
+# -----------------------------------------------------------------------------
+databases:
+  postgres:
+    enabled: true
+    internal: false
+    externalUrl: "postgres://srw:<pw>@pg.example.com:5432/srw"
+  vector:
+    enabled: true
+    internal: false
+    externalUrl: "postgresql://srw:<pw>@pg.example.com:5432/srw_vector"
+  mongodb:
+    enabled: true
+    internal: false
+    externalUrl: "mongodb://srw:<pw>@mongo.example.com:27017/srw_logs"
+  neo4j:
+    # Neo4j is optional. Disable unless you use the project knowledge graph.
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# Cloud storage — point at your existing Nextcloud / OpenCloud / WebDAV.
+# Disables the bundled cloud StatefulSet.
+# -----------------------------------------------------------------------------
+opencloud:
+  enabled: false
+nextcloud:
+  enabled: false
+cloud:
+  externalBackend: "nextcloud"  # "nextcloud" | "opencloud" | "webdav"
+  externalUrl: "https://cloud.internal.example.com"
+  externalServiceUrl: "https://cloud.internal.example.com"
+  # CLOUD_SERVICE_USER / CLOUD_SERVICE_PASSWORD live in srw-secrets.
+
+# -----------------------------------------------------------------------------
+# S3 / object storage — used for snapshot / backup archives.
+# -----------------------------------------------------------------------------
+s3:
+  endpoint: "https://s3.eu-central-1.amazonaws.com"
+  bucket: "srw-snapshots"
+  region: "eu-central-1"
+  snapshotMaxSizeGb: "10"
+  snapshotRetentionDays: "90"
+
+# -----------------------------------------------------------------------------
+# Disable home-cluster-only components.
+# -----------------------------------------------------------------------------
+headscale:
+  enabled: false
+pgadmin:
+  enabled: false
+mongoExpress:
+  enabled: false
+dozzle:
+  enabled: false
+codexProxy:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# LLM defaults — provider keys live in the secret. The orchestrator reads the
+# active model catalog from the database (system_api_keys + llm_endpoints),
+# seeded post-install via Admin → Providers in the UI.
+# -----------------------------------------------------------------------------
+llm:
+  baseUrl: "https://api.openai.com/v1"
+  visionModel: "gpt-4o-mini"
+  embeddingModel: "qwen3-embedding-8b"
+  # Optional: seed system endpoints declaratively at install time.
+  # See values.yaml `llm.seed.*` for schema.
+  seed:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# Ingress — set to match your cluster's ingress controller and cert-manager.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx  # or "traefik"
+  tls:
+    enabled: true
+    issuerName: letsencrypt-prod
+
+# -----------------------------------------------------------------------------
+# Sizing — defaults are dev-friendly. Adjust for production load.
+# -----------------------------------------------------------------------------
+agent:
+  pool:
+    minAgents: "2"
+    maxAgents: "10"
+    reservedSessionSlots: "2"
+    reservedJobSlots: "2"
+
+logLevel: "INFO"
