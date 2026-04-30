@@ -231,11 +231,11 @@ data:
           "secret": "${PGADMIN_OIDC_CLIENT_SECRET}",
           "redirectUris": [
             "http://localhost:5050/oauth2/authorize",
-            "https://pgadmin.{{ .Values.global.domain }}/oauth2/authorize"
+            "https://{{ include "srw.pgadminHost" . }}/oauth2/authorize"
           ],
           "webOrigins": [
             "http://localhost:5050",
-            "https://pgadmin.{{ .Values.global.domain }}"
+            "https://{{ include "srw.pgadminHost" . }}"
           ],
           "protocol": "openid-connect",
           "defaultClientScopes": [

@@ -1,0 +1,83 @@
+# Workspace VM NetworkPolicy — cross-cluster install
+#
+# Cross-cluster subset of the unified workspace policy. Selects the same
+# label as the helm-chart same-cluster path (srw.io/component: agent-workspace),
+# applied to virt-launcher pods via the VM template's
+# spec.template.metadata.labels.
+#
+# What this enforces:
+#   - Egress restriction (DNS, 80/443, Tailscale UDP carve-outs).
+#   - VM↔VM lateral isolation (workspace label is NOT in any allowed source).
+#
+# What this deliberately does NOT enforce:
+#   - Ingress restriction by source. Cross-cluster traffic from the
+#     orchestrator arrives via the Headscale/Tailscale mesh. Tailscale CGNAT
+#     IPs (100.64.0.0/10) only exist *inside* the WireGuard tunnel, after
+#     decryption by tailscaled — the cluster CNI sees only the encrypted
+#     underlay (UDP/41641 + TCP/443 from node IPs / DERP relays). Filtering
+#     ingress by source IP at this layer is fantasy.
+#
+#     The actual cross-cluster gates are:
+#       1. Headscale ACLs (tailnet-level identity)
+#       2. SSH key auth + IDE token (app-level)
+#
+# What this deliberately omits vs. the helm policy:
+#   - In-cluster DB egress. Databases live in the orchestrator cluster; VMs
+#     reach them via Tailscale, which is opaque to pod-level NetworkPolicy.
+#   - In-cluster pod selectors for ingress (orchestrator/agent/Traefik don't
+#     run on this cluster).
+#
+# CNI requirement: only enforced by Calico, Cilium, OVN-Kubernetes, Antrea.
+# Flannel does not enforce NetworkPolicy at all — operators on Flannel see
+# this resource applied with no effect.
+#
+# See docs/features/workspace_network_policy_unification.md for the full
+# design rationale.
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srw-vm-workspace-policy
+  namespace: agent-vms
+  labels:
+    app: srw-vm-controller
+spec:
+  podSelector:
+    matchLabels:
+      srw.io/component: agent-workspace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Ingress is open at the pod-level. Tailscale ACLs + SSH/IDE auth are
+    # the actual gate (see header). VM↔VM lateral movement is denied below
+    # because no allowed source carries srw.io/component=agent-workspace.
+    - {}
+  egress:
+    # DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTP/HTTPS — package mirrors at boot, agent browser automation,
+    # and the Tailscale DERP-relay fallback when UDP is blocked.
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+    # Tailscale mesh — direct WireGuard peer (UDP/41641) and STUN (UDP/3478).
+    # Required to reach Headscale and orchestrator-cluster peers via the
+    # mesh. If UDP is blocked end-to-end, Tailscale falls back to
+    # DERP-over-443 transparently.
+    - ports:
+        - protocol: UDP
+          port: 41641
+        - protocol: UDP
+          port: 3478
+    # No DB egress carve-outs — databases live in the orchestrator cluster
+    # and are reached over the Tailscale tunnel, which is opaque to
+    # pod-level NetworkPolicy.
+    # No kubevirt namespace egress — virt-launcher↔virt-handler is via
+    # hostPath Unix socket, not pod network.

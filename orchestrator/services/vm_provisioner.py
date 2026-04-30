@@ -1,17 +1,26 @@
 """VM Provisioner — Unified VM lifecycle management.
 
-Two backends, auto-selected based on available infrastructure:
+Four backends, auto-selected based on available infrastructure:
 
 1. **NATS bridge** (cross-cluster): Publishes to NATS, VM Controller on remote
    agent cluster handles KubeVirt API calls. Used when NATS_URL is configured.
 
-2. **Direct K8s API** (same-cluster): Orchestrator calls KubeVirt API directly.
-   Used when both orchestrator and VMs run on the same cluster.
+2. **HTTP controller** (same-cluster): POSTs to a co-located VM Controller
+   over HTTP. The controller still owns KubeVirt RBAC and the VM template;
+   only the transport changes. Used when VM_CONTROLLER_URL is configured.
 
-Selection logic:
-  - NATS_URL set and nats-py installed → NATS mode
-  - No NATS, but kubernetes client available + VM template found → direct mode
-  - Neither → VM features disabled
+3. **Direct K8s API** (same-cluster, no controller): Orchestrator calls
+   KubeVirt API directly. Requires VM_TEMPLATE_PATH + kubevirt.io RBAC on
+   the orchestrator's ServiceAccount.
+
+4. **Docker** (compose): QEMU-in-Docker pool, see docker_provisioner.py.
+
+Selection priority:
+  NATS_URL set       → NATS mode
+  VM_CONTROLLER_URL  → HTTP mode
+  template + k8s     → direct mode
+  docker hosts       → docker mode
+  none               → VM features disabled
 
 The VM endpoints and lifecycle hooks in main.py use this provisioner exclusively.
 """
@@ -21,6 +30,7 @@ import logging
 import os
 from typing import Any, Optional
 
+import httpx
 import yaml
 
 from .nats_bridge import nats_bridge
@@ -75,11 +85,25 @@ class VMProvisioner:
             "DEFAULT_VM_IMAGE",
             "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
         )
+        # HTTP controller transport (same-cluster, no NATS).
+        self._controller_url: str = os.environ.get("VM_CONTROLLER_URL", "").rstrip("/")
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._http_timeout: float = float(os.environ.get("VM_CONTROLLER_TIMEOUT", "30"))
 
     @property
     def is_available(self) -> bool:
         """True if any VM provisioning backend is available."""
-        return nats_bridge.is_available or self._k8s_available or self._docker_available
+        return (
+            nats_bridge.is_available
+            or self._http_available
+            or self._k8s_available
+            or self._docker_available
+        )
+
+    @property
+    def _http_available(self) -> bool:
+        """True if a co-located VM controller HTTP endpoint is configured."""
+        return bool(self._controller_url)
 
     @property
     def _docker_available(self) -> bool:
@@ -90,9 +114,11 @@ class VMProvisioner:
 
     @property
     def mode(self) -> Optional[str]:
-        """Current provisioning mode: 'nats', 'direct', 'docker', or None."""
+        """Current provisioning mode: 'nats', 'http', 'direct', 'docker', or None."""
         if nats_bridge.is_available:
             return "nats"
+        if self._http_available:
+            return "http"
         if self._k8s_available:
             return "direct"
         if self._docker_available:
@@ -118,17 +144,38 @@ class VMProvisioner:
         self._snapshot_service = snapshot_service
         self._init_k8s()
 
-        if self._k8s_available:
+        if self._http_available:
+            self._http_client = httpx.AsyncClient(
+                base_url=self._controller_url,
+                timeout=self._http_timeout,
+            )
+
+        if nats_bridge.is_available:
+            logger.info("VM provisioner ready: NATS mode")
+        elif self._http_available:
+            logger.info(
+                "VM provisioner ready: HTTP mode (controller=%s)",
+                self._controller_url,
+            )
+        elif self._k8s_available:
             logger.info(
                 "VM provisioner ready: direct K8s mode (namespace=%s)",
                 self._vm_namespace,
             )
-        elif nats_bridge.is_available:
-            logger.info("VM provisioner ready: NATS mode")
         else:
             logger.info(
-                "VM provisioner: no backend available (NATS and K8s both unavailable)"
+                "VM provisioner: no backend available "
+                "(NATS, controller URL, and K8s all unavailable)"
             )
+
+    async def disconnect(self) -> None:
+        """Close the HTTP client (if any)."""
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                logger.debug("Error closing VM controller HTTP client", exc_info=True)
+            self._http_client = None
 
     def _init_k8s(self) -> None:
         """Try to initialize the Kubernetes client for direct provisioning."""
@@ -217,7 +264,8 @@ class VMProvisioner:
     ) -> bool:
         """Create a VM for a job.
 
-        Uses NATS (cross-cluster) or direct K8s API (same-cluster).
+        Picks the highest-priority transport that is available
+        (NATS > HTTP > direct > docker).
 
         Returns:
             True if the request was accepted, False otherwise.
@@ -230,6 +278,17 @@ class VMProvisioner:
                 cpu_cores=cpu_cores,
                 memory=memory,
                 description=description,
+            )
+
+        if self._http_available:
+            return await self._create_http(
+                job_id=job_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
+                entity_type="job",
             )
 
         if self._k8s_available:
@@ -259,6 +318,9 @@ class VMProvisioner:
         """
         if nats_bridge.is_available:
             return await nats_bridge.request_vm_delete(job_id)
+
+        if self._http_available:
+            return await self._delete_http(job_id, entity_type="job")
 
         if self._k8s_available:
             return await self._delete_direct(job_id)
@@ -375,6 +437,7 @@ class VMProvisioner:
         """Query live VM status.
 
         NATS mode: request/reply to VM controller.
+        HTTP mode: GET /vms/{job_id} on the controller.
         Direct mode: query KubeVirt API.
 
         Returns:
@@ -382,6 +445,9 @@ class VMProvisioner:
         """
         if nats_bridge.is_available:
             return await nats_bridge.query_vm_status(job_id, timeout)
+
+        if self._http_available:
+            return await self._query_http(job_id, timeout)
 
         if self._k8s_available:
             return await self._query_direct(job_id)
@@ -517,6 +583,143 @@ class VMProvisioner:
             return None
 
     # =========================================================================
+    # HTTP controller backend (same-cluster, controller-mediated)
+    #
+    # The controller still owns KubeVirt RBAC and the VM template; this
+    # transport just swaps NATS for HTTP. Status updates that NATS pushed
+    # asynchronously now arrive synchronously in the response body, so
+    # context updates happen here in the orchestrator instead of via the
+    # vm.lifecycle.status subscription.
+    #
+    # Caveat: in-VM daemon events (register/heartbeat/freeze/resume) are
+    # NOT carried by this transport. Same-cluster deployments that need
+    # those still need NATS (or a future HTTP webhook from the daemon).
+    # =========================================================================
+
+    async def _create_http(
+        self,
+        job_id: str,
+        agent_config: str,
+        vm_image: Optional[str],
+        cpu_cores: int,
+        memory: str,
+        description: str,
+        entity_type: str = "job",
+    ) -> bool:
+        """Create a VM by POSTing to the co-located VM controller."""
+        if self._http_client is None:
+            return False
+
+        payload: dict[str, Any] = {
+            "job_id": job_id,
+            "agent_config": agent_config,
+            "cpu_cores": cpu_cores,
+            "memory": memory,
+            "description": description,
+            "nats_url": "",  # No NATS in same-cluster mode
+        }
+        if vm_image:
+            payload["vm_image"] = vm_image
+
+        try:
+            await self._set_context(entity_type, job_id, {"status": "provisioning"})
+            resp = await self._http_client.post("/vms", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+            await self._set_context(
+                entity_type,
+                job_id,
+                {
+                    "status": data.get("status", "created"),
+                    "vm_name": data.get("vm_name"),
+                    "namespace": data.get("namespace"),
+                    "provisioned_by": "http",
+                },
+            )
+            logger.info(
+                "VM created (http): %s (%s %s)",
+                data.get("vm_name"),
+                entity_type,
+                job_id,
+            )
+            return True
+        except httpx.HTTPStatusError as e:
+            error = _extract_http_error(e.response)
+            logger.error(
+                "VM controller rejected create for %s %s: %s",
+                entity_type,
+                job_id,
+                error,
+            )
+            await self._set_context(
+                entity_type,
+                job_id,
+                {"status": "failed", "error": error, "provisioned_by": "http"},
+            )
+            return False
+        except Exception as e:
+            logger.error("HTTP create failed for %s %s: %s", entity_type, job_id, e)
+            await self._set_context(
+                entity_type,
+                job_id,
+                {"status": "failed", "error": str(e), "provisioned_by": "http"},
+            )
+            return False
+
+    async def _delete_http(self, job_id: str, entity_type: str = "job") -> bool:
+        """Delete a VM by sending DELETE to the co-located VM controller."""
+        if self._http_client is None:
+            return False
+
+        try:
+            resp = await self._http_client.delete(f"/vms/{job_id}")
+            # 404 from the controller means already gone — treat as success.
+            if resp.status_code == 404:
+                await self._set_context(entity_type, job_id, {"status": "deleted"})
+                return True
+            resp.raise_for_status()
+            await self._set_context(entity_type, job_id, {"status": "deleted"})
+            logger.info("VM deleted (http): %s %s", entity_type, job_id)
+            return True
+        except httpx.HTTPStatusError as e:
+            error = _extract_http_error(e.response)
+            logger.error(
+                "VM controller rejected delete for %s %s: %s",
+                entity_type,
+                job_id,
+                error,
+            )
+            return False
+        except Exception as e:
+            logger.error("HTTP delete failed for %s %s: %s", entity_type, job_id, e)
+            return False
+
+    async def _query_http(self, job_id: str, timeout: float = 5.0) -> Optional[dict]:
+        """Query VM status via the co-located VM controller."""
+        if self._http_client is None:
+            return None
+
+        try:
+            resp = await self._http_client.get(f"/vms/{job_id}", timeout=timeout)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("HTTP status query failed for job %s: %s", job_id, e)
+            return None
+
+    async def _set_context(
+        self, entity_type: str, entity_id: str, updates: dict
+    ) -> None:
+        """Route context updates to the right table based on entity type."""
+        if entity_type == "thread":
+            await self._set_thread_vm_context(entity_id, updates)
+        else:
+            await self._set_vm_context(entity_id, updates)
+
+    # =========================================================================
     # Helpers
     # =========================================================================
 
@@ -562,6 +765,17 @@ class VMProvisioner:
                 entity_type="thread",
             )
 
+        if self._http_available:
+            return await self._create_http(
+                job_id=thread_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
+                entity_type="thread",
+            )
+
         if self._k8s_available:
             return await self._create_thread_vm_direct(
                 thread_id=thread_id,
@@ -582,6 +796,9 @@ class VMProvisioner:
         """
         if nats_bridge.is_available:
             return await nats_bridge.request_vm_delete(thread_id)
+
+        if self._http_available:
+            return await self._delete_http(thread_id, entity_type="thread")
 
         if self._k8s_available:
             return await self._delete_thread_vm_direct(thread_id)
@@ -685,6 +902,18 @@ class VMProvisioner:
             await self._db.merge_thread_vm_context(thread_id, updates)
         except Exception:
             logger.exception("Failed to update thread VM context for %s", thread_id)
+
+
+def _extract_http_error(response: httpx.Response) -> str:
+    """Pull a useful error message out of a controller HTTP error response."""
+    try:
+        data = response.json()
+        if isinstance(data, dict) and data.get("error"):
+            return str(data["error"])
+    except Exception:
+        pass
+    text = (response.text or "").strip()
+    return text or f"HTTP {response.status_code}"
 
 
 # Module-level singleton
