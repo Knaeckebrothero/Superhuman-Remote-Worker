@@ -12,8 +12,8 @@
 #
 # Image build:
 #   cd vm-controller
-#   podman build -t ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-ba0aecf<coresponding_hash> .
-#   podman push ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-ba0aecf<coresponding_hash>
+#   podman build -t ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-f1cee08<coresponding_hash> .
+#   podman push ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-f1cee08<coresponding_hash>
 
 ---
 # Namespace (idempotent — already created during agent cluster setup)
@@ -197,7 +197,7 @@ spec:
       containers:
         - name: vm-controller
           # Image tag managed by CI/CD — do not edit manually
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-ba0aecf
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-f1cee08
           imagePullPolicy: Always
           env:
             - name: NATS_URL
