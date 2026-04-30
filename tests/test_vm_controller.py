@@ -205,6 +205,8 @@ def _make_controller(headscale_available: bool = True) -> VMController:
     # Mock K8s client
     ctrl.k8s_client = MagicMock()
 
+    ctrl.http_runner = None
+
     return ctrl
 
 
