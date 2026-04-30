@@ -252,7 +252,7 @@ Generate `APP_ENCRYPTION_KEY` with: `openssl rand -base64 32`
 ## Same-cluster VMs (optional)
 
 By default the chart does not deploy any VM infrastructure — VMs live on a
-separate `vms` cluster managed by the Fleet bundles in `deployment-vms/`,
+separate `vm` cluster managed by the Fleet bundles in `deployment-vms/`,
 and the orchestrator reaches them via NATS. To run KubeVirt VMs in the same
 cluster as the orchestrator, enable the bundled VM controller:
 
