@@ -637,7 +637,9 @@ vmController:
   service:
     port: 8080
   # -- Default VM image — override per-job via the orchestrator API.
-  defaultVmImage: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest
+  # When empty, defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<Chart.AppVersion>
+  # so the VM base tracks the chart release. Set explicitly to pin a specific tag.
+  defaultVmImage: ""
   defaultCpu: 2
   defaultMemory: 4Gi
   # -- CDI DataVolume storage class + size for the VM root disk.
