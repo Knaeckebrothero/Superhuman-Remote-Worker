@@ -5,8 +5,14 @@ dependsOn: []
 targets:
   - clusterSelector:
       matchLabels:
-        management.cattle.io/cluster-display-name: vms
+        # Rancher would not let us rename the imported cluster to the
+        # historic "vms" naming used elsewhere; selector pinned to the
+        # actual display name.
+        management.cattle.io/cluster-display-name: vm
 targetRestrictions:
   - clusterSelector:
       matchLabels:
-        management.cattle.io/cluster-display-name: vms
+        # Rancher would not let us rename the imported cluster to the
+        # historic "vms" naming used elsewhere; selector pinned to the
+        # actual display name.
+        management.cattle.io/cluster-display-name: vm

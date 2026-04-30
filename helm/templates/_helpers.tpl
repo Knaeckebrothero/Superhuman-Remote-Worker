@@ -83,6 +83,41 @@ ConfigMap name (used by all deployments that read from the shared configmap).
 {{- end }}
 
 {{/*
+VM controller — resource names + URLs. The controller can run in the same
+namespace as the orchestrator (vmController.namespace = .Release.Namespace)
+or in a dedicated namespace (the typical case). When enabled, the controller
+exposes an HTTP API on Service `srw.vmControllerServiceName` port
+`vmController.service.port`.
+*/}}
+{{- define "srw.vmControllerName" -}}
+{{- printf "%s-vm-controller" (include "srw.fullname" .) }}
+{{- end }}
+
+{{- define "srw.vmControllerServiceName" -}}
+{{- include "srw.vmControllerName" . }}
+{{- end }}
+
+{{- define "srw.vmControllerNamespace" -}}
+{{- default .Release.Namespace .Values.vmController.namespace }}
+{{- end }}
+
+{{/*
+URL the orchestrator uses to reach the controller's HTTP API. Empty when
+vmController.enabled is false or transport=nats — orchestrator falls back
+to NATS / direct K8s in those cases. When transport=both, the URL is
+exported so the orchestrator's HTTP transport is available even though
+NATS takes priority.
+*/}}
+{{- define "srw.vmControllerUrl" -}}
+{{- if and .Values.vmController.enabled (ne .Values.vmController.transport "nats") }}
+{{- printf "http://%s.%s.svc.cluster.local:%d"
+    (include "srw.vmControllerServiceName" .)
+    (include "srw.vmControllerNamespace" .)
+    (int .Values.vmController.service.port) }}
+{{- end }}
+{{- end }}
+
+{{/*
 Component labels — extends common labels with a component identifier.
 Usage: {{ include "srw.componentLabels" (dict "context" . "component" "orchestrator") }}
 */}}
@@ -109,21 +144,49 @@ Usage: {{ include "srw.serviceName" (dict "context" . "component" "postgres") }}
 {{- end }}
 
 {{/*
-Domain-derived URLs. All subdomains are derived from global.domain.
+Domain-derived URLs. Each component host is `global.hostnames.<key>` when
+set, otherwise `<subdomain>.<global.domain>`. Centralised in srw.host so a
+single override propagates to ingress, configmap, OIDC redirects, and the
+cockpit env-init script.
+
+Usage:
+  {{ include "srw.host" (dict "context" . "key" "git" "default" "git") }}
+  {{ include "srw.host" (dict "context" . "key" "cockpit" "default" "") }}  # root
 */}}
+{{- define "srw.host" -}}
+{{- $ctx := .context -}}
+{{- $hostnames := default (dict) $ctx.Values.global.hostnames -}}
+{{- $override := index $hostnames .key -}}
+{{- if $override -}}
+{{- $override -}}
+{{- else if eq .default "" -}}
+{{- required "global.domain is required" $ctx.Values.global.domain -}}
+{{- else -}}
+{{- printf "%s.%s" .default (required "global.domain is required" $ctx.Values.global.domain) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Strip the scheme from an https:// URL so URL helpers can be reused as
+ingress / TLS host strings without duplicating per-component logic.
+*/}}
+{{- define "srw.urlHost" -}}
+{{- . | trimPrefix "https://" | trimPrefix "http://" -}}
+{{- end }}
+
 {{- define "srw.cockpitUrl" -}}
-{{- printf "https://%s" (required "global.domain is required" .Values.global.domain) }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "cockpit" "default" "")) }}
 {{- end }}
 
 {{- define "srw.apiUrl" -}}
-{{- printf "https://api.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
 {{- end }}
 
 {{- define "srw.authUrl" -}}
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.externalIssuerUrl }}
 {{- .Values.keycloak.externalIssuerUrl }}
 {{- else }}
-{{- printf "https://auth.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "auth" "default" "auth")) }}
 {{- end }}
 {{- end }}
 
@@ -144,7 +207,7 @@ Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS
 {{- if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
 {{- .Values.gitea.externalUrl }}
 {{- else }}
-{{- printf "https://git.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "git" "default" "git")) }}
 {{- end }}
 {{- end }}
 
@@ -165,7 +228,7 @@ Internal cluster URL for Gitea — used by orchestrator/agents for back-end API 
 {{- if and (not .Values.opencloud.enabled) (not .Values.nextcloud.enabled) .Values.cloud.externalUrl }}
 {{- .Values.cloud.externalUrl }}
 {{- else }}
-{{- printf "https://cloud.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "cloud" "default" "cloud")) }}
 {{- end }}
 {{- end }}
 
@@ -182,19 +245,44 @@ Falls back to externalUrl if externalServiceUrl is not set.
 {{- end }}
 
 {{- define "srw.mcpUrl" -}}
-{{- printf "https://mcp.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "mcp" "default" "mcp")) }}
 {{- end }}
 
 {{- define "srw.headscaleUrl" -}}
 {{- if .Values.headscale.url }}
 {{- .Values.headscale.url }}
 {{- else }}
-{{- printf "https://headscale.%s" .Values.global.domain }}
+{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "headscale" "default" "headscale")) }}
 {{- end }}
 {{- end }}
 
 {{- define "srw.neo4jBoltHost" -}}
-{{- printf "bolt-neo4j.%s" .Values.global.domain }}
+{{- include "srw.host" (dict "context" . "key" "neo4jBolt" "default" "bolt-neo4j") }}
+{{- end }}
+
+{{/*
+Hosts for the optional admin UIs and the cockpit deep-link to MinIO. These
+have no URL helper because nothing else in the chart uses them as URLs —
+they're consumed only as ingress hosts and as window.env.* deep-links.
+*/}}
+{{- define "srw.neo4jBrowserHost" -}}
+{{- include "srw.host" (dict "context" . "key" "neo4j" "default" "neo4j") }}
+{{- end }}
+
+{{- define "srw.pgadminHost" -}}
+{{- include "srw.host" (dict "context" . "key" "pgadmin" "default" "pgadmin") }}
+{{- end }}
+
+{{- define "srw.mongoHost" -}}
+{{- include "srw.host" (dict "context" . "key" "mongo" "default" "mongo") }}
+{{- end }}
+
+{{- define "srw.dozzleHost" -}}
+{{- include "srw.host" (dict "context" . "key" "dozzle" "default" "dozzle") }}
+{{- end }}
+
+{{- define "srw.minioHost" -}}
+{{- include "srw.host" (dict "context" . "key" "minio" "default" "minio") }}
 {{- end }}
 
 {{/*
