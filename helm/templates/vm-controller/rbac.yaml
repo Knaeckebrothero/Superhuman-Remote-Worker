@@ -1,0 +1,40 @@
+{{- if .Values.vmController.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "srw.vmControllerName" . }}
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.vmControllerName" . }}
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.vmControllerName" . }}
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.vmControllerName" . }}
+    namespace: {{ include "srw.vmControllerNamespace" . }}
+roleRef:
+  kind: Role
+  name: {{ include "srw.vmControllerName" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

@@ -165,6 +165,12 @@ data:
   # NATS
   NATS_URL: {{ .Values.nats.url | quote }}
 
+  # VM Controller (HTTP transport, same-cluster mode). Empty when
+  # vmController.enabled=false or transport=nats — orchestrator falls back
+  # to NATS / direct K8s in those cases.
+  VM_CONTROLLER_URL: {{ include "srw.vmControllerUrl" . | quote }}
+  VM_NAMESPACE: {{ include "srw.vmControllerNamespace" . | quote }}
+
   # Headscale (mesh VPN coordination server)
   HEADSCALE_URL: {{ include "srw.headscaleUrl" . | quote }}
 

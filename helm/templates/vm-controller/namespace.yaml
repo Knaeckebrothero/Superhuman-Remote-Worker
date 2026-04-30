@@ -1,0 +1,10 @@
+{{- if .Values.vmController.enabled }}
+{{- if ne (include "srw.vmControllerNamespace" .) .Release.Namespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+{{- end }}
+{{- end }}
