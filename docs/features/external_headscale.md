@@ -54,7 +54,7 @@ to Vault — so embedding it in the chart had no operational upside.
         │                                                │ from Vault
 ┌─────────────────┐                            ┌─────────────────────┐
 │ vm-controller   │                            │ Vault               │
-│ (vms cluster)   │                            │  homelab/superhuman-│
+│ (vm cluster)    │                            │  homelab/superhuman-│
 │  HEADSCALE_URL  │                            │    remote-worker/   │
 │  HEADSCALE_API_ │◄───── api-key ─────────────┤    srw-secrets      │
 │    KEY          │                            │  homelab/agent-vms/ │
@@ -167,13 +167,13 @@ Two separate paths, two consumers:
 | Path | Key | Consumer | Cluster |
 |---|---|---|---|
 | `secret/homelab/superhuman-remote-worker/srw-secrets` | `TAILSCALE_AUTH_KEY` | agent tailscale sidecar | main |
-| `secret/homelab/agent-vms/headscale-api-key` | `api-key` | vm-controller | vms |
+| `secret/homelab/agent-vms/headscale-api-key` | `api-key` | vm-controller | vm |
 
 Both are picked up by existing ExternalSecrets:
 
 - `superhuman-remote-worker/srw` (main) — already syncs the entire
   `srw-secrets` blob; `TAILSCALE_AUTH_KEY` rides along automatically.
-- `agent-vms/headscale-api-key` (vms) — defined in
+- `agent-vms/headscale-api-key` (vm) — defined in
   `deployment-vms/srw-vm-controller/01-eso.yaml`.
 
 After patching Vault, force ESO to refresh:
@@ -183,7 +183,7 @@ kubectl --context main annotate externalsecret srw \
   -n superhuman-remote-worker \
   force-sync=$(date +%s) --overwrite
 
-kubectl --context vms annotate externalsecret headscale-api-key \
+kubectl --context vm annotate externalsecret headscale-api-key \
   -n agent-vms \
   force-sync=$(date +%s) --overwrite
 ```
