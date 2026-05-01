@@ -1,0 +1,256 @@
+# Model Config Matrix — unified replacement for the three legacy matrix files
+# (prompt_matrix.yaml, instruction_matrix.yaml, settings_matrix.yaml).
+#
+# Top-level keys are model families (output of family_of() in
+# src/core/model_registry.py); `default` is the fall-through. Each family
+# block can carry up to three subsections:
+#   - prompts:       (prompt_type)      → filename in config/prompts/
+#   - instructions:  (instruction_type) → filename in config/templates/
+#   - settings:      inference parameters and `limits:` block
+#
+# Resolution: per-section, expert family → expert default → base family →
+# base default → hardcoded fallback. Sections and keys missing for a family
+# fall through to `default`.
+
+default:
+  prompts:
+    systemprompt: systemprompt.txt
+    systemprompt_interactive: systemprompt_interactive.txt
+    persona: persona.txt
+    strategic: strategic.txt
+    tactical: tactical.txt
+    summarization: summarization_prompt.txt
+    memory_extraction: memory_extraction_prompt.txt
+    memory_assembler: memory_assembler_prompt.txt
+    curation: curation_prompt.txt
+  instructions:
+    instructions: instructions.md
+    strategic_todos_initial: strategic_todos_initial.yaml
+    strategic_todos_transition: strategic_todos_transition.yaml
+    strategic_todos_resume: strategic_todos_resume.yaml
+    workspace_template: workspace_template.md
+    todo_guide: todo_guide.md
+  settings:
+    temperature: 0.0
+    multimodal: false
+    parallel_tool_calls: false
+    model_max_context_tokens: 128000
+    limits:
+      model_max_context_tokens: 100000
+      context_threshold_tokens: 80000
+      summarization_safe_limit: 90000
+      summarization_chunk_size: 80000
+      message_count_min_tokens: 50000
+
+minimax:
+  prompts:
+    systemprompt: systemprompt_minimax.txt
+    persona: persona_minimax.txt
+    strategic: strategic_minimax.txt
+    tactical: tactical_minimax.txt
+    summarization: summarization_prompt_minimax.txt
+  instructions:
+    instructions: instructions_minimax.md
+  settings:
+    temperature: 1.0  # M2.7 is a reasoning model; use default
+    top_p: 0.95
+    multimodal: false
+    parallel_tool_calls: true
+    model_max_context_tokens: 204800  # M2.7: 204,800 context, 131K max output
+    limits:
+      model_max_context_tokens: 170000
+      context_threshold_tokens: 130000
+      summarization_safe_limit: 160000
+      summarization_chunk_size: 110000
+      message_count_min_tokens: 80000
+
+o-series:
+  settings:
+    temperature: 1.0
+    multimodal: true  # o3/o4-mini support image inputs
+    parallel_tool_calls: true
+    model_max_context_tokens: 200000
+    limits:
+      model_max_context_tokens: 170000
+      context_threshold_tokens: 130000
+      summarization_safe_limit: 160000
+      summarization_chunk_size: 110000
+      message_count_min_tokens: 80000
+
+deepseek:
+  settings:
+    top_p: 0.95
+    multimodal: false
+    parallel_tool_calls: false  # DeepSeek parallel calls are unreliable
+    model_max_context_tokens: 64000
+    limits:
+      model_max_context_tokens: 55000
+      context_threshold_tokens: 40000
+      summarization_safe_limit: 45000
+      summarization_chunk_size: 35000
+      message_count_min_tokens: 30000
+
+gemini:
+  settings:
+    top_p: 0.95
+    top_k: 40
+    multimodal: true  # Gemini models are natively multimodal
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000
+    limits:
+      model_max_context_tokens: 200000
+      context_threshold_tokens: 150000
+      summarization_safe_limit: 180000
+      summarization_chunk_size: 120000
+      message_count_min_tokens: 100000
+
+claude-opus:
+  settings:
+    temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
+    multimodal: true  # Claude Opus 4.6 supports vision
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Opus 4.6: 1M context, 128K max output
+    limits:
+      model_max_context_tokens: 200000
+      context_threshold_tokens: 150000
+      summarization_safe_limit: 180000
+      summarization_chunk_size: 120000
+      message_count_min_tokens: 100000
+
+gpt-5:
+  prompts:
+    systemprompt: systemprompt_gpt_5.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_gpt_5.txt
+    strategic: strategic_gpt_5.txt
+    tactical: tactical_gpt_5.txt
+    summarization: summarization_prompt_gpt_5.txt
+  settings:
+    temperature: 1.0  # Reasoning model: only default 1.0 is supported
+    multimodal: true  # GPT-5 supports image inputs
+    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+    # LangChain's Responses API streaming corrupts parallel tool call args,
+    # and the Codex proxy only supports the Responses API.
+    parallel_tool_calls: false
+    model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, 128K max output
+    limits:
+      model_max_context_tokens: 200000
+      context_threshold_tokens: 150000
+      summarization_safe_limit: 180000
+      summarization_chunk_size: 120000
+      message_count_min_tokens: 100000
+
+codex:
+  prompts:
+    systemprompt: systemprompt_gpt_5.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_gpt_5.txt
+    strategic: strategic_gpt_5.txt
+    tactical: tactical_gpt_5.txt
+    summarization: summarization_prompt_gpt_5.txt
+  settings:
+    temperature: 1.0  # Reasoning model: temperature effectively disabled
+    multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
+    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+    parallel_tool_calls: false
+    model_max_context_tokens: 400000  # gpt-5.3-codex: 400K context, 128K max output
+    limits:
+      model_max_context_tokens: 350000
+      context_threshold_tokens: 270000  # Stay under 272K to avoid accuracy degradation
+      summarization_safe_limit: 300000
+      summarization_chunk_size: 200000
+      message_count_min_tokens: 150000
+
+codex-spark:
+  prompts:
+    systemprompt: systemprompt_codex_spark.txt
+    systemprompt_interactive: systemprompt_interactive_gpt_5.txt
+    persona: persona_codex_spark.txt
+    strategic: strategic_codex_spark.txt
+    tactical: tactical_codex_spark.txt
+    summarization: summarization_prompt_gpt_5.txt
+  settings:
+    temperature: 1.0  # Reasoning model: temperature effectively disabled
+    multimodal: false  # Codex Spark is code-focused, no vision
+    # TODO: Re-enable once langchain-ai/langchain#34660 is fixed.
+    parallel_tool_calls: false
+    model_max_context_tokens: 128000  # gpt-5.3-codex-spark: 128K context (distilled)
+    limits:
+      model_max_context_tokens: 110000
+      context_threshold_tokens: 85000
+      summarization_safe_limit: 100000
+      summarization_chunk_size: 75000
+      message_count_min_tokens: 60000
+
+gpt-oss:
+  prompts:
+    systemprompt: systemprompt_gpt_oss.txt
+    persona: persona_gpt_oss.txt
+    strategic: strategic_gpt_oss.txt
+    tactical: tactical_gpt_oss.txt
+    summarization: summarization_prompt_gpt_oss.txt
+    memory_extraction: memory_extraction_prompt_gpt_oss.txt
+    memory_assembler: memory_assembler_prompt_gpt_oss.txt
+    curation: curation_prompt_gpt_oss.txt
+  instructions:
+    instructions: instructions_gpt_oss.md
+    todo_guide: todo_guide_gpt_oss.md
+    strategic_todos_transition: strategic_todos_transition_gpt_oss.yaml
+  settings:
+    temperature: 1.0  # OpenAI official: use 1.0 for full reasoning capability
+    top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution
+    # top_k: DO NOT SET — HuggingFace defaults to 50 if present; must stay disabled
+    # repetition_penalty: DO NOT SET — some clients enable by default; OpenAI says disable
+    multimodal: false  # gpt-oss-120b is text-only (MoE architecture)
+    parallel_tool_calls: false  # Served via vLLM; parallel calls need provider support
+    model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
+    limits:
+      model_max_context_tokens: 110000
+      context_threshold_tokens: 85000
+      summarization_safe_limit: 100000
+      summarization_chunk_size: 75000
+      message_count_min_tokens: 60000
+
+# Gemma 4 has native system role and strong instruction following — the default
+# Markdown prompts work well for systemprompt/persona/strategic/tactical/summarization.
+# Only the structured-output tasks get gemma-specific variants: they add explicit
+# anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON schema can trigger
+# infinite repetition loops). The complementary repetition_penalty / frequency_penalty
+# in `settings:` is the runtime-side mitigation.
+gemma:
+  prompts:
+    memory_extraction: memory_extraction_prompt_gemma.txt
+    memory_assembler: memory_assembler_prompt_gemma.txt
+    curation: curation_prompt_gemma.txt
+  settings:
+    # Google official for Gemma 4 instruct is temp=1.0, top_p=0.95, top_k=64.
+    # We run temp=0.3 because the workload is heavy tool-calling / structured
+    # output and community evidence shows high entropy increases malformed
+    # tool-call rate on vLLM's gemma4 parser.
+    temperature: 0.3
+    top_p: 0.95
+    top_k: 64
+    # Partial mitigation for vllm#40080 — Gemma 4 + xgrammar JSON schema
+    # enters infinite repetition loops. Values >1.0 discourage token repeats.
+    # Kept mild (1.05) to avoid distorting legitimate repeated structure
+    # (e.g. code, tables, list items). Upstream fix not yet shipped.
+    repetition_penalty: 1.05
+    frequency_penalty: 0.1  # Additional defense-in-depth against loop output
+    multimodal: true  # Gemma 4 31B accepts text + image + video (no audio on 31B)
+    parallel_tool_calls: false  # vllm#39392: concurrent tool calls can emit <pad> tokens
+    model_max_context_tokens: 131072  # Endpoint reports 131072 for current deployment
+    limits:
+      model_max_context_tokens: 110000
+      context_threshold_tokens: 85000
+      summarization_safe_limit: 100000
+      summarization_chunk_size: 75000
+      message_count_min_tokens: 60000
+
+# Model-specific overrides — add as needed:
+# claude-sonnet:
+#   prompts:
+#     systemprompt: systemprompt_claude_sonnet.txt
+#   instructions:
+#     instructions: instructions_claude_sonnet.md
+#   settings:
+#     temperature: 1.0

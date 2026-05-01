@@ -9,7 +9,7 @@ Covers:
   themselves through the DB accessors (LiteLLM #14661 hazard regression).
 - ``resolve_catalog_model`` JOINs to the right transport (system vs endpoint)
   and prefers the system row when both are present.
-- ``list_models_by_role_alphabetical`` filters on enabled and sorts.
+- ``list_models_by_capability_alphabetical`` filters on enabled and sorts.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 from main import (  # noqa: E402
     VALID_CATALOG_PROVIDER_KINDS,
-    VALID_CATALOG_ROLES,
+    VALID_CATALOG_CAPABILITIES,
     CatalogModelCreate,
     CatalogModelUpdate,
     app,
@@ -52,6 +52,7 @@ CATALOG_ROUTES = {
     ("DELETE", "/api/admin/providers/models/{catalog_id}"),
     ("POST", "/api/admin/providers/models/{catalog_id}/test"),
     ("GET", "/api/admin/families"),
+    ("GET", "/api/admin/families/detect"),
 }
 
 
@@ -73,8 +74,8 @@ class TestCatalogRoutesRegistered:
 
 
 class TestCatalogConstants:
-    def test_role_enum_locked(self):
-        assert VALID_CATALOG_ROLES == (
+    def test_capability_enum_locked(self):
+        assert VALID_CATALOG_CAPABILITIES == (
             "chat",
             "auxiliary",
             "embedding",
@@ -99,7 +100,7 @@ class TestCatalogModelCreate:
             "provider_ref": "anthropic",
             "model_id": "claude-opus-4-7",
             "display_label": "Claude Opus 4.7",
-            "role": "chat",
+            "capability": "chat",
             "family": "claude-opus",
         }
         base.update(overrides)
@@ -119,9 +120,9 @@ class TestCatalogModelCreate:
         )
         assert body.provider_kind == "endpoint"
 
-    def test_invalid_role_rejected(self):
+    def test_invalid_capability_rejected(self):
         with pytest.raises(Exception):
-            CatalogModelCreate(**self._ok_payload(role="banana"))
+            CatalogModelCreate(**self._ok_payload(capability="banana"))
 
     def test_invalid_provider_kind_rejected(self):
         with pytest.raises(Exception):
@@ -133,7 +134,7 @@ class TestCatalogModelCreate:
             "provider_ref",
             "model_id",
             "display_label",
-            "role",
+            "capability",
             "family",
         ):
             payload = self._ok_payload()
@@ -199,7 +200,7 @@ def _row(**overrides):
         "provider_ref": "anthropic",
         "model_id": "claude-opus-4-7",
         "display_label": "Claude Opus 4.7",
-        "role": "chat",
+        "capability": "chat",
         "family": "claude-opus",
         "context_window": None,
         "reasoning_level": None,
@@ -228,7 +229,7 @@ class TestCreateModelJsonbHandling:
             provider_ref="anthropic",
             model_id="claude-opus-4-7",
             display_label="Claude Opus 4.7",
-            role="chat",
+            capability="chat",
             family="claude-opus",
             params_json=None,
         )
@@ -246,7 +247,7 @@ class TestCreateModelJsonbHandling:
             provider_ref="anthropic",
             model_id="claude-opus-4-7",
             display_label="Claude Opus 4.7",
-            role="chat",
+            capability="chat",
             family="claude-opus",
             params_json={"temperature": 0},
         )
@@ -282,15 +283,15 @@ class TestListModelsFilters:
         assert "WHERE" not in sql
 
     @pytest.mark.asyncio
-    async def test_role_filter_added(self):
+    async def test_capability_filter_added(self):
         conn = _conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db(conn)
 
-        await db.list_models(role="auxiliary")
+        await db.list_models(capability="auxiliary")
         sql = conn.fetch.await_args.args[0]
         args = conn.fetch.await_args.args[1:]
-        assert "role = $1" in sql
+        assert "capability = $1" in sql
         assert args == ("auxiliary",)
 
     @pytest.mark.asyncio
@@ -372,13 +373,13 @@ class TestResolveCatalogModelTransportJoin:
         assert "ORDER BY (m.provider_kind = 'system') DESC" in sql
 
 
-class TestListByRoleAlphabetical:
+class TestListByCapabilityAlphabetical:
     @pytest.mark.asyncio
     async def test_filters_enabled_and_orders_by_label(self):
         conn = _conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db(conn)
-        await db.list_models_by_role_alphabetical("auxiliary")
+        await db.list_models_by_capability_alphabetical("auxiliary")
         sql = conn.fetch.await_args.args[0]
         assert "enabled = TRUE" in sql
         assert "ORDER BY display_label ASC" in sql

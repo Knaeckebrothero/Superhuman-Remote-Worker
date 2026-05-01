@@ -1143,9 +1143,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
         except asyncio.TimeoutError:
             approved = False
         if hasattr(_session, "tool_decisions"):
-            _session.tool_decisions[tool_call_id] = (
-                "approved" if approved else "denied"
-            )
+            _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
         return approved
 
     async def on_turn_start(turn_id: int) -> None:

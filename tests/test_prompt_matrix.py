@@ -135,13 +135,14 @@ class TestPromptMatrixResolver:
     def test_base_matrix_default_resolution(self, tmp_path):
         """Base matrix default entries are used when no expert matrix exists."""
         # Create base matrix
-        base_matrix = tmp_path / "config" / "prompt_matrix.yaml"
+        base_matrix = tmp_path / "config" / "model_config_matrix.yaml"
         base_matrix.parent.mkdir(parents=True)
         base_matrix.write_text(
             textwrap.dedent("""\
             default:
-              systemprompt: custom_systemprompt.txt
-              strategic: custom_strategic.txt
+              prompts:
+                systemprompt: custom_systemprompt.txt
+                strategic: custom_strategic.txt
         """)
         )
 
@@ -169,8 +170,9 @@ class TestPromptMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              systemprompt: base_system.txt
-              strategic: base_strategic.txt
+              prompts:
+                systemprompt: base_system.txt
+                strategic: base_strategic.txt
         """)
         )
 
@@ -179,7 +181,8 @@ class TestPromptMatrixResolver:
         expert_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              strategic: expert_strategic.txt
+              prompts:
+                strategic: expert_strategic.txt
         """)
         )
 
@@ -208,10 +211,12 @@ class TestPromptMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              systemprompt: systemprompt.txt
-              strategic: strategic.txt
+              prompts:
+                systemprompt: systemprompt.txt
+                strategic: strategic.txt
             claude-opus:
-              systemprompt: systemprompt_claude_opus.txt
+              prompts:
+                systemprompt: systemprompt_claude_opus.txt
         """)
         )
 
@@ -240,12 +245,14 @@ class TestPromptMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              systemprompt: base_default_system.txt
-              strategic: base_default_strategic.txt
-              tactical: base_default_tactical.txt
-              summarization: base_default_summarization.txt
+              prompts:
+                systemprompt: base_default_system.txt
+                strategic: base_default_strategic.txt
+                tactical: base_default_tactical.txt
+                summarization: base_default_summarization.txt
             claude-opus:
-              tactical: base_claude_tactical.txt
+              prompts:
+                tactical: base_claude_tactical.txt
         """)
         )
 
@@ -253,9 +260,11 @@ class TestPromptMatrixResolver:
         expert_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              strategic: expert_default_strategic.txt
+              prompts:
+                strategic: expert_default_strategic.txt
             claude-opus:
-              systemprompt: expert_claude_system.txt
+              prompts:
+                systemprompt: expert_claude_system.txt
         """)
         )
 
@@ -287,22 +296,32 @@ class TestPromptMatrixResolver:
 
     def test_load_matrix_invalid_yaml(self, tmp_path):
         """Invalid YAML in matrix file returns empty dict gracefully."""
-        matrix_path = tmp_path / "prompt_matrix.yaml"
+        matrix_path = tmp_path / "model_config_matrix.yaml"
         matrix_path.write_text(":{invalid yaml")
 
+        # Bypass the per-path cache so the malformed write is actually parsed.
+        from src.core import loader as _loader
+
+        _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
         assert result == {}
 
     def test_load_matrix_non_dict(self, tmp_path):
         """Non-dict YAML content returns empty dict."""
-        matrix_path = tmp_path / "prompt_matrix.yaml"
+        matrix_path = tmp_path / "model_config_matrix.yaml"
         matrix_path.write_text("- just\n- a\n- list\n")
 
+        from src.core import loader as _loader
+
+        _loader._model_config_matrix_cache.pop(matrix_path, None)
         result = PromptMatrixResolver._load_matrix_from_path(matrix_path)
         assert result == {}
 
     def test_load_matrix_nonexistent(self, tmp_path):
         """Non-existent matrix file returns empty dict."""
+        from src.core import loader as _loader
+
+        _loader._model_config_matrix_cache.pop(tmp_path / "nope.yaml", None)
         result = PromptMatrixResolver._load_matrix_from_path(tmp_path / "nope.yaml")
         assert result == {}
 
@@ -321,9 +340,11 @@ class TestPromptMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              systemprompt: default_system.txt
+              prompts:
+                systemprompt: default_system.txt
             claude-opus:
-              systemprompt: claude_system.txt
+              prompts:
+                systemprompt: claude_system.txt
         """)
         )
 
@@ -441,10 +462,11 @@ class TestPromptMatrixResolverLoad:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
         (expert_dir / "strategic.txt").write_text("expert strategic content")
-        (expert_dir / "prompt_matrix.yaml").write_text(
+        (expert_dir / "model_config_matrix.yaml").write_text(
             textwrap.dedent("""\
             default:
-              strategic: strategic.txt
+              prompts:
+                strategic: strategic.txt
         """)
         )
 

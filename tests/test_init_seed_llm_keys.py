@@ -148,10 +148,10 @@ class TestApplyOpenrouterDefaults:
         db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
         await init_mod._apply_openrouter_defaults(db)
         assert db.create_model.await_count == 2
-        roles_inserted = {
-            call.kwargs["role"] for call in db.create_model.await_args_list
+        capabilities_inserted = {
+            call.kwargs["capability"] for call in db.create_model.await_args_list
         }
-        assert roles_inserted == {"auxiliary", "embedding"}
+        assert capabilities_inserted == {"auxiliary", "embedding"}
 
     @pytest.mark.asyncio
     async def test_idempotent_when_rows_already_exist(self):

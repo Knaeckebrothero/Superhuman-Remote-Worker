@@ -130,70 +130,119 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Settings Matrix — model-family-specific inference defaults
+# Model Config Matrix — unified prompt + instruction + settings table
 # =============================================================================
+#
+# Top-level keys are model families; each family block carries up to three
+# subsections — `prompts`, `instructions`, `settings`. The same parsed file
+# powers PromptMatrixResolver (`prompts`), InstructionMatrixResolver
+# (`instructions`), and the inference-param applier (`settings`). One file,
+# one cache, three views — eliminates the family-list drift that the legacy
+# three-file split allowed.
 
-_settings_matrix_base_cache: Optional[Dict[str, Dict[str, Any]]] = None
+_model_config_matrix_cache: Dict[Path, Dict[str, Dict[str, Any]]] = {}
 
 
-def _load_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
-    """Load a single settings matrix YAML file.
+def _load_model_config_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Parse a single model_config_matrix.yaml file (cached by path).
 
-    Returns a dict mapping family names to parameter dicts.
-    Falls back to empty dict on any error.
+    Returns ``{family: {prompts: {...}, instructions: {...}, settings: {...}}}``.
+    Subsections that aren't present at a given family fall through to
+    ``default`` at lookup time. Falls back to an empty dict on any read error
+    so missing/optional files (e.g. an expert without overrides) don't break
+    the loader.
     """
+    if path in _model_config_matrix_cache:
+        return _model_config_matrix_cache[path]
     if not path.exists():
-        return {}
+        _model_config_matrix_cache[path] = {}
+        return _model_config_matrix_cache[path]
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if not isinstance(data, dict):
             logger.warning(
-                f"Invalid settings matrix {path}: expected dict, got {type(data)}"
+                f"Invalid model_config_matrix {path}: expected dict, got {type(data)}"
             )
-            return {}
-        result = {}
-        for family, params in data.items():
-            if isinstance(params, dict):
-                result[family] = params
-            else:
+            _model_config_matrix_cache[path] = {}
+            return _model_config_matrix_cache[path]
+        result: Dict[str, Dict[str, Any]] = {}
+        for family, family_block in data.items():
+            if not isinstance(family_block, dict):
                 logger.warning(
-                    f"settings_matrix: skipping '{family}' (expected dict, got {type(params)})"
+                    f"model_config_matrix: skipping '{family}' (expected dict, "
+                    f"got {type(family_block)})"
                 )
+                continue
+            normalized: Dict[str, Any] = {}
+            for section, payload in family_block.items():
+                if section in ("prompts", "instructions", "settings"):
+                    if isinstance(payload, dict):
+                        normalized[section] = payload
+                    else:
+                        logger.warning(
+                            f"model_config_matrix: skipping '{family}.{section}' "
+                            f"(expected dict, got {type(payload)})"
+                        )
+                else:
+                    logger.warning(
+                        f"model_config_matrix: ignoring unknown section "
+                        f"'{family}.{section}'"
+                    )
+            if normalized:
+                result[family] = normalized
+        _model_config_matrix_cache[path] = result
         return result
     except Exception as e:
         logger.warning(f"Failed to load {path}: {e}")
-        return {}
+        _model_config_matrix_cache[path] = {}
+        return _model_config_matrix_cache[path]
+
+
+def _matrix_subsection(
+    matrix: Dict[str, Dict[str, Any]], section: str
+) -> Dict[str, Dict[str, Any]]:
+    """Project a parsed model_config_matrix to one section as a flat
+    family→entries map (the legacy single-section shape).
+
+    A family that doesn't define ``section`` is dropped from the result rather
+    than appearing as an empty dict — so the legacy resolution chain
+    (`family in matrix` checks) still does the right thing without bonus keys.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for family, sections in matrix.items():
+        payload = sections.get(section)
+        if isinstance(payload, dict):
+            out[family] = payload
+    return out
 
 
 def _load_settings_matrix(deployment_dir: str = None) -> Dict[str, Dict[str, Any]]:
-    """Load settings matrix: base (cached) + optional expert override (deep-merged).
+    """Return the ``settings`` subsection of the unified matrix.
 
-    Returns a dict mapping model family names to inference parameter dicts.
-    Falls back to empty dict if the file doesn't exist.
+    Base file: ``config/model_config_matrix.yaml`` (cached). Optional expert
+    overlay: ``<deployment_dir>/model_config_matrix.yaml`` deep-merged on top.
+    Result is the same family→params shape the legacy ``settings_matrix.yaml``
+    produced, so callers (`_apply_settings_matrix`, `resolve_model_settings`)
+    don't change.
     """
-    global _settings_matrix_base_cache
-    if _settings_matrix_base_cache is None:
-        base_path = get_project_root() / "config" / "settings_matrix.yaml"
-        _settings_matrix_base_cache = _load_matrix_file(base_path)
-        if _settings_matrix_base_cache:
-            logger.debug(
-                f"Loaded settings matrix: {len(_settings_matrix_base_cache)} families"
-            )
+    base_path = get_project_root() / "config" / "model_config_matrix.yaml"
+    base_settings = _matrix_subsection(
+        _load_model_config_matrix_file(base_path), "settings"
+    )
 
-    base = _settings_matrix_base_cache
     if not deployment_dir:
-        return base
+        return base_settings
 
-    expert_path = Path(deployment_dir) / "settings_matrix.yaml"
+    expert_path = Path(deployment_dir) / "model_config_matrix.yaml"
     if not expert_path.exists():
-        return base
-
-    expert = _load_matrix_file(expert_path)
-    if not expert:
-        return base
-
-    return deep_merge(base, expert)
+        return base_settings
+    expert_settings = _matrix_subsection(
+        _load_model_config_matrix_file(expert_path), "settings"
+    )
+    if not expert_settings:
+        return base_settings
+    return deep_merge(base_settings, expert_settings)
 
 
 def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, Any]:
@@ -425,10 +474,14 @@ class MatrixResolver:
     Once the filename is determined, FileResolver locates the actual file
     (expert directory → framework directory).
 
-    Subclasses define MATRIX_FILENAME, FRAMEWORK_DIR, and HARDCODED_DEFAULTS.
+    Subclasses define MATRIX_SUBSECTION (``prompts`` or ``instructions``) and
+    FRAMEWORK_DIR + HARDCODED_DEFAULTS for fallback. The matrix data itself
+    lives in the unified ``model_config_matrix.yaml`` (one file at the project
+    root, optional one per expert directory).
     """
 
-    MATRIX_FILENAME: str = "matrix.yaml"
+    MATRIX_FILENAME: str = "model_config_matrix.yaml"
+    MATRIX_SUBSECTION: str = "prompts"
     FRAMEWORK_DIR: str = "config/prompts"
     HARDCODED_DEFAULTS: Dict[str, str] = {}
 
@@ -444,30 +497,27 @@ class MatrixResolver:
             framework_dir=get_project_root() / self.FRAMEWORK_DIR,
         )
 
-        # Load matrices
+        # Load matrices — share the parsed-once cache with _load_settings_matrix
+        # so the unified file is only read from disk once per process.
         self._expert_matrix = self._load_matrix(self.deployment_dir)
         base_matrix_path = get_project_root() / "config" / self.MATRIX_FILENAME
         self._base_matrix = self._load_matrix_from_path(base_matrix_path)
 
-    @staticmethod
-    def _load_matrix_from_path(path: Path) -> Dict[str, Dict[str, str]]:
-        """Load a matrix YAML file. Returns empty dict if not found."""
-        if not path.exists():
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-            if not isinstance(data, dict):
-                return {}
-            # Validate structure: each key maps to a dict of type → filename
-            result = {}
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    result[key] = {k: str(v) for k, v in value.items() if v is not None}
-            return result
-        except Exception as e:
-            logger.warning(f"Failed to load matrix {path}: {e}")
-            return {}
+    @classmethod
+    def _load_matrix_from_path(cls, path: Path) -> Dict[str, Dict[str, str]]:
+        """Load the matrix YAML and project to this resolver's subsection.
+
+        Returns the legacy family→{type:filename} shape. Missing file or
+        missing subsection both yield an empty dict so the resolution chain
+        falls through cleanly.
+        """
+        parsed = _load_model_config_matrix_file(path)
+        section = _matrix_subsection(parsed, cls.MATRIX_SUBSECTION)
+        # Coerce filename values to strings (matches the legacy loader's contract).
+        return {
+            family: {k: str(v) for k, v in entries.items() if v is not None}
+            for family, entries in section.items()
+        }
 
     def _load_matrix(self, directory: Optional[Path]) -> Dict[str, Dict[str, str]]:
         """Load matrix YAML from a directory. Returns empty dict if not found."""
@@ -530,10 +580,10 @@ class MatrixResolver:
 class PromptMatrixResolver(MatrixResolver):
     """Resolves prompt filenames through a 2D matrix: (prompt_type, model_family).
 
-    Thin subclass of MatrixResolver for prompt files (config/prompts/).
+    Reads the ``prompts`` subsection of the unified model_config_matrix.yaml.
     """
 
-    MATRIX_FILENAME = "prompt_matrix.yaml"
+    MATRIX_SUBSECTION = "prompts"
     FRAMEWORK_DIR = "config/prompts"
     HARDCODED_DEFAULTS = {
         "systemprompt": "systemprompt.txt",
@@ -559,11 +609,12 @@ class PromptMatrixResolver(MatrixResolver):
 class InstructionMatrixResolver(MatrixResolver):
     """Resolves instruction filenames through a 2D matrix: (instruction_type, model_family).
 
+    Reads the ``instructions`` subsection of the unified model_config_matrix.yaml.
     Handles non-prompt template files: instructions, strategic todos templates,
     workspace template, and todo guide.
     """
 
-    MATRIX_FILENAME = "instruction_matrix.yaml"
+    MATRIX_SUBSECTION = "instructions"
     FRAMEWORK_DIR = "config/templates"
     HARDCODED_DEFAULTS = {
         "instructions": "instructions.md",

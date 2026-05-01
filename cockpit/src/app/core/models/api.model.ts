@@ -277,13 +277,13 @@ export interface LlmEndpointDiscoveryResult {
 // Models Catalog (Admin → Models)
 // =============================================================================
 
-/** Locked enum for catalog rows. Adding a role requires schema + resolver work. */
-export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
+/** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
+export type CatalogCapability = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
-export const CATALOG_ROLES: CatalogRole[] = [
+export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
 ];
 
@@ -297,7 +297,7 @@ export interface CatalogModel {
   provider_ref: string;
   model_id: string;
   display_label: string;
-  role: CatalogRole;
+  capability: CatalogCapability;
   family: string;
   context_window: number | null;
   reasoning_level: string | null;
@@ -314,7 +314,7 @@ export interface CatalogModelCreateRequest {
   provider_ref: string;
   model_id: string;
   display_label: string;
-  role: CatalogRole;
+  capability: CatalogCapability;
   family: string;
   context_window?: number | null;
   reasoning_level?: string | null;
@@ -328,7 +328,7 @@ export interface CatalogModelUpdateRequest {
   provider_ref?: string;
   model_id?: string;
   display_label?: string;
-  role?: CatalogRole;
+  capability?: CatalogCapability;
   family?: string;
   context_window?: number | null;
   reasoning_level?: string | null;
