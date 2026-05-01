@@ -85,7 +85,6 @@ class TestProviderWhitelist:
             "google",
             "groq",
             "openrouter",
-            "tavily",
             "vision",
         }
         assert VALID_SYSTEM_API_KEY_PROVIDERS == db_allowed

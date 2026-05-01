@@ -26,7 +26,6 @@ const SYSTEM_PROVIDERS: {value: Exclude<ApiKeyProvider, 'codex'>; label: string}
   {value: 'google', label: 'Google'},
   {value: 'groq', label: 'Groq'},
   {value: 'openrouter', label: 'OpenRouter'},
-  {value: 'tavily', label: 'Tavily (Web Search)'},
   {value: 'vision', label: 'Vision'},
 ];
 

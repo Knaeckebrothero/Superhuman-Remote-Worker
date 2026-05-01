@@ -172,7 +172,7 @@ export interface VmWorkspacesSetting {
 /**
  * Supported LLM and tool provider slugs for API key management.
  */
-export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'codex' | 'tavily' | 'vision';
+export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'codex' | 'vision';
 
 /**
  * An API key entry (as returned by GET endpoints — no full key, prefix only).

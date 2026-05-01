@@ -15,7 +15,6 @@ import os
 import secrets
 import time
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -869,12 +868,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             ):
                 llm_over["api_key"] = resolved_keys[provider_for_key]
 
-        # Non-LLM tool keys (tavily, vision) always travel as env_keys.
+        # Non-LLM tool keys (vision) always travel as env_keys.
         if resolved_keys:
-            _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
+            _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
             env_keys = {
                 _ENV_KEY_MAP[p]: resolved_keys[p]
-                for p in ("tavily", "vision")
+                for p in ("vision",)
                 if p in resolved_keys
             }
             if env_keys:
@@ -2436,7 +2435,6 @@ VALID_API_KEY_PROVIDERS = {
     "groq",
     "openrouter",
     "codex",
-    "tavily",
     "vision",
 }
 
@@ -2593,7 +2591,6 @@ VALID_SYSTEM_API_KEY_PROVIDERS = {
     "google",
     "groq",
     "openrouter",
-    "tavily",
     "vision",
 }
 
@@ -15380,14 +15377,15 @@ async def _execute_server_tool(
 ) -> tuple[str, str | None]:
     """Execute a server-side builder tool via the shared dispatch module.
 
-    Resolves the Tavily key from system_api_keys at call time so the
-    builder_search helper stays DB-agnostic.
+    Tavily is a search engine (not an LLM), so its key lives in the
+    ``TAVILY_API_KEY`` env var rather than ``system_api_keys``. The
+    ``tavily_search`` helper resolves it from the env when ``api_key``
+    is not passed.
     """
-    tavily_key = await postgres_db.get_system_api_key("tavily")
     return await _dispatch_server_tool(
         tool_name,
         args,
-        tavily_search_fn=partial(tavily_search, api_key=tavily_key),
+        tavily_search_fn=tavily_search,
         user_id=user_id,
         active_project_id=active_project_id,
     )

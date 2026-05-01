@@ -1121,7 +1121,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 },
             )
 
-    async def permission_check(tool_name: str, tool_args) -> bool:
+    async def permission_check(tool_name: str, tool_args, tool_call_id: str) -> bool:
         mode = _session.permission_mode
         if mode == "autonomous":
             return True
@@ -1132,15 +1132,21 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
             ws,
             "permission.request",
             {
+                "id": tool_call_id,
                 "tool": tool_name,
                 "args": pa._safe_serialize(tool_args),
             },
         )
         try:
             response = await asyncio.wait_for(user_queue.get(), timeout=300)
-            return response == APPROVE_SENTINEL
+            approved = response == APPROVE_SENTINEL
         except asyncio.TimeoutError:
-            return False
+            approved = False
+        if hasattr(_session, "tool_decisions"):
+            _session.tool_decisions[tool_call_id] = (
+                "approved" if approved else "denied"
+            )
+        return approved
 
     async def on_turn_start(turn_id: int) -> None:
         _session.turn_count = turn_id

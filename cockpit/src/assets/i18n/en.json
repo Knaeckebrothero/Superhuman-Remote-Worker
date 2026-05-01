@@ -743,6 +743,13 @@
       "autoAccept": "Auto-accept",
       "deny": "Deny"
     },
+    "approval": {
+      "pendingTitle": "Approval needed to run this tool",
+      "badge": {
+        "approved": "Approved",
+        "denied": "Denied"
+      }
+    },
     "error": {
       "dismiss": "dismiss"
     },
