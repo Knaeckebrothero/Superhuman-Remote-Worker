@@ -122,6 +122,20 @@ A new `routines` table in Postgres stores recurring schedule definitions. A new 
 
 The right answer is **both**, and the order is **native first**. Native handles the common case with no friction; the API handles the long tail for users who already live in n8n.
 
+### Why a Separate Dispatcher, Not a Unified Queue
+
+A reasonable alternative is to collapse the routine dispatcher entirely: store the cron expression on the `jobs` table itself, let the existing auto-assign dispatcher consider only jobs whose `next_run_at <= now()`, and skip the separate `routines` table + tick loop. The priority queue *is* the scheduler. One concept, fewer moving parts.
+
+This was considered and rejected for three reasons:
+
+1. **Template vs instance.** A routine is a *recipe* that produces many jobs over time; a job is a single execution. Storing the recipe on the same row that represents the execution means a routine that fires 100 times either spawns 100 rows (and the original row is ambiguous — is it the recipe or the first instance?) or rewrites itself in place (and then run history needs a separate audit table anyway). Two concepts, two tables.
+
+2. **Stale config.** A pre-created job that won't fire for six days has its prompt, model, and config baked in *now*. If the user edits the routine 10 minutes before the next fire — a common UX flow — the queued job has the old prompt. Fire-at-trigger creates the job with *current* routine config every time. That's what users expect, and what every mature scheduler does (Vercel Cron, GitHub Actions, Temporal Schedules — all materialize on fire, not on definition).
+
+3. **Queue clutter.** With pre-creation, the job list contains `created`-status rows that won't actually run for days. Jobs and routines have different list-view semantics — "what's pending right now" vs. "what's scheduled to happen later" — and forcing them into one view degrades both.
+
+The cost of keeping them separate is small: one Postgres table, one 60-second async loop, one CRUD UI tab. The benefits — clean template/instance split, fresh config at fire time, separable list views — justify it. Priority then composes cleanly on top: routines decide *when* a job materializes; the existing priority queue decides *what order* materialized jobs run. Two orthogonal concerns, two systems, no conflation.
+
 ### Schema: `routines` Table
 
 ```sql
@@ -466,6 +480,7 @@ The existence of these future features is **the reason the API escape hatch matt
 ## Future Extensions
 
 - **One-shot scheduled jobs.** "Run this job on Friday at 3pm, once." Same table, `cron_expr` becomes optional, add a `run_at` field. Auto-disables after firing.
+- **Deadline-window jobs.** A complementary primitive to cron schedules: instead of a point-in-time trigger, a `deadline_at TIMESTAMPTZ` and an optional `not_before TIMESTAMPTZ` define a window in which the job must run. The dispatcher picks the job up during idle windows (Low priority by default) and force-promotes its priority as `deadline_at` approaches — implementing the natural "run this once before tomorrow morning, ideally when nothing else is happening" pattern that low-priority cron only approximates. Implementable on the same table: `cron_expr` becomes nullable, add `deadline_at` and `not_before`, dispatcher learns one new ranking rule (`urgency_boost = clamp((now - not_before) / (deadline_at - not_before), 0, 1)`). Pairs naturally with the one-shot item above; both are "non-recurring trigger" variants on the same schema.
 - **Conditional routines.** "Run weekly *only if* the previous run produced output." Cheap to add once routines are stable: check `last_status` before firing.
 - **Routine chains.** "When routine A finishes, fire routine B." The completion service already has hooks for delegation; routines could subscribe.
 - **Public routine catalog.** Curated routines that users can install with one click ("Weekly news digest", "Daily standup summary"). Templates with placeholder prompts.

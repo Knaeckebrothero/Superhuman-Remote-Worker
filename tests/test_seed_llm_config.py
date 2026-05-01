@@ -217,6 +217,10 @@ class TestSeedEndpoints:
             key_prefix=None,
         )
         # Model entries become catalog rows now (provider_kind='endpoint').
+        # The seed pipeline always emits the array spelling — passing the
+        # singular form is allowed at the helm-values layer for ergonomics
+        # but the seeder canonicalizes before calling create_model so the
+        # accessor sees the array.
         db.create_model.assert_awaited_once()
         kwargs = db.create_model.await_args.kwargs
         assert kwargs["provider_kind"] == "endpoint"
@@ -224,7 +228,9 @@ class TestSeedEndpoints:
         assert kwargs["display_label"] == "Gemma 4 31B"
         assert kwargs["family"] == "gemma"
         assert kwargs["context_window"] == 128000
-        assert kwargs["capability"] == "chat"
+        # No explicit `capability` in the helm entry → defaults to 'chat'
+        # which auto-expands to ['chat', 'auxiliary'].
+        assert kwargs["capabilities"] == ["chat", "auxiliary"]
         assert kwargs["seeded_from"] == "helm:llm.seed"
         assert kwargs["on_conflict_do_nothing"] is True
         assert report.endpoints_seeded == ["Local Gemma"]
@@ -382,3 +388,139 @@ class TestSeedIdempotence:
         db = _fake_db()
         with pytest.raises(ValueError):
             await seed(db, {"systemApiKeys": {"openai": "sk"}})
+
+
+# ---------------------------------------------------------------------------
+# Capabilities-array seed semantics
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilitiesArraySemantics:
+    """Pin the helm-values shape contract introduced in chunk 2 of the
+    model_capabilities_array work."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_capabilities_array_passed_through(self):
+        """`capabilities: [chat, vision]` (explicit array) lands as-is — no
+        auto-expansion to chat+auxiliary. Operator gets exact control."""
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-4-vision",
+                    "displayName": "GPT-4 Vision",
+                    "capabilities": ["chat", "vision"],
+                    "family": "gpt-4o",
+                }
+            ],
+        }
+        # API key is pre-seeded so _seed_system_models accepts the entry.
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, payload)
+        assert db.create_model.await_args.kwargs["capabilities"] == [
+            "chat",
+            "vision",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_flag_adds_vision_to_chat_row(self):
+        """`multimodal: true` on a chat-capable row adds `vision` to the
+        capabilities[] array. Lets operators flag known multimodal models
+        without writing the full array."""
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-4o",
+                    "displayName": "GPT-4o",
+                    "capability": "chat",
+                    "multimodal": True,
+                    "family": "gpt-4o",
+                }
+            ],
+        }
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, payload)
+        assert db.create_model.await_args.kwargs["capabilities"] == [
+            "chat",
+            "auxiliary",
+            "vision",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_multimodal_flag_no_op_on_non_chat_row(self):
+        """`multimodal: true` only affects chat-capable rows. Embedding,
+        whisper, tts entries with the flag still land as singletons."""
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "text-embedding-3-large",
+                    "displayName": "Embedding",
+                    "capability": "embedding",
+                    "multimodal": True,
+                    "family": "openai-embedding",
+                }
+            ],
+        }
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, payload)
+        assert db.create_model.await_args.kwargs["capabilities"] == ["embedding"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_provider_model_aggregates_capabilities(self):
+        """Two helm entries pointing at the same (provider, model_id) collapse
+        into a single insert with the union of capabilities[]. Required because
+        the new UNIQUE (provider_kind, provider_ref, model_id) key would otherwise
+        reject the second entry under ON CONFLICT DO NOTHING — losing data."""
+        payload = {
+            "systemModels": [
+                {
+                    "provider": "openai",
+                    "id": "gpt-4o",
+                    "displayName": "GPT-4o",
+                    "capability": "chat",
+                    "family": "gpt-4o",
+                },
+                {
+                    "provider": "openai",
+                    "id": "gpt-4o",
+                    "displayName": "GPT-4o (Vision)",
+                    "capability": "vision",
+                    "family": "gpt-4o",
+                },
+            ],
+        }
+        db = _fake_db(existing_api_keys=[{"provider": "openai"}])
+        await seed(db, payload)
+        # ONE insert, capabilities is the union.
+        assert db.create_model.await_count == 1
+        kwargs = db.create_model.await_args.kwargs
+        assert kwargs["capabilities"] == ["chat", "auxiliary", "vision"]
+        # First entry's display_label wins (operator metadata precedence).
+        assert kwargs["display_label"] == "GPT-4o"
+
+    @pytest.mark.asyncio
+    async def test_endpoint_models_aggregate_per_endpoint(self):
+        """Same aggregation contract applies inside a single endpoint's
+        models[] list — duplicates collapse."""
+        payload = {
+            "systemEndpoints": [
+                {
+                    "label": "vLLM",
+                    "baseUrl": "http://vllm/v1",
+                    "models": [
+                        {"id": "gemma", "capability": "chat"},
+                        {"id": "gemma", "capability": "vision"},
+                    ],
+                }
+            ]
+        }
+        db = _fake_db()
+        await seed(db, payload)
+        assert db.create_model.await_count == 1
+        assert db.create_model.await_args.kwargs["capabilities"] == [
+            "chat",
+            "auxiliary",
+            "vision",
+        ]

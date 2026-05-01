@@ -400,6 +400,77 @@ async def _attach_session(
                 f"temperature={effective_config.llm.temperature}"
             )
 
+    # Auxiliary LLM rebuild. The boot-time _agent._auxiliary_llm is built from
+    # config.auxiliary.model in the YAML default — for persistent sessions
+    # without an override that's RedHatAI/... with no transport, which routes
+    # title-generation/memory-extraction calls to api.openai.com with
+    # not-needed and 401s. When the orchestrator's create_thread injection
+    # (or a runtime config.update) supplies an auxiliary section, build a
+    # session-scoped AuxiliaryLLM and pass it in instead of the singleton.
+    auxiliary_llm = _agent._auxiliary_llm
+    if config_override and config_override.get("auxiliary", {}).get("model"):
+        from ..core.loader import LLMConfig, resolve_model_settings
+        from ..services.auxiliary import AuxiliaryLLM
+
+        aux_cfg = effective_config.auxiliary
+        model_settings = resolve_model_settings(
+            aux_cfg.model, effective_config._deployment_dir
+        )
+        aux_llm_config = LLMConfig(
+            model=aux_cfg.model,
+            base_url=aux_cfg.base_url,
+            api_key=aux_cfg.api_key,
+            temperature=aux_cfg.temperature,
+            top_p=model_settings.get("top_p"),
+            top_k=model_settings.get("top_k"),
+            model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+            max_retries=1,
+        )
+        aux_inner = create_llm(aux_llm_config, effective_config.limits)
+        auxiliary_llm = AuxiliaryLLM(
+            llm=aux_inner,
+            max_iterations=aux_cfg.max_iterations,
+            timeout=aux_cfg.timeout,
+        )
+        logger.info(
+            "Auxiliary override applied: model=%s, base_url=%s",
+            aux_cfg.model,
+            aux_cfg.base_url or "default",
+        )
+
+    # Embedding override. EmbeddingService is a process-wide singleton built
+    # from EMBEDDING_* env vars at first call. When the orchestrator supplies
+    # env_keys carrying embedding routing, push them onto os.environ and
+    # clear the singleton so the next get_embedding_service() rebuilds with
+    # the right base_url + api_key. Without this the singleton stays bound
+    # to whatever was set at boot.
+    if config_override and config_override.get("env_keys"):
+        env_keys = config_override["env_keys"]
+        embedding_keys = (
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_API_KEY",
+        )
+        if any(k in env_keys for k in embedding_keys):
+            for k in embedding_keys:
+                if k in env_keys and env_keys[k] is not None:
+                    os.environ[k] = str(env_keys[k])
+            from ..services import embedding_service as _embedding_module
+
+            _embedding_module._embedding_service = None
+            logger.info(
+                "Embedding override applied: provider=%s, model=%s, base_url=%s",
+                env_keys.get(
+                    "EMBEDDING_PROVIDER", os.environ.get("EMBEDDING_PROVIDER")
+                ),
+                env_keys.get("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL")),
+                env_keys.get(
+                    "EMBEDDING_BASE_URL",
+                    os.environ.get("EMBEDDING_BASE_URL", "default"),
+                ),
+            )
+
     # Create PersistentSession
     _session = PersistentSession(
         thread_id=_thread_id,
@@ -415,7 +486,7 @@ async def _attach_session(
     )
     await _session.setup(
         llm=llm,
-        auxiliary_llm=_agent._auxiliary_llm,
+        auxiliary_llm=auxiliary_llm,
         postgres_conn=_agent.postgres_conn,
         vector_conn=getattr(_agent, "vector_conn", None),
         workspace_override=workspace_override,
@@ -1430,6 +1501,11 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
     Deep-merges *config_override* into the session config, rebuilds the
     LLM if the ``llm`` key changed, and persists the update to the
     orchestrator DB so it survives session resume.
+
+    The cockpit only sends the model ID — never the matching ``base_url``
+    or ``api_key``. We must let the orchestrator resolve credentials
+    BEFORE rebuilding the LLM, otherwise endpoint-backed models silently
+    route to api.openai.com with ``not-needed``.
     """
     global _session, _orchestrator_client, _thread_id
 
@@ -1447,13 +1523,48 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             load_agent_config_from_dict,
         )
 
+        # Resolve credentials with the orchestrator first when any
+        # credential-bearing slot is changing (chat model, auxiliary model,
+        # or embedding env keys). The PATCH endpoint enriches the override
+        # with the right base_url + api_key (custom/system endpoint or
+        # built-in provider key) and returns the merged dict. Skip the
+        # round trip for purely cosmetic changes (permission_mode,
+        # temperature-only edits).
+        embedding_env_keys = (
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_API_KEY",
+        )
+        env_block = config_override.get("env_keys") or {}
+        needs_enrichment = bool(
+            config_override.get("llm", {}).get("model")
+            or config_override.get("auxiliary", {}).get("model")
+            or any(k in env_block for k in embedding_env_keys)
+        )
+        effective_override = config_override
+        if _orchestrator_client and _thread_id and needs_enrichment:
+            try:
+                enriched = await _orchestrator_client.update_thread_config(
+                    _thread_id, config_override
+                )
+                if enriched is not None:
+                    effective_override = enriched
+                else:
+                    logger.warning(
+                        "Orchestrator config enrichment failed; falling back to "
+                        "raw override (custom endpoints may misroute)"
+                    )
+            except Exception:
+                logger.warning("Config persistence to orchestrator failed (non-fatal)")
+
         base_dict = dataclasses.asdict(_session.config)
-        merged = deep_merge(base_dict, config_override)
+        merged = deep_merge(base_dict, effective_override)
 
         # Re-apply settings_matrix when LLM config changes so model-family
         # defaults (temperature, top_p, limits) are resolved correctly.
-        if config_override.get("llm"):
-            override_llm_keys = set(config_override["llm"].keys())
+        if effective_override.get("llm"):
+            override_llm_keys = set(effective_override["llm"].keys())
             _apply_settings_matrix(
                 merged, override_llm_keys, _session.config._deployment_dir
             )
@@ -1462,19 +1573,75 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
             merged, deployment_dir=_session.config._deployment_dir
         )
 
-        # Rebuild LLM if llm settings changed
-        if config_override.get("llm"):
+        # Rebuild chat LLM if llm settings changed
+        if effective_override.get("llm"):
             new_llm = create_llm(new_config.llm, new_config.limits)
             _session._llm = new_llm
             _session.config = new_config
             _session._bind_tools()
             logger.info(
-                "LLM hot-swapped: model=%s, temperature=%s",
+                "LLM hot-swapped: model=%s, temperature=%s, base_url=%s",
                 new_config.llm.model,
                 new_config.llm.temperature,
+                new_config.llm.base_url or "default",
             )
         else:
             _session.config = new_config
+
+        # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
+        # the chat-side rebuild — the boot-time singleton on _agent doesn't
+        # carry the new credentials, so we replace _session.auxiliary_llm
+        # with a session-scoped instance.
+        if effective_override.get("auxiliary"):
+            from ..core.loader import LLMConfig, resolve_model_settings
+            from ..services.auxiliary import AuxiliaryLLM
+
+            aux_cfg = new_config.auxiliary
+            model_settings = resolve_model_settings(
+                aux_cfg.model, new_config._deployment_dir
+            )
+            aux_llm_config = LLMConfig(
+                model=aux_cfg.model,
+                base_url=aux_cfg.base_url,
+                api_key=aux_cfg.api_key,
+                temperature=aux_cfg.temperature,
+                top_p=model_settings.get("top_p"),
+                top_k=model_settings.get("top_k"),
+                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
+                max_retries=1,
+            )
+            aux_inner = create_llm(aux_llm_config, new_config.limits)
+            _session.auxiliary_llm = AuxiliaryLLM(
+                llm=aux_inner,
+                max_iterations=aux_cfg.max_iterations,
+                timeout=aux_cfg.timeout,
+            )
+            logger.info(
+                "Auxiliary hot-swapped: model=%s, base_url=%s",
+                aux_cfg.model,
+                aux_cfg.base_url or "default",
+            )
+
+        # Reset embedding singleton if embedding env keys changed.
+        new_env_block = effective_override.get("env_keys") or {}
+        if any(k in new_env_block for k in embedding_env_keys):
+            for k in embedding_env_keys:
+                if k in new_env_block and new_env_block[k] is not None:
+                    os.environ[k] = str(new_env_block[k])
+            from ..services import embedding_service as _embedding_module
+
+            _embedding_module._embedding_service = None
+            logger.info(
+                "Embedding hot-swapped: provider=%s, model=%s, base_url=%s",
+                new_env_block.get(
+                    "EMBEDDING_PROVIDER", os.environ.get("EMBEDDING_PROVIDER")
+                ),
+                new_env_block.get("EMBEDDING_MODEL", os.environ.get("EMBEDDING_MODEL")),
+                new_env_block.get(
+                    "EMBEDDING_BASE_URL",
+                    os.environ.get("EMBEDDING_BASE_URL", "default"),
+                ),
+            )
 
         # Update permission mode if included
         pm = (config_override.get("interactive") or {}).get("permission_mode")
@@ -1484,8 +1651,10 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
         if nm and nm in ("silent", "verbose", "auto"):
             _session.narration_mode = nm
 
-        # Persist to orchestrator DB (fire-and-forget)
-        if _orchestrator_client and _thread_id:
+        # Persist updates that didn't go through the enrichment PATCH above
+        # (cosmetic-only changes like permission_mode, narration_mode,
+        # temperature-without-model edits).
+        if _orchestrator_client and _thread_id and not needs_enrichment:
             try:
                 await _orchestrator_client.update_thread_config(
                     _thread_id, config_override

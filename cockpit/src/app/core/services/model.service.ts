@@ -9,13 +9,6 @@ export interface ModelGroup {
   models: string[];
 }
 
-export interface ModelPreset {
-  label: string;
-  strategic: string;
-  tactical: string;
-  configured: boolean;
-}
-
 export interface BuilderModel {
   label: string;
   id: string;
@@ -34,7 +27,6 @@ export interface EmbeddingModel extends HelperModel {
 
 interface ModelsResponse {
   groups: ModelGroup[];
-  presets: ModelPreset[];
   builder_models: BuilderModel[];
   auxiliary_models: HelperModel[];
   vision_models: HelperModel[];
@@ -55,7 +47,6 @@ export class ModelService {
   private fetchInFlight = false;
 
   readonly models = signal<ModelGroup[]>([]);
-  readonly presets = signal<ModelPreset[]>([]);
   readonly builderModels = signal<BuilderModel[]>([]);
   readonly auxiliaryModels = signal<HelperModel[]>([]);
   readonly visionModels = signal<HelperModel[]>([]);
@@ -81,7 +72,6 @@ export class ModelService {
     this.http.get<ModelsResponse>(url).subscribe({
       next: (resp) => {
         this.models.set(resp.groups);
-        this.presets.set(resp.presets);
         this.builderModels.set(resp.builder_models);
         this.auxiliaryModels.set(resp.auxiliary_models ?? []);
         this.visionModels.set(resp.vision_models ?? []);
@@ -98,7 +88,6 @@ export class ModelService {
         // catalog so the empty-state banner + disabled pickers render
         // instead of stale, hard-coded fallbacks.
         this.models.set([]);
-        this.presets.set([]);
         this.builderModels.set([]);
         this.auxiliaryModels.set([]);
         this.visionModels.set([]);

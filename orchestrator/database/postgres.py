@@ -3712,6 +3712,61 @@ class PostgresDB:
             )
             return result == "DELETE 1"
 
+    async def set_system_api_key_discovery_cache(
+        self,
+        provider: str,
+        payload: Dict[str, Any] | None,
+    ) -> bool:
+        """Stage (or clear) the discovery payload for a provider key.
+
+        ``payload=None`` clears the cache (e.g. on key rotation, before the
+        async re-discovery completes). Returns True iff a row was updated.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE system_api_keys
+                   SET discovery_cache_json = $2,
+                       discovery_cache_at = CASE
+                           WHEN $2::JSONB IS NULL THEN NULL
+                           ELSE CURRENT_TIMESTAMP
+                       END
+                 WHERE provider = $1
+                """,
+                provider,
+                json.dumps(payload) if payload is not None else None,
+            )
+            return result == "UPDATE 1"
+
+    async def get_system_api_key_discovery_cache(
+        self, provider: str
+    ) -> Dict[str, Any] | None:
+        """Return the cached discovery payload + timestamp, or None.
+
+        The returned dict carries ``payload`` (the cockpit-ready candidate
+        list, exactly as ``build_cache_payload`` shaped it) and ``cached_at``
+        as an ISO-8601 string for staleness math on the client side.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT discovery_cache_json, discovery_cache_at
+                  FROM system_api_keys
+                 WHERE provider = $1
+                """,
+                provider,
+            )
+        if row is None or row["discovery_cache_json"] is None:
+            return None
+        cached_at = row["discovery_cache_at"]
+        cache_json = row["discovery_cache_json"]
+        if isinstance(cache_json, str):
+            cache_json = json.loads(cache_json)
+        return {
+            "payload": cache_json,
+            "cached_at": cached_at.isoformat() if cached_at else None,
+        }
+
     # =========================================================================
     # SYSTEM LLM ENDPOINT OPERATIONS
     # System-scoped endpoints (user_id IS NULL) are visible to every user.
@@ -3875,8 +3930,8 @@ class PostgresDB:
 
     _MODEL_FIELDS = (
         "id, provider_kind, provider_ref, model_id, display_label, "
-        "capability, family, context_window, reasoning_level, params_json, "
-        "enabled, seeded_from, notes, created_at, updated_at"
+        "capabilities, family, context_window, reasoning_level, "
+        "params_json, enabled, seeded_from, notes, created_at, updated_at"
     )
 
     @staticmethod
@@ -3888,21 +3943,75 @@ class PostgresDB:
             d["params_json"] = json.loads(params)
         return d
 
+    @classmethod
+    def _canonicalize_capabilities(
+        cls,
+        *,
+        capability: str | None = None,
+        capabilities: List[str] | None = None,
+    ) -> List[str]:
+        """Resolve capability inputs into the canonical ``capabilities[]`` form.
+
+        Accepts either spelling for one release (the singular column is dropped
+        in the cleanup chunk):
+
+        - ``capabilities=['chat', 'auxiliary']`` — passed through after
+          dedupe + enum validation. Caller chose; we trust it.
+        - ``capability='chat'`` — expanded to ``['chat', 'auxiliary']``.
+          Reflects the design invariant from
+          ``orchestrator/services/readiness.py:16-21``: a chat-capable LLM
+          can always run auxiliary tasks. Operators who want a strictly-
+          separate auxiliary model still pass ``capabilities=['auxiliary']``.
+        - ``capability='embedding'`` (or whisper/tts/vision) — wrapped as
+          a singleton ``[capability]``.
+
+        Raises ``ValueError`` if neither is provided or any value is outside
+        the locked enum.
+        """
+        if capabilities is not None:
+            caps = list(capabilities)
+        elif capability is not None:
+            caps = ["chat", "auxiliary"] if capability == "chat" else [capability]
+        else:
+            raise ValueError(
+                "_canonicalize_capabilities requires either capability= or capabilities="
+            )
+        seen: set[str] = set()
+        out: List[str] = []
+        for c in caps:
+            if not isinstance(c, str):
+                raise ValueError(f"capability must be str, got {type(c).__name__}")
+            if c not in cls._CATALOG_CAPABILITIES:
+                raise ValueError(
+                    f"unknown capability {c!r}; allowed: {sorted(cls._CATALOG_CAPABILITIES)}"
+                )
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        if not out:
+            raise ValueError("capabilities must be non-empty")
+        return out
+
     async def list_models(
         self,
         *,
-        capability: str | None = None,
+        capabilities: List[str] | None = None,
         provider_kind: str | None = None,
         provider_ref: str | None = None,
         enabled_only: bool = False,
     ) -> List[Dict[str, Any]]:
-        """List catalog rows with optional filters."""
+        """List catalog rows with optional filters.
+
+        ``capabilities`` narrows by overlap semantics — a row matches if
+        its ``capabilities[]`` contains ANY of the requested values. Pass
+        a single-element list (``['chat']``) to filter on one role.
+        """
         clauses: list[str] = []
         args: list[Any] = []
         idx = 1
-        if capability is not None:
-            clauses.append(f"capability = ${idx}")
-            args.append(capability)
+        if capabilities is not None and capabilities:
+            clauses.append(f"capabilities && ${idx}::TEXT[]")
+            args.append(list(capabilities))
             idx += 1
         if provider_kind is not None:
             clauses.append(f"provider_kind = ${idx}")
@@ -3918,7 +4027,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {self._MODEL_FIELDS} FROM models {where} "
-                "ORDER BY provider_kind, provider_ref, capability, display_label",
+                "ORDER BY provider_kind, provider_ref, display_label",
                 *args,
             )
         return [self._row_to_model(r) for r in rows]
@@ -3939,7 +4048,8 @@ class PostgresDB:
         provider_ref: str,
         model_id: str,
         display_label: str,
-        capability: str,
+        capability: str | None = None,
+        capabilities: List[str] | None = None,
         family: str,
         context_window: int | None = None,
         reasoning_level: str | None = None,
@@ -3955,12 +4065,20 @@ class PostgresDB:
         as themselves — only literal ``None`` is treated as "use default"
         (LiteLLM #14661 hazard).
 
+        Capability inputs go through :meth:`_canonicalize_capabilities`.
+        ``capability`` (singular) is kept as a kwarg for legacy callers but
+        is translated into the canonical ``capabilities[]`` array internally
+        — the table only stores the array form.
+
         When ``on_conflict_do_nothing`` is True and a row already exists for
-        ``(provider_kind, provider_ref, model_id, capability)``, returns None
-        so the seed pipeline can count "newly inserted" cleanly.
+        ``(provider_kind, provider_ref, model_id)``, returns None so the seed
+        pipeline can count "newly inserted" cleanly.
         """
+        canonical = self._canonicalize_capabilities(
+            capability=capability, capabilities=capabilities
+        )
         on_conflict = (
-            "ON CONFLICT (provider_kind, provider_ref, model_id, capability) DO NOTHING"
+            "ON CONFLICT (provider_kind, provider_ref, model_id) DO NOTHING"
             if on_conflict_do_nothing
             else ""
         )
@@ -3969,9 +4087,9 @@ class PostgresDB:
                 f"""
                 INSERT INTO models
                     (provider_kind, provider_ref, model_id, display_label,
-                     capability, family, context_window, reasoning_level,
-                     params_json, enabled, seeded_from, notes)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     capabilities, family, context_window,
+                     reasoning_level, params_json, enabled, seeded_from, notes)
+                VALUES ($1, $2, $3, $4, $5::TEXT[], $6, $7, $8, $9, $10, $11, $12)
                 {on_conflict}
                 RETURNING {self._MODEL_FIELDS}
                 """,
@@ -3979,7 +4097,7 @@ class PostgresDB:
                 provider_ref,
                 model_id,
                 display_label,
-                capability,
+                canonical,
                 family,
                 context_window,
                 reasoning_level,
@@ -3997,13 +4115,17 @@ class PostgresDB:
         explicitly; pass ``None`` to write a SQL NULL (resets to default).
         Use a sentinel-free pattern: only the keys the caller passes are
         considered for the UPDATE.
+
+        ``capability`` (legacy singular) and ``capabilities`` (array) both
+        route through ``_canonicalize_capabilities``. The accessor stores
+        only the array form.
         """
         allowed = {
             "provider_kind",
             "provider_ref",
             "model_id",
             "display_label",
-            "capability",
+            "capabilities",
             "family",
             "context_window",
             "reasoning_level",
@@ -4011,13 +4133,24 @@ class PostgresDB:
             "enabled",
             "notes",
         }
+        # Capability changes are coupled — canonicalize singular/array
+        # spellings into the array form before writing.
+        if "capability" in fields or "capabilities" in fields:
+            canonical = self._canonicalize_capabilities(
+                capability=fields.pop("capability", None),
+                capabilities=fields.pop("capabilities", None),
+            )
+            fields["capabilities"] = canonical
         sets: list[str] = []
         args: list[Any] = [UUID(model_id)]
         idx = 2
         for name, value in fields.items():
             if name not in allowed:
                 continue
-            sets.append(f"{name} = ${idx}")
+            if name == "capabilities":
+                sets.append(f"{name} = ${idx}::TEXT[]")
+            else:
+                sets.append(f"{name} = ${idx}")
             if name == "params_json" and value is not None:
                 args.append(json.dumps(value))
             else:
@@ -4066,7 +4199,7 @@ class PostgresDB:
                     m.provider_ref,
                     m.model_id,
                     m.display_label,
-                    m.capability,
+                    m.capabilities,
                     m.family,
                     m.context_window,
                     m.reasoning_level,
@@ -4085,7 +4218,7 @@ class PostgresDB:
                    AND m.provider_ref = ule.id::text
                    AND ule.user_id IS NULL
                 WHERE m.model_id = $1
-                  AND m.capability = $2
+                  AND $2 = ANY(m.capabilities)
                   AND m.enabled = TRUE
                 ORDER BY (m.provider_kind = 'system') DESC, m.created_at ASC
                 LIMIT 1
@@ -4113,19 +4246,90 @@ class PostgresDB:
     async def list_models_by_capability_alphabetical(
         self, capability: str
     ) -> List[Dict[str, Any]]:
-        """Enabled catalog rows for ``capability``, sorted by display_label.
+        """Enabled catalog rows that include ``capability`` in their
+        ``capabilities[]`` array, sorted by display_label.
 
         Powers the "first-enabled-alphabetical" fallback used by the default-
-        model resolver when no admin pin (or a dangling pin) is set.
+        model resolver when no admin pin (or a dangling pin) is set. Under
+        the array model, one chat row with ``['chat', 'auxiliary']`` is
+        considered for both the chat and the auxiliary fallback — the
+        operator's intent ("this model serves both roles") is honored.
         """
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {self._MODEL_FIELDS} FROM models "
-                "WHERE capability = $1 AND enabled = TRUE "
+                "WHERE $1 = ANY(capabilities) AND enabled = TRUE "
                 "ORDER BY display_label ASC, created_at ASC",
                 capability,
             )
         return [self._row_to_model(r) for r in rows]
+
+    async def count_enabled_models_by_capability(self) -> Dict[str, int]:
+        """Return ``{capability: count}`` of enabled rows per capability.
+
+        Powers the readiness gate: a capability with zero enabled rows is
+        treated as missing. Under the array model, one row contributes to
+        every capability in its ``capabilities[]`` array — so a chat row
+        seeded as ``['chat', 'auxiliary']`` increments BOTH counts. This
+        is exactly what closes the user-reported bug: pinning a chat row
+        as the auxiliary default no longer leaves the auxiliary count at
+        zero. Capabilities with no rows at all are reported as ``0``
+        rather than dropped, so callers can ask for "is `embedding`
+        ready?" without first checking presence.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT cap, COUNT(*)::INT AS n "
+                "FROM models, unnest(capabilities) AS cap "
+                "WHERE enabled = TRUE "
+                "GROUP BY cap"
+            )
+        counts: Dict[str, int] = {c: 0 for c in self._CATALOG_CAPABILITIES}
+        for row in rows:
+            counts[row["cap"]] = int(row["n"])
+        return counts
+
+    async def list_default_pin_capabilities(self) -> List[str]:
+        """Return the catalog capabilities that have an admin-pinned default.
+
+        Reads `system_settings` keys of the form ``llm.default_<cap>_model``
+        and returns the capability portion when the value carries a
+        non-empty model ID. Used by the readiness gate to compute
+        ``missing_defaults`` without N round-trips.
+        """
+        prefix = "llm.default_"
+        suffix = "_model"
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT key, value FROM system_settings "
+                "WHERE key LIKE $1 AND key LIKE $2",
+                f"{prefix}%",
+                f"%{suffix}",
+            )
+        out: List[str] = []
+        for row in rows:
+            key = row["key"]
+            if not (key.startswith(prefix) and key.endswith(suffix)):
+                continue
+            capability = key[len(prefix) : -len(suffix)]
+            if not capability:
+                continue
+            value = row["value"]
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except (TypeError, ValueError):
+                    value = None
+            model: str | None = None
+            if isinstance(value, dict):
+                model = (
+                    value.get("model") if isinstance(value.get("model"), str) else None
+                )
+            elif isinstance(value, str):
+                model = value or None
+            if model:
+                out.append(capability)
+        return out
 
     # =========================================================================
     # DEFAULT LLM MODEL HELPERS

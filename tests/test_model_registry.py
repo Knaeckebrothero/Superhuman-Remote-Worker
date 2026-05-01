@@ -1,8 +1,13 @@
 """Tests for the model registry (src/core/model_registry.py).
 
-Locks in provider/family/origin contracts for every built-in model ID and
-validates the registry's load-from-YAML path, so the PR 2 refactor that
-swaps out _detect_provider / detect_model_family has a regression anchor.
+Pins the post-chunk-6 contract:
+
+- Resolution chain is custom → system → catalog → ``UnknownModelError``.
+  No YAML fallback, no ``LLM_BASE_URL`` env-var inheritance.
+- ``family_of`` is a sync prefix-pattern fallback for callers that don't
+  have a catalog row in hand.
+- ``UnknownModelError``'s message points operators at the right admin
+  surfaces (Admin → Models, /api/settings/llm-endpoints).
 """
 
 from pathlib import Path
@@ -14,17 +19,15 @@ from src.core.model_registry import (
     ModelMeta,
     UnknownModelError,
     _factory_provider,
-    list_builtin_models,
+    family_of,
     register_catalog_lookup,
     register_custom_lookup,
     register_system_lookup,
-    reload_registry,
     resolve_model,
 )
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MODELS_YAML = _REPO_ROOT / "config" / "models.yaml"
 _MODEL_CONFIG_MATRIX_YAML = _REPO_ROOT / "config" / "model_config_matrix.yaml"
 
 
@@ -34,7 +37,7 @@ def _load_yaml(path: Path) -> dict:
 
 
 class TestFactoryProviderMapping:
-    """_factory_provider maps YAML labels to LLM factory keys."""
+    """_factory_provider maps catalog provider slugs to LLM factory keys."""
 
     def test_local_maps_to_openai(self):
         assert _factory_provider("local") == "openai"
@@ -47,92 +50,67 @@ class TestFactoryProviderMapping:
             assert _factory_provider(p) == p
 
     def test_unknown_label_falls_back_to_openai(self):
-        # Keeps the system forgiving of YAML typos — dispatch won't crash,
+        # Keeps the system forgiving of catalog typos — dispatch won't crash,
         # it'll just route through the OpenAI factory.
         assert _factory_provider("made-up-provider") == "openai"
 
 
-class TestResolveBuiltinModels:
-    """resolve_model() returns correct metadata for every built-in entry."""
+class TestFamilyOf:
+    """family_of() — sync prefix-pattern fallback for callers without a row."""
 
-    @pytest.mark.asyncio
-    async def test_claude_opus(self):
-        meta = await resolve_model("claude-opus-4-6")
-        assert meta.provider == "anthropic"
-        assert meta.family == "claude-opus"
-        assert meta.origin == "builtin"
-        assert meta.display_name == "Claude Opus 4.6"
+    def test_claude_opus(self):
+        assert family_of("claude-opus-4-7") == "claude-opus"
 
-    @pytest.mark.asyncio
-    async def test_claude_sonnet(self):
-        meta = await resolve_model("claude-sonnet-4-5-20250929")
-        assert meta.provider == "anthropic"
-        assert meta.family == "claude-sonnet"
+    def test_gpt_4o_uses_legacy_family(self):
+        # `family_of`'s heuristic predates the family-matcher service and
+        # still returns "gpt-4o" for native gpt-4o; the matcher service
+        # (orchestrator/services/family_matcher.py) is the modern source
+        # of truth and routes gpt-4o to "default". Pin both behaviors so a
+        # future unification doesn't quietly break either caller.
+        assert family_of("gpt-4o") == "gpt-4o"
 
-    @pytest.mark.asyncio
-    async def test_gemini_pro(self):
-        meta = await resolve_model("gemini-2.5-pro")
-        assert meta.provider == "google"
-        assert meta.family == "gemini"
+    def test_gpt_5_pro(self):
+        assert family_of("gpt-5.2-pro") == "gpt-5"
 
-    @pytest.mark.asyncio
-    async def test_gpt_4o(self):
-        meta = await resolve_model("gpt-4o")
-        assert meta.provider == "openai"
-        assert meta.family == "default"
+    def test_o_series(self):
+        assert family_of("o3-mini") == "o-series"
 
-    @pytest.mark.asyncio
-    async def test_groq_kimi(self):
-        meta = await resolve_model("groq/moonshotai/kimi-k2-instruct-0905")
-        assert meta.provider == "groq"
-        assert meta.family == "default"
+    def test_codex_spark_beats_codex(self):
+        assert family_of("gpt-5.3-codex-spark") == "codex-spark"
 
-    @pytest.mark.asyncio
-    async def test_groq_gpt_oss(self):
-        meta = await resolve_model("groq/gpt-oss-120b")
-        assert meta.provider == "groq"
-        assert meta.family == "gpt-oss"
-
-    @pytest.mark.asyncio
-    async def test_openrouter_minimax(self):
-        meta = await resolve_model("openrouter/minimax/minimax-m2.7")
-        assert meta.provider == "openrouter"
-        assert meta.family == "minimax"
-
-    @pytest.mark.asyncio
-    async def test_codex(self):
-        meta = await resolve_model("codex/gpt-5.3-codex")
-        assert meta.provider == "codex"
-        assert meta.family == "gpt-5"
-
-    @pytest.mark.asyncio
-    async def test_local_model_routes_through_openai_factory(self):
-        # Currently named with openai/ prefix; PR 2 drops the prefix.
-        # Either way, the Local group's factory target is openai.
-        meta = await resolve_model("RedHatAI/gemma-4-31B-it-FP8-Dynamic")
-        assert meta.provider == "openai"
-        assert meta.family == "gemma"
-        assert meta.origin == "builtin"
-
-
-class TestHelperOnlyModels:
-    """Models that live only in builder/auxiliary/vision lists, not groups[]."""
-
-    @pytest.mark.asyncio
-    async def test_gpt_4_1_mini_from_vision_list(self):
-        # gpt-4.1-mini is only in vision_models, not in groups[].
-        meta = await resolve_model("gpt-4.1-mini")
-        assert meta.provider == "openai"
-        assert meta.origin == "builtin"
+    def test_unknown_returns_default(self):
+        assert family_of("totally-unknown-model") == "default"
 
 
 class TestUnknownModels:
+    @pytest.fixture(autouse=True)
+    def _clear_hooks(self):
+        register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
+        yield
+        register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
+
     @pytest.mark.asyncio
     async def test_unknown_id_raises(self):
+        """No hooks, unknown ID → UnknownModelError. Post chunk 6 there is
+        no YAML fallback to soak up unrecognised IDs."""
         with pytest.raises(UnknownModelError) as exc_info:
             await resolve_model("totally-made-up-model-xyz")
         assert exc_info.value.model_id == "totally-made-up-model-xyz"
         assert "totally-made-up-model-xyz" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_unknown_id_message_points_at_admin_surfaces(self):
+        """Error message must name the right admin paths so operators
+        landing on the message can self-serve."""
+        with pytest.raises(UnknownModelError) as exc_info:
+            await resolve_model("never-heard-of")
+        msg = str(exc_info.value)
+        assert "Admin → Models" in msg or "Admin -> Models" in msg
+        assert "/api/settings/llm-endpoints" in msg
 
     @pytest.mark.asyncio
     async def test_empty_id_raises(self):
@@ -140,81 +118,43 @@ class TestUnknownModels:
             await resolve_model("")
 
     @pytest.mark.asyncio
-    async def test_user_id_without_hook_hits_builtin(self):
-        # If no custom-endpoint hook is registered (e.g., agent process,
-        # unit test), user_id is accepted but ignored — built-in lookup runs.
-        register_custom_lookup(None)
-        meta = await resolve_model(
-            "claude-opus-4-6",
-            user_id="11111111-2222-3333-4444-555555555555",
-        )
-        assert meta.provider == "anthropic"
-        assert meta.origin == "builtin"
+    async def test_known_id_without_any_hook_still_raises(self):
+        """Even a previously-built-in ID like gpt-4o resolves to
+        UnknownModelError when no DB hook is registered — the YAML
+        fallback that used to absorb this case is gone."""
+        with pytest.raises(UnknownModelError):
+            await resolve_model("gpt-4o")
 
 
 class TestCatalogCoverage:
-    """Contract tests against config/models.yaml — catches drift."""
+    """The ``model_config_matrix.yaml`` must always carry a ``default``
+    family with a ``settings`` block — every catalog row whose family
+    isn't explicit falls through to it."""
 
-    def test_every_groups_entry_is_registered(self):
-        data = _load_yaml(_MODELS_YAML)
-        all_ids = list_builtin_models()
-        registered_ids = {m.model_id for m in all_ids}
-        for group in data.get("groups", []):
-            for entry in group.get("models", []):
-                assert entry["id"] in registered_ids, (
-                    f"Model {entry['id']!r} from group {group.get('name')!r} "
-                    f"was not registered"
-                )
-
-    def test_every_family_has_settings_matrix_entry_or_default(self):
-        """Every family used in models.yaml should resolve cleanly through
-        the unified model_config_matrix.yaml — either via a dedicated family
-        entry or the 'default' fallback. Custom models default to
-        family='default', so the default entry must exist.
-        """
+    def test_default_family_has_settings_subsection(self):
         matrix = _load_yaml(_MODEL_CONFIG_MATRIX_YAML)
         assert "default" in matrix and "settings" in matrix["default"], (
             "model_config_matrix.yaml must contain a 'default' family with a "
             "'settings' subsection — custom models without a family rely on it."
         )
 
-        families = {m.family for m in list_builtin_models()}
-        for family in families:
-            # Either the family has its own matrix entry, or 'default'
-            # covers it. Both are acceptable.
-            assert family == "default" or family in matrix or "default" in matrix
-
-    def test_no_duplicate_model_ids(self):
-        ids = [m.model_id for m in list_builtin_models()]
-        assert len(ids) == len(set(ids)), (
-            f"Duplicate model IDs in built-in registry: "
-            f"{[i for i in ids if ids.count(i) > 1]}"
-        )
-
-
-class TestReloadRegistry:
-    def test_reload_is_idempotent(self):
-        before = {m.model_id for m in list_builtin_models()}
-        reload_registry()
-        after = {m.model_id for m in list_builtin_models()}
-        assert before == after
-
 
 class TestCustomEndpointLookup:
-    """resolve_model() defers to the registered custom-endpoint hook when
-    user_id is present; falls back to the built-in catalog otherwise.
-    """
+    """Per-user custom endpoints take precedence over system + catalog."""
 
     @pytest.fixture(autouse=True)
     def _clear_hook(self):
-        # Every test in this class starts with no hook registered.
         register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
         yield
         register_custom_lookup(None)
+        register_system_lookup(None)
+        register_catalog_lookup(None)
 
     @pytest.mark.asyncio
-    async def test_custom_lookup_wins_over_builtin(self):
-        """A user-registered 'gpt-4o' should route to their endpoint, not OpenAI."""
+    async def test_custom_lookup_wins(self):
+        """A user-registered 'gpt-4o' should route to their endpoint."""
         calls = []
 
         async def fake_lookup(user_id, model_id, capability="chat"):
@@ -235,26 +175,25 @@ class TestCustomEndpointLookup:
         assert meta.origin == "custom"
         assert meta.provider == "openai"
         assert meta.base_url == "https://my-vllm.example/v1"
-        assert meta.display_name == "My Private GPT-4o"
         assert meta.endpoint_id == "00000000-0000-0000-0000-000000000001"
-        # api_key_ref is None — custom keys travel inline via endpoint_id.
         assert meta.api_key_ref is None
         assert calls == [("user-1", "gpt-4o")]
 
     @pytest.mark.asyncio
-    async def test_missing_custom_row_falls_back_to_builtin(self):
+    async def test_missing_custom_row_with_no_other_hooks_raises(self):
+        """No catalog or system hook, custom returns None → UnknownModelError."""
+
         async def fake_lookup(user_id, model_id, capability="chat"):
             return None
 
         register_custom_lookup(fake_lookup)
 
-        meta = await resolve_model("gpt-4o", user_id="user-1")
-        assert meta.origin == "builtin"
-        assert meta.provider == "openai"
+        with pytest.raises(UnknownModelError):
+            await resolve_model("gpt-4o", user_id="user-1")
 
     @pytest.mark.asyncio
     async def test_no_user_id_skips_hook(self):
-        """Even with a hook registered, None user_id never calls it."""
+        """user_id=None never invokes the per-user hook."""
         hook_called = False
 
         async def fake_lookup(user_id, model_id, capability="chat"):
@@ -264,16 +203,17 @@ class TestCustomEndpointLookup:
 
         register_custom_lookup(fake_lookup)
 
-        meta = await resolve_model("gpt-4o", user_id=None)
+        with pytest.raises(UnknownModelError):
+            await resolve_model("gpt-4o", user_id=None)
         assert hook_called is False
-        assert meta.origin == "builtin"
 
     @pytest.mark.asyncio
-    async def test_hook_none_falls_back_to_builtin(self):
-        """Registering None (orchestrator shutdown path) must not raise."""
+    async def test_hook_none_falls_to_unknown(self):
+        """Registering None (orchestrator shutdown path) must not raise
+        — but resolve_model itself does, since no other source matches."""
         register_custom_lookup(None)
-        meta = await resolve_model("gpt-4o", user_id="user-1")
-        assert meta.origin == "builtin"
+        with pytest.raises(UnknownModelError):
+            await resolve_model("gpt-4o", user_id="user-1")
 
     @pytest.mark.asyncio
     async def test_custom_family_default_when_null(self):
@@ -292,35 +232,24 @@ class TestCustomEndpointLookup:
         meta = await resolve_model("some-custom-id", user_id="user-1")
         assert meta.family == "default"
 
-    @pytest.mark.asyncio
-    async def test_unknown_with_hook_still_raises(self):
-        """If custom lookup returns None and ID isn't built-in, still raises."""
-
-        async def fake_lookup(user_id, model_id, capability="chat"):
-            return None
-
-        register_custom_lookup(fake_lookup)
-
-        with pytest.raises(UnknownModelError):
-            await resolve_model("nothing-anywhere", user_id="user-1")
-
 
 class TestSystemEndpointLookup:
     """resolve_model() consults the system-scope hook after the user hook
-    and before the built-in catalog. System rows are visible to all users.
-    """
+    and before the catalog. System rows are visible to all users."""
 
     @pytest.fixture(autouse=True)
     def _clear_hooks(self):
         register_custom_lookup(None)
         register_system_lookup(None)
+        register_catalog_lookup(None)
         yield
         register_custom_lookup(None)
         register_system_lookup(None)
+        register_catalog_lookup(None)
 
     @pytest.mark.asyncio
-    async def test_system_lookup_wins_over_builtin(self):
-        """A seeded system endpoint for 'gpt-4o' should route there, not OpenAI."""
+    async def test_system_lookup_wins(self):
+        """A seeded system endpoint for 'gpt-4o' should route there."""
 
         async def fake_sys(model_id, capability="chat"):
             return {
@@ -396,22 +325,13 @@ class TestSystemEndpointLookup:
         assert called_with == ["gpt-4o"]
 
     @pytest.mark.asyncio
-    async def test_system_miss_falls_back_to_builtin(self):
-        async def fake_sys(model_id, capability="chat"):
-            return None
-
-        register_system_lookup(fake_sys)
-        meta = await resolve_model("gpt-4o")
-        assert meta.origin == "builtin"
-
-    @pytest.mark.asyncio
-    async def test_unknown_still_raises_with_system_hook(self):
+    async def test_system_miss_falls_to_unknown(self):
         async def fake_sys(model_id, capability="chat"):
             return None
 
         register_system_lookup(fake_sys)
         with pytest.raises(UnknownModelError):
-            await resolve_model("nothing-anywhere")
+            await resolve_model("gpt-4o")
 
     @pytest.mark.asyncio
     async def test_custom_miss_falls_through_to_system(self):
@@ -442,24 +362,27 @@ class TestSystemEndpointLookup:
 class TestModelMetaShape:
     """ModelMeta is frozen and carries the expected fields."""
 
-    @pytest.mark.asyncio
-    async def test_metadata_is_frozen(self):
-        meta = await resolve_model("gpt-4o")
+    def test_metadata_is_frozen(self):
+        meta = ModelMeta(
+            model_id="test/model",
+            provider="openai",
+            family="default",
+            display_name="Test",
+        )
         with pytest.raises(Exception):  # FrozenInstanceError or AttributeError
             meta.provider = "anthropic"  # type: ignore[misc]
 
-    @pytest.mark.asyncio
-    async def test_default_origin_is_builtin(self):
-        meta = await resolve_model("gpt-4o")
-        assert meta.origin == "builtin"
+    def test_default_origin_is_catalog(self):
+        """Default origin flipped from 'builtin' to 'catalog' in chunk 6 —
+        the YAML-derived 'builtin' provenance no longer exists."""
+        meta = ModelMeta(
+            model_id="test/model",
+            provider="openai",
+            family="default",
+            display_name="Test",
+        )
+        assert meta.origin == "catalog"
         assert meta.endpoint_id is None
-
-    @pytest.mark.asyncio
-    async def test_api_key_ref_matches_provider_for_builtins(self):
-        # For built-ins, api_key_ref == provider (used to look up the
-        # right entry in user_api_keys at dispatch time).
-        meta = await resolve_model("claude-opus-4-6")
-        assert meta.api_key_ref == "anthropic"
 
     def test_dataclass_shape(self):
         # Construct a ModelMeta to validate the full field set.
@@ -472,17 +395,16 @@ class TestModelMetaShape:
         assert meta.base_url is None
         assert meta.context_window is None
         assert meta.reasoning_level is None
-        assert meta.origin == "builtin"
         assert meta.endpoint_id is None
+        assert meta.capability == "chat"
 
 
 class TestCatalogLookup:
     """resolve_model() consults the DB-backed catalog hook between the
-    system-endpoint hook and the built-in YAML fallback. Catalog rows carry
-    their transport: 'endpoint' rows inherit base_url+api_key from the joined
-    llm_endpoints row; 'system' rows carry api_key_ref so the dispatcher
-    resolves the key via system_api_keys.
-    """
+    system-endpoint hook and the (now removed) YAML fallback. Catalog rows
+    carry their transport: 'endpoint' rows inherit base_url+api_key from
+    the joined llm_endpoints row; 'system' rows carry api_key_ref so the
+    dispatcher resolves the key via system_api_keys."""
 
     @pytest.fixture(autouse=True)
     def _clear_hooks(self):
@@ -573,25 +495,18 @@ class TestCatalogLookup:
         assert meta.origin == "catalog"
 
     @pytest.mark.asyncio
-    async def test_catalog_miss_falls_back_to_builtin_with_warn(self, caplog):
-        """When the catalog lookup misses, the YAML built-in is returned
-        and a WARN log is emitted so coverage gaps are visible during the
-        rollout window."""
-        import logging
+    async def test_catalog_miss_raises_unknown(self):
+        """When the catalog lookup misses and no other hook matches, the
+        resolver raises — there is no longer a YAML fallback to soak up
+        the miss. This is the behavioral contract change of chunk 6."""
 
         async def fake_catalog(model_id, capability="chat"):
             return None
 
         register_catalog_lookup(fake_catalog)
 
-        with caplog.at_level(logging.WARNING, logger="src.core.model_registry"):
-            meta = await resolve_model("gpt-4o")
-
-        assert meta.origin == "builtin"
-        assert any(
-            "YAML fallback" in rec.message and "gpt-4o" in rec.message
-            for rec in caplog.records
-        ), f"expected YAML-fallback WARN, got: {[r.message for r in caplog.records]}"
+        with pytest.raises(UnknownModelError):
+            await resolve_model("gpt-4o")
 
     @pytest.mark.asyncio
     async def test_catalog_passes_capability_through(self):
@@ -614,18 +529,3 @@ class TestCatalogLookup:
             "model_id": "openrouter/openai/text-embedding-3-large",
             "capability": "embedding",
         }
-
-    @pytest.mark.asyncio
-    async def test_disabled_catalog_row_does_not_match(self):
-        """The catalog accessor (resolve_catalog_model in postgres.py) only
-        returns enabled rows — verify the registry treats a None return as a
-        miss and falls through. This test guards against a future regression
-        where the catalog accessor signature changes.
-        """
-
-        async def fake_catalog(model_id, capability="chat"):
-            return None  # simulates a disabled-only match
-
-        register_catalog_lookup(fake_catalog)
-        meta = await resolve_model("gpt-4o")
-        assert meta.origin == "builtin"  # falls back to YAML

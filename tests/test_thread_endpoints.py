@@ -41,14 +41,61 @@ async def agent_create_thread(
     config_name="persistent_defaults",
     permission_mode="supervised",
     title="Local Session",
+    inject_credentials=None,
+    inject_env_credentials=None,
 ):
-    """5.1: POST /api/agents/threads"""
+    """5.1: POST /api/agents/threads — mirrors orchestrator/main.py handler.
+
+    Includes the system-default chat/auxiliary/embedding pin injection
+    that lands a config_override in thread metadata. Without this, the
+    standalone agent boots against its YAML default and 401s on
+    api.openai.com (see docs/hardcoded_model_defaults.md).
+    """
     thread_id = await db.create_thread(
         user_id=None,
         config_name=config_name,
         permission_mode=permission_mode,
         title=title,
     )
+
+    config_override = {}
+    chat_model = await db.resolve_default_for_capability("chat")
+    if chat_model:
+        llm_section = {"model": chat_model}
+        if inject_credentials:
+            await inject_credentials(
+                section=llm_section,
+                model_id=chat_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+        config_override["llm"] = llm_section
+    aux_model = await db.resolve_default_for_capability("auxiliary")
+    if aux_model:
+        aux_section = {"model": aux_model}
+        if inject_credentials:
+            await inject_credentials(
+                section=aux_section,
+                model_id=aux_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+        config_override["auxiliary"] = aux_section
+    embedding_model = await db.resolve_default_for_capability("embedding")
+    if embedding_model:
+        env_keys = {"EMBEDDING_MODEL": embedding_model}
+        if inject_env_credentials:
+            await inject_env_credentials(
+                env_keys=env_keys,
+                prefix="EMBEDDING",
+                model_id=embedding_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+        config_override["env_keys"] = env_keys
+    if config_override:
+        await db.merge_thread_metadata_config_override(thread_id, config_override)
+
     if gitea.is_initialized:
         repo_name = f"thread-{thread_id[:8]}"
         git_remote_url = await gitea.create_repo(repo_name)
@@ -354,11 +401,15 @@ def _mock_db():
     db.get_agent = AsyncMock(return_value=None)
     db.save_thread_message = AsyncMock(return_value="msg-uuid-1")
     db.merge_thread_workspace_context = AsyncMock()
+    db.merge_thread_metadata_config_override = AsyncMock()
     db.end_thread = AsyncMock()
     db.list_threads = AsyncMock(return_value=[])
     db.get_thread_messages_history = AsyncMock(return_value=[])
     db.get_thread_message_count = AsyncMock(return_value=0)
     db.acquire = MagicMock()
+    # Pin resolution defaults to "no system pin set" so existing tests
+    # that don't care about the override stay green.
+    db.resolve_default_for_capability = AsyncMock(return_value=None)
     return db
 
 
@@ -509,6 +560,97 @@ class TestAgentCreateThread:
 
         with pytest.raises(RuntimeError, match="DB down"):
             await agent_create_thread(db, gitea, prov)
+
+    @pytest.mark.asyncio
+    async def test_skips_override_when_no_pins_set(self):
+        """Without system pins, no config_override is persisted. The
+        readiness gate is the gatekeeper that prevents thread create
+        before pins are set; if the operator somehow gets here without
+        pins, the agent will boot on YAML defaults — but that's a
+        separate bug, not our problem to mask. Pin: don't fabricate
+        an override out of nothing."""
+        db = _mock_db()
+        # Default mock returns None for every capability — no pins set.
+        gitea = _mock_gitea(initialized=False)
+        prov = _mock_provisioner(available=False)
+
+        await agent_create_thread(db, gitea, prov)
+
+        db.merge_thread_metadata_config_override.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_persists_chat_auxiliary_embedding_overrides(self):
+        """When all three system pins are set, the override carries chat
+        + auxiliary + embedding sections so the agent doesn't fall
+        through to YAML defaults at attach. This is the fix for the
+        "Untitled Session" + missing-memory + embedding-401 bug
+        documented in docs/hardcoded_model_defaults.md."""
+        db = _mock_db()
+
+        async def _resolve(cap):
+            return {
+                "chat": "chat-model",
+                "auxiliary": "aux-model",
+                "embedding": "emb-model",
+            }.get(cap)
+
+        db.resolve_default_for_capability = AsyncMock(side_effect=_resolve)
+
+        async def fake_inject(*, section, model_id, user_id, resolved_keys):
+            section["base_url"] = f"https://endpoint/{model_id}/v1"
+            section["api_key"] = "k"
+
+        async def fake_inject_env(
+            *, env_keys, prefix, model_id, user_id, resolved_keys
+        ):
+            env_keys[f"{prefix}_BASE_URL"] = "https://e/v1"
+            env_keys[f"{prefix}_API_KEY"] = "k"
+
+        gitea = _mock_gitea(initialized=False)
+        prov = _mock_provisioner(available=False)
+
+        await agent_create_thread(
+            db,
+            gitea,
+            prov,
+            inject_credentials=fake_inject,
+            inject_env_credentials=fake_inject_env,
+        )
+
+        db.merge_thread_metadata_config_override.assert_awaited_once()
+        call_args = db.merge_thread_metadata_config_override.await_args
+        thread_id, override = call_args.args
+        assert thread_id == "aaaaaaaa-1111-2222-3333-444444444444"
+        assert override["llm"]["model"] == "chat-model"
+        assert override["llm"]["base_url"] == "https://endpoint/chat-model/v1"
+        assert override["auxiliary"]["model"] == "aux-model"
+        assert override["auxiliary"]["base_url"] == "https://endpoint/aux-model/v1"
+        assert override["env_keys"]["EMBEDDING_MODEL"] == "emb-model"
+        assert override["env_keys"]["EMBEDDING_BASE_URL"] == "https://e/v1"
+
+    @pytest.mark.asyncio
+    async def test_persists_partial_override_when_only_chat_pinned(self):
+        """If only chat is pinned (no auxiliary, no embedding), the
+        override carries chat alone. The readiness gate would normally
+        block thread create in this state, but if it doesn't (test
+        environment, future relaxation), the override should at least
+        carry what IS set rather than nothing."""
+        db = _mock_db()
+
+        async def _resolve(cap):
+            return "chat-only" if cap == "chat" else None
+
+        db.resolve_default_for_capability = AsyncMock(side_effect=_resolve)
+        gitea = _mock_gitea(initialized=False)
+        prov = _mock_provisioner(available=False)
+
+        await agent_create_thread(db, gitea, prov)
+
+        db.merge_thread_metadata_config_override.assert_awaited_once()
+        _, override = db.merge_thread_metadata_config_override.await_args.args
+        assert override["llm"]["model"] == "chat-only"
+        assert "auxiliary" not in override
+        assert "env_keys" not in override
 
 
 # =============================================================================
