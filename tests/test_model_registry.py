@@ -25,7 +25,7 @@ from src.core.model_registry import (
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MODELS_YAML = _REPO_ROOT / "config" / "models.yaml"
-_SETTINGS_MATRIX_YAML = _REPO_ROOT / "config" / "settings_matrix.yaml"
+_MODEL_CONFIG_MATRIX_YAML = _REPO_ROOT / "config" / "model_config_matrix.yaml"
 
 
 def _load_yaml(path: Path) -> dict:
@@ -168,14 +168,14 @@ class TestCatalogCoverage:
 
     def test_every_family_has_settings_matrix_entry_or_default(self):
         """Every family used in models.yaml should resolve cleanly through
-        settings_matrix.yaml — either via a dedicated entry or the 'default'
-        fallback. Custom models default to family='default', so the default
-        entry must exist.
+        the unified model_config_matrix.yaml — either via a dedicated family
+        entry or the 'default' fallback. Custom models default to
+        family='default', so the default entry must exist.
         """
-        matrix = _load_yaml(_SETTINGS_MATRIX_YAML)
-        assert "default" in matrix, (
-            "settings_matrix.yaml must contain a 'default' entry — custom "
-            "models without a family rely on it."
+        matrix = _load_yaml(_MODEL_CONFIG_MATRIX_YAML)
+        assert "default" in matrix and "settings" in matrix["default"], (
+            "model_config_matrix.yaml must contain a 'default' family with a "
+            "'settings' subsection — custom models without a family rely on it."
         )
 
         families = {m.family for m in list_builtin_models()}
@@ -496,13 +496,13 @@ class TestCatalogLookup:
 
     @pytest.mark.asyncio
     async def test_catalog_endpoint_row_resolves_with_inline_base_url(self):
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             return {
                 "provider_kind": "endpoint",
                 "provider_ref": "11111111-1111-1111-1111-111111111111",
                 "model_id": model_id,
                 "display_label": "Local Gemma",
-                "role": role,
+                "capability": capability,
                 "family": "gemma",
                 "context_window": 32000,
                 "reasoning_level": None,
@@ -523,13 +523,13 @@ class TestCatalogLookup:
 
     @pytest.mark.asyncio
     async def test_catalog_system_row_resolves_with_api_key_ref(self):
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             return {
                 "provider_kind": "system",
                 "provider_ref": "anthropic",
                 "model_id": model_id,
                 "display_label": "Claude Opus 4.7",
-                "role": role,
+                "capability": capability,
                 "family": "claude-opus",
                 "context_window": 200000,
                 "reasoning_level": None,
@@ -553,14 +553,14 @@ class TestCatalogLookup:
             order.append("system")
             return None
 
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             order.append("catalog")
             return {
                 "provider_kind": "system",
                 "provider_ref": "openai",
                 "model_id": model_id,
                 "display_label": "Custom GPT",
-                "role": role,
+                "capability": capability,
                 "family": "default",
                 "enabled": True,
             }
@@ -579,7 +579,7 @@ class TestCatalogLookup:
         rollout window."""
         import logging
 
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             return None
 
         register_catalog_lookup(fake_catalog)
@@ -594,14 +594,14 @@ class TestCatalogLookup:
         ), f"expected YAML-fallback WARN, got: {[r.message for r in caplog.records]}"
 
     @pytest.mark.asyncio
-    async def test_catalog_passes_capability_as_role(self):
+    async def test_catalog_passes_capability_through(self):
         """resolve_model(..., capability='auxiliary') must reach the catalog
-        with role='auxiliary' so non-chat catalog rows are matchable."""
+        with capability='auxiliary' so non-chat catalog rows are matchable."""
         captured: dict = {}
 
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             captured["model_id"] = model_id
-            captured["role"] = role
+            captured["capability"] = capability
             return None
 
         register_catalog_lookup(fake_catalog)
@@ -612,7 +612,7 @@ class TestCatalogLookup:
             )
         assert captured == {
             "model_id": "openrouter/openai/text-embedding-3-large",
-            "role": "embedding",
+            "capability": "embedding",
         }
 
     @pytest.mark.asyncio
@@ -623,7 +623,7 @@ class TestCatalogLookup:
         where the catalog accessor signature changes.
         """
 
-        async def fake_catalog(model_id, role="chat"):
+        async def fake_catalog(model_id, capability="chat"):
             return None  # simulates a disabled-only match
 
         register_catalog_lookup(fake_catalog)

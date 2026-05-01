@@ -597,6 +597,27 @@ llm:
     #         capability: tts
     systemEndpoints: []
 
+    # -- Optional: provider-direct catalog rows (served by a system API key,
+    # not a custom endpoint). Mirrors the YAML groups block that today lives
+    # in config/models.yaml. Each entry is one (model, capability) catalog row;
+    # repeat the model with a different `capability` if it serves multiple slots.
+    # `provider` must match an entry in `systemApiKeys` above (or one already
+    # in the DB) — entries whose provider has no key seeded are skipped.
+    #
+    # systemModels:
+    #   - provider: "anthropic"
+    #     id: "claude-opus-4-7"
+    #     displayName: "Claude Opus 4.7"
+    #     capability: "chat"      # chat | auxiliary | embedding | vision | whisper | tts
+    #     family: "claude-opus"   # optional; family_matcher derives default from `id`
+    #     contextWindow: 200000   # optional; settings_matrix default if null
+    #     reasoningLevel: null    # optional
+    #   - provider: "openai"
+    #     id: "text-embedding-3-large"
+    #     displayName: "OpenAI Embedding (Large)"
+    #     capability: "embedding"
+    systemModels: []
+
     # -- Resource requests for the short-lived seed Job pod.
     resources:
       requests:

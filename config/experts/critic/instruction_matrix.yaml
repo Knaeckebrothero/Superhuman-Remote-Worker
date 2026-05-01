@@ -1,5 +1,0 @@
-# Critic expert instruction matrix
-# Only list entries that differ from the base matrix.
-
-default:
-  instructions: instructions.md

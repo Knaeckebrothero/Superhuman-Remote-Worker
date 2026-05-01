@@ -292,7 +292,7 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
 
 -- ============================================================================
 -- 0k. MODELS CATALOG
--- Admin-curated catalog of LLM offerings. Each row is one (model, role)
+-- Admin-curated catalog of LLM offerings. Each row is one (model, capability)
 -- anchored to a transport — either a system_api_keys provider
 -- (provider_kind='system', provider_ref='anthropic') or a system-scoped
 -- llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS models (
     provider_ref TEXT NOT NULL,
     model_id TEXT NOT NULL,
     display_label TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts')),
+    capability TEXT NOT NULL CHECK (capability IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts')),
     family TEXT NOT NULL,
     context_window INT,
     reasoning_level TEXT,
@@ -316,22 +316,37 @@ CREATE TABLE IF NOT EXISTS models (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT uq_model_provider UNIQUE (provider_kind, provider_ref, model_id, role)
+    CONSTRAINT uq_model_provider UNIQUE (provider_kind, provider_ref, model_id, capability)
 );
 
-CREATE INDEX IF NOT EXISTS idx_models_role_enabled
-    ON models(role) WHERE enabled = TRUE;
+-- Migration: rename role → capability for vocabulary consistency with the helm
+-- seed (systemEndpoints[].models[].capability). Pre-production app, dev DBs
+-- only — single ALTER TABLE is the migration. Idempotent on fresh installs
+-- (column starts as `capability`) and on upgraded ones (rename then no-op).
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'models' AND column_name = 'role'
+    ) THEN
+        ALTER TABLE models RENAME COLUMN role TO capability;
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_models_capability_enabled
+    ON models(capability) WHERE enabled = TRUE;
+DROP INDEX IF EXISTS idx_models_role_enabled;
 CREATE INDEX IF NOT EXISTS idx_models_provider
     ON models(provider_kind, provider_ref);
 
--- Migration: widen models.role CHECK to include whisper/tts (catalog v1.1).
+-- Migration: widen models.capability CHECK to include whisper/tts (catalog v1.1).
 -- Drops the implicit constraint name Postgres assigns to the inline CHECK and
 -- re-creates it with the wider set. Idempotent on fresh installs (no-op when
 -- the new constraint is already in place).
 DO $$ BEGIN
     ALTER TABLE models DROP CONSTRAINT IF EXISTS models_role_check;
-    ALTER TABLE models ADD CONSTRAINT models_role_check
-        CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts'));
+    ALTER TABLE models DROP CONSTRAINT IF EXISTS models_capability_check;
+    ALTER TABLE models ADD CONSTRAINT models_capability_check
+        CHECK (capability IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts'));
 END $$;
 
 -- ============================================================================

@@ -956,9 +956,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 approved = response == APPROVE_SENTINEL
             except asyncio.TimeoutError:
                 approved = False
-            _session.tool_decisions[tool_call_id] = (
-                "approved" if approved else "denied"
-            )
+            _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
             return approved
 
         async def on_turn_start(turn_id: int) -> None:

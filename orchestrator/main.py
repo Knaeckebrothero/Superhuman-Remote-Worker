@@ -114,6 +114,7 @@ from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
+from services import family_matcher  # noqa: E402
 from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
@@ -892,7 +893,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
             if not aux_model:
-                aux_model = await postgres_db.resolve_default_for_role("auxiliary")
+                aux_model = await postgres_db.resolve_default_for_capability(
+                    "auxiliary"
+                )
             if aux_model:
                 config_override = config_override or {}
                 aux_override = config_override.setdefault("auxiliary", {})
@@ -996,7 +999,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             ):
                 _model = user_settings.get(_user_key)
                 if not _model:
-                    _model = await postgres_db.resolve_default_for_role(_kind)
+                    _model = await postgres_db.resolve_default_for_capability(_kind)
                 if not _model:
                     continue
                 config_override = config_override or {}
@@ -1019,7 +1022,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             embedding_provider = user_settings.get("embedding_provider")
             embedding_model = user_settings.get("default_embedding_model")
             if not embedding_model:
-                embedding_model = await postgres_db.resolve_default_for_role(
+                embedding_model = await postgres_db.resolve_default_for_capability(
                     "embedding"
                 )
             if embedding_provider or embedding_model:
@@ -1049,7 +1052,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # and silently routes to api.openai.com with "not-needed".
         llm_override_check = (config_override or {}).get("llm") or {}
         if "model" not in llm_override_check:
-            system_chat_model = await postgres_db.resolve_default_for_role("chat")
+            system_chat_model = await postgres_db.resolve_default_for_capability("chat")
             if system_chat_model:
                 config_override = config_override or {}
                 llm_override = config_override.setdefault("llm", {})
@@ -2498,10 +2501,17 @@ class AdminDefaultModelSet(BaseModel):
     model: str = Field(..., description="Model ID; empty string clears the default")
 
 
-# Locked enum for the admin-curated catalog. Adding a new role requires
+# Locked enum for the admin-curated catalog. Adding a new capability requires
 # touching every consumer (resolver, dispatcher, default-model fallback),
 # so the schema-level CHECK constraint and this Literal are kept in sync.
-VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
+VALID_CATALOG_CAPABILITIES = (
+    "chat",
+    "auxiliary",
+    "embedding",
+    "vision",
+    "whisper",
+    "tts",
+)
 VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
 
 
@@ -2520,18 +2530,19 @@ class CatalogModelCreate(BaseModel):
     )
     model_id: str = Field(..., min_length=1, max_length=500)
     display_label: str = Field(..., min_length=1, max_length=200)
-    role: Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"]
+    capability: Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"]
     family: str = Field(
         ...,
         min_length=1,
-        description="settings_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
+        description="model_config_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
     )
     context_window: int | None = Field(
         None,
         description=(
-            "Optional override; falls back to settings_matrix family default. "
-            "Pass null (the default) to use the matrix; pass an explicit int "
-            "to override (zero is allowed and round-trips as zero)."
+            "Optional override; falls back to model_config_matrix family "
+            "default. Pass null (the default) to use the matrix; pass an "
+            "explicit int to override (zero is allowed and round-trips as "
+            "zero)."
         ),
     )
     reasoning_level: str | None = None
@@ -2557,7 +2568,7 @@ class CatalogModelUpdate(BaseModel):
     provider_ref: str | None = Field(None, min_length=1)
     model_id: str | None = Field(None, min_length=1, max_length=500)
     display_label: str | None = Field(None, min_length=1, max_length=200)
-    role: (
+    capability: (
         Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"] | None
     ) = None
     family: str | None = Field(None, min_length=1)
@@ -10837,14 +10848,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
 _settings_matrix_cache: dict[str, Any] | None = None
 
 
+def _project_settings_subsection(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Project a parsed model_config_matrix to the legacy settings shape.
+
+    Returns ``{family: settings_dict}`` (drops families without a settings
+    block) so callers that pre-date the unified file see the same shape
+    they used to read from ``settings_matrix.yaml``.
+    """
+    out: dict[str, Any] = {}
+    for family, sections in (parsed or {}).items():
+        if not isinstance(sections, dict):
+            continue
+        # Tolerate both legacy flat shape and unified subsection shape — the
+        # unified loader downstream is the source of truth, but per-expert
+        # files written before chunk 1 may still arrive flat in tests.
+        if "settings" in sections and isinstance(sections["settings"], dict):
+            out[family] = sections["settings"]
+        elif {"prompts", "instructions"}.isdisjoint(sections.keys()):
+            # Pure legacy settings-only block (no `settings:` wrapper) — keep
+            # whatever scalar/dict children it carries.
+            out[family] = sections
+    return out
+
+
 def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
-    """Load and cache settings_matrix.yaml from the config directory."""
+    """Load and cache the settings subsection of ``model_config_matrix.yaml``.
+
+    Returns the legacy ``{family: settings_dict}`` shape so existing callers
+    (`/api/admin/families`, expert detail endpoints) keep working without
+    rewrites. Per-expert overlays are handled by the callers that need
+    them; this function returns the base file only.
+    """
     global _settings_matrix_cache
     if _settings_matrix_cache is None:
-        matrix_path = config_dir / "settings_matrix.yaml"
+        matrix_path = config_dir / "model_config_matrix.yaml"
         if matrix_path.exists():
             with open(matrix_path) as f:
-                _settings_matrix_cache = yaml.safe_load(f) or {}
+                parsed = yaml.safe_load(f) or {}
+            _settings_matrix_cache = _project_settings_subsection(parsed)
         else:
             _settings_matrix_cache = {}
     return _settings_matrix_cache
@@ -10864,14 +10905,16 @@ def _apply_settings_matrix_to_config(
     """
     base_matrix = _load_settings_matrix(config_dir)
 
-    # Support per-expert settings_matrix override
+    # Support per-expert model_config_matrix.yaml override (settings
+    # subsection only — prompts/instructions are loaded by the agent loader).
     matrix = dict(base_matrix)
     if expert_dir and expert_dir != config_dir:
-        expert_matrix_path = expert_dir / "settings_matrix.yaml"
+        expert_matrix_path = expert_dir / "model_config_matrix.yaml"
         if expert_matrix_path.exists():
             with open(expert_matrix_path) as f:
-                expert_matrix = yaml.safe_load(f) or {}
-            matrix = _deep_merge(matrix, expert_matrix)
+                expert_parsed = yaml.safe_load(f) or {}
+            expert_settings = _project_settings_subsection(expert_parsed)
+            matrix = _deep_merge(matrix, expert_settings)
 
     llm_data = merged.get("llm", {})
     model = llm_data.get("model", "gpt-4o")
@@ -10941,11 +10984,12 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     # Do NOT apply it to merged — the client resolves based on the user's model selection.
     raw_matrix = _load_settings_matrix(config_dir)
     if expert_config_dir and expert_config_dir != config_dir:
-        expert_matrix_path = expert_config_dir / "settings_matrix.yaml"
+        expert_matrix_path = expert_config_dir / "model_config_matrix.yaml"
         if expert_matrix_path.exists():
             with open(expert_matrix_path) as f:
-                expert_matrix = yaml.safe_load(f) or {}
-            raw_matrix = _deep_merge(raw_matrix, expert_matrix)
+                expert_parsed = yaml.safe_load(f) or {}
+            expert_settings = _project_settings_subsection(expert_parsed)
+            raw_matrix = _deep_merge(raw_matrix, expert_settings)
 
     # Load instructions content
     instructions_content = None
@@ -11909,7 +11953,7 @@ def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
         "provider_ref": row["provider_ref"],
         "model_id": row["model_id"],
         "display_label": row["display_label"],
-        "role": row["role"],
+        "capability": row["capability"],
         "family": row["family"],
         "context_window": row.get("context_window"),
         "reasoning_level": row.get("reasoning_level"),
@@ -11965,20 +12009,23 @@ async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) 
 @app.get("/api/admin/providers/models")
 async def admin_list_catalog_models(
     request: Request,
-    role: str | None = None,
+    capability: str | None = None,
     provider_kind: str | None = None,
     provider_ref: str | None = None,
     enabled_only: bool = False,
 ) -> list[dict[str, Any]]:
     """List catalog rows with optional filters. Returns full row shape."""
     await _require_admin(request)
-    if role is not None and role not in VALID_CATALOG_ROLES:
+    if capability is not None and capability not in VALID_CATALOG_CAPABILITIES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid role '{role}'. Valid: {list(VALID_CATALOG_ROLES)}",
+            detail=(
+                f"Invalid capability '{capability}'. "
+                f"Valid: {list(VALID_CATALOG_CAPABILITIES)}"
+            ),
         )
     rows = await postgres_db.list_models(
-        role=role,
+        capability=capability,
         provider_kind=provider_kind,
         provider_ref=provider_ref,
         enabled_only=enabled_only,
@@ -11994,7 +12041,7 @@ async def admin_create_catalog_model(
 
     Validates that ``provider_ref`` resolves to an existing transport before
     insert. Returns the created row; raises 409 on
-    ``(provider_kind, provider_ref, model_id, role)`` collision.
+    ``(provider_kind, provider_ref, model_id, capability)`` collision.
     """
     await _require_admin(request)
     await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
@@ -12004,7 +12051,7 @@ async def admin_create_catalog_model(
             provider_ref=body.provider_ref,
             model_id=body.model_id,
             display_label=body.display_label,
-            role=body.role,
+            capability=body.capability,
             family=body.family,
             context_window=body.context_window,
             reasoning_level=body.reasoning_level,
@@ -12018,7 +12065,7 @@ async def admin_create_catalog_model(
                 status_code=409,
                 detail=(
                     f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                    f"{body.model_id}, role={body.role}) already exists."
+                    f"{body.model_id}, capability={body.capability}) already exists."
                 ),
             )
         raise
@@ -12142,7 +12189,7 @@ async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[st
 
 @app.get("/api/admin/families")
 async def admin_list_families(request: Request) -> dict[str, list[str]]:
-    """Return the family keys defined in ``settings_matrix.yaml``.
+    """Return the family keys defined in ``model_config_matrix.yaml``.
 
     Powers the family dropdown on the *Admin → Models* form so adding a
     family in the YAML doesn't require a frontend rebuild.
@@ -12151,6 +12198,26 @@ async def admin_list_families(request: Request) -> dict[str, list[str]]:
     matrix = _load_settings_matrix(_get_config_dir())
     families = sorted(k for k in matrix.keys() if isinstance(k, str))
     return {"families": families}
+
+
+@app.get("/api/admin/families/detect")
+async def admin_detect_family(request: Request, model_id: str) -> dict[str, str]:
+    """Suggest a family for ``model_id`` via the regex matcher.
+
+    Pre-fills the family dropdown on the *Admin → Models* add form and the
+    discovery confirmation dialog so admins don't have to memorize the
+    mapping. ``source`` is ``"matched"`` for a regex hit and ``"fallback"``
+    when no rule matched (the result is ``default`` — works, but quality is
+    on the model). Admin can override before saving either way.
+    """
+    await _require_admin(request)
+    if not model_id or not model_id.strip():
+        raise HTTPException(status_code=400, detail="model_id is required")
+    detection = family_matcher.detect_family(model_id.strip())
+    return {
+        "family": detection.family,
+        "source": detection.source,
+    }
 
 
 def _resolve_preference_defaults() -> dict[str, Any]:
@@ -12429,28 +12496,28 @@ async def list_available_models(
     for row in catalog_rows:
         kind = row["provider_kind"]
         ref = row["provider_ref"]
-        role = row["role"]
+        capability = row["capability"]
         helper_entry = {
             "id": row["model_id"],
             "label": row["display_label"],
             "configured": True,
         }
-        if role == "auxiliary":
+        if capability == "auxiliary":
             auxiliary.append(helper_entry)
             continue
-        if role == "vision":
+        if capability == "vision":
             vision.append(helper_entry)
             continue
-        if role == "embedding":
+        if capability == "embedding":
             embedding.append(helper_entry)
             continue
-        if role == "whisper":
+        if capability == "whisper":
             whisper_catalog.append(helper_entry)
             continue
-        if role == "tts":
+        if capability == "tts":
             tts_catalog.append(helper_entry)
             continue
-        # role == 'chat'
+        # capability == 'chat'
         key = (kind, ref)
         group = groups_by_key.get(key)
         if group is None:

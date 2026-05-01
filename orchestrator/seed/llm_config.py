@@ -17,6 +17,12 @@ a fresh stack. On each run:
 * ``systemEndpoints`` entries are matched by label. Missing endpoints are
   created; existing ones are left alone apart from their model list — any
   listed model that is not already present gets appended.
+* ``systemModels`` entries are provider-direct catalog rows
+  (``provider_kind='system'``) anchored to a ``system_api_keys`` provider.
+  Inserted with ``ON CONFLICT DO NOTHING`` on
+  ``(provider_kind, provider_ref, model_id, capability)``, so admin edits
+  via the Cockpit survive subsequent helm upgrades. Entries whose provider
+  is not (yet) in ``system_api_keys`` are skipped with a log line.
 
 The Job is re-run on every upgrade, so the seeder's success path must be
 idempotent. Non-zero exits are reserved for genuine DB errors — a re-run
@@ -45,6 +51,17 @@ Payload shape::
           - id: "qwen3-embedding-8b"
             displayName: "Qwen3 Embedding 8B"
             capability: embedding        # routes to Admin → Defaults → Embedding
+
+    systemModels:
+      - provider: "anthropic"
+        id: "claude-opus-4-7"
+        displayName: "Claude Opus 4.7"
+        capability: chat
+        family: "claude-opus"
+      - provider: "openai"
+        id: "text-embedding-3-large"
+        displayName: "OpenAI Embedding (Large)"
+        capability: embedding
 
 ``apiKeyEnv`` lets helm keep the payload ConfigMap plaintext-free: the Job pod
 mounts the referenced Secret via ``envFrom`` and the seeder resolves the
@@ -247,8 +264,8 @@ async def _seed_endpoints(
                     "skipping model entry under %s — id missing: %r", label, model
                 )
                 continue
-            role = (model.get("capability") or "chat").lower()
-            if role not in (
+            capability = (model.get("capability") or "chat").lower()
+            if capability not in (
                 "chat",
                 "auxiliary",
                 "embedding",
@@ -257,10 +274,10 @@ async def _seed_endpoints(
                 "tts",
             ):
                 logger.info(
-                    "skipping model %s under %s — capability %r is not a catalog role",
+                    "skipping model %s under %s — capability %r is not in catalog enum",
                     model_id,
                     label,
-                    role,
+                    capability,
                 )
                 continue
             display_label = (
@@ -271,7 +288,7 @@ async def _seed_endpoints(
                 provider_ref=endpoint_id,
                 model_id=model_id,
                 display_label=display_label,
-                role=role,
+                capability=capability,
                 family=model.get("family") or family_of(model_id),
                 context_window=model.get("contextWindow")
                 or model.get("context_window"),
@@ -286,11 +303,89 @@ async def _seed_endpoints(
                 continue
             report.models_seeded.append((label, model_id))
             logger.info(
-                "seeded catalog row %s (role=%s) under endpoint %s",
+                "seeded catalog row %s (capability=%s) under endpoint %s",
                 model_id,
-                role,
+                capability,
                 label,
             )
+
+
+async def _seed_system_models(
+    db: PostgresDB, entries: Iterable[dict[str, Any]], report: SeedReport
+) -> None:
+    """Seed provider-direct catalog rows (provider_kind='system').
+
+    Each entry is one (provider, model_id, capability) tuple anchored to a
+    ``system_api_keys`` provider that must already exist. Entries whose
+    provider has no key are skipped — same contract as the legacy
+    ``_seed_models_from_yaml`` path it replaces.
+    """
+    seeded_providers = {k["provider"] for k in await db.list_system_api_keys()}
+
+    from src.core.model_registry import family_of  # local: src/* lazy load
+
+    for entry in entries:
+        provider = entry.get("provider")
+        model_id = entry.get("id") or entry.get("model_id")
+        if not provider or not model_id:
+            logger.warning(
+                "skipping systemModels entry — provider or id missing: %r", entry
+            )
+            continue
+
+        if provider not in seeded_providers:
+            logger.info(
+                "skipping systemModels[%s/%s] — no system_api_keys row for "
+                "provider yet (seed the key first or add via Admin → Providers)",
+                provider,
+                model_id,
+            )
+            report.models_skipped.append((provider, model_id))
+            continue
+
+        capability = (entry.get("capability") or "chat").lower()
+        if capability not in (
+            "chat",
+            "auxiliary",
+            "embedding",
+            "vision",
+            "whisper",
+            "tts",
+        ):
+            logger.info(
+                "skipping systemModels[%s/%s] — capability %r is not in catalog enum",
+                provider,
+                model_id,
+                capability,
+            )
+            continue
+
+        display_label = (
+            entry.get("displayName") or entry.get("display_name") or model_id
+        )
+        inserted = await db.create_model(
+            provider_kind="system",
+            provider_ref=provider,
+            model_id=model_id,
+            display_label=display_label,
+            capability=capability,
+            family=entry.get("family") or family_of(model_id),
+            context_window=entry.get("contextWindow") or entry.get("context_window"),
+            reasoning_level=entry.get("reasoningLevel") or entry.get("reasoning_level"),
+            enabled=entry.get("enabled", True),
+            seeded_from=SEEDED_FROM_TAG,
+            on_conflict_do_nothing=True,
+        )
+        if inserted is None:
+            report.models_skipped.append((provider, model_id))
+            continue
+        report.models_seeded.append((provider, model_id))
+        logger.info(
+            "seeded catalog row %s (capability=%s) under system provider %s",
+            model_id,
+            capability,
+            provider,
+        )
 
 
 async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
@@ -298,12 +393,23 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     report = SeedReport()
     api_keys = payload.get("systemApiKeys") or []
     endpoints = payload.get("systemEndpoints") or []
+    system_models = payload.get("systemModels") or []
 
-    if not isinstance(api_keys, list) or not isinstance(endpoints, list):
-        raise ValueError("systemApiKeys and systemEndpoints must be lists when present")
+    if (
+        not isinstance(api_keys, list)
+        or not isinstance(endpoints, list)
+        or not isinstance(system_models, list)
+    ):
+        raise ValueError(
+            "systemApiKeys, systemEndpoints, and systemModels must be lists when present"
+        )
 
-    await _seed_api_keys(db, api_keys, report)
-    await _seed_endpoints(db, endpoints, report)
+    if api_keys:
+        await _seed_api_keys(db, api_keys, report)
+    if endpoints:
+        await _seed_endpoints(db, endpoints, report)
+    if system_models:
+        await _seed_system_models(db, system_models, report)
     return report
 
 

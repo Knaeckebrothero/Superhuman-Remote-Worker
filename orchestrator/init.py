@@ -286,9 +286,10 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # (idempotent; matched by well-known label)
         await _seed_codex_proxy_endpoint(db)
 
-        # Seed the models catalog from config/models.yaml (idempotent —
-        # admin edits via Cockpit are never clobbered)
-        await _seed_models_from_yaml(db)
+        # Seed the models catalog from the helm seed payload — same source
+        # the helm Job consumes. config/models.yaml acts as a legacy bridge
+        # until chunk 7 of the catalog migration deletes it.
+        await _seed_models_from_helm(db)
 
         # One-shot migration: promote system-scoped user_llm_endpoint_models
         # rows to the catalog and drop the legacy table. No-op once the
@@ -909,7 +910,7 @@ async def _seed_codex_proxy_endpoint(db) -> None:
         logger.info("  codex-proxy endpoint already present — leaving untouched")
 
 
-_YAML_GROUP_ROLE = {
+_YAML_GROUP_CAPABILITY = {
     "auxiliary_models": "auxiliary",
     "vision_models": "vision",
     "embedding_models": "embedding",
@@ -937,64 +938,112 @@ def _infer_provider_from_model_id(model_id: str) -> str | None:
     return None
 
 
-async def _seed_models_from_yaml(db) -> None:
-    """Seed the ``models`` catalog from ``config/models.yaml`` on first boot.
+async def _seed_models_from_helm(db) -> None:
+    """Seed the ``models`` catalog from the helm seed payload on first boot.
 
-    For each entry in the YAML groups + the auxiliary/vision/embedding helper
-    lists, construct one catalog row per (model, role) and insert with
-    ``ON CONFLICT DO NOTHING`` so admin edits made via the Cockpit are never
-    clobbered by subsequent boots.
+    Reads ``helm/values.yaml``'s ``llm.seed.systemModels[]`` block (the same
+    block the helm post-install Job consumes via the rendered ConfigMap) and
+    delegates to :func:`orchestrator.seed.llm_config.seed`. Each entry becomes
+    one ``(model, capability)`` catalog row with ``provider_kind='system'``,
+    inserted via ``ON CONFLICT DO NOTHING`` so admin edits made via the
+    Cockpit are never clobbered.
 
-    Rows whose inferred provider has no ``system_api_keys`` entry yet are
-    skipped — they would not be reachable. The ``local`` provider (vLLM via
-    a static endpoint) is also skipped: those models surface through the
-    ``llm_endpoints`` route, not as system rows.
+    Rows whose ``provider`` has no ``system_api_keys`` entry yet are skipped
+    by the seeder — they would not be reachable. Bare-metal devs running
+    ``python init.py`` get the same path as the helm Job; the helm chart
+    values are the single source of truth for which catalog rows ship by
+    default.
+
+    Backwards-compat: if ``helm/values.yaml`` carries no ``systemModels``,
+    we additionally consume the legacy ``config/models.yaml`` ``groups:``
+    block to ease the migration window. That fallback drops out when
+    ``config/models.yaml`` is deleted in chunk 7 of the catalog migration.
+    """
+    helm_values_path = Path(__file__).resolve().parent.parent / "helm" / "values.yaml"
+    system_models: list[dict] = []
+
+    if helm_values_path.exists():
+        try:
+            helm_raw = yaml.safe_load(helm_values_path.read_text()) or {}
+        except yaml.YAMLError as e:
+            logger.warning(f"  Could not parse {helm_values_path}: {e}")
+            helm_raw = {}
+        seed_block = (helm_raw.get("llm") or {}).get("seed") or {}
+        system_models = list(seed_block.get("systemModels") or [])
+
+    # Legacy bridge: while config/models.yaml still exists, fold its groups[]
+    # + helper lists into the systemModels payload so the migration window
+    # doesn't lose catalog rows. Removed in chunk 7.
+    legacy_models = _legacy_models_yaml_to_system_models()
+    if legacy_models:
+        system_models.extend(legacy_models)
+
+    if not system_models:
+        logger.info("  Catalog seed skipped — no helm.llm.seed.systemModels entries")
+        return
+
+    try:
+        from orchestrator.seed.llm_config import seed as llm_seed
+    except ImportError as e:
+        logger.warning(f"  Could not import seed.llm_config: {e}")
+        return
+
+    # Only systemModels here. Endpoint seeding is owned by
+    # _seed_codex_proxy_endpoint (init.py) and the helm post-install Job.
+    report = await llm_seed(db, {"systemModels": system_models})
+
+    if report.models_seeded:
+        logger.info(f"  Seeded {len(report.models_seeded)} catalog rows from helm seed")
+    if report.models_skipped:
+        # skipped covers both "already present" and "provider not configured" —
+        # the per-entry reason is in the seeder's own log lines above.
+        logger.info(
+            f"  Skipped {len(report.models_skipped)} catalog rows "
+            "(already present or provider not seeded)"
+        )
+
+
+def _legacy_models_yaml_to_system_models() -> list[dict]:
+    """Adapt ``config/models.yaml``'s legacy shape into ``systemModels[]`` entries.
+
+    Bridge for the chunk 2 → chunk 7 migration window. When ``models.yaml`` is
+    deleted in chunk 7, this returns ``[]`` and the function is removed.
     """
     catalog_path = Path(__file__).resolve().parent.parent / "config" / "models.yaml"
     if not catalog_path.exists():
-        logger.info(f"  Catalog seed skipped — {catalog_path} not found")
-        return
+        return []
 
     try:
         raw = yaml.safe_load(catalog_path.read_text()) or {}
     except yaml.YAMLError as e:
         logger.warning(f"  Could not parse {catalog_path}: {e}")
-        return
+        return []
 
-    seeded_keys = {k["provider"] for k in await db.list_system_api_keys()}
+    out: list[dict] = []
 
-    rows: list[dict] = []
-    skipped_provider_counts: dict[str, int] = {}
-
-    def _enqueue(
-        provider: str | None, model_id: str, display: str, role: str, family: str | None
+    def _emit(
+        provider: str | None,
+        model_id: str,
+        display: str,
+        capability: str,
+        family: str | None,
     ) -> None:
         if not provider or provider == "local":
             return
-        if provider not in seeded_keys:
-            skipped_provider_counts[provider] = (
-                skipped_provider_counts.get(provider, 0) + 1
-            )
-            return
-        from src.core.model_registry import family_of  # local import: avoids
-        # importing src/* during early startup before sys.path is set up
-
-        rows.append(
+        out.append(
             {
-                "provider_kind": "system",
-                "provider_ref": provider,
-                "model_id": model_id,
-                "display_label": display or model_id,
-                "role": role,
-                "family": family or family_of(model_id),
-                "seeded_from": "config/models.yaml",
+                "provider": provider,
+                "id": model_id,
+                "displayName": display or model_id,
+                "capability": capability,
+                **({"family": family} if family else {}),
             }
         )
 
     for group in raw.get("groups", []):
         provider = group.get("provider")
         for entry in group.get("models", []):
-            _enqueue(
+            _emit(
                 provider,
                 entry["id"],
                 entry.get("display_name") or entry["id"],
@@ -1002,33 +1051,20 @@ async def _seed_models_from_yaml(db) -> None:
                 entry.get("family"),
             )
 
-    for yaml_key, role in _YAML_GROUP_ROLE.items():
+    for yaml_key, capability in _YAML_GROUP_CAPABILITY.items():
         for entry in raw.get(yaml_key, []):
             provider = entry.get("provider") or _infer_provider_from_model_id(
                 entry["id"]
             )
-            _enqueue(
+            _emit(
                 provider,
                 entry["id"],
                 entry.get("label") or entry["id"],
-                role,
+                capability,
                 entry.get("family"),
             )
 
-    inserted = 0
-    for row in rows:
-        result = await db.create_model(**row, on_conflict_do_nothing=True)
-        if result is not None:
-            inserted += 1
-
-    if inserted:
-        logger.info(f"  Seeded {inserted} catalog rows from config/models.yaml")
-    else:
-        logger.info("  No new catalog rows from config/models.yaml (all present)")
-    for provider, count in sorted(skipped_provider_counts.items()):
-        logger.info(
-            f"  Skipped {count} {provider} catalog rows — no system_api_keys row yet"
-        )
+    return out
 
 
 async def _migrate_endpoint_models_to_catalog(db) -> None:
@@ -1058,7 +1094,7 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
         )
 
     promoted = 0
-    skipped_unsupported_role = 0
+    skipped_unsupported_capability = 0
     for row in rows:
         capability = (row["capability"] or "chat").lower()
         if capability not in (
@@ -1069,7 +1105,7 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
             "whisper",
             "tts",
         ):
-            skipped_unsupported_role += 1
+            skipped_unsupported_capability += 1
             continue
         from src.core.model_registry import family_of  # local import: src/*
         # path may not be on sys.path until runtime is fully wired
@@ -1079,7 +1115,7 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
             provider_ref=str(row["endpoint_id"]),
             model_id=row["model_id"],
             display_label=row["display_name"],
-            role=capability,
+            capability=capability,
             family=row["family"] or family_of(row["model_id"]),
             context_window=row["context_window"],
             reasoning_level=row["reasoning_level"],
@@ -1095,9 +1131,9 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
 
     logger.info(
         "  Migrated user_llm_endpoint_models → models: %d promoted, "
-        "%d skipped (unsupported v1 role); table dropped",
+        "%d skipped (unsupported v1 capability); table dropped",
         promoted,
-        skipped_unsupported_role,
+        skipped_unsupported_capability,
     )
 
 
@@ -1109,7 +1145,7 @@ async def _apply_openrouter_defaults(db) -> None:
     When an admin only seeds an OpenRouter key, the auxiliary and embedding
     slots would otherwise be empty and dependent features (memory
     extraction, recall search) would fail at first use. Inserting these
-    rows ensures the catalog has at least one entry per dependent role.
+    rows ensures the catalog has at least one entry per dependent capability.
 
     The default-model resolver's "first-enabled-alphabetical" fallback then
     handles which one gets used. Admin edits/disables survive subsequent
@@ -1125,7 +1161,7 @@ async def _apply_openrouter_defaults(db) -> None:
             "provider_ref": "openrouter",
             "model_id": "openrouter/google/gemini-2.5-flash",
             "display_label": "Gemini 2.5 Flash (OpenRouter)",
-            "role": "auxiliary",
+            "capability": "auxiliary",
             "family": "gemini",
             "seeded_from": "helm:openrouter-defaults",
         },
@@ -1134,7 +1170,7 @@ async def _apply_openrouter_defaults(db) -> None:
             "provider_ref": "openrouter",
             "model_id": "openrouter/openai/text-embedding-3-large",
             "display_label": "text-embedding-3-large (OpenRouter)",
-            "role": "embedding",
+            "capability": "embedding",
             "family": "default",
             "seeded_from": "helm:openrouter-defaults",
         },
@@ -1146,7 +1182,8 @@ async def _apply_openrouter_defaults(db) -> None:
         if result is not None:
             inserted += 1
             logger.info(
-                f"  Inserted openrouter convenience row: {row['model_id']} ({row['role']})"
+                f"  Inserted openrouter convenience row: {row['model_id']} "
+                f"({row['capability']})"
             )
     if not inserted:
         logger.info("  OpenRouter convenience catalog rows already present — no-op")
