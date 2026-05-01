@@ -25,25 +25,10 @@ const STORAGE_KEYS = {
     <div class="settings-group">
       <div class="group-label">{{ 'agentSettings.model.group' | transloco }}</div>
 
-      <!-- Model Preset Chips (job mode only) -->
-      @if (mode() === 'job' && availablePresets().length > 0) {
-        <div class="field-row preset-row">
-          <label class="field-label">{{ 'agentSettings.model.preset' | transloco }}</label>
-          <div class="preset-chips">
-            @for (preset of availablePresets(); track preset.label) {
-              <button
-                type="button"
-                class="preset-chip"
-                [class.active]="strategicModel() === preset.strategic && tacticalModel() === preset.tactical"
-                [class.unconfigured]="!preset.configured"
-                (click)="applyPreset(preset)"
-                [disabled]="disabled()"
-                [title]="preset.configured ? '' : ('agentSettings.model.presetUnconfigured' | transloco)"
-              >{{ preset.label }}</button>
-            }
-          </div>
-        </div>
-      }
+      <!-- Strategic+tactical preset chips were removed in chunk 7 of
+           models_yaml_removal — the legacy presets block in models.yaml
+           has no DB-backed successor. The catalog carries enough
+           metadata to rebuild presets if demand surfaces. -->
 
       @if (mode() === 'job') {
         <!-- Strategic Model -->
@@ -176,41 +161,6 @@ const STORAGE_KEYS = {
       opacity: 0.6;
       cursor: not-allowed;
     }
-    .preset-row {
-      border-left-color: transparent !important;
-    }
-    .preset-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .preset-chip {
-      padding: 5px 12px;
-      border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 16px;
-      background: transparent;
-      color: var(--text-primary, var(--text-primary));
-      font-size: 12px;
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-    .preset-chip:hover:not(:disabled) {
-      border-color: var(--accent-color, var(--accent-color));
-      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-    }
-    .preset-chip.active {
-      border-color: var(--accent-color, var(--accent-color));
-      background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-      color: var(--accent-color, var(--accent-color));
-    }
-    .preset-chip:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-    .preset-chip.unconfigured {
-      opacity: 0.5;
-      border-style: dashed;
-    }
     .reset-btn {
       display: inline-flex;
       align-items: center;
@@ -248,7 +198,6 @@ export class ModelGroupComponent {
   change = output<void>();
 
   readonly availableModels = this.modelService.models;
-  readonly availablePresets = this.modelService.presets;
 
   // Job mode: per-phase overrides
   readonly strategicModel = signal<string | null>(null);
@@ -295,14 +244,6 @@ export class ModelGroupComponent {
     }
     return count;
   });
-
-  applyPreset(preset: { label: string; strategic: string; tactical: string }): void {
-    this.strategicModel.set(preset.strategic);
-    this.tacticalModel.set(preset.tactical);
-    this.persistModel('strategic', preset.strategic);
-    this.persistModel('tactical', preset.tactical);
-    this.change.emit();
-  }
 
   onStrategicModelChange(value: string | null): void {
     const resolved = value === this.resolvedStrategicModel() ? null : value;

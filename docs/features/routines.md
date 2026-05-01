@@ -122,6 +122,20 @@ A new `routines` table in Postgres stores recurring schedule definitions. A new 
 
 The right answer is **both**, and the order is **native first**. Native handles the common case with no friction; the API handles the long tail for users who already live in n8n.
 
+### Why a Separate Dispatcher, Not a Unified Queue
+
+A reasonable alternative is to collapse the routine dispatcher entirely: store the cron expression on the `jobs` table itself, let the existing auto-assign dispatcher consider only jobs whose `next_run_at <= now()`, and skip the separate `routines` table + tick loop. The priority queue *is* the scheduler. One concept, fewer moving parts.
+
+This was considered and rejected for three reasons:
+
+1. **Template vs instance.** A routine is a *recipe* that produces many jobs over time; a job is a single execution. Storing the recipe on the same row that represents the execution means a routine that fires 100 times either spawns 100 rows (and the original row is ambiguous — is it the recipe or the first instance?) or rewrites itself in place (and then run history needs a separate audit table anyway). Two concepts, two tables.
+
+2. **Stale config.** A pre-created job that won't fire for six days has its prompt, model, and config baked in *now*. If the user edits the routine 10 minutes before the next fire — a common UX flow — the queued job has the old prompt. Fire-at-trigger creates the job with *current* routine config every time. That's what users expect, and what every mature scheduler does (Vercel Cron, GitHub Actions, Temporal Schedules — all materialize on fire, not on definition).
+
+3. **Queue clutter.** With pre-creation, the job list contains `created`-status rows that won't actually run for days. Jobs and routines have different list-view semantics — "what's pending right now" vs. "what's scheduled to happen later" — and forcing them into one view degrades both.
+
+The cost of keeping them separate is small: one Postgres table, one 60-second async loop, one CRUD UI tab. The benefits — clean template/instance split, fresh config at fire time, separable list views — justify it. Priority then composes cleanly on top: routines decide *when* a job materializes; the existing priority queue decides *what order* materialized jobs run. Two orthogonal concerns, two systems, no conflation.
+
 ### Schema: `routines` Table
 
 ```sql
@@ -144,6 +158,7 @@ CREATE TABLE IF NOT EXISTS routines (
     prompt          TEXT NOT NULL,         -- the description sent to the agent
     config_override JSONB NOT NULL DEFAULT '{}'::jsonb,
     autonomy        TEXT NOT NULL DEFAULT 'review',
+    priority        INTEGER NOT NULL DEFAULT 5,  -- copied to jobs.priority at fire time
 
     -- Scheduling state
     next_run_at         TIMESTAMPTZ NOT NULL,  -- the cron-computed time the next fire is *due*
@@ -175,6 +190,16 @@ The partial index on `(next_run_at) WHERE enabled = true` is the only index the 
 **`last_scheduled_at` vs `last_dispatched_at`** — these are two different concepts and conflating them is the single most common scheduler bug (Airflow spent years renaming `execution_date` to `logical_date` for exactly this reason). `last_scheduled_at` is *what the cron expression said* — the planned time. `last_dispatched_at` is *what the wall clock said when the dispatcher actually fired* — usually a few seconds later, sometimes hours later if the orchestrator was down. The cockpit shows both. Drift between them is the user-visible signal that the scheduler is unhealthy.
 
 **`catchup_window_seconds`** — the grace window for missed fires. If the orchestrator was down longer than this when a routine becomes due, the dispatcher logs the miss and skips to the next future tick rather than firing a stale run. The 24-hour default is intentionally generous: a weekly Monday-morning routine should still fire even if the orchestrator was down for 18 hours overnight. Users with high-frequency routines can lower it. This is the "grace_time" pattern from Sidekiq-Cron and the `CatchupWindow` from Temporal Schedules.
+
+**`priority`** — a template field, not a new mechanism. Copied verbatim into the resulting `jobs.priority` at fire time. Same scale, same default (5), same semantics as a manually-created job. See the Priority subsection below for how the existing dispatcher uses it.
+
+### Priority
+
+Routines reuse the existing `jobs.priority` column (`INTEGER NOT NULL DEFAULT 5`, defined at `orchestrator/database/schema.sql:536` with index `idx_jobs_priority` at line 604) and the existing two-phase auto-assign dispatcher at `orchestrator/main.py:1752`. Phase 1 directly assigns free agents to the highest-priority pending jobs — `get_dispatchable_jobs` in `orchestrator/database/postgres.py:1931` orders by `priority DESC, created_at ASC`. Phase 2 preempts lowest-priority running jobs when higher-priority pending ones can't otherwise be scheduled. Both phases are already shipped; the routines feature does not extend or modify them.
+
+`routines.priority` is therefore a **template field**: `create_job_from_routine` copies it verbatim into the new job's `priority` column, and from there the dispatcher takes over with no special handling for routine-spawned jobs. A routine looks identical to a manually-created job from the dispatcher's point of view.
+
+Trigger-time and run-order are deliberately kept orthogonal. The cron expression decides *when* a job comes into existence; priority decides *what order ready jobs run in*. A `Low (1)` daily-digest routine fires at 03:00 regardless of load, then sits behind any `Normal (5)` work until capacity opens — the "fill the gaps" pattern. A `High (8)` time-critical routine fires at 09:00 and preempts running `Low` work via Phase 2. Users get this composition for free, without the routines feature having to reason about scheduling order at all.
 
 ### Endpoint Surface
 
@@ -220,7 +245,7 @@ async def _tick() -> None:
         rows = await db.fetch(
             """
             WITH due AS (
-                SELECT id, cron_expr, timezone, next_run_at, catchup_window_seconds
+                SELECT id, cron_expr, timezone, next_run_at, catchup_window_seconds, priority
                 FROM routines
                 WHERE enabled = true AND next_run_at <= $1
                 ORDER BY next_run_at
@@ -278,7 +303,7 @@ async def _tick() -> None:
 - **CTE + `FOR UPDATE SKIP LOCKED`** — selecting due rows and processing them inside a single transaction is the pattern used by river, graphile-worker, and PgQueuer. The locked rows are released on commit; multiple orchestrator replicas can tick in parallel and never collide. This also means the **transactional approach gives us idempotency for free**: if the tick crashes between job INSERT and routine UPDATE, the transaction rolls back and the next tick re-tries the same routine with the same `scheduled_for`. No `(routine_id, scheduled_fire_time)` unique constraint required. (If we ever split job creation across services — e.g., the agent dispatcher becomes an HTTP call inside `create_job_from_routine` — we revisit this and add the unique constraint as a fallback.)
 - **`next_run` is computed from the previous `scheduled_for`, not from `now()`.** Anchoring on wall-clock time causes drift on minute-level schedules: a 1.5-second tick on `* * * * *` shifts the schedule forward by 1.5s every minute. Always advance from the cron-canonical previous time.
 - **The `while next_run <= now` loop** collapses long downtime to a single fire. If the orchestrator was down for 6 hours on a `0 * * * *` schedule, we fire once for the most recent due hour (or skip if past the catchup window) and advance `next_run_at` to the next *future* hour — no flood of 6 backfilled jobs.
-- **`create_job_from_routine` calls the existing job-creation service** used by `POST /api/jobs`. The created job carries `context.routine_id = <routine.id>` and `context.scheduled_for = <iso8601>` so it's filterable in the job list and audit-visible.
+- **`create_job_from_routine` calls the existing job-creation service** used by `POST /api/jobs`. The created job carries `context.routine_id = <routine.id>` and `context.scheduled_for = <iso8601>` so it's filterable in the job list and audit-visible. The new job's `priority` is populated from `r["priority"]` — the existing two-phase auto-assign dispatcher (`orchestrator/main.py:1752`) handles ordering and preemption with no scheduler-side changes.
 - **`LIMIT 100`** caps per-tick work. Sudden spikes (downtime recovery) are absorbed across multiple ticks. Jitter the `next_run_at` of recovered routines slightly to desynchronize fleets — see "Top-of-hour herd" in the risks table.
 - The 60s sleep is a `wait_for(shutdown_event)` so the task tears down cleanly on orchestrator shutdown.
 
@@ -305,6 +330,7 @@ A new top-level navigation item in the cockpit, alongside Jobs / Projects / Thre
 - Advanced (collapsed by default):
   - Autonomy dropdown
   - Model override
+  - Priority dropdown — `Low (1)` / `Normal (5)` / `High (8)` / `Critical (10)`. Mirrors the scale used by manual job creation so users see one priority mental model across the cockpit; the value is copied verbatim into `jobs.priority` at fire time and from there the existing two-phase dispatcher handles ordering + preemption. Default `Normal (5)`. Use `Low` for "fill the gaps" routines (daily digests, opportunistic indexing) and `High` for time-critical routines that should preempt running work
   - Catchup window (defaulted, hidden behind "Advanced")
   - Config JSON editor for power users
 
@@ -454,6 +480,7 @@ The existence of these future features is **the reason the API escape hatch matt
 ## Future Extensions
 
 - **One-shot scheduled jobs.** "Run this job on Friday at 3pm, once." Same table, `cron_expr` becomes optional, add a `run_at` field. Auto-disables after firing.
+- **Deadline-window jobs.** A complementary primitive to cron schedules: instead of a point-in-time trigger, a `deadline_at TIMESTAMPTZ` and an optional `not_before TIMESTAMPTZ` define a window in which the job must run. The dispatcher picks the job up during idle windows (Low priority by default) and force-promotes its priority as `deadline_at` approaches — implementing the natural "run this once before tomorrow morning, ideally when nothing else is happening" pattern that low-priority cron only approximates. Implementable on the same table: `cron_expr` becomes nullable, add `deadline_at` and `not_before`, dispatcher learns one new ranking rule (`urgency_boost = clamp((now - not_before) / (deadline_at - not_before), 0, 1)`). Pairs naturally with the one-shot item above; both are "non-recurring trigger" variants on the same schema.
 - **Conditional routines.** "Run weekly *only if* the previous run produced output." Cheap to add once routines are stable: check `last_status` before firing.
 - **Routine chains.** "When routine A finishes, fire routine B." The completion service already has hooks for delegation; routines could subscribe.
 - **Public routine catalog.** Curated routines that users can install with one click ("Weekly news digest", "Daily standup summary"). Templates with placeholder prompts.

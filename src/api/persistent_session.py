@@ -105,6 +105,11 @@ class PersistentSession:
     # Parent clients for cleanup (e.g. MongoClient)
     _datasource_clients: Dict[str, Any] = field(default_factory=dict)
 
+    # Per-tool-call approval decisions (tool_call_id -> 'approved'|'denied').
+    # Populated by the WS permission_check; consumed at turn save so the
+    # decision is persisted alongside the tool call in thread_messages.
+    tool_decisions: Dict[str, str] = field(default_factory=dict)
+
     @property
     def project_id(self) -> Optional[str]:
         """Primary project (first in list) for backward compat."""

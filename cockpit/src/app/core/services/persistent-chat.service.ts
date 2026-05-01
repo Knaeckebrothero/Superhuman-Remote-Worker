@@ -24,10 +24,18 @@ export interface ToolCallInfo {
     status: 'pending' | 'running' | 'completed' | 'denied';
     /** Tool category from the registry (e.g. workspace, git, research). */
     category?: string;
+    /**
+     * Supervised approval outcome, if this call passed through a permission
+     * gate. Persisted on the backend so it survives history reload.
+     * Absent for autonomous / auto-accepted calls.
+     */
+    decision?: 'approved' | 'denied';
 }
 
 /** Permission request from the agent. */
 export interface PermissionRequest {
+    /** Tool call id — correlates the eventual decision back to the call. */
+    id: string;
     tool: string;
     args: Record<string, unknown>;
 }
@@ -198,7 +206,8 @@ export class PersistentChatService {
                             id: tc.id || '',
                             tool: tc.name || '',
                             args: tc.args || {},
-                            status: 'completed' as const,
+                            status: (tc.decision === 'denied' ? 'denied' : 'completed') as 'denied' | 'completed',
+                            decision: tc.decision,
                         })),
                         timestamp: new Date(m.created_at || Date.now()),
                         historical: true,
@@ -386,14 +395,38 @@ export class PersistentChatService {
 
     /** Approve a pending permission request. */
     approve(): void {
+        const pending = this.pendingPermission();
         this.pendingPermission.set(null);
+        if (pending?.id) this.recordLiveDecision(pending.id, 'approved');
         this.send({method: 'approve'});
     }
 
     /** Deny a pending permission request. */
     deny(): void {
+        const pending = this.pendingPermission();
         this.pendingPermission.set(null);
+        if (pending?.id) {
+            // Denied tools never get a tool.started event, so seed a synthetic
+            // entry in currentToolCalls so the marker renders inline with the
+            // turn rather than vanishing on the next token.
+            this.currentToolCalls.update(calls => {
+                if (calls.some(c => c.id === pending.id)) return calls;
+                return [...calls, {
+                    id: pending.id,
+                    tool: pending.tool,
+                    args: pending.args,
+                    status: 'denied',
+                    decision: 'denied',
+                }];
+            });
+        }
         this.send({method: 'deny'});
+    }
+
+    private recordLiveDecision(id: string, decision: 'approved' | 'denied'): void {
+        this.currentToolCalls.update(calls =>
+            calls.map(c => (c.id === id ? {...c, decision} : c)),
+        );
     }
 
     /** Interrupt the current turn. */
@@ -523,6 +556,7 @@ export class PersistentChatService {
 
             case 'permission.request':
                 this.pendingPermission.set({
+                    id: (params['id'] as string) || '',
                     tool: (params['tool'] as string) || '',
                     args: (params['args'] as Record<string, unknown>) || {},
                 });
@@ -695,7 +729,7 @@ interface HistoryMessage {
     id: string;
     role: string;
     content: string | null;
-    tool_calls: { name: string; args: Record<string, unknown>; id: string }[] | null;
+    tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[] | null;
     turn_number: number | null;
     created_at: string | null;
 }

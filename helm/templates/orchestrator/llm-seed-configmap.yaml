@@ -38,6 +38,7 @@ data:
           {{- range $ep.models }}
           - id: {{ required "model.id is required" .id | quote }}
             displayName: {{ default .id .displayName | quote }}
+            capability: {{ default "chat" .capability | quote }}
             {{- with .family }}
             family: {{ . | quote }}
             {{- end }}
@@ -49,5 +50,22 @@ data:
             {{- end }}
             enabled: {{ default true .enabled }}
           {{- end }}
+      {{- end }}
+    systemModels:
+      {{- range .Values.llm.seed.systemModels }}
+      - provider: {{ required "llm.seed.systemModels[].provider is required" .provider | quote }}
+        id: {{ required "llm.seed.systemModels[].id is required" .id | quote }}
+        displayName: {{ default .id .displayName | quote }}
+        capability: {{ default "chat" .capability | quote }}
+        {{- with .family }}
+        family: {{ . | quote }}
+        {{- end }}
+        {{- with .contextWindow }}
+        contextWindow: {{ . }}
+        {{- end }}
+        {{- if hasKey . "reasoningLevel" }}
+        reasoningLevel: {{ .reasoningLevel | quote }}
+        {{- end }}
+        enabled: {{ default true .enabled }}
       {{- end }}
 {{- end }}

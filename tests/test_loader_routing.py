@@ -13,7 +13,6 @@ from src.core.loader import (
     _create_openrouter_llm,
     _create_codex_llm,
 )
-from src.core.model_registry import reload_registry
 
 
 def _make_config(**overrides):
@@ -43,40 +42,45 @@ _common_patches = [
 class TestOpenAILLMRouting:
     """Integration tests for base_url routing in _create_openai_llm.
 
-    After the registry refactor, base_url resolution is:
-      1. Explicit config.base_url always wins (dispatcher-injected for
-         custom endpoints).
-      2. Registry meta.base_url for known built-ins. The registry picks
-         up LLM_BASE_URL at load time for entries in the "Local" group.
-      3. None otherwise (native providers route to their canonical URL).
+    Post chunk-6 (models_yaml_removal), base_url resolution collapsed to
+    a single source: ``config.base_url`` (dispatcher-injected from the
+    catalog row's transport). The legacy YAML fallback that read
+    ``LLM_BASE_URL`` for self-hosted "Local" group entries is gone — the
+    orchestrator hard-fails at boot when ``LLM_BASE_URL`` is set, so the
+    var being present in the test environment doesn't reach the loader.
+    Self-hosted models now MUST come through a catalog row whose
+    ``provider_kind='endpoint'`` row supplies the base_url at dispatch.
     """
 
     _LOCAL_MODEL = "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
-    def test_local_model_uses_llm_base_url(self):
-        """Built-in Local-group model picks up LLM_BASE_URL via the registry."""
-        env = os.environ.copy()
-        env["LLM_BASE_URL"] = "http://localhost:8080/v1"
-        with patch.dict(os.environ, env, clear=True):
-            reload_registry()  # re-read LLM_BASE_URL into Local-group entries
-            with patch("src.core.loader.ReasoningChatOpenAI") as mock_chat:
-                mock_chat.return_value = MagicMock()
-                config = _make_config(model=self._LOCAL_MODEL)
-                _create_openai_llm(config, limits=None)
-
-                call_kwargs = mock_chat.call_args[1]
-                assert call_kwargs["base_url"] == "http://localhost:8080/v1"
-                # Regression: the original bug was that the openai/ prefix
-                # leaked into the wire name and vLLM 404'd. The bare ID must
-                # reach the SDK untouched.
-                assert call_kwargs["model"] == self._LOCAL_MODEL
-                assert not call_kwargs["model"].startswith("openai/")
-        reload_registry()  # restore normal env state for downstream tests
-
-    @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_native_gpt_ignores_llm_base_url(self, mock_chat):
-        """Native gpt-* model should NOT use LLM_BASE_URL."""
+    def test_self_hosted_model_uses_dispatcher_injected_base_url(self, mock_chat):
+        """Self-hosted models receive base_url via dispatcher-injected
+        config.base_url — not via the deleted LLM_BASE_URL fallback."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model=self._LOCAL_MODEL,
+            base_url="http://my-vllm.cluster.local:8080/v1",
+        )
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["base_url"] == "http://my-vllm.cluster.local:8080/v1"
+        # Regression: the original bug was that the openai/ prefix
+        # leaked into the wire name and vLLM 404'd. The bare ID must
+        # reach the SDK untouched.
+        assert call_kwargs["model"] == self._LOCAL_MODEL
+        assert not call_kwargs["model"].startswith("openai/")
+
+    @patch.dict(
+        os.environ, {"LLM_BASE_URL": "http://stale-leftover:8080/v1"}, clear=False
+    )
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_env_var_does_not_leak_into_native_openai_models(self, mock_chat):
+        """A stale LLM_BASE_URL in the test env (the orchestrator boot
+        check would refuse to start in production) must NOT reach the
+        OpenAI factory — chunk 6 deleted the env-var inheritance path."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-5.2-pro")
 
@@ -85,10 +89,12 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert "base_url" not in call_kwargs
 
-    @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
+    @patch.dict(
+        os.environ, {"LLM_BASE_URL": "http://stale-leftover:8080/v1"}, clear=False
+    )
     @patch("src.core.loader.ReasoningChatOpenAI")
-    def test_gpt4o_ignores_llm_base_url(self, mock_chat):
-        """gpt-4o (native, not Local-group) should NOT use LLM_BASE_URL."""
+    def test_gpt4o_routes_to_native_openai(self, mock_chat):
+        """gpt-4o is native — no base_url override, ever."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-4o")
 
@@ -97,10 +103,9 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert "base_url" not in call_kwargs
 
-    @patch.dict(os.environ, {"LLM_BASE_URL": "http://localhost:8080/v1"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_explicit_base_url_always_wins(self, mock_chat):
-        """Explicit config.base_url overrides registry metadata entirely."""
+        """Explicit config.base_url is the dispatcher-injection path."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="gpt-4o", base_url="http://custom-proxy:9000/v1")
 
@@ -109,20 +114,20 @@ class TestOpenAILLMRouting:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "http://custom-proxy:9000/v1"
 
-    def test_no_base_url_env_set(self):
-        """Without LLM_BASE_URL, Local-group models get no base_url."""
-        env = os.environ.copy()
-        env.pop("LLM_BASE_URL", None)
-        with patch.dict(os.environ, env, clear=True):
-            reload_registry()
-            with patch("src.core.loader.ReasoningChatOpenAI") as mock_chat:
-                mock_chat.return_value = MagicMock()
-                config = _make_config(model=self._LOCAL_MODEL)
-                _create_openai_llm(config, limits=None)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_self_hosted_without_dispatcher_injection_falls_to_native(self, mock_chat):
+        """Self-hosted ID with no base_url leaks through to api.openai.com.
 
-                call_kwargs = mock_chat.call_args[1]
-                assert "base_url" not in call_kwargs
-        reload_registry()
+        This is intentional post-chunk-6: catch-all behavior at the loader
+        is API-OpenAI-default, and the readiness gate (chunk 5) blocks
+        catalog-row-less models from being dispatched in the first place.
+        Test pins the absence of any env-driven fallback magic."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model=self._LOCAL_MODEL)
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "base_url" not in call_kwargs
 
 
 class TestShouldUseReasoningSummary:

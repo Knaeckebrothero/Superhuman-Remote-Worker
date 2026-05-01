@@ -13,9 +13,9 @@ import json
 import logging
 import os
 import secrets
+import sys
 import time
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -115,6 +115,9 @@ from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.llm_endpoint_probe import probe_endpoint_models  # noqa: E402
+from services import discovery as discovery_service  # noqa: E402
+from services import family_matcher  # noqa: E402
+from services import readiness as readiness_service  # noqa: E402
 from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 
 # Registry helpers live in src/ and stay there — the orchestrator imports
@@ -122,7 +125,6 @@ from seed.llm_config import ensure_codex_proxy_endpoint  # noqa: E402
 from src.core.model_registry import (  # noqa: E402
     UnknownModelError,
     family_of as _model_family,
-    resolve_builtin,
     resolve_model as _resolve_model,
 )
 from langchain_core.messages import (  # noqa: E402
@@ -869,12 +871,12 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             ):
                 llm_over["api_key"] = resolved_keys[provider_for_key]
 
-        # Non-LLM tool keys (tavily, vision) always travel as env_keys.
+        # Non-LLM tool keys (vision) always travel as env_keys.
         if resolved_keys:
-            _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
+            _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
             env_keys = {
                 _ENV_KEY_MAP[p]: resolved_keys[p]
-                for p in ("tavily", "vision")
+                for p in ("vision",)
                 if p in resolved_keys
             }
             if env_keys:
@@ -893,7 +895,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
             if not aux_model:
-                aux_model = await postgres_db.resolve_default_for_role("auxiliary")
+                aux_model = await postgres_db.resolve_default_for_capability(
+                    "auxiliary"
+                )
             if aux_model:
                 config_override = config_override or {}
                 aux_override = config_override.setdefault("auxiliary", {})
@@ -997,7 +1001,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             ):
                 _model = user_settings.get(_user_key)
                 if not _model:
-                    _model = await postgres_db.resolve_default_for_role(_kind)
+                    _model = await postgres_db.resolve_default_for_capability(_kind)
                 if not _model:
                     continue
                 config_override = config_override or {}
@@ -1020,7 +1024,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             embedding_provider = user_settings.get("embedding_provider")
             embedding_model = user_settings.get("default_embedding_model")
             if not embedding_model:
-                embedding_model = await postgres_db.resolve_default_for_role(
+                embedding_model = await postgres_db.resolve_default_for_capability(
                     "embedding"
                 )
             if embedding_provider or embedding_model:
@@ -1050,7 +1054,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         # and silently routes to api.openai.com with "not-needed".
         llm_override_check = (config_override or {}).get("llm") or {}
         if "model" not in llm_override_check:
-            system_chat_model = await postgres_db.resolve_default_for_role("chat")
+            system_chat_model = await postgres_db.resolve_default_for_capability("chat")
             if system_chat_model:
                 config_override = config_override or {}
                 llm_override = config_override.setdefault("llm", {})
@@ -1614,15 +1618,35 @@ async def _archive_and_cleanup_workspace(
 
 
 def _provider_of_model(model: str) -> str | None:
-    """Registry-backed provider lookup. Returns None for unknown IDs.
+    """Sync prefix-based provider heuristic for legacy dispatch paths.
 
-    Used at dispatch for the legacy code paths that need only the factory
-    name (aux-model key injection, vision-model key lookup). Custom
-    endpoints resolve to ``openai`` here (the factory name); their inline
-    api_key travels via a separate code path that consults the endpoint row.
+    Catalog rows carry ``provider_ref`` explicitly; this helper exists for
+    the small set of code paths that don't have a row in hand and only
+    need the factory name (aux-model key injection, vision-model key
+    lookup, dispatcher provider-key inference). Returns None on any miss
+    so callers fall through to their config_name / env-var heuristics.
+
+    The legacy ``resolve_builtin`` lookup that this replaced was the entry
+    point for the YAML fallback path — removed in chunk 6 of the
+    models_yaml_removal work.
     """
-    meta = resolve_builtin(model)
-    return meta.provider if meta is not None else None
+    if not model:
+        return None
+    name = model.lower()
+    for prefix in ("openrouter/", "groq/"):
+        if name.startswith(prefix):
+            return prefix.rstrip("/")
+    if name.startswith("codex/"):
+        return "codex"
+    if name.startswith("openai/"):
+        return "openai"
+    if name.startswith(("claude-",)):
+        return "anthropic"
+    if name.startswith("gemini-") or name.startswith("gemma-"):
+        return "google"
+    if name.startswith(("gpt-", "o1", "o3", "o4", "text-embedding-")):
+        return "openai"
+    return None
 
 
 async def _inject_model_credentials(
@@ -2436,7 +2460,6 @@ VALID_API_KEY_PROVIDERS = {
     "groq",
     "openrouter",
     "codex",
-    "tavily",
     "vision",
 }
 
@@ -2500,15 +2523,34 @@ class AdminDefaultModelSet(BaseModel):
     model: str = Field(..., description="Model ID; empty string clears the default")
 
 
-# Locked enum for the admin-curated catalog. Adding a new role requires
+# Locked enum for the admin-curated catalog. Adding a new capability requires
 # touching every consumer (resolver, dispatcher, default-model fallback),
 # so the schema-level CHECK constraint and this Literal are kept in sync.
-VALID_CATALOG_ROLES = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
+VALID_CATALOG_CAPABILITIES = (
+    "chat",
+    "auxiliary",
+    "embedding",
+    "vision",
+    "whisper",
+    "tts",
+)
 VALID_CATALOG_PROVIDER_KINDS = ("system", "endpoint")
 
 
+CatalogCapabilityLiteral = Literal[
+    "chat", "auxiliary", "embedding", "vision", "whisper", "tts"
+]
+
+
 class CatalogModelCreate(BaseModel):
-    """Request body for inserting a catalog row (Admin → Models)."""
+    """Request body for inserting a catalog row (Admin → Models).
+
+    ``capabilities`` is the source of truth — one row can serve multiple
+    roles (e.g. ``['chat', 'auxiliary']`` for a chat-capable LLM,
+    ``['chat', 'auxiliary', 'vision']`` for a multimodal one). The legacy
+    singular ``capability`` form is no longer accepted; clients post the
+    array directly.
+    """
 
     provider_kind: Literal["system", "endpoint"]
     provider_ref: str = Field(
@@ -2522,18 +2564,28 @@ class CatalogModelCreate(BaseModel):
     )
     model_id: str = Field(..., min_length=1, max_length=500)
     display_label: str = Field(..., min_length=1, max_length=200)
-    role: Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"]
+    capabilities: list[CatalogCapabilityLiteral] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "The set of capabilities this model row claims. One row can "
+            "serve multiple roles (e.g. ['chat', 'auxiliary'] for a "
+            "chat-capable LLM, ['chat', 'auxiliary', 'vision'] for a "
+            "multimodal one). Must be non-empty."
+        ),
+    )
     family: str = Field(
         ...,
         min_length=1,
-        description="settings_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
+        description="model_config_matrix.yaml key (e.g. 'claude-opus', 'gemini').",
     )
     context_window: int | None = Field(
         None,
         description=(
-            "Optional override; falls back to settings_matrix family default. "
-            "Pass null (the default) to use the matrix; pass an explicit int "
-            "to override (zero is allowed and round-trips as zero)."
+            "Optional override; falls back to model_config_matrix family "
+            "default. Pass null (the default) to use the matrix; pass an "
+            "explicit int to override (zero is allowed and round-trips as "
+            "zero)."
         ),
     )
     reasoning_level: str | None = None
@@ -2559,9 +2611,7 @@ class CatalogModelUpdate(BaseModel):
     provider_ref: str | None = Field(None, min_length=1)
     model_id: str | None = Field(None, min_length=1, max_length=500)
     display_label: str | None = Field(None, min_length=1, max_length=200)
-    role: (
-        Literal["chat", "auxiliary", "embedding", "vision", "whisper", "tts"] | None
-    ) = None
+    capabilities: list[CatalogCapabilityLiteral] | None = Field(None, min_length=1)
     family: str | None = Field(None, min_length=1)
     context_window: int | None = None
     reasoning_level: str | None = None
@@ -2574,7 +2624,16 @@ class CatalogModelUpdate(BaseModel):
 # system_settings key pattern is ``llm.default_<kind>_model``. ``tts`` is
 # present even without a current consumer in src/services/ — landing the
 # plumbing keeps the registry path uniform across audio capabilities.
+#
+# The ``chat`` slot is the cluster-wide chat default — used by the
+# orchestrator dispatcher when a job/session doesn't carry its own model
+# override (see resolve_default_for_capability("chat") at the dispatch
+# call sites). Surfacing it in the cockpit's Defaults panel lets the
+# readiness gate's ``Pin a default for: chat`` requirement actually have
+# a UI to fulfill (it was previously phantom — the gate asked but the
+# panel didn't render the dropdown).
 VALID_DEFAULT_MODEL_KINDS = {
+    "chat",
     "builder",
     "browser",
     "citation",
@@ -2593,7 +2652,6 @@ VALID_SYSTEM_API_KEY_PROVIDERS = {
     "google",
     "groq",
     "openrouter",
-    "tavily",
     "vision",
 }
 
@@ -2604,6 +2662,7 @@ class UserSettingsUpdate(BaseModel):
     default_model: str | None = None
     default_autonomy: str | None = None
     default_reasoning_level: str | None = None
+    default_chat_model: str | None = None
     default_auxiliary_model: str | None = None
     default_vision_model: str | None = None
     default_whisper_model: str | None = None
@@ -2761,6 +2820,25 @@ class CustomJSONResponse(JSONResponse):
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     global _shutdown_event
+
+    # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
+    # routing for self-hosted "Local" group models was removed in chunk 6 of
+    # the models_yaml_removal work. Operators currently relying on it must
+    # migrate to a helm-seeded llm_endpoints row + catalog rows referencing
+    # it. ERROR + sys.exit(1) (not WARN + ignore) because the var being set
+    # with no consumer is an active misconfiguration that won't self-heal —
+    # the legacy code path silently fell through to api.openai.com with
+    # `not-needed` (the bug captured in docs/llm_routing_issues.md).
+    if os.getenv("LLM_BASE_URL"):
+        logger.error(
+            "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
+            "must now be configured via Admin → Providers (system endpoint) "
+            "+ Admin → Models (catalog row) or via "
+            "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
+            "the endpoint in helm to migrate. See "
+            "docs/features/models_yaml_removal.md."
+        )
+        sys.exit(1)
 
     # Connect to databases
     await postgres_db.connect()
@@ -3258,6 +3336,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
     branched from the project's shared jobs repo instead of getting its own
     per-job repo.
     """
+    await _enforce_readiness_gate()
     try:
         # Merge upload IDs into context
         context = dict(job.context) if job.context else {}
@@ -9051,6 +9130,55 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
             title=request.title,
         )
 
+        # Inject system-default model pins so the standalone agent boots
+        # against the catalog (with resolved base_url + api_key) instead of
+        # falling through to its YAML default. Same shape as the cockpit
+        # create_thread path above, just without user prefs since this
+        # endpoint has no user context.
+        config_override: dict[str, Any] = {}
+        chat_model = await postgres_db.resolve_default_for_capability("chat")
+        if chat_model:
+            llm_section: dict[str, Any] = {"model": chat_model}
+            await _inject_model_credentials(
+                section=llm_section,
+                model_id=chat_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+            config_override["llm"] = llm_section
+        aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
+        if aux_model:
+            aux_section: dict[str, Any] = {"model": aux_model}
+            await _inject_model_credentials(
+                section=aux_section,
+                model_id=aux_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+            config_override["auxiliary"] = aux_section
+        embedding_model = await postgres_db.resolve_default_for_capability("embedding")
+        if embedding_model:
+            env_keys_block: dict[str, Any] = {"EMBEDDING_MODEL": embedding_model}
+            await _inject_env_key_credentials(
+                env_keys=env_keys_block,
+                prefix="EMBEDDING",
+                model_id=embedding_model,
+                user_id=None,
+                resolved_keys=None,
+            )
+            config_override["env_keys"] = env_keys_block
+        if config_override:
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET metadata = COALESCE(metadata, '{}') || $2::jsonb
+                    WHERE id = $1
+                    """,
+                    thread_id,
+                    json.dumps({"config_override": config_override}),
+                )
+
         # Create Gitea repo for workspace versioning
         if not gitea_client.is_initialized and gitea_client.is_configured:
             await gitea_client.ensure_initialized()
@@ -9171,13 +9299,17 @@ class AgentThreadConfigUpdateRequest(BaseModel):
 @app.patch("/api/agents/threads/{thread_id}/config")
 async def agent_update_thread_config(
     thread_id: str, request: AgentThreadConfigUpdateRequest
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Persist runtime config changes for a thread (no auth, agent-facing).
 
     Deep-merges the provided config_override into the existing
     ``threads.metadata.config_override``.  If the override includes
     ``interactive.permission_mode``, the top-level ``permission_mode``
     column is updated as well for query consistency.
+
+    Returns the enriched ``config_override`` so the agent can rebuild its
+    LLM with the resolved ``base_url``/``api_key`` instead of sending the
+    next request to api.openai.com with ``not-needed``.
     """
     try:
         # Enrich endpoint-backed model swaps with base_url + api_key so the
@@ -9223,7 +9355,7 @@ async def agent_update_thread_config(
                     thread_id,
                 )
 
-        return {"status": "updated"}
+        return {"status": "updated", "config_override": config_override}
     except HTTPException:
         raise
     except Exception as e:
@@ -9455,6 +9587,7 @@ async def create_thread(
     Merges user's persistent_agent settings into thread metadata.config_override
     so the agent can apply them via the existing deep_merge path.
     """
+    await _enforce_readiness_gate()
     try:
         user = await require_approved_user(request, postgres_db)
 
@@ -9500,11 +9633,24 @@ async def create_thread(
         # default OpenAI base and 404. Mirrors the dispatch path used for
         # jobs at the dispatch_job site above.
         llm_section = config_override.get("llm") or {}
+        resolved_keys = await postgres_db.resolve_api_keys_for_job(
+            user_id=str(user["id"]),
+            project_id=effective_project_ids[0] if effective_project_ids else None,
+        )
+        # If neither the request nor the user's persistent_agent prefs pinned
+        # a model, fall back to the system default chat pin (the readiness
+        # gate's default_chat_model). This stops the agent from booting on
+        # its YAML default (RedHatAI/...) — which has no transport and
+        # silently routes to api.openai.com with "not-needed".
+        if not llm_section.get("model"):
+            system_chat_model = await postgres_db.resolve_default_for_capability("chat")
+            if system_chat_model:
+                llm_section["model"] = system_chat_model
+                logger.info(
+                    "Thread create: injected system default chat model: %s",
+                    system_chat_model,
+                )
         if llm_section.get("model"):
-            resolved_keys = await postgres_db.resolve_api_keys_for_job(
-                user_id=str(user["id"]),
-                project_id=effective_project_ids[0] if effective_project_ids else None,
-            )
             await _inject_model_credentials(
                 section=llm_section,
                 model_id=llm_section["model"],
@@ -9512,6 +9658,67 @@ async def create_thread(
                 resolved_keys=resolved_keys,
             )
             config_override["llm"] = llm_section
+
+        # Auxiliary slot. The agent's auxiliary_llm runs title generation,
+        # memory extraction, and knowledge curation; without an explicit
+        # override here the agent falls through to the YAML default and 401s
+        # on api.openai.com. Mirrors the worker dispatch block above.
+        aux_section = config_override.get("auxiliary") or {}
+        if not aux_section.get("model"):
+            aux_model = (user_settings or {}).get("default_auxiliary_model")
+            if not aux_model:
+                aux_model = await postgres_db.resolve_default_for_capability(
+                    "auxiliary"
+                )
+            if aux_model:
+                aux_section["model"] = aux_model
+                logger.info("Thread create: injected auxiliary model: %s", aux_model)
+        if aux_section.get("model"):
+            await _inject_model_credentials(
+                section=aux_section,
+                model_id=aux_section["model"],
+                user_id=str(user["id"]),
+                resolved_keys=resolved_keys,
+            )
+            config_override["auxiliary"] = aux_section
+
+        # Embedding capability travels as flat env vars (EMBEDDING_PROVIDER,
+        # EMBEDDING_MODEL, EMBEDDING_BASE_URL, EMBEDDING_API_KEY) consumed by
+        # the EmbeddingService singleton. Same risk as the auxiliary slot:
+        # the singleton is built at process boot from the agent's environment;
+        # without an attach-time override it sticks at whatever was set then.
+        env_keys_block = config_override.setdefault("env_keys", {})
+        embedding_provider = (user_settings or {}).get("embedding_provider")
+        embedding_model = (user_settings or {}).get("default_embedding_model")
+        if not embedding_model:
+            embedding_model = await postgres_db.resolve_default_for_capability(
+                "embedding"
+            )
+        if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
+            env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
+        if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
+            env_keys_block["EMBEDDING_MODEL"] = embedding_model
+            await _inject_env_key_credentials(
+                env_keys=env_keys_block,
+                prefix="EMBEDDING",
+                model_id=embedding_model,
+                user_id=str(user["id"]),
+                resolved_keys=resolved_keys,
+            )
+            logger.info(
+                "Thread create: injected embedding: provider=%s, model=%s",
+                embedding_provider,
+                embedding_model,
+            )
+        if (
+            embedding_provider == "openrouter"
+            and resolved_keys
+            and "openrouter" in resolved_keys
+            and "OPENROUTER_API_KEY" not in env_keys_block
+        ):
+            env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
+        if not env_keys_block:
+            config_override.pop("env_keys", None)
 
         thread_id = await postgres_db.create_thread(
             user_id=str(user["id"]),
@@ -10840,14 +11047,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
 _settings_matrix_cache: dict[str, Any] | None = None
 
 
+def _project_settings_subsection(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Project a parsed model_config_matrix to the legacy settings shape.
+
+    Returns ``{family: settings_dict}`` (drops families without a settings
+    block) so callers that pre-date the unified file see the same shape
+    they used to read from ``settings_matrix.yaml``.
+    """
+    out: dict[str, Any] = {}
+    for family, sections in (parsed or {}).items():
+        if not isinstance(sections, dict):
+            continue
+        # Tolerate both legacy flat shape and unified subsection shape — the
+        # unified loader downstream is the source of truth, but per-expert
+        # files written before chunk 1 may still arrive flat in tests.
+        if "settings" in sections and isinstance(sections["settings"], dict):
+            out[family] = sections["settings"]
+        elif {"prompts", "instructions"}.isdisjoint(sections.keys()):
+            # Pure legacy settings-only block (no `settings:` wrapper) — keep
+            # whatever scalar/dict children it carries.
+            out[family] = sections
+    return out
+
+
 def _load_settings_matrix(config_dir: Path) -> dict[str, Any]:
-    """Load and cache settings_matrix.yaml from the config directory."""
+    """Load and cache the settings subsection of ``model_config_matrix.yaml``.
+
+    Returns the legacy ``{family: settings_dict}`` shape so existing callers
+    (`/api/admin/families`, expert detail endpoints) keep working without
+    rewrites. Per-expert overlays are handled by the callers that need
+    them; this function returns the base file only.
+    """
     global _settings_matrix_cache
     if _settings_matrix_cache is None:
-        matrix_path = config_dir / "settings_matrix.yaml"
+        matrix_path = config_dir / "model_config_matrix.yaml"
         if matrix_path.exists():
             with open(matrix_path) as f:
-                _settings_matrix_cache = yaml.safe_load(f) or {}
+                parsed = yaml.safe_load(f) or {}
+            _settings_matrix_cache = _project_settings_subsection(parsed)
         else:
             _settings_matrix_cache = {}
     return _settings_matrix_cache
@@ -10867,14 +11104,16 @@ def _apply_settings_matrix_to_config(
     """
     base_matrix = _load_settings_matrix(config_dir)
 
-    # Support per-expert settings_matrix override
+    # Support per-expert model_config_matrix.yaml override (settings
+    # subsection only — prompts/instructions are loaded by the agent loader).
     matrix = dict(base_matrix)
     if expert_dir and expert_dir != config_dir:
-        expert_matrix_path = expert_dir / "settings_matrix.yaml"
+        expert_matrix_path = expert_dir / "model_config_matrix.yaml"
         if expert_matrix_path.exists():
             with open(expert_matrix_path) as f:
-                expert_matrix = yaml.safe_load(f) or {}
-            matrix = _deep_merge(matrix, expert_matrix)
+                expert_parsed = yaml.safe_load(f) or {}
+            expert_settings = _project_settings_subsection(expert_parsed)
+            matrix = _deep_merge(matrix, expert_settings)
 
     llm_data = merged.get("llm", {})
     model = llm_data.get("model", "gpt-4o")
@@ -10944,11 +11183,12 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     # Do NOT apply it to merged — the client resolves based on the user's model selection.
     raw_matrix = _load_settings_matrix(config_dir)
     if expert_config_dir and expert_config_dir != config_dir:
-        expert_matrix_path = expert_config_dir / "settings_matrix.yaml"
+        expert_matrix_path = expert_config_dir / "model_config_matrix.yaml"
         if expert_matrix_path.exists():
             with open(expert_matrix_path) as f:
-                expert_matrix = yaml.safe_load(f) or {}
-            raw_matrix = _deep_merge(raw_matrix, expert_matrix)
+                expert_parsed = yaml.safe_load(f) or {}
+            expert_settings = _project_settings_subsection(expert_parsed)
+            raw_matrix = _deep_merge(raw_matrix, expert_settings)
 
     # Load instructions content
     instructions_content = None
@@ -11643,7 +11883,14 @@ async def admin_list_provider_keys(request: Request) -> list[dict[str, Any]]:
 async def admin_set_provider_key(
     request: Request, provider: str, body: ApiKeySet
 ) -> dict[str, Any]:
-    """Set or rotate the system-level API key for a provider."""
+    """Set or rotate the system-level API key for a provider.
+
+    On success, schedules a non-blocking discovery probe for providers
+    we know how to enumerate (see ``discovery_service.DISCOVERABLE_PROVIDERS``).
+    The discovery cache is cleared inline before the probe fires so the
+    cockpit never shows stale candidates from a previous key. When the
+    ``admin.discovery_enabled`` flag is set to ``false``, no probe runs.
+    """
     await _require_admin(request)
     if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
         raise HTTPException(
@@ -11659,6 +11906,7 @@ async def admin_set_provider_key(
         key_prefix=body.api_key[:8],
         label=body.label,
     )
+    await _maybe_schedule_discovery(provider, body.api_key)
     return _serialize_system_api_key(row)
 
 
@@ -11672,6 +11920,132 @@ async def admin_delete_provider_key(request: Request, provider: str) -> dict[str
             status_code=404, detail=f"No system key for provider '{provider}'"
         )
     return {"status": "deleted"}
+
+
+@app.get("/api/admin/providers/keys/{provider}/discovery")
+async def admin_get_provider_discovery(
+    request: Request, provider: str
+) -> dict[str, Any]:
+    """Return the cached discovery payload for a provider key.
+
+    Powers the post-save confirmation dialog on Admin → Providers. The
+    response is ``{ready, fresh, payload, cached_at}``:
+
+    - ``ready=False`` when no probe has completed yet (e.g. the async
+      probe scheduled by the PUT side-effect is still running).
+    - ``fresh`` reflects the 24h TTL — the cockpit can prompt for an
+      explicit rediscover when stale.
+    - ``payload`` is the cockpit-ready candidate list shaped by
+      :func:`discovery_service.build_cache_payload`.
+    """
+    await _require_admin(request)
+    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider '{provider}'. Valid: "
+                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+            ),
+        )
+    cached = await postgres_db.get_system_api_key_discovery_cache(provider)
+    if cached is None:
+        return {"ready": False, "fresh": False, "payload": None, "cached_at": None}
+    cached_at_dt = (
+        datetime.fromisoformat(cached["cached_at"]) if cached.get("cached_at") else None
+    )
+    return {
+        "ready": True,
+        "fresh": discovery_service.is_discovery_cache_fresh(cached_at_dt),
+        "payload": cached.get("payload"),
+        "cached_at": cached.get("cached_at"),
+    }
+
+
+@app.post("/api/admin/providers/keys/{provider}/rediscover")
+async def admin_rediscover_provider_models(
+    request: Request, provider: str
+) -> dict[str, Any]:
+    """Force-refresh the discovery cache for a provider key.
+
+    Useful when the provider released new models since the cache was
+    populated, or when the admin wants to retry after a transient probe
+    failure. Returns the freshly-cached payload (synchronous probe — the
+    button blocks until results come back, like an explicit "test" click).
+    """
+    await _require_admin(request)
+    if provider not in VALID_SYSTEM_API_KEY_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid provider '{provider}'. Valid: "
+                f"{sorted(VALID_SYSTEM_API_KEY_PROVIDERS)}"
+            ),
+        )
+    if provider not in discovery_service.DISCOVERABLE_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Provider '{provider}' has no discovery source. "
+                "Add models manually via Admin → Models."
+            ),
+        )
+    if not await _discovery_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Auto-discovery is disabled "
+                "(admin.discovery_enabled = false in system_settings)."
+            ),
+        )
+    api_key = await postgres_db.get_system_api_key(provider)
+    if not api_key:
+        raise HTTPException(
+            status_code=404, detail=f"No system key for provider '{provider}'"
+        )
+    candidates = await discovery_service.discover_models(provider, api_key)
+    payload = discovery_service.build_cache_payload(provider, candidates)
+    await postgres_db.set_system_api_key_discovery_cache(provider, payload)
+    return {
+        "ready": True,
+        "fresh": True,
+        "payload": payload,
+        "cached_at": payload["fetched_at"],
+    }
+
+
+async def _discovery_enabled() -> bool:
+    """Return whether admin auto-discovery is enabled (system setting,
+    default True). Operators flip this off when they want catalog growth
+    to be a deliberate manual action."""
+    row = await postgres_db.get_system_setting("admin.discovery_enabled")
+    if row is None:
+        return True
+    value = row.get("value")
+    if isinstance(value, dict):
+        return bool(value.get("enabled", True))
+    return bool(value)
+
+
+async def _maybe_schedule_discovery(provider: str, api_key: str) -> None:
+    """Clear the cache for a key and fire an async probe if applicable.
+
+    The probe runs as a fire-and-forget task so the PUT route returns as
+    quickly as today; the cockpit polls ``GET .../discovery`` to render
+    the confirmation dialog when results land. Errors are swallowed by
+    ``discover_models`` so a failed probe never blocks key-save.
+    """
+    if provider not in discovery_service.DISCOVERABLE_PROVIDERS:
+        return
+    if not await _discovery_enabled():
+        return
+    await postgres_db.set_system_api_key_discovery_cache(provider, None)
+
+    async def _probe() -> None:
+        candidates = await discovery_service.discover_models(provider, api_key)
+        payload = discovery_service.build_cache_payload(provider, candidates)
+        await postgres_db.set_system_api_key_discovery_cache(provider, payload)
+
+    asyncio.create_task(_probe())
 
 
 @app.get("/api/admin/providers/endpoints")
@@ -11905,14 +12279,18 @@ async def admin_set_provider_default(
 
 
 def _serialize_catalog_model(row: dict[str, Any]) -> dict[str, Any]:
-    """Shape a ``models`` row for API responses."""
+    """Shape a ``models`` row for API responses.
+
+    Single-column source of truth: only the ``capabilities`` array is on
+    the wire. Cockpit clients have been migrated to the array form.
+    """
     return {
         "id": str(row["id"]),
         "provider_kind": row["provider_kind"],
         "provider_ref": row["provider_ref"],
         "model_id": row["model_id"],
         "display_label": row["display_label"],
-        "role": row["role"],
+        "capabilities": list(row.get("capabilities") or []),
         "family": row["family"],
         "context_window": row.get("context_window"),
         "reasoning_level": row.get("reasoning_level"),
@@ -11968,20 +12346,29 @@ async def _validate_catalog_provider_ref(provider_kind: str, provider_ref: str) 
 @app.get("/api/admin/providers/models")
 async def admin_list_catalog_models(
     request: Request,
-    role: str | None = None,
+    capability: str | None = None,
     provider_kind: str | None = None,
     provider_ref: str | None = None,
     enabled_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """List catalog rows with optional filters. Returns full row shape."""
+    """List catalog rows with optional filters.
+
+    The ``capability`` query param narrows by membership — a row matches
+    iff its ``capabilities[]`` contains the requested value. Returns full
+    row shape.
+    """
     await _require_admin(request)
-    if role is not None and role not in VALID_CATALOG_ROLES:
+    if capability is not None and capability not in VALID_CATALOG_CAPABILITIES:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid role '{role}'. Valid: {list(VALID_CATALOG_ROLES)}",
+            detail=(
+                f"Invalid capability '{capability}'. "
+                f"Valid: {list(VALID_CATALOG_CAPABILITIES)}"
+            ),
         )
+    capability_filter = [capability] if capability else None
     rows = await postgres_db.list_models(
-        role=role,
+        capabilities=capability_filter,
         provider_kind=provider_kind,
         provider_ref=provider_ref,
         enabled_only=enabled_only,
@@ -11997,7 +12384,7 @@ async def admin_create_catalog_model(
 
     Validates that ``provider_ref`` resolves to an existing transport before
     insert. Returns the created row; raises 409 on
-    ``(provider_kind, provider_ref, model_id, role)`` collision.
+    ``(provider_kind, provider_ref, model_id, capability)`` collision.
     """
     await _require_admin(request)
     await _validate_catalog_provider_ref(body.provider_kind, body.provider_ref)
@@ -12007,7 +12394,7 @@ async def admin_create_catalog_model(
             provider_ref=body.provider_ref,
             model_id=body.model_id,
             display_label=body.display_label,
-            role=body.role,
+            capabilities=body.capabilities,
             family=body.family,
             context_window=body.context_window,
             reasoning_level=body.reasoning_level,
@@ -12015,13 +12402,15 @@ async def admin_create_catalog_model(
             enabled=body.enabled,
             notes=body.notes,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         if "uq_model_provider" in str(e):
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"Catalog row for ({body.provider_kind}/{body.provider_ref}, "
-                    f"{body.model_id}, role={body.role}) already exists."
+                    f"{body.model_id}) already exists."
                 ),
             )
         raise
@@ -12050,6 +12439,8 @@ async def admin_update_catalog_model(
         await _validate_catalog_provider_ref(new_kind, new_ref)
     try:
         row = await postgres_db.update_model(catalog_id, **fields)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         if "uq_model_provider" in str(e):
             raise HTTPException(
@@ -12145,7 +12536,7 @@ async def admin_test_catalog_model(request: Request, catalog_id: str) -> dict[st
 
 @app.get("/api/admin/families")
 async def admin_list_families(request: Request) -> dict[str, list[str]]:
-    """Return the family keys defined in ``settings_matrix.yaml``.
+    """Return the family keys defined in ``model_config_matrix.yaml``.
 
     Powers the family dropdown on the *Admin → Models* form so adding a
     family in the YAML doesn't require a frontend rebuild.
@@ -12154,6 +12545,58 @@ async def admin_list_families(request: Request) -> dict[str, list[str]]:
     matrix = _load_settings_matrix(_get_config_dir())
     families = sorted(k for k in matrix.keys() if isinstance(k, str))
     return {"families": families}
+
+
+@app.get("/api/admin/families/detect")
+async def admin_detect_family(request: Request, model_id: str) -> dict[str, str]:
+    """Suggest a family for ``model_id`` via the regex matcher.
+
+    Pre-fills the family dropdown on the *Admin → Models* add form and the
+    discovery confirmation dialog so admins don't have to memorize the
+    mapping. ``source`` is ``"matched"`` for a regex hit and ``"fallback"``
+    when no rule matched (the result is ``default`` — works, but quality is
+    on the model). Admin can override before saving either way.
+    """
+    await _require_admin(request)
+    if not model_id or not model_id.strip():
+        raise HTTPException(status_code=400, detail="model_id is required")
+    detection = family_matcher.detect_family(model_id.strip())
+    return {
+        "family": detection.family,
+        "source": detection.source,
+    }
+
+
+@app.get("/api/system/readiness")
+async def system_readiness(request: Request) -> dict[str, Any]:
+    """Return the cockpit-facing readiness signal.
+
+    Authenticated, but not admin-gated — the onboarding screen calls this
+    on first paint. Auth-required because the response leaks details
+    about whether catalog rows exist (a low-stakes leak, but still
+    user-scoped). See ``readiness_service.compute_readiness`` for the
+    payload shape.
+    """
+    await get_current_user(request, postgres_db)
+    return await readiness_service.compute_readiness(postgres_db)
+
+
+async def _enforce_readiness_gate() -> None:
+    """Raise 503 when the LLM stack isn't ready.
+
+    Called from ``POST /api/jobs`` and ``POST /api/persistent/threads``
+    so dispatch hard-fails rather than silently routing to a chat model
+    that doesn't exist. The error body carries the same ``missing_*``
+    fields the cockpit reads from ``/api/system/readiness`` so the UI
+    can deep-link to the right admin page from either source.
+    """
+    readiness = await readiness_service.compute_readiness(postgres_db)
+    if readiness.get("ready"):
+        return
+    raise HTTPException(
+        status_code=503,
+        detail=readiness_service.gate_error_detail(readiness),
+    )
 
 
 def _resolve_preference_defaults() -> dict[str, Any]:
@@ -12323,38 +12766,6 @@ _PROVIDER_ENV_KEYS: dict[str, list[str]] = {
     "codex": ["CODEX_API_KEY"],
 }
 
-# Cache for the legacy YAML bits still surfaced through /api/models (presets,
-# whisper, tts — none of which are catalog roles in v1). Reset by
-# /api/models/reload.
-_model_catalog_yaml_cache: dict[str, Any] | None = None
-
-
-def _load_models_yaml_legacy() -> dict[str, Any]:
-    """Load the residual ``config/models.yaml`` bits the catalog table doesn't
-    cover yet (presets, whisper, tts). Cached after first load.
-
-    Catalog roles (chat / auxiliary / embedding / vision) come from the DB
-    via ``postgres_db.list_models``; this YAML reader only services the
-    transitional surface for the four bits Phase D leaves behind.
-    """
-    global _model_catalog_yaml_cache
-    if _model_catalog_yaml_cache is not None:
-        return _model_catalog_yaml_cache
-
-    catalog_path = _get_config_dir() / "models.yaml"
-    if not catalog_path.exists():
-        logger.warning(
-            "models.yaml not found at %s — returning empty legacy bits",
-            catalog_path,
-        )
-        return {"presets": [], "whisper_models": [], "tts_models": []}
-
-    with open(catalog_path) as f:
-        data = yaml.safe_load(f) or {}
-
-    _model_catalog_yaml_cache = data
-    return data
-
 
 def _get_system_providers() -> set[str]:
     """Detect which providers have API keys set via environment variables."""
@@ -12396,13 +12807,17 @@ async def list_available_models(
 ) -> dict[str, Any]:
     """List all models from the admin-curated catalog.
 
-    Returns the catalog grouped by provider for every catalog role
-    (chat → ``groups`` + ``builder_models``; auxiliary / vision / embedding /
-    whisper / tts → sibling arrays). The legacy ``config/models.yaml``
-    whisper/tts entries are merged in only when no catalog row covers the
-    same id, so admins can migrate at their own pace. Each row carries
-    ``configured: true`` because the catalog only contains rows whose
-    transport (system_api_keys row or system endpoint) is admin-managed.
+    Returns catalog rows grouped by provider/capability:
+
+    - ``groups`` + ``builder_models`` (chat-capability rows)
+    - ``auxiliary_models`` / ``vision_models`` / ``embedding_models`` /
+      ``whisper_models`` / ``tts_models`` (one helper list per capability)
+
+    Every row carries ``configured: true`` because the catalog only
+    contains rows whose transport (system_api_keys row or system endpoint)
+    is admin-managed. The legacy strategic+tactical preset bundle was
+    removed in chunk 7 of the models_yaml_removal work — the job-create
+    UX picks strategic and tactical models individually now.
 
     Query params:
         project_id: kept for backward compatibility — no longer affects the
@@ -12424,36 +12839,40 @@ async def list_available_models(
     auxiliary: list[dict[str, Any]] = []
     vision: list[dict[str, Any]] = []
     embedding: list[dict[str, Any]] = []
-    whisper_catalog: list[dict[str, Any]] = []
-    tts_catalog: list[dict[str, Any]] = []
+    whisper: list[dict[str, Any]] = []
+    tts: list[dict[str, Any]] = []
 
     configured_providers: set[str] = set()
 
     for row in catalog_rows:
         kind = row["provider_kind"]
         ref = row["provider_ref"]
-        role = row["role"]
+        # Fan-out: under the array model one row contributes to every
+        # capability bucket it claims. A multimodal chat row registered as
+        # ['chat','auxiliary','vision'] surfaces in builder_models AND
+        # auxiliary_models AND vision_models simultaneously — which is
+        # exactly the operator intent (one physical model serves all three).
+        capabilities_set = set(row.get("capabilities") or [])
         helper_entry = {
             "id": row["model_id"],
             "label": row["display_label"],
             "configured": True,
         }
-        if role == "auxiliary":
+        if "auxiliary" in capabilities_set:
             auxiliary.append(helper_entry)
-            continue
-        if role == "vision":
+        if "vision" in capabilities_set:
             vision.append(helper_entry)
-            continue
-        if role == "embedding":
+        if "embedding" in capabilities_set:
             embedding.append(helper_entry)
+        if "whisper" in capabilities_set:
+            whisper.append(helper_entry)
+        if "tts" in capabilities_set:
+            tts.append(helper_entry)
+        # Chat-only path: register the row in its provider group + the flat
+        # builder list. Embedding-/whisper-/tts-only rows skip this path so
+        # the chat dropdowns don't show non-chat models.
+        if "chat" not in capabilities_set:
             continue
-        if role == "whisper":
-            whisper_catalog.append(helper_entry)
-            continue
-        if role == "tts":
-            tts_catalog.append(helper_entry)
-            continue
-        # role == 'chat'
         key = (kind, ref)
         group = groups_by_key.get(key)
         if group is None:
@@ -12488,53 +12907,8 @@ async def list_available_models(
 
     groups = list(groups_by_key.values())
 
-    # Legacy YAML bits — presets + whisper + tts — kept until they earn
-    # first-class catalog support. Configured-flag is checked against the
-    # provider set we built from the catalog.
-    legacy = _load_models_yaml_legacy()
-
-    catalog_model_ids: set[str] = {r["model_id"] for r in catalog_rows}
-    presets = [
-        {
-            "label": p["label"],
-            "strategic": p["strategic"],
-            "tactical": p["tactical"],
-            "configured": (
-                p["strategic"] in catalog_model_ids
-                and p["tactical"] in catalog_model_ids
-            ),
-        }
-        for p in legacy.get("presets", [])
-    ]
-
-    def _legacy_helper(key: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": m["id"],
-                "label": m["label"],
-                "configured": m.get("provider", "local")
-                in (configured_providers | {"local"}),
-            }
-            for m in legacy.get(key, [])
-        ]
-
-    # Catalog rows take precedence; legacy YAML entries fill in if no catalog
-    # row covers the same model id. After admins migrate their whisper/tts
-    # entries into the catalog the YAML fallback drops out cleanly.
-    catalog_whisper_ids = {m["id"] for m in whisper_catalog}
-    catalog_tts_ids = {m["id"] for m in tts_catalog}
-    whisper = whisper_catalog + [
-        m
-        for m in _legacy_helper("whisper_models")
-        if m["id"] not in catalog_whisper_ids
-    ]
-    tts = tts_catalog + [
-        m for m in _legacy_helper("tts_models") if m["id"] not in catalog_tts_ids
-    ]
-
     return {
         "groups": groups,
-        "presets": presets,
         "builder_models": builder_models,
         "auxiliary_models": auxiliary,
         "vision_models": vision,
@@ -12547,19 +12921,15 @@ async def list_available_models(
 
 @app.post("/api/models/reload")
 async def reload_model_catalog(request: Request) -> dict[str, str]:
-    """Drop the legacy YAML cache and reload the registry.
+    """No-op kept for backward compat with cockpit clients that still POST.
 
-    Catalog rows live in the DB and are read fresh on every ``/api/models``
-    call — no cache to invalidate. This endpoint stays in place to flush
-    the residual whisper/tts/presets YAML cache and to bounce the registry
-    in case the YAML fallback wants picked-up edits.
+    Catalog rows live in the DB and ``/api/models`` queries them fresh on
+    every call — there is no cache to invalidate. The YAML fallback
+    registry that this endpoint used to bounce was deleted in chunk 6;
+    the legacy YAML projection cache it then bounced was deleted in
+    chunk 7.
     """
     await _require_admin(request)
-    global _model_catalog_yaml_cache
-    _model_catalog_yaml_cache = None
-    from src.core.model_registry import reload_registry as _reload_registry
-
-    _reload_registry()
     return {"status": "reloaded"}
 
 
@@ -15380,14 +15750,15 @@ async def _execute_server_tool(
 ) -> tuple[str, str | None]:
     """Execute a server-side builder tool via the shared dispatch module.
 
-    Resolves the Tavily key from system_api_keys at call time so the
-    builder_search helper stays DB-agnostic.
+    Tavily is a search engine (not an LLM), so its key lives in the
+    ``TAVILY_API_KEY`` env var rather than ``system_api_keys``. The
+    ``tavily_search`` helper resolves it from the env when ``api_key``
+    is not passed.
     """
-    tavily_key = await postgres_db.get_system_api_key("tavily")
     return await _dispatch_server_tool(
         tool_name,
         args,
-        tavily_search_fn=partial(tavily_search, api_key=tavily_key),
+        tavily_search_fn=tavily_search,
         user_id=user_id,
         active_project_id=active_project_id,
     )
