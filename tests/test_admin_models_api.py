@@ -9,7 +9,7 @@ Covers:
   themselves through the DB accessors (LiteLLM #14661 hazard regression).
 - ``resolve_catalog_model`` JOINs to the right transport (system vs endpoint)
   and prefers the system row when both are present.
-- ``list_models_by_role_alphabetical`` filters on enabled and sorts.
+- ``list_models_by_capability_alphabetical`` filters on enabled and sorts.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 from main import (  # noqa: E402
     VALID_CATALOG_PROVIDER_KINDS,
-    VALID_CATALOG_ROLES,
+    VALID_CATALOG_CAPABILITIES,
     CatalogModelCreate,
     CatalogModelUpdate,
     app,
@@ -52,6 +52,7 @@ CATALOG_ROUTES = {
     ("DELETE", "/api/admin/providers/models/{catalog_id}"),
     ("POST", "/api/admin/providers/models/{catalog_id}/test"),
     ("GET", "/api/admin/families"),
+    ("GET", "/api/admin/families/detect"),
 }
 
 
@@ -73,8 +74,8 @@ class TestCatalogRoutesRegistered:
 
 
 class TestCatalogConstants:
-    def test_role_enum_locked(self):
-        assert VALID_CATALOG_ROLES == (
+    def test_capability_enum_locked(self):
+        assert VALID_CATALOG_CAPABILITIES == (
             "chat",
             "auxiliary",
             "embedding",
@@ -99,7 +100,7 @@ class TestCatalogModelCreate:
             "provider_ref": "anthropic",
             "model_id": "claude-opus-4-7",
             "display_label": "Claude Opus 4.7",
-            "role": "chat",
+            "capabilities": ["chat", "auxiliary"],
             "family": "claude-opus",
         }
         base.update(overrides)
@@ -109,6 +110,7 @@ class TestCatalogModelCreate:
         body = CatalogModelCreate(**self._ok_payload())
         assert body.provider_kind == "system"
         assert body.enabled is True  # default
+        assert body.capabilities == ["chat", "auxiliary"]
 
     def test_endpoint_kind_accepted(self):
         body = CatalogModelCreate(
@@ -119,9 +121,25 @@ class TestCatalogModelCreate:
         )
         assert body.provider_kind == "endpoint"
 
-    def test_invalid_role_rejected(self):
+    def test_invalid_capability_rejected(self):
         with pytest.raises(Exception):
-            CatalogModelCreate(**self._ok_payload(role="banana"))
+            CatalogModelCreate(**self._ok_payload(capabilities=["banana"]))
+
+    def test_empty_capabilities_array_rejected(self):
+        """min_length=1 on the Pydantic field — every row must claim at
+        least one role."""
+        with pytest.raises(Exception):
+            CatalogModelCreate(**self._ok_payload(capabilities=[]))
+
+    def test_legacy_capability_singular_field_rejected(self):
+        """The chunk 7 cleanup dropped the legacy `capability` field. Older
+        clients posting the singular form get a Pydantic validation error
+        pointing at the new `capabilities` array."""
+        payload = self._ok_payload()
+        payload.pop("capabilities")
+        payload["capability"] = "chat"
+        with pytest.raises(Exception):
+            CatalogModelCreate(**payload)
 
     def test_invalid_provider_kind_rejected(self):
         with pytest.raises(Exception):
@@ -133,7 +151,7 @@ class TestCatalogModelCreate:
             "provider_ref",
             "model_id",
             "display_label",
-            "role",
+            "capabilities",
             "family",
         ):
             payload = self._ok_payload()
@@ -199,7 +217,8 @@ def _row(**overrides):
         "provider_ref": "anthropic",
         "model_id": "claude-opus-4-7",
         "display_label": "Claude Opus 4.7",
-        "role": "chat",
+        "capability": "chat",
+        "capabilities": ["chat", "auxiliary"],
         "family": "claude-opus",
         "context_window": None,
         "reasoning_level": None,
@@ -215,7 +234,14 @@ def _row(**overrides):
 
 
 class TestCreateModelJsonbHandling:
-    """LiteLLM #14661 hazard — null vs explicit zero must be distinguished."""
+    """LiteLLM #14661 hazard — null vs explicit zero must be distinguished.
+
+    Positional argument indices on the INSERT bind layout (post chunk 7):
+    $1 provider_kind, $2 provider_ref, $3 model_id, $4 display_label,
+    $5 capabilities, $6 family, $7 context_window, $8 reasoning_level,
+    $9 params_json, $10 enabled, $11 seeded_from, $12 notes. ``args[0]``
+    is the SQL string; positional binds start at ``args[1]``.
+    """
 
     @pytest.mark.asyncio
     async def test_null_params_writes_sql_null(self):
@@ -228,7 +254,7 @@ class TestCreateModelJsonbHandling:
             provider_ref="anthropic",
             model_id="claude-opus-4-7",
             display_label="Claude Opus 4.7",
-            role="chat",
+            capabilities=["chat", "auxiliary"],
             family="claude-opus",
             params_json=None,
         )
@@ -246,7 +272,7 @@ class TestCreateModelJsonbHandling:
             provider_ref="anthropic",
             model_id="claude-opus-4-7",
             display_label="Claude Opus 4.7",
-            role="chat",
+            capabilities=["chat", "auxiliary"],
             family="claude-opus",
             params_json={"temperature": 0},
         )
@@ -254,6 +280,96 @@ class TestCreateModelJsonbHandling:
         assert params_arg is not None
         # round-trip via JSON to confirm the zero survived
         assert json.loads(params_arg) == {"temperature": 0}
+
+    @pytest.mark.asyncio
+    async def test_chat_capability_expands_to_chat_and_auxiliary(self):
+        """Passing capability='chat' (legacy kwarg) lands capabilities=
+        ['chat','auxiliary'] in the array column. Reflects the operator-intent
+        invariant: chat-capable LLMs always work for the auxiliary observer/
+        curator workload. The kwarg is kept on the accessor for legacy
+        callers (init.py migration); the API layer enforces the array form."""
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=_row())
+        db = _make_db(conn)
+
+        await db.create_model(
+            provider_kind="system",
+            provider_ref="anthropic",
+            model_id="claude-opus-4-7",
+            display_label="Claude Opus 4.7",
+            capability="chat",
+            family="claude-opus",
+        )
+        # $5 = capabilities (only column now — capability dropped in chunk 7).
+        capabilities_arg = conn.fetchrow.await_args.args[5]
+        assert capabilities_arg == ["chat", "auxiliary"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_capabilities_array_passed_through(self):
+        """When the caller provides capabilities= directly the canonicalizer
+        respects the explicit list — it does NOT auto-expand chat-only into
+        chat+auxiliary. Operators get exact control over the row's roles."""
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=_row())
+        db = _make_db(conn)
+
+        await db.create_model(
+            provider_kind="system",
+            provider_ref="anthropic",
+            model_id="claude-opus-4-7",
+            display_label="Claude Opus 4.7",
+            capabilities=["chat"],
+            family="claude-opus",
+        )
+        capabilities_arg = conn.fetchrow.await_args.args[5]
+        assert capabilities_arg == ["chat"]
+
+    @pytest.mark.asyncio
+    async def test_singleton_non_chat_capability_stays_singleton(self):
+        """capability='embedding' lands as ['embedding'] — only the chat
+        spelling auto-expands."""
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=_row())
+        db = _make_db(conn)
+
+        await db.create_model(
+            provider_kind="system",
+            provider_ref="openai",
+            model_id="text-embedding-3-large",
+            display_label="OpenAI Embedding",
+            capability="embedding",
+            family="openai-embedding",
+        )
+        capabilities_arg = conn.fetchrow.await_args.args[5]
+        assert capabilities_arg == ["embedding"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_capability_rejected(self):
+        """Element-level enum guard at the accessor — defense in depth in
+        case the Pydantic Literal is bypassed (e.g. internal callers)."""
+        db = _make_db(_conn())
+        with pytest.raises(ValueError, match="unknown capability"):
+            await db.create_model(
+                provider_kind="system",
+                provider_ref="anthropic",
+                model_id="claude-opus-4-7",
+                display_label="Claude Opus 4.7",
+                capabilities=["banana"],
+                family="claude-opus",
+            )
+
+    @pytest.mark.asyncio
+    async def test_neither_capability_nor_capabilities_rejected(self):
+        """At least one of the two spellings must be set."""
+        db = _make_db(_conn())
+        with pytest.raises(ValueError):
+            await db.create_model(
+                provider_kind="system",
+                provider_ref="anthropic",
+                model_id="claude-opus-4-7",
+                display_label="Claude Opus 4.7",
+                family="claude-opus",
+            )
 
     @pytest.mark.asyncio
     async def test_row_to_model_decodes_jsonb_string(self):
@@ -282,16 +398,33 @@ class TestListModelsFilters:
         assert "WHERE" not in sql
 
     @pytest.mark.asyncio
-    async def test_role_filter_added(self):
+    async def test_capabilities_singleton_filter(self):
+        """Single-element array filter for asking 'rows tagged for X'."""
         conn = _conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db(conn)
 
-        await db.list_models(role="auxiliary")
+        await db.list_models(capabilities=["auxiliary"])
         sql = conn.fetch.await_args.args[0]
         args = conn.fetch.await_args.args[1:]
-        assert "role = $1" in sql
-        assert args == ("auxiliary",)
+        assert "capabilities && $1::TEXT[]" in sql
+        assert args == (["auxiliary"],)
+
+    @pytest.mark.asyncio
+    async def test_capabilities_array_filter_uses_overlap(self):
+        """Multi-capability filter narrows by overlap — a row matches if
+        any of the requested capabilities is present in the array. Used
+        when the cockpit asks 'show me everything tagged for chat OR
+        auxiliary'."""
+        conn = _conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db(conn)
+
+        await db.list_models(capabilities=["chat", "vision"])
+        sql = conn.fetch.await_args.args[0]
+        args = conn.fetch.await_args.args[1:]
+        assert "capabilities && $1::TEXT[]" in sql
+        assert args == (["chat", "vision"],)
 
     @pytest.mark.asyncio
     async def test_enabled_only_adds_clause(self):
@@ -302,6 +435,111 @@ class TestListModelsFilters:
         await db.list_models(enabled_only=True)
         sql = conn.fetch.await_args.args[0]
         assert "enabled = TRUE" in sql
+
+
+class TestReadinessAccessors:
+    """The capability-completeness gate (chunk 5) reads two helpers
+    on PostgresDB. These tests pin the SQL shape and the empty-case
+    behavior so a future query rewrite doesn't silently break the gate."""
+
+    @pytest.mark.asyncio
+    async def test_count_returns_zero_for_unseen_capabilities(self):
+        """A capability with no rows must report 0 (not be dropped) so
+        callers can ask 'is `embedding` ready?' without a presence check."""
+        conn = _conn()
+        conn.fetch = AsyncMock(return_value=[{"cap": "chat", "n": 3}])
+        db = _make_db(conn)
+
+        counts = await db.count_enabled_models_by_capability()
+        assert counts["chat"] == 3
+        assert counts["embedding"] == 0
+        assert counts["auxiliary"] == 0
+        # Whisper/tts joined the enum in v1.1; they must also report 0.
+        assert counts["whisper"] == 0
+        assert counts["tts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_count_fan_out_for_multi_capability_rows(self):
+        """The unnest-based count must increment EVERY capability in a
+        row's capabilities[] array. A chat row seeded as ['chat','auxiliary']
+        contributes +1 to both buckets — exactly the user-reported fix:
+        pinning a chat row as the auxiliary default no longer leaves the
+        readiness gate red on a missing auxiliary count."""
+        conn = _conn()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"cap": "chat", "n": 2},
+                {"cap": "auxiliary", "n": 2},
+                {"cap": "vision", "n": 1},
+                {"cap": "embedding", "n": 1},
+            ]
+        )
+        db = _make_db(conn)
+
+        counts = await db.count_enabled_models_by_capability()
+        assert counts == {
+            "chat": 2,
+            "auxiliary": 2,
+            "vision": 1,
+            "embedding": 1,
+            "whisper": 0,
+            "tts": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_count_filters_to_enabled_rows(self):
+        conn = _conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db(conn)
+
+        await db.count_enabled_models_by_capability()
+        sql = conn.fetch.await_args.args[0]
+        assert "enabled = TRUE" in sql
+        # unnest-driven fan-out: GROUP BY the unnested element, not the
+        # singular column.
+        assert "unnest(capabilities)" in sql
+        assert "GROUP BY cap" in sql
+
+    @pytest.mark.asyncio
+    async def test_pinned_capabilities_strips_prefix_and_suffix(self):
+        """The setting key pattern is ``llm.default_<cap>_model``; the
+        accessor must extract ``<cap>`` for each non-empty value."""
+        conn = _conn()
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "key": "llm.default_chat_model",
+                    "value": {"model": "claude-opus-4-7"},
+                },
+                {
+                    "key": "llm.default_embedding_model",
+                    "value": {"model": "text-embedding-3-large"},
+                },
+                # Empty model — must NOT be reported as pinned.
+                {"key": "llm.default_auxiliary_model", "value": {"model": ""}},
+            ]
+        )
+        db = _make_db(conn)
+
+        pinned = await db.list_default_pin_capabilities()
+        assert sorted(pinned) == ["chat", "embedding"]
+
+    @pytest.mark.asyncio
+    async def test_pinned_capabilities_skips_unrelated_setting_keys(self):
+        """The LIKE filters guard against picking up unrelated
+        `llm.*` system_settings rows that happen to match one half of
+        the pattern."""
+        conn = _conn()
+        conn.fetch = AsyncMock(return_value=[])
+        db = _make_db(conn)
+
+        await db.list_default_pin_capabilities()
+        sql = conn.fetch.await_args.args[0]
+        args = conn.fetch.await_args.args[1:]
+        assert "system_settings" in sql
+        # Both LIKE bounds present so 'llm.default_foo_extra' doesn't slip in.
+        assert args[0] == "llm.default_%"
+        assert args[1] == "%_model"
 
 
 class TestResolveCatalogModelTransportJoin:
@@ -372,14 +610,16 @@ class TestResolveCatalogModelTransportJoin:
         assert "ORDER BY (m.provider_kind = 'system') DESC" in sql
 
 
-class TestListByRoleAlphabetical:
+class TestListByCapabilityAlphabetical:
     @pytest.mark.asyncio
     async def test_filters_enabled_and_orders_by_label(self):
         conn = _conn()
         conn.fetch = AsyncMock(return_value=[])
         db = _make_db(conn)
-        await db.list_models_by_role_alphabetical("auxiliary")
+        await db.list_models_by_capability_alphabetical("auxiliary")
         sql = conn.fetch.await_args.args[0]
+        # Array membership replaces the literal capability= filter.
+        assert "$1 = ANY(capabilities)" in sql
         assert "enabled = TRUE" in sql
         assert "ORDER BY display_label ASC" in sql
         assert conn.fetch.await_args.args[1:] == ("auxiliary",)

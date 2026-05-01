@@ -1,7 +1,7 @@
 """Model registry — single source of truth for model routing metadata.
 
 Resolves a model ID to a ModelMeta (provider, family, base_url, api_key_ref,
-etc.) via three sources:
+etc.) via three DB-backed sources:
 
 1. The per-user ``user_llm_endpoint_models`` table, queried through a
    callable installed by ``register_custom_lookup`` at orchestrator startup
@@ -9,28 +9,26 @@ etc.) via three sources:
 2. System-scoped rows in the same table (``user_id IS NULL``), queried
    through a callable installed by ``register_system_lookup``
    (``origin='system'``).
-3. The built-in catalog loaded at import time from ``config/models.yaml``
-   (``origin='builtin'``).
+3. The admin-curated ``models`` catalog table, queried through a callable
+   installed by ``register_catalog_lookup`` (``origin='catalog'``).
 
 Unknown IDs raise ``UnknownModelError``. Dispatch code consumes the
 ModelMeta to decide which LLM factory to invoke and whether to inject a
 ``base_url`` / ``api_key`` into the job's ``config_override``.
 
-Built-in entries in the "Local" YAML group inherit ``LLM_BASE_URL`` from
-the environment at load time; this preserves the legacy env-var routing
-(with a deprecation warning) until users migrate to custom endpoints.
+The legacy YAML fallback (``config/models.yaml`` + ``LLM_BASE_URL``
+env-var inheritance for self-hosted "Local" group models) was removed in
+chunk 6 of the ``models_yaml_removal`` work. Self-hosted models are now
+catalog rows pointing at an explicit ``llm_endpoints`` transport — the
+previous "fall through to api.openai.com with `not-needed`" silent
+failure mode is structurally impossible.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import warnings
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
-
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -40,9 +38,9 @@ class UnknownModelError(LookupError):
 
     def __init__(self, model_id: str) -> None:
         super().__init__(
-            f"Unknown model '{model_id}'. Built-in models are defined in "
-            f"config/models.yaml; user-defined models come from per-user "
-            f"endpoints (see /api/settings/llm-endpoints)."
+            f"Unknown model '{model_id}'. Configure it via Admin → Models "
+            f"(catalog row anchored to a system API key or system endpoint), "
+            f"or as a per-user endpoint via /api/settings/llm-endpoints."
         )
         self.model_id = model_id
 
@@ -59,122 +57,27 @@ class ModelMeta:
     api_key_ref: Optional[str] = None
     context_window: Optional[int] = None
     reasoning_level: Optional[str] = None
-    origin: str = "builtin"
+    origin: str = "catalog"
     endpoint_id: Optional[str] = None
     capability: str = "chat"
 
-
-_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
-_CATALOG_PATH = _CONFIG_DIR / "models.yaml"
 
 _FACTORY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "codex"}
 
 
 def _factory_provider(yaml_provider: Optional[str]) -> str:
-    """Map a YAML provider label to the LLM factory that serves it.
+    """Map a provider label to the LLM factory that serves it.
 
-    YAML uses `local` for self-hosted OpenAI-compatible endpoints (vLLM,
-    Ollama). They route through the openai factory because the wire
-    protocol is OpenAI-compatible; the distinction only matters for UI
-    filtering and access control, not for dispatch.
+    Catalog rows use the same provider slugs as the legacy YAML (``local``
+    for self-hosted OpenAI-compatible endpoints — those route through the
+    openai factory because the wire protocol matches; the distinction only
+    matters for UI filtering and access control, not for dispatch).
     """
     if yaml_provider is None or yaml_provider == "local":
         return "openai"
     if yaml_provider in _FACTORY_PROVIDERS:
         return yaml_provider
     return "openai"
-
-
-def _entry_to_meta(entry: dict[str, Any], *, provider: str) -> ModelMeta:
-    model_id = entry["id"]
-    return ModelMeta(
-        model_id=model_id,
-        provider=provider,
-        family=entry.get("family") or "default",
-        display_name=entry.get("display_name") or entry.get("label") or model_id,
-        base_url=entry.get("base_url"),
-        api_key_ref=provider,
-        context_window=entry.get("context_window"),
-        reasoning_level=entry.get("reasoning_level"),
-        origin="builtin",
-    )
-
-
-def _load_builtin_catalog() -> dict[str, ModelMeta]:
-    """Parse config/models.yaml into a model_id → ModelMeta dict.
-
-    Self-hosted "Local" group entries inherit ``LLM_BASE_URL`` from the
-    environment when their YAML has no explicit ``base_url``. This keeps
-    the legacy deployment path working (env-var-driven vLLM URL) while
-    users migrate to per-user custom endpoints. A deprecation warning
-    fires the first time the fallback is applied.
-    """
-    if not _CATALOG_PATH.exists():
-        return {}
-
-    with open(_CATALOG_PATH) as f:
-        data = yaml.safe_load(f) or {}
-
-    env_base_url = os.getenv("LLM_BASE_URL")
-    env_fallback_used = False
-    registry: dict[str, ModelMeta] = {}
-
-    # Main groups: provider lives at group level, applies to every entry.
-    for group in data.get("groups", []):
-        yaml_provider = group.get("provider")
-        provider = _factory_provider(yaml_provider)
-        is_local_group = yaml_provider == "local"
-        for entry in group.get("models", []):
-            if "id" not in entry:
-                continue
-            meta = _entry_to_meta(entry, provider=provider)
-            if is_local_group and meta.base_url is None and env_base_url:
-                # Replace the immutable meta with one carrying the env URL.
-                meta = ModelMeta(
-                    model_id=meta.model_id,
-                    provider=meta.provider,
-                    family=meta.family,
-                    display_name=meta.display_name,
-                    base_url=env_base_url,
-                    api_key_ref=meta.api_key_ref,
-                    context_window=meta.context_window,
-                    reasoning_level=meta.reasoning_level,
-                    origin=meta.origin,
-                    endpoint_id=meta.endpoint_id,
-                )
-                env_fallback_used = True
-            registry[meta.model_id] = meta
-
-    # Helper lists: provider is per-entry. Register only the ones that
-    # aren't already covered by the main groups (helper lists may include
-    # duplicates for UI filtering).
-    for section in ("builder_models", "auxiliary_models", "vision_models"):
-        for entry in data.get(section, []):
-            model_id = entry.get("id")
-            if not model_id or model_id in registry:
-                continue
-            provider = _factory_provider(entry.get("provider"))
-            meta = _entry_to_meta(entry, provider=provider)
-            registry[meta.model_id] = meta
-
-    if env_fallback_used:
-        warnings.warn(
-            "LLM_BASE_URL is being applied to built-in 'Local' models. "
-            "This env-var routing is deprecated — configure a per-user LLM "
-            "endpoint via the settings UI (/api/settings/llm-endpoints) "
-            "instead. The env fallback will be removed in a future release.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        logger.warning(
-            "Using LLM_BASE_URL=%s for local built-in models (deprecated)",
-            env_base_url,
-        )
-
-    return registry
-
-
-_builtin_registry: dict[str, ModelMeta] = _load_builtin_catalog()
 
 
 # Dependency injection: the orchestrator registers DB-backed lookups at
@@ -217,8 +120,8 @@ def register_system_lookup(fn: Optional[SystemLookup]) -> None:
 def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     """Install (or clear) the DB-backed catalog lookup callable.
 
-    The callable takes (model_id, role='chat') and returns either None or a
-    flattened row dict from the ``models`` table joined to its transport
+    The callable takes (model_id, capability='chat') and returns either None
+    or a flattened row dict from the ``models`` table joined to its transport
     (system_api_keys or llm_endpoints). Wired to
     ``postgres_db.resolve_catalog_model`` at orchestrator startup.
     """
@@ -226,48 +129,19 @@ def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     _catalog_lookup = fn
 
 
-def reload_registry() -> None:
-    """Reload the built-in catalog from disk.
-
-    Used by tests and by the /api/models/reload endpoint after YAML edits.
-    """
-    global _builtin_registry
-    _builtin_registry = _load_builtin_catalog()
-
-
-def list_builtin_models() -> list[ModelMeta]:
-    """Return every built-in ModelMeta in catalog order. For tests and UI."""
-    return list(_builtin_registry.values())
-
-
-def resolve_builtin(model_id: str) -> Optional[ModelMeta]:
-    """Synchronous lookup against the built-in catalog only.
-
-    Skips custom-endpoint resolution entirely. Used by sync call sites
-    (settings-matrix family lookup, factory dispatch) that don't have
-    user context or can't await. Returns None instead of raising so
-    callers can apply defaults.
-    """
-    return _builtin_registry.get(model_id)
-
-
 def family_of(model_id: str, default: str = "default") -> str:
     """Return the family string for a model ID.
 
-    Primary source: the built-in registry (authoritative for every entry
-    in ``config/models.yaml``).
+    The DB-backed catalog row carries ``family`` explicitly; this helper
+    is the sync prefix-pattern fallback used by call sites that don't have
+    a row in hand (settings-matrix family lookup before resolution, log
+    formatting, etc.).
 
-    Best-effort fallback for unknown IDs: strip common provider prefixes
-    and pattern-match against the known family names. This keeps the
-    settings_matrix lookup graceful for bare model names, custom-endpoint
-    models without an explicit ``family``, and anything else not in the
-    catalog. The heuristic is deliberately minimal and explicit-loss:
-    it returns ``default`` on any miss rather than inventing new families.
+    The heuristic strips common provider prefixes (``openrouter/``,
+    ``groq/``, ``codex/``, ``openai/``) and pattern-matches against the
+    known family names. Deliberately minimal and explicit-loss: returns
+    ``default`` on any miss rather than inventing new families.
     """
-    meta = _builtin_registry.get(model_id)
-    if meta is not None:
-        return meta.family
-
     name = model_id.lower()
     for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
@@ -355,7 +229,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     """
     provider_kind = row["provider_kind"]
     provider_ref = row["provider_ref"]
-    role = row.get("role") or "chat"
+    capability = row.get("capability") or "chat"
     if provider_kind == "endpoint":
         return ModelMeta(
             model_id=row["model_id"],
@@ -368,7 +242,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
-            capability=role,
+            capability=capability,
         )
     return ModelMeta(
         model_id=row["model_id"],
@@ -380,7 +254,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         context_window=row.get("context_window"),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
-        capability=role,
+        capability=capability,
     )
 
 
@@ -397,15 +271,11 @@ async def resolve_model(
         2. System-scoped endpoints (when the system lookup hook has been
            registered). Shared across all users; seeded by helm or
            managed via Admin → Providers.
-        2.5. DB-backed catalog (``models`` table) — admin-curated offerings
+        3. DB-backed catalog (``models`` table) — admin-curated offerings
            anchored to a transport (system_api_keys or system endpoint).
            When matched, the row's transport is joined inline so the
            returned ModelMeta carries either ``base_url`` (endpoint) or
            ``api_key_ref`` (system provider).
-        3. Built-in catalog from config/models.yaml (chat-capability only;
-           kept as a fallback during the catalog rollout window — every
-           hit logs at WARN so coverage gaps are visible before the YAML
-           is deleted).
         4. Miss → UnknownModelError.
 
     Args:
@@ -435,18 +305,8 @@ async def resolve_model(
             return _endpoint_row_to_meta(row, origin="system")
 
     if _catalog_lookup is not None:
-        row = await _catalog_lookup(model_id, role=capability)
+        row = await _catalog_lookup(model_id, capability=capability)
         if row is not None:
             return _catalog_row_to_meta(row)
-
-    if capability == "chat":
-        meta = _builtin_registry.get(model_id)
-        if meta is not None:
-            logger.warning(
-                "Resolved model %s from YAML fallback — should be in catalog "
-                "(seed via _seed_models_from_yaml or add via Admin → Models)",
-                model_id,
-            )
-            return meta
 
     raise UnknownModelError(model_id)

@@ -3,11 +3,11 @@ import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-togg
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {
-  CATALOG_ROLES,
+  CATALOG_CAPABILITIES,
+  CatalogCapability,
   CatalogModel,
   CatalogModelTestResult,
   CatalogProviderKind,
-  CatalogRole,
   LlmEndpointDiscoveredModel,
 } from '../../../core/models/api.model';
 import {AppButtonComponent} from '../../../ui/button';
@@ -33,18 +33,27 @@ interface ProviderOption {
  */
 const CODEX_PROXY_LABEL = 'codex-proxy';
 
-/** Maps the discover endpoint's capability hint onto a catalog role. */
-function hintToRole(hint: string | null | undefined): CatalogRole {
-  switch (hint) {
-    case 'auxiliary':
-    case 'embedding':
-    case 'vision':
-    case 'whisper':
-    case 'tts':
-      return hint;
-    default:
-      return 'chat';
-  }
+/**
+ * Build the `capabilities[]` pre-fill from the discovery hint array.
+ * Filters to known capability values and de-duplicates while preserving
+ * the order the orchestrator emitted (chat-capable rows already include
+ * `auxiliary`; multimodal families include `vision`).
+ */
+function hintsToCapabilities(
+  hints: readonly string[] | null | undefined,
+): CatalogCapability[] {
+  const known: CatalogCapability[] = [
+    'chat',
+    'auxiliary',
+    'embedding',
+    'vision',
+    'whisper',
+    'tts',
+  ];
+  const isKnown = (v: string): v is CatalogCapability =>
+    known.includes(v as CatalogCapability);
+  const filtered = (hints ?? []).filter(isKnown);
+  return filtered.length > 0 ? [...new Set(filtered)] : ['chat', 'auxiliary'];
 }
 
 @Component({
@@ -92,7 +101,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   <div class="model-header">
                     <span class="col-display">Display label</span>
                     <span class="col-id">Model ID</span>
-                    <span class="col-role">Role</span>
+                    <span class="col-capability">Capabilities</span>
                     <span class="col-family">Family</span>
                     <span class="col-enabled">Enabled</span>
                     <span class="col-actions"></span>
@@ -101,7 +110,13 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                     <div class="model-row">
                       <span class="col-display">{{ m.display_label }}</span>
                       <span class="col-id mono">{{ m.model_id }}</span>
-                      <span class="col-role">{{ m.role }}</span>
+                      <span class="col-capability">
+                        <span class="cap-badges">
+                          @for (cap of rowCapabilities(m); track cap) {
+                            <app-badge tone="neutral" size="xs">{{ cap }}</app-badge>
+                          }
+                        </span>
+                      </span>
                       <span class="col-family">{{ m.family }}</span>
                       <span class="col-enabled">
                         <app-checkbox
@@ -167,16 +182,20 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field label="Role">
-                <app-select
-                  [value]="formRole()"
-                  [disabled]="creating()"
-                  (changed)="onRoleChange($event)"
-                >
-                  @for (r of roles; track r) {
-                    <option [value]="r">{{ r }}</option>
+              <app-form-field label="Capabilities">
+                <fieldset class="cap-fieldset" [disabled]="creating()">
+                  @for (c of capabilities; track c) {
+                    <label class="cap-checkbox">
+                      <app-checkbox
+                        size="sm"
+                        [checked]="formCapabilities().includes(c)"
+                        [ariaLabel]="c"
+                        (changed)="toggleFormCapability(c, $event)"
+                      />
+                      <span>{{ c }}</span>
+                    </label>
                   }
-                </app-select>
+                </fieldset>
               </app-form-field>
             </div>
 
@@ -230,7 +249,9 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                         (click)="applyDiscoveredModel(m)"
                       >
                         <span class="mono">{{ m.id }}</span>
-                        <span class="discover-cap">{{ m.capability_hint }}</span>
+                        <span class="discover-cap">
+                          {{ m.capability_hints.join(', ') }}
+                        </span>
                       </button>
                     }
                   </div>
@@ -244,7 +265,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   [value]="formModelId()"
                   placeholder="e.g. claude-opus-4-7"
                   [disabled]="creating()"
-                  (changed)="formModelId.set($event)"
+                  (changed)="onModelIdChange($event)"
                 />
               </app-form-field>
               <app-form-field label="Display label">
@@ -339,7 +360,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
     .model-header,
     .model-row {
       display: grid;
-      grid-template-columns: 1.4fr 2fr 90px 100px 70px 260px;
+      grid-template-columns: 1.4fr 2fr 160px 100px 70px 260px;
       gap: 8px;
       align-items: center;
       padding: 8px 12px;
@@ -371,6 +392,30 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
       gap: 8px;
       align-items: center;
       flex-wrap: wrap;
+    }
+    .cap-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .cap-fieldset {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      padding: 6px 8px;
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      background: var(--surface-0);
+    }
+    .cap-fieldset[disabled] { opacity: 0.6; pointer-events: none; }
+    .cap-checkbox {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--text-primary);
+      cursor: pointer;
+      user-select: none;
     }
     .create-form {
       padding: 16px;
@@ -451,7 +496,7 @@ export class AdminModelsComponent implements OnInit {
   readonly models = inject(AdminModelsService);
   readonly providers = inject(AdminProvidersService);
 
-  readonly roles: CatalogRole[] = CATALOG_ROLES;
+  readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
   readonly creating = signal(false);
   readonly testing = signal<string | null>(null);
   readonly testResults = signal<Record<string, CatalogModelTestResult>>({});
@@ -459,7 +504,9 @@ export class AdminModelsComponent implements OnInit {
 
   // Form state — signals so OnPush picks up updates from primitive callbacks.
   readonly formProviderKey = signal('');
-  readonly formRole = signal<CatalogRole>('chat');
+  // Default to ['chat', 'auxiliary'] — chat-capable LLMs always serve
+  // auxiliary unless the operator explicitly unchecks it.
+  readonly formCapabilities = signal<CatalogCapability[]>(['chat', 'auxiliary']);
   readonly formModelId = signal('');
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
@@ -485,7 +532,7 @@ export class AdminModelsComponent implements OnInit {
   });
 
   /** Provider dropdown options sourced from the keys + endpoints lists.
-   * Non-LLM providers (`tavily`, `vision`) are filtered out — they live in
+   * Non-LLM providers (`vision`) are filtered out — they live in
    * `system_api_keys` for env injection but can't anchor a catalog row.
    * The seeded `codex-proxy` endpoint is rendered as a "subscription"
    * source so admins recognise it as separate from a generic vLLM/Ollama
@@ -493,7 +540,7 @@ export class AdminModelsComponent implements OnInit {
   readonly providerOptions = computed<ProviderOption[]>(() => {
     const opts: ProviderOption[] = [];
     for (const key of this.providers.systemApiKeys()) {
-      if (key.provider === 'tavily' || key.provider === 'vision') continue;
+      if (key.provider === 'vision') continue;
       opts.push({
         kind: 'system',
         ref: key.provider,
@@ -562,8 +609,28 @@ export class AdminModelsComponent implements OnInit {
       !!this.formProviderKey() &&
       !!this.formModelId().trim() &&
       !!this.formDisplayLabel().trim() &&
-      !!this.formFamily().trim()
+      !!this.formFamily().trim() &&
+      this.formCapabilities().length > 0
     );
+  }
+
+  /** Capability set displayed for a catalog row in the table. */
+  rowCapabilities(m: CatalogModel): CatalogCapability[] {
+    return m.capabilities ?? [];
+  }
+
+  /** Toggle one capability checkbox in the create/edit form. Maintains
+   * CATALOG_CAPABILITIES order so the array sent to the backend is
+   * deterministic regardless of click order. */
+  toggleFormCapability(capability: CatalogCapability, checked: boolean): void {
+    const current = new Set(this.formCapabilities());
+    if (checked) {
+      current.add(capability);
+    } else {
+      current.delete(capability);
+    }
+    const ordered = this.capabilities.filter((c) => current.has(c));
+    this.formCapabilities.set(ordered);
   }
 
   onProviderKeyChange(value: string | null): void {
@@ -578,10 +645,6 @@ export class AdminModelsComponent implements OnInit {
     this.formFamily.set('default');
     this.formContextWindow.set(null);
     this.formError.set('');
-  }
-
-  onRoleChange(value: string | null): void {
-    if (value) this.formRole.set(value as CatalogRole);
   }
 
   onFamilyChange(value: string | null): void {
@@ -604,6 +667,11 @@ export class AdminModelsComponent implements OnInit {
       this.formError.set('Pick a provider.');
       return;
     }
+    const capabilities = this.formCapabilities();
+    if (capabilities.length === 0) {
+      this.formError.set('Select at least one capability.');
+      return;
+    }
     this.creating.set(true);
     this.models
       .createModel({
@@ -611,7 +679,7 @@ export class AdminModelsComponent implements OnInit {
         provider_ref: ref,
         model_id: this.formModelId().trim(),
         display_label: this.formDisplayLabel().trim(),
-        role: this.formRole(),
+        capabilities,
         family: this.formFamily().trim(),
         context_window: this.formContextWindow() ?? null,
       })
@@ -674,8 +742,38 @@ export class AdminModelsComponent implements OnInit {
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {
     this.formModelId.set(m.id);
     this.formDisplayLabel.set(m.id);
-    this.formRole.set(hintToRole(m.capability_hint));
-    this.formFamily.set(m.family || 'default');
+    this.formCapabilities.set(hintsToCapabilities(m.capability_hints));
+    // Endpoint discovery doesn't always know the family — fall back to the
+    // matcher when the discovered row leaves it empty.
+    if (m.family) {
+      this.formFamily.set(m.family);
+    } else {
+      this.detectAndSetFamily(m.id);
+    }
     this.formContextWindow.set(m.context_window ?? null);
+  }
+
+  /** Invoked when the operator types or pastes a model ID directly (not
+   * via the discovery list). Pre-fills the family dropdown from the
+   * matcher; admin can still override before save. */
+  onModelIdChange(value: string): void {
+    this.formModelId.set(value);
+    const trimmed = value.trim();
+    if (!trimmed) {
+      this.formFamily.set('default');
+      return;
+    }
+    this.detectAndSetFamily(trimmed);
+  }
+
+  private detectAndSetFamily(modelId: string): void {
+    this.models.detectFamily(modelId).subscribe((res) => {
+      // Only apply the matcher's suggestion when it actually matched; a
+      // 'fallback' result means we'd just be replacing whatever the admin
+      // already selected with 'default', which is rarely what they want.
+      if (res.source === 'matched') {
+        this.formFamily.set(res.family);
+      }
+    });
   }
 }

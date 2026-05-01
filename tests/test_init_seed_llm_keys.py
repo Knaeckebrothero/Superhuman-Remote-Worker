@@ -55,7 +55,7 @@ def _fake_db_with_catalog(
 @pytest.mark.asyncio
 async def test_no_seed_env_vars_is_noop(monkeypatch):
     """With no SEED_* env vars set, the seeder isn't invoked."""
-    for provider in ("openai", "anthropic", "google", "groq", "openrouter", "tavily"):
+    for provider in ("openai", "anthropic", "google", "groq", "openrouter"):
         monkeypatch.delenv(f"SEED_{provider.upper()}_API_KEY", raising=False)
 
     db = _fake_db()
@@ -65,7 +65,7 @@ async def test_no_seed_env_vars_is_noop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_single_provider_seeded(monkeypatch):
-    for provider in ("openai", "anthropic", "google", "groq", "openrouter", "tavily"):
+    for provider in ("openai", "anthropic", "google", "groq", "openrouter"):
         monkeypatch.delenv(f"SEED_{provider.upper()}_API_KEY", raising=False)
     monkeypatch.setenv("SEED_OPENAI_API_KEY", "sk-test")
 
@@ -81,7 +81,7 @@ async def test_single_provider_seeded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_existing_row_skipped(monkeypatch):
-    for provider in ("openai", "anthropic", "google", "groq", "openrouter", "tavily"):
+    for provider in ("openai", "anthropic", "google", "groq", "openrouter"):
         monkeypatch.delenv(f"SEED_{provider.upper()}_API_KEY", raising=False)
     monkeypatch.setenv("SEED_OPENAI_API_KEY", "sk-rotated")
 
@@ -98,7 +98,7 @@ async def test_vision_legacy_slot_never_seeded(monkeypatch):
     """``vision`` is in VALID_SYSTEM_API_KEY_PROVIDERS for legacy reasons but
     must never be seeded — vision keys flow through the per-endpoint inline
     api_key on a custom endpoint row."""
-    for provider in ("openai", "anthropic", "google", "groq", "openrouter", "tavily"):
+    for provider in ("openai", "anthropic", "google", "groq", "openrouter"):
         monkeypatch.delenv(f"SEED_{provider.upper()}_API_KEY", raising=False)
     monkeypatch.setenv("SEED_VISION_API_KEY", "should-be-ignored")
 
@@ -109,11 +109,11 @@ async def test_vision_legacy_slot_never_seeded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_multiple_providers_seeded(monkeypatch):
-    for provider in ("openai", "anthropic", "google", "groq", "openrouter", "tavily"):
+    for provider in ("openai", "anthropic", "google", "groq", "openrouter"):
         monkeypatch.delenv(f"SEED_{provider.upper()}_API_KEY", raising=False)
     monkeypatch.setenv("SEED_OPENAI_API_KEY", "sk-openai")
     monkeypatch.setenv("SEED_ANTHROPIC_API_KEY", "sk-ant")
-    monkeypatch.setenv("SEED_TAVILY_API_KEY", "tvly-x")
+    monkeypatch.setenv("SEED_GROQ_API_KEY", "gsk-test")
 
     db = _fake_db()
     await init_mod._seed_llm_keys_from_env(db)
@@ -122,7 +122,7 @@ async def test_multiple_providers_seeded(monkeypatch):
     seeded_providers = {
         call.kwargs["provider"] for call in db.upsert_system_api_key.await_args_list
     }
-    assert seeded_providers == {"openai", "anthropic", "tavily"}
+    assert seeded_providers == {"openai", "anthropic", "groq"}
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +148,15 @@ class TestApplyOpenrouterDefaults:
         db = _fake_db_with_catalog(openrouter_key="sk-or-v1-xxx")
         await init_mod._apply_openrouter_defaults(db)
         assert db.create_model.await_count == 2
-        roles_inserted = {
-            call.kwargs["role"] for call in db.create_model.await_args_list
+        # Each convenience row is registered as a singleton-array (the
+        # auxiliary openrouter row is purposefully aux-only, NOT
+        # auxiliary+chat — it's a small/cheap model the operator routes to
+        # the auxiliary slot specifically).
+        capabilities_inserted = {
+            tuple(call.kwargs["capabilities"])
+            for call in db.create_model.await_args_list
         }
-        assert roles_inserted == {"auxiliary", "embedding"}
+        assert capabilities_inserted == {("auxiliary",), ("embedding",)}
 
     @pytest.mark.asyncio
     async def test_idempotent_when_rows_already_exist(self):

@@ -41,6 +41,13 @@ data:
       "maxFailureWaitSeconds": 900,
       "maxDeltaTimeSeconds": 43200,
       "failureFactor": 5,
+      "rememberMe": {{ .Values.keycloak.session.rememberMe }},
+      "ssoSessionIdleTimeout": {{ .Values.keycloak.session.ssoSessionIdleTimeout }},
+      "ssoSessionMaxLifespan": {{ .Values.keycloak.session.ssoSessionMaxLifespan }},
+      "ssoSessionIdleTimeoutRememberMe": {{ .Values.keycloak.session.ssoSessionIdleTimeoutRememberMe }},
+      "ssoSessionMaxLifespanRememberMe": {{ .Values.keycloak.session.ssoSessionMaxLifespanRememberMe }},
+      "accessTokenLifespan": {{ .Values.keycloak.session.accessTokenLifespan }},
+      "offlineSessionIdleTimeout": {{ .Values.keycloak.session.offlineSessionIdleTimeout }},
       "roles": {
         "realm": [
           {
@@ -726,6 +733,19 @@ spec:
                         -s "smtpServer.user=$SMTP_USER" \
                         -s "smtpServer.password=$SMTP_PASSWORD" 2>/dev/null
                     fi
+                    # --- Sync session/token lifespans ---
+                    # Same self-heal pattern as SMTP: realm-import only seeds
+                    # these on first boot, so existing deployments would keep
+                    # Keycloak's 30-min default idle timeout forever. Force
+                    # them on every start so values.yaml is the source of truth.
+                    $KC update "realms/{{ .Values.keycloak.realm }}" \
+                      -s "rememberMe={{ .Values.keycloak.session.rememberMe }}" \
+                      -s "ssoSessionIdleTimeout={{ .Values.keycloak.session.ssoSessionIdleTimeout }}" \
+                      -s "ssoSessionMaxLifespan={{ .Values.keycloak.session.ssoSessionMaxLifespan }}" \
+                      -s "ssoSessionIdleTimeoutRememberMe={{ .Values.keycloak.session.ssoSessionIdleTimeoutRememberMe }}" \
+                      -s "ssoSessionMaxLifespanRememberMe={{ .Values.keycloak.session.ssoSessionMaxLifespanRememberMe }}" \
+                      -s "accessTokenLifespan={{ .Values.keycloak.session.accessTokenLifespan }}" \
+                      -s "offlineSessionIdleTimeout={{ .Values.keycloak.session.offlineSessionIdleTimeout }}" 2>/dev/null
                     # --- Ensure OpenCloud clients + group ---
                     # Idempotent: creates only if missing. Mirrors setup-opencloud-client.sh.
                     if [ -n "$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" ]; then

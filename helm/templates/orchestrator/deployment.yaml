@@ -175,13 +175,10 @@ spec:
             # provider key from system_api_keys (seeded via the llm-seed-job).
             # See docs/api_key_resolution.md for the wire-format vs config-source
             # split.
-            # BUILDER_MODEL removed — resolved from system_settings
-            # ('llm.default_builder_model') at request time.
-            - name: BUILDER_LLM_PROVIDER
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: BUILDER_LLM_PROVIDER
+            # BUILDER_MODEL + BUILDER_LLM_PROVIDER removed in chunk 7 of
+            # models_yaml_removal — both resolved from the catalog at
+            # request time (system_settings['llm.default_builder_model']
+            # + the joined transport's provider_kind/provider_ref).
             # Default Neo4j datasource (local instance — optional)
             - name: DEFAULT_DS_NEO4J_URL
               valueFrom:
@@ -574,11 +571,9 @@ spec:
             # Codex OAuth Proxy
             - name: CODEX_PROXY_URL
               value: "http://{{ include "srw.fullname" . }}-codex-proxy:8317"
-            - name: CODEX_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: CODEX_BASE_URL
+            # CODEX_BASE_URL removed in chunk 7 of models_yaml_removal —
+            # the codex transport is a system endpoint catalog row now,
+            # not an env-var-injected base URL.
             - name: CODEX_MANAGEMENT_KEY
               valueFrom:
                 secretKeyRef:

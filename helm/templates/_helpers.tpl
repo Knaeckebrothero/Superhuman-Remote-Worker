@@ -203,6 +203,42 @@ Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS
 {{- end }}
 {{- end }}
 
+{{/*
+Resources for the Keycloak bootstrap Job.
+
+  - srw.keycloakBootstrapServer  — URL kcadm authenticates against.
+      Resolution: bootstrap.serverUrl override → externalInternalUrl
+      (stripped of any /realms/... suffix) → externalIssuerUrl (same
+      strip). Errors if none are set, since the Job has nothing to talk to.
+  - srw.keycloakBootstrapRealm   — target realm. Defaults to keycloak.realm.
+  - srw.keycloakBootstrapImage   — image with kcadm.sh. Defaults to
+      keycloak.image so the Job re-uses what's already pulled.
+*/}}
+{{- define "srw.keycloakBootstrapServer" -}}
+{{- $b := .Values.keycloak.bootstrap -}}
+{{- if $b.serverUrl -}}
+{{- $b.serverUrl -}}
+{{- else if .Values.keycloak.externalInternalUrl -}}
+{{- regexReplaceAll "/realms/.*$" .Values.keycloak.externalInternalUrl "" -}}
+{{- else if .Values.keycloak.externalIssuerUrl -}}
+{{- regexReplaceAll "/realms/.*$" .Values.keycloak.externalIssuerUrl "" -}}
+{{- else -}}
+{{- fail "keycloak.bootstrap.enabled requires keycloak.bootstrap.serverUrl, keycloak.externalInternalUrl, or keycloak.externalIssuerUrl" -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.keycloakBootstrapRealm" -}}
+{{- default .Values.keycloak.realm .Values.keycloak.bootstrap.realm -}}
+{{- end }}
+
+{{- define "srw.keycloakBootstrapImage" -}}
+{{- default .Values.keycloak.image .Values.keycloak.bootstrap.image -}}
+{{- end }}
+
+{{- define "srw.keycloakBootstrapName" -}}
+{{- printf "%s-keycloak-bootstrap" (include "srw.fullname" .) -}}
+{{- end }}
+
 {{- define "srw.gitUrl" -}}
 {{- if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
 {{- .Values.gitea.externalUrl }}

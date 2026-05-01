@@ -172,7 +172,7 @@ export interface VmWorkspacesSetting {
 /**
  * Supported LLM and tool provider slugs for API key management.
  */
-export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'codex' | 'tavily' | 'vision';
+export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'codex' | 'vision';
 
 /**
  * An API key entry (as returned by GET endpoints — no full key, prefix only).
@@ -256,11 +256,14 @@ export interface LlmEndpointTestResult {
  * A single model surfaced by `GET {base_url}/models` via the admin discovery
  * endpoint. Used by Admin → Models as a quick-fill helper when the admin has
  * picked a system endpoint as the catalog row's transport.
+ *
+ * `capability_hints` is the array of suggested capabilities — chat-capable
+ * rows always include `auxiliary`.
  */
 export interface LlmEndpointDiscoveredModel {
   id: string;
   owned_by: string | null;
-  capability_hint: LlmModelCapability;
+  capability_hints: LlmModelCapability[];
   family: string | null;
   context_window: number | null;
 }
@@ -273,23 +276,64 @@ export interface LlmEndpointDiscoveryResult {
   models: LlmEndpointDiscoveredModel[];
 }
 
+/**
+ * One row in the Admin → Providers post-save discovery dialog. Comes from
+ * the orchestrator's `discover_models()` per-provider clients (OpenAI,
+ * Google, Groq, OpenRouter); Anthropic + the env-bridge `vision` provider
+ * never produce these — admins add those models manually.
+ */
+export interface DiscoveryCandidate {
+  model_id: string;
+  detected_family: string;
+  /** True iff `detected_family` has a non-default entry in
+   * `model_config_matrix.yaml` — i.e. we ship custom prompts/settings. The
+   * dialog defaults supported rows to checked. */
+  supported: boolean;
+  /** Suggested capabilities array. Chat-capable models include `auxiliary`
+   * automatically; multimodal chat families also include `vision`. */
+  suggested_capabilities: CatalogCapability[];
+  suggested_display_label: string;
+}
+
+/** Wrapper stored on `system_api_keys.discovery_cache_json`. */
+export interface DiscoveryPayload {
+  provider: string;
+  fetched_at: string;
+  count: number;
+  candidates: DiscoveryCandidate[];
+}
+
+/** Response shape for `GET /api/admin/providers/keys/{provider}/discovery`
+ * and `POST .../rediscover`. ``ready=false`` means no probe has completed
+ * yet (e.g. the async post-save probe is still in flight). */
+export interface DiscoveryResponse {
+  ready: boolean;
+  fresh: boolean;
+  payload: DiscoveryPayload | null;
+  cached_at: string | null;
+}
+
 // =============================================================================
 // Models Catalog (Admin → Models)
 // =============================================================================
 
-/** Locked enum for catalog rows. Adding a role requires schema + resolver work. */
-export type CatalogRole = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
+/** Locked enum for catalog rows. Adding a capability requires schema + resolver work. */
+export type CatalogCapability = 'chat' | 'auxiliary' | 'embedding' | 'vision' | 'whisper' | 'tts';
 
 /** Provider anchor for a catalog row. */
 export type CatalogProviderKind = 'system' | 'endpoint';
 
-export const CATALOG_ROLES: CatalogRole[] = [
+export const CATALOG_CAPABILITIES: CatalogCapability[] = [
   'chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts',
 ];
 
 /**
  * A row in the admin-curated `models` table. Mirrors orchestrator
  * `_serialize_catalog_model`.
+ *
+ * `capabilities` is the source of truth: a single row can claim multiple
+ * roles — e.g. `['chat','auxiliary']` for a chat-capable LLM,
+ * `['chat','auxiliary','vision']` for a multimodal one.
  */
 export interface CatalogModel {
   id: string;
@@ -297,7 +341,7 @@ export interface CatalogModel {
   provider_ref: string;
   model_id: string;
   display_label: string;
-  role: CatalogRole;
+  capabilities: CatalogCapability[];
   family: string;
   context_window: number | null;
   reasoning_level: string | null;
@@ -314,7 +358,8 @@ export interface CatalogModelCreateRequest {
   provider_ref: string;
   model_id: string;
   display_label: string;
-  role: CatalogRole;
+  /** Capabilities the row claims. Required, non-empty. */
+  capabilities: CatalogCapability[];
   family: string;
   context_window?: number | null;
   reasoning_level?: string | null;
@@ -328,7 +373,7 @@ export interface CatalogModelUpdateRequest {
   provider_ref?: string;
   model_id?: string;
   display_label?: string;
-  role?: CatalogRole;
+  capabilities?: CatalogCapability[];
   family?: string;
   context_window?: number | null;
   reasoning_level?: string | null;

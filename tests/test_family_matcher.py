@@ -1,0 +1,118 @@
+"""Tests for ``orchestrator.services.family_matcher.detect_family``.
+
+Pins the regex registry against representative model IDs so a future edit
+to ``_FAMILY_RULES`` that breaks an established mapping fails loudly. The
+suite covers each rule, the OpenRouter prefix recursion, the
+``default``-fallback path, and a few edge cases that specifically caused
+trouble during the chunk-3 design (`o-series` reasoning models that look
+like `o3` not `o3-mini`, `gpt-5` ahead of `gpt-4` ordering, etc.).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from orchestrator.services.family_matcher import detect_family
+
+
+@pytest.mark.parametrize(
+    "model_id,expected_family",
+    [
+        # Anthropic
+        ("claude-opus-4-7", "claude-opus"),
+        ("claude-opus-4-7-20251024", "claude-opus"),
+        ("claude-sonnet-4-6", "claude-sonnet"),
+        ("claude-haiku-4-5", "claude-haiku"),
+        # OpenAI gpt-5 + o-series (split families post chunk 1)
+        ("gpt-5", "gpt-5"),
+        ("gpt-5.2", "gpt-5"),
+        ("gpt-5-mini", "gpt-5"),
+        ("o3", "o-series"),
+        ("o3-mini", "o-series"),
+        ("o4", "o-series"),
+        ("o4-mini", "o-series"),
+        # Codex variants — codex-spark must beat plain codex
+        ("gpt-5.3-codex", "codex"),
+        ("gpt-5.3-codex-spark", "codex-spark"),
+        # gpt-4* → default (works with default prompts)
+        ("gpt-4o", "default"),
+        ("gpt-4o-mini", "default"),
+        ("gpt-4-turbo", "default"),
+        # Google
+        ("gemini-2.5-pro", "gemini"),
+        ("gemini-2.0-flash-exp", "gemini"),
+        ("gemma-4-31b-it", "gemma"),
+        # Open weights
+        ("openai/gpt-oss-120b", "gpt-oss"),
+        ("MiniMaxAI/MiniMax-M2.7", "minimax"),
+        ("deepseek-v3", "deepseek"),
+        # Kimi (Moonshot) → default per design (no custom prompts shipped)
+        ("moonshotai/kimi-k2-instruct-0905", "default"),
+        # Embeddings
+        ("text-embedding-3-large", "openai-embedding"),
+        ("text-embedding-ada-002", "openai-embedding"),
+    ],
+)
+def test_detect_family_matched_rules(model_id: str, expected_family: str) -> None:
+    """Each rule maps its representative model_id to the expected family."""
+    detection = detect_family(model_id)
+    assert detection.family == expected_family
+    assert detection.source == "matched"
+
+
+@pytest.mark.parametrize(
+    "model_id,expected_family",
+    [
+        ("openrouter/anthropic/claude-opus-4-7", "claude-opus"),
+        ("openrouter/anthropic/claude-sonnet-4-6", "claude-sonnet"),
+        ("openrouter/openai/gpt-5", "gpt-5"),
+        ("openrouter/openai/text-embedding-3-large", "openai-embedding"),
+        ("openrouter/google/gemini-2.5-pro", "gemini"),
+        ("openrouter/openai/gpt-oss-120b", "gpt-oss"),
+    ],
+)
+def test_openrouter_prefix_recurses(model_id: str, expected_family: str) -> None:
+    """OpenRouter passthrough IDs route through the recursive prefix rule —
+    no rule duplication required."""
+    detection = detect_family(model_id)
+    assert detection.family == expected_family
+    assert detection.source == "matched"
+
+
+def test_unknown_model_falls_back_to_default() -> None:
+    """A model_id no rule matches resolves to default with provenance
+    so the cockpit can flag "we guessed" vs "we know."""
+    detection = detect_family("some-bespoke-model-99-x")
+    assert detection.family == "default"
+    assert detection.source == "fallback"
+
+
+def test_empty_model_id_returns_default_fallback() -> None:
+    """Empty/whitespace-only IDs are treated as the unknown case rather
+    than raising, so the API surface can validate at the route boundary."""
+    assert detect_family("").family == "default"
+    assert detect_family("").source == "fallback"
+
+
+def test_openrouter_unknown_inner_falls_back() -> None:
+    """OpenRouter wrapper around an unknown model still recurses; the inner
+    miss surfaces as ``fallback`` (not ``matched``)."""
+    detection = detect_family("openrouter/something/never-heard-of")
+    assert detection.family == "default"
+    assert detection.source == "fallback"
+
+
+def test_case_insensitive_match() -> None:
+    """Provider catalogs sometimes return mixed-case IDs (Claude-Opus,
+    GEMINI-2.5-pro). The matcher should not care."""
+    assert detect_family("CLAUDE-OPUS-4-7").family == "claude-opus"
+    assert detect_family("Gemini-2.5-pro").family == "gemini"
+    assert detect_family("GPT-OSS-120B").family == "gpt-oss"
+
+
+def test_codex_spark_ordering_pins_against_regression() -> None:
+    """codex-spark is a substring of "codex" — if the rules table is ever
+    reordered such that the plain `codex` rule fires first, codex-spark
+    models silently route to the wrong matrix entry."""
+    assert detect_family("codex-spark").family == "codex-spark"
+    assert detect_family("gpt-5.3-codex-spark").family == "codex-spark"

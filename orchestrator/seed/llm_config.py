@@ -17,6 +17,12 @@ a fresh stack. On each run:
 * ``systemEndpoints`` entries are matched by label. Missing endpoints are
   created; existing ones are left alone apart from their model list — any
   listed model that is not already present gets appended.
+* ``systemModels`` entries are provider-direct catalog rows
+  (``provider_kind='system'``) anchored to a ``system_api_keys`` provider.
+  Inserted with ``ON CONFLICT DO NOTHING`` on
+  ``(provider_kind, provider_ref, model_id, capability)``, so admin edits
+  via the Cockpit survive subsequent helm upgrades. Entries whose provider
+  is not (yet) in ``system_api_keys`` are skipped with a log line.
 
 The Job is re-run on every upgrade, so the seeder's success path must be
 idempotent. Non-zero exits are reserved for genuine DB errors — a re-run
@@ -45,6 +51,17 @@ Payload shape::
           - id: "qwen3-embedding-8b"
             displayName: "Qwen3 Embedding 8B"
             capability: embedding        # routes to Admin → Defaults → Embedding
+
+    systemModels:
+      - provider: "anthropic"
+        id: "claude-opus-4-7"
+        displayName: "Claude Opus 4.7"
+        capability: chat
+        family: "claude-opus"
+      - provider: "openai"
+        id: "text-embedding-3-large"
+        displayName: "OpenAI Embedding (Large)"
+        capability: embedding
 
 ``apiKeyEnv`` lets helm keep the payload ConfigMap plaintext-free: the Job pod
 mounts the referenced Secret via ``envFrom`` and the seeder resolves the
@@ -119,6 +136,58 @@ def _resolve_secret_value(entry: dict[str, Any], *, context: str) -> str | None:
         return value
 
     return None
+
+
+_CAPABILITY_ENUM = ("chat", "auxiliary", "embedding", "vision", "whisper", "tts")
+
+
+def _resolve_capabilities_from_entry(
+    entry: dict[str, Any], *, context: str
+) -> list[str] | None:
+    """Build the canonical ``capabilities[]`` for a helm seed entry.
+
+    Operator semantics (in order of precedence):
+
+    - ``capabilities: [chat, vision]`` — explicit array, respected as-is.
+      No auto-expansion: if you write ``[chat]`` you get a chat-only row.
+    - ``capability: chat`` — singular shorthand for the legacy spelling,
+      auto-expanded to ``[chat, auxiliary]``. Reflects the design invariant
+      that a chat-capable LLM always works for the auxiliary observer/
+      curator workload (see orchestrator/services/readiness.py:16-21).
+    - ``capability: <other>`` — singular for any other enum value lands as
+      ``[<other>]``. No expansion (only chat is fungible by default).
+    - ``multimodal: true`` — convenience hint that adds ``'vision'`` to a
+      chat-capable row regardless of which spelling produced it. Lets
+      operators flag known multimodal models (gpt-4o, gemini-2-pro,
+      claude-opus-4) without writing the array form.
+
+    Returns ``None`` when the resulting set contains a value outside the
+    catalog enum — caller treats that as "skip this entry".
+    """
+    explicit_caps = entry.get("capabilities")
+    if isinstance(explicit_caps, list) and explicit_caps:
+        caps = [str(c).lower() for c in explicit_caps]
+    else:
+        single = str(entry.get("capability") or "chat").lower()
+        caps = ["chat", "auxiliary"] if single == "chat" else [single]
+
+    for c in caps:
+        if c not in _CAPABILITY_ENUM:
+            logger.info(
+                "skipping %s — capability %r is not in catalog enum", context, c
+            )
+            return None
+
+    if entry.get("multimodal") and "chat" in caps and "vision" not in caps:
+        caps.append("vision")
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in caps:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
 
 
 @dataclass
@@ -240,6 +309,11 @@ async def _seed_endpoints(
         # (whisper, tts) are skipped — those don't surface in v1.
         from src.core.model_registry import family_of  # local: src/* lazy load
 
+        # Aggregate per-endpoint duplicates: same model_id appearing under
+        # multiple capabilities collapses into one row whose capabilities[]
+        # is the union. Same admin-edit-safety semantics as
+        # _seed_system_models — first occurrence's metadata wins.
+        endpoint_aggregated: dict[str, dict[str, Any]] = {}
         for model in models:
             model_id = model.get("id") or model.get("model_id")
             if not model_id:
@@ -247,22 +321,26 @@ async def _seed_endpoints(
                     "skipping model entry under %s — id missing: %r", label, model
                 )
                 continue
-            role = (model.get("capability") or "chat").lower()
-            if role not in (
-                "chat",
-                "auxiliary",
-                "embedding",
-                "vision",
-                "whisper",
-                "tts",
-            ):
-                logger.info(
-                    "skipping model %s under %s — capability %r is not a catalog role",
-                    model_id,
-                    label,
-                    role,
-                )
+            capabilities = _resolve_capabilities_from_entry(
+                model, context=f"systemEndpoints[{label}].models[{model_id}]"
+            )
+            if capabilities is None:
                 continue
+            existing = endpoint_aggregated.get(model_id)
+            if existing is None:
+                endpoint_aggregated[model_id] = {
+                    "model": model,
+                    "capabilities": list(capabilities),
+                }
+            else:
+                existing_caps = existing["capabilities"]
+                for c in capabilities:
+                    if c not in existing_caps:
+                        existing_caps.append(c)
+
+        for model_id, agg in endpoint_aggregated.items():
+            model = agg["model"]
+            capabilities = agg["capabilities"]
             display_label = (
                 model.get("displayName") or model.get("display_name") or model_id
             )
@@ -271,7 +349,7 @@ async def _seed_endpoints(
                 provider_ref=endpoint_id,
                 model_id=model_id,
                 display_label=display_label,
-                role=role,
+                capabilities=capabilities,
                 family=model.get("family") or family_of(model_id),
                 context_window=model.get("contextWindow")
                 or model.get("context_window"),
@@ -286,11 +364,107 @@ async def _seed_endpoints(
                 continue
             report.models_seeded.append((label, model_id))
             logger.info(
-                "seeded catalog row %s (role=%s) under endpoint %s",
+                "seeded catalog row %s (capabilities=%s) under endpoint %s",
                 model_id,
-                role,
+                capabilities,
                 label,
             )
+
+
+async def _seed_system_models(
+    db: PostgresDB, entries: Iterable[dict[str, Any]], report: SeedReport
+) -> None:
+    """Seed provider-direct catalog rows (provider_kind='system').
+
+    Each entry is anchored to a ``system_api_keys`` provider that must
+    already exist. Entries whose provider has no key are skipped — same
+    contract as the legacy ``_seed_models_from_yaml`` path this replaces.
+
+    Aggregation: under the array-capability model, multiple helm entries
+    pointing at the same (provider, model_id) get merged into ONE row
+    whose capabilities[] is the union of the contributions. This handles
+    legacy helm shapes where operators wrote one entry per capability for
+    the same physical model (gpt-4o + capability: chat alongside
+    gpt-4o + capability: vision). After aggregation we issue a single
+    INSERT per (provider, model_id) — preserving the original admin-edit
+    safety: ON CONFLICT DO NOTHING leaves admin-modified rows alone.
+    """
+    seeded_providers = {k["provider"] for k in await db.list_system_api_keys()}
+
+    from src.core.model_registry import family_of  # local: src/* lazy load
+
+    aggregated: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in entries:
+        provider = entry.get("provider")
+        model_id = entry.get("id") or entry.get("model_id")
+        if not provider or not model_id:
+            logger.warning(
+                "skipping systemModels entry — provider or id missing: %r", entry
+            )
+            continue
+
+        if provider not in seeded_providers:
+            logger.info(
+                "skipping systemModels[%s/%s] — no system_api_keys row for "
+                "provider yet (seed the key first or add via Admin → Providers)",
+                provider,
+                model_id,
+            )
+            report.models_skipped.append((provider, model_id))
+            continue
+
+        capabilities = _resolve_capabilities_from_entry(
+            entry, context=f"systemModels[{provider}/{model_id}]"
+        )
+        if capabilities is None:
+            continue
+
+        key = (provider, model_id)
+        existing = aggregated.get(key)
+        if existing is None:
+            aggregated[key] = {
+                "entry": entry,
+                "capabilities": list(capabilities),
+            }
+        else:
+            # Union the capabilities (preserve order, dedupe). Other metadata
+            # comes from the FIRST entry seen — operators who care about
+            # display_label/family disambiguation should put their preferred
+            # entry first in the helm values.
+            existing_caps = existing["capabilities"]
+            for c in capabilities:
+                if c not in existing_caps:
+                    existing_caps.append(c)
+
+    for (provider, model_id), agg in aggregated.items():
+        entry = agg["entry"]
+        capabilities = agg["capabilities"]
+        display_label = (
+            entry.get("displayName") or entry.get("display_name") or model_id
+        )
+        inserted = await db.create_model(
+            provider_kind="system",
+            provider_ref=provider,
+            model_id=model_id,
+            display_label=display_label,
+            capabilities=capabilities,
+            family=entry.get("family") or family_of(model_id),
+            context_window=entry.get("contextWindow") or entry.get("context_window"),
+            reasoning_level=entry.get("reasoningLevel") or entry.get("reasoning_level"),
+            enabled=entry.get("enabled", True),
+            seeded_from=SEEDED_FROM_TAG,
+            on_conflict_do_nothing=True,
+        )
+        if inserted is None:
+            report.models_skipped.append((provider, model_id))
+            continue
+        report.models_seeded.append((provider, model_id))
+        logger.info(
+            "seeded catalog row %s (capabilities=%s) under system provider %s",
+            model_id,
+            capabilities,
+            provider,
+        )
 
 
 async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
@@ -298,12 +472,23 @@ async def seed(db: PostgresDB, payload: dict[str, Any]) -> SeedReport:
     report = SeedReport()
     api_keys = payload.get("systemApiKeys") or []
     endpoints = payload.get("systemEndpoints") or []
+    system_models = payload.get("systemModels") or []
 
-    if not isinstance(api_keys, list) or not isinstance(endpoints, list):
-        raise ValueError("systemApiKeys and systemEndpoints must be lists when present")
+    if (
+        not isinstance(api_keys, list)
+        or not isinstance(endpoints, list)
+        or not isinstance(system_models, list)
+    ):
+        raise ValueError(
+            "systemApiKeys, systemEndpoints, and systemModels must be lists when present"
+        )
 
-    await _seed_api_keys(db, api_keys, report)
-    await _seed_endpoints(db, endpoints, report)
+    if api_keys:
+        await _seed_api_keys(db, api_keys, report)
+    if endpoints:
+        await _seed_endpoints(db, endpoints, report)
+    if system_models:
+        await _seed_system_models(db, system_models, report)
     return report
 
 

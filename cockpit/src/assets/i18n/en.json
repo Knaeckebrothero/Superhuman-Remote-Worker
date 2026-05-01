@@ -277,6 +277,7 @@
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {
+          "chat": "Chat (cluster-wide default)",
           "builder": "Builder (job authoring / UI helper)",
           "browser": "Browser (research subagent)",
           "citation": "Citation engine",
@@ -742,6 +743,13 @@
       "approve": "Approve",
       "autoAccept": "Auto-accept",
       "deny": "Deny"
+    },
+    "approval": {
+      "pendingTitle": "Approval needed to run this tool",
+      "badge": {
+        "approved": "Approved",
+        "denied": "Denied"
+      }
     },
     "error": {
       "dismiss": "dismiss"

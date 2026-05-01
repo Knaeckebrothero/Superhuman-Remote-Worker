@@ -1,8 +1,0 @@
-# Developer expert instruction matrix
-# Only list entries that differ from the base matrix.
-# These files exist in config/experts/developer/ and are found by file search.
-
-default:
-  instructions: instructions.md
-  strategic_todos_initial: strategic_todos_initial.yaml
-  todo_guide: todo_guide.md
