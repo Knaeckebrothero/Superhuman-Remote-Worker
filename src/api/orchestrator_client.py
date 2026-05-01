@@ -344,7 +344,7 @@ class OrchestratorClient:
 
     async def update_thread_config(
         self, thread_id: str, config_override: dict[str, Any]
-    ) -> bool:
+    ) -> Optional[dict[str, Any]]:
         """Persist runtime config changes for a thread.
 
         Args:
@@ -353,17 +353,25 @@ class OrchestratorClient:
                              (e.g. ``{"llm": {"model": "..."}}``)
 
         Returns:
-            True if update succeeded, False otherwise
+            The orchestrator-enriched ``config_override`` (with resolved
+            ``base_url``/``api_key`` for endpoint-backed models) on success,
+            or ``None`` on failure. Callers must use the returned dict —
+            not the input — when rebuilding the LLM, otherwise custom
+            endpoint requests fall through to api.openai.com.
         """
         if not self._client:
-            return False
+            return None
         url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/config"
         try:
             r = await self._client.patch(url, json={"config_override": config_override})
-            return r.status_code == 200
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            enriched = data.get("config_override")
+            return enriched if isinstance(enriched, dict) else config_override
         except Exception as e:
             logger.warning(f"Thread config update failed (non-fatal): {e}")
-            return False
+            return None
 
     async def heartbeat(
         self,

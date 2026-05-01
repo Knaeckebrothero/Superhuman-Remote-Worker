@@ -41,11 +41,16 @@ class ProbeResult:
 
 
 def _capability_hint(model_id: str) -> str:
-    """Heuristic: map a model_id to the most likely capability slot.
+    """Heuristic: map a model_id to the most likely PRIMARY capability slot.
 
     Treated as a suggestion — the UI lets the user override per-row before
     import. Pattern checks run in decreasing specificity so ``whisper`` and
     ``embed`` hit before the ``vision``/``vl`` fallbacks.
+
+    Returns the singular primary capability — used by the legacy
+    ``capability_hint`` wire field and by callers that want one label.
+    The full ``capability_hints`` array (with auxiliary auto-expansion
+    and multimodal-vision detection) lives in :func:`_capability_hints`.
     """
     name = model_id.lower()
     if "whisper" in name:
@@ -61,6 +66,22 @@ def _capability_hint(model_id: str) -> str:
     # Deliberately no 'auxiliary' heuristic — auxiliary is a role, not a
     # naming convention. Users pick which chat models should fill it.
     return "chat"
+
+
+def _capability_hints(model_id: str) -> list[str]:
+    """Heuristic: map a model_id to the most likely ``capabilities[]``.
+
+    Chat-capable IDs auto-expand to ``[chat, auxiliary]`` (chat-capable
+    LLMs always serve auxiliary). The result mirrors the discovery
+    service's :func:`_capabilities_from_model_id` semantics, intentionally
+    minus the multimodal-vision heuristic — endpoint probes return raw
+    server inventories with arbitrary IDs, and we don't want to claim
+    vision capability without explicit naming evidence.
+    """
+    primary = _capability_hint(model_id)
+    if primary != "chat":
+        return [primary]
+    return ["chat", "auxiliary"]
 
 
 async def probe_endpoint_models(
@@ -153,7 +174,7 @@ async def probe_endpoint_models(
             {
                 "id": model_id,
                 "owned_by": owned_by,
-                "capability_hint": _capability_hint(model_id),
+                "capability_hints": _capability_hints(model_id),
                 "family": family,
                 "context_window": context_window,
             }

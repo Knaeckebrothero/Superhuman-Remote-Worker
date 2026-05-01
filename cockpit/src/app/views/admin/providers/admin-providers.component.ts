@@ -7,11 +7,18 @@ import {
   DEFAULT_MODEL_KINDS,
   DefaultModelKind,
 } from '../../../core/services/admin-providers.service';
+import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {ModelService} from '../../../core/services/model.service';
 import {
   ApiKeyProvider,
+  CATALOG_CAPABILITIES,
+  CatalogCapability,
+  DiscoveryCandidate,
+  DiscoveryResponse,
   LlmEndpointTestResult,
 } from '../../../core/models/api.model';
+import {timer} from 'rxjs';
+import {filter, switchMap, take} from 'rxjs/operators';
 import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
 import {AppSelectComponent} from '../../../ui/select';
@@ -30,6 +37,15 @@ const SYSTEM_PROVIDERS: {value: Exclude<ApiKeyProvider, 'codex'>; label: string}
 ];
 
 type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
+
+// Providers we know how to enumerate via the orchestrator's discovery
+// service. Keep in sync with `discovery_service.DISCOVERABLE_PROVIDERS`.
+const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
+  'openai',
+  'google',
+  'groq',
+  'openrouter',
+]);
 
 @Component({
   selector: 'app-admin-providers',
@@ -79,7 +95,7 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                     @if (key.seeded_from) {
                       <app-badge
                         tone="neutral"
-                        size="xs"
+                        size="sm"
                         [title]="key.seeded_from"
                       >
                         {{ 'admin.providers.keys.seededBadge' | transloco }}
@@ -149,6 +165,149 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
               {{ savingKey() ? ('common.saving' | transloco) : ('admin.providers.keys.saveButton' | transloco) }}
             </app-button>
           </div>
+
+          <!-- Auto-discovery confirmation dialog (inline; opens after a
+               successful key save for openai/google/groq/openrouter) -->
+          @if (discoveryProvider(); as discProvider) {
+            <div class="discovery-pane">
+              <div class="discovery-head">
+                <strong>
+                  Models discovered for {{ providerLabel(discProvider) }}
+                </strong>
+                <div class="discovery-actions">
+                  <app-button
+                    variant="secondary"
+                    size="sm"
+                    [loading]="discoveryPolling()"
+                    [disabled]="discoveryPolling() || discoveryAdding()"
+                    (clicked)="rediscover()"
+                  >
+                    Rediscover
+                  </app-button>
+                  <app-button
+                    variant="ghost"
+                    size="sm"
+                    [disabled]="discoveryAdding()"
+                    (clicked)="closeDiscovery()"
+                  >
+                    Close
+                  </app-button>
+                </div>
+              </div>
+
+              @if (discoveryPolling() && !discoveryPayload()) {
+                <p class="muted">
+                  Probing the provider's model listing… (this is non-blocking;
+                  the key is already saved.)
+                </p>
+              } @else if (discoveryPayload(); as res) {
+                @if (!res.payload || res.payload.count === 0) {
+                  <p class="empty-state">
+                    The provider returned no models — your key may lack the
+                    necessary scope, or the listing endpoint is unavailable.
+                    Add models manually via Admin → Models.
+                  </p>
+                } @else {
+                  <p class="muted">
+                    Pick which models become catalog rows. Supported families
+                    have custom prompts and settings; generic ones work but
+                    use defaults.
+                  </p>
+
+                  @if (supportedCandidates().length > 0) {
+                    <div class="discovery-tier">
+                      <h4 class="discovery-tier-title">
+                        Supported ({{ supportedCandidates().length }})
+                      </h4>
+                      @for (c of supportedCandidates(); track c.model_id) {
+                        <div class="discovery-row">
+                          <app-checkbox
+                            size="sm"
+                            [checked]="discoverySelections()[c.model_id]?.selected ?? false"
+                            [ariaLabel]="c.model_id"
+                            (changed)="toggleCandidate(c.model_id, $event)"
+                          />
+                          <span class="discovery-id mono">{{ c.model_id }}</span>
+                          <span class="discovery-family">{{ c.detected_family }}</span>
+                          <div class="discovery-caps">
+                            @for (cap of capabilities; track cap) {
+                              <label class="discovery-cap-chip">
+                                <app-checkbox
+                                  size="sm"
+                                  [checked]="candidateHasCapability(c.model_id, cap)"
+                                  [ariaLabel]="c.model_id + ':' + cap"
+                                  (changed)="toggleCandidateCapability(c.model_id, cap, $event)"
+                                />
+                                <span>{{ cap }}</span>
+                              </label>
+                            }
+                          </div>
+                        </div>
+                      }
+                    </div>
+                  }
+
+                  @if (genericCandidates().length > 0) {
+                    <div class="discovery-tier">
+                      <h4 class="discovery-tier-title">
+                        Generic ({{ genericCandidates().length }})
+                        <button
+                          type="button"
+                          class="link-button"
+                          (click)="discoveryShowGeneric.set(!discoveryShowGeneric())"
+                        >
+                          {{ discoveryShowGeneric() ? 'Hide' : 'Show models without custom prompts' }}
+                        </button>
+                      </h4>
+                      @if (discoveryShowGeneric()) {
+                        @for (c of genericCandidates(); track c.model_id) {
+                          <div class="discovery-row">
+                            <app-checkbox
+                              size="sm"
+                              [checked]="discoverySelections()[c.model_id]?.selected ?? false"
+                              [ariaLabel]="c.model_id"
+                              (changed)="toggleCandidate(c.model_id, $event)"
+                            />
+                            <span class="discovery-id mono">{{ c.model_id }}</span>
+                            <span class="discovery-family muted">default</span>
+                            <div class="discovery-caps">
+                              @for (cap of capabilities; track cap) {
+                                <label class="discovery-cap-chip">
+                                  <app-checkbox
+                                    size="sm"
+                                    [checked]="candidateHasCapability(c.model_id, cap)"
+                                    [ariaLabel]="c.model_id + ':' + cap"
+                                    (changed)="toggleCandidateCapability(c.model_id, cap, $event)"
+                                  />
+                                  <span>{{ cap }}</span>
+                                </label>
+                              }
+                            </div>
+                          </div>
+                        }
+                      }
+                    </div>
+                  }
+
+                  <div class="discovery-footer">
+                    <app-button
+                      variant="primary"
+                      size="md"
+                      [loading]="discoveryAdding()"
+                      [disabled]="selectedCount() === 0 || discoveryAdding()"
+                      (clicked)="addSelectedCandidates()"
+                    >
+                      Add {{ selectedCount() }} selected
+                    </app-button>
+                  </div>
+                }
+              }
+
+              @if (discoveryError()) {
+                <p class="form-error">{{ discoveryError() }}</p>
+              }
+            </div>
+          }
         </section>
 
         <!-- System Endpoints -->
@@ -163,7 +322,7 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                   <div class="endpoint-title">
                     <strong>{{ endpoint.label }}</strong>
                     @if (isCodexEndpoint(endpoint.label)) {
-                      <app-badge tone="info" size="xs" [uppercase]="true" shape="pill">
+                      <app-badge tone="info" size="sm" [uppercase]="true" shape="pill">
                         codex subscription
                       </app-badge>
                     }
@@ -322,19 +481,22 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
                       @for (m of modelService.ttsModels(); track m.id) {
                         <option [value]="m.id">{{ m.label }}</option>
                       }
+                    } @else if (kind === 'auxiliary') {
+                      <!-- Strict: only rows whose capabilities[] includes
+                           'auxiliary'. Under the array fan-out a chat row
+                           registered as ['chat','auxiliary'] surfaces
+                           here too — same row serves both slots. -->
+                      @for (m of modelService.auxiliaryModels(); track m.id) {
+                        <option [value]="m.id">{{ m.label }}</option>
+                      }
                     } @else {
-                      <!-- chat-slot kinds (builder/browser/citation/auxiliary) -->
+                      <!-- Chat-slot kinds (chat/builder/browser/citation):
+                           strict filter by 'chat' capability via the
+                           pre-bucketed groups list. -->
                       @for (group of modelService.models(); track group.group) {
                         <optgroup [label]="group.group">
                           @for (model of group.models; track model) {
                             <option [value]="model">{{ model }}</option>
-                          }
-                        </optgroup>
-                      }
-                      @if (modelService.auxiliaryModels().length > 0) {
-                        <optgroup [label]="'admin.providers.defaults.auxiliaryGroup' | transloco">
-                          @for (m of modelService.auxiliaryModels(); track m.id) {
-                            <option [value]="m.id">{{ m.label }}</option>
                           }
                         </optgroup>
                       }
@@ -515,15 +677,91 @@ type SystemProviderValue = (typeof SYSTEM_PROVIDERS)[number]['value'];
       font-size: 12px;
       margin: 4px 0 8px 0;
     }
+    .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+    .muted { color: var(--text-muted); }
+    .discovery-pane {
+      margin-top: 16px;
+      padding: 14px;
+      background: var(--surface-0);
+      border: 1px dashed var(--border-color);
+      border-radius: 8px;
+    }
+    .discovery-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .discovery-actions {
+      display: flex;
+      gap: 6px;
+    }
+    .discovery-tier {
+      margin-top: 10px;
+    }
+    .discovery-tier-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: var(--text-muted);
+      margin: 8px 0 6px 0;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .discovery-row {
+      display: grid;
+      grid-template-columns: 24px 1.6fr 0.8fr 1.6fr;
+      gap: 8px;
+      align-items: center;
+      padding: 4px 0;
+      font-size: 13px;
+    }
+    .discovery-family {
+      font-size: 11px;
+      letter-spacing: 0.3px;
+    }
+    .discovery-caps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+    }
+    .discovery-cap-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 11px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      user-select: none;
+    }
+    .discovery-footer {
+      margin-top: 10px;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .link-button {
+      background: none;
+      border: 0;
+      padding: 0;
+      cursor: pointer;
+      color: var(--accent-color);
+      font-size: 11px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .link-button:hover { text-decoration: underline; }
   `],
 })
 export class AdminProvidersComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
+  readonly catalog = inject(AdminModelsService);
   readonly modelService = inject(ModelService);
   private readonly transloco = inject(TranslocoService);
 
   readonly providers = SYSTEM_PROVIDERS;
   readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;
+  readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
 
   readonly catalogEmpty = computed(() => this.modelService.models().length === 0);
 
@@ -532,6 +770,27 @@ export class AdminProvidersComponent implements OnInit {
   readonly keyValue = signal('');
   readonly keyLabel = signal('');
   readonly savingKey = signal(false);
+
+  // Post-save discovery dialog. `discoveryProvider` is the provider whose
+  // post-save async probe we're polling for; `discoveryPolling` flips off
+  // when results arrive (or after we've shown a "took too long" message).
+  // `discoverySelections` tracks per-row checkbox + capability override:
+  // keys are model_id, values are { selected, capability }. The supported
+  // tier is checked-by-default; the generic (default-family) tier is
+  // unchecked-by-default — admin opts in deliberately.
+  readonly discoveryProvider = signal<SystemProviderValue | null>(null);
+  readonly discoveryPolling = signal(false);
+  readonly discoveryPayload = signal<DiscoveryResponse | null>(null);
+  readonly discoveryShowGeneric = signal(false);
+  // Per-row state during the discovery dialog. `selected` controls the
+  // checkbox; `capabilities` is the multi-select array. Pre-populated from
+  // the orchestrator's `suggested_capabilities` (chunk 3) — admin can
+  // tick boxes to refine before insert.
+  readonly discoverySelections = signal<
+    Record<string, {selected: boolean; capabilities: CatalogCapability[]}>
+  >({});
+  readonly discoveryAdding = signal(false);
+  readonly discoveryError = signal<string>('');
 
   // Endpoint form
   readonly newEndpointLabel = signal('');
@@ -575,9 +834,11 @@ export class AdminProvidersComponent implements OnInit {
   saveKey(): void {
     const value = this.keyValue().trim();
     if (!value) return;
+    const provider = this.keyProvider();
     this.savingKey.set(true);
+    this.discoveryError.set('');
     this.admin
-      .setSystemApiKey(this.keyProvider(), {
+      .setSystemApiKey(provider, {
         api_key: value,
         label: this.keyLabel().trim() || null,
       })
@@ -586,9 +847,208 @@ export class AdminProvidersComponent implements OnInit {
           this.keyValue.set('');
           this.keyLabel.set('');
           this.savingKey.set(false);
+          // Trigger the post-save discovery dialog for providers we
+          // know how to enumerate. The orchestrator already kicked off
+          // an async probe; we poll until the cache is populated.
+          if (DISCOVERABLE_PROVIDERS.has(provider)) {
+            this.startDiscoveryPolling(provider);
+          }
         },
         error: () => this.savingKey.set(false),
       });
+  }
+
+  /** Poll ``GET .../keys/{provider}/discovery`` until ``ready=true`` (or
+   * we've waited long enough). Probes are typically <2s but can stretch to
+   * 10s when the provider's listing endpoint is slow; we cap at ~15s and
+   * surface a "took too long" message that links to the explicit
+   * Rediscover button. */
+  private startDiscoveryPolling(provider: SystemProviderValue): void {
+    this.discoveryProvider.set(provider);
+    this.discoveryPayload.set(null);
+    this.discoverySelections.set({});
+    this.discoveryShowGeneric.set(false);
+    this.discoveryPolling.set(true);
+
+    let attempts = 0;
+    const subscription = timer(0, 1500)
+      .pipe(
+        switchMap(() => {
+          attempts += 1;
+          return this.admin.getDiscoveryPayload(provider);
+        }),
+        filter((res: DiscoveryResponse) => res.ready || attempts >= 10),
+        take(1),
+      )
+      .subscribe((res: DiscoveryResponse) => {
+        this.discoveryPolling.set(false);
+        if (!res.ready) {
+          this.discoveryError.set(
+            this.transloco.translate('admin.providers.discovery.timeout') ||
+              'Discovery is taking longer than expected. Try Rediscover.',
+          );
+          return;
+        }
+        this.applyDiscoveryPayload(res);
+      });
+    void subscription;
+  }
+
+  rediscover(): void {
+    const provider = this.discoveryProvider();
+    if (!provider) return;
+    this.discoveryPolling.set(true);
+    this.discoveryError.set('');
+    this.admin.rediscoverProvider(provider).subscribe({
+      next: (res: DiscoveryResponse) => {
+        this.discoveryPolling.set(false);
+        this.applyDiscoveryPayload(res);
+      },
+      error: (err) => {
+        this.discoveryPolling.set(false);
+        this.discoveryError.set(
+          err?.error?.detail ?? 'Rediscover failed.',
+        );
+      },
+    });
+  }
+
+  private applyDiscoveryPayload(res: DiscoveryResponse): void {
+    this.discoveryPayload.set(res);
+    const candidates = res.payload?.candidates ?? [];
+    const selections: Record<
+      string,
+      {selected: boolean; capabilities: CatalogCapability[]}
+    > = {};
+    for (const c of candidates) {
+      const caps = c.suggested_capabilities ?? [];
+      selections[c.model_id] = {
+        selected: c.supported,
+        capabilities: [...caps],
+      };
+    }
+    this.discoverySelections.set(selections);
+  }
+
+  closeDiscovery(): void {
+    this.discoveryProvider.set(null);
+    this.discoveryPayload.set(null);
+    this.discoverySelections.set({});
+    this.discoveryError.set('');
+  }
+
+  toggleCandidate(modelId: string, checked: boolean): void {
+    const current = this.discoverySelections();
+    const entry = current[modelId];
+    if (!entry) return;
+    this.discoverySelections.set({
+      ...current,
+      [modelId]: {...entry, selected: checked},
+    });
+  }
+
+  candidateHasCapability(modelId: string, capability: CatalogCapability): boolean {
+    return (
+      this.discoverySelections()[modelId]?.capabilities.includes(capability) ??
+      false
+    );
+  }
+
+  toggleCandidateCapability(
+    modelId: string,
+    capability: CatalogCapability,
+    checked: boolean,
+  ): void {
+    const current = this.discoverySelections();
+    const entry = current[modelId];
+    if (!entry) return;
+    const next = new Set(entry.capabilities);
+    if (checked) {
+      next.add(capability);
+    } else {
+      next.delete(capability);
+    }
+    // Preserve original CATALOG_CAPABILITIES order so the array sent to
+    // the backend is deterministic regardless of click order.
+    const ordered = this.capabilities.filter((c) => next.has(c));
+    this.discoverySelections.set({
+      ...current,
+      [modelId]: {...entry, capabilities: ordered},
+    });
+  }
+
+  readonly supportedCandidates = computed(() => {
+    const candidates = this.discoveryPayload()?.payload?.candidates ?? [];
+    return candidates.filter((c) => c.supported);
+  });
+
+  readonly genericCandidates = computed(() => {
+    const candidates = this.discoveryPayload()?.payload?.candidates ?? [];
+    return candidates.filter((c) => !c.supported);
+  });
+
+  readonly selectedCount = computed(() => {
+    return Object.values(this.discoverySelections()).filter(
+      (s) => s.selected,
+    ).length;
+  });
+
+  /** Insert one catalog row per checked candidate. We submit sequentially
+   * so a single 409/422 doesn't poison the whole batch — the dialog
+   * reports successes + failures at the end. */
+  addSelectedCandidates(): void {
+    const provider = this.discoveryProvider();
+    const candidates = this.discoveryPayload()?.payload?.candidates ?? [];
+    const selections = this.discoverySelections();
+    if (!provider) return;
+
+    const chosen: DiscoveryCandidate[] = candidates.filter(
+      (c) => selections[c.model_id]?.selected,
+    );
+    if (chosen.length === 0) return;
+
+    this.discoveryAdding.set(true);
+    this.discoveryError.set('');
+
+    let remaining = chosen.length;
+    let failures = 0;
+    for (const c of chosen) {
+      const selectedCaps = selections[c.model_id]?.capabilities ?? [];
+      const capabilities =
+        selectedCaps.length > 0 ? selectedCaps : c.suggested_capabilities ?? [];
+      this.catalog
+        .createModel({
+          provider_kind: 'system',
+          provider_ref: provider,
+          model_id: c.model_id,
+          display_label: c.suggested_display_label,
+          capabilities,
+          family: c.detected_family,
+          context_window: null,
+        })
+        .subscribe({
+          next: () => {
+            remaining -= 1;
+            if (remaining === 0) this.finishAdding(failures);
+          },
+          error: () => {
+            remaining -= 1;
+            failures += 1;
+            if (remaining === 0) this.finishAdding(failures);
+          },
+        });
+    }
+  }
+
+  private finishAdding(failures: number): void {
+    this.discoveryAdding.set(false);
+    if (failures > 0) {
+      this.discoveryError.set(
+        `Added with ${failures} failure(s) — likely duplicates that already exist in the catalog.`,
+      );
+    } else {
+      this.closeDiscovery();
+    }
   }
 
   deleteKey(provider: string): void {

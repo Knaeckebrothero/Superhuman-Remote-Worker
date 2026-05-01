@@ -1249,3 +1249,107 @@ class TestCreatePersistentApp:
 
         create_persistent_app("config")
         assert mod._thread_id is None
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary + embedding hot-swap in _handle_config_update
+# ---------------------------------------------------------------------------
+
+
+class TestHandleConfigUpdateEnrichmentGate:
+    """Pin the widened orchestrator-PATCH gate as a structural assertion.
+
+    The gate at the top of ``_handle_config_update`` must fire for any
+    credential-bearing slot (chat, auxiliary, embedding env_keys). A
+    regression that reverts to chat-only silently breaks custom-endpoint
+    routing for auxiliary and embedding (the ``Untitled Session`` and
+    missing-memory bug documented in
+    ``docs/hardcoded_model_defaults.md``). Mocking the full async call
+    chain here is brittle because of internal imports; pinning the
+    source-level shape is the cheapest reliable regression catch.
+    """
+
+    def test_gate_checks_auxiliary_model(self):
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert 'config_override.get("auxiliary", {}).get("model")' in src, (
+            "Auxiliary model changes must trigger the orchestrator-PATCH "
+            "enrichment gate."
+        )
+
+    def test_gate_checks_embedding_env_keys(self):
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        for key in (
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_API_KEY",
+        ):
+            assert key in src, (
+                f"Embedding env key {key} must be in the gate's "
+                "credential-bearing-keys tuple."
+            )
+
+    def test_rebuilds_auxiliary_llm_from_override(self):
+        """When auxiliary section is in the enriched override, a session-
+        scoped AuxiliaryLLM is constructed from new_config.auxiliary —
+        rather than passing through _agent._auxiliary_llm. Pinning the
+        landmark `_session.auxiliary_llm = AuxiliaryLLM(` assignment so
+        the rebuild path can't silently regress to the singleton."""
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "_session.auxiliary_llm = AuxiliaryLLM(" in src
+
+    def test_resets_embedding_singleton(self):
+        """Embedding hot-swap must clear ``embedding_service._embedding_service``
+        so the next get_embedding_service() call rebuilds with the new
+        env. Without this the process-wide singleton sticks at the
+        boot-time base_url and 401s on api.openai.com."""
+        from inspect import getsource
+        from src.api.persistent_app import _handle_config_update
+
+        src = getsource(_handle_config_update)
+        assert "_embedding_module._embedding_service = None" in src
+
+
+class TestAttachSessionRebinds:
+    """Pin the per-session rebind landmarks in ``_attach_session``.
+
+    Without these landmarks the agent's boot-time singletons leak
+    through to every session — title generation 401s, memory extraction
+    silently fails, and embedding routes to api.openai.com. The chat-
+    side fix carries no protection for auxiliary/embedding; this test
+    keeps the rebind machinery wired.
+    """
+
+    def test_attach_rebuilds_auxiliary_when_override_present(self):
+        from inspect import getsource
+        from src.api.persistent_app import _attach_session
+
+        src = getsource(_attach_session)
+        # Auxiliary rebuild branch
+        assert 'config_override.get("auxiliary", {}).get("model")' in src
+        assert "AuxiliaryLLM(" in src
+        # Pass session-scoped instance, not _agent._auxiliary_llm
+        assert "auxiliary_llm=auxiliary_llm" in src
+
+    def test_attach_resets_embedding_singleton_when_env_changes(self):
+        from inspect import getsource
+        from src.api.persistent_app import _attach_session
+
+        src = getsource(_attach_session)
+        assert "_embedding_module._embedding_service = None" in src
+        for key in (
+            "EMBEDDING_PROVIDER",
+            "EMBEDDING_MODEL",
+            "EMBEDDING_BASE_URL",
+            "EMBEDDING_API_KEY",
+        ):
+            assert key in src

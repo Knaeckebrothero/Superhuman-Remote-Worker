@@ -133,12 +133,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SEMANTIC_SCHOLAR_API_KEY
-            # Codex proxy (CLIProxyAPI)
-            - name: CODEX_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: CODEX_BASE_URL
             # Codex raw-response diagnostic (off by default)
             - name: DEBUG_CODEX_RAW_RESPONSE
               valueFrom:
@@ -152,15 +146,10 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: CODEX_RAW_DUMP_DIR
                   optional: true
-            # Vision model — VISION_API_KEY is injected per-job by the
-            # orchestrator (env_keys block) from the resolved provider key.
-            # Vault no longer carries it; vision_helper falls back to
-            # OPENAI_API_KEY when no vision model is configured.
-            - name: VISION_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: VISION_MODEL
+            # Vision: VISION_MODEL + VISION_API_KEY are injected per-job
+            # by the orchestrator (env_keys block) from the admin-pinned
+            # default + the resolved provider key. No env-var default —
+            # admins pin one via Admin → Models → Defaults.
             # Whisper — WHISPER_API_KEY/WHISPER_BASE_URL are injected per-job
             # by the orchestrator (env_keys block) when an admin / user has
             # pinned a whisper model via Admin → Defaults or user_settings.
@@ -207,19 +196,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: CITATION_EMBEDDING_URL
-            - name: EMBEDDING_MODEL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: EMBEDDING_MODEL
-            - name: EMBEDDING_BASE_URL
-              valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
-                  key: EMBEDDING_BASE_URL
-            # EMBEDDING_API_KEY is injected per-job by the orchestrator
-            # (env_keys block) from the resolved provider key or the
-            # endpoint registry row.
+            # Embedding: EMBEDDING_MODEL + EMBEDDING_BASE_URL +
+            # EMBEDDING_API_KEY are all injected per-job by the orchestrator
+            # (env_keys block). The admin-pinned default
+            # ``llm.default_embedding_model`` is the model ID source; the
+            # transport (catalog row + system_api_keys/llm_endpoints) is
+            # the URL/key source. No env-var default.
             - name: CITATION_EMBEDDING_KEY
               valueFrom:
                 secretKeyRef:

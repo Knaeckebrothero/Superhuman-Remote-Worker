@@ -287,8 +287,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
         await _seed_codex_proxy_endpoint(db)
 
         # Seed the models catalog from the helm seed payload — same source
-        # the helm Job consumes. config/models.yaml acts as a legacy bridge
-        # until chunk 7 of the catalog migration deletes it.
+        # the helm Job consumes. helm/values.yaml's llm.seed.systemModels[]
+        # is the only source; the legacy config/models.yaml bridge was
+        # removed in chunk 7 of the catalog migration.
         await _seed_models_from_helm(db)
 
         # One-shot migration: promote system-scoped user_llm_endpoint_models
@@ -910,34 +911,6 @@ async def _seed_codex_proxy_endpoint(db) -> None:
         logger.info("  codex-proxy endpoint already present — leaving untouched")
 
 
-_YAML_GROUP_CAPABILITY = {
-    "auxiliary_models": "auxiliary",
-    "vision_models": "vision",
-    "embedding_models": "embedding",
-}
-
-
-def _infer_provider_from_model_id(model_id: str) -> str | None:
-    """Best-effort provider inference for catalog seed rows lacking an explicit
-    ``provider`` field. Mirrors the prefix logic in
-    ``orchestrator.main._create_builder_llm``.
-    """
-    name = model_id.lower()
-    if name.startswith("claude"):
-        return "anthropic"
-    if name.startswith("openrouter/"):
-        return "openrouter"
-    if name.startswith("groq/"):
-        return "groq"
-    if name.startswith("codex/"):
-        return "codex"
-    if name.startswith("gemini") or name.startswith("google/"):
-        return "google"
-    if name.startswith("gpt-") or name.startswith("text-embedding-"):
-        return "openai"
-    return None
-
-
 async def _seed_models_from_helm(db) -> None:
     """Seed the ``models`` catalog from the helm seed payload on first boot.
 
@@ -953,11 +926,6 @@ async def _seed_models_from_helm(db) -> None:
     ``python init.py`` get the same path as the helm Job; the helm chart
     values are the single source of truth for which catalog rows ship by
     default.
-
-    Backwards-compat: if ``helm/values.yaml`` carries no ``systemModels``,
-    we additionally consume the legacy ``config/models.yaml`` ``groups:``
-    block to ease the migration window. That fallback drops out when
-    ``config/models.yaml`` is deleted in chunk 7 of the catalog migration.
     """
     helm_values_path = Path(__file__).resolve().parent.parent / "helm" / "values.yaml"
     system_models: list[dict] = []
@@ -970,13 +938,6 @@ async def _seed_models_from_helm(db) -> None:
             helm_raw = {}
         seed_block = (helm_raw.get("llm") or {}).get("seed") or {}
         system_models = list(seed_block.get("systemModels") or [])
-
-    # Legacy bridge: while config/models.yaml still exists, fold its groups[]
-    # + helper lists into the systemModels payload so the migration window
-    # doesn't lose catalog rows. Removed in chunk 7.
-    legacy_models = _legacy_models_yaml_to_system_models()
-    if legacy_models:
-        system_models.extend(legacy_models)
 
     if not system_models:
         logger.info("  Catalog seed skipped — no helm.llm.seed.systemModels entries")
@@ -1001,70 +962,6 @@ async def _seed_models_from_helm(db) -> None:
             f"  Skipped {len(report.models_skipped)} catalog rows "
             "(already present or provider not seeded)"
         )
-
-
-def _legacy_models_yaml_to_system_models() -> list[dict]:
-    """Adapt ``config/models.yaml``'s legacy shape into ``systemModels[]`` entries.
-
-    Bridge for the chunk 2 → chunk 7 migration window. When ``models.yaml`` is
-    deleted in chunk 7, this returns ``[]`` and the function is removed.
-    """
-    catalog_path = Path(__file__).resolve().parent.parent / "config" / "models.yaml"
-    if not catalog_path.exists():
-        return []
-
-    try:
-        raw = yaml.safe_load(catalog_path.read_text()) or {}
-    except yaml.YAMLError as e:
-        logger.warning(f"  Could not parse {catalog_path}: {e}")
-        return []
-
-    out: list[dict] = []
-
-    def _emit(
-        provider: str | None,
-        model_id: str,
-        display: str,
-        capability: str,
-        family: str | None,
-    ) -> None:
-        if not provider or provider == "local":
-            return
-        out.append(
-            {
-                "provider": provider,
-                "id": model_id,
-                "displayName": display or model_id,
-                "capability": capability,
-                **({"family": family} if family else {}),
-            }
-        )
-
-    for group in raw.get("groups", []):
-        provider = group.get("provider")
-        for entry in group.get("models", []):
-            _emit(
-                provider,
-                entry["id"],
-                entry.get("display_name") or entry["id"],
-                "chat",
-                entry.get("family"),
-            )
-
-    for yaml_key, capability in _YAML_GROUP_CAPABILITY.items():
-        for entry in raw.get(yaml_key, []):
-            provider = entry.get("provider") or _infer_provider_from_model_id(
-                entry["id"]
-            )
-            _emit(
-                provider,
-                entry["id"],
-                entry.get("label") or entry["id"],
-                capability,
-                entry.get("family"),
-            )
-
-    return out
 
 
 async def _migrate_endpoint_models_to_catalog(db) -> None:
@@ -1110,6 +1007,10 @@ async def _migrate_endpoint_models_to_catalog(db) -> None:
         from src.core.model_registry import family_of  # local import: src/*
         # path may not be on sys.path until runtime is fully wired
 
+        # Forward the singular capability — the accessor's canonicalizer
+        # auto-expands 'chat' to ['chat','auxiliary'] (matches the operator
+        # intent on the v1 endpoint table, which never knew about array
+        # shapes). Other singular values land as singletons.
         result = await db.create_model(
             provider_kind="endpoint",
             provider_ref=str(row["endpoint_id"]),
@@ -1161,7 +1062,7 @@ async def _apply_openrouter_defaults(db) -> None:
             "provider_ref": "openrouter",
             "model_id": "openrouter/google/gemini-2.5-flash",
             "display_label": "Gemini 2.5 Flash (OpenRouter)",
-            "capability": "auxiliary",
+            "capabilities": ["auxiliary"],
             "family": "gemini",
             "seeded_from": "helm:openrouter-defaults",
         },
@@ -1170,7 +1071,7 @@ async def _apply_openrouter_defaults(db) -> None:
             "provider_ref": "openrouter",
             "model_id": "openrouter/openai/text-embedding-3-large",
             "display_label": "text-embedding-3-large (OpenRouter)",
-            "capability": "embedding",
+            "capabilities": ["embedding"],
             "family": "default",
             "seeded_from": "helm:openrouter-defaults",
         },
@@ -1183,7 +1084,7 @@ async def _apply_openrouter_defaults(db) -> None:
             inserted += 1
             logger.info(
                 f"  Inserted openrouter convenience row: {row['model_id']} "
-                f"({row['capability']})"
+                f"({row['capabilities']})"
             )
     if not inserted:
         logger.info("  OpenRouter convenience catalog rows already present — no-op")
