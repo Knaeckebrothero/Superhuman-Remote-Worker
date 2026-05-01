@@ -42,9 +42,7 @@ def test_unique_constraint_is_v2(schema_text: str) -> None:
 
 def test_gin_index_on_capabilities(schema_text: str) -> None:
     """GIN index supports ``$1 = ANY(capabilities)`` and unnest fan-out."""
-    assert (
-        "CREATE INDEX IF NOT EXISTS idx_models_capabilities_enabled" in schema_text
-    )
+    assert "CREATE INDEX IF NOT EXISTS idx_models_capabilities_enabled" in schema_text
     assert "USING GIN (capabilities) WHERE enabled = TRUE" in schema_text
 
 
