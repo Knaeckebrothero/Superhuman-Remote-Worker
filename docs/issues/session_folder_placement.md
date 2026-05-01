@@ -171,3 +171,42 @@ immediate bugs is a prerequisite for Option 4's fallback branch. So:
 ---
 
 Write-up for discussion, not a decision. No code changes from this doc.
+
+## 2026-05-01 update
+
+Two things changed since this was written:
+
+1. **The OpenCloud share bugs referenced above are fixed** — see
+   `docs/issues/opencloud_share_bugs.md`. Both the role-weight
+   disambiguation and the WebDAV-PROPFIND-based `_resolve_item_id`
+   landed silently in commit `25283b3` (2026-04-23). The status-quo
+   Option 3 path (`srw-agent-home/sessions/`, share per-session) works
+   end-to-end again.
+
+2. **User raised the cross-project case explicitly** ("sessions can be
+   cross-project, right?"). This sharpens Q1 in the open-questions list:
+   the runtime already accepts `project_ids: List[str]`, the user wants
+   that capability preserved, but the DB still has a singular
+   `threads.project_id`. So the layout decision can't avoid resolving
+   the data-model mismatch — even Option 4 (hybrid) needs to know which
+   project a folder belongs to when there are multiple.
+
+Tentative direction (still for discussion, not a decision):
+
+- Keep Option 4 (hybrid) as the recommended target, with **Option 1
+  (project-bound) only when `project_ids` has exactly one entry**.
+  Multi-project sessions and zero-project (scratch) sessions both fall
+  back to the global agent-home path — i.e. Option 3 stays alive as
+  the explicit fallback, not as the default.
+- This avoids the "folder pinned to wrong project" failure mode of
+  Option 1 entirely (multi-project sessions are never placed in a
+  project Space) and lets us defer the DB join-table question.
+- Cost: the orchestrator has to commit to a placement *at session
+  creation time* and stick with it — a session that starts
+  single-project and later adds a second project keeps its original
+  project-Space folder, with the second project's members not getting
+  ACL inheritance. That seems acceptable; the alternative (move the
+  folder cross-drive) is not atomic on WebDAV.
+
+Open questions Q2-Q5 in the original write-up still stand and are not
+resolved by this update.

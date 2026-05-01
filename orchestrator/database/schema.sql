@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_user_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
 
@@ -281,9 +281,24 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_system_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
+
+-- Migration: Cache discovery results (`/v1/models` listings) on the key row
+-- so the cockpit can render the post-save confirmation dialog without
+-- re-hitting the provider. Cleared on key rotation; refreshable via the
+-- /api/admin/providers/keys/{provider}/rediscover route. The 24h TTL is
+-- enforced at read time by checking discovery_cache_at against now().
+DO $$ BEGIN
+    ALTER TABLE system_api_keys ADD COLUMN discovery_cache_json JSONB;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE system_api_keys ADD COLUMN discovery_cache_at TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 -- Default LLM model IDs (builder, browser, citation) piggy-back on the
 -- existing `system_settings` table defined in section 9d. Keys follow the
@@ -292,7 +307,7 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
 
 -- ============================================================================
 -- 0k. MODELS CATALOG
--- Admin-curated catalog of LLM offerings. Each row is one (model, role)
+-- Admin-curated catalog of LLM offerings. Each row is one (model, capability)
 -- anchored to a transport — either a system_api_keys provider
 -- (provider_kind='system', provider_ref='anthropic') or a system-scoped
 -- llm_endpoints row (provider_kind='endpoint', provider_ref=<uuid>).
@@ -305,7 +320,10 @@ CREATE TABLE IF NOT EXISTS models (
     provider_ref TEXT NOT NULL,
     model_id TEXT NOT NULL,
     display_label TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts')),
+    capabilities TEXT[] NOT NULL CHECK (
+        cardinality(capabilities) >= 1
+        AND capabilities <@ ARRAY['chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts']::TEXT[]
+    ),
     family TEXT NOT NULL,
     context_window INT,
     reasoning_level TEXT,
@@ -316,23 +334,81 @@ CREATE TABLE IF NOT EXISTS models (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT uq_model_provider UNIQUE (provider_kind, provider_ref, model_id, role)
+    CONSTRAINT uq_model_provider_v2 UNIQUE (provider_kind, provider_ref, model_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_models_role_enabled
-    ON models(role) WHERE enabled = TRUE;
+-- ----------------------------------------------------------------------------
+-- Migration v2 (2026-05): collapse legacy `role TEXT` → `capabilities TEXT[]`.
+-- The CREATE TABLE above is the post-migration shape; this block bridges
+-- pre-v2 DBs onto it. No-op on fresh installs (role never existed there).
+-- ----------------------------------------------------------------------------
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'models' AND column_name = 'capabilities'
+    ) THEN
+        ALTER TABLE models ADD COLUMN capabilities TEXT[];
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'models' AND column_name = 'role'
+    ) THEN
+        WITH groups AS (
+            SELECT
+                provider_kind, provider_ref, model_id,
+                array_agg(DISTINCT role ORDER BY role) AS caps,
+                (array_agg(id ORDER BY created_at, id))[1] AS keep_id
+            FROM models
+            GROUP BY provider_kind, provider_ref, model_id
+        )
+        UPDATE models m
+        SET capabilities = g.caps
+        FROM groups g
+        WHERE m.id = g.keep_id;
+
+        DELETE FROM models m
+        WHERE m.id NOT IN (
+            SELECT (array_agg(id ORDER BY created_at, id))[1]
+            FROM models
+            GROUP BY provider_kind, provider_ref, model_id
+        );
+
+        ALTER TABLE models DROP CONSTRAINT IF EXISTS uq_model_provider;
+        DROP INDEX IF EXISTS idx_models_role_enabled;
+        ALTER TABLE models DROP COLUMN role;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'models'
+          AND column_name = 'capabilities'
+          AND is_nullable = 'YES'
+    ) THEN
+        ALTER TABLE models ALTER COLUMN capabilities SET NOT NULL;
+    END IF;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE models ADD CONSTRAINT models_capabilities_check
+        CHECK (
+            cardinality(capabilities) >= 1
+            AND capabilities <@ ARRAY['chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts']::TEXT[]
+        );
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE models ADD CONSTRAINT uq_model_provider_v2
+        UNIQUE (provider_kind, provider_ref, model_id);
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_models_capabilities_enabled
+    ON models USING GIN (capabilities) WHERE enabled = TRUE;
 CREATE INDEX IF NOT EXISTS idx_models_provider
     ON models(provider_kind, provider_ref);
-
--- Migration: widen models.role CHECK to include whisper/tts (catalog v1.1).
--- Drops the implicit constraint name Postgres assigns to the inline CHECK and
--- re-creates it with the wider set. Idempotent on fresh installs (no-op when
--- the new constraint is already in place).
-DO $$ BEGIN
-    ALTER TABLE models DROP CONSTRAINT IF EXISTS models_role_check;
-    ALTER TABLE models ADD CONSTRAINT models_role_check
-        CHECK (role IN ('chat', 'auxiliary', 'embedding', 'vision', 'whisper', 'tts'));
-END $$;
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE
@@ -465,12 +541,36 @@ CREATE TABLE IF NOT EXISTS project_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_project_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_api_keys_provider ON project_api_keys(project_id, provider);
 CREATE INDEX IF NOT EXISTS idx_project_api_keys_project ON project_api_keys(project_id);
+
+-- Migration: drop 'tavily' from api_key provider CHECK constraints.
+-- Tavily is a search engine, not an LLM, so its key is now managed
+-- exclusively as a TAVILY_API_KEY env var (Vault → secret → agent pod
+-- env), not as a row in any of the *_api_keys tables. Cleans up rows
+-- seeded under the old shape on prior installs. Idempotent on fresh
+-- installs (DELETE matches nothing; ALTER re-adds the same constraint).
+DO $$ BEGIN
+    DELETE FROM user_api_keys    WHERE provider = 'tavily';
+    DELETE FROM system_api_keys  WHERE provider = 'tavily';
+    DELETE FROM project_api_keys WHERE provider = 'tavily';
+
+    ALTER TABLE user_api_keys    DROP CONSTRAINT IF EXISTS valid_user_api_key_provider;
+    ALTER TABLE user_api_keys    ADD CONSTRAINT valid_user_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+
+    ALTER TABLE system_api_keys  DROP CONSTRAINT IF EXISTS valid_system_api_key_provider;
+    ALTER TABLE system_api_keys  ADD CONSTRAINT valid_system_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+
+    ALTER TABLE project_api_keys DROP CONSTRAINT IF EXISTS valid_project_api_key_provider;
+    ALTER TABLE project_api_keys ADD CONSTRAINT valid_project_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+END $$;
 
 -- ============================================================================
 -- 1. JOBS TABLE

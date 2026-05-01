@@ -1,0 +1,148 @@
+"""Readiness gate for the LLM stack.
+
+Today an admin can configure a provider key, skip Admin → Models entirely,
+create a session, and hit a 503/401 on first turn because no chat-capability
+catalog row exists. This module computes the readiness signal that:
+
+- Powers the cockpit's three-step onboarding checklist (provider →
+  models → defaults pinned).
+- Gates ``POST /api/jobs`` and ``POST /api/persistent/threads`` with a
+  503 when one of the three required capabilities is missing.
+
+Required capabilities: ``chat``, ``embedding``, ``auxiliary``. Optional:
+``vision`` (falls back to chat when ``llm.fallback_optional_capabilities_to_chat``
+is true), ``whisper``, ``tts`` (audio features disable when missing).
+
+Auxiliary is required (not optional + chat-fallback) because the
+auxiliary LLM runs the memory observer and knowledge curator on a
+separate task budget; defaulting it to chat means every observer pass
+competes with the live agent for chat-model tokens, defeats per-capability
+rate-limiting, and tends to surface as "the agent feels slower" without
+an obvious cause.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+# Capabilities that *must* be ready before the cockpit releases. Aligns
+# with docs/features/models_yaml_removal.md §"Role-completeness gate".
+REQUIRED_CAPABILITIES = ("chat", "embedding", "auxiliary")
+
+# Optional capabilities — surfaced in the readiness payload so the cockpit
+# can show "vision is missing → falls back to chat" hints, but they don't
+# block the gate.
+OPTIONAL_CAPABILITIES = ("vision", "whisper", "tts")
+
+# When ``llm.fallback_optional_capabilities_to_chat`` is true (the default),
+# missing ``vision`` resolves to the configured chat model and audio
+# features simply disable; when false, the optional capabilities also
+# gate the cockpit (operators who want strict capability separation).
+DEFAULT_FALLBACK_OPTIONAL_TO_CHAT = True
+
+
+async def compute_readiness(db: Any) -> dict[str, Any]:
+    """Build the readiness payload consumed by the cockpit + dispatcher.
+
+    Returns:
+        ``{ready, missing_providers, missing_capabilities, missing_defaults,
+        optional_capability_fallbacks}``.
+
+        - ``ready`` is False iff any required capability is missing
+          rows or a default pin.
+        - ``missing_providers`` is non-empty only when *no* provider is
+          configured at all (the existing onboarding gate's signal).
+        - ``optional_capability_fallbacks`` carries the per-capability
+          fallback target so the cockpit can render the right hint.
+    """
+    api_keys = await db.list_system_api_keys()
+    endpoints = await db.list_system_llm_endpoints()
+    has_any_provider = bool(api_keys) or bool(endpoints)
+
+    counts = await db.count_enabled_models_by_capability()
+    pinned_caps = set(await db.list_default_pin_capabilities())
+
+    missing_capabilities = [
+        cap for cap in REQUIRED_CAPABILITIES if counts.get(cap, 0) <= 0
+    ]
+    # A default pin is required only when at least one row exists for the
+    # capability; pinning into a thin air doesn't help anyone.
+    missing_defaults = [
+        cap
+        for cap in REQUIRED_CAPABILITIES
+        if counts.get(cap, 0) > 0 and cap not in pinned_caps
+    ]
+
+    fallback_to_chat = await _fallback_optional_capabilities_to_chat(db)
+    optional_fallbacks: dict[str, str | None] = {}
+    for cap in OPTIONAL_CAPABILITIES:
+        if counts.get(cap, 0) > 0:
+            optional_fallbacks[cap] = None  # natively available
+        elif cap == "vision" and fallback_to_chat:
+            optional_fallbacks[cap] = "use_chat"
+        else:
+            optional_fallbacks[cap] = None  # disabled (no fallback)
+
+    missing_providers: list[str] = [] if has_any_provider else ["any"]
+
+    ready = has_any_provider and not missing_capabilities and not missing_defaults
+
+    return {
+        "ready": ready,
+        "missing_providers": missing_providers,
+        "missing_capabilities": missing_capabilities,
+        "missing_defaults": missing_defaults,
+        "optional_capability_fallbacks": optional_fallbacks,
+    }
+
+
+async def _fallback_optional_capabilities_to_chat(db: Any) -> bool:
+    """Read the ``llm.fallback_optional_capabilities_to_chat`` system flag.
+
+    Default ``True`` (pragmatic — operators who want strict separation
+    flip the flag).
+    """
+    row = await db.get_system_setting("llm.fallback_optional_capabilities_to_chat")
+    if row is None:
+        return DEFAULT_FALLBACK_OPTIONAL_TO_CHAT
+    value = row.get("value")
+    if isinstance(value, dict):
+        return bool(value.get("enabled", DEFAULT_FALLBACK_OPTIONAL_TO_CHAT))
+    if isinstance(value, bool):
+        return value
+    return DEFAULT_FALLBACK_OPTIONAL_TO_CHAT
+
+
+def gate_error_detail(readiness: dict[str, Any]) -> dict[str, Any]:
+    """Shape the 503 error body for ``POST /api/jobs`` / ``POST /api/persistent/threads``.
+
+    Carries the same ``missing_*`` fields the cockpit reads from
+    ``/api/system/readiness`` so the UI can deep-link to the right admin
+    page from either source.
+    """
+    return {
+        "error": "system_not_ready",
+        "missing_providers": readiness.get("missing_providers", []),
+        "missing_capabilities": readiness.get("missing_capabilities", []),
+        "missing_defaults": readiness.get("missing_defaults", []),
+        "message": _build_message(readiness),
+    }
+
+
+def _build_message(readiness: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if readiness.get("missing_providers"):
+        parts.append("Configure at least one provider key or endpoint")
+    if readiness.get("missing_capabilities"):
+        caps = ", ".join(readiness["missing_capabilities"])
+        parts.append(f"add a model row for: {caps}")
+    if readiness.get("missing_defaults"):
+        caps = ", ".join(readiness["missing_defaults"])
+        parts.append(f"pin a default model for: {caps}")
+    if not parts:
+        return "System ready."
+    return (
+        "System not ready — "
+        + "; ".join(parts)
+        + ". Visit Admin → Providers → Defaults to finish setup."
+    )

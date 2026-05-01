@@ -73,7 +73,7 @@ async def test_promotes_chat_row_to_catalog_and_drops_table():
     kwargs = db.create_model.await_args.kwargs
     assert kwargs["provider_kind"] == "endpoint"
     assert kwargs["provider_ref"] == str(_row()["endpoint_id"])
-    assert kwargs["role"] == "chat"
+    assert kwargs["capability"] == "chat"
     assert kwargs["family"] == "gemma"
     assert kwargs["seeded_from"] == "migration:user_llm_endpoint_models"
     assert kwargs["on_conflict_do_nothing"] is True
@@ -84,7 +84,7 @@ async def test_promotes_chat_row_to_catalog_and_drops_table():
 
 
 @pytest.mark.asyncio
-async def test_promotes_each_catalog_role():
+async def test_promotes_each_catalog_capability():
     rows = [
         _row(model_id="aux-1", capability="auxiliary"),
         _row(model_id="emb-1", capability="embedding"),
@@ -95,14 +95,16 @@ async def test_promotes_each_catalog_role():
     db = _make_db(exists=True, rows=rows)
     await init_mod._migrate_endpoint_models_to_catalog(db)
 
-    roles_seen = {call.kwargs["role"] for call in db.create_model.await_args_list}
-    assert roles_seen == {"auxiliary", "embedding", "vision", "whisper", "tts"}
+    capabilities_seen = {
+        call.kwargs["capability"] for call in db.create_model.await_args_list
+    }
+    assert capabilities_seen == {"auxiliary", "embedding", "vision", "whisper", "tts"}
 
 
 @pytest.mark.asyncio
 async def test_skips_unknown_capability_rows():
-    """Rows whose capability isn't a recognized catalog role are dropped with
-    the legacy table rather than promoted."""
+    """Rows whose capability isn't a recognized catalog enum value are dropped
+    with the legacy table rather than promoted."""
     rows = [
         _row(model_id="ok-chat", capability="chat"),
         _row(model_id="skip-banana", capability="banana"),

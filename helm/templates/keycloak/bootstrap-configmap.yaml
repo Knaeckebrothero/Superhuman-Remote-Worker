@@ -1,0 +1,195 @@
+{{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.bootstrap.enabled }}
+# Bootstrap script for the Keycloak pre-install/pre-upgrade Job.
+#
+# Mounted into the Job at /scripts/bootstrap.sh. Uses kcadm.sh shipped with
+# the Keycloak image — no extra image build. Idempotent: get-or-create for
+# realm + each client; fields we own get re-applied on every run, so future
+# chart upgrades that add fields propagate automatically.
+#
+# WARNING: chart-managed clients should NOT be hand-edited in the Keycloak
+# UI — those edits will be clobbered on the next `helm upgrade`. Add new
+# redirect URIs / scopes via chart values instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.keycloakBootstrapName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloak-bootstrap") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  bootstrap.sh: |
+    #!/usr/bin/env bash
+    # Resolves the SRW Keycloak clients (and optionally the realm) on an
+    # external Keycloak. Inputs come from env vars set by the Job spec.
+    set -euo pipefail
+
+    : "${KC_SERVER:?missing KC_SERVER}"
+    : "${KC_ADMIN_USER:?missing KC_ADMIN_USER}"
+    : "${KC_ADMIN_PASSWORD:?missing KC_ADMIN_PASSWORD}"
+    : "${TARGET_REALM:?missing TARGET_REALM}"
+    : "${COCKPIT_CLIENT_ID:?missing COCKPIT_CLIENT_ID}"
+    : "${COCKPIT_HOST:?missing COCKPIT_HOST}"
+    : "${MCP_CLIENT_ID:?missing MCP_CLIENT_ID}"
+    : "${MCP_HOST:?missing MCP_HOST}"
+    : "${MCP_OIDC_CLIENT_SECRET:?missing MCP_OIDC_CLIENT_SECRET (must be in main chart secret)}"
+    CREATE_REALM="${CREATE_REALM:-false}"
+
+    KCADM=/opt/keycloak/bin/kcadm.sh
+
+    echo "[bootstrap] kcadm login → $KC_SERVER (master realm)"
+    "$KCADM" config credentials \
+      --server "$KC_SERVER" \
+      --realm master \
+      --user "$KC_ADMIN_USER" \
+      --password "$KC_ADMIN_PASSWORD" >/dev/null
+
+    # ------------------------------------------------------------------
+    # Realm: get-or-create
+    # ------------------------------------------------------------------
+    if "$KCADM" get "realms/$TARGET_REALM" --fields realm >/dev/null 2>&1; then
+      echo "[bootstrap] realm '$TARGET_REALM' already exists"
+    elif [ "$CREATE_REALM" = "true" ]; then
+      echo "[bootstrap] creating realm '$TARGET_REALM'"
+      "$KCADM" create realms -s "realm=$TARGET_REALM" -s enabled=true \
+        -s "displayName=Superhuman Remote Worker"
+    else
+      echo "[bootstrap] ERROR: realm '$TARGET_REALM' does not exist and createRealm=false" >&2
+      exit 1
+    fi
+
+    # ------------------------------------------------------------------
+    # Client: get-or-create. Returns the client UUID (internal id).
+    # Args: <clientId> <payload-file>
+    # ------------------------------------------------------------------
+    upsert_client() {
+      local cid="$1" payload="$2" uuid
+      uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
+        --fields id --format csv --noquotes 2>/dev/null \
+        | tail -n +2 | head -n1 | tr -d '\r\n' || true)
+      if [ -n "$uuid" ]; then
+        echo "[bootstrap]   updating $cid (id=$uuid)"
+        "$KCADM" update "clients/$uuid" -r "$TARGET_REALM" -f "$payload"
+      else
+        echo "[bootstrap]   creating $cid"
+        "$KCADM" create clients -r "$TARGET_REALM" -f "$payload"
+        uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
+          --fields id --format csv --noquotes 2>/dev/null \
+          | tail -n +2 | head -n1 | tr -d '\r\n')
+      fi
+      echo "$uuid"
+    }
+
+    # ------------------------------------------------------------------
+    # srw-cockpit (public SPA, PKCE S256)
+    # ------------------------------------------------------------------
+    echo "[bootstrap] === $COCKPIT_CLIENT_ID (public SPA on https://$COCKPIT_HOST) ==="
+    cat >/tmp/cockpit.json <<JSON
+    {
+      "clientId": "$COCKPIT_CLIENT_ID",
+      "name": "SRW Cockpit ($COCKPIT_HOST)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "rootUrl": "https://$COCKPIT_HOST",
+      "baseUrl": "https://$COCKPIT_HOST",
+      "redirectUris": ["https://$COCKPIT_HOST/*"],
+      "webOrigins": ["https://$COCKPIT_HOST"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://$COCKPIT_HOST/*"
+      }
+    }
+    JSON
+    upsert_client "$COCKPIT_CLIENT_ID" /tmp/cockpit.json >/dev/null
+
+    # ------------------------------------------------------------------
+    # srw-mcp (confidential, secret supplied from chart Secret)
+    # ------------------------------------------------------------------
+    echo "[bootstrap] === $MCP_CLIENT_ID (confidential on https://$MCP_HOST) ==="
+    cat >/tmp/mcp.json <<JSON
+    {
+      "clientId": "$MCP_CLIENT_ID",
+      "name": "SRW MCP Server ($MCP_HOST)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "$MCP_OIDC_CLIENT_SECRET",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": true,
+      "rootUrl": "https://$MCP_HOST",
+      "baseUrl": "https://$MCP_HOST",
+      "redirectUris": ["https://$MCP_HOST/*"],
+      "webOrigins": ["https://$MCP_HOST"],
+      "attributes": {
+        "post.logout.redirect.uris": "https://$MCP_HOST/*"
+      }
+    }
+    JSON
+    MCP_UUID=$(upsert_client "$MCP_CLIENT_ID" /tmp/mcp.json)
+
+    # kcadm's `update` ignores the `secret` field — set it explicitly so a
+    # rotated MCP_OIDC_CLIENT_SECRET in Vault is honoured on the next upgrade.
+    if [ -n "$MCP_UUID" ]; then
+      echo "[bootstrap]   syncing MCP client secret"
+      "$KCADM" update "clients/$MCP_UUID" -r "$TARGET_REALM" \
+        -s "secret=$MCP_OIDC_CLIENT_SECRET" >/dev/null
+    fi
+
+    # ------------------------------------------------------------------
+    # Cloud service-account user (opt-in via serviceAccounts.cloud.enabled).
+    # CLOUD_SERVICE_USER from the main Secret wins over the chart-values
+    # fallback so a value already provisioned in Vault stays authoritative.
+    # ------------------------------------------------------------------
+    if [ "${BOOTSTRAP_CLOUD_ENABLED:-false}" = "true" ]; then
+      CLOUD_USER="${CLOUD_SERVICE_USER:-${BOOTSTRAP_CLOUD_USERNAME:-}}"
+      if [ -z "$CLOUD_USER" ]; then
+        echo "[bootstrap] ERROR: cloud service account requested but no username — set CLOUD_SERVICE_USER in the chart Secret or bootstrap.serviceAccounts.cloud.username in values" >&2
+        exit 1
+      fi
+      if [ -z "${CLOUD_SERVICE_PASSWORD:-}" ]; then
+        echo "[bootstrap] ERROR: cloud service account requested but CLOUD_SERVICE_PASSWORD missing from chart Secret" >&2
+        exit 1
+      fi
+      echo "[bootstrap] === cloud service account: $CLOUD_USER (realm $TARGET_REALM) ==="
+      USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
+        --fields id --format csv --noquotes 2>/dev/null \
+        | tail -n +2 | head -n1 | tr -d '\r\n' || true)
+      if [ -n "$USER_ID" ]; then
+        echo "[bootstrap]   updating user (id=$USER_ID)"
+        "$KCADM" update "users/$USER_ID" -r "$TARGET_REALM" \
+          -s "enabled=true" \
+          ${BOOTSTRAP_CLOUD_EMAIL:+-s "email=$BOOTSTRAP_CLOUD_EMAIL" -s "emailVerified=true"} \
+          ${BOOTSTRAP_CLOUD_FIRST_NAME:+-s "firstName=$BOOTSTRAP_CLOUD_FIRST_NAME"} \
+          ${BOOTSTRAP_CLOUD_LAST_NAME:+-s "lastName=$BOOTSTRAP_CLOUD_LAST_NAME"} >/dev/null
+      else
+        echo "[bootstrap]   creating user"
+        "$KCADM" create users -r "$TARGET_REALM" \
+          -s "username=$CLOUD_USER" \
+          -s "enabled=true" \
+          ${BOOTSTRAP_CLOUD_EMAIL:+-s "email=$BOOTSTRAP_CLOUD_EMAIL" -s "emailVerified=true"} \
+          ${BOOTSTRAP_CLOUD_FIRST_NAME:+-s "firstName=$BOOTSTRAP_CLOUD_FIRST_NAME"} \
+          ${BOOTSTRAP_CLOUD_LAST_NAME:+-s "lastName=$BOOTSTRAP_CLOUD_LAST_NAME"} >/dev/null
+        USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
+          --fields id --format csv --noquotes 2>/dev/null \
+          | tail -n +2 | head -n1 | tr -d '\r\n')
+      fi
+      # Force-set the password each run — handles rotation in Vault. The
+      # `--temporary=false` flag is critical: without it Keycloak forces the
+      # user to change the password on next login, breaking the agent.
+      echo "[bootstrap]   syncing password (rotation-safe)"
+      "$KCADM" set-password -r "$TARGET_REALM" --userid "$USER_ID" \
+        --new-password "$CLOUD_SERVICE_PASSWORD" --temporary=false
+    fi
+
+    echo "[bootstrap] done"
+{{- end }}

@@ -47,38 +47,25 @@ data:
   COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}
 
   # LLM routing
-  # LLM_BASE_URL / BROWSER_LLM_* / BUILDER_MODEL moved to the DB-backed
-  # config (system_api_keys + llm_endpoints). See docs/features/
-  # db_backed_llm_config.md for the migration rationale.
+  # All routing (base URLs, vision/embedding/codex/builder model IDs and
+  # providers) moved to admin-curated catalog rows + default-model pins:
+  #   - system_api_keys + llm_endpoints → transports (helm-seeded)
+  #   - models table → catalog rows (provider_kind + provider_ref + capability)
+  #   - default_llm_models → admin-pinned per-capability defaults
+  # Removed in chunk 7 of models_yaml_removal: VISION_MODEL, EMBEDDING_MODEL,
+  # EMBEDDING_BASE_URL, CODEX_BASE_URL, BUILDER_LLM_PROVIDER. See
+  # docs/features/models_yaml_removal.md.
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
-  # Vision model
-  VISION_MODEL: {{ .Values.llm.visionModel | quote }}
-
-  # Citation Engine
+  # Citation Engine — embedding lives outside the catalog table for now
+  # (separate code path; not gated by readiness). Stays env-driven.
   # CITATION_DB_URL (with credentials) is in the Secret.
-  # CITATION_LLM_* values moved to the DB-backed config — the orchestrator
-  # injects them via job config_override at dispatch. Embedding model/URL
-  # stay as env-driven for now (not part of the LLM config feature).
   CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
   CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
-
-  # Embedding model (memories + knowledge index)
-  EMBEDDING_MODEL: {{ .Values.llm.embeddingModel | quote }}
-  EMBEDDING_BASE_URL: {{ .Values.llm.embeddingBaseUrl | quote }}
-
-  # Codex proxy (CLIProxyAPI)
-  CODEX_BASE_URL: {{ .Values.llm.codexBaseUrl | quote }}
 
   # Codex raw-response diagnostic capture
   DEBUG_CODEX_RAW_RESPONSE: {{ "0" | quote }}
   CODEX_RAW_DUMP_DIR: {{ "/app/logs/codex-raw" | quote }}
-
-  # Instruction Builder (Cockpit AI Chat)
-  # BUILDER_MODEL moved to system_settings['llm.default_builder_model']
-  # (set via Admin → Providers or the llm.seed.defaultBuilderModel path).
-  # BUILDER_LLM_PROVIDER stays as a hint for provider dispatch logic.
-  BUILDER_LLM_PROVIDER: {{ .Values.llm.builderProvider | quote }}
 
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}

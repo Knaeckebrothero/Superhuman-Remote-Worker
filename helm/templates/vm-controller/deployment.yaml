@@ -49,7 +49,7 @@ spec:
             - name: VM_NAMESPACE
               value: {{ include "srw.vmControllerNamespace" . | quote }}
             - name: DEFAULT_VM_IMAGE
-              value: {{ .Values.vmController.defaultVmImage | quote }}
+              value: {{ .Values.vmController.defaultVmImage | default (printf "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v%s" .Chart.AppVersion) | quote }}
             - name: DEFAULT_CPU
               value: {{ .Values.vmController.defaultCpu | quote }}
             - name: DEFAULT_MEMORY

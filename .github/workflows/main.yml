@@ -637,7 +637,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-chart:
     name: Package and publish Helm chart
-    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller]
+    needs: [resolve-version, build-agent, build-orchestrator, build-cockpit, build-mcp, build-workspace, build-vm-controller, build-agent-vm-base]
     if: >-
       always() && !cancelled() &&
       github.event_name == 'push' &&
@@ -646,6 +646,7 @@ jobs:
       needs.build-orchestrator.result == 'success' &&
       needs.build-cockpit.result == 'success' &&
       needs.build-mcp.result == 'success' &&
+      needs.build-agent-vm-base.result == 'success' &&
       !contains(needs.build-workspace.result, 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 10

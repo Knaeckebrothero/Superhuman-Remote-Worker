@@ -89,31 +89,40 @@ class TestMatrixResolver:
     """Tests for the MatrixResolver base class mechanics."""
 
     def test_subclass_constants(self):
-        """PromptMatrixResolver and InstructionMatrixResolver have correct constants."""
-        assert PromptMatrixResolver.MATRIX_FILENAME == "prompt_matrix.yaml"
+        """PromptMatrixResolver and InstructionMatrixResolver share the unified
+        matrix file but read different subsections."""
+        assert PromptMatrixResolver.MATRIX_FILENAME == "model_config_matrix.yaml"
+        assert PromptMatrixResolver.MATRIX_SUBSECTION == "prompts"
         assert PromptMatrixResolver.FRAMEWORK_DIR == "config/prompts"
         assert "systemprompt" in PromptMatrixResolver.HARDCODED_DEFAULTS
         assert "instructions" not in PromptMatrixResolver.HARDCODED_DEFAULTS
 
-        assert InstructionMatrixResolver.MATRIX_FILENAME == "instruction_matrix.yaml"
+        assert InstructionMatrixResolver.MATRIX_FILENAME == "model_config_matrix.yaml"
+        assert InstructionMatrixResolver.MATRIX_SUBSECTION == "instructions"
         assert InstructionMatrixResolver.FRAMEWORK_DIR == "config/templates"
         assert "instructions" in InstructionMatrixResolver.HARDCODED_DEFAULTS
         assert "workspace_template" in InstructionMatrixResolver.HARDCODED_DEFAULTS
 
     def test_shared_load_matrix_from_path(self, tmp_path):
-        """_load_matrix_from_path is inherited and works for both subclasses."""
+        """_load_matrix_from_path projects to each subclass's subsection."""
         matrix_path = tmp_path / "test_matrix.yaml"
         matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              foo: bar.txt
+              prompts:
+                systemprompt: prompt.txt
+              instructions:
+                instructions: instr.md
         """)
         )
 
-        # Both subclasses can use the static method
+        from src.core import loader as _loader
+
+        _loader._model_config_matrix_cache.pop(matrix_path, None)
         result_prompt = PromptMatrixResolver._load_matrix_from_path(matrix_path)
         result_instr = InstructionMatrixResolver._load_matrix_from_path(matrix_path)
-        assert result_prompt == result_instr == {"default": {"foo": "bar.txt"}}
+        assert result_prompt == {"default": {"systemprompt": "prompt.txt"}}
+        assert result_instr == {"default": {"instructions": "instr.md"}}
 
 
 # =============================================================================
@@ -142,13 +151,14 @@ class TestInstructionMatrixResolver:
 
     def test_base_matrix_default_resolution(self, tmp_path):
         """Base instruction matrix default entries are used."""
-        base_matrix = tmp_path / "config" / "instruction_matrix.yaml"
+        base_matrix = tmp_path / "config" / "model_config_matrix.yaml"
         base_matrix.parent.mkdir(parents=True)
         base_matrix.write_text(
             textwrap.dedent("""\
             default:
-              instructions: custom_instructions.md
-              workspace_template: custom_workspace.md
+              instructions:
+                instructions: custom_instructions.md
+                workspace_template: custom_workspace.md
         """)
         )
 
@@ -173,8 +183,9 @@ class TestInstructionMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              instructions: base_instructions.md
-              workspace_template: base_workspace.md
+              instructions:
+                instructions: base_instructions.md
+                workspace_template: base_workspace.md
         """)
         )
 
@@ -182,7 +193,8 @@ class TestInstructionMatrixResolver:
         expert_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              instructions: expert_instructions.md
+              instructions:
+                instructions: expert_instructions.md
         """)
         )
 
@@ -212,9 +224,11 @@ class TestInstructionMatrixResolver:
         base_matrix_path.write_text(
             textwrap.dedent("""\
             default:
-              instructions: default_instructions.md
+              instructions:
+                instructions: default_instructions.md
             claude-opus:
-              instructions: claude_instructions.md
+              instructions:
+                instructions: claude_instructions.md
         """)
         )
 
@@ -235,10 +249,11 @@ class TestInstructionMatrixResolver:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
         (expert_dir / "instructions.md").write_text("expert instructions content")
-        (expert_dir / "instruction_matrix.yaml").write_text(
+        (expert_dir / "model_config_matrix.yaml").write_text(
             textwrap.dedent("""\
             default:
-              instructions: instructions.md
+              instructions:
+                instructions: instructions.md
         """)
         )
 
