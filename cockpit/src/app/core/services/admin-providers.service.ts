@@ -4,6 +4,7 @@ import {catchError, Observable, of, tap} from 'rxjs';
 import {
   ApiKeyProvider,
   ApiKeySetRequest,
+  DiscoveryResponse,
   LlmEndpoint,
   LlmEndpointCreateRequest,
   LlmEndpointDiscoveryResult,
@@ -30,9 +31,12 @@ export interface SystemApiKeyEntry {
  * Admins can pin cluster-wide defaults for each of these slots via the
  * Admin → Providers → Defaults section. Keep this in sync with the
  * orchestrator's `VALID_DEFAULT_MODEL_KINDS` — unknown kinds are rejected
- * server-side.
+ * server-side. The `chat` slot is the cluster-wide chat default used by
+ * the dispatcher when a job/session has no override; surfacing it here
+ * fulfills the readiness gate's `Pin a default for: chat` requirement.
  */
 export type DefaultModelKind =
+  | 'chat'
   | 'builder'
   | 'browser'
   | 'citation'
@@ -43,6 +47,7 @@ export type DefaultModelKind =
   | 'tts';
 
 export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
+  'chat',
   'builder',
   'browser',
   'citation',
@@ -54,6 +59,7 @@ export const DEFAULT_MODEL_KINDS: DefaultModelKind[] = [
 ];
 
 const EMPTY_DEFAULTS: Record<DefaultModelKind, string | null> = {
+  chat: null,
   builder: null,
   browser: null,
   citation: null,
@@ -118,6 +124,38 @@ export class AdminProvidersService {
     return this.http
       .delete<{status: string}>(`${this.baseUrl}/admin/providers/keys/${provider}`)
       .pipe(tap(() => this.loadSystemApiKeys()));
+  }
+
+  /**
+   * Read the staged discovery payload for a provider key. Returns
+   * ``ready=false`` while the orchestrator's async probe is still
+   * in-flight (post-save) — the cockpit polls this until the dialog can
+   * render. The route never throws; transient backend failures resolve
+   * to ``ready=false`` so the UI degrades gracefully.
+   */
+  getDiscoveryPayload(provider: string): Observable<DiscoveryResponse> {
+    return this.http
+      .get<DiscoveryResponse>(
+        `${this.baseUrl}/admin/providers/keys/${provider}/discovery`,
+      )
+      .pipe(
+        catchError(() =>
+          of<DiscoveryResponse>({ready: false, fresh: false, payload: null, cached_at: null}),
+        ),
+      );
+  }
+
+  /**
+   * Force-refresh the discovery cache for a provider key (synchronous —
+   * the route blocks until the probe returns). Used by the explicit
+   * "Rediscover" button; the response carries the freshly-cached payload
+   * so the dialog can re-render without an extra GET.
+   */
+  rediscoverProvider(provider: string): Observable<DiscoveryResponse> {
+    return this.http.post<DiscoveryResponse>(
+      `${this.baseUrl}/admin/providers/keys/${provider}/rediscover`,
+      {},
+    );
   }
 
   // ── System Endpoints ──────────────────────────────────────────────

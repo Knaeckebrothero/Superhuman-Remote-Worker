@@ -12,20 +12,15 @@ import {SettingsService} from '../../core/services/settings.service';
  */
 function createComponent(overrides?: {
   models?: { group: string; provider: string; configured: boolean; models: string[] }[];
-  presets?: { label: string; strategic: string; tactical: string; configured: boolean }[];
 }) {
   const mockModels = signal(overrides?.models ?? [
     {group: 'Local', provider: 'local', configured: true, models: ['openai/gpt-oss-120b']},
     {group: 'OpenAI', provider: 'openai', configured: true, models: ['gpt-5.4', 'gpt-4o']},
     {group: 'Anthropic', provider: 'anthropic', configured: false, models: ['claude-opus-4-6', 'claude-sonnet-4-5-20250929']},
   ]);
-  const mockPresets = signal(overrides?.presets ?? [
-    {label: 'Opus + Sonnet', strategic: 'claude-opus-4-6', tactical: 'claude-sonnet-4-5-20250929', configured: false},
-  ]);
 
   const mockModelService = {
     models: mockModels,
-    presets: mockPresets,
     builderModels: signal([]),
     auxiliaryModels: signal([]),
     visionModels: signal([]),
@@ -61,7 +56,7 @@ function createComponent(overrides?: {
   });
 
   const component = runInInjectionContext(injector, () => new ModelGroupComponent());
-  return {component, mockModelService, mockModels, mockPresets};
+  return {component, mockModelService, mockModels};
 }
 
 
@@ -73,12 +68,6 @@ describe('ModelGroupComponent', () => {
       const {component} = createComponent();
       expect(component.availableModels()).toHaveLength(3);
       expect(component.availableModels()[0].group).toBe('Local');
-    });
-
-    it('should read presets from ModelService', () => {
-      const {component} = createComponent();
-      expect(component.availablePresets()).toHaveLength(1);
-      expect(component.availablePresets()[0].label).toBe('Opus + Sonnet');
     });
 
     it('should react to model service updates', () => {
@@ -118,16 +107,6 @@ describe('ModelGroupComponent', () => {
       // In session mode this would be 1, but since mode() defaults to 'job',
       // the computed only counts strategic/tactical
       expect(component.strategicModel()).toBeNull();
-    });
-  });
-
-  describe('applyPreset', () => {
-    it('should set both strategic and tactical models', () => {
-      const {component} = createComponent();
-      component.applyPreset({label: 'Test', strategic: 'model-a', tactical: 'model-b'});
-
-      expect(component.strategicModel()).toBe('model-a');
-      expect(component.tacticalModel()).toBe('model-b');
     });
   });
 

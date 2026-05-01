@@ -35,8 +35,8 @@ def clear_settings_matrix_cache():
 
 class TestFamilyOfMinimax:
     def test_openrouter_minimax_is_registered(self):
-        # MiniMax is a built-in entry under openrouter/. The registry
-        # reads the `family: minimax` field from models.yaml.
+        # `family_of` recognises the openrouter/.../minimax pattern via
+        # its sync prefix heuristic — no DB round-trip required.
         assert family_of("openrouter/minimax/minimax-m2.7") == "minimax"
 
     def test_bare_minimax_via_heuristic(self):

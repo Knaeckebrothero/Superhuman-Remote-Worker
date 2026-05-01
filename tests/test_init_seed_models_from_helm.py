@@ -1,21 +1,101 @@
 """Tests for ``orchestrator.init._seed_models_from_helm``.
 
 The seed step reads ``helm/values.yaml``'s ``llm.seed.systemModels[]`` block
-(plus a legacy ``config/models.yaml`` bridge that drops out in chunk 7) and
-delegates to :func:`orchestrator.seed.llm_config.seed`. These tests pin:
-provider-gating (skip rows for unseeded providers), the ``local`` provider
-is excluded from the legacy bridge, the auxiliary / vision / embedding helper
-lists map to non-chat capabilities, and re-runs are no-ops thanks to
+and delegates to :func:`orchestrator.seed.llm_config.seed`. These tests pin:
+provider-gating (skip rows for unseeded providers), the auxiliary / vision /
+embedding helper lists map to non-chat capabilities, the ``helm:llm.seed``
+breadcrumb travels with every insert, and re-runs are no-ops thanks to
 ``ON CONFLICT DO NOTHING``.
+
+Post chunk 7 (models_yaml_removal), the legacy ``config/models.yaml`` bridge
+is gone — these tests inject the systemModels payload via a temporary
+``helm/values.yaml`` so they don't depend on the real chart values shipping
+test fixtures.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+from textwrap import dedent
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator import init as init_mod
+
+
+_TEST_HELM_VALUES = dedent(
+    """
+    llm:
+      seed:
+        enabled: true
+        systemModels:
+          - provider: openai
+            id: gpt-4o
+            displayName: GPT-4o
+            capability: chat
+            family: default
+          - provider: openai
+            id: gpt-4o-mini
+            displayName: GPT-4o Mini
+            capability: chat
+            family: default
+          - provider: openai
+            id: gpt-4o-mini
+            displayName: GPT-4o Mini (Aux)
+            capability: auxiliary
+            family: default
+          - provider: openai
+            id: gpt-4o
+            displayName: GPT-4o (Vision)
+            capability: vision
+            family: default
+          - provider: openai
+            id: text-embedding-3-large
+            displayName: OpenAI Embedding
+            capability: embedding
+            family: openai-embedding
+          - provider: anthropic
+            id: claude-opus-4-7
+            displayName: Claude Opus 4.7
+            capability: chat
+            family: claude-opus
+          - provider: openrouter
+            id: openrouter/qwen/qwen3-embedding-8b
+            displayName: Qwen Embedding (OR)
+            capability: embedding
+            family: default
+    """
+)
+
+
+@pytest.fixture(autouse=True)
+def _patch_helm_values(monkeypatch, tmp_path):
+    """Redirect _seed_models_from_helm to a temp helm/values.yaml fixture.
+
+    The function builds the path from ``__file__``; we monkey-patch
+    ``Path`` resolution by replacing the project-relative file in a
+    temporary directory and pointing the resolver at it.
+    """
+    helm_dir = tmp_path / "helm"
+    helm_dir.mkdir()
+    helm_path = helm_dir / "values.yaml"
+    helm_path.write_text(_TEST_HELM_VALUES)
+
+    real_resolve = Path.resolve
+
+    def fake_resolve(self, *args, **kwargs):
+        # The function calls Path(__file__).resolve().parent.parent / "helm" / "values.yaml".
+        # Hijack any resolve() call on the init.py module file so the
+        # subsequent .parent.parent / "helm" / "values.yaml" lands at our
+        # temp tree.
+        out = real_resolve(self, *args, **kwargs)
+        if str(out).endswith("/orchestrator/init.py"):
+            return tmp_path / "orchestrator" / "init.py"
+        return out
+
+    monkeypatch.setattr(Path, "resolve", fake_resolve)
+    yield
 
 
 def _fake_db(*, seeded_providers: list[str] | None = None):
@@ -42,10 +122,9 @@ async def test_no_keys_seeded_inserts_nothing():
 async def test_only_openai_seeded_only_openai_rows_inserted():
     """One provider seeded → only that provider's catalog rows are inserted.
 
-    The legacy bridge consumes ``config/models.yaml`` which ships at least
-    two openai chat entries (gpt-4o, gpt-4o-mini) plus auxiliary/vision/
-    embedding entries. Anthropic / Google / Groq / OpenRouter rows must be
-    skipped.
+    The fixture ships openai chat (gpt-4o, gpt-4o-mini) + auxiliary +
+    vision + embedding entries plus anthropic and openrouter rows. Only
+    openai rows should land when only openai has a key seeded.
     """
     db = _fake_db(seeded_providers=["openai"])
     await init_mod._seed_models_from_helm(db)
@@ -60,34 +139,77 @@ async def test_only_openai_seeded_only_openai_rows_inserted():
 
 
 @pytest.mark.asyncio
-async def test_local_provider_never_seeded():
-    """The 'local' YAML provider routes through llm_endpoints, not
-    system_api_keys — it must never produce catalog rows even if 'local'
-    somehow ends up in the seeded provider set."""
-    db = _fake_db(seeded_providers=["local", "openai"])
-    await init_mod._seed_models_from_helm(db)
-
-    inserted_providers = {
-        call.kwargs["provider_ref"] for call in db.create_model.await_args_list
-    }
-    assert "local" not in inserted_providers
-
-
-@pytest.mark.asyncio
 async def test_helper_lists_map_to_non_chat_capabilities():
-    """auxiliary_models / vision_models / embedding_models YAML keys must
-    insert with the corresponding capability (not 'chat').
-
-    With openai seeded, the YAML contributes openai entries to all three
-    helper lists. We assert at least one of each non-chat capability appears.
-    """
+    """Capability values from systemModels[] entries reach the catalog as
+    arrays — auxiliary / vision / embedding singular entries land as
+    single-element arrays, NOT defaulted to chat. The chat singular form
+    is the only one that auto-expands (to ['chat','auxiliary'])."""
     db = _fake_db(seeded_providers=["openai"])
     await init_mod._seed_models_from_helm(db)
 
-    inserted_capabilities = {
-        call.kwargs["capability"] for call in db.create_model.await_args_list
-    }
-    assert {"chat", "auxiliary", "vision", "embedding"}.issubset(inserted_capabilities)
+    # Flatten every emitted capabilities[] across all inserts so we can
+    # ask 'did each role get represented at least once'.
+    seen_capabilities: set[str] = set()
+    for call in db.create_model.await_args_list:
+        for cap in call.kwargs["capabilities"]:
+            seen_capabilities.add(cap)
+    assert {"chat", "auxiliary", "vision", "embedding"}.issubset(seen_capabilities)
+
+
+@pytest.mark.asyncio
+async def test_chat_singular_auto_expands_to_chat_and_auxiliary():
+    """The fixture has gpt-4o-mini at ``capability: chat`` and a separate
+    entry at ``capability: auxiliary``. Both contribute to the same row
+    under aggregation; the chat-singular auto-expand to ['chat','auxiliary']
+    plus the explicit auxiliary dedupe should yield exactly ['chat','auxiliary']."""
+    db = _fake_db(seeded_providers=["openai"])
+    await init_mod._seed_models_from_helm(db)
+
+    rows = [
+        call
+        for call in db.create_model.await_args_list
+        if call.kwargs["model_id"] == "gpt-4o-mini"
+    ]
+    # Aggregation collapses the two helm entries into one INSERT.
+    assert len(rows) == 1
+    assert rows[0].kwargs["capabilities"] == ["chat", "auxiliary"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_helm_entries_aggregate_into_one_row():
+    """The fixture has two entries for gpt-4o (one chat, one vision). Under
+    the array-capability model these collapse into one INSERT whose
+    capabilities[] is the union: ['chat','auxiliary','vision']."""
+    db = _fake_db(seeded_providers=["openai"])
+    await init_mod._seed_models_from_helm(db)
+
+    gpt4o_rows = [
+        call
+        for call in db.create_model.await_args_list
+        if call.kwargs["model_id"] == "gpt-4o"
+    ]
+    assert len(gpt4o_rows) == 1
+    assert gpt4o_rows[0].kwargs["capabilities"] == [
+        "chat",
+        "auxiliary",
+        "vision",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_singular_non_chat_capability_stays_singleton():
+    """text-embedding-3-large is registered with `capability: embedding`.
+    The pipeline must NOT auto-expand non-chat singular values."""
+    db = _fake_db(seeded_providers=["openai"])
+    await init_mod._seed_models_from_helm(db)
+
+    embedding_rows = [
+        call
+        for call in db.create_model.await_args_list
+        if call.kwargs["model_id"] == "text-embedding-3-large"
+    ]
+    assert embedding_rows
+    assert embedding_rows[0].kwargs["capabilities"] == ["embedding"]
 
 
 @pytest.mark.asyncio
@@ -125,3 +247,16 @@ async def test_idempotent_when_create_model_returns_none():
     await init_mod._seed_models_from_helm(db)
     # Still attempted the inserts.
     assert db.create_model.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_anthropic_only_seeded_inserts_only_claude_rows():
+    """The Anthropic chat row in the fixture should land alone when only
+    the anthropic provider is seeded."""
+    db = _fake_db(seeded_providers=["anthropic"])
+    await init_mod._seed_models_from_helm(db)
+
+    inserted_providers = {
+        call.kwargs["provider_ref"] for call in db.create_model.await_args_list
+    }
+    assert inserted_providers == {"anthropic"}

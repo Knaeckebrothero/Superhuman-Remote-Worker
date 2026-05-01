@@ -327,6 +327,20 @@ keycloak:
   bridgeCert:
     enabled: false
     smtpHost: ""
+  # -- Realm session/token lifespans (seconds). Applied to both the realm-import
+  # JSON (fresh installs) and force-synced via kcadm in the postStart hook on
+  # every pod restart, so changes here propagate to existing deployments
+  # without a DB wipe. Defaults to 2h idle / 24h max with a 3-day "remember me"
+  # checkbox enabled — matches the homelab profile and avoids the 30-min
+  # re-login that Keycloak's built-in defaults impose.
+  session:
+    rememberMe: true
+    ssoSessionIdleTimeout: 7200              # 2 hours
+    ssoSessionMaxLifespan: 86400             # 24 hours
+    ssoSessionIdleTimeoutRememberMe: 259200  # 3 days
+    ssoSessionMaxLifespanRememberMe: 259200  # 3 days
+    accessTokenLifespan: 900                 # 15 minutes
+    offlineSessionIdleTimeout: 2592000       # 30 days
   resources:
     requests:
       memory: "512Mi"
@@ -525,17 +539,18 @@ reloader:
 # LLM Configuration (configmap values)
 # =============================================================================
 llm:
-  # NOTE: builder/browser/citation model IDs and base URLs moved to the
-  # `system_api_keys` + `llm_endpoints` tables via the seed block below.
-  # The orchestrator resolves them at runtime through the model registry;
-  # they are no longer read from env at startup. See
-  # docs/features/db_backed_llm_config.md for the migration rationale.
+  # NOTE: builder/browser/citation/vision/embedding model IDs and base URLs
+  # are admin-curated catalog rows now (system_api_keys + llm_endpoints
+  # tables, plus default-model pins via Admin → Providers → Defaults).
+  # The orchestrator resolves them at runtime through the model registry.
+  # See docs/features/db_backed_llm_config.md and
+  # docs/features/models_yaml_removal.md for the migration rationale.
+  #
+  # Removed in chunk 7 of models_yaml_removal:
+  #   visionModel, embeddingModel, embeddingBaseUrl, codexBaseUrl,
+  #   builderProvider
+  # Pin replacement defaults via Admin → Models → Defaults.
   keyCooldownSeconds: "3600"
-  visionModel: "gpt-4o-mini"
-  embeddingModel: "qwen3-embedding-8b"
-  embeddingBaseUrl: ""
-  codexBaseUrl: ""
-  builderProvider: "openai"
 
   # ---------------------------------------------------------------------------
   # One-shot seed for system-scoped provider keys and LLM endpoints. Applied
@@ -571,7 +586,8 @@ llm:
     # to the matching slot in Admin → Providers → Defaults. A single endpoint
     # can back multiple capabilities (e.g., Groq serving chat + whisper, or
     # OpenRouter serving chat + embedding) by listing the same `apiKeyRef`
-    # once and adding one model row per capability.
+    # once and adding one model row per physical model — a single row can
+    # claim multiple capabilities via `capabilities: [...]` (see below).
     #
     # systemEndpoints:
     #   - label: "Local Gemma"
@@ -585,10 +601,10 @@ llm:
     #         family: "gemma"
     #         contextWindow: 128000
     #         reasoningLevel: null
-    #         capability: chat           # default; explicit for clarity
+    #         capabilities: [chat, auxiliary]  # explicit array (preferred)
     #       - id: "qwen3-embedding-8b"
     #         displayName: "Qwen3 Embedding 8B"
-    #         capability: embedding
+    #         capability: embedding             # singular shorthand also accepted
     #       - id: "whisper-large-v3"
     #         displayName: "Whisper Large v3"
     #         capability: whisper
@@ -598,24 +614,43 @@ llm:
     systemEndpoints: []
 
     # -- Optional: provider-direct catalog rows (served by a system API key,
-    # not a custom endpoint). Mirrors the YAML groups block that today lives
-    # in config/models.yaml. Each entry is one (model, capability) catalog row;
-    # repeat the model with a different `capability` if it serves multiple slots.
+    # not a custom endpoint). Each entry is one physical model — under the
+    # capabilities[] array model, a single row can serve multiple roles
+    # (e.g. ['chat', 'auxiliary'] for any chat-capable LLM, or
+    # ['chat', 'auxiliary', 'vision'] for a multimodal one).
+    #
     # `provider` must match an entry in `systemApiKeys` above (or one already
     # in the DB) — entries whose provider has no key seeded are skipped.
+    #
+    # Capability inputs:
+    #
+    # - `capabilities: [chat, auxiliary]` — explicit array, respected as-is.
+    #   No auto-expansion: write `[chat]` and you get a chat-only row.
+    # - `capability: chat` — singular shorthand. Auto-expanded to
+    #   ['chat', 'auxiliary'] (chat-capable LLMs always serve auxiliary).
+    #   Singular for any other enum value lands as `[<value>]`.
+    # - `multimodal: true` — convenience flag that adds 'vision' to a
+    #   chat-capable row. Use it for known multimodal models so the same
+    #   physical row also surfaces in the vision dropdown.
     #
     # systemModels:
     #   - provider: "anthropic"
     #     id: "claude-opus-4-7"
     #     displayName: "Claude Opus 4.7"
-    #     capability: "chat"      # chat | auxiliary | embedding | vision | whisper | tts
-    #     family: "claude-opus"   # optional; family_matcher derives default from `id`
-    #     contextWindow: 200000   # optional; settings_matrix default if null
-    #     reasoningLevel: null    # optional
+    #     capabilities: [chat, auxiliary, vision]   # multimodal → all three
+    #     family: "claude-opus"
+    #     contextWindow: 200000
+    #     reasoningLevel: null
+    #   - provider: "openai"
+    #     id: "gpt-4o"
+    #     displayName: "GPT-4o"
+    #     capability: chat                          # auto-expands to [chat, aux]
+    #     multimodal: true                          # +vision
+    #     family: "gpt-4o"
     #   - provider: "openai"
     #     id: "text-embedding-3-large"
     #     displayName: "OpenAI Embedding (Large)"
-    #     capability: "embedding"
+    #     capability: embedding                     # singleton: [embedding]
     systemModels: []
 
     # -- Resource requests for the short-lived seed Job pod.

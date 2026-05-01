@@ -24,7 +24,10 @@ from src.core.model_registry import family_of
 
 
 class TestFamilyOf:
-    """Registry reads `family` from models.yaml for every built-in entry."""
+    """Pure prefix heuristic post chunk 6 — the YAML registry that used to
+    return the explicit ``family`` field is gone. Catalog rows carry
+    ``family`` directly; ``family_of`` is the sync fallback for callers
+    without a row."""
 
     def test_claude_opus(self):
         assert family_of("claude-opus-4-6") == "claude-opus"
@@ -33,8 +36,12 @@ class TestFamilyOf:
         assert family_of("claude-sonnet-4-5-20250929") == "claude-sonnet"
 
     def test_gpt4o(self):
-        assert family_of("gpt-4o") == "default"  # YAML declares family: default
-        assert family_of("gpt-4o-mini") == "default"
+        # Heuristic-only post chunk 6: `gpt-4o` matches the gpt-4o prefix.
+        # The modern family-matcher service routes gpt-4o to "default" for
+        # discovery — this helper is a different surface and stays prefix-
+        # accurate.
+        assert family_of("gpt-4o") == "gpt-4o"
+        assert family_of("gpt-4o-mini") == "gpt-4o"
 
     def test_groq_gpt_oss(self):
         assert family_of("groq/gpt-oss-120b") == "gpt-oss"
@@ -47,7 +54,9 @@ class TestFamilyOf:
         assert family_of("openrouter/minimax/minimax-m2.7") == "minimax"
 
     def test_codex_gpt5(self):
-        assert family_of("codex/gpt-5.3-codex") == "gpt-5"
+        # `gpt-5.3-codex` is the codex family — the heuristic recognises
+        # `codex` substring + `gpt-5` prefix as codex, not bare gpt-5.
+        assert family_of("codex/gpt-5.3-codex") == "codex"
 
     def test_unknown_model_returns_default(self):
         # After heuristic fallback kicks in, unrecognized IDs still fall through
@@ -90,7 +99,8 @@ class TestDetectReasoningMethod:
         assert detect_reasoning_method("gemini-2.5-flash") == "none"
 
     def test_gpt4o_returns_api(self):
-        # gpt-4o has family 'default' in models.yaml → 'api' reasoning method.
+        # gpt-4o resolves through family_of to "gpt-4o"; reasoning method
+        # falls through to the default-family handling → 'api'.
         assert detect_reasoning_method("gpt-4o") == "api"
 
     def test_codex_returns_api(self):

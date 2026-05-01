@@ -106,7 +106,8 @@ describe('AdminProvidersService', () => {
         get: vi.fn(),
         post: vi.fn().mockReturnValue(of({
           ok: true, status: 200, error: null, probe_url: 'http://vllm/v1/models',
-          models: [{id: 'gemma', owned_by: 'vllm', capability_hint: 'chat',
+          models: [{id: 'gemma', owned_by: 'vllm',
+                    capability_hints: ['chat', 'auxiliary'],
                     family: null, context_window: null}],
         })),
         put: vi.fn(), patch: vi.fn(), delete: vi.fn(),
@@ -207,6 +208,33 @@ describe('AdminProvidersService', () => {
       // New slots default to null when the server omits them.
       expect(service.defaults().whisper).toBeNull();
       expect(service.defaults().tts).toBeNull();
+    });
+
+    it('exposes chat slot in EMPTY_DEFAULTS shape', () => {
+      // Chunk 4 of model_capabilities_array surfaces `chat` in the
+      // Defaults panel so the readiness gate's "Pin a default for: chat"
+      // requirement has a UI to fulfill.
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.loadDefaults();
+      expect(service.defaults().chat).toBeNull();
+    });
+
+    it('PUTs a chat default', () => {
+      const http = {
+        get: vi.fn().mockReturnValue(of({})),
+        put: vi.fn().mockReturnValue(of({kind: 'chat', model: 'gpt-4o'})),
+        post: vi.fn(), patch: vi.fn(), delete: vi.fn(),
+      };
+      const {service} = createService(http);
+      service.setDefault('chat', 'gpt-4o').subscribe();
+      expect(http.put).toHaveBeenCalledWith(
+        expect.stringContaining('/admin/providers/defaults/chat'),
+        {model: 'gpt-4o'},
+      );
     });
   });
 });

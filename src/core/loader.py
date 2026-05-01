@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 from langchain_core.language_models import BaseChatModel
 
-from src.core.model_registry import family_of, resolve_builtin
+from src.core.model_registry import family_of
 from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
@@ -1755,15 +1755,14 @@ def create_llm(
     Returns:
         Configured LLM instance (ChatOpenAI, ChatAnthropic, ChatGoogleGenerativeAI, or ChatGroq)
     """
-    # Resolution order: explicit config override > registry > openai fallback.
-    # The registry is the source of truth for built-ins; custom endpoints
-    # land in config.base_url via dispatcher injection (they always route
-    # through the openai factory).
-    if config.provider:
-        provider = config.provider.lower()
-    else:
-        meta = resolve_builtin(config.model)
-        provider = meta.provider if meta is not None else "openai"
+    # Resolution: orchestrator dispatcher injects ``provider`` from the
+    # catalog row (system_api_keys provider slug or ``openai`` for endpoint-
+    # backed rows). Default to ``openai`` when missing — covers native
+    # OpenAI models and anything routed through an OpenAI-compatible
+    # endpoint, which is every endpoint case post-chunk-6 (the legacy
+    # YAML fallback that distinguished ``anthropic``/``google``/``groq``
+    # native is gone; the dispatcher now sets ``provider`` explicitly).
+    provider = config.provider.lower() if config.provider else "openai"
 
     if provider == "anthropic":
         return _create_anthropic_llm(config, limits)
@@ -1809,15 +1808,16 @@ def _create_openai_llm(
     # SDK gets the first key; KeyRing overrides the header in send()
     api_key = keys[0]
 
-    # Get base URL: explicit config wins (dispatcher-injected for custom
-    # endpoints), then the registry (which pre-resolves LLM_BASE_URL for
-    # built-in Local-group entries at startup). Native OpenAI models have
-    # no base_url and go straight to api.openai.com.
-    if config.base_url:
-        base_url = config.base_url
-    else:
-        meta = resolve_builtin(config.model)
-        base_url = meta.base_url if meta is not None else None
+    # Base URL: dispatcher-injected for endpoint-backed catalog rows,
+    # custom user endpoints, and system endpoints. Native OpenAI models
+    # leave it None and the SDK uses api.openai.com.
+    #
+    # The legacy YAML fallback (LLM_BASE_URL inheritance via
+    # `_load_builtin_catalog`'s Local-group branch) was removed in chunk 6
+    # of the models_yaml_removal work. A self-hosted model now MUST have
+    # a catalog row pointing at an explicit `llm_endpoints` transport;
+    # the dispatcher's `_inject_model_credentials` injects its `base_url`.
+    base_url = config.base_url
 
     # Build model kwargs
     model_kwargs = {}
