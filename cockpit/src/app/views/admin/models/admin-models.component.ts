@@ -485,7 +485,7 @@ export class AdminModelsComponent implements OnInit {
   });
 
   /** Provider dropdown options sourced from the keys + endpoints lists.
-   * Non-LLM providers (`tavily`, `vision`) are filtered out — they live in
+   * Non-LLM providers (`vision`) are filtered out — they live in
    * `system_api_keys` for env injection but can't anchor a catalog row.
    * The seeded `codex-proxy` endpoint is rendered as a "subscription"
    * source so admins recognise it as separate from a generic vLLM/Ollama
@@ -493,7 +493,7 @@ export class AdminModelsComponent implements OnInit {
   readonly providerOptions = computed<ProviderOption[]>(() => {
     const opts: ProviderOption[] = [];
     for (const key of this.providers.systemApiKeys()) {
-      if (key.provider === 'tavily' || key.provider === 'vision') continue;
+      if (key.provider === 'vision') continue;
       opts.push({
         kind: 'system',
         ref: key.provider,

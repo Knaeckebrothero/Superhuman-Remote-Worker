@@ -334,6 +334,72 @@ keycloak:
     limits:
       memory: "1Gi"
       cpu: "1000m"
+  # -- Bootstrap (only meaningful when keycloak.internal=false): a Helm
+  # pre-install/pre-upgrade Job that registers the SRW clients (`srw-cockpit`,
+  # `srw-mcp`) in an existing external Keycloak. Idempotent: get-or-create
+  # semantics, safe to re-run on every upgrade. Uses kcadm.sh in the same
+  # Keycloak image we already pull for internal mode, so no extra build.
+  #
+  # MCP secret is *supplied* (not generated): the Job reads MCP_OIDC_CLIENT_SECRET
+  # from the main app Secret and registers it in Keycloak. This keeps Vault as
+  # the source of truth for the secret and avoids chart-owned writeback.
+  bootstrap:
+    enabled: false
+    # -- K8s Secret containing KC_ADMIN_USER + KC_ADMIN_PASSWORD for an account
+    # with rights to create clients in the target realm (typically a service
+    # account with `manage-clients`/`manage-realm` role, NOT full master admin).
+    # Required when bootstrap.enabled=true.
+    adminCredentialsSecret: ""
+    # -- Realm to create the clients in. Defaults to keycloak.realm.
+    realm: ""
+    # -- Create the realm if it does not exist. Requires master-realm admin
+    # credentials (the supplied account must be in the master realm with
+    # `create-realm` role). Off by default — most customers add SRW clients
+    # to an existing realm that already holds their human users.
+    createRealm: false
+    # -- Admin server URL kcadm authenticates against. Defaults to
+    # keycloak.externalInternalUrl (cluster-internal, fastest) and falls back
+    # to keycloak.externalIssuerUrl with the /realms/... suffix stripped. Set
+    # explicitly only if neither default is reachable from the chart's
+    # namespace (e.g. a Keycloak behind a private network the cluster can't
+    # reach via either URL).
+    serverUrl: ""
+    # -- The clientIds to register. Match the ones the Cockpit/MCP services
+    # already expect (keycloak.cockpitClientId / mcp.oauth.clientId).
+    cockpitClientId: ""
+    mcpClientId: ""
+    # -- Image used for kcadm. Defaults to keycloak.image (already cached when
+    # keycloak.internal=true; otherwise pulled once per upgrade).
+    image: ""
+    backoffLimit: 3
+    resources:
+      requests:
+        memory: "128Mi"
+        cpu: "50m"
+      limits:
+        memory: "256Mi"
+        cpu: "500m"
+    # -- Service accounts to provision in TARGET_REALM. Each block is opt-in.
+    # Only meaningful when keycloak.internal=false (otherwise the realm-import
+    # JSON owns user provisioning). Username + password read from the main app
+    # Secret so they always match what the agent reads at runtime.
+    serviceAccounts:
+      # The agent's cloud datasource user. Enable when:
+      #   - opencloud.enabled or nextcloud.enabled is true (the internal cloud
+      #     trusts our Keycloak), OR
+      #   - cloud.externalUrl is set AND that external cloud is configured
+      #     against the SAME Keycloak realm we're bootstrapping. If the cloud
+      #     uses a different IdP, leave this off and create the user manually
+      #     per your cloud's docs.
+      # Reads username from CLOUD_SERVICE_USER and password from
+      # CLOUD_SERVICE_PASSWORD in the main app Secret. The `username` field
+      # below is a fallback only — if CLOUD_SERVICE_USER is set, it wins.
+      cloud:
+        enabled: false
+        username: "srw-agent"
+        email: ""
+        firstName: "SRW"
+        lastName: "Agent"
 
 nextcloud:
   enabled: false
