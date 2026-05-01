@@ -1,0 +1,16 @@
+# Critic expert model config matrix
+# Only list entries that differ from the base matrix. Base entries fall through.
+# Files referenced here resolve via expert directory → config/{prompts,templates}/.
+
+default:
+  prompts:
+    strategic: strategic.txt
+    tactical: tactical.txt
+  instructions:
+    instructions: instructions.md
+
+minimax:
+  prompts:
+    persona: persona_minimax.txt
+    strategic: strategic_minimax.txt
+    tactical: tactical_minimax.txt

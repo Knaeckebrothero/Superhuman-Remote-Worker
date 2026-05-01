@@ -3,11 +3,11 @@ import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-togg
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {
-  CATALOG_ROLES,
+  CATALOG_CAPABILITIES,
+  CatalogCapability,
   CatalogModel,
   CatalogModelTestResult,
   CatalogProviderKind,
-  CatalogRole,
   LlmEndpointDiscoveredModel,
 } from '../../../core/models/api.model';
 import {AppButtonComponent} from '../../../ui/button';
@@ -33,8 +33,8 @@ interface ProviderOption {
  */
 const CODEX_PROXY_LABEL = 'codex-proxy';
 
-/** Maps the discover endpoint's capability hint onto a catalog role. */
-function hintToRole(hint: string | null | undefined): CatalogRole {
+/** Maps the discover endpoint's capability hint onto a catalog capability. */
+function hintToCapability(hint: string | null | undefined): CatalogCapability {
   switch (hint) {
     case 'auxiliary':
     case 'embedding':
@@ -92,7 +92,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   <div class="model-header">
                     <span class="col-display">Display label</span>
                     <span class="col-id">Model ID</span>
-                    <span class="col-role">Role</span>
+                    <span class="col-capability">Capability</span>
                     <span class="col-family">Family</span>
                     <span class="col-enabled">Enabled</span>
                     <span class="col-actions"></span>
@@ -101,7 +101,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                     <div class="model-row">
                       <span class="col-display">{{ m.display_label }}</span>
                       <span class="col-id mono">{{ m.model_id }}</span>
-                      <span class="col-role">{{ m.role }}</span>
+                      <span class="col-capability">{{ m.capability }}</span>
                       <span class="col-family">{{ m.family }}</span>
                       <span class="col-enabled">
                         <app-checkbox
@@ -167,14 +167,14 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   }
                 </app-select>
               </app-form-field>
-              <app-form-field label="Role">
+              <app-form-field label="Capability">
                 <app-select
-                  [value]="formRole()"
+                  [value]="formCapability()"
                   [disabled]="creating()"
-                  (changed)="onRoleChange($event)"
+                  (changed)="onCapabilityChange($event)"
                 >
-                  @for (r of roles; track r) {
-                    <option [value]="r">{{ r }}</option>
+                  @for (c of capabilities; track c) {
+                    <option [value]="c">{{ c }}</option>
                   }
                 </app-select>
               </app-form-field>
@@ -244,7 +244,7 @@ function hintToRole(hint: string | null | undefined): CatalogRole {
                   [value]="formModelId()"
                   placeholder="e.g. claude-opus-4-7"
                   [disabled]="creating()"
-                  (changed)="formModelId.set($event)"
+                  (changed)="onModelIdChange($event)"
                 />
               </app-form-field>
               <app-form-field label="Display label">
@@ -451,7 +451,7 @@ export class AdminModelsComponent implements OnInit {
   readonly models = inject(AdminModelsService);
   readonly providers = inject(AdminProvidersService);
 
-  readonly roles: CatalogRole[] = CATALOG_ROLES;
+  readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
   readonly creating = signal(false);
   readonly testing = signal<string | null>(null);
   readonly testResults = signal<Record<string, CatalogModelTestResult>>({});
@@ -459,7 +459,7 @@ export class AdminModelsComponent implements OnInit {
 
   // Form state — signals so OnPush picks up updates from primitive callbacks.
   readonly formProviderKey = signal('');
-  readonly formRole = signal<CatalogRole>('chat');
+  readonly formCapability = signal<CatalogCapability>('chat');
   readonly formModelId = signal('');
   readonly formDisplayLabel = signal('');
   readonly formFamily = signal('default');
@@ -580,8 +580,8 @@ export class AdminModelsComponent implements OnInit {
     this.formError.set('');
   }
 
-  onRoleChange(value: string | null): void {
-    if (value) this.formRole.set(value as CatalogRole);
+  onCapabilityChange(value: string | null): void {
+    if (value) this.formCapability.set(value as CatalogCapability);
   }
 
   onFamilyChange(value: string | null): void {
@@ -611,7 +611,7 @@ export class AdminModelsComponent implements OnInit {
         provider_ref: ref,
         model_id: this.formModelId().trim(),
         display_label: this.formDisplayLabel().trim(),
-        role: this.formRole(),
+        capability: this.formCapability(),
         family: this.formFamily().trim(),
         context_window: this.formContextWindow() ?? null,
       })
@@ -674,8 +674,38 @@ export class AdminModelsComponent implements OnInit {
   applyDiscoveredModel(m: LlmEndpointDiscoveredModel): void {
     this.formModelId.set(m.id);
     this.formDisplayLabel.set(m.id);
-    this.formRole.set(hintToRole(m.capability_hint));
-    this.formFamily.set(m.family || 'default');
+    this.formCapability.set(hintToCapability(m.capability_hint));
+    // Endpoint discovery doesn't always know the family — fall back to the
+    // matcher when the discovered row leaves it empty.
+    if (m.family) {
+      this.formFamily.set(m.family);
+    } else {
+      this.detectAndSetFamily(m.id);
+    }
     this.formContextWindow.set(m.context_window ?? null);
+  }
+
+  /** Invoked when the operator types or pastes a model ID directly (not
+   * via the discovery list). Pre-fills the family dropdown from the
+   * matcher; admin can still override before save. */
+  onModelIdChange(value: string): void {
+    this.formModelId.set(value);
+    const trimmed = value.trim();
+    if (!trimmed) {
+      this.formFamily.set('default');
+      return;
+    }
+    this.detectAndSetFamily(trimmed);
+  }
+
+  private detectAndSetFamily(modelId: string): void {
+    this.models.detectFamily(modelId).subscribe((res) => {
+      // Only apply the matcher's suggestion when it actually matched; a
+      // 'fallback' result means we'd just be replacing whatever the admin
+      // already selected with 'default', which is rarely what they want.
+      if (res.source === 'matched') {
+        this.formFamily.set(res.family);
+      }
+    });
   }
 }

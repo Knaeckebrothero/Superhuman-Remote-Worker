@@ -224,7 +224,7 @@ class TestSeedEndpoints:
         assert kwargs["display_label"] == "Gemma 4 31B"
         assert kwargs["family"] == "gemma"
         assert kwargs["context_window"] == 128000
-        assert kwargs["role"] == "chat"
+        assert kwargs["capability"] == "chat"
         assert kwargs["seeded_from"] == "helm:llm.seed"
         assert kwargs["on_conflict_do_nothing"] is True
         assert report.endpoints_seeded == ["Local Gemma"]

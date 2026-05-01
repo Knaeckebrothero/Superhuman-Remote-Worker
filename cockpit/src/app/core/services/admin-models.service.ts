@@ -46,6 +46,22 @@ export class AdminModelsService {
       .subscribe((res) => this.families.set(res.families));
   }
 
+  /** Ask the orchestrator's regex matcher which family the given model_id
+   * looks like. Returns ``family: 'default'`` with ``source: 'fallback'``
+   * when no rule matches; the caller can still pre-fill the dropdown and
+   * let the admin override. Errors quietly resolve to the same fallback so
+   * a transient backend failure never blocks the form. */
+  detectFamily(modelId: string): Observable<{family: string; source: string}> {
+    return this.http
+      .get<{family: string; source: string}>(
+        `${this.baseUrl}/admin/families/detect`,
+        {params: {model_id: modelId}},
+      )
+      .pipe(
+        catchError(() => of({family: 'default', source: 'fallback'})),
+      );
+  }
+
   createModel(body: CatalogModelCreateRequest): Observable<CatalogModel> {
     return this.http
       .post<CatalogModel>(`${this.baseUrl}/admin/providers/models`, body)

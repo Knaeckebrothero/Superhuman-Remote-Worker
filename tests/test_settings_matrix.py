@@ -11,7 +11,6 @@ from src.core.loader import (
     LLMConfig,
     PhaseLLMOverride,
     _apply_settings_matrix,
-    _load_matrix_file,
     _load_settings_matrix,
     _parse_llm_config,
     _parse_phase_override,
@@ -23,10 +22,10 @@ from src.core.model_registry import family_of
 
 @pytest.fixture(autouse=True)
 def clear_settings_matrix_cache():
-    """Reset settings matrix cache between tests."""
-    loader._settings_matrix_base_cache = None
+    """Reset the unified model_config_matrix cache between tests."""
+    loader._model_config_matrix_cache.clear()
     yield
-    loader._settings_matrix_base_cache = None
+    loader._model_config_matrix_cache.clear()
 
 
 # =============================================================================
@@ -59,7 +58,8 @@ class TestFamilyOfMinimax:
 
 class TestLoadSettingsMatrix:
     def test_loads_real_file(self):
-        """The real config/settings_matrix.yaml should load successfully."""
+        """The real config/model_config_matrix.yaml should expose the
+        ``settings`` subsection in the legacy family→params shape."""
         matrix = _load_settings_matrix()
         assert isinstance(matrix, dict)
         assert "default" in matrix
@@ -73,27 +73,30 @@ class TestLoadSettingsMatrix:
         assert matrix["default"]["limits"]["context_threshold_tokens"] == 80000
 
     def test_caches_result(self):
-        """Second call should return the cached dict."""
+        """The unified file is parsed once per path; the projection (the
+        ``settings`` subsection extract) re-runs cheaply on each call."""
         first = _load_settings_matrix()
         second = _load_settings_matrix()
-        assert first is second
+        # Same payloads (the projection produces equal dicts), and the parsed
+        # cache is shared — so the underlying parse only ran once.
+        assert first == second
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        assert base_path in loader._model_config_matrix_cache
 
     def test_missing_file_returns_empty(self):
-        """If settings_matrix.yaml doesn't exist, return empty dict."""
+        """If the unified matrix file is absent, return empty dict."""
         with patch.object(Path, "exists", return_value=False):
-            loader._settings_matrix_base_cache = None  # Force reload
+            loader._model_config_matrix_cache.clear()
             matrix = _load_settings_matrix()
             assert matrix == {}
 
     def test_invalid_yaml_returns_empty(self):
-        """If the YAML is not a dict, return empty dict."""
+        """If the YAML is not a dict, the projection is empty."""
         with patch("builtins.open", create=True) as mock_open:
             mock_open.return_value.__enter__ = lambda s: s
             mock_open.return_value.__exit__ = lambda s, *a: None
             mock_open.return_value.read = lambda: "just a string"
-            # Force reload by clearing cache and patching Path.exists
-            loader._settings_matrix_base_cache = None
-            # This will fail to parse correctly; the real test is the graceful fallback
+            loader._model_config_matrix_cache.clear()
             matrix = _load_settings_matrix()
             assert isinstance(matrix, dict)
 
@@ -170,12 +173,17 @@ class TestApplySettingsMatrixLimits:
 
     def test_no_limits_in_matrix_uses_default(self):
         """Family without limits sub-dict: default limits applied."""
-        loader._settings_matrix_base_cache = {
+        # Pre-populate the unified cache with a synthetic base file so we
+        # don't depend on the real config/model_config_matrix.yaml content.
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        loader._model_config_matrix_cache[base_path] = {
             "default": {
-                "model_max_context_tokens": 128000,
-                "limits": {"context_threshold_tokens": 80000},
+                "settings": {
+                    "model_max_context_tokens": 128000,
+                    "limits": {"context_threshold_tokens": 80000},
+                },
             },
-            "minimax": {"temperature": 1.0},
+            "minimax": {"settings": {"temperature": 1.0}},
         }
         data = {
             "llm": {"model": "minimax-m2.7"},
@@ -226,17 +234,21 @@ class TestApplySettingsMatrixLimits:
 
 class TestPerExpertMatrix:
     def test_expert_matrix_merges_over_base(self, tmp_path):
-        """Expert's settings_matrix.yaml overrides base matrix values."""
-        # Write an expert settings_matrix.yaml that overrides minimax temperature
+        """Expert's model_config_matrix.yaml overrides base matrix values."""
+        # Write an expert model_config_matrix.yaml that overrides minimax
+        # settings (the unified shape — the same file that also carries
+        # `prompts:` and `instructions:` sections in real expert dirs).
         expert_matrix = {
             "minimax": {
-                "temperature": 0.7,
-                "limits": {
-                    "context_threshold_tokens": 90000,
+                "settings": {
+                    "temperature": 0.7,
+                    "limits": {
+                        "context_threshold_tokens": 90000,
+                    },
                 },
             },
         }
-        expert_matrix_path = tmp_path / "settings_matrix.yaml"
+        expert_matrix_path = tmp_path / "model_config_matrix.yaml"
         with open(expert_matrix_path, "w") as f:
             yaml.dump(expert_matrix, f)
 
@@ -253,8 +265,8 @@ class TestPerExpertMatrix:
         assert data["limits"]["model_max_context_tokens"] == 170000
 
     def test_no_expert_matrix_uses_base(self, tmp_path):
-        """Missing expert settings_matrix.yaml falls back to base."""
-        # tmp_path exists but has no settings_matrix.yaml
+        """Missing expert model_config_matrix.yaml falls back to base."""
+        # tmp_path exists but has no model_config_matrix.yaml
         data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(
             data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
@@ -452,8 +464,8 @@ class TestSettingsMatrixIntegration:
         assert config.limits.message_count_min_tokens == 50000
 
     def test_load_agent_config_with_deployment_dir_matrix(self, tmp_path):
-        """Expert directory with settings_matrix.yaml flows through load_agent_config."""
-        # Create expert directory with config and settings_matrix
+        """Expert directory with model_config_matrix.yaml flows through load_agent_config."""
+        # Create expert directory with config and unified matrix
         expert_dir = tmp_path / "my_expert"
         expert_dir.mkdir()
 
@@ -469,12 +481,14 @@ class TestSettingsMatrixIntegration:
 
         expert_matrix = {
             "minimax": {
-                "limits": {
-                    "context_threshold_tokens": 95000,
+                "settings": {
+                    "limits": {
+                        "context_threshold_tokens": 95000,
+                    },
                 },
             },
         }
-        with open(expert_dir / "settings_matrix.yaml", "w") as f:
+        with open(expert_dir / "model_config_matrix.yaml", "w") as f:
             yaml.dump(expert_matrix, f)
 
         config = loader.load_agent_config(
@@ -488,37 +502,46 @@ class TestSettingsMatrixIntegration:
 
 
 # =============================================================================
-# _load_matrix_file — unit tests
+# _load_model_config_matrix_file — unit tests
 # =============================================================================
 
 
 class TestLoadMatrixFile:
     def test_nonexistent_path(self, tmp_path):
         """Nonexistent file returns empty dict."""
-        result = _load_matrix_file(tmp_path / "nope.yaml")
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(tmp_path / "nope.yaml")
         assert result == {}
 
     def test_valid_yaml(self, tmp_path):
-        """Valid YAML dict is parsed correctly."""
-        matrix = {"minimax": {"temperature": 1.0}, "deepseek": {"top_p": 0.95}}
+        """Valid unified YAML is parsed and structured by family."""
+        matrix = {
+            "minimax": {"settings": {"temperature": 1.0}},
+            "deepseek": {"settings": {"top_p": 0.95}},
+        }
         path = tmp_path / "matrix.yaml"
         with open(path, "w") as f:
             yaml.dump(matrix, f)
-        result = _load_matrix_file(path)
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(path)
         assert result == matrix
 
     def test_non_dict_yaml_returns_empty(self, tmp_path):
         """YAML that parses to a list/string returns empty dict."""
         path = tmp_path / "matrix.yaml"
         path.write_text("- item1\n- item2\n")
-        result = _load_matrix_file(path)
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(path)
         assert result == {}
 
     def test_skips_non_dict_entries(self, tmp_path):
         """Entries whose values aren't dicts are skipped."""
         path = tmp_path / "matrix.yaml"
-        path.write_text("minimax:\n  temperature: 1.0\nbad_entry: just_a_string\n")
-        result = _load_matrix_file(path)
+        path.write_text(
+            "minimax:\n  settings:\n    temperature: 1.0\nbad_entry: just_a_string\n"
+        )
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(path)
         assert "minimax" in result
         assert "bad_entry" not in result
 
@@ -526,16 +549,34 @@ class TestLoadMatrixFile:
         """Empty YAML file returns empty dict."""
         path = tmp_path / "matrix.yaml"
         path.write_text("")
-        result = _load_matrix_file(path)
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(path)
         assert result == {}
 
     def test_io_error_returns_empty(self, tmp_path):
         """IO errors during read return empty dict."""
         path = tmp_path / "matrix.yaml"
-        path.write_text("good: {key: value}")
+        path.write_text("good: {settings: {key: value}}")
+        loader._model_config_matrix_cache.clear()
         with patch("builtins.open", side_effect=PermissionError("denied")):
-            result = _load_matrix_file(path)
+            result = loader._load_model_config_matrix_file(path)
         assert result == {}
+
+    def test_unknown_section_dropped_with_warning(self, tmp_path):
+        """Sections that aren't prompts/instructions/settings are ignored."""
+        matrix = {
+            "minimax": {
+                "settings": {"temperature": 1.0},
+                "bogus": {"foo": "bar"},
+            },
+        }
+        path = tmp_path / "matrix.yaml"
+        with open(path, "w") as f:
+            yaml.dump(matrix, f)
+        loader._model_config_matrix_cache.clear()
+        result = loader._load_model_config_matrix_file(path)
+        assert "settings" in result["minimax"]
+        assert "bogus" not in result["minimax"]
 
 
 # =============================================================================
@@ -545,28 +586,32 @@ class TestLoadMatrixFile:
 
 class TestLoadSettingsMatrixCaching:
     def test_base_cache_not_reloaded_with_deployment_dir(self, tmp_path):
-        """Base cache is set once and reused even when deployment_dir is given."""
+        """Base cache is populated once and reused even when deployment_dir
+        is given on subsequent calls."""
+        loader._model_config_matrix_cache.clear()
         # First call loads base
         _load_settings_matrix()
-        first_cache = loader._settings_matrix_base_cache
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        first_cache = loader._model_config_matrix_cache.get(base_path)
         assert first_cache is not None
 
-        # Second call with deployment_dir reuses same base cache
+        # Second call with deployment_dir reuses same base cache (the cache
+        # entry is keyed by Path and identity-stable across calls).
         _load_settings_matrix(deployment_dir=str(tmp_path))
-        assert loader._settings_matrix_base_cache is first_cache
+        assert loader._model_config_matrix_cache.get(base_path) is first_cache
 
     def test_expert_empty_file_returns_base(self, tmp_path):
         """Expert matrix file that parses to empty returns base unchanged."""
-        path = tmp_path / "settings_matrix.yaml"
-        path.write_text("")  # Empty file -> _load_matrix_file returns {}
+        path = tmp_path / "model_config_matrix.yaml"
+        path.write_text("")  # empty -> projection is empty -> base wins
         result = _load_settings_matrix(deployment_dir=str(tmp_path))
         base = _load_settings_matrix()
-        assert result is base
+        assert result == base
 
     def test_expert_adds_new_family(self, tmp_path):
         """Expert matrix can add a family not in base."""
-        expert_matrix = {"custom_model": {"temperature": 0.42}}
-        path = tmp_path / "settings_matrix.yaml"
+        expert_matrix = {"custom_model": {"settings": {"temperature": 0.42}}}
+        path = tmp_path / "model_config_matrix.yaml"
         with open(path, "w") as f:
             yaml.dump(expert_matrix, f)
 
@@ -579,10 +624,10 @@ class TestLoadSettingsMatrixCaching:
         assert result["custom_model"]["temperature"] == 0.42
 
     def test_no_deployment_dir_returns_base(self):
-        """None deployment_dir returns base directly."""
+        """None deployment_dir returns the base settings projection."""
         result = _load_settings_matrix(deployment_dir=None)
         base = _load_settings_matrix()
-        assert result is base
+        assert result == base
 
 
 # =============================================================================
@@ -593,7 +638,8 @@ class TestLoadSettingsMatrixCaching:
 class TestApplySettingsMatrixEdgeCases:
     def test_empty_matrix_no_default(self):
         """Empty matrix (no 'default' key) applies nothing."""
-        loader._settings_matrix_base_cache = {}
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        loader._model_config_matrix_cache[base_path] = {}
         data = {"llm": {"model": "some-model", "temperature": 0.5}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # Nothing changed
@@ -602,10 +648,13 @@ class TestApplySettingsMatrixEdgeCases:
 
     def test_family_is_default_skips_family_merge(self):
         """When detect_model_family returns 'default', no double-apply of default entry."""
-        loader._settings_matrix_base_cache = {
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        loader._model_config_matrix_cache[base_path] = {
             "default": {
-                "model_max_context_tokens": 128000,
-                "limits": {"context_threshold_tokens": 80000},
+                "settings": {
+                    "model_max_context_tokens": 128000,
+                    "limits": {"context_threshold_tokens": 80000},
+                },
             },
         }
         data = {"llm": {"model": "some-unknown-model"}, "limits": {}}
@@ -656,11 +705,13 @@ class TestPerExpertMatrixExtended:
         """Expert matrix can override values in the 'default' entry."""
         expert_matrix = {
             "default": {
-                "model_max_context_tokens": 256000,
-                "limits": {"context_threshold_tokens": 200000},
+                "settings": {
+                    "model_max_context_tokens": 256000,
+                    "limits": {"context_threshold_tokens": 200000},
+                },
             },
         }
-        path = tmp_path / "settings_matrix.yaml"
+        path = tmp_path / "model_config_matrix.yaml"
         with open(path, "w") as f:
             yaml.dump(expert_matrix, f)
 
@@ -679,25 +730,30 @@ class TestPerExpertMatrixExtended:
         """Expert can define a new family that the base doesn't have."""
         expert_matrix = {
             "my_custom_model": {
-                "temperature": 0.3,
-                "model_max_context_tokens": 50000,
-                "limits": {
-                    "context_threshold_tokens": 30000,
-                    "model_max_context_tokens": 40000,
-                    "summarization_safe_limit": 35000,
-                    "summarization_chunk_size": 25000,
-                    "message_count_min_tokens": 20000,
+                "settings": {
+                    "temperature": 0.3,
+                    "model_max_context_tokens": 50000,
+                    "limits": {
+                        "context_threshold_tokens": 30000,
+                        "model_max_context_tokens": 40000,
+                        "summarization_safe_limit": 35000,
+                        "summarization_chunk_size": 25000,
+                        "message_count_min_tokens": 20000,
+                    },
                 },
             },
         }
-        path = tmp_path / "settings_matrix.yaml"
+        path = tmp_path / "model_config_matrix.yaml"
         with open(path, "w") as f:
             yaml.dump(expert_matrix, f)
 
-        # Pretend detect_model_family returns "my_custom_model" by using
-        # a model name that would match — we'll use the cache directly
-        loader._settings_matrix_base_cache = {
-            "default": {"limits": {"context_threshold_tokens": 80000}},
+        # Override the base cache entry to a synthetic minimal default so
+        # this test is independent of the real base file's defaults.
+        base_path = loader.get_project_root() / "config" / "model_config_matrix.yaml"
+        loader._model_config_matrix_cache[base_path] = {
+            "default": {
+                "settings": {"limits": {"context_threshold_tokens": 80000}},
+            },
         }
         data = {"llm": {"model": "my_custom_model-v1"}, "limits": {}}
         # Since detect_model_family won't know "my_custom_model", it returns "default"
@@ -712,12 +768,14 @@ class TestPerExpertMatrixExtended:
         """Expert overrides one limit key; others come from base family."""
         expert_matrix = {
             "deepseek": {
-                "limits": {
-                    "context_threshold_tokens": 42000,
+                "settings": {
+                    "limits": {
+                        "context_threshold_tokens": 42000,
+                    },
                 },
             },
         }
-        path = tmp_path / "settings_matrix.yaml"
+        path = tmp_path / "model_config_matrix.yaml"
         with open(path, "w") as f:
             yaml.dump(expert_matrix, f)
 

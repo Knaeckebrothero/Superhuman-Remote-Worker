@@ -3867,15 +3867,15 @@ class PostgresDB:
 
     # =========================================================================
     # MODELS CATALOG
-    # Admin-curated table of (model, role) offerings anchored to a transport
-    # (system_api_keys provider OR system-scoped llm_endpoints row).
+    # Admin-curated table of (model, capability) offerings anchored to a
+    # transport (system_api_keys provider OR system-scoped llm_endpoints row).
     # Reads feed every model picker (builder/session/job) and the resolver's
     # catalog branch in src/core/model_registry.py.
     # =========================================================================
 
     _MODEL_FIELDS = (
         "id, provider_kind, provider_ref, model_id, display_label, "
-        "role, family, context_window, reasoning_level, params_json, "
+        "capability, family, context_window, reasoning_level, params_json, "
         "enabled, seeded_from, notes, created_at, updated_at"
     )
 
@@ -3891,7 +3891,7 @@ class PostgresDB:
     async def list_models(
         self,
         *,
-        role: str | None = None,
+        capability: str | None = None,
         provider_kind: str | None = None,
         provider_ref: str | None = None,
         enabled_only: bool = False,
@@ -3900,9 +3900,9 @@ class PostgresDB:
         clauses: list[str] = []
         args: list[Any] = []
         idx = 1
-        if role is not None:
-            clauses.append(f"role = ${idx}")
-            args.append(role)
+        if capability is not None:
+            clauses.append(f"capability = ${idx}")
+            args.append(capability)
             idx += 1
         if provider_kind is not None:
             clauses.append(f"provider_kind = ${idx}")
@@ -3918,7 +3918,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {self._MODEL_FIELDS} FROM models {where} "
-                "ORDER BY provider_kind, provider_ref, role, display_label",
+                "ORDER BY provider_kind, provider_ref, capability, display_label",
                 *args,
             )
         return [self._row_to_model(r) for r in rows]
@@ -3939,7 +3939,7 @@ class PostgresDB:
         provider_ref: str,
         model_id: str,
         display_label: str,
-        role: str,
+        capability: str,
         family: str,
         context_window: int | None = None,
         reasoning_level: str | None = None,
@@ -3956,11 +3956,11 @@ class PostgresDB:
         (LiteLLM #14661 hazard).
 
         When ``on_conflict_do_nothing`` is True and a row already exists for
-        ``(provider_kind, provider_ref, model_id, role)``, returns None so
-        the seed pipeline can count "newly inserted" cleanly.
+        ``(provider_kind, provider_ref, model_id, capability)``, returns None
+        so the seed pipeline can count "newly inserted" cleanly.
         """
         on_conflict = (
-            "ON CONFLICT (provider_kind, provider_ref, model_id, role) DO NOTHING"
+            "ON CONFLICT (provider_kind, provider_ref, model_id, capability) DO NOTHING"
             if on_conflict_do_nothing
             else ""
         )
@@ -3969,7 +3969,7 @@ class PostgresDB:
                 f"""
                 INSERT INTO models
                     (provider_kind, provider_ref, model_id, display_label,
-                     role, family, context_window, reasoning_level,
+                     capability, family, context_window, reasoning_level,
                      params_json, enabled, seeded_from, notes)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                 {on_conflict}
@@ -3979,7 +3979,7 @@ class PostgresDB:
                 provider_ref,
                 model_id,
                 display_label,
-                role,
+                capability,
                 family,
                 context_window,
                 reasoning_level,
@@ -4003,7 +4003,7 @@ class PostgresDB:
             "provider_ref",
             "model_id",
             "display_label",
-            "role",
+            "capability",
             "family",
             "context_window",
             "reasoning_level",
@@ -4043,7 +4043,7 @@ class PostgresDB:
         return result == "DELETE 1"
 
     async def resolve_catalog_model(
-        self, model_id: str, *, role: str = "chat"
+        self, model_id: str, *, capability: str = "chat"
     ) -> Dict[str, Any] | None:
         """Resolve a catalog row to a flat dict carrying the transport.
 
@@ -4066,7 +4066,7 @@ class PostgresDB:
                     m.provider_ref,
                     m.model_id,
                     m.display_label,
-                    m.role,
+                    m.capability,
                     m.family,
                     m.context_window,
                     m.reasoning_level,
@@ -4085,13 +4085,13 @@ class PostgresDB:
                    AND m.provider_ref = ule.id::text
                    AND ule.user_id IS NULL
                 WHERE m.model_id = $1
-                  AND m.role = $2
+                  AND m.capability = $2
                   AND m.enabled = TRUE
                 ORDER BY (m.provider_kind = 'system') DESC, m.created_at ASC
                 LIMIT 1
                 """,
                 model_id,
-                role,
+                capability,
             )
         if row is None:
             return None
@@ -4110,8 +4110,10 @@ class PostgresDB:
             result.pop("system_api_key", None)
         return result
 
-    async def list_models_by_role_alphabetical(self, role: str) -> List[Dict[str, Any]]:
-        """Enabled catalog rows for ``role``, sorted by display_label.
+    async def list_models_by_capability_alphabetical(
+        self, capability: str
+    ) -> List[Dict[str, Any]]:
+        """Enabled catalog rows for ``capability``, sorted by display_label.
 
         Powers the "first-enabled-alphabetical" fallback used by the default-
         model resolver when no admin pin (or a dangling pin) is set.
@@ -4119,9 +4121,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"SELECT {self._MODEL_FIELDS} FROM models "
-                "WHERE role = $1 AND enabled = TRUE "
+                "WHERE capability = $1 AND enabled = TRUE "
                 "ORDER BY display_label ASC, created_at ASC",
-                role,
+                capability,
             )
         return [self._row_to_model(r) for r in rows]
 
@@ -4169,37 +4171,40 @@ class PostgresDB:
             return
         await self.upsert_system_setting(key, {"model": model}, updated_by=updated_by)
 
-    # Catalog roles that support a "first-enabled-alphabetical" fallback when
-    # the admin pin is missing or dangling. Whisper/tts gained catalog rows in
-    # v1.1; non-catalog kinds (none today) would pass through unchanged.
-    _CATALOG_ROLES = frozenset(
+    # Catalog capabilities that support a "first-enabled-alphabetical" fallback
+    # when the admin pin is missing or dangling. Whisper/tts gained catalog
+    # rows in v1.1; non-catalog kinds (none today) would pass through unchanged.
+    _CATALOG_CAPABILITIES = frozenset(
         {"chat", "auxiliary", "embedding", "vision", "whisper", "tts"}
     )
 
-    async def resolve_default_for_role(self, kind: str) -> str | None:
-        """Resolve the effective default model ID for a role.
+    async def resolve_default_for_capability(self, capability: str) -> str | None:
+        """Resolve the effective default model ID for a capability.
 
         Behavior:
-        - Reads the admin pin via ``get_default_llm_model(kind)``.
-        - For catalog-supported roles, the pin is validated against
+        - Reads the admin pin via ``get_default_llm_model(capability)``.
+        - For catalog-supported capabilities, the pin is validated against
           ``resolve_catalog_model``. A pin pointing at a missing or
           ``enabled=false`` row is treated as absent, and the first
-          enabled catalog row for the role (sorted alphabetically by
+          enabled catalog row for the capability (sorted alphabetically by
           ``display_label``) is returned instead.
-        - For any kind not in ``_CATALOG_ROLES`` the pin is returned
-          verbatim. As of catalog v1.1 every role is catalog-backed, so
-          this branch is currently a no-op kept for forward compat.
+        - For any capability not in ``_CATALOG_CAPABILITIES`` the pin is
+          returned verbatim. As of catalog v1.1 every capability is
+          catalog-backed, so this branch is currently a no-op kept for
+          forward compat.
         - Returns ``None`` only when no pin exists AND no enabled catalog
           row is available.
         """
-        pinned = await self.get_default_llm_model(kind)
-        if kind not in self._CATALOG_ROLES:
+        pinned = await self.get_default_llm_model(capability)
+        if capability not in self._CATALOG_CAPABILITIES:
             return pinned
         if pinned:
-            catalog_row = await self.resolve_catalog_model(pinned, role=kind)
+            catalog_row = await self.resolve_catalog_model(
+                pinned, capability=capability
+            )
             if catalog_row is not None and catalog_row.get("enabled"):
                 return pinned
-        candidates = await self.list_models_by_role_alphabetical(kind)
+        candidates = await self.list_models_by_capability_alphabetical(capability)
         if candidates:
             return candidates[0]["model_id"]
         return None

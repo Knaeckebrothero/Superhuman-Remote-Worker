@@ -217,8 +217,8 @@ def register_system_lookup(fn: Optional[SystemLookup]) -> None:
 def register_catalog_lookup(fn: Optional[CatalogLookup]) -> None:
     """Install (or clear) the DB-backed catalog lookup callable.
 
-    The callable takes (model_id, role='chat') and returns either None or a
-    flattened row dict from the ``models`` table joined to its transport
+    The callable takes (model_id, capability='chat') and returns either None
+    or a flattened row dict from the ``models`` table joined to its transport
     (system_api_keys or llm_endpoints). Wired to
     ``postgres_db.resolve_catalog_model`` at orchestrator startup.
     """
@@ -355,7 +355,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
     """
     provider_kind = row["provider_kind"]
     provider_ref = row["provider_ref"]
-    role = row.get("role") or "chat"
+    capability = row.get("capability") or "chat"
     if provider_kind == "endpoint":
         return ModelMeta(
             model_id=row["model_id"],
@@ -368,7 +368,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
             reasoning_level=row.get("reasoning_level"),
             origin="catalog",
             endpoint_id=str(row["endpoint_id"]) if row.get("endpoint_id") else None,
-            capability=role,
+            capability=capability,
         )
     return ModelMeta(
         model_id=row["model_id"],
@@ -380,7 +380,7 @@ def _catalog_row_to_meta(row: dict[str, Any]) -> ModelMeta:
         context_window=row.get("context_window"),
         reasoning_level=row.get("reasoning_level"),
         origin="catalog",
-        capability=role,
+        capability=capability,
     )
 
 
@@ -435,7 +435,7 @@ async def resolve_model(
             return _endpoint_row_to_meta(row, origin="system")
 
     if _catalog_lookup is not None:
-        row = await _catalog_lookup(model_id, role=capability)
+        row = await _catalog_lookup(model_id, capability=capability)
         if row is not None:
             return _catalog_row_to_meta(row)
 
