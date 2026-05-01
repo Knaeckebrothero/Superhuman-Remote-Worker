@@ -1,0 +1,121 @@
+{{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.bootstrap.enabled }}
+{{- if not .Values.keycloak.bootstrap.adminCredentialsSecret -}}
+{{- fail "keycloak.bootstrap.enabled requires keycloak.bootstrap.adminCredentialsSecret (a K8s Secret with KC_ADMIN_USER + KC_ADMIN_PASSWORD)" -}}
+{{- end -}}
+{{- $sa := .Values.keycloak.bootstrap.serviceAccounts -}}
+{{- if and $sa $sa.cloud $sa.cloud.enabled -}}
+{{- $hasCloud := or .Values.opencloud.enabled .Values.nextcloud.enabled (ne (default "" .Values.cloud.externalUrl) "") -}}
+{{- if not $hasCloud -}}
+{{- fail "keycloak.bootstrap.serviceAccounts.cloud.enabled=true requires a configured cloud (opencloud.enabled, nextcloud.enabled, or cloud.externalUrl). With no cloud, the user has nothing to authenticate against." -}}
+{{- end -}}
+{{- end -}}
+# Keycloak bootstrap Job — pre-install/pre-upgrade hook that registers the
+# SRW clients in an external Keycloak. Runs once per `helm install/upgrade`.
+#
+# Hook ordering: weight=-5 so it runs after the bootstrap ConfigMap (-10) but
+# before any chart resource that depends on the clients existing (orchestrator,
+# cockpit, mcp). Failure aborts the install/upgrade.
+#
+# delete-policy: before-hook-creation keeps the Job from a previous run around
+# for log inspection; it gets cleaned up the next time we run. hook-succeeded
+# means a successful Job is removed immediately so it doesn't clutter the ns.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "srw.keycloakBootstrapName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloak-bootstrap") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.keycloak.bootstrap.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak-bootstrap") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: bootstrap
+          image: {{ include "srw.keycloakBootstrapImage" . | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scripts/bootstrap.sh"]
+          env:
+            - name: KC_SERVER
+              value: {{ include "srw.keycloakBootstrapServer" . | quote }}
+            - name: TARGET_REALM
+              value: {{ include "srw.keycloakBootstrapRealm" . | quote }}
+            - name: CREATE_REALM
+              value: {{ .Values.keycloak.bootstrap.createRealm | quote }}
+            - name: COCKPIT_CLIENT_ID
+              value: {{ default .Values.keycloak.cockpitClientId .Values.keycloak.bootstrap.cockpitClientId | quote }}
+            - name: COCKPIT_HOST
+              value: {{ include "srw.host" (dict "context" . "key" "cockpit" "default" "") | quote }}
+            - name: MCP_CLIENT_ID
+              value: {{ default .Values.mcp.oauth.clientId .Values.keycloak.bootstrap.mcpClientId | quote }}
+            - name: MCP_HOST
+              value: {{ include "srw.host" (dict "context" . "key" "mcp" "default" "mcp") | quote }}
+            # Admin credentials: from the user-provided Secret.
+            - name: KC_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.bootstrap.adminCredentialsSecret }}
+                  key: KC_ADMIN_USER
+            - name: KC_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.bootstrap.adminCredentialsSecret }}
+                  key: KC_ADMIN_PASSWORD
+            # MCP client secret: from the main app secret. The same value the
+            # MCP server reads at runtime, so the chart guarantees they match.
+            - name: MCP_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: MCP_OIDC_CLIENT_SECRET
+            {{- if and $sa $sa.cloud $sa.cloud.enabled }}
+            # Cloud service-account user — created in TARGET_REALM. Username
+            # and password come from the same chart Secret keys the agent
+            # reads at runtime, so the user we create matches what the agent
+            # logs in as. The chart-values fallback (BOOTSTRAP_CLOUD_USERNAME)
+            # is used only if CLOUD_SERVICE_USER is unset on the Secret.
+            - name: BOOTSTRAP_CLOUD_ENABLED
+              value: "true"
+            - name: BOOTSTRAP_CLOUD_USERNAME
+              value: {{ $sa.cloud.username | quote }}
+            - name: BOOTSTRAP_CLOUD_EMAIL
+              value: {{ $sa.cloud.email | quote }}
+            - name: BOOTSTRAP_CLOUD_FIRST_NAME
+              value: {{ $sa.cloud.firstName | quote }}
+            - name: BOOTSTRAP_CLOUD_LAST_NAME
+              value: {{ $sa.cloud.lastName | quote }}
+            - name: CLOUD_SERVICE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CLOUD_SERVICE_USER
+                  optional: true
+            - name: CLOUD_SERVICE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CLOUD_SERVICE_PASSWORD
+            {{- end }}
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            {{- toYaml .Values.keycloak.bootstrap.resources | nindent 12 }}
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: {{ include "srw.keycloakBootstrapName" . }}
+            defaultMode: 0755
+{{- end }}

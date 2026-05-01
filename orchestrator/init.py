@@ -836,7 +836,6 @@ _SEEDABLE_PROVIDERS = (
     "google",
     "groq",
     "openrouter",
-    "tavily",
 )
 
 

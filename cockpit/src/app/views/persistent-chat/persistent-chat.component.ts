@@ -9,7 +9,7 @@ import {
     signal,
     ViewChild,
 } from '@angular/core';
-import {JsonPipe, TitleCasePipe} from '@angular/common';
+import {TitleCasePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -151,7 +151,6 @@ const CATEGORY_LABELS: Record<string, string> = {
     standalone: true,
     imports: [
         FormsModule,
-        JsonPipe,
         TitleCasePipe,
         RouterLink,
         MarkdownComponent,
@@ -386,9 +385,15 @@ const CATEGORY_LABELS: Record<string, string> = {
                       </summary>
                       <div class="tool-detail-list">
                         @for (tc of msg.toolCalls; track tc.id) {
-                          <details class="tool-detail-item" [attr.open]="tc.status === 'denied' ? '' : null">
+                          <details class="tool-detail-item" [class.has-decision]="!!tc.decision" [attr.open]="tc.status === 'denied' ? '' : null">
                             <summary class="tool-detail-header">
                               <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
+                              @if (tc.decision; as d) {
+                                <span class="approval-badge" [class]="'approval-' + d">
+                                  <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                  {{ ('chat.approval.badge.' + d) | transloco }}
+                                </span>
+                              }
                               <span class="tool-detail-name">{{ tc.tool }}</span>
                               <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
                               <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
@@ -500,11 +505,17 @@ const CATEGORY_LABELS: Record<string, string> = {
                     </summary>
                     <div class="tool-detail-list">
                       @for (tc of completedOnly(chat.currentToolCalls()); track tc.id) {
-                        <details class="tool-detail-item">
+                        <details class="tool-detail-item" [class.has-decision]="!!tc.decision">
                           <summary class="tool-detail-header">
+                            @if (tc.decision; as d) {
+                              <span class="approval-badge" [class]="'approval-' + d">
+                                <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                {{ ('chat.approval.badge.' + d) | transloco }}
+                              </span>
+                            }
                             <span class="tool-detail-name">{{ tc.tool }}</span>
                             <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                            <span class="tool-detail-status status-completed">{{ 'chat.tools.statusCompleted' | transloco }}</span>
+                            <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
                           </summary>
                           @if (tc.result) {
                             <pre class="tool-detail-result">{{ tc.result }}</pre>
@@ -515,7 +526,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                   </details>
                 }
               }
-              @if (!chat.streamingText() && !chat.currentToolCalls().length) {
+              @if (!chat.streamingText() && !chat.currentToolCalls().length && !chat.pendingPermission()) {
                 <div class="thinking">
                   <span class="thinking-dot"></span>
                   <span class="thinking-dot"></span>
@@ -526,18 +537,20 @@ const CATEGORY_LABELS: Record<string, string> = {
           </div>
         }
 
-        <!-- Permission request -->
+        <!-- Inline approval card — anchored to the live turn, not gated on
+             streaming state so it stays visible across edge cases. -->
         @if (chat.pendingPermission(); as perm) {
-          <div class="permission-request">
-            <div class="perm-header">
-              <app-icon size="sm" class="perm-icon">shield</app-icon>
-              {{ 'chat.permission.title' | transloco }}
+          <div class="approval-card">
+            <div class="approval-card-head">
+              <app-icon size="sm" class="approval-card-icon">shield</app-icon>
+              <span class="approval-card-label">{{ 'chat.approval.pendingTitle' | transloco }}</span>
             </div>
-            <div class="perm-body">
-              <strong>{{ perm.tool }}</strong>
-              <pre class="perm-args">{{ perm.args | json }}</pre>
+            <div class="approval-card-tool">
+              <app-icon size="sm" class="tool-icon">{{ toolIcon(perm.tool) }}</app-icon>
+              <span class="approval-card-tool-name">{{ perm.tool }}</span>
+              <span class="approval-card-tool-args">{{ formatToolArgs(perm.args) }}</span>
             </div>
-            <div class="perm-actions">
+            <div class="approval-card-actions">
               <app-button variant="success" size="sm" (clicked)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</app-button>
@@ -650,7 +663,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .back-link:hover { color: var(--text-primary, var(--text-primary)); }
 
-      .header-icon, .perm-icon, .error-icon {
+      .header-icon, .approval-card-icon, .error-icon {
         color: var(--accent-color, var(--accent-color));
       }
 
@@ -933,23 +946,27 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-body {
-        padding: 10px 14px;
-        border-radius: 12px;
         font-size: 13px;
         line-height: 1.5;
         min-width: 0;
       }
 
+      /* User: speech bubble — soft tinted background using the theme's
+         user-bubble token, with an accent-derived hairline border. */
       .message-user .message-body {
-        background: var(--accent-color, var(--accent-color));
-        color: var(--timeline-bg, var(--timeline-bg));
-        border-bottom-right-radius: 4px;
+        padding: 10px 14px;
+        border-radius: 12px;
+        border-top-right-radius: 4px;
+        background: var(--user-bubble, var(--surface-0));
+        color: var(--user-bubble-text, var(--text-primary));
+        border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
       }
 
+      /* Assistant: no bubble — flush text aligned with the avatar gutter. */
       .message-assistant .message-body {
-        background: var(--surface-0, var(--surface-0));
+        padding: 4px 0;
+        background: transparent;
         color: var(--text-primary, var(--text-primary));
-        border-bottom-left-radius: 4px;
       }
 
       .user-text {
@@ -1268,48 +1285,92 @@ const CATEGORY_LABELS: Record<string, string> = {
         40% { transform: translateY(-6px); }
       }
 
-      /* Permission request */
+      /* Approval — pending card and resolved badges.
+         Pending: warning-toned card anchored to the live turn.
+         Resolved: small inline badge prefixed onto the tool-detail row. */
 
-      .permission-request {
-        margin: 0 auto;
+      .approval-card {
+        margin: 8px auto;
         width: 80%;
         border: 1px solid var(--warning);
         border-radius: 8px;
         padding: 12px;
         background: var(--warning-tint);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
       }
 
-      .perm-header {
+      .approval-card-head {
         display: flex;
         align-items: center;
         gap: 6px;
         font-size: 13px;
         font-weight: 600;
         color: var(--warning);
-        margin-bottom: 8px;
       }
 
-      .perm-header .perm-icon { color: var(--warning); }
+      .approval-card-head .approval-card-icon { color: var(--warning); }
 
-      .perm-body {
+      .approval-card-tool {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        background: var(--surface-0);
+        border-radius: 6px;
         font-size: 12px;
-        color: var(--text-secondary, var(--text-secondary));
+        min-width: 0;
       }
 
-      .perm-args {
-        margin: 4px 0 8px;
-        padding: 6px 8px;
-        background: var(--surface-0, var(--surface-0));
-        border-radius: 4px;
+      .approval-card-tool .tool-icon { color: var(--text-muted); flex-shrink: 0; }
+
+      .approval-card-tool-name {
+        font-family: var(--font-mono);
+        font-weight: 600;
+        color: var(--text-primary);
+        flex-shrink: 0;
+      }
+
+      .approval-card-tool-args {
+        font-family: var(--font-mono);
         font-size: 11px;
-        max-height: 120px;
-        overflow: auto;
+        color: var(--text-muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
       }
 
-      .perm-actions {
+      .approval-card-actions {
         display: flex;
         gap: 8px;
       }
+
+      .approval-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        flex-shrink: 0;
+      }
+
+      .approval-badge.approval-approved {
+        background: var(--success-tint);
+        color: var(--success);
+      }
+
+      .approval-badge.approval-denied {
+        background: var(--danger-tint);
+        color: var(--danger);
+      }
+
+      .approval-badge-icon { font-size: 12px; }
 
       /* Error banner */
 
@@ -1692,7 +1753,7 @@ const CATEGORY_LABELS: Record<string, string> = {
           max-width: 98%;
         }
 
-        .permission-request {
+        .approval-card {
           width: 95%;
         }
 
@@ -2213,15 +2274,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     hasCompletedTools(calls: ToolCallInfo[]): boolean {
-        return calls.some(tc => tc.status === 'completed');
+        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied');
     }
 
     completedOnly(calls: ToolCallInfo[]): ToolCallInfo[] {
-        return calls.filter(tc => tc.status === 'completed');
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied');
     }
 
     completedToolCount(calls: ToolCallInfo[]): number {
-        return calls.filter(tc => tc.status === 'completed').length;
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied').length;
     }
 
     currentToolLabel(calls: ToolCallInfo[]): string {

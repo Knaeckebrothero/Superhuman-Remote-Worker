@@ -35,9 +35,10 @@ Env vars that participate:
 - `SEED_GOOGLE_API_KEY`
 - `SEED_GROQ_API_KEY`
 - `SEED_OPENROUTER_API_KEY`
-- `SEED_TAVILY_API_KEY`
 
 The legacy `vision` slot in `VALID_SYSTEM_API_KEY_PROVIDERS` is intentionally excluded — vision keys ride along on the per-endpoint inline `api_key` for custom endpoint rows.
+
+**Tavily is not a seedable provider.** Tavily is a web search engine, not an LLM, and is managed exclusively as a `TAVILY_API_KEY` env var sourced from a Vault-synced secret in production (see `helm/templates/agent/deployment.yaml`). It is not stored in `system_api_keys`/`user_api_keys`/`project_api_keys` and is not surfaced under Admin → Providers. Rotation: update Vault → re-render the secret → restart agent pods.
 
 ## What changed in this migration
 
@@ -45,7 +46,7 @@ Three orchestrator code paths used to read bare env names directly. They now go 
 
 | File | Before | After |
 |---|---|---|
-| `orchestrator/services/builder_search.py:tavily_search` | `os.getenv("TAVILY_API_KEY")` | accepts `api_key: str \| None` kwarg; caller resolves via `db.get_system_api_key("tavily")` |
+| `orchestrator/services/builder_search.py:tavily_search` | `os.getenv("TAVILY_API_KEY")` | accepts an optional `api_key: str \| None` kwarg; falls back to `os.getenv("TAVILY_API_KEY")` when unset. Tavily is not a DB-managed provider. |
 | `orchestrator/main.py:_create_builder_llm` | fell through `BUILDER_*_API_KEY` → bare-name env | infer provider, look up in `system_api_keys`, raise `RuntimeError` with seed-hint when absent. Codex unchanged. |
 | `orchestrator/services/message_triage.py:_resolve_from_env` | env-var legacy fallback under `DeprecationWarning` | **deleted** — DB-only path now |
 

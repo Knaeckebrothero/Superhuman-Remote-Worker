@@ -925,7 +925,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     },
                 )
 
-        async def permission_check(tool_name: str, tool_args: Dict[str, Any]) -> bool:
+        async def permission_check(
+            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+        ) -> bool:
             mode = _session.permission_mode
 
             if mode == "autonomous":
@@ -942,6 +944,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 ws,
                 "permission.request",
                 {
+                    "id": tool_call_id,
                     "tool": tool_name,
                     "args": _safe_serialize(tool_args),
                 },
@@ -950,9 +953,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             # Wait for approval (with timeout)
             try:
                 response = await asyncio.wait_for(user_queue.get(), timeout=300)
-                return response == APPROVE_SENTINEL
+                approved = response == APPROVE_SENTINEL
             except asyncio.TimeoutError:
-                return False
+                approved = False
+            _session.tool_decisions[tool_call_id] = (
+                "approved" if approved else "denied"
+            )
+            return approved
 
         async def on_turn_start(turn_id: int) -> None:
             _session.turn_count = turn_id
@@ -986,11 +993,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                             _session.messages,
                             turn_id,
                             metrics=metrics,
+                            tool_decisions=dict(_session.tool_decisions),
                         ),
                         timeout=5.0,
                     )
                 except asyncio.TimeoutError:
                     logger.warning("AI message save timed out (5s) — proceeding")
+            _session.tool_decisions.clear()
 
             # Auto-generate title after first few turns (fire-and-forget).
             # Retry on turns 1-3 in case the LLM is transiently unreachable.
@@ -1306,8 +1315,14 @@ async def _save_turn_ai_messages(
     messages: List[Any],
     turn_number: int,
     metrics: dict | None = None,
+    tool_decisions: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Fire-and-forget: save AI + tool messages from the most recent turn via orchestrator REST."""
+    """Fire-and-forget: save AI + tool messages from the most recent turn via orchestrator REST.
+
+    ``tool_decisions`` carries the per-call supervised approval outcome
+    (``tool_call_id -> 'approved' | 'denied'``) so the decision survives
+    history reload as a field on the persisted tool_calls.
+    """
     try:
         # Walk backwards from the end to find messages from this turn
         # (after the last HumanMessage)
@@ -1335,10 +1350,17 @@ async def _save_turn_ai_messages(
             content = msg.content if hasattr(msg, "content") else None
             tc = None
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tc = [
-                    {"name": t.get("name"), "args": t.get("args"), "id": t.get("id")}
-                    for t in msg.tool_calls
-                ]
+                tc = []
+                for t in msg.tool_calls:
+                    entry: Dict[str, Any] = {
+                        "name": t.get("name"),
+                        "args": t.get("args"),
+                        "id": t.get("id"),
+                    }
+                    decision = (tool_decisions or {}).get(t.get("id") or "")
+                    if decision:
+                        entry["decision"] = decision
+                    tc.append(entry)
             # Normalize content for Anthropic list-of-dicts format
             if isinstance(content, list):
                 content = " ".join(

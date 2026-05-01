@@ -743,6 +743,13 @@
       "autoAccept": "Auto-akzeptieren",
       "deny": "Ablehnen"
     },
+    "approval": {
+      "pendingTitle": "Bestätigung erforderlich, um dieses Tool auszuführen",
+      "badge": {
+        "approved": "Genehmigt",
+        "denied": "Abgelehnt"
+      }
+    },
     "error": {
       "dismiss": "Schließen"
     },

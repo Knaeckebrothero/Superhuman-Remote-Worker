@@ -104,8 +104,10 @@ class PersistentLoopCallbacks:
     # Notify client with tool result
     on_tool_result: Callable[[str, str, str], Awaitable[None]]
 
-    # Ask client for permission to run a tool (returns True if approved)
-    permission_check: Callable[[str, Dict[str, Any]], Awaitable[bool]]
+    # Ask client for permission to run a tool (returns True if approved).
+    # tool_call_id lets the transport correlate the decision back to a
+    # specific call so it can be persisted with the rest of the turn.
+    permission_check: Callable[[str, Dict[str, Any], str], Awaitable[bool]]
 
     # Notify client of turn lifecycle events
     on_turn_start: Callable[[int], Awaitable[None]]
@@ -783,7 +785,9 @@ async def _execute_turn(
             tool_call_id = tool_call["id"]
 
             # Permission check
-            approved = await callbacks.permission_check(tool_name, tool_args)
+            approved = await callbacks.permission_check(
+                tool_name, tool_args, tool_call_id
+            )
             if not approved:
                 messages.append(
                     ToolMessage(

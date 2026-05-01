@@ -165,7 +165,7 @@ CREATE TABLE IF NOT EXISTS user_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_user_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
 
@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS system_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_system_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
 
@@ -465,12 +465,36 @@ CREATE TABLE IF NOT EXISTS project_api_keys (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT valid_project_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'
     ))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_project_api_keys_provider ON project_api_keys(project_id, provider);
 CREATE INDEX IF NOT EXISTS idx_project_api_keys_project ON project_api_keys(project_id);
+
+-- Migration: drop 'tavily' from api_key provider CHECK constraints.
+-- Tavily is a search engine, not an LLM, so its key is now managed
+-- exclusively as a TAVILY_API_KEY env var (Vault → secret → agent pod
+-- env), not as a row in any of the *_api_keys tables. Cleans up rows
+-- seeded under the old shape on prior installs. Idempotent on fresh
+-- installs (DELETE matches nothing; ALTER re-adds the same constraint).
+DO $$ BEGIN
+    DELETE FROM user_api_keys    WHERE provider = 'tavily';
+    DELETE FROM system_api_keys  WHERE provider = 'tavily';
+    DELETE FROM project_api_keys WHERE provider = 'tavily';
+
+    ALTER TABLE user_api_keys    DROP CONSTRAINT IF EXISTS valid_user_api_key_provider;
+    ALTER TABLE user_api_keys    ADD CONSTRAINT valid_user_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+
+    ALTER TABLE system_api_keys  DROP CONSTRAINT IF EXISTS valid_system_api_key_provider;
+    ALTER TABLE system_api_keys  ADD CONSTRAINT valid_system_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+
+    ALTER TABLE project_api_keys DROP CONSTRAINT IF EXISTS valid_project_api_key_provider;
+    ALTER TABLE project_api_keys ADD CONSTRAINT valid_project_api_key_provider
+        CHECK (provider IN ('openai', 'anthropic', 'google', 'groq', 'openrouter', 'vision'));
+END $$;
 
 -- ============================================================================
 -- 1. JOBS TABLE

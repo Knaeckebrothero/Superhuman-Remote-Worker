@@ -1,6 +1,7 @@
 """Tavily web search for the instruction builder."""
 
 import logging
+import os
 
 import httpx
 
@@ -17,12 +18,15 @@ async def tavily_search(
     Returns formatted text results for the LLM. On any error,
     returns an error string (never raises).
 
-    The caller is responsible for resolving the key from
-    ``system_api_keys.tavily`` and passing it in — keeping this helper
-    DB-agnostic.
+    Tavily is a search engine, not an LLM — its key lives in the
+    ``TAVILY_API_KEY`` env var (sourced from a Helm/Vault secret in
+    production), not in ``system_api_keys``. Callers may pass an
+    explicit ``api_key`` to override the env (used by tests).
     """
     if not api_key:
-        return "Error: no Tavily API key configured (system_api_keys.tavily empty)."
+        api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Error: no Tavily API key configured (TAVILY_API_KEY env var unset)."
 
     payload = {
         "query": query,

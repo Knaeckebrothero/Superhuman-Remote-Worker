@@ -1,10 +1,10 @@
 """Tests for ``services.builder_search.tavily_search``.
 
-The helper migrated from reading ``TAVILY_API_KEY`` directly to accepting an
-``api_key`` keyword arg — the orchestrator wiring resolves it from
-``system_api_keys.tavily`` at dispatch time. These tests pin the new
-contract: explicit key → HTTP call with Bearer header; missing key →
-graceful error string, no HTTP call.
+Tavily is a search engine, not an LLM, so its key lives in the
+``TAVILY_API_KEY`` env var (sourced from a Helm/Vault secret in
+production). These tests pin the contract: env-fallback resolution,
+explicit ``api_key`` override → HTTP call with Bearer header, and a
+graceful error string with no HTTP call when neither is set.
 """
 
 from __future__ import annotations
@@ -17,8 +17,9 @@ from orchestrator.services.builder_search import tavily_search
 
 
 @pytest.mark.asyncio
-async def test_returns_error_when_no_key():
+async def test_returns_error_when_no_key(monkeypatch):
     """Missing key short-circuits — never opens an httpx client."""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     with patch("orchestrator.services.builder_search.httpx.AsyncClient") as mock_client:
         result = await tavily_search("foo")
     assert "no Tavily API key configured" in result
@@ -26,12 +27,38 @@ async def test_returns_error_when_no_key():
 
 
 @pytest.mark.asyncio
-async def test_returns_error_when_key_is_empty_string():
+async def test_returns_error_when_key_is_empty_string(monkeypatch):
     """Empty string is treated the same as None."""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     with patch("orchestrator.services.builder_search.httpx.AsyncClient") as mock_client:
         result = await tavily_search("foo", api_key="")
     assert "no Tavily API key configured" in result
     mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_env_var_when_kwarg_missing(monkeypatch):
+    """When ``api_key`` is not passed, the helper reads ``TAVILY_API_KEY``."""
+    monkeypatch.setenv("TAVILY_API_KEY", "tk-env-456")
+
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value={"results": [], "answer": ""})
+
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.post = AsyncMock(return_value=fake_response)
+
+    with patch(
+        "orchestrator.services.builder_search.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await tavily_search("hello")
+
+    fake_client.post.assert_awaited_once()
+    _, kwargs = fake_client.post.call_args
+    assert kwargs["headers"]["Authorization"] == "Bearer tk-env-456"
 
 
 @pytest.mark.asyncio
