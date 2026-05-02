@@ -1,4 +1,10 @@
 {{- if and .Values.databases.neo4j.enabled .Values.databases.neo4j.internal }}
+{{- $edition := .Values.databases.neo4j.edition | default "community" -}}
+{{- if and (eq $edition "enterprise") (not .Values.databases.neo4j.acceptLicense) -}}
+{{- fail "databases.neo4j.edition is 'enterprise' but databases.neo4j.acceptLicense is empty. Set acceptLicense to 'yes' (Startup Program / commercial license) or 'eval' (non-production developer license)." -}}
+{{- end -}}
+{{- $defaultImage := ternary "neo4j:5-enterprise" "neo4j:5-community" (eq $edition "enterprise") -}}
+{{- $image := default $defaultImage .Values.databases.neo4j.image -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -45,15 +51,14 @@ spec:
 ---
 {{- end }}
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "srw.fullname" . }}-neo4j
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
 spec:
+  serviceName: {{ include "srw.fullname" . }}-neo4j
   replicas: 1
-  strategy:
-    type: Recreate
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 6 }}
@@ -68,7 +73,7 @@ spec:
       {{- end }}
       containers:
         - name: neo4j
-          image: {{ .Values.databases.neo4j.image }}
+          image: {{ $image }}
           ports:
             - containerPort: 7474
               name: http
@@ -80,6 +85,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NEO4J_AUTH
+            {{- if eq $edition "enterprise" }}
+            - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
+              value: {{ .Values.databases.neo4j.acceptLicense | quote }}
+            {{- end }}
             - name: NEO4J_PLUGINS
               value: '["apoc"]'
             - name: NEO4J_dbms_security_procedures_unrestricted

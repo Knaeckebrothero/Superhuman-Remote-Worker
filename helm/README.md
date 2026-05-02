@@ -27,8 +27,9 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 | `workspace` | Per-job isolated PVC + SSH workspace pods | always on |
 | `databases.postgres` | Application database (jobs, users, projects) | internal or external |
 | `databases.vector` | pgvector for embeddings, citations, memories | internal or external |
+| `databases.keycloak` | Dedicated Postgres for the bundled Keycloak (only relevant when `keycloak.internal: true`) | internal or external |
 | `databases.mongodb` | Audit trail (optional but recommended) | internal or external |
-| `databases.neo4j` | Project knowledge graph (optional) | internal or external |
+| `databases.neo4j` | Project knowledge graph (optional). `edition: community` (default) or `enterprise` (set `acceptLicense` to `"yes"` for Startup Program / commercial, or `"eval"` for non-production). | internal or external |
 | `keycloak` | OIDC provider | internal or external |
 | `gitea` | Git server for agent code workspaces | internal or external |
 | `opencloud` / `nextcloud` | Cloud storage backend | one or external |
@@ -200,14 +201,15 @@ deployment — what you need depends on which optional components you enable.
 
 **Database credentials** (only when `internal: true` for that database):
 - `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`
-- `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_DB` (password reuses `POSTGRES_PASSWORD`)
+- `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD`, `VECTOR_POSTGRES_DB` — pgvector has its own superuser password key (separate from the main Postgres) so a credential leak on one instance doesn't compromise the other. Embed the same value in `VECTOR_DB_URL` if you also set that key for external-mode deployments.
 - `NEO` — Neo4j auth string (`neo4j/<password>`)
 
 **Database URLs** (only when `internal: false`):
 - `DATABASE_URL`, `VECTOR_DB_URL`, `MONGODB_URL`, `CITATION_DB_URL`
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
-- `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD`, `KC_DB_PASSWORD` (internal Keycloak only)
+- `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
+- `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
 - `KC_REALM_ADMIN_PASSWORD`
 - `MCP_OIDC_CLIENT_SECRET` (if `mcp.enabled`)
 - `GITEA_OIDC_CLIENT_SECRET`, `NEXTCLOUD_OIDC_CLIENT_SECRET`, `OPENCLOUD_KEYCLOAK_CLIENT_SECRET`, `PGADMIN_OIDC_CLIENT_SECRET` (per enabled component)
@@ -238,6 +240,7 @@ POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
 POSTGRES_DB=srw
 VECTOR_POSTGRES_USER=srw
+VECTOR_POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_DB=srw_vector
 KC_REALM_ADMIN_PASSWORD=changeme
 OPENAI_API_KEY=sk-...

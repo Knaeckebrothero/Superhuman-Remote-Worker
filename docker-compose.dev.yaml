@@ -50,12 +50,26 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
-      - ./orchestrator/database/init_sso_dbs.sh:/docker-entrypoint-initdb.d/000_init_sso_dbs.sh:Z
       - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-keycloak:
+    image: docker.io/library/postgres:15
+    container_name: srw-postgres-keycloak
+    environment:
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD:-keycloak}
+      POSTGRES_DB: keycloak
+    volumes:
+      - postgres_keycloak_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -230,9 +244,9 @@ services:
     environment:
       # Database
       KC_DB: postgres
-      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_URL: jdbc:postgresql://postgres-keycloak:5432/keycloak
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: keycloak
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD:-keycloak}
       # Hostname — front-channel URLs use localhost so the browser can reach them.
       # KC_HOSTNAME_BACKCHANNEL_DYNAMIC allows container-to-container backchannel
       # requests (e.g. Gitea token exchange) to use the internal hostname.
@@ -263,7 +277,7 @@ services:
     ports:
       - "${KEYCLOAK_PORT:-8180}:8080"
     depends_on:
-      postgres:
+      postgres-keycloak:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
@@ -601,6 +615,8 @@ services:
 volumes:
   postgres_dev_data:
     name: srw_postgres_dev_data
+  postgres_keycloak_dev_data:
+    name: srw_postgres_keycloak_dev_data
   postgres_vector_dev_data:
     name: srw_postgres_vector_dev_data
   mongodb_dev_data:

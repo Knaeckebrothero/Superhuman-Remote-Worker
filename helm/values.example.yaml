@@ -70,6 +70,13 @@ databases:
     enabled: true
     internal: false
     externalUrl: "postgresql://srw:<pw>@pg.example.com:5432/srw_vector"
+  # Dedicated Postgres for the bundled Keycloak. Only relevant when keycloak.internal=true.
+  # When the customer brings an external IdP (the recommended setup above), this block is ignored.
+  keycloak:
+    enabled: true
+    internal: false
+    # JDBC URL — password still comes from KC_DB_PASSWORD in the secret.
+    externalUrl: "jdbc:postgresql://kc-pg.example.com:5432/keycloak?user=keycloak"
   mongodb:
     enabled: true
     internal: false
@@ -77,6 +84,13 @@ databases:
   neo4j:
     # Neo4j is optional. Disable unless you use the project knowledge graph.
     enabled: false
+    # Edition toggle — defaults to community. To run Neo4j Enterprise:
+    #   edition: enterprise
+    #   acceptLicense: "yes"   # Startup Program / commercial license, or
+    #   acceptLicense: "eval"  # non-production developer license
+    # Image is auto-selected from edition; override .image to pin a specific tag.
+    edition: community
+    acceptLicense: ""
 
 # -----------------------------------------------------------------------------
 # Cloud storage — point at your existing Nextcloud / OpenCloud / WebDAV.

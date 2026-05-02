@@ -168,19 +168,6 @@ async def init_all(
                 return False
             logger.info("")
 
-            # Reset SSO databases on force-reset (Keycloak re-imports realm-export.json)
-            if force_reset:
-                from orchestrator.init import reset_sso_databases
-
-                logger.info("  Resetting SSO databases (Keycloak)...")
-                await reset_sso_databases()
-
-            # Create Keycloak database on the same PostgreSQL instance
-            from orchestrator.init import ensure_sso_databases
-
-            logger.info("  Creating SSO databases (Keycloak, Nextcloud)...")
-            await ensure_sso_databases()
-
             step += 1
             logger.info(f"[{step}/{total_steps}] Initializing Vector DB...")
             if not await init_vector_db(force_reset):

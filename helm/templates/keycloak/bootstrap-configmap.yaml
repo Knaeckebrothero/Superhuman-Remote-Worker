@@ -6,6 +6,14 @@
 # realm + each client; fields we own get re-applied on every run, so future
 # chart upgrades that add fields propagate automatically.
 #
+# Required permissions on the kcadm account (KC_ADMIN_USER), assigned via the
+# master realm on client `<TARGET_REALM>-realm`:
+#   view-realm, view-clients, manage-clients
+#   + view-users, manage-users  (only when serviceAccounts.cloud.enabled=true)
+#   + master-realm create-realm (only when CREATE_REALM=true)
+# The composite `realm-admin` role no longer exists in modern Keycloak (24+);
+# the granular roles above are the minimum.
+#
 # WARNING: chart-managed clients should NOT be hand-edited in the Keycloak
 # UI — those edits will be clobbered on the next `helm upgrade`. Add new
 # redirect URIs / scopes via chart values instead.
