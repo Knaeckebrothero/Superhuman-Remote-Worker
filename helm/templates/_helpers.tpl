@@ -204,6 +204,19 @@ Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS
 {{- end }}
 
 {{/*
+JDBC URL the bundled Keycloak uses to talk to its own Postgres. Resolves to the
+in-cluster `srw-keycloakdb` Service when databases.keycloak.internal is true,
+or to the operator-supplied externalUrl otherwise (e.g. managed Postgres).
+*/}}
+{{- define "srw.keycloakDbJdbcUrl" -}}
+{{- if .Values.databases.keycloak.internal -}}
+jdbc:postgresql://{{ include "srw.fullname" . }}-keycloakdb:5432/keycloak
+{{- else -}}
+{{- required "databases.keycloak.externalUrl is required when databases.keycloak.internal is false" .Values.databases.keycloak.externalUrl -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Resources for the Keycloak bootstrap Job.
 
   - srw.keycloakBootstrapServer  — URL kcadm authenticates against.

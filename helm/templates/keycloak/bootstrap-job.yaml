@@ -1,6 +1,6 @@
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.bootstrap.enabled }}
 {{- if not .Values.keycloak.bootstrap.adminCredentialsSecret -}}
-{{- fail "keycloak.bootstrap.enabled requires keycloak.bootstrap.adminCredentialsSecret (a K8s Secret with KC_ADMIN_USER + KC_ADMIN_PASSWORD)" -}}
+{{- fail "keycloak.bootstrap.enabled requires keycloak.bootstrap.adminCredentialsSecret — a K8s Secret with KC_ADMIN_USER + KC_ADMIN_PASSWORD. The account needs roles view-realm, view-clients, manage-clients (+ view-users, manage-users when serviceAccounts.cloud.enabled=true) on the <TARGET_REALM>-realm client in the master realm. See keycloak.bootstrap.adminCredentialsSecret in values.yaml for details." -}}
 {{- end -}}
 {{- $sa := .Values.keycloak.bootstrap.serviceAccounts -}}
 {{- if and $sa $sa.cloud $sa.cloud.enabled -}}
