@@ -89,6 +89,10 @@ spec:
             - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
               value: {{ .Values.databases.neo4j.acceptLicense | quote }}
             {{- end }}
+            - name: NEO4J_server_memory_heap_max__size
+              value: {{ .Values.databases.neo4j.heapMaxSize | default "512m" | quote }}
+            - name: NEO4J_server_memory_pagecache_size
+              value: {{ .Values.databases.neo4j.pagecacheSize | default "512m" | quote }}
             - name: NEO4J_PLUGINS
               value: '["apoc"]'
             - name: NEO4J_dbms_security_procedures_unrestricted
