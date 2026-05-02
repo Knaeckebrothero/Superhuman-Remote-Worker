@@ -65,10 +65,7 @@ sudo apt-get install -y \
     python3 \
     python3-venv \
     python3-dev \
-    python3-pip \
-    chromium-browser \
-    fonts-liberation \
-    fonts-noto-core
+    python3-pip
 
 # -----------------------------------------------------------------------------
 # 1b. Datasource CLI clients (psql, mongosh, cypher-shell)
@@ -116,6 +113,28 @@ sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || 
 
 # Management daemon dependencies (system-wide so they survive packer user deletion)
 sudo python3 -m pip install --break-system-packages nats-py psutil
+
+# -----------------------------------------------------------------------------
+# 3b. Playwright Chromium (replaces apt chromium-browser, which on Ubuntu Noble
+#     is a snap shim that hangs the build with no snap-store connectivity).
+#     Pin propagated from .playwright-version via the Packer var of the same
+#     name; symlink is provisioned at image build time only — runtime upgrades
+#     would dangle the symlink and are not supported.
+# -----------------------------------------------------------------------------
+
+echo "--- Installing Playwright Chromium ---"
+: "${PLAYWRIGHT_VERSION:?PLAYWRIGHT_VERSION must be set by Packer (see .playwright-version)}"
+
+sudo python3 -m pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}"
+# fonts-noto-core: extended Unicode/CJK coverage that --with-deps does not pull
+sudo apt-get install -y --no-install-recommends fonts-noto-core
+sudo PLAYWRIGHT_BROWSERS_PATH=/opt/playwright playwright install --with-deps chromium
+
+CHROMIUM_BIN=$(sudo find /opt/playwright -maxdepth 4 -path '*/chrome-linux/chrome' -type f | head -1)
+test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/playwright"; exit 1; }
+sudo ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium
+echo "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright" | sudo tee -a /etc/environment
+echo "Chromium installed at $CHROMIUM_BIN (symlinked /usr/local/bin/agent-chromium)"
 
 # -----------------------------------------------------------------------------
 # 4. Node.js 22 + npm + global packages

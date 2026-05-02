@@ -84,19 +84,21 @@ def _start_remote_chromium(backend, downloads_path: str) -> str:
 
     # Kill any existing Chromium (idempotent)
     backend.exec_command(
-        "pkill -f 'chromium.*remote-debugging-port' || true", timeout=5
+        "pkill -f 'agent-chromium.*remote-debugging-port' || true", timeout=5
     )
 
-    # Start Chromium headless with CDP
+    # Start Chromium headless with CDP. `agent-chromium` is a stable symlink
+    # to the Playwright-bundled binary, provisioned by docker/agent-vm-base
+    # /scripts/provision.sh and docker/Dockerfile.workspace.
     cmd = (
-        "chromium-browser"
+        "agent-chromium"
         " --headless=new"
         " --no-sandbox"
         " --disable-gpu"
         " --disable-dev-shm-usage"
         f" --remote-debugging-port={CDP_PORT}"
         " --remote-debugging-address=0.0.0.0"
-        " --user-data-dir=/tmp/chromium-cdp-profile"
+        " --user-data-dir=/tmp/agent-chromium-cdp-profile"
     )
     backend.exec_command(f"nohup {cmd} > /tmp/chromium-cdp.log 2>&1 &", timeout=10)
 
@@ -126,7 +128,7 @@ def _stop_remote_chromium(backend) -> None:
     """Stop Chromium on the remote workspace."""
     try:
         backend.exec_command(
-            "pkill -f 'chromium.*remote-debugging-port' || true", timeout=5
+            "pkill -f 'agent-chromium.*remote-debugging-port' || true", timeout=5
         )
     except Exception:
         pass
