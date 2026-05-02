@@ -27,13 +27,13 @@ image:
   orchestrator:
     tag: sha-fb3c9c9
   agent:
-    tag: sha-8a1f0d3
+    tag: sha-b4d7fd1
   cockpit:
     tag: sha-8a1f0d3
   mcp:
     tag: sha-2dd8e7f
   workspace:
-    tag: sha-5788dfd
+    tag: sha-b4d7fd1
 # -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
