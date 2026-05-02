@@ -181,14 +181,21 @@ is *why* it sits forever once it fails.
 ## Status
 
 - [x] Diagnosis written up
-- [x] Step 2: node-side investigation in cluster (no taint, scheduler not
-      avoiding node4, container exited with code 255 reason `Unknown` —
-      consistent with containerd hiccup)
-- [ ] Pull `journalctl` / `dmesg` from node4 around 2026-04-28 17:41 UTC to
-      identify the actual containerd trigger
+- [x] Step 2: node-side investigation (no taint, scheduler not avoiding node4,
+      container exited with code 255 reason `Unknown` — consistent with hard
+      power-off)
+- [x] Trigger identified: rack-level power-down on 2026-04-28 17:41 UTC while
+      operator was installing a new server. No journal dive needed.
+- [x] Force-deleted the ten zombie pods on 2026-05-01 (data already lost via
+      emptyDir; purely cosmetic cleanup of the API objects).
+- [x] Marked the ten orphaned `threads` rows in srw Postgres as `ended` with
+      `ended_at = NOW()` on 2026-05-02. Chat history / audit rows preserved;
+      Cockpit will no longer show these as live sessions.
 - [ ] Reconcile `pvc-ws-thread-*` code path — figure out why PVCs are not
       being created and decide whether to (a) make thread workspaces really
       persistent or (b) remove the dead code path
-- [ ] Force-delete current zombies (data already lost — purely a cleanup)
-- [ ] Implement thread-workspace reaper
-- [ ] Decide on owner-reference / restartPolicy change
+- [ ] Implement thread-workspace reaper that catches both pod-side zombies
+      (`Failed`/`Unknown`) and DB-side orphans (threads with `status` in
+      `{created, active, idle}` whose pod has been gone for > N minutes).
+- [ ] Decide on owner-reference / restartPolicy change so future power events
+      don't leave bare-Pod tombstones in the first place.

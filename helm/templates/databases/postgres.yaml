@@ -15,37 +15,6 @@ spec:
     requests:
       storage: {{ .Values.databases.postgres.storageSize }}
 ---
-# ConfigMap for SSO database initialization script.
-# Runs on first postgres start via docker-entrypoint-initdb.d/.
-# The postStart lifecycle hook on the postgres container also runs
-# this SQL on every start, covering re-deploys with existing PVC data.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "srw.fullname" . }}-postgres-init
-  labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
-data:
-  init_sso_dbs.sh: |
-    #!/bin/bash
-    set -e
-    echo "Creating SSO databases..."
-
-    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" \
-         -v kc_pass="$KC_DB_PASSWORD" <<-EOSQL
-        DO \$\$
-        BEGIN
-            IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'keycloak') THEN
-                CREATE ROLE keycloak WITH LOGIN PASSWORD :'kc_pass';
-            END IF;
-        END\$\$;
-        SELECT 'CREATE DATABASE keycloak OWNER keycloak'
-        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'keycloak')
-        \gexec
-    EOSQL
-    echo "  keycloak: ok"
-    echo "SSO databases ready."
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -88,34 +57,9 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: POSTGRES_DB
-            - name: KC_DB_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
-                  key: KC_DB_PASSWORD
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-            - name: init-scripts
-              mountPath: /docker-entrypoint-initdb.d/init_sso_dbs.sh
-              subPath: init_sso_dbs.sh
-          lifecycle:
-            postStart:
-              exec:
-                command:
-                  - /bin/sh
-                  - -c
-                  - |
-                    until pg_isready -U "$POSTGRES_USER" -q; do sleep 1; done
-                    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" \
-                         -v kc_pass="$KC_DB_PASSWORD" <<-'EOSQL'
-                        SELECT format('CREATE ROLE keycloak LOGIN PASSWORD %L', :'kc_pass')
-                        WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'keycloak')
-                        \gexec
-                        SELECT 'CREATE DATABASE keycloak OWNER keycloak'
-                        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'keycloak')
-                        \gexec
-                    EOSQL
           livenessProbe:
             exec:
               command: ["pg_isready", "-U", "srw"]
@@ -132,10 +76,6 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "srw.fullname" . }}-postgres-data
-        - name: init-scripts
-          configMap:
-            name: {{ include "srw.fullname" . }}-postgres-init
-            defaultMode: 0755
 ---
 apiVersion: v1
 kind: Service
