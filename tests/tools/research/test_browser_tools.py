@@ -474,9 +474,9 @@ class TestStartRemoteChromium:
         first_call = mock_remote_backend.exec_command.call_args_list[0]
         assert "pkill" in first_call[0][0]
 
-        # Verify chromium-browser was started
+        # Verify the Playwright Chromium symlink was launched
         second_call = mock_remote_backend.exec_command.call_args_list[1]
-        assert "chromium-browser" in second_call[0][0]
+        assert "agent-chromium" in second_call[0][0]
         assert "--remote-debugging-port=9222" in second_call[0][0]
         assert "--headless=new" in second_call[0][0]
 
