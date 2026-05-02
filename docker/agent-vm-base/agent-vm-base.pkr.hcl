@@ -68,6 +68,11 @@ variable "cpus" {
   default = 4
 }
 
+variable "playwright_version" {
+  type        = string
+  description = "Playwright Python package version (read from .playwright-version at repo root). No default — Packer refuses to build without it, preventing silent drift."
+}
+
 # -----------------------------------------------------------------------------
 # Source: QEMU builder with Ubuntu cloud image + cloud-init seed
 # -----------------------------------------------------------------------------
@@ -186,6 +191,7 @@ build {
     script = "scripts/provision.sh"
     environment_vars = [
       "DEBIAN_FRONTEND=noninteractive",
+      "PLAYWRIGHT_VERSION=${var.playwright_version}",
     ]
   }
 

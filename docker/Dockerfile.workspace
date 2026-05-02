@@ -5,7 +5,7 @@
 # Provides: SSH server, tmux, git, code-server, dev tools.
 # The agent connects via RemoteBackend (SSH/SFTP) — identical to VM workspaces.
 #
-# Does NOT include: Python agent code, LLM libraries, playwright, PyTorch.
+# Does NOT include: Python agent code, LLM libraries, PyTorch.
 # =============================================================================
 
 FROM ubuntu:24.04
@@ -109,13 +109,21 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
         yarn
 
 # ---------------------------------------------------------------------------
-# 2b. Chromium (headless browser for CDP-based remote automation)
+# 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
+#     Noble is a snap shim — see docker/agent-vm-base/scripts/provision.sh).
+#     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
+#     provision.sh and requirements.txt). Path matches Dockerfile.agent:80.
 # ---------------------------------------------------------------------------
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    chromium-browser \
-    fonts-liberation \
-    fonts-noto-core \
-    && rm -rf /var/lib/apt/lists/*
+ARG PLAYWRIGHT_VERSION
+RUN test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg required" && exit 1) \
+    && pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
+    && apt-get update -y && apt-get install -y --no-install-recommends fonts-noto-core \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright playwright install --with-deps chromium \
+    && CHROMIUM_BIN=$(find /opt/playwright -maxdepth 4 -path '*/chrome-linux/chrome' -type f | head -1) \
+    && test -n "$CHROMIUM_BIN" \
+    && ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.cache/ms-playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 # ---------------------------------------------------------------------------
 # 3. code-server (IDE)
