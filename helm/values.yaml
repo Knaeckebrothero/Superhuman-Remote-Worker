@@ -306,6 +306,13 @@ databases:
     # -- LoadBalancer for direct Bolt access (optional, internal-only)
     loadBalancer:
       enabled: false
+    # -- JVM heap and OS-level page cache. Neo4j 5 auto-detects from the cgroup
+    #    limit and routinely overshoots, refusing to start with "Invalid memory
+    #    configuration - exceeds physical memory". Pin both explicitly. Together
+    #    they should leave ~1Gi of headroom under the container's memory limit
+    #    for JVM metaspace, native threads, and page cache OS overhead.
+    heapMaxSize: "512m"
+    pagecacheSize: "512m"
     resources:
       requests:
         memory: "512Mi"
