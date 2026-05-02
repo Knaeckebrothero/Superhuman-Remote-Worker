@@ -59,6 +59,7 @@ def _make_pod(
     thread_id=None,
     age_seconds=10,
     waiting_reason=None,
+    agent_terminated_at=None,
 ):
     """Create a mock K8s pod object.
 
@@ -66,6 +67,10 @@ def _make_pod(
     ``waiting_reason`` attaches a single container_status with
     ``state.waiting.reason``. When None, container_statuses is empty — which
     matches the shape of pods that haven't progressed to container creation.
+    ``agent_terminated_at`` attaches a container_status named ``"agent"``
+    with ``state.terminated.finished_at`` set to (now - that many seconds),
+    simulating an agent container that has crashed while a sidecar keeps
+    the pod in phase=Running.
     """
     pod = MagicMock()
     pod.metadata.name = name
@@ -80,12 +85,22 @@ def _make_pod(
     )
     pod.status.phase = phase
     pod.status.pod_ip = "10.0.0.1"
+    statuses = []
     if waiting_reason is not None:
         cs = MagicMock()
+        cs.name = "agent"
         cs.state.waiting.reason = waiting_reason
-        pod.status.container_statuses = [cs]
-    else:
-        pod.status.container_statuses = []
+        cs.state.terminated = None
+        statuses.append(cs)
+    if agent_terminated_at is not None:
+        cs = MagicMock()
+        cs.name = "agent"
+        cs.state.waiting = None
+        cs.state.terminated.finished_at = datetime.now(timezone.utc) - timedelta(
+            seconds=agent_terminated_at
+        )
+        statuses.append(cs)
+    pod.status.container_statuses = statuses
     pod.status.init_container_statuses = []
     return pod
 
@@ -107,7 +122,7 @@ class TestReapPods:
     async def test_noop_when_k8s_not_available(self):
         p, _ = _make_provisioner(k8s_available=False)
         result = await p.reap_pods()
-        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
+        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
 
     @pytest.mark.asyncio
     async def test_noop_when_no_reapable_pods(self):
@@ -121,7 +136,7 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
+        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
         assert p._core_api.delete_namespaced_pod.call_count == 0
 
     @pytest.mark.asyncio
@@ -229,7 +244,51 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 0, "stale": 0, "unstartable": 0}
+        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
+        assert p._core_api.delete_namespaced_pod.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_reaps_crashed_running_pod_past_grace(self):
+        # Sidecar keeps the pod in phase=Running even though agent died —
+        # this is the case the original sidecar-pinned bug exposed.
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-crashed",
+                phase="Running",
+                agent_terminated_at=120,
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["crashed"] == 1
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_preserves_crashed_pod_within_grace(self):
+        p, conn = _make_provisioner()
+        conn.fetch.return_value = []
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod(
+                "srw-agent-j-just-crashed",
+                phase="Running",
+                agent_terminated_at=10,
+            ),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["crashed"] == 0
         assert p._core_api.delete_namespaced_pod.call_count == 0
 
     @pytest.mark.asyncio
@@ -254,7 +313,7 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 1, "stale": 1, "unstartable": 1}
+        assert result == {"completed": 1, "crashed": 0, "stale": 1, "unstartable": 1}
         assert p._core_api.delete_namespaced_pod.call_count == 3
 
 
@@ -654,3 +713,22 @@ class TestActiveCountsByPurpose:
         p, _ = _make_provisioner(k8s_available=False)
         result = await p.active_counts_by_purpose()
         assert result == {"job": 0, "session": 0, "total": 0}
+
+    @pytest.mark.asyncio
+    async def test_excludes_pods_with_terminated_agent_container(self):
+        # Sidecar-pinned crashed pods stay in phase=Running but must not
+        # count against MAX_AGENTS, otherwise the ceiling locks up.
+        p, _ = _make_provisioner()
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("j1", purpose="job"),
+            _make_pod("j2", purpose="job", agent_terminated_at=5),
+            _make_pod("s1", purpose="session", agent_terminated_at=200),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.active_counts_by_purpose()
+        assert result == {"job": 1, "session": 0, "total": 1}
