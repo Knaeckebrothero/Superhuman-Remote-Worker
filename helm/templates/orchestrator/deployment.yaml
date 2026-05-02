@@ -561,6 +561,14 @@ spec:
               value: {{ include "srw.secretName" . | quote }}
             - name: AGENT_CONFIGMAP
               value: {{ include "srw.configMapName" . | quote }}
+            # Chart-standard labels for dynamically-provisioned agent pods.
+            # The chart's database NetworkPolicies match on these labels;
+            # without them, dynamic agent pods are blocked from reaching
+            # postgres/pgvector/mongodb/neo4j.
+            - name: AGENT_LABEL_NAME
+              value: {{ include "srw.name" . | quote }}
+            - name: AGENT_LABEL_INSTANCE
+              value: {{ .Release.Name | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
             # Persistent agent pods (on-demand provisioning)
