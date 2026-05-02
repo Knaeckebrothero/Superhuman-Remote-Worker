@@ -60,7 +60,8 @@ ALTER TABLE models ADD CONSTRAINT models_capabilities_check
 DO $$ BEGIN
     ALTER TABLE models ADD CONSTRAINT uq_model_provider_v2
         UNIQUE (provider_kind, provider_ref, model_id);
-EXCEPTION WHEN duplicate_object THEN null;
+-- See schema.sql: implicit backing index trips 42P07 ahead of 42710.
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN null;
 END $$;
 
 DROP INDEX IF EXISTS idx_models_role_enabled;

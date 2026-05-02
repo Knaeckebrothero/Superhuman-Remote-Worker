@@ -402,7 +402,11 @@ END $$;
 DO $$ BEGIN
     ALTER TABLE models ADD CONSTRAINT uq_model_provider_v2
         UNIQUE (provider_kind, provider_ref, model_id);
-EXCEPTION WHEN duplicate_object THEN null;
+-- ADD CONSTRAINT ... UNIQUE creates a backing index with the same name. On
+-- fresh installs the inline CONSTRAINT in CREATE TABLE above already created
+-- both. PostgreSQL checks the relation namespace first and raises 42P07
+-- (duplicate_table) for the index, not 42710 (duplicate_object). Catch both.
+EXCEPTION WHEN duplicate_object OR duplicate_table THEN null;
 END $$;
 
 CREATE INDEX IF NOT EXISTS idx_models_capabilities_enabled
