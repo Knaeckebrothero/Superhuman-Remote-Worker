@@ -66,6 +66,14 @@ jobs:
         run: ruff format --check src/ orchestrator/ tests/
         continue-on-error: true
 
+      - name: Verify Playwright pin consistency
+        run: |
+          PIN=$(tr -d '[:space:]' < .playwright-version)
+          test -n "$PIN" || { echo "::error::.playwright-version is empty"; exit 1; }
+          grep -q "^playwright==${PIN}\b" requirements.txt \
+            || { echo "::error::playwright pin in requirements.txt does not match .playwright-version (${PIN})"; exit 1; }
+        continue-on-error: true
+
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
@@ -285,7 +293,7 @@ jobs:
           echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
 
           AGENT=$(has_changes "$SHA_AGENT" \
-            src/ config/ agent.py requirements.txt docker/Dockerfile.agent)
+            src/ config/ agent.py requirements.txt docker/Dockerfile.agent .playwright-version)
 
           ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" \
             orchestrator/ config/ docker/Dockerfile.orchestrator)
@@ -298,13 +306,13 @@ jobs:
             orchestrator/services/__init__.py docker/Dockerfile.mcp)
 
           WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
-            docker/Dockerfile.workspace docker/workspace-entrypoint.sh)
+            docker/Dockerfile.workspace docker/workspace-entrypoint.sh .playwright-version)
 
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
 
           VM_BASE=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/)
+            docker/agent-vm-base/ .playwright-version)
 
           SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
             vm/sudo-daemon/ vm/sudo-plugin/)
@@ -617,11 +625,16 @@ jobs:
           tags: |
             type=sha,format=short,prefix=sha-
             type=raw,value=experimental
+      - name: Read Playwright version
+        id: pw
+        run: echo "version=$(tr -d '[:space:]' < .playwright-version)" >> "$GITHUB_OUTPUT"
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.workspace
+          build-args: |
+            PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -745,7 +758,10 @@ jobs:
         run: packer init agent-vm-base.pkr.hcl
       - name: Packer build
         working-directory: docker/agent-vm-base
-        run: packer build agent-vm-base.pkr.hcl
+        run: |
+          PW_VERSION=$(tr -d '[:space:]' < ../../.playwright-version)
+          test -n "$PW_VERSION" || { echo "::error::.playwright-version is empty"; exit 1; }
+          packer build -var "playwright_version=${PW_VERSION}" agent-vm-base.pkr.hcl
       - uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
