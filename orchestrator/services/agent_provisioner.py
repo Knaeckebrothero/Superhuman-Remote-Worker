@@ -81,9 +81,7 @@ class AgentProvisioner:
         # app.kubernetes.io/{name,instance,component}=agent) reject ingress
         # from dynamically-provisioned agent pods. Injected by the chart's
         # orchestrator Deployment; defaults match the homelab values.
-        self._chart_label_name: str = os.environ.get(
-            "AGENT_LABEL_NAME", ""
-        ).strip()
+        self._chart_label_name: str = os.environ.get("AGENT_LABEL_NAME", "").strip()
         self._chart_label_instance: str = os.environ.get(
             "AGENT_LABEL_INSTANCE", ""
         ).strip()
