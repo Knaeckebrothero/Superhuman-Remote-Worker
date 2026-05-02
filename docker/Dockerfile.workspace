@@ -119,8 +119,10 @@ RUN test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg require
     && pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
     && apt-get update -y && apt-get install -y --no-install-recommends fonts-noto-core \
     && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright playwright install --with-deps chromium \
-    && CHROMIUM_BIN=$(find /opt/playwright -maxdepth 4 -path '*/chrome-linux/chrome' -type f | head -1) \
-    && test -n "$CHROMIUM_BIN" \
+    # Layout varies by version: older revs use chrome-linux/, newer (>=1.49) use
+    # chrome-linux64/. Match both; exclude the headless-shell directory.
+    && CHROMIUM_BIN=$(find /opt/playwright -maxdepth 4 -type f \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) ! -path '*headless_shell*' | head -1) \
+    && test -n "$CHROMIUM_BIN" || (echo "chromium binary not found under /opt/playwright" && find /opt/playwright -maxdepth 4 -type d && exit 1) \
     && ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium \
     && rm -rf /var/lib/apt/lists/* /root/.cache/ms-playwright
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
