@@ -208,7 +208,7 @@ spec:
               value: "agent-vms"
             # Image tag managed by CI/CD — do not edit manually
             - name: DEFAULT_VM_IMAGE
-              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-2e27285"
+              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-3a2fbce"
             - name: DEFAULT_CPU
               value: "2"
             - name: DEFAULT_MEMORY
