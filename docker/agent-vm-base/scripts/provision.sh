@@ -130,8 +130,10 @@ sudo python3 -m pip install --break-system-packages "playwright==${PLAYWRIGHT_VE
 sudo apt-get install -y --no-install-recommends fonts-noto-core
 sudo PLAYWRIGHT_BROWSERS_PATH=/opt/playwright playwright install --with-deps chromium
 
-CHROMIUM_BIN=$(sudo find /opt/playwright -maxdepth 4 -path '*/chrome-linux/chrome' -type f | head -1)
-test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/playwright"; exit 1; }
+# Playwright's directory layout varies by version: older revs use chrome-linux/,
+# newer (>=1.49) use chrome-linux64/. Match both, exclude headless-shell builds.
+CHROMIUM_BIN=$(sudo find /opt/playwright -maxdepth 4 -type f \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) ! -path '*headless_shell*' | head -1)
+test -n "$CHROMIUM_BIN" || { echo "ERROR: chromium binary not found under /opt/playwright"; sudo find /opt/playwright -maxdepth 4 -type d; exit 1; }
 sudo ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium
 echo "PLAYWRIGHT_BROWSERS_PATH=/opt/playwright" | sudo tee -a /etc/environment
 echo "Chromium installed at $CHROMIUM_BIN (symlinked /usr/local/bin/agent-chromium)"
