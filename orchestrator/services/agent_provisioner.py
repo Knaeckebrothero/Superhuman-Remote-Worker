@@ -76,6 +76,17 @@ class AgentProvisioner:
         )
         self._reserved_job_slots: int = int(os.environ.get("RESERVED_JOB_SLOTS", "0"))
         self._label_selector: str = "srw/managed-by=agent-provisioner"
+        # Standard Helm chart labels for chart-managed NetworkPolicies.
+        # Without these, the database NetworkPolicies (which match on
+        # app.kubernetes.io/{name,instance,component}=agent) reject ingress
+        # from dynamically-provisioned agent pods. Injected by the chart's
+        # orchestrator Deployment; defaults match the homelab values.
+        self._chart_label_name: str = os.environ.get(
+            "AGENT_LABEL_NAME", ""
+        ).strip()
+        self._chart_label_instance: str = os.environ.get(
+            "AGENT_LABEL_INSTANCE", ""
+        ).strip()
         self._tailscale_enabled: bool = os.environ.get(
             "AGENT_TAILSCALE_ENABLED", "false"
         ).strip().lower() in ("true", "1", "yes")
@@ -758,6 +769,18 @@ class AgentProvisioner:
             "srw/managed-by": "agent-provisioner",
             "srw/purpose": purpose,
         }
+        # Standard chart labels — required for the chart's database
+        # NetworkPolicies to allow ingress from these dynamic pods. The
+        # chart's Helm-rendered "agent" component selectors expect:
+        #   app.kubernetes.io/name      = <chart name>      (e.g. srw-dev)
+        #   app.kubernetes.io/instance  = <release name>    (e.g. ...-deployment)
+        #   app.kubernetes.io/component = agent
+        if self._chart_label_name:
+            labels["app.kubernetes.io/name"] = self._chart_label_name
+        if self._chart_label_instance:
+            labels["app.kubernetes.io/instance"] = self._chart_label_instance
+        if self._chart_label_name or self._chart_label_instance:
+            labels["app.kubernetes.io/component"] = "agent"
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
 
