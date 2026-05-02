@@ -47,16 +47,23 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data/db
+          # mongosh is a Node.js CLI; cold-start + driver handshake routinely
+          # exceeds the default 1s probe timeout under PVC load, leading to
+          # spurious liveness kills. 5s gives mongosh room to boot.
           livenessProbe:
             exec:
-              command: ["mongosh", "--eval", "db.adminCommand('ping')"]
+              command: ["mongosh", "--quiet", "--norc", "--eval", "db.adminCommand({ping:1})"]
             initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           readinessProbe:
             exec:
-              command: ["mongosh", "--eval", "db.adminCommand('ping')"]
+              command: ["mongosh", "--quiet", "--norc", "--eval", "db.adminCommand({ping:1})"]
             initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.databases.mongodb.resources | nindent 12 }}
       volumes:
