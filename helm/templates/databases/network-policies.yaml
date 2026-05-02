@@ -1,0 +1,163 @@
+{{- /*
+Database-tier NetworkPolicies — one per internal DB StatefulSet.
+
+Each policy locks the database pod to ingress from its legitimate consumers
+only. Egress is intentionally unrestricted — a workspace-pod compromise that
+reaches a DB is the threat model here, and that path is closed by the
+podSelector-based allow-list below.
+
+Probes (liveness/readiness) come from the kubelet on the node, which bypasses
+NetworkPolicy entirely — no allowance needed.
+
+Optional admin UIs (pgadmin, mongo-express) are conditionally added to the
+allow-list when their respective .enabled toggles are set. The short-lived
+llm-seed Job is allowed against the main Postgres so the install can seed
+the model catalog.
+*/ -}}
+
+{{- if and .Values.databases.postgres.enabled .Values.databases.postgres.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-postgres
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "llm-seed") | nindent 14 }}
+        {{- if .Values.pgadmin.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgadmin") | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+{{- end }}
+
+{{- if and .Values.databases.vector.enabled .Values.databases.vector.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-pgvector
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+      ports:
+        - port: 5432
+          protocol: TCP
+---
+{{- end }}
+
+{{- if and .Values.databases.mongodb.enabled .Values.databases.mongodb.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-mongodb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "mongodb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongodb") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+        {{- if .Values.mongoExpress.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongo-express") | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: 27017
+          protocol: TCP
+---
+{{- end }}
+
+{{- if and .Values.databases.neo4j.enabled .Values.databases.neo4j.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-neo4j
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent") | nindent 14 }}
+      ports:
+        - port: 7474
+          protocol: TCP
+        - port: 7688
+          protocol: TCP
+        # Bolt also listens on 7687 in some configs; current chart pins 7688.
+---
+{{- end }}
+
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal .Values.databases.keycloak.enabled .Values.databases.keycloak.internal }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-keycloakdb
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "keycloakdb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloakdb") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 14 }}
+      ports:
+        - port: 5432
+          protocol: TCP
+{{- end }}

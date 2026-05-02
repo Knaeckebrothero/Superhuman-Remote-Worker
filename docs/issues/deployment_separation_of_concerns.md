@@ -223,7 +223,32 @@ Cosmetic but worth bundling with the others.
 
 ---
 
-## Issue E: No NetworkPolicies on the data tier
+## Issue E: No NetworkPolicies on the data tier — RESOLVED 2026-05-02
+
+**Status**: Fixed on `develop`. New
+`helm/templates/databases/network-policies.yaml` adds one ingress
+NetworkPolicy per internal database StatefulSet, each gated on the same
+`enabled && internal` condition as the database itself:
+- `srw-postgres` ← orchestrator, agent, llm-seed Job, pgadmin (when
+  `pgadmin.enabled`)
+- `srw-pgvector` ← orchestrator, agent
+- `srw-mongodb` ← orchestrator, agent, mongo-express (when
+  `mongoExpress.enabled`)
+- `srw-neo4j` ← orchestrator, agent (HTTP 7474 + Bolt 7688)
+- `srw-keycloakdb` ← keycloak only (renders only when
+  `keycloak.internal && databases.keycloak.internal`)
+
+Selectors use the chart's existing `srw.componentSelectorLabels` helper, so
+they stay in sync if components are ever renamed. Only `policyTypes:
+[Ingress]` is set — egress is left unrestricted (DBs don't initiate
+meaningful outbound traffic; locking it down would just complicate future
+backup/replication work). Kubelet probes bypass NetworkPolicy entirely, so
+no allowance was needed for liveness/readiness. Verified by rendering
+default, `pgadmin/mongoExpress on`, and `keycloak.internal=false` paths —
+admin-UI selectors appear when toggled, keycloakdb policy disappears with
+external IdP. `helm lint` clean. Operator action on the next deploy: none
+beyond confirming the cluster has a CNI that enforces NetworkPolicy
+(Cilium, Calico, etc. — most do; Flannel does not).
 
 **Severity**: Medium
 
