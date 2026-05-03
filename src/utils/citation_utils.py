@@ -7,7 +7,6 @@ package that provides source verification and citation management.
 
 import os
 import logging
-import warnings
 from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -43,12 +42,21 @@ def get_citation_engine_config(
 ) -> Dict[str, Any]:
     """Build Citation Engine configuration.
 
-    ``overrides`` is the preferred path: the orchestrator passes resolved
-    values (model, base URL, DB URL) through job ``config_override`` at
-    dispatch, and the agent surfaces those here. When an override is
-    missing, the legacy env var is read and a ``DeprecationWarning`` is
-    emitted — those env vars come from the helm ConfigMap on pre-stage-5
-    deployments and will disappear entirely once the chart cleanup lands.
+    Resolution order: ``overrides`` > env vars > defaults. Both paths are
+    first-class — the orchestrator can either pass resolved values through
+    ``config_override`` or, more commonly, inject them as ``env_keys`` at
+    dispatch (the upstream ``citation_engine`` package reads them directly
+    from the process environment, so the env-var route is what actually
+    drives the engine in production).
+
+    Configure the citation model via Admin → Providers
+    (``system_settings.default_citation_model``); the orchestrator resolves
+    the pin against the model catalog at dispatch and writes
+    ``CITATION_LLM_MODEL`` / ``CITATION_LLM_URL`` (and
+    ``CITATION_LLM_API_KEY`` — currently informational; the upstream package
+    still reads ``OPENAI_API_KEY``) into the agent process environment for
+    the duration of the job. The vars in ``.env`` only take effect when the
+    agent runs without an orchestrator or no pin is configured anywhere.
 
     Args:
         overrides: Optional dict with ``llm_model``, ``llm_url``,
@@ -59,31 +67,11 @@ def get_citation_engine_config(
     """
     overrides = overrides or {}
 
-    llm_model = overrides.get("llm_model")
-    if not llm_model:
-        env_model = os.getenv("CITATION_LLM_MODEL")
-        if env_model:
-            warnings.warn(
-                "CITATION_LLM_MODEL env var is deprecated — pass "
-                "config_override['llm_model'] from the orchestrator instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            llm_model = env_model
-        else:
-            llm_model = "gpt-4"
+    llm_model = (
+        overrides.get("llm_model") or os.getenv("CITATION_LLM_MODEL") or "gpt-4"
+    )
 
-    llm_url = overrides.get("llm_url")
-    if not llm_url:
-        env_url = os.getenv("CITATION_LLM_URL")
-        if env_url:
-            warnings.warn(
-                "CITATION_LLM_URL env var is deprecated — pass "
-                "config_override['llm_url'] from the orchestrator instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            llm_url = env_url
+    llm_url = overrides.get("llm_url") or os.getenv("CITATION_LLM_URL")
 
     db_url = overrides.get("db_url") or os.getenv(
         "CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))
