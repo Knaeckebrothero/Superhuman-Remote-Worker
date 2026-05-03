@@ -832,6 +832,7 @@ async def _inject_dispatch_credentials(
             ("vision", "VISION", "default_vision_model"),
             ("whisper", "WHISPER", "default_whisper_model"),
             ("tts", "TTS", "default_tts_model"),
+            ("citation", "CITATION_LLM", "default_citation_model"),
         ):
             _model = user_settings.get(_user_key)
             if not _model:
@@ -848,6 +849,13 @@ async def _inject_dispatch_credentials(
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
             )
+            # The citation_engine package reads CITATION_LLM_URL (not _BASE_URL)
+            # and falls back to OPENAI_API_KEY for auth. Alias the URL key here
+            # so the upstream package picks up the dispatched endpoint.
+            if _kind == "citation" and "CITATION_LLM_BASE_URL" in env_keys_block:
+                env_keys_block.setdefault(
+                    "CITATION_LLM_URL", env_keys_block["CITATION_LLM_BASE_URL"]
+                )
             logger.info(f"Dispatch: injected {_kind} model: {_model}")
 
         embedding_provider = user_settings.get("embedding_provider")
