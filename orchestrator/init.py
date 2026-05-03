@@ -150,9 +150,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
             logger.info("  Resetting schema (dropping all tables)...")
             await db.reset_schema()
         else:
-            # Apply schema (idempotent)
-            await db.ensure_schema()
-            logger.info("  Applied schema.sql")
+            # Apply pending migrations (idempotent — no-op if up to date)
+            await db.apply_migrations()
+            logger.info("  Applied pending migrations")
 
         # Verify tables exist
         logger.info("  Verifying tables:")

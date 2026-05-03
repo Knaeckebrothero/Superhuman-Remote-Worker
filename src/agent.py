@@ -840,7 +840,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         metadata = metadata or {}
 
-        # On resume: try to load frozen config from JSONB (prevents config drift)
+        # On resume: try to load frozen config from JSONB (prevents config drift).
+        # NOTE: serialize_resolved_config strips api_key from agent.llm before
+        # storage, so the loaded config has llm.api_key=None. The orchestrator's
+        # resume dispatch re-injects credentials into metadata.config_override
+        # (see _inject_dispatch_credentials), which the override block below
+        # layers on top — so we deliberately defer _create_phase_llms() until
+        # after that merge happens at line ~1014 instead of recreating LLMs
+        # twice with a half-built config.
         _config_from_db = False
         if resume and self.postgres_conn:
             try:
@@ -852,7 +859,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 )
                 if resolved:
                     self.config = load_config_from_resolved(resolved)
-                    self._create_phase_llms()
                     _config_from_db = True
                     logger.info(f"Loaded frozen config for resumed job {job_id}")
             except Exception as e:
@@ -967,8 +973,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         f"Config upload directory not found: {config_uploads_dir}"
                     )
 
-        # Handle inline config override - merge on top of current config
-        if not _config_from_db and metadata.get("config_override"):
+        # Handle inline config override - merge on top of current config.
+        # Runs even when _config_from_db (resume path) so the orchestrator's
+        # re-injected credentials (api_key/base_url stripped from frozen
+        # config) can layer back onto the merged config before LLMs are
+        # created. Without this, resumed jobs hit the user's router with
+        # api_key=None and 401.
+        if metadata.get("config_override"):
             from .core.loader import (
                 _apply_settings_matrix,
                 deep_merge,
@@ -1010,12 +1021,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 _os.environ[k] = v
             logger.info(f"Applied {len(env_keys)} env key override(s)")
 
-        # Recreate LLMs if config was modified for this job (skip if already loaded from DB)
-        if not _config_from_db and (
+        # Recreate LLMs if config was modified for this job. On resume we
+        # always recreate when frozen config was loaded — frozen config has
+        # api_key stripped and the override applied above carries the
+        # re-injected credentials. Without recreation the strategic/tactical
+        # LLMs would still hold whatever was built at agent boot (if any) or
+        # would never be created at all.
+        config_dirty = bool(
             metadata.get("config_name")
             or metadata.get("config_upload_id")
             or metadata.get("config_override")
-        ):
+        )
+        if (not _config_from_db and config_dirty) or _config_from_db:
             logger.info("Config changed for this job — recreating LLMs")
             self._create_phase_llms()
 

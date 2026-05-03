@@ -83,7 +83,7 @@ What it changes from production:
 ### Phase 1: Stabilize single-cluster option (current)
 
 The `deployment-local/` Kustomize overlay works. Immediate cleanup:
-- Remove the temporary schema ConfigMap workaround (rebuild images with fixed schema.sql)
+- Remove the temporary schema ConfigMap workaround (post-cutover schema lives under `orchestrator/database/migrations/<app|vector>/`; `schema.sql` is now a frozen reference snapshot — see `docs/db_migration.md`)
 - Add GHCR pull secret setup to `create-secrets.sh` or document image import
 - Test the full job lifecycle (create job → agent picks up → workspace pod → delivery)
 - Write a setup guide in `deployment-local/README.md`

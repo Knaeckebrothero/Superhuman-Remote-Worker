@@ -1,8 +1,19 @@
+-- migration:     0001_initial.sql
+-- description:   Initial app-DB snapshot at migration-runner cutover.
+-- depends-on:    (none — first migration)
+-- expected:      Fast on empty DB; pre-marked applied on existing environments
+--                (see docs/db_migration.md §Operational runbook).
+-- locks:         Brief AccessExclusiveLock per CREATE TABLE / CREATE INDEX.
+-- transactional: yes
+--
+-- Snapshot of orchestrator/database/schema.sql at cutover. Future schema
+-- changes ship as new numbered files in this directory; schema.sql is kept
+-- as a frozen reference and is no longer applied at runtime.
+--
 -- Superhuman Remote Worker — Autonomous Agent System
 -- PostgreSQL Schema
 --
 -- This file defines all tables for the Superhuman Remote Worker system.
--- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:
 --   users             - User identity with optional password authentication
