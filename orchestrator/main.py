@@ -9292,6 +9292,22 @@ async def agent_update_thread_status(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/api/agents/threads/{thread_id}/release-agent")
+async def agent_release_thread_agent(thread_id: str) -> dict[str, str]:
+    """Clear threads.agent_id (no auth, agent-facing).
+
+    Called by an agent whose /session/attach background task failed (e.g.
+    workspace SSH polling timed out before the workspace pod's image pull
+    completed). Without this, the thread stays bound to a session-less agent
+    and the next WS reconnect re-targets the same broken agent.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    await postgres_db.resume_thread(thread_id)
+    return {"status": "released"}
+
+
 class AgentThreadConfigUpdateRequest(BaseModel):
     config_override: dict[str, Any]
 
@@ -10563,14 +10579,32 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
     # If agent_id is set but the agent is offline, clear the stale binding
     # so we can re-provision.  This handles the case where the desktop cockpit
     # opens the WS directly (without calling the resume endpoint first).
+    # Also clear when the agent is alive but no longer holds this thread —
+    # this catches /session/attach failures where the agent reset its local
+    # _pod_state to IDLE (heartbeat → status=ready, thread_id=NULL) but the
+    # release-agent POST didn't reach us (e.g. orchestrator restart).
     if thread.get("agent_id"):
         bound_agent = await postgres_db.get_agent(str(thread["agent_id"]))
-        if not bound_agent or bound_agent.get("status") == "offline":
+        is_missing = not bound_agent
+        is_offline = bool(bound_agent) and bound_agent.get("status") == "offline"
+        is_session_lost = (
+            bool(bound_agent)
+            and bound_agent.get("status") == "ready"
+            and str(bound_agent.get("thread_id") or "") != thread_id
+        )
+        if is_missing or is_offline or is_session_lost:
+            reason = (
+                "missing"
+                if is_missing
+                else "offline"
+                if is_offline
+                else "ready-without-session"
+            )
             logger.warning(
                 "Thread %s: bound agent %s is %s — clearing stale binding",
                 thread_id,
                 thread.get("agent_id"),
-                "missing" if not bound_agent else "offline",
+                reason,
             )
             await postgres_db.resume_thread(thread_id)
             thread = await postgres_db.get_thread(thread_id)
@@ -10657,10 +10691,15 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
         await ws.close(code=4503, reason="Agent has no IP")
         return
 
-    # Wait for agent readiness before proxying WS
+    # Wait for agent readiness before proxying WS.
+    # Budget must outlast the agent's own _poll_workspace_ready (120s) plus
+    # margin for image pulls — a cold workspace image pull can take ~130s.
     await ws.send_json({"method": "status", "params": {"phase": "booting"}})
+    ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+    poll_interval_s = 2
+    iterations = max(1, ready_timeout_s // poll_interval_s)
     agent_ready = False
-    for _ in range(30):  # 60s timeout
+    for i in range(iterations):
         try:
             async with httpx.AsyncClient(timeout=2) as client:
                 resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
@@ -10674,7 +10713,23 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                         pass
         except Exception:
             pass
-        await asyncio.sleep(2)
+        # Periodic progress ping so the cockpit doesn't sit silent for minutes
+        # on a cold image pull. Every 5 iterations ≈ every 10s.
+        if i > 0 and i % 5 == 0:
+            try:
+                await ws.send_json(
+                    {
+                        "method": "status",
+                        "params": {
+                            "phase": "booting",
+                            "elapsed_s": i * poll_interval_s,
+                            "timeout_s": ready_timeout_s,
+                        },
+                    }
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(poll_interval_s)
 
     if not agent_ready:
         await ws.close(code=4503, reason="Agent not ready within timeout")
