@@ -67,9 +67,7 @@ def get_citation_engine_config(
     """
     overrides = overrides or {}
 
-    llm_model = (
-        overrides.get("llm_model") or os.getenv("CITATION_LLM_MODEL") or "gpt-4"
-    )
+    llm_model = overrides.get("llm_model") or os.getenv("CITATION_LLM_MODEL") or "gpt-4"
 
     llm_url = overrides.get("llm_url") or os.getenv("CITATION_LLM_URL")
 
