@@ -17,7 +17,7 @@ Example:
     rows = await db.fetch("SELECT * FROM jobs WHERE status = $1", "pending")
 
     # Schema management
-    await db.ensure_schema()  # Apply schema.sql (idempotent)
+    await db.apply_migrations()  # Apply pending migrations (idempotent)
     tables = await db.verify_schema()  # Check all tables exist
 
     # Job and agent operations
@@ -36,6 +36,8 @@ from .postgres import (
     ALLOWED_TABLES,
     PG_TYPE_MAP,
     SCHEMA_FILE,
+    MIGRATIONS_APP_DIR,
+    MIGRATIONS_VECTOR_DIR,
     REQUIRED_TABLES,
 )
 from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
@@ -46,6 +48,8 @@ __all__ = [
     "ALLOWED_TABLES",
     "PG_TYPE_MAP",
     "SCHEMA_FILE",
+    "MIGRATIONS_APP_DIR",
+    "MIGRATIONS_VECTOR_DIR",
     "REQUIRED_TABLES",
     # MongoDB
     "MongoDB",

@@ -1,0 +1,114 @@
+name: db-migrations
+
+# Gate for changes under orchestrator/database/migrations/**.
+#
+# Runs three jobs in parallel:
+#   1. squawk      — static lint of the SQL diff (lock safety, missing
+#                    NOT VALID, non-concurrent indexes, etc.)
+#   2. dry-run     — apply every migration to a fresh postgres:16 service
+#                    container (transactional pass rolls back; non-tx
+#                    migrations are skipped under --dry-run)
+#   3. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
+#                    subdirectory
+#
+# Design rationale: see docs/db_migration.md §Testing & CI.
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - 'orchestrator/database/migrations/**.sql'
+      - 'orchestrator/database/migrate.py'
+      - '.github/workflows/db-migrations.yml'
+  pull_request:
+    paths:
+      - 'orchestrator/database/migrations/**.sql'
+      - 'orchestrator/database/migrate.py'
+      - '.github/workflows/db-migrations.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  squawk:
+    name: lint (squawk)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: sbdchd/squawk-action@v2
+        with:
+          pattern: "orchestrator/database/migrations/**/*.sql"
+          version: "latest"
+          config: ".squawk.toml"
+          fail-on-violations: true
+
+  dry-run:
+    name: dry-run on postgres:16
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_USER: ci
+          POSTGRES_DB: ci_app
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ci"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet asyncpg
+      - name: Create vector DB
+        env:
+          PGPASSWORD: ci
+        run: |
+          psql -h localhost -U ci -d ci_app -c "CREATE DATABASE ci_vector;"
+          psql -h localhost -U ci -d ci_vector -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
+      - name: Dry-run app migrations
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
+        run: |
+          python orchestrator/database/migrate.py \
+            --dir orchestrator/database/migrations/app \
+            --dry-run
+      - name: Dry-run vector migrations
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
+        run: |
+          python orchestrator/database/migrate.py \
+            --dir orchestrator/database/migrations/vector \
+            --dry-run
+
+  uniqueness:
+    name: unique NNNN_ prefixes
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: No duplicate migration prefixes
+        run: |
+          set -euo pipefail
+          fail=0
+          for d in orchestrator/database/migrations/*/; do
+            if ls "$d"*.sql >/dev/null 2>&1; then
+              dupes=$(ls "$d"*.sql | xargs -n1 basename | awk -F_ '{print $1}' | sort | uniq -d)
+              if [ -n "$dupes" ]; then
+                echo "ERROR: duplicate prefix(es) in $d: $dupes"
+                fail=1
+              fi
+            fi
+          done
+          exit $fail

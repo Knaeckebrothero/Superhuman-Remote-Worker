@@ -6,7 +6,7 @@ Every production database schema eventually needs a breaking change. Adding a nu
 
 This is especially sharp in Kubernetes rolling deployments where old pods and new pods overlap. Even with a single-replica orchestrator, there's a window during rollout where:
 
-1. New orchestrator starts, runs `ensure_schema()`, applies the migration
+1. New orchestrator starts, runs `apply_migrations()`, applies the migration
 2. Old orchestrator is still running (hasn't received SIGTERM yet), issuing queries against the now-changed schema
 3. Agent pods (2 replicas, rolled independently) may be running old code that expects the old schema
 
@@ -14,16 +14,26 @@ The overlap window is brief for the orchestrator (seconds) but can be minutes fo
 
 According to Gartner, 83% of data migration projects fail outright or exceed budgets. The recurring causes: untested backups, missing lock timeouts, no environment isolation, and rolling deployments creating race conditions between old code and new schema.
 
-## Current Approach
+## How This Repo Handles It
 
-Our `ensure_schema()` method (`orchestrator/database/postgres.py`) re-applies the full `schema.sql` on every orchestrator startup. All DDL is idempotent:
+Schema changes ship as numbered SQL files under `orchestrator/database/migrations/<app|vector>/NNNN_short_description.sql`. At orchestrator startup, `lifespan` calls `PostgresDB.apply_migrations()`, which delegates to the runner in `orchestrator/database/migrate.py`. The runner serializes via a Postgres advisory lock, tracks applied files in a `schema_migrations` table on each DB (filename + sha256 checksum + timing + success flag), refuses to proceed on checksum drift or a previous failure, and applies whatever's pending in lexicographic order.
 
-- `CREATE TABLE IF NOT EXISTS` for tables
-- `CREATE INDEX IF NOT EXISTS` for indexes
-- `DO $$ BEGIN ... EXCEPTION WHEN duplicate_column THEN null; END $$` for adding columns
-- `DO $$ BEGIN ... EXCEPTION WHEN undefined_object THEN null; END $$` for constraint changes
+The full design — tracking table schema, file-naming convention, transactional vs `.notx.sql` files, lock-retry pattern, anti-patterns, CI gate, operational runbook — lives in [The Migration System](#the-migration-system) below. If you've never added a migration before, jump to [Quick Start: Adding a Migration](#quick-start-adding-a-migration).
 
-This works for **additive changes**: new tables, new columns (with defaults), new indexes, new enum values in CHECK constraints. The old code simply ignores what it doesn't know about.
+> **Legacy approach (pre-cutover, retained for context):** before the cutover, `schema.sql` was re-applied at every orchestrator startup with idempotent `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` / `DO $$ BEGIN … EXCEPTION WHEN duplicate_column THEN null; END $$` blocks. That worked for purely additive changes (the only kind we shipped), but had no version tracking, no checksum protection, and broke down the moment we needed a non-idempotent transformation (the v2 `role → capabilities` migration that motivated the new system). `schema.sql` and `vector_schema.sql` remain in the tree as frozen reference snapshots and are no longer applied at runtime.
+
+## Quick Start: Adding a Migration
+
+For the impatient. Full reference is [The Migration System](#the-migration-system) below; failure modes are in the [Operational runbook](#operational-runbook).
+
+1. **Pick the next number.** `ls orchestrator/database/migrations/app/` (or `vector/`) — find the highest `NNNN_` prefix, add 1.
+2. **Create the file** as `migrations/<app|vector>/NNNN_short_snake_case_description.sql`. Use `.notx.sql` instead of `.sql` if and only if the migration uses a statement that can't run inside a transaction (e.g. `CREATE INDEX CONCURRENTLY`, `VACUUM`, `ALTER SYSTEM`).
+3. **Start from the [migration template](#migration-file-template)**: header block, `BEGIN;`/`COMMIT;`, `SET LOCAL` timeouts, lock-retry loop for any `ALTER TABLE`. Idempotent DDL (`IF EXISTS` / `IF NOT EXISTS`) as defense-in-depth.
+4. **Test locally** against a clone of the test DB: `pg_dump <test_db> | pg_restore -d local_scratch_db`, then `psql local_scratch_db -f migrations/<db>/NNNN_*.sql`. Watch the timing.
+5. **Push.** CI runs Squawk + a dry-run on `postgres:16` + a duplicate-prefix check. Review the squawk findings before merging.
+6. **Deploy.** The orchestrator picks the file up at startup, applies it under the advisory lock, records it in `schema_migrations`. No further action needed.
+
+If you're making a **breaking change** (rename, type change, drop, NOT NULL on existing data, normalize, …): stop. Read [The Expand-Contract Pattern](#the-expand-contract-pattern) and split it across releases. The runner doesn't save you from a migration that breaks the running code.
 
 ## What Breaks
 
@@ -248,18 +258,21 @@ When migrating data from old to new columns/tables:
 
 ### Do we need one?
 
-Frameworks like Alembic, Flyway, or Atlas provide version tracking, ordering, rollback, and conflict detection. Our current `schema.sql` approach works because:
+Frameworks like Alembic, Flyway, or Atlas provide version tracking, ordering, rollback, and conflict detection. We evaluated them at cutover and chose to hand-roll instead — the codebase uses raw `asyncpg` (no SQLAlchemy ORM for Alembic to introspect), so the value of those tools collapses to "ordering + tracking + checksums," which is exactly what the ~280-line runner in [The Migration System](#the-migration-system) provides without an extra dependency.
 
-- We have one schema file, one database, one team
-- Changes are infrequent and predominantly additive
+The legacy `schema.sql`-only approach was tenable only because:
+
+- Changes were infrequent and predominantly additive
 - The `DO $$ ... EXCEPTION ... $$` pattern is inherently idempotent
-- We don't need rollback — we roll forward (fix and redeploy)
+- Single-replica orchestrator, no concurrent-runner concern
+- Roll-forward-only meant we never needed a rollback story
 
-We'd want a migration framework when:
-- Multiple developers are making concurrent schema changes
-- We need guaranteed ordering (migration B depends on migration A)
-- We need downgrade support for compliance or SLA reasons
-- The schema file grows unwieldy with accumulated migration blocks
+It broke down when:
+- A non-idempotent transformation was needed (the `role → capabilities` migration)
+- The schema file started growing accumulated `DO $$` blocks for past breaking changes
+- We wanted a record of when a given DDL change was actually applied to a given environment
+
+If we ever outgrow the hand-rolled runner (multiple parallel contributors landing schema changes, need for dependency graphs, declarative drift detection, etc.), the natural next step is Atlas — it slots in alongside numbered SQL files and adds the heavyweight features without forcing a rewrite of the existing migrations.
 
 ### Options for Python/PostgreSQL
 
@@ -279,19 +292,23 @@ Regardless of framework, add **Squawk** to CI. It's a static analyzer for Postgr
 - Column drops without verification
 - `ALTER COLUMN TYPE` without the dual-column pattern
 
+The `.github/workflows/db-migrations.yml` job already wires this in alongside `.squawk.toml` at the repo root:
+
 ```yaml
-# GitHub Actions
-- name: Lint migrations
-  uses: sbdchd/squawk-action@v1
+- uses: sbdchd/squawk-action@v2
+  with:
+    pattern: "orchestrator/database/migrations/**/*.sql"
+    config:  ".squawk.toml"
+    fail-on-violations: true
 ```
 
 ### Recommendation
 
-We're moving to a versioned `migrations/` directory with a small hand-rolled runner — concrete design in [Proposed System for This Repo](#proposed-system-for-this-repo) below. Continue to follow expand-contract discipline for any breaking change regardless of mechanism. Pair Squawk with the cutover — it's zero-effort and catches the most dangerous mistakes.
+We landed a versioned `migrations/` directory with a small hand-rolled runner at cutover — concrete design in [The Migration System](#the-migration-system) below. Squawk shipped alongside it (`.squawk.toml` + `.github/workflows/db-migrations.yml`) to catch lock-safety and breakage rules in CI. Continue to follow expand-contract discipline for any breaking change regardless of mechanism — the runner handles ordering and tracking, but the human still owns "is this safe to deploy?"
 
-## Proposed System for This Repo
+## The Migration System
 
-We're moving from inline `DO $$` blocks inside `schema.sql` to a versioned migrations directory with a small hand-rolled runner. This section is the authoritative design from cutover onward. It borrows the boring parts (tracking schema, advisory locks, checksum semantics) from how mature tools (Flyway, golang-migrate, Atlas, pgmigrate) handle them, while keeping the implementation small enough to read in one sitting.
+This section is the authoritative reference for how schema changes ship in this repo. It documents what already lives in `orchestrator/database/migrate.py` and `orchestrator/database/migrations/`. The implementation borrows the boring parts (tracking schema, advisory locks, checksum semantics) from how mature tools (Flyway, golang-migrate, Atlas, pgmigrate) handle them, while keeping the surface small enough to read in one sitting.
 
 ### Why hand-rolled (not Alembic)
 
@@ -308,9 +325,9 @@ orchestrator/database/
 ├── vector_schema.sql        # same, for the pgvector DB
 ├── migrations/
 │   ├── app/
-│   │   ├── 0001_initial.sql
-│   │   ├── 0002_capabilities_array.sql
-│   │   ├── 0003_jobs_priority_idx.notx.sql
+│   │   ├── 0001_initial.sql            # snapshot of schema.sql at cutover
+│   │   ├── 0002_add_jobs_priority.sql  # example: column add
+│   │   ├── 0003_jobs_priority_idx.notx.sql  # example: CONCURRENTLY index
 │   │   └── ...
 │   └── vector/
 │       ├── 0001_initial.sql
@@ -326,7 +343,7 @@ Pattern: `NNNN_short_snake_case_description.sql`, with the optional `.notx.sql` 
 
 ```
 0001_initial.sql
-0002_capabilities_array.sql
+0002_add_jobs_priority.sql
 0003_jobs_priority_idx.notx.sql
 ```
 
@@ -353,7 +370,7 @@ Surveyed projects split roughly:
 - **Timestamp 14-digit**: Discourse, GitLab, Plausible, Supabase — wins when ≥3 devs branch in parallel.
 - **Unix-ms timestamp**: n8n — same idea, uglier.
 
-For one developer on a linear `develop` branch, timestamps are pure noise. `0042_capabilities.sql` is easier to scan than `20260501123045_capabilities.sql`, and the collision risk that timestamps solve doesn't exist here. Switch to timestamps if/when the team grows past three concurrent contributors.
+For one developer on a linear `develop` branch, timestamps are pure noise. `0042_add_jobs_priority.sql` is easier to scan than `20260501123045_add_jobs_priority.sql`, and the collision risk that timestamps solve doesn't exist here. Switch to timestamps if/when the team grows past three concurrent contributors.
 
 ### Tracking table
 
@@ -361,7 +378,7 @@ Borrowed from Flyway's column set + Atlas's error forensics + golang-migrate's d
 
 ```sql
 CREATE TABLE IF NOT EXISTS schema_migrations (
-    filename       TEXT         PRIMARY KEY,             -- '0002_capabilities_array.sql'
+    filename       TEXT         PRIMARY KEY,             -- '0002_add_jobs_priority.sql'
     checksum       TEXT         NOT NULL,                -- sha256 hex of file bytes
     applied_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     applied_by     TEXT         NOT NULL DEFAULT current_user,
@@ -395,7 +412,7 @@ await conn.execute("SELECT pg_advisory_xact_lock($1)", LOCK_ID)
 
 ### The runner
 
-`orchestrator/database/migrate.py`, ~80 lines. Invoked from the orchestrator's FastAPI `lifespan`, replacing the current `await postgres_db.ensure_schema()` call.
+`orchestrator/database/migrate.py`, ~280 lines. Invoked from the orchestrator's FastAPI `lifespan` via `await postgres_db.apply_migrations()` (a thin method wrapper on `PostgresDB` that calls into the free function `run_migrations(pool, migrations_dir)`).
 
 ```python
 import asyncpg, hashlib, logging, time
@@ -716,24 +733,26 @@ When you need to undo: write a new forward migration. When you need to recover l
 
 ### Transition plan
 
-**Step 1 — Land the runner, no behavior change.**
-Add `migrate.py` + empty `migrations/{app,vector}/` directories. `lifespan` calls the runner *after* the existing `ensure_schema()` (additive — no migrations to run, no-op). Deploy. Verify `schema_migrations` appears in both DBs.
+The cutover from inline `schema.sql` to the migrations runner shipped in a single change to `develop`. Because the only existing environment is a low-traffic test cluster, the four conceptual steps below collapsed into one push; on a busier system, splitting them across deploys is the safer path.
+
+**Step 1 — Land the runner.**
+Add `orchestrator/database/migrate.py` and `migrations/{app,vector}/` directories. `PostgresDB` gains a `migrations_dir` constructor kwarg; the vector instance points at `migrations/vector/`. The legacy `ensure_schema(schema_file=…)` method is replaced by `apply_migrations()` — a thin wrapper that calls `run_migrations()` against the bound directory. Call sites (lifespan, `init.py --force-reset`, `reset_schema`) are updated to the new name.
 
 **Step 2 — Snapshot current schema as `0001_initial.sql`.**
-For each DB, `pg_dump --schema-only --no-owner --no-acl` against a freshly-applied `schema.sql`, checked in as `migrations/{app,vector}/0001_initial.sql`. On every existing environment, mark it applied once:
+For each DB, copy the cleaned `schema.sql` / `vector_schema.sql` into `migrations/{app,vector}/0001_initial.sql` with a migration header prepended. (`pg_dump --schema-only --no-owner --no-acl` against a freshly-applied schema is the more rigorous variant; for a small repo with no schema drift, a copy is equivalent.) On every existing environment, mark it applied once:
 
 ```sql
 INSERT INTO schema_migrations(filename, checksum, execution_ms)
-VALUES ('0001_initial.sql', '<sha256 of file>', 0);
+VALUES ('0001_initial.sql', '<sha256 of committed file>', 0);
 ```
 
 This is the only manual step. Existing environments skip 0001 forever; fresh installs apply it like any other migration.
 
-**Step 3 — Stop using `schema.sql` at runtime.**
-Drop the `ensure_schema()` call from `lifespan`. Only the runner runs. Update `CLAUDE.md`: schema changes go in a new numbered file under `migrations/`. The next change after cutover ships as `0002_*.sql`.
+**Step 3 — Stop editing `schema.sql`.**
+Strip any inline `DO $$` migration blocks from `schema.sql` so it reads as a clean reference snapshot of the cutover state. From this point on, schema changes ship as new numbered files in `migrations/<db>/`. `CLAUDE.md` is updated to point new contributors at the runbook below.
 
 **Step 4 — Verify cutover.**
-Test on a clone of prod (`pg_dump | pg_restore` to a scratch DB; run migrations; smoke-test). Run `python init.py --force-reset` to confirm fresh installs work end-to-end through migrations alone.
+Test on a clone of test/prod (`pg_dump | pg_restore` to a scratch DB; run migrations; smoke-test). Run `python init.py --force-reset` to confirm fresh installs work end-to-end through migrations alone.
 
 ### Operational runbook
 

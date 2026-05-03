@@ -206,11 +206,13 @@ This section maps the decision above to concrete codebase changes. Each phase bu
 
 **Goal:** Prepare the database for per-job repos.
 
+> Schema changes ship as a single new file under `orchestrator/database/migrations/app/NNNN_*.sql`, not as edits to `schema.sql` (which is frozen post-cutover). See `docs/db_migration.md` for the runbook.
+
 | File | Change |
 |------|--------|
-| `orchestrator/database/schema.sql` | Add `repo_name VARCHAR(200)` column to `jobs` table (stores `job-<short-id>`) |
-| `orchestrator/database/schema.sql` | Deprecate `uq_project_jobs_repo` unique index — projects no longer require a `jobs`-role repo |
-| `orchestrator/database/schema.sql` | Consider removing `'jobs'` from `valid_repo_role` constraint on `project_repositories` (keep `source`, `reference`) |
+| `orchestrator/database/migrations/app/NNNN_per_job_repos.sql` | Add `repo_name VARCHAR(200)` column to `jobs` table (stores `job-<short-id>`) |
+| same file | Deprecate `uq_project_jobs_repo` unique index — projects no longer require a `jobs`-role repo |
+| same file | Consider removing `'jobs'` from `valid_repo_role` constraint on `project_repositories` (keep `source`, `reference`) |
 | `orchestrator/database/postgres.py` | Update `create_job()` to accept and store `repo_name` |
 
 Branch naming convention changes from `job/<short-id>` to `subjob/<short-id>/<type>` for subjobs.

@@ -1,0 +1,25 @@
+# Squawk linter config for orchestrator/database/migrations/**.sql.
+# Wired into CI by .github/workflows/db-migrations.yml; design rationale
+# and the rule list this complements live in docs/db_migration.md
+# §Testing & CI.
+
+# Match the orchestrator's deployed Postgres version. Squawk uses this to
+# decide which rules apply (e.g. PG 11+ skips table rewrites for ADD COLUMN
+# with a constant default; PG 12+ tightens NOT NULL behaviour).
+pg_version = "16.0"
+
+# Stylistic rules disabled across all migrations — too noisy in practice
+# and orthogonal to the lock-safety / breakage rules we actually care about.
+excluded_rules = [
+    "prefer-bigint-over-int",
+    "prefer-text-field",
+]
+
+# 0001_initial.sql is a snapshot of the cutover state, not a hand-written
+# migration. It would trip rules that are appropriate for ALTERs on a hot
+# prod table but irrelevant for an empty-DB bootstrap. Future numbered
+# migrations are linted normally.
+excluded_paths = [
+    "orchestrator/database/migrations/app/0001_initial.sql",
+    "orchestrator/database/migrations/vector/0001_initial.sql",
+]
