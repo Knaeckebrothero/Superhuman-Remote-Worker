@@ -476,18 +476,6 @@ data:
           ]
         }
       ],
-      "smtpServer": {
-        "host": "${SMTP_HOST}",
-        "port": "1025",
-        "from": "noreply@{{ .Values.global.domain }}",
-        "fromDisplayName": "Superhuman Remote Worker",
-        "ssl": "false",
-        "starttls": "true",
-        "envelopeFrom": "noreply@{{ .Values.global.domain }}",
-        "auth": "true",
-        "user": "${SMTP_USER}",
-        "password": "${SMTP_PASSWORD}"
-      },
       "internationalizationEnabled": false,
       "loginTheme": "keycloak",
       "accountTheme": "keycloak.v3"
@@ -719,9 +707,15 @@ spec:
                       $KC update "clients/$ID" -r {{ .Values.keycloak.realm }} -s "secret=$SEC" 2>/dev/null
                     done
                     # --- Sync SMTP config ---
-                    # Force-update on every start so rotated SMTP creds
-                    # propagate without a DB wipe. Realm import only runs
-                    # on first boot with an empty DB.
+                    # Sole source of truth for SMTP — realm-import JSON
+                    # deliberately omits smtpServer because the import-time
+                    # cached RealmRepresentation stays stale even after a
+                    # later kcadm update (keycloak#15428), which left the
+                    # in-memory password broken until someone clicked Save
+                    # in the admin UI. By only writing here AND flushing
+                    # the realm cache after, the very first value Keycloak
+                    # caches is the correct one — and Vault rotations on
+                    # later boots are picked up immediately, no UI dance.
                     if [ -n "$SMTP_HOST" ]; then
                       $KC update "realms/{{ .Values.keycloak.realm }}" \
                         -s "smtpServer.host=$SMTP_HOST" \
@@ -732,8 +726,12 @@ spec:
                         -s "smtpServer.ssl=false" \
                         -s "smtpServer.starttls=true" \
                         -s "smtpServer.auth=true" \
+                        -s "smtpServer.authType=basic" \
                         -s "smtpServer.user=$SMTP_USER" \
-                        -s "smtpServer.password=$SMTP_PASSWORD" 2>/dev/null
+                        -s "smtpServer.password=$SMTP_PASSWORD" || \
+                        echo "WARN: kcadm smtpServer update failed"
+                      $KC create "realms/{{ .Values.keycloak.realm }}/clear-realm-cache" 2>&1 || \
+                        echo "WARN: kcadm clear-realm-cache failed"
                     fi
                     # --- Sync session/token lifespans ---
                     # Same self-heal pattern as SMTP: realm-import only seeds
