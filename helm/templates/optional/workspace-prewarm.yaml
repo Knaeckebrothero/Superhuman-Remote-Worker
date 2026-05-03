@@ -1,0 +1,73 @@
+{{/*
+Image pre-warmer — DaemonSet that pulls hot-path images on every node so the
+first session-attach or job-dispatch for a freshly-published tag doesn't pay
+a multi-minute cold pull penalty. The workspace image (~1.4 GB) and the
+agent image are both pulled at session/job start; on first schedule to a node
+without the tag cached, the kubelet pull exceeds both the agent's
+_poll_workspace_ready (120s) and the orchestrator's agent_bound wait (default
+300s, was 180s).
+
+Mechanism: each init container references its image with imagePullPolicy:
+Always (so a Helm rollout updates the cached layer); the init's command is a
+no-op, the pull is the side effect. Init containers run sequentially so two
+parallel pulls don't saturate the node's network. The main container runs
+`pause` so the DaemonSet stays Ready and the kubelet doesn't garbage-collect
+the warmed images.
+*/}}
+{{- if .Values.workspace.prewarm.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "srw.fullname" . }}-image-prewarm
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "image-prewarm") | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "image-prewarm") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "image-prewarm") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      tolerations:
+        # Land on every schedulable node, including tainted ones.
+        - operator: Exists
+      initContainers:
+        - name: pull-workspace
+          image: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+          imagePullPolicy: Always
+          command: ["true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+        - name: pull-agent
+          image: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
+          imagePullPolicy: Always
+          command: ["true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+      containers:
+        - name: pause
+          image: {{ .Values.workspace.prewarm.pauseImage | default "registry.k8s.io/pause:3.10" | quote }}
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "10m"
+              memory: "32Mi"
+{{- end }}

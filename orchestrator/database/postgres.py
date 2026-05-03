@@ -68,8 +68,14 @@ def _decrypt_stored(value: str | None, *, field: str) -> str | None:
 
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
-# Schema file for database initialization
+# Frozen schema reference (no longer applied at runtime — see migrate.py).
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
+
+# Migration directories per DB. The runner picks one of these via the
+# ``migrations_dir`` constructor kwarg on ``PostgresDB``; lifespan + init
+# wire each instance to its own subdir.
+MIGRATIONS_APP_DIR = Path(__file__).parent / "migrations" / "app"
+MIGRATIONS_VECTOR_DIR = Path(__file__).parent / "migrations" / "vector"
 
 # Tables exposed to the cockpit
 ALLOWED_TABLES = frozenset(
@@ -180,6 +186,7 @@ class PostgresDB:
         min_connections: int = None,
         max_connections: int = None,
         command_timeout: float = None,
+        migrations_dir: Optional[Path] = None,
     ):
         """Initialize PostgreSQL database manager.
 
@@ -188,6 +195,9 @@ class PostgresDB:
             min_connections: Minimum pool size (default: 2)
             max_connections: Maximum pool size (default: 10)
             command_timeout: Query timeout in seconds (default: 60.0)
+            migrations_dir: Directory of NNNN_*.sql migrations applied by
+                ``apply_migrations``. Defaults to ``migrations/app/``; the
+                vector instance overrides this to ``migrations/vector/``.
 
         Raises:
             ImportError: If asyncpg is not installed
@@ -214,6 +224,7 @@ class PostgresDB:
 
         self._pool: Optional[asyncpg.Pool] = None
         self._queries: Dict[str, str] = {}  # Cache for loaded queries
+        self._migrations_dir: Path = migrations_dir or MIGRATIONS_APP_DIR
 
         logger.info("PostgresDB initialized (not connected yet)")
 
@@ -5836,47 +5847,53 @@ class PostgresDB:
         finally:
             await conn.close()
 
-    async def ensure_schema(self, schema_file: Path | None = None) -> bool:
-        """Apply a schema file to initialize database tables.
+    async def apply_migrations(self) -> bool:
+        """Apply pending migrations from this instance's migrations directory.
 
-        This is idempotent - uses IF NOT EXISTS clauses.
-        Requires an active connection pool (call connect() first).
-
-        Args:
-            schema_file: Path to the SQL schema file. Defaults to schema.sql
-                         (app DB). Pass vector_schema.sql for the vector DB.
+        Thin wrapper over ``orchestrator.database.migrate.run_migrations`` —
+        each ``PostgresDB`` instance binds to its migrations dir at
+        construction time, so the call site doesn't pass the directory.
+        See ``docs/db_migration.md`` for the runner's design and contract.
 
         Returns:
-            True if schema was applied successfully.
+            True if migrations were applied successfully.
 
         Raises:
-            RuntimeError: If not connected to database.
-            FileNotFoundError: If schema file doesn't exist.
+            RuntimeError: If not connected, or migrations dir is invalid,
+                or a previous run left a dirty row, or checksum drift was
+                detected.
         """
-        target = schema_file or SCHEMA_FILE
-        if not target.exists():
-            raise FileNotFoundError(f"Schema file not found: {target}")
+        try:
+            # Host-side: invoked from repo root (e.g. `python init.py`) where
+            # the orchestrator package is importable via its full path.
+            from orchestrator.database.migrate import run_migrations
+        except ImportError:
+            # In-container: Dockerfile.orchestrator copies orchestrator/ flat
+            # into /app with PYTHONPATH=/app, so the same module is reachable
+            # as a top-level `database` package.
+            from database.migrate import run_migrations
 
-        schema_sql = target.read_text()
+        if self._pool is None:
+            raise RuntimeError("apply_migrations() called before connect()")
 
-        async with self.acquire() as conn:
-            await conn.execute(schema_sql)
+        await run_migrations(self._pool, self._migrations_dir)
+        logger.info("Applied migrations from %s", self._migrations_dir)
 
-        logger.info(f"Applied schema from {target}")
-
-        # Migration only applies to the app DB schema
-        if target == SCHEMA_FILE:
+        # Data migration only applies to the app DB. This predates the
+        # numbered-migrations system and will be folded into a real
+        # migration file the next time it gets touched.
+        if self._migrations_dir == MIGRATIONS_APP_DIR:
             await self.migrate_existing_users_verified()
 
         return True
 
     async def reset_schema(self) -> None:
-        """Drop all tables and recreate schema.
+        """Drop all tables and re-apply migrations from 0001 onward.
 
-        WARNING: This deletes all data!
+        WARNING: This deletes all data.
 
-        Drops the public schema entirely and recreates it,
-        then applies schema.sql.
+        Drops the public schema entirely, recreates it, then runs the
+        full migration chain on a fresh DB.
 
         Raises:
             RuntimeError: If not connected to database.
@@ -5888,8 +5905,9 @@ class PostgresDB:
             await conn.execute("GRANT ALL ON SCHEMA public TO public")
             logger.info("Dropped all tables (schema reset)")
 
-        # Apply fresh schema
-        await self.ensure_schema()
+        # Re-apply fresh chain. The runner re-creates schema_migrations
+        # (it was dropped with the public schema) and applies every migration.
+        await self.apply_migrations()
 
     async def verify_schema(self) -> Dict[str, bool]:
         """Verify all required tables exist.

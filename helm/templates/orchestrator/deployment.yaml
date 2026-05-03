@@ -142,6 +142,10 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: KEYCLOAK_REALM
+            {{- if .Values.keycloak.internal }}
+            # KEYCLOAK_ADMIN_* — only when SRW manages the Keycloak instance.
+            # External Keycloak deployments use the bootstrap Job (with its
+            # own KC_ADMIN_USER/PASSWORD Secret) instead.
             - name: KEYCLOAK_ADMIN_USER
               valueFrom:
                 secretKeyRef:
@@ -152,6 +156,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: KEYCLOAK_ADMIN_PASSWORD
+            {{- end }}
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:
@@ -210,7 +215,11 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: DEFAULT_DS_NEO4J_READ_ONLY
                   optional: true
-            # Nextcloud (optional — set when nextcloud.enabled or cloud.externalBackend=nextcloud)
+            {{- if or .Values.nextcloud.enabled (eq (default "" .Values.cloud.externalBackend) "nextcloud") }}
+            # Nextcloud — bundled (nextcloud.enabled=true) or external
+            # (cloud.externalBackend=nextcloud). Skipped entirely otherwise so
+            # the chart doesn't reference Secret keys the operator hasn't
+            # populated.
             - name: NEXTCLOUD_URL
               valueFrom:
                 configMapKeyRef:
@@ -247,6 +256,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_AGENT_PASSWORD
                   optional: true
+            {{- end }}
             # Default WebDAV datasource (optional)
             - name: DEFAULT_DS_WEBDAV_URL
               valueFrom:
@@ -285,7 +295,11 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: MAIN_CLOUD_BACKEND
                   optional: true
-            # OpenCloud (optional — set when opencloud.enabled or cloud.externalBackend=opencloud)
+            {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
+            # OpenCloud — bundled (opencloud.enabled=true) or external
+            # (cloud.externalBackend=opencloud). Skipped entirely otherwise so
+            # the chart doesn't reference Secret keys the operator hasn't
+            # populated.
             - name: OPENCLOUD_URL
               valueFrom:
                 configMapKeyRef:
@@ -316,6 +330,7 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
                   optional: true
+            {{- end }}
             # External cloud service account (used with cloud.externalBackend)
             - name: CLOUD_SERVICE_USER
               valueFrom:
@@ -546,8 +561,24 @@ spec:
               value: {{ include "srw.secretName" . | quote }}
             - name: AGENT_CONFIGMAP
               value: {{ include "srw.configMapName" . | quote }}
+            # Chart-standard labels for dynamically-provisioned agent pods.
+            # The chart's database NetworkPolicies match on these labels;
+            # without them, dynamic agent pods are blocked from reaching
+            # postgres/pgvector/mongodb/neo4j.
+            - name: AGENT_LABEL_NAME
+              value: {{ include "srw.name" . | quote }}
+            - name: AGENT_LABEL_INSTANCE
+              value: {{ .Release.Name | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
+            # Budget for the WS proxy's /ready poll. Must outlast the agent's
+            # own _poll_workspace_ready (120s) plus margin for cold image pulls.
+            - name: WS_READY_TIMEOUT_S
+              value: {{ .Values.orchestrator.wsReadyTimeoutSeconds | default 180 | quote }}
+            # Budget for the WS proxy waiting for an agent to register and
+            # bind to the thread. Must accommodate a cold agent image pull.
+            - name: AGENT_BIND_TIMEOUT_S
+              value: {{ .Values.orchestrator.agentBindTimeoutSeconds | default 300 | quote }}
             # Persistent agent pods (on-demand provisioning)
             - name: PERSISTENT_AGENT_IMAGE
               valueFrom:

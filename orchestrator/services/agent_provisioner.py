@@ -76,6 +76,15 @@ class AgentProvisioner:
         )
         self._reserved_job_slots: int = int(os.environ.get("RESERVED_JOB_SLOTS", "0"))
         self._label_selector: str = "srw/managed-by=agent-provisioner"
+        # Standard Helm chart labels for chart-managed NetworkPolicies.
+        # Without these, the database NetworkPolicies (which match on
+        # app.kubernetes.io/{name,instance,component}=agent) reject ingress
+        # from dynamically-provisioned agent pods. Injected by the chart's
+        # orchestrator Deployment; defaults match the homelab values.
+        self._chart_label_name: str = os.environ.get("AGENT_LABEL_NAME", "").strip()
+        self._chart_label_instance: str = os.environ.get(
+            "AGENT_LABEL_INSTANCE", ""
+        ).strip()
         self._tailscale_enabled: bool = os.environ.get(
             "AGENT_TAILSCALE_ENABLED", "false"
         ).strip().lower() in ("true", "1", "yes")
@@ -399,6 +408,12 @@ class AgentProvisioner:
             for pod in pods.items:
                 if pod.status.phase in ("Succeeded", "Failed"):
                     continue
+                # With restartPolicy: Never and a tailscale sidecar, a crashed
+                # agent container leaves the pod in phase=Running indefinitely
+                # (the sidecar is still up). Skip these so they don't pin the
+                # MAX_AGENTS ceiling — the reaper will delete them.
+                if self._has_dead_agent_container(pod):
+                    continue
                 purpose = (pod.metadata.labels or {}).get("srw/purpose", "job")
                 if purpose in result:
                     result[purpose] += 1
@@ -407,6 +422,21 @@ class AgentProvisioner:
         except Exception as e:
             logger.error("Failed to count active agent pods: %s", e)
             return result
+
+    @staticmethod
+    def _has_dead_agent_container(pod) -> bool:
+        """True if the primary "agent" container has terminated.
+
+        Catches both crashes (non-zero exit) and clean exits that didn't
+        propagate to pod phase because a sidecar is still running.
+        """
+        for cs in getattr(pod.status, "container_statuses", None) or []:
+            if cs.name != "agent":
+                continue
+            state = getattr(cs, "state", None)
+            if state and getattr(state, "terminated", None) is not None:
+                return True
+        return False
 
     async def _count_idle_agents(self) -> int:
         """Count agents registered as ready (idle, waiting for work) in the DB."""
@@ -478,13 +508,18 @@ class AgentProvisioner:
         self,
         offline_threshold_minutes: int = 10,
         unstartable_grace_seconds: int = 300,
+        crashed_grace_seconds: int = 60,
     ) -> dict[str, int]:
         """Single-pass GC over managed agent pods.
 
-        Lists the pod set once and dispatches each pod to one of three
+        Lists the pod set once and dispatches each pod to one of four
         policies with different SLOs:
 
           - ``completed``: phase in {Succeeded, Failed} → delete immediately.
+          - ``crashed``: phase == Running but the ``agent`` container has
+            terminated (any exit code) for at least ``crashed_grace_seconds``.
+            Catches sidecar-pinned pods that never propagate to phase=Failed,
+            including agents that crash before their first heartbeat.
           - ``stale``: phase == Running but the agent's heartbeat has been
             offline in the DB for ``offline_threshold_minutes``.
           - ``unstartable``: phase == Pending with a terminal
@@ -493,7 +528,7 @@ class AgentProvisioner:
 
         Returns a per-category count dict.
         """
-        stats = {"completed": 0, "stale": 0, "unstartable": 0}
+        stats = {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
         if not self._k8s_available:
             return stats
 
@@ -514,6 +549,8 @@ class AgentProvisioner:
         for pod in pods.items:
             if self._is_completed(pod):
                 category = "completed"
+            elif self._is_crashed(pod, crashed_grace_seconds):
+                category = "crashed"
             elif self._is_stale_running(pod, offline_hostnames):
                 category = "stale"
             elif self._is_unstartable(pod, unstartable_grace_seconds):
@@ -530,6 +567,31 @@ class AgentProvisioner:
     @staticmethod
     def _is_completed(pod) -> bool:
         return pod.status.phase in ("Succeeded", "Failed")
+
+    @staticmethod
+    def _is_crashed(pod, grace_seconds: int) -> bool:
+        """Pod is Running but the agent container terminated past the grace.
+
+        Brief grace lets in-flight DB writes (final heartbeat, audit) land
+        before we delete the pod, which preserves debuggability without
+        meaningfully delaying capacity reclaim.
+        """
+        if pod.status.phase != "Running":
+            return False
+        for cs in getattr(pod.status, "container_statuses", None) or []:
+            if cs.name != "agent":
+                continue
+            state = getattr(cs, "state", None)
+            terminated = getattr(state, "terminated", None) if state else None
+            if terminated is None:
+                return False
+            finished_at = getattr(terminated, "finished_at", None)
+            if finished_at is None:
+                # Terminated but no timestamp yet — be conservative, wait.
+                return False
+            age = (datetime.now(timezone.utc) - finished_at).total_seconds()
+            return age >= grace_seconds
+        return False
 
     @staticmethod
     def _is_stale_running(pod, offline_hostnames: set[str]) -> bool:
@@ -758,6 +820,18 @@ class AgentProvisioner:
             "srw/managed-by": "agent-provisioner",
             "srw/purpose": purpose,
         }
+        # Standard chart labels — required for the chart's database
+        # NetworkPolicies to allow ingress from these dynamic pods. The
+        # chart's Helm-rendered "agent" component selectors expect:
+        #   app.kubernetes.io/name      = <chart name>      (e.g. srw-dev)
+        #   app.kubernetes.io/instance  = <release name>    (e.g. ...-deployment)
+        #   app.kubernetes.io/component = agent
+        if self._chart_label_name:
+            labels["app.kubernetes.io/name"] = self._chart_label_name
+        if self._chart_label_instance:
+            labels["app.kubernetes.io/instance"] = self._chart_label_instance
+        if self._chart_label_name or self._chart_label_instance:
+            labels["app.kubernetes.io/component"] = "agent"
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
 
