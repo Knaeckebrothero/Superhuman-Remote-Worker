@@ -342,6 +342,22 @@ class OrchestratorClient:
             logger.warning(f"Thread status update failed (non-fatal): {e}")
             return False
 
+    async def release_thread_agent(self, thread_id: str) -> bool:
+        """Clear threads.agent_id when this agent's session attach fails.
+
+        Lets the orchestrator dispatch the next WS reconnect to a healthy
+        agent instead of re-targeting this (now session-less) one.
+        """
+        if not self._client:
+            return False
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/release-agent"
+        try:
+            r = await self._client.post(url)
+            return r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Thread→agent release failed (non-fatal): {e}")
+            return False
+
     async def update_thread_config(
         self, thread_id: str, config_override: dict[str, Any]
     ) -> Optional[dict[str, Any]]:

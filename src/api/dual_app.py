@@ -880,6 +880,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         # runs in the background. The /ready endpoint will report readiness
         # once the session is fully set up.
         async def _setup_session():
+            # Without this, `_pod_state = PodState.IDLE` below creates a
+            # closure-local variable instead of resetting the module global,
+            # leaving the agent permanently stuck reporting `session` status.
+            global _pod_state
             try:
                 import src.api.persistent_app as pa
 
@@ -897,8 +901,32 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.info(f"Session setup complete for thread {thread_id}")
             except Exception:
                 logger.exception(f"Session setup failed for thread {thread_id}")
+                import src.api.persistent_app as pa
+
+                # _attach_session sets pa._thread_id before it can fail;
+                # _detach_session short-circuits when _session is None and
+                # never clears _thread_id, so we have to do it explicitly.
+                pa._thread_id = None
                 async with _state_lock:
                     _pod_state = PodState.IDLE
+                if _orchestrator_client and _orchestrator_client.agent_id:
+                    try:
+                        await _orchestrator_client.heartbeat(
+                            status="ready",
+                            job_id=None,
+                            metrics=_get_agent_metrics(),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to send ready heartbeat after attach failure: {e}"
+                        )
+                if _orchestrator_client:
+                    try:
+                        await _orchestrator_client.release_thread_agent(thread_id)
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to release thread→agent binding for {thread_id}: {e}"
+                        )
 
         asyncio.create_task(_setup_session())
 

@@ -88,6 +88,10 @@ orchestrator:
       cpu: "500m"
   # -- Auto-assign jobs to idle agents
   autoAssignEnabled: "true"
+  # -- Budget (seconds) for the WS proxy to wait for the agent's /ready
+  # endpoint to flip true. Must outlast the agent's own workspace SSH poll
+  # (120s) plus margin for cold workspace image pulls (~130s observed).
+  wsReadyTimeoutSeconds: 180
 
 # =============================================================================
 # Agent
@@ -530,6 +534,15 @@ workspace:
   # not enforce it). See docs/features/workspace_network_policy_unification.md.
   networkPolicy:
     enabled: true
+  # -- Pre-pull the workspace image on every node via a DaemonSet, so a
+  # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first
+  # session-attach (which would exceed the orchestrator/agent readiness
+  # timeouts). See helm/templates/optional/workspace-prewarm.yaml.
+  prewarm:
+    enabled: true
+    # -- Tiny no-op container that keeps the DaemonSet pod Ready so the
+    # kubelet doesn't garbage-collect the pulled workspace image.
+    pauseImage: "registry.k8s.io/pause:3.10"
 
 # =============================================================================
 # Optional Admin UIs
