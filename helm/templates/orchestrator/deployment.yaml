@@ -575,6 +575,10 @@ spec:
             # own _poll_workspace_ready (120s) plus margin for cold image pulls.
             - name: WS_READY_TIMEOUT_S
               value: {{ .Values.orchestrator.wsReadyTimeoutSeconds | default 180 | quote }}
+            # Budget for the WS proxy waiting for an agent to register and
+            # bind to the thread. Must accommodate a cold agent image pull.
+            - name: AGENT_BIND_TIMEOUT_S
+              value: {{ .Values.orchestrator.agentBindTimeoutSeconds | default 300 | quote }}
             # Persistent agent pods (on-demand provisioning)
             - name: PERSISTENT_AGENT_IMAGE
               valueFrom:
