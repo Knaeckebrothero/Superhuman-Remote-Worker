@@ -409,7 +409,7 @@ To get from the current state to the datasource connector system:
 Remove the baked-in Neo4j integration and lay the groundwork for generic datasources.
 
 **1.1 — Database & Schema**
-- Create `datasources` table in `orchestrator/database/schema.sql`
+- Create `datasources` table in a new migration file under `orchestrator/database/migrations/app/NNNN_add_datasources.sql` (post-cutover, `schema.sql` is frozen — see `docs/db_migration.md`)
 - Add orchestrator API endpoints for datasource CRUD
 - Add default datasource seeding in `orchestrator/init.py` (reads `DEFAULT_DS_*` env vars)
 

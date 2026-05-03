@@ -81,7 +81,13 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa:
 
 from pydantic import BaseModel, Field  # noqa: E402
 
-from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
+from database import (  # noqa: E402
+    PostgresDB,
+    MongoDB,
+    ALLOWED_TABLES,
+    FilterCategory,
+    MIGRATIONS_VECTOR_DIR,
+)
 from security.auth import (  # noqa: E402
     get_current_user,
     require_approved_user,
@@ -168,7 +174,10 @@ main_cloud_router = MainCloudRouter(build_backend())
 _vector_url = os.getenv("VECTOR_DB_URL")
 if not _vector_url:
     raise RuntimeError("VECTOR_DB_URL environment variable is required")
-vector_db = PostgresDB(connection_string=_vector_url)
+vector_db = PostgresDB(
+    connection_string=_vector_url,
+    migrations_dir=MIGRATIONS_VECTOR_DIR,
+)
 
 
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
@@ -668,6 +677,228 @@ async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
 # =============================================================================
 
 
+async def _inject_dispatch_credentials(
+    job: dict[str, Any],
+    config_override: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve and inject API keys, model routing, and capability defaults.
+
+    Mutates ``config_override`` in place (creating it if None) with everything
+    the agent needs to reach its configured LLM endpoints: per-user/project
+    API keys, endpoint base_url + api_key for catalog-routed models, user-
+    preference fallbacks (default chat/auxiliary/strategic/tactical models,
+    autonomy, reasoning level, vision/whisper/tts), and the system-level
+    default chat model when no override pinned one.
+
+    Called from both first-dispatch (``_dispatch_job_to_agent``) and resume
+    (``_resume_job_on_agent``) — without this on resume, an orphaned/paused
+    job re-dispatched to a fresh agent would inherit only the bare
+    creation-time config_override (no model/api_key) and the agent would
+    silently fall back to ``OPENAI_API_KEY=not-needed``, producing 401s
+    against the user's router.
+
+    Returns the (mutated) ``config_override`` dict so callers can rebind
+    locals when the input was None.
+    """
+    job_id = str(job["id"])
+    user_id_str = str(job["user_id"]) if job.get("user_id") else None
+
+    resolved_keys = await postgres_db.resolve_api_keys_for_job(
+        user_id=user_id_str,
+        project_id=str(job["project_id"]) if job.get("project_id") else None,
+    )
+
+    config_override = config_override or {}
+    llm_over = config_override.setdefault("llm", {})
+    model_id = llm_over.get("model")
+    meta = None
+    if model_id:
+        try:
+            meta = await _resolve_model(model_id, user_id=user_id_str)
+        except UnknownModelError:
+            meta = None
+
+    if (
+        meta is not None
+        and meta.origin in ("custom", "system", "catalog")
+        and meta.endpoint_id
+    ):
+        endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
+        if endpoint_row:
+            if endpoint_row.get("base_url"):
+                llm_over.setdefault("base_url", endpoint_row["base_url"])
+            if endpoint_row.get("api_key"):
+                llm_over.setdefault("api_key", endpoint_row["api_key"])
+            logger.info(
+                f"Dispatch: routed {model_id} to {meta.origin} endpoint "
+                f"{endpoint_row.get('label') or meta.endpoint_id}"
+            )
+    elif resolved_keys:
+        if meta is not None and meta.api_key_ref:
+            provider_for_key: str | None = meta.api_key_ref
+        else:
+            provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
+        if (
+            provider_for_key
+            and provider_for_key in resolved_keys
+            and "api_key" not in llm_over
+        ):
+            llm_over["api_key"] = resolved_keys[provider_for_key]
+
+    if resolved_keys:
+        _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
+        env_keys = {
+            _ENV_KEY_MAP[p]: resolved_keys[p] for p in ("vision",) if p in resolved_keys
+        }
+        if env_keys:
+            config_override.setdefault("env_keys", {}).update(env_keys)
+        logger.info(
+            f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
+        )
+
+    if job.get("user_id"):
+        user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
+        aux_model = user_settings.get("default_auxiliary_model")
+        if not aux_model:
+            aux_model = await postgres_db.resolve_default_for_capability("auxiliary")
+        if aux_model:
+            aux_override = config_override.setdefault("auxiliary", {})
+            if "model" not in aux_override:
+                aux_override["model"] = aux_model
+                await _inject_model_credentials(
+                    section=aux_override,
+                    model_id=aux_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
+
+        default_model = user_settings.get("default_model")
+        if default_model:
+            llm_override = config_override.setdefault("llm", {})
+            if "model" not in llm_override:
+                llm_override["model"] = default_model
+                await _inject_model_credentials(
+                    section=llm_override,
+                    model_id=default_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                )
+                logger.info(f"Dispatch: injected user default_model: {default_model}")
+
+        for _phase, _setting_key in (
+            ("strategic", "default_strategic_model"),
+            ("tactical", "default_tactical_model"),
+        ):
+            _phase_model = user_settings.get(_setting_key)
+            if not _phase_model:
+                continue
+            llm_block = config_override.setdefault("llm", {})
+            if _phase in llm_block and llm_block[_phase].get("model"):
+                continue
+            phase_section: dict = {}
+            await _inject_model_credentials(
+                section=phase_section,
+                model_id=_phase_model,
+                user_id=user_id_str,
+                resolved_keys=resolved_keys,
+            )
+            if "api_key" not in phase_section and "base_url" not in phase_section:
+                logger.warning(
+                    f"Dispatch: skipping {_phase} phase pin {_phase_model} — "
+                    f"no credentials resolvable; configure the provider key "
+                    f"in system_api_keys or clear the {_setting_key} preference."
+                )
+                continue
+            phase_section["model"] = _phase_model
+            llm_block[_phase] = phase_section
+            logger.info(f"Dispatch: injected {_phase} phase pin: {_phase_model}")
+
+        default_autonomy = user_settings.get("default_autonomy")
+        if default_autonomy and "autonomy" not in config_override:
+            config_override["autonomy"] = default_autonomy
+            logger.info(f"Dispatch: injected user default_autonomy: {default_autonomy}")
+
+        default_reasoning = user_settings.get("default_reasoning_level")
+        if default_reasoning:
+            llm_override = config_override.setdefault("llm", {})
+            if "reasoning_level" not in llm_override:
+                llm_override["reasoning_level"] = default_reasoning
+                logger.info(
+                    f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
+                )
+
+        for _kind, _prefix, _user_key in (
+            ("vision", "VISION", "default_vision_model"),
+            ("whisper", "WHISPER", "default_whisper_model"),
+            ("tts", "TTS", "default_tts_model"),
+        ):
+            _model = user_settings.get(_user_key)
+            if not _model:
+                _model = await postgres_db.resolve_default_for_capability(_kind)
+            if not _model:
+                continue
+            env_keys_block = config_override.setdefault("env_keys", {})
+            if f"{_prefix}_MODEL" in env_keys_block:
+                continue
+            await _inject_env_key_credentials(
+                env_keys=env_keys_block,
+                prefix=_prefix,
+                model_id=_model,
+                user_id=user_id_str,
+                resolved_keys=resolved_keys,
+            )
+            logger.info(f"Dispatch: injected {_kind} model: {_model}")
+
+        embedding_provider = user_settings.get("embedding_provider")
+        embedding_model = user_settings.get("default_embedding_model")
+        if not embedding_model:
+            embedding_model = await postgres_db.resolve_default_for_capability(
+                "embedding"
+            )
+        if embedding_provider or embedding_model:
+            env_keys_block = config_override.setdefault("env_keys", {})
+            if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
+                env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
+            if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
+                env_keys_block["EMBEDDING_MODEL"] = embedding_model
+            if (
+                embedding_provider == "openrouter"
+                and resolved_keys
+                and "openrouter" in resolved_keys
+            ):
+                env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
+            logger.info(
+                f"Dispatch: injected embedding: "
+                f"provider={embedding_provider}, model={embedding_model}"
+            )
+
+    # System-default fallback for the worker chat model. Runs after the
+    # user-preference block (or whenever there's no user) so jobs that
+    # arrived without an llm.model still pick up the admin-curated default
+    # from the catalog instead of falling through to the agent's YAML
+    # default — which has no base_url/api_key for self-hosted models and
+    # silently routes to api.openai.com with "not-needed".
+    llm_override_check = config_override.get("llm") or {}
+    if "model" not in llm_override_check:
+        system_chat_model = await postgres_db.resolve_default_for_capability("chat")
+        if system_chat_model:
+            llm_override = config_override.setdefault("llm", {})
+            llm_override["model"] = system_chat_model
+            await _inject_model_credentials(
+                section=llm_override,
+                model_id=system_chat_model,
+                user_id=user_id_str,
+                resolved_keys=resolved_keys,
+            )
+            logger.info(
+                f"Dispatch: injected system default chat model: {system_chat_model} "
+                f"(job {job_id})"
+            )
+
+    return config_override
+
+
 async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
     """Start a new job on an agent. Returns True on success.
 
@@ -821,253 +1052,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     f"Dispatch: using worktree path {worktree_path} for job {job_id}"
                 )
 
-        # Resolve user/project API keys (user > project > env var fallback).
-        user_id_str = str(job["user_id"]) if job.get("user_id") else None
-        resolved_keys = await postgres_db.resolve_api_keys_for_job(
-            user_id=user_id_str,
-            project_id=str(job["project_id"]) if job.get("project_id") else None,
-        )
-
-        # Resolve the main LLM through the registry. Endpoint-backed
-        # models (custom = per-user, system = helm-seeded / Admin →
-        # Providers) carry their own inline base_url + api_key on the
-        # llm_endpoints row; built-ins look up their api_key via
-        # resolved_keys.
-        config_override = config_override or {}
-        llm_over = config_override.setdefault("llm", {})
-        model_id = llm_over.get("model")
-        meta = None
-        if model_id:
-            try:
-                meta = await _resolve_model(model_id, user_id=user_id_str)
-            except UnknownModelError:
-                meta = None
-
-        if (
-            meta is not None
-            and meta.origin in ("custom", "system", "catalog")
-            and meta.endpoint_id
-        ):
-            endpoint_row = await postgres_db.get_user_llm_endpoint(meta.endpoint_id)
-            if endpoint_row:
-                if endpoint_row.get("base_url"):
-                    llm_over.setdefault("base_url", endpoint_row["base_url"])
-                if endpoint_row.get("api_key"):
-                    llm_over.setdefault("api_key", endpoint_row["api_key"])
-                logger.info(
-                    f"Dispatch: routed {model_id} to {meta.origin} endpoint "
-                    f"{endpoint_row.get('label') or meta.endpoint_id}"
-                )
-        elif resolved_keys:
-            # Built-in (or unknown): inject the right named-provider key.
-            if meta is not None and meta.api_key_ref:
-                provider_for_key: str | None = meta.api_key_ref
-            else:
-                provider_for_key = _dispatch_llm_provider_fallback(job, config_override)
-            if (
-                provider_for_key
-                and provider_for_key in resolved_keys
-                and "api_key" not in llm_over
-            ):
-                llm_over["api_key"] = resolved_keys[provider_for_key]
-
-        # Non-LLM tool keys (vision) always travel as env_keys.
-        if resolved_keys:
-            _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
-            env_keys = {
-                _ENV_KEY_MAP[p]: resolved_keys[p]
-                for p in ("vision",)
-                if p in resolved_keys
-            }
-            if env_keys:
-                config_override.setdefault("env_keys", {}).update(env_keys)
-            logger.info(
-                f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
-            )
-
-        # Inject user preferences as lowest-priority config overrides
-        # (only fill gaps not set by per-job or project-level overrides).
-        # System-settings defaults fill any gap the user didn't set — they're
-        # the admin-controlled cluster-wide fallback, still shadowed by per-job
-        # / project / user overrides so individual users can pick their own
-        # model if they prefer.
-        if job.get("user_id"):
-            user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
-            aux_model = user_settings.get("default_auxiliary_model")
-            if not aux_model:
-                aux_model = await postgres_db.resolve_default_for_capability(
-                    "auxiliary"
-                )
-            if aux_model:
-                config_override = config_override or {}
-                aux_override = config_override.setdefault("auxiliary", {})
-                if "model" not in aux_override:
-                    aux_override["model"] = aux_model
-                    await _inject_model_credentials(
-                        section=aux_override,
-                        model_id=aux_model,
-                        user_id=user_id_str,
-                        resolved_keys=resolved_keys,
-                    )
-                    logger.info(
-                        f"Dispatch: injected auxiliary model override: {aux_model}"
-                    )
-
-            # Worker chat model — top-level llm.model. Phase-specific pins
-            # (default_strategic_model / default_tactical_model) are handled
-            # separately below as PhaseLLMOverride fields on llm.{strategic,
-            # tactical} so they can be skipped softly when their provider
-            # is unreachable (stale pin to a removed provider).
-            default_model = user_settings.get("default_model")
-            if default_model:
-                config_override = config_override or {}
-                llm_override = config_override.setdefault("llm", {})
-                if "model" not in llm_override:
-                    llm_override["model"] = default_model
-                    await _inject_model_credentials(
-                        section=llm_override,
-                        model_id=default_model,
-                        user_id=user_id_str,
-                        resolved_keys=resolved_keys,
-                    )
-                    logger.info(
-                        f"Dispatch: injected user default_model: {default_model}"
-                    )
-
-            # Phase-specific model pins. These override only the named phase;
-            # the canonical model on llm.model still drives every other
-            # phase. Soft-skip when the provider has no resolvable
-            # credentials so a stale strategic/tactical pin to a removed
-            # provider doesn't break the whole job — the phase falls back
-            # to the canonical model instead.
-            for _phase, _setting_key in (
-                ("strategic", "default_strategic_model"),
-                ("tactical", "default_tactical_model"),
-            ):
-                _phase_model = user_settings.get(_setting_key)
-                if not _phase_model:
-                    continue
-                config_override = config_override or {}
-                llm_block = config_override.setdefault("llm", {})
-                if _phase in llm_block and llm_block[_phase].get("model"):
-                    continue
-                phase_section: dict = {}
-                await _inject_model_credentials(
-                    section=phase_section,
-                    model_id=_phase_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                )
-                if "api_key" not in phase_section and "base_url" not in phase_section:
-                    logger.warning(
-                        f"Dispatch: skipping {_phase} phase pin {_phase_model} — "
-                        f"no credentials resolvable; configure the provider key "
-                        f"in system_api_keys or clear the {_setting_key} preference."
-                    )
-                    continue
-                phase_section["model"] = _phase_model
-                llm_block[_phase] = phase_section
-                logger.info(f"Dispatch: injected {_phase} phase pin: {_phase_model}")
-
-            default_autonomy = user_settings.get("default_autonomy")
-            if default_autonomy:
-                config_override = config_override or {}
-                if "autonomy" not in config_override:
-                    config_override["autonomy"] = default_autonomy
-                    logger.info(
-                        f"Dispatch: injected user default_autonomy: {default_autonomy}"
-                    )
-
-            default_reasoning = user_settings.get("default_reasoning_level")
-            if default_reasoning:
-                config_override = config_override or {}
-                llm_override = config_override.setdefault("llm", {})
-                if "reasoning_level" not in llm_override:
-                    llm_override["reasoning_level"] = default_reasoning
-                    logger.info(
-                        f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
-                    )
-
-            # Helper-capability env-var injection (vision / whisper / tts).
-            # Each routes through _inject_env_key_credentials which handles
-            # both built-in models (api_key from resolved_keys[provider]) and
-            # endpoint-registry-backed models (base_url + api_key inlined
-            # from the endpoint row). User preference wins; otherwise the
-            # admin-controlled system_settings default fills the gap.
-            for _kind, _prefix, _user_key in (
-                ("vision", "VISION", "default_vision_model"),
-                ("whisper", "WHISPER", "default_whisper_model"),
-                ("tts", "TTS", "default_tts_model"),
-            ):
-                _model = user_settings.get(_user_key)
-                if not _model:
-                    _model = await postgres_db.resolve_default_for_capability(_kind)
-                if not _model:
-                    continue
-                config_override = config_override or {}
-                env_keys_block = config_override.setdefault("env_keys", {})
-                if f"{_prefix}_MODEL" in env_keys_block:
-                    continue
-                await _inject_env_key_credentials(
-                    env_keys=env_keys_block,
-                    prefix=_prefix,
-                    model_id=_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                )
-                logger.info(f"Dispatch: injected {_kind} model: {_model}")
-
-            # Embedding provider and model (per-account). The model and
-            # provider fall back to system_settings independently — some
-            # deployments set a default model without pinning the provider,
-            # leaving it up to the agent's existing env-var resolution.
-            embedding_provider = user_settings.get("embedding_provider")
-            embedding_model = user_settings.get("default_embedding_model")
-            if not embedding_model:
-                embedding_model = await postgres_db.resolve_default_for_capability(
-                    "embedding"
-                )
-            if embedding_provider or embedding_model:
-                config_override = config_override or {}
-                env_keys_block = config_override.setdefault("env_keys", {})
-                if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
-                    env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
-                if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
-                    env_keys_block["EMBEDDING_MODEL"] = embedding_model
-                # When using openrouter, inject the user's OpenRouter key
-                if (
-                    embedding_provider == "openrouter"
-                    and resolved_keys
-                    and "openrouter" in resolved_keys
-                ):
-                    env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
-                logger.info(
-                    f"Dispatch: injected embedding: "
-                    f"provider={embedding_provider}, model={embedding_model}"
-                )
-
-        # System-default fallback for the worker chat model. Runs after the
-        # user-preference block (or whenever there's no user) so jobs that
-        # arrived without an llm.model still pick up the admin-curated
-        # default from the catalog instead of falling through to the agent's
-        # YAML default — which has no base_url/api_key for self-hosted models
-        # and silently routes to api.openai.com with "not-needed".
-        llm_override_check = (config_override or {}).get("llm") or {}
-        if "model" not in llm_override_check:
-            system_chat_model = await postgres_db.resolve_default_for_capability("chat")
-            if system_chat_model:
-                config_override = config_override or {}
-                llm_override = config_override.setdefault("llm", {})
-                llm_override["model"] = system_chat_model
-                await _inject_model_credentials(
-                    section=llm_override,
-                    model_id=system_chat_model,
-                    user_id=user_id_str,
-                    resolved_keys=resolved_keys,
-                )
-                logger.info(
-                    f"Dispatch: injected system default chat model: {system_chat_model}"
-                )
+        # Resolve API keys, model routing, and capability defaults.
+        # Same helper drives both first-dispatch and resume so an orphaned
+        # job re-dispatched to a fresh agent doesn't lose its credentials.
+        config_override = await _inject_dispatch_credentials(job, config_override)
 
         # Build job start request
         job_start = JobStartRequest(
@@ -1157,6 +1145,15 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             config_override = _build_datasource_tool_override(
                 resolved_ds, config_override
             )
+
+        # Re-inject API keys and model routing. The first dispatch already
+        # did this, but the result was passed inline to the agent and never
+        # written back to jobs.config_override — so on resume the persisted
+        # row only carries the bare creation-time override. Without this
+        # call, an orphaned/paused job picked up by a fresh agent would have
+        # no llm.api_key and the loader would silently fall back to
+        # OPENAI_API_KEY=not-needed and 401 against the user's router.
+        config_override = await _inject_dispatch_credentials(job, config_override)
 
         # Inject VM workspace config if job has a ready VM
         vm_ctx = _get_vm_context(job)
@@ -2845,13 +2842,14 @@ async def lifespan(app: FastAPI):
     await vector_db.connect()
     await mongodb.connect()
 
-    # Ensure database schemas exist (idempotent — safe on every restart)
-    await postgres_db.ensure_schema()
-    from pathlib import Path as _Path
-
-    _vector_schema = _Path(__file__).parent / "database" / "vector_schema.sql"
-    await vector_db.ensure_schema(schema_file=_vector_schema)
-    logger.info("Database schemas verified")
+    # Apply pending migrations on each DB. Each PostgresDB instance is
+    # bound to its migrations directory at construction time; the runner
+    # serializes via pg_advisory_xact_lock and refuses to proceed on
+    # checksum drift or a dirty row from a prior failure (see
+    # docs/db_migration.md §Operational runbook for repair steps).
+    await postgres_db.apply_migrations()
+    await vector_db.apply_migrations()
+    logger.info("Database migrations applied")
 
     # Wire the model registry's catalog lookup to the DB. The registry lives
     # in src/core/ and must not import orchestrator/, so the hook is injected

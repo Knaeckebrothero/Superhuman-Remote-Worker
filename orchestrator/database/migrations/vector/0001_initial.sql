@@ -1,3 +1,16 @@
+-- migration:     0001_initial.sql
+-- description:   Initial vector-DB snapshot at migration-runner cutover.
+-- depends-on:    (none — first migration)
+-- expected:      Fast on empty DB; pre-marked applied on existing environments
+--                (see docs/db_migration.md §Operational runbook).
+-- locks:         Brief AccessExclusiveLock per CREATE TABLE / CREATE INDEX.
+-- transactional: yes
+--
+-- Snapshot of orchestrator/database/vector_schema.sql at cutover. Future
+-- changes to the vector DB ship as new numbered files in this directory;
+-- vector_schema.sql is kept as a frozen reference and is no longer applied
+-- at runtime.
+--
 -- Superhuman Remote Worker — Vector Database Schema
 -- PostgreSQL + pgvector for vector search workloads
 --
