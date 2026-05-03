@@ -10666,15 +10666,36 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
                     )
                 )
 
-        # Poll for agent registration (agent calls /api/agents/register on startup)
+        # Poll for agent registration (agent calls /api/agents/register on startup).
+        # Budget must accommodate a cold pull of the agent image — on a fresh
+        # tag, kubelet image pull alone can take 2–3 minutes per node.
         await ws.send_json({"method": "status", "params": {"phase": "provisioning"}})
+        bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
+        bind_interval_s = 2
+        bind_iterations = max(1, bind_timeout_s // bind_interval_s)
         agent_bound = False
-        for _ in range(90):  # 180s timeout
-            await asyncio.sleep(2)
+        for i in range(bind_iterations):
+            await asyncio.sleep(bind_interval_s)
             thread = await postgres_db.get_thread(thread_id)
             if thread and thread.get("agent_id"):
                 agent_bound = True
                 break
+            # Periodic progress ping so the cockpit doesn't sit silent for
+            # minutes on a cold agent image pull.
+            if i > 0 and i % 5 == 0:
+                try:
+                    await ws.send_json(
+                        {
+                            "method": "status",
+                            "params": {
+                                "phase": "provisioning",
+                                "elapsed_s": (i + 1) * bind_interval_s,
+                                "timeout_s": bind_timeout_s,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
 
         if not agent_bound:
             await ws.close(code=4503, reason="Agent failed to start within timeout")
