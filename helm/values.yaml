@@ -92,6 +92,10 @@ orchestrator:
   # endpoint to flip true. Must outlast the agent's own workspace SSH poll
   # (120s) plus margin for cold workspace image pulls (~130s observed).
   wsReadyTimeoutSeconds: 180
+  # -- Budget (seconds) for the WS proxy to wait for an agent pod to register
+  # and bind to a thread. Must accommodate a cold agent image pull on every
+  # node — observed up to 5+ minutes for a fresh tag with no cache.
+  agentBindTimeoutSeconds: 300
 
 # =============================================================================
 # Agent

@@ -464,6 +464,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.workspace
+      args:
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:?set PLAYWRIGHT_VERSION (see .playwright-version)}
     image: srw-workspace:dev
     container_name: srw-workspace-1
     environment:
@@ -488,6 +490,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.workspace
+      args:
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:?set PLAYWRIGHT_VERSION (see .playwright-version)}
     image: srw-workspace:dev
     container_name: srw-workspace-2
     environment:
@@ -512,6 +516,8 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.workspace
+      args:
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:?set PLAYWRIGHT_VERSION (see .playwright-version)}
     image: srw-workspace:dev
     container_name: srw-workspace-3
     environment:

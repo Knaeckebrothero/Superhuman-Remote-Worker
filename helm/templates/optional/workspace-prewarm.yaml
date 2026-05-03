@@ -1,32 +1,34 @@
 {{/*
-Workspace image pre-warmer — DaemonSet that pulls the workspace image on every
-node so the first session-attach for a freshly-published tag doesn't pay a
-~2-minute cold pull penalty. The workspace image is ~1.4 GB; on first schedule
-to a node without the tag cached, the kubelet spends that long pulling, which
-exceeds both the agent's _poll_workspace_ready (120s) and the orchestrator's
-WS-proxy /ready budget (default 180s).
+Image pre-warmer — DaemonSet that pulls hot-path images on every node so the
+first session-attach or job-dispatch for a freshly-published tag doesn't pay
+a multi-minute cold pull penalty. The workspace image (~1.4 GB) and the
+agent image are both pulled at session/job start; on first schedule to a node
+without the tag cached, the kubelet pull exceeds both the agent's
+_poll_workspace_ready (120s) and the orchestrator's agent_bound wait (default
+300s, was 180s).
 
-Mechanism: the init container references the workspace image with
-imagePullPolicy: Always (so a Helm rollout updates the cached layer); the
-init's command is a no-op, the pull is the side effect. The main container
-runs `pause` so the DaemonSet stays Ready and the kubelet doesn't garbage-
-collect the image.
+Mechanism: each init container references its image with imagePullPolicy:
+Always (so a Helm rollout updates the cached layer); the init's command is a
+no-op, the pull is the side effect. Init containers run sequentially so two
+parallel pulls don't saturate the node's network. The main container runs
+`pause` so the DaemonSet stays Ready and the kubelet doesn't garbage-collect
+the warmed images.
 */}}
 {{- if .Values.workspace.prewarm.enabled }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: {{ include "srw.fullname" . }}-workspace-prewarm
+  name: {{ include "srw.fullname" . }}-image-prewarm
   labels:
-    {{- include "srw.componentLabels" (dict "context" . "component" "workspace-prewarm") | nindent 4 }}
+    {{- include "srw.componentLabels" (dict "context" . "component" "image-prewarm") | nindent 4 }}
 spec:
   selector:
     matchLabels:
-      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "workspace-prewarm") | nindent 6 }}
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "image-prewarm") | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "workspace-prewarm") | nindent 8 }}
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "image-prewarm") | nindent 8 }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -38,6 +40,17 @@ spec:
       initContainers:
         - name: pull-workspace
           image: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
+          imagePullPolicy: Always
+          command: ["true"]
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "8Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+        - name: pull-agent
+          image: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
           imagePullPolicy: Always
           command: ["true"]
           resources:
