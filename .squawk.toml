@@ -23,3 +23,10 @@ excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
 ]
+
+# Until the first real migration lands as 0002_*.sql, the workflow's glob
+# pattern (orchestrator/database/migrations/**/*.sql) matches only the two
+# excluded snapshots above — so squawk ends up with zero files to lint.
+# By default that's an error; flip the default so an empty match set is a
+# pass, not a fail. Once real migrations exist this is a no-op.
+no_error_on_unmatched_pattern = true
