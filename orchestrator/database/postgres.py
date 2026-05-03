@@ -5863,7 +5863,15 @@ class PostgresDB:
                 or a previous run left a dirty row, or checksum drift was
                 detected.
         """
-        from orchestrator.database.migrate import run_migrations
+        try:
+            # Host-side: invoked from repo root (e.g. `python init.py`) where
+            # the orchestrator package is importable via its full path.
+            from orchestrator.database.migrate import run_migrations
+        except ImportError:
+            # In-container: Dockerfile.orchestrator copies orchestrator/ flat
+            # into /app with PYTHONPATH=/app, so the same module is reachable
+            # as a top-level `database` package.
+            from database.migrate import run_migrations
 
         if self._pool is None:
             raise RuntimeError("apply_migrations() called before connect()")
