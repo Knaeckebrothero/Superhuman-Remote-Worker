@@ -5,8 +5,8 @@ name: db-migrations
 # Runs three jobs in parallel:
 #   1. squawk      — static lint of the SQL diff (lock safety, missing
 #                    NOT VALID, non-concurrent indexes, etc.)
-#   2. dry-run     — apply every migration to a fresh postgres:16 service
-#                    container (transactional pass rolls back; non-tx
+#   2. dry-run     — apply every migration to a fresh pgvector/pgvector:pg16
+#                    service container (transactional pass rolls back; non-tx
 #                    migrations are skipped under --dry-run)
 #   3. uniqueness  — refuse duplicate NNNN_ prefixes within each migrations
 #                    subdirectory
@@ -20,16 +20,26 @@ on:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
       - '.github/workflows/db-migrations.yml'
+      - '.squawk.toml'
   pull_request:
     paths:
       - 'orchestrator/database/migrations/**.sql'
       - 'orchestrator/database/migrate.py'
       - '.github/workflows/db-migrations.yml'
+      - '.squawk.toml'
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Squawk's GitHub Action posts findings as PR comments, which requires
+# write access to issues/pull-requests on top of the default read-only
+# token. Granted at the workflow level so the comment-posting step doesn't
+# 403 on PR runs (and to avoid having to repeat it per job).
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   squawk:
@@ -40,20 +50,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # `.squawk.toml` at repo root is auto-discovered by squawk by walking
+      # up from the cwd — no `config` input needed (and the v2 action
+      # doesn't accept one anyway).
       - uses: sbdchd/squawk-action@v2
         with:
           pattern: "orchestrator/database/migrations/**/*.sql"
           version: "latest"
-          config: ".squawk.toml"
           fail-on-violations: true
 
   dry-run:
-    name: dry-run on postgres:16
+    name: dry-run on pgvector/pgvector:pg16
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
+      # pgvector/pgvector:pg16 is the canonical "Postgres 16 + pgvector"
+      # build. The vector DB's 0001_initial.sql declares vector(4096) on
+      # source_embeddings, so the stock postgres:16 image fails on
+      # CREATE EXTENSION vector. This image bundles the extension.
       postgres:
-        image: postgres:16
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: ci
           POSTGRES_USER: ci
@@ -71,12 +87,14 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install --quiet asyncpg
-      - name: Create vector DB
+      - name: Create the vector database
         env:
           PGPASSWORD: ci
         run: |
+          # 0001_initial.sql declares its own CREATE EXTENSION statements
+          # (uuid-ossp on both DBs, vector on the vector DB), so we only
+          # need to ensure the second database exists.
           psql -h localhost -U ci -d ci_app -c "CREATE DATABASE ci_vector;"
-          psql -h localhost -U ci -d ci_vector -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
       - name: Dry-run app migrations
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
