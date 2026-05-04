@@ -25,13 +25,21 @@ echo "=== Agent VM Base Image Provisioning ==="
 
 echo "--- Installing system packages ---"
 
-# Apt resilience: archive.ubuntu.com behind SLIRP is flaky on long fetches.
-# Without retries, a single dropped connection mid-install fails the build.
-sudo tee /etc/apt/apt.conf.d/99-retries > /dev/null <<'EOF'
+# Apt speed + resilience. archive.ubuntu.com behind SLIRP/Canonical's load
+# balancer is both flaky and slow; the Azure mirror is significantly faster
+# from GitHub-hosted runners (which are Azure-hosted) and on most home links.
+sudo sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || \
+    sudo sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+    /etc/apt/sources.list
+
+sudo tee /etc/apt/apt.conf.d/99-build-tuning > /dev/null <<'EOF'
 Acquire::Retries "5";
 Acquire::Retries::Delay::Maximum "30";
-Acquire::http::Timeout "60";
-Acquire::https::Timeout "60";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+Acquire::http::Pipeline-Depth "10";
+Acquire::Queue-Mode "access";
 EOF
 
 sudo apt-get update -y

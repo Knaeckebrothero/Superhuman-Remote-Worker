@@ -15,6 +15,16 @@ ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
 
 # ---------------------------------------------------------------------------
+# 0. Apt tuning: switch to Azure mirror (faster from GHA Azure runners and
+#    far more reliable than archive.ubuntu.com's load balancer) and enable
+#    retries + pipelining. Same config as agent-vm-base/scripts/provision.sh.
+# ---------------------------------------------------------------------------
+RUN { sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
+      || sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; } \
+    && printf 'Acquire::Retries "5";\nAcquire::Retries::Delay::Maximum "30";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::http::Pipeline-Depth "10";\nAcquire::Queue-Mode "access";\n' \
+        > /etc/apt/apt.conf.d/99-build-tuning
+
+# ---------------------------------------------------------------------------
 # 1. System packages (mirrors agent-vm-base/scripts/provision.sh lines 28-68)
 # ---------------------------------------------------------------------------
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
