@@ -838,8 +838,9 @@ ide:
 #                              provisioned by a post-install Job.
 #
 #   url="nats://...:4222"      orchestrator points at an external NATS (e.g.
-#                              the dev hub installed manually from
-#                              deployment/nats/nats-hub-values.yaml).
+#                              a shared homelab hub — see the HomeLab repo's
+#                              deployments_managed/nats/ for the canonical
+#                              shared-hub deployment pattern).
 #
 # Leaving both unset disables VM lifecycle entirely (orchestrator falls back
 # to K8s pod workspaces via the container provisioner).
