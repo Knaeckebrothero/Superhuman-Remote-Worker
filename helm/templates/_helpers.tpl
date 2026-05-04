@@ -252,6 +252,22 @@ Resources for the Keycloak bootstrap Job.
 {{- printf "%s-keycloak-bootstrap" (include "srw.fullname" .) -}}
 {{- end }}
 
+{{/*
+Name of the K8s Secret holding the bootstrap admin credentials (KC_ADMIN_USER /
+KC_ADMIN_PASSWORD). Resolves to either:
+  - the user-provided pre-existing Secret (.Values.keycloak.bootstrap.adminCredentialsSecret), or
+  - the chart-managed Secret synced by the bootstrap ExternalSecret pre-install
+    hook (when .Values.keycloak.bootstrap.adminCredentialsVaultPath is set):
+    `<fullname>-keycloak-bootstrap-creds`
+*/}}
+{{- define "srw.keycloakBootstrapAdminSecretName" -}}
+{{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath -}}
+{{- printf "%s-keycloak-bootstrap-creds" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- .Values.keycloak.bootstrap.adminCredentialsSecret -}}
+{{- end -}}
+{{- end }}
+
 {{- define "srw.gitUrl" -}}
 {{- if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
 {{- .Values.gitea.externalUrl }}

@@ -7,6 +7,20 @@ nameOverride: ""
 fullnameOverride: ""
 
 # =============================================================================
+# Namespace
+# =============================================================================
+namespace:
+  # -- If true, the chart creates the namespace it's deployed into. The
+  # Namespace manifest is annotated `helm.sh/resource-policy: keep` so
+  # `helm uninstall` does NOT delete it (which would cascade-delete every
+  # PVC, including the databases). To fully wipe an installation:
+  #   helm uninstall <release> -n <ns>
+  #   kubectl delete namespace <ns>
+  # Leave false if the namespace is managed elsewhere (e.g. Fleet, Kustomize,
+  # or `kubectl apply -f namespace.yaml` before `helm install`).
+  create: false
+
+# =============================================================================
 # License Acceptance
 # =============================================================================
 # The Superhuman Remote Worker source is publicly available under the terms in
@@ -409,11 +423,30 @@ keycloak:
   # the source of truth for the secret and avoids chart-owned writeback.
   bootstrap:
     enabled: false
-    # -- K8s Secret containing KC_ADMIN_USER + KC_ADMIN_PASSWORD for an account
-    # the bootstrap Job uses to drive kcadm. Required when bootstrap.enabled=true.
+    # -- Source of the bootstrap admin credentials (KC_ADMIN_USER + KC_ADMIN_PASSWORD)
+    # used by the Job to drive kcadm. When bootstrap.enabled=true, set EXACTLY ONE of:
     #
-    # Required roles (assign via the master realm, on the `<TARGET_REALM>-realm`
-    # client — e.g. `home-realm` if you're bootstrapping realm `home`):
+    #   adminCredentialsSecret       — name of a pre-existing K8s Secret in the
+    #                                  release namespace, with keys KC_ADMIN_USER
+    #                                  and KC_ADMIN_PASSWORD. You create it before
+    #                                  `helm install` (kubectl create secret ...).
+    #
+    #   adminCredentialsVaultPath    — Vault path (e.g.
+    #                                  "homelab/<ns>/keycloak-bootstrap") containing
+    #                                  the same two keys. The chart renders an
+    #                                  ExternalSecret as a pre-install hook
+    #                                  (weight -15, runs before the bootstrap Job
+    #                                  at -5); ESO syncs Vault → K8s Secret. The
+    #                                  bootstrap Job's init container waits for
+    #                                  the Secret to materialize before the main
+    #                                  container runs. Requires externalSecrets.enabled=true
+    #                                  and externalSecrets.secretStoreRef configured.
+    #
+    # Setting both, or neither, is a chart-render error.
+    #
+    # Required roles for the credentials (assign via the master realm, on the
+    # `<TARGET_REALM>-realm` client — e.g. `home-realm` if you're bootstrapping
+    # realm `home`):
     #   - view-realm      — kcadm get realms/<realm> existence check
     #   - view-clients    — look up cockpit/mcp client UUIDs before update
     #   - manage-clients  — create/update srw-cockpit + srw-mcp
@@ -430,6 +463,7 @@ keycloak:
     # `create-realm` role (which auto-makes the creator admin of the new realm,
     # so the five granular roles above are not separately required for it).
     adminCredentialsSecret: ""
+    adminCredentialsVaultPath: ""
     # -- Realm to create the clients in. Defaults to keycloak.realm.
     realm: ""
     # -- Create the realm if it does not exist. Requires master-realm admin
