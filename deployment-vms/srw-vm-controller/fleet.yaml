@@ -20,10 +20,12 @@ helm:
     # Identifies this controller instance for NATS subject scoping. Matches
     # the dev orchestrator's release identity.
     orchestratorId: srw-dev
-    # Hub the in-cluster NATS leaf dials into. Mirrors the value in
-    # deployment/nats/nats-leaf-values.yaml from the dev manual install.
+    # Hub the in-cluster NATS leaf dials into. The hub is the shared
+    # homelab NATS instance on the main cluster (HomeLab repo:
+    # deployments_managed/nats/), exposed via a MetalLB LoadBalancer
+    # Service at 10.0.51.14. Stable across node reboots / drains.
     nats:
-      hubUrl: "nats-leaf://10.0.0.101:30742"
+      hubUrl: "nats-leaf://10.0.51.14:7422"
     # Authorized into VMs at boot. Same key the dev orchestrator's agent
     # pods hold the private side of (matches the previously-hardcoded value
     # in the old deployment-vms/srw-vm-controller/vm-controller.yaml).
