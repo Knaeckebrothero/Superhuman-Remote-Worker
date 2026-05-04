@@ -1,0 +1,27 @@
+{{- if .Values.nats.internal }}
+# Headless Service for the NATS StatefulSet — what NATS_URL resolves to.
+# Client port 4222 is the only one exposed to the orchestrator; monitor
+# (8222) and leafnode (7422) are reachable in-cluster for debugging /
+# leaf-connection-from-NodePort.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.natsName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats") | nindent 4 }}
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+    - name: monitor
+      port: 8222
+      targetPort: monitor
+    - name: leafnode
+      port: 7422
+      targetPort: leafnode
+{{- end }}

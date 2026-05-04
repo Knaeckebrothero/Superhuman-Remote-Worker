@@ -675,23 +675,29 @@ jobs:
         uses: azure/setup-helm@v4
         with:
           version: v3.17.0
-      - name: Package chart
+      - name: Package both charts
         run: |
           mkdir -p dist
-          helm package helm/ \
-            --version "${{ needs.resolve-version.outputs.version }}" \
-            --app-version "${{ needs.resolve-version.outputs.version }}" \
-            --destination ./dist
+          for chart_dir in helm helm-vm-cluster; do
+            helm package "${chart_dir}/" \
+              --version "${{ needs.resolve-version.outputs.version }}" \
+              --app-version "${{ needs.resolve-version.outputs.version }}" \
+              --destination ./dist
+          done
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push chart to OCI registry
+      - name: Push both charts to OCI registry
         run: |
-          helm push ./dist/superhuman-remote-worker-${{ needs.resolve-version.outputs.version }}.tgz \
-            oci://ghcr.io/knaeckebrothero/charts
+          # Chart names are stable; use them directly to find the .tgz
+          # produced by `helm package` (named <chart-name>-<version>.tgz).
+          for chart_name in superhuman-remote-worker superhuman-remote-worker-vm-cluster; do
+            helm push "./dist/${chart_name}-${{ needs.resolve-version.outputs.version }}.tgz" \
+              oci://ghcr.io/knaeckebrothero/charts
+          done
       - name: Push git tag
         run: |
           git config user.name "github-actions[bot]"

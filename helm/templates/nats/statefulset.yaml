@@ -1,0 +1,78 @@
+{{- if .Values.nats.internal }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "srw.natsName" . }}-data
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.nats.storageSize }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "srw.natsName" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats") | nindent 4 }}
+spec:
+  serviceName: {{ include "srw.natsName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats") | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nats
+          image: {{ .Values.nats.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["nats-server"]
+          args: ["--config", "/etc/nats/nats.conf"]
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+            - name: leafnode
+              containerPort: 7422
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+              readOnly: true
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "srw.natsName" . }}-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "srw.natsName" . }}-data
+{{- end }}
