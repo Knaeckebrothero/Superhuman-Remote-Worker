@@ -3,7 +3,8 @@
 # Idempotent: `nats stream add --defaults` is a no-op if the stream
 # already exists with the same config.
 #
-# Mirrors deployment/nats/setup-streams.sh from the dev manual setup.
+# Equivalent to the `nats stream add` commands documented in the
+# HomeLab repo's deployments_managed/nats/README.md.
 apiVersion: batch/v1
 kind: Job
 metadata:

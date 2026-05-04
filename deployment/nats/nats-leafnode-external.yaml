@@ -1,7 +1,0 @@
-# MOVED — this Service now lives in the HomeLab repo:
-#   HomeLab/deployments_managed/nats/nats_metallb_service.yaml
-#
-# It's a MetalLB LoadBalancer at 10.0.51.14:7422 (was 30742 NodePort).
-# Fleet-managed alongside the NATS hub release. This file is kept as a
-# stub so the move is discoverable in `git log`. Safe to delete in a
-# follow-up cleanup.
