@@ -1,0 +1,19 @@
+# In-cluster Service the vm-controller dials. Subjects published here
+# are forwarded by the leaf to the hub on the orchestrator cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srwvm.natsLeafName" . }}
+  labels:
+    {{- include "srwvm.componentLabels" (dict "context" . "component" "nats-leaf") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "nats-leaf") | nindent 4 }}
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+    - name: monitor
+      port: 8222
+      targetPort: monitor

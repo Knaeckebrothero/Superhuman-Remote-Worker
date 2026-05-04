@@ -1,0 +1,98 @@
+{{- if .Values.nats.internal }}
+# JetStream stream provisioning — runs once per install/upgrade.
+# Idempotent: `nats stream add --defaults` is a no-op if the stream
+# already exists with the same config.
+#
+# Mirrors deployment/nats/setup-streams.sh from the dev manual setup.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "srw.natsName" . }}-streams
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats-streams") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats-streams") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Wait for the NATS server to accept connections.
+        - name: wait-for-nats
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z {{ include "srw.natsName" . }} 4222; do
+                echo "waiting for NATS..."
+                sleep 2
+              done
+      containers:
+        - name: streams
+          image: natsio/nats-box:0.14.5
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              NATS_URL="nats://{{ include "srw.natsName" . }}:4222"
+              echo "Provisioning JetStream streams on $NATS_URL..."
+
+              # VM lifecycle + status — single replica (we run a single-node hub),
+              # 24h retention, 1 GiB max. Idempotent via --defaults.
+              nats stream add VM_EVENTS \
+                --subjects "vm.lifecycle.>,vm.status.>" \
+                --retention limits \
+                --max-age 24h \
+                --max-bytes 1073741824 \
+                --replicas 1 \
+                --storage file \
+                --discard old \
+                --defaults \
+                --server "$NATS_URL"
+              echo "stream VM_EVENTS ready"
+
+              # Agent heartbeats — short retention, small size.
+              nats stream add AGENT_HEARTBEATS \
+                --subjects "agent.*.heartbeat" \
+                --retention limits \
+                --max-age 1h \
+                --max-bytes 104857600 \
+                --replicas 1 \
+                --storage file \
+                --discard old \
+                --defaults \
+                --server "$NATS_URL"
+              echo "stream AGENT_HEARTBEATS ready"
+
+              # Job assignments — work queue (at-least-once delivery).
+              nats stream add JOB_ASSIGNMENTS \
+                --subjects "agent.*.job.>" \
+                --retention work \
+                --max-bytes 536870912 \
+                --replicas 1 \
+                --storage file \
+                --defaults \
+                --server "$NATS_URL"
+              echo "stream JOB_ASSIGNMENTS ready"
+
+              echo "All streams provisioned."
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+{{- end }}

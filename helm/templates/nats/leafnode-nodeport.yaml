@@ -1,0 +1,24 @@
+{{- if and .Values.nats.internal (gt (int .Values.nats.leafNodePort) 0) }}
+# Cross-cluster leaf connection NodePort — exposes the NATS leafnode port
+# (7422) on every cluster node so a NATS leaf on a separate cluster (e.g.
+# the vm cluster running superhuman-remote-worker-vm-cluster) can dial in.
+#
+# The vm cluster's chart points at this NodePort via .Values.nats.hubUrl
+# (e.g. "nats://<any-cluster-node-ip>:30743").
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srw.natsName" . }}-leafnode
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats") | nindent 4 }}
+spec:
+  type: NodePort
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "nats") | nindent 4 }}
+  ports:
+    - name: leafnode
+      port: 7422
+      targetPort: leafnode
+      nodePort: {{ .Values.nats.leafNodePort }}
+      protocol: TCP
+{{- end }}

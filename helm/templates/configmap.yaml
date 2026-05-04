@@ -149,8 +149,9 @@ data:
   {{- end }}
   {{- end }}
 
-  # NATS
-  NATS_URL: {{ .Values.nats.url | quote }}
+  # NATS — when nats.internal=true, points at the in-cluster Service;
+  # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
+  NATS_URL: {{ include "srw.natsUrl" . | quote }}
 
   # VM Controller (HTTP transport, same-cluster mode). Empty when
   # vmController.enabled=false or transport=nats — orchestrator falls back

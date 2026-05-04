@@ -1,0 +1,163 @@
+# Superhuman Remote Worker — VM Cluster Helm Chart Values
+#
+# This chart packages the cross-cluster VM controller + NATS leaf for the
+# vm-side of an SRW deployment. Pair it with the main chart
+# (superhuman-remote-worker) running on the orchestrator cluster.
+#
+# Architecture:
+#   [orchestrator cluster]  superhuman-remote-worker chart       NATS hub
+#                                                                   ▲
+#                                                                   │ leaf
+#   [vm cluster]            superhuman-remote-worker-vm-cluster  NATS leaf + vm-controller + KubeVirt VMs
+#
+# The two charts coordinate via:
+#   - NATS subjects (vm.*, agent.*) — the leaf relays them to the hub
+#   - SSH key pair (orchestrator holds private, this chart's `ssh.publicKey`
+#     authorizes it into VMs at boot)
+#   - Headscale tailnet (VMs join via tailscale.authKey, orchestrator reaches
+#     them via its own tailscale sidecar)
+
+# -- Override chart name in resource names
+nameOverride: ""
+# -- Override full resource name prefix
+fullnameOverride: ""
+
+# =============================================================================
+# License Acceptance
+# =============================================================================
+# Same license as the main chart — see the source repo's LICENSE file.
+license:
+  # -- REQUIRED: set to true to accept the license terms.
+  acceptTerms: false
+
+# =============================================================================
+# Namespace
+# =============================================================================
+namespace:
+  # -- If true, the chart creates the namespace it's deployed into.
+  # Annotated `helm.sh/resource-policy: keep` so `helm uninstall` does NOT
+  # delete it. Manual deletion: kubectl delete namespace <ns>
+  create: false
+
+# =============================================================================
+# Identity (paired with the main chart)
+# =============================================================================
+# -- Identifier for this VM controller instance. Used as a NATS subject prefix
+# to scope this controller's traffic from other vm-controllers sharing the
+# same NATS hub. MUST match what the orchestrator-side chart sends.
+# Example: "srw-prod" for an SRW prod deployment named srw-prod.
+orchestratorId: ""
+
+# =============================================================================
+# Container Images
+# =============================================================================
+image:
+  vmController:
+    repository: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller
+    # -- Defaults to .Chart.AppVersion (set by CI on release) when empty.
+    tag: ""
+    pullPolicy: IfNotPresent
+  natsLeaf:
+    repository: nats
+    tag: "2.10-alpine"
+    pullPolicy: IfNotPresent
+
+# -- Pull secrets for private container registries (e.g. GHCR)
+imagePullSecrets: []
+#   - name: ghcr-pull-secret
+
+# =============================================================================
+# NATS Leaf — dials into the hub on the orchestrator cluster
+# =============================================================================
+nats:
+  # -- URL of the NATS hub on the orchestrator cluster's chart-managed
+  # NodePort. Required (chart-render error if empty).
+  # Example: "nats://10.0.50.101:30743"
+  hubUrl: ""
+  # -- Optional auth Secret with NATS_USER + NATS_PASSWORD. The dev hub
+  # currently uses no auth; this is for future production hardening.
+  credentialsSecret: ""
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+
+# =============================================================================
+# VM Controller
+# =============================================================================
+vmController:
+  replicas: 1
+  # -- Default VM image — override per-job via the orchestrator API.
+  # Defaults to ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:v<chart.AppVersion>
+  defaultVmImage: ""
+  defaultCpu: 2
+  defaultMemory: "4Gi"
+  vmStorageClass: "local-path"
+  vmDiskSize: "20Gi"
+  service:
+    port: 8080
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# =============================================================================
+# Headscale (mesh VPN coordination server)
+# =============================================================================
+# The vm-controller calls Headscale's API to register newly-provisioned VMs.
+# Either provide a pre-existing Secret or sync from Vault.
+headscale:
+  url: ""
+  user: "srw"
+  # -- Provide EXACTLY ONE of:
+  #   apiKeySecret      — name of a pre-existing K8s Secret in this namespace
+  #                       with key `api-key` (you create it before install).
+  #   apiKeyVaultPath   — Vault path with key `api-key` (chart syncs via ESO).
+  apiKeySecret: ""
+  apiKeyVaultPath: ""
+
+# =============================================================================
+# SSH public key authorized into VMs at boot
+# =============================================================================
+# The matching private key is held by the orchestrator (chart 1, in its
+# vm-ssh-key Secret). When the orchestrator SSHs into a provisioned VM, the
+# VM's authorized_keys must contain this public key.
+ssh:
+  # -- Provide EXACTLY ONE of:
+  #   publicKey         — inline ssh-ed25519 / ssh-rsa string
+  #   publicKeyVaultPath — Vault path with key `ssh-publickey` (chart syncs via ESO)
+  publicKey: ""
+  publicKeyVaultPath: ""
+
+# =============================================================================
+# Tailscale (auth key injected into VMs)
+# =============================================================================
+# When enabled, the controller passes the auth key into VMs at boot so they
+# join the headscale tailnet. The orchestrator's own tailscale sidecar (chart
+# 1's agent.tailscale.enabled) needs to be on the same tailnet to reach them.
+tailscale:
+  enabled: false
+  # -- Provide EXACTLY ONE when enabled=true:
+  #   authKeySecret     — name of a pre-existing K8s Secret with key
+  #                       TAILSCALE_AUTH_KEY (you create it before install).
+  #   authKeyVaultPath  — Vault path with key TAILSCALE_AUTH_KEY.
+  authKeySecret: ""
+  authKeyVaultPath: ""
+
+# =============================================================================
+# External Secrets (ESO) — optional Vault sync
+# =============================================================================
+externalSecrets:
+  enabled: false
+  refreshInterval: "1h"
+  secretStoreRef: "vault-backend"
+  secretStoreKind: "ClusterSecretStore"
+  # -- Optional: a per-controller secrets bundle in Vault. If set, chart syncs
+  # it to a Secret in this namespace. Currently optional (no required keys);
+  # reserved for future use (e.g. NATS auth credentials).
+  vaultPath: ""

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: superhuman-remote-worker-vm-cluster
+description: SRW VM controller + NATS leaf for the cross-cluster VM cluster (paired with the superhuman-remote-worker chart)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+home: https://github.com/knaeckebrothero/Superhuman-Remote-Worker
+maintainers:
+  - name: knaeckebrothero
