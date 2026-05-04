@@ -253,6 +253,27 @@ Resources for the Keycloak bootstrap Job.
 {{- end }}
 
 {{/*
+NATS hub names + URL resolver. When nats.internal is true, the chart
+deploys a StatefulSet + Service named <fullname>-nats and the orchestrator's
+NATS_URL points at the in-cluster Service. When false, NATS_URL is the
+user-supplied .Values.nats.url (empty disables VM lifecycle).
+
+Setting both nats.internal=true and nats.url is a chart-render error
+(enforced in helm/templates/nats/configmap.yaml at top).
+*/}}
+{{- define "srw.natsName" -}}
+{{- printf "%s-nats" (include "srw.fullname" .) -}}
+{{- end }}
+
+{{- define "srw.natsUrl" -}}
+{{- if .Values.nats.internal -}}
+{{- printf "nats://%s.%s.svc.cluster.local:4222" (include "srw.natsName" .) .Release.Namespace -}}
+{{- else -}}
+{{- .Values.nats.url -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Name of the K8s Secret holding the bootstrap admin credentials (KC_ADMIN_USER /
 KC_ADMIN_PASSWORD). Resolves to either:
   - the user-provided pre-existing Secret (.Values.keycloak.bootstrap.adminCredentialsSecret), or

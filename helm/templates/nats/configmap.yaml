@@ -1,0 +1,34 @@
+{{- if and .Values.nats.internal .Values.nats.url -}}
+{{- fail "nats.internal=true and nats.url are mutually exclusive — pick one. Use nats.internal=true to have the chart deploy a NATS hub, or set nats.url to point at an external NATS." -}}
+{{- end -}}
+{{- if .Values.nats.internal }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.natsName" . }}-config
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "nats") | nindent 4 }}
+data:
+  nats.conf: |
+    # NATS server config — single-replica hub for the SRW orchestrator.
+    # JetStream durable streams are created by a post-install Job
+    # (see helm/templates/nats/streams-job.yaml).
+    # No auth configured — pilot-grade, like the dev hub setup.
+
+    server_name: {{ include "srw.natsName" . }}-0
+    listen: 0.0.0.0:4222
+    http: 0.0.0.0:8222
+
+    jetstream {
+      store_dir: /data/jetstream
+      max_memory_store: 256MB
+      max_file_store: {{ .Values.nats.storageSize | replace "Gi" "GB" | replace "Mi" "MB" | quote }}
+    }
+
+    leafnodes {
+      listen: 0.0.0.0:7422
+    }
+
+    # No clustering — single replica is fine for pilot. To scale to a
+    # 3-node hub later, add a cluster {} block + bump StatefulSet replicas.
+{{- end }}

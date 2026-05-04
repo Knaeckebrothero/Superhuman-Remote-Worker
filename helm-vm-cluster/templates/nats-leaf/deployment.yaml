@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "srwvm.natsLeafName" . }}
+  labels:
+    {{- include "srwvm.componentLabels" (dict "context" . "component" "nats-leaf") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "nats-leaf") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "nats-leaf") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: nats
+          image: "{{ .Values.image.natsLeaf.repository }}:{{ .Values.image.natsLeaf.tag }}"
+          imagePullPolicy: {{ .Values.image.natsLeaf.pullPolicy }}
+          command: ["nats-server"]
+          args: ["--config", "/etc/nats/nats.conf"]
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "srwvm.natsLeafName" . }}-config

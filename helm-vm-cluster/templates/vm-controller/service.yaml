@@ -1,0 +1,18 @@
+# ClusterIP Service for the vm-controller. Currently exposed only for
+# internal probes / debugging — the controller has no HTTP API (NATS-only
+# communication), but a Service provides a stable cluster DNS name and
+# enables future HTTP additions without re-render.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "srwvm.vmControllerName" . }}
+  labels:
+    {{- include "srwvm.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "srwvm.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.vmController.service.port }}
+      targetPort: {{ .Values.vmController.service.port }}

@@ -905,7 +905,27 @@ jobs:
           # Restore Chart.yaml (don't commit the name override)
           git checkout helm/Chart.yaml
 
-      # -- Update fleet.yaml chart version --
+      # -- Publish dev VM-cluster chart (parallel to srw-dev). Same trigger:
+      # any chart-source change OR any image build success. The vm-controller
+      # image build is the most common trigger here. --
+      - name: Package and push dev vm-cluster chart
+        if: >-
+          needs.changes.outputs.chart == 'true' ||
+          needs.build-vm-controller.result == 'success' ||
+          needs.build-agent-vm-base.result == 'success'
+        run: |
+          # Override chart name for dev channel
+          yq -i '.name = "srw-dev-vm-cluster"' helm-vm-cluster/Chart.yaml
+          mkdir -p dist
+          helm package helm-vm-cluster/ \
+            --version "${{ steps.tag.outputs.chart_version }}" \
+            --app-version "${{ steps.tag.outputs.sha }}" \
+            --destination ./dist
+          helm push ./dist/srw-dev-vm-cluster-${{ steps.tag.outputs.chart_version }}.tgz \
+            oci://ghcr.io/knaeckebrothero/charts
+          git checkout helm-vm-cluster/Chart.yaml
+
+      # -- Update fleet.yaml chart version (orchestrator chart) --
       - name: Update fleet.yaml chart version
         if: >-
           needs.changes.outputs.chart == 'true' ||
@@ -916,6 +936,16 @@ jobs:
         run: >-
           yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
           deployment/fleet.yaml
+
+      # -- Update vm-cluster bundle's chart version --
+      - name: Update vm-cluster fleet.yaml chart version
+        if: >-
+          needs.changes.outputs.chart == 'true' ||
+          needs.build-vm-controller.result == 'success' ||
+          needs.build-agent-vm-base.result == 'success'
+        run: >-
+          yq -i '.helm.version = "${{ steps.tag.outputs.chart_version }}"'
+          deployment-vms/srw-vm-controller/fleet.yaml
 
       # -- Update image tags in values-experimental.yaml --
       - name: Update orchestrator tag
@@ -940,15 +970,15 @@ jobs:
 
       - name: Update VM controller image tag
         if: needs.build-vm-controller.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-vm-controller:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vm-controller:${{ steps.tag.outputs.sha }}|g' \
-            deployment-vms/srw-vm-controller/vm-controller.yaml
+        run: >-
+          yq -i '.helm.values.image.vmController.tag = "${{ steps.tag.outputs.sha }}"'
+          deployment-vms/srw-vm-controller/fleet.yaml
 
       - name: Update agent VM base image tag
         if: needs.build-agent-vm-base.result == 'success'
-        run: |
-          sed -i 's|superhuman-remote-worker-agent-vm-base:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}|g' \
-            deployment-vms/srw-vm-controller/vm-controller.yaml
+        run: >-
+          yq -i '.helm.values.vmController.defaultVmImage = "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}"'
+          deployment-vms/srw-vm-controller/fleet.yaml
 
       - name: Commit and push
         run: |
