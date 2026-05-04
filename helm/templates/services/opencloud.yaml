@@ -74,6 +74,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-opencloud-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "opencloud") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -90,6 +92,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-opencloud-config
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "opencloud") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

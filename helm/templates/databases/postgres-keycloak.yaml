@@ -16,6 +16,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-keycloakdb-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "keycloakdb") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

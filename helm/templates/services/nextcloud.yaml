@@ -140,6 +140,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-nextcloud-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "nextcloud") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

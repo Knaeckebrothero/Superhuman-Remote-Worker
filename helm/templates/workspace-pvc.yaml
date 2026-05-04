@@ -4,6 +4,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-workspace
   labels:
     {{- include "srw.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteMany

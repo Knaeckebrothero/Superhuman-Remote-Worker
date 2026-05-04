@@ -20,6 +20,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-codex-proxy-auth
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "codex-proxy") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

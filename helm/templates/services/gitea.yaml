@@ -5,6 +5,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-gitea-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "gitea") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

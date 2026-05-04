@@ -13,6 +13,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-pgvector-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "pgvector") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
