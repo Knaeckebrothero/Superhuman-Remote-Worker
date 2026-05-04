@@ -33,7 +33,7 @@ image:
   mcp:
     tag: sha-2dd8e7f
   workspace:
-    tag: sha-b4d7fd1
+    tag: sha-a7d2ea5
 # -----------------------------------------------------------------------------
 # Secrets — External Secrets Operator (Vault-backed)
 # -----------------------------------------------------------------------------
