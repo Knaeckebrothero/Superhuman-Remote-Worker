@@ -6,59 +6,49 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha.placeholder"
+  version: "0.0.0-dev.sha.1dc3ebe"
   takeOwnership: true
   values:
     license:
       acceptTerms: true
-
     # Pin the release-name prefix so resources stay short and predictable.
     fullnameOverride: srw-vm
-
     # `agent-vms` is externally managed (existed before this chart took over).
     # Don't try to create or own it from the chart.
     namespace:
       create: false
-
     # Identifies this controller instance for NATS subject scoping. Matches
     # the dev orchestrator's release identity.
     orchestratorId: srw-dev
-
     # Hub the in-cluster NATS leaf dials into. Mirrors the value in
     # deployment/nats/nats-leaf-values.yaml from the dev manual install.
     nats:
       hubUrl: "nats-leaf://10.0.0.101:30742"
-
     # Authorized into VMs at boot. Same key the dev orchestrator's agent
     # pods hold the private side of (matches the previously-hardcoded value
     # in the old deployment-vms/srw-vm-controller/vm-controller.yaml).
     ssh:
       publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access"
-
     # Headscale API access — pulled from Vault by ESO (same path the old
     # standalone ExternalSecret in 01-eso.yaml used).
     headscale:
       url: "https://headscale.h4ll.app"
       user: srw
       apiKeyVaultPath: "homelab/agent-vms/headscale-api-key"
-
     externalSecrets:
       enabled: true
       refreshInterval: "1h"
       secretStoreRef: "vault-backend"
       secretStoreKind: "ClusterSecretStore"
-
     # Image tags overridden by CI on each develop push. Defaults left as
     # placeholders; the workflow's image-tag update steps rewrite these
     # in-place via yq.
     image:
       vmController:
-        tag: "sha-placeholder"
+        tag: "sha-1dc3ebe"
     vmController:
-      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-placeholder"
-
+      defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-1dc3ebe"
 dependsOn: []
-
 # Cluster targeting handled by the dedicated GitRepo
 # (HomeLab/rancher_cluster/fleet-gitrepo-srw-vms.yaml) whose spec.targets
 # pins to the vms cluster. Two GitRepos is the canonical Fleet pattern
