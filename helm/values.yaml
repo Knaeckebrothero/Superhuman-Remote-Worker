@@ -829,11 +829,40 @@ ide:
 # =============================================================================
 # NATS Messaging (optional)
 # =============================================================================
-# When set, the orchestrator and (optionally) the in-cluster VM controller
-# use NATS for VM lifecycle commands. This is the cross-cluster transport —
-# leave empty for same-cluster deployments that use vmController.transport=http.
+# Used by the orchestrator for VM lifecycle commands when VMs are involved.
+# Two modes (mutually exclusive — setting both is a chart-render error):
+#
+#   internal=true              chart deploys a single-replica NATS hub in the
+#                              release namespace. NATS_URL is auto-set to the
+#                              in-cluster Service. JetStream streams are
+#                              provisioned by a post-install Job.
+#
+#   url="nats://...:4222"      orchestrator points at an external NATS (e.g.
+#                              the dev hub installed manually from
+#                              deployment/nats/nats-hub-values.yaml).
+#
+# Leaving both unset disables VM lifecycle entirely (orchestrator falls back
+# to K8s pod workspaces via the container provisioner).
 nats:
+  internal: false
   url: ""
+  # When internal=true, expose the leafnode port (7422) via a NodePort so a
+  # NATS leaf on a different cluster (e.g. the vm cluster running
+  # superhuman-remote-worker-vm-cluster) can dial in. Set to 0 to skip the
+  # NodePort (single-cluster setups). Recommend 30743+ to avoid collision
+  # with dev's existing 30742 if both share the same cluster.
+  leafNodePort: 0
+  # Storage size for JetStream durable streams (PVC has helm.sh/resource-policy:
+  # keep so it survives uninstall, matching the v0.0.5 PVC pattern).
+  storageSize: "2Gi"
+  # NATS server image (official nats-io)
+  image: "nats:2.10-alpine"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
 
 # =============================================================================
 # VM Controller (optional, same-cluster KubeVirt)

@@ -1,0 +1,123 @@
+{{- /*
+VM template — loaded by the vm-controller's render_template() and
+string-substituted at provision time. Variables of the form ${...}
+are populated by the controller per-job, EXCEPT for the SSH public key
+and Helm-configurable defaults which are templated in by Helm now.
+*/ -}}
+{{- $sshPubKey := "" -}}
+{{- if .Values.ssh.publicKey -}}
+{{- $sshPubKey = .Values.ssh.publicKey -}}
+{{- else -}}
+{{- /* When using publicKeyVaultPath, the controller reads the pub key from
+       the synced Secret at runtime via env (SSH_AUTHORIZED_KEY) and
+       substitutes it into the template before applying. The placeholder
+       below stays as a literal ${SSH_AUTHORIZED_KEY} for the controller. */ -}}
+{{- $sshPubKey = "${SSH_AUTHORIZED_KEY}" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srwvm.vmControllerName" . }}-template
+  labels:
+    {{- include "srwvm.componentLabels" (dict "context" . "component" "vm-controller") | nindent 4 }}
+data:
+  vm-template.yaml: |
+    apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: agent-vm-${JOB_ID}
+      labels:
+        vm.kubevirt.io/name: agent-vm-${JOB_ID}
+        job-id: ${JOB_ID}
+    spec:
+      runStrategy: RerunOnFailure
+      dataVolumeTemplates:
+        - metadata:
+            name: agent-vm-${JOB_ID}-rootdisk
+          spec:
+            storage:
+              accessModes:
+                - ReadWriteOnce
+              storageClassName: ${VM_STORAGE_CLASS}
+              resources:
+                requests:
+                  storage: ${VM_DISK_SIZE}
+            source:
+              registry:
+                url: docker://${VM_IMAGE}
+      template:
+        metadata:
+          labels:
+            vm.kubevirt.io/name: agent-vm-${JOB_ID}
+            job-id: ${JOB_ID}
+            # Selector for the workspace NetworkPolicy. MUST live here
+            # (VMI template), not on the top-level VM metadata —
+            # only template labels propagate to the virt-launcher pod.
+            srw.io/component: agent-workspace
+        spec:
+          domain:
+            cpu:
+              cores: ${CPU_CORES}
+            memory:
+              guest: ${MEMORY}
+            devices:
+              disks:
+                - name: rootdisk
+                  disk:
+                    bus: virtio
+                - name: cloud-init
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: default
+                  masquerade: {}
+            machine:
+              type: q35
+          networks:
+            - name: default
+              pod: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: agent-vm-${JOB_ID}-rootdisk
+            - name: cloud-init
+              cloudInitNoCloud:
+                userData: |
+                  #cloud-config
+                  write_files:
+                    - path: /etc/default/management-daemon
+                      permissions: '0644'
+                      content: |
+                        NATS_URL=${NATS_URL}
+                        JOB_ID=${JOB_ID}
+                    - path: /run/agent/job-config.json
+                      permissions: '0644'
+                      content: |
+                        {
+                          "job_id": "${JOB_ID}",
+                          "agent_config": "${AGENT_CONFIG}",
+                          "vm_image": "${VM_IMAGE}",
+                          "cpu_cores": ${CPU_CORES},
+                          "memory": "${MEMORY}",
+                          "description": "${DESCRIPTION}",
+                          "nats_url": "${NATS_URL}"
+                        }
+                    - path: /etc/default/sudo-gated
+                      permissions: '0644'
+                      content: |
+                        NATS_URL=${NATS_URL}
+                        JOB_ID=${JOB_ID}
+                        VM_ID=agent-vm-${JOB_ID}
+                    - path: /home/agent-host/.ssh/authorized_keys
+                      permissions: '0600'
+                      owner: agent-host:agent-host
+                      content: |
+                        {{ $sshPubKey }}
+                  runcmd:
+                    - mkdir -p /run/agent
+                    - chmod 755 /run/agent
+                    - systemctl daemon-reload
+                    - systemctl enable management-daemon.service
+                    - systemctl start management-daemon.service
+                    - systemctl restart sudo-gated.socket
+                    - 'if [ -n "${TAILSCALE_AUTH_KEY}" ]; then tailscale up --auth-key=${TAILSCALE_AUTH_KEY} --login-server=${HEADSCALE_URL} --hostname=vm-${JOB_ID} --accept-routes=false --timeout=120s & fi'

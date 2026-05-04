@@ -1,0 +1,56 @@
+# Workspace VM NetworkPolicy
+#
+# Selects the virt-launcher pods via srw.io/component: agent-workspace
+# (label propagated from the VM template's spec.template.metadata.labels).
+#
+# What this enforces:
+#   - Egress restriction (DNS, 80/443, Tailscale UDP carve-outs).
+#   - VM↔VM lateral isolation (workspace label is NOT in any allowed source).
+#
+# What this deliberately does NOT enforce:
+#   - Ingress restriction by source. Cross-cluster traffic from the
+#     orchestrator arrives via the Headscale/Tailscale mesh. Tailscale
+#     CGNAT IPs (100.64.0.0/10) only exist *inside* the WireGuard tunnel,
+#     after decryption — the cluster CNI sees only the encrypted underlay.
+#     The actual cross-cluster gates are headscale ACLs + SSH/IDE auth.
+#
+# CNI requirement: enforced only by Calico, Cilium, OVN-Kubernetes, Antrea.
+# Flannel does not enforce NetworkPolicy at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srwvm.fullname" . }}-workspace
+  labels:
+    {{- include "srwvm.componentLabels" (dict "context" . "component" "vm-workspace") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      srw.io/component: agent-workspace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Pod-level ingress is open. Tailscale ACLs + SSH/IDE auth are the
+    # actual gate. VM↔VM lateral movement is denied because no allowed
+    # source carries srw.io/component=agent-workspace.
+    - {}
+  egress:
+    # DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # HTTP/HTTPS — package mirrors at boot, agent browser automation,
+    # and the Tailscale DERP-relay fallback when UDP is blocked.
+    - ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+    # Tailscale mesh — direct WireGuard peer (UDP/41641) and STUN (UDP/3478).
+    - ports:
+        - protocol: UDP
+          port: 41641
+        - protocol: UDP
+          port: 3478
