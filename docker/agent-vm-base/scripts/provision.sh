@@ -24,6 +24,16 @@ echo "=== Agent VM Base Image Provisioning ==="
 # -----------------------------------------------------------------------------
 
 echo "--- Installing system packages ---"
+
+# Apt resilience: archive.ubuntu.com behind SLIRP is flaky on long fetches.
+# Without retries, a single dropped connection mid-install fails the build.
+sudo tee /etc/apt/apt.conf.d/99-retries > /dev/null <<'EOF'
+Acquire::Retries "5";
+Acquire::Retries::Delay::Maximum "30";
+Acquire::http::Timeout "60";
+Acquire::https::Timeout "60";
+EOF
+
 sudo apt-get update -y
 sudo apt-get install -y \
     openssh-server \
