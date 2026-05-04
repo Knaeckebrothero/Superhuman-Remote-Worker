@@ -1,6 +1,9 @@
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.bootstrap.enabled }}
-{{- if not .Values.keycloak.bootstrap.adminCredentialsSecret -}}
-{{- fail "keycloak.bootstrap.enabled requires keycloak.bootstrap.adminCredentialsSecret — a K8s Secret with KC_ADMIN_USER + KC_ADMIN_PASSWORD. The account needs roles view-realm, view-clients, manage-clients (+ view-users, manage-users when serviceAccounts.cloud.enabled=true) on the <TARGET_REALM>-realm client in the master realm. See keycloak.bootstrap.adminCredentialsSecret in values.yaml for details." -}}
+{{- if and .Values.keycloak.bootstrap.adminCredentialsSecret .Values.keycloak.bootstrap.adminCredentialsVaultPath -}}
+{{- fail "keycloak.bootstrap.adminCredentialsSecret and keycloak.bootstrap.adminCredentialsVaultPath are mutually exclusive — set exactly one. See keycloak.bootstrap in values.yaml." -}}
+{{- end -}}
+{{- if and (not .Values.keycloak.bootstrap.adminCredentialsSecret) (not .Values.keycloak.bootstrap.adminCredentialsVaultPath) -}}
+{{- fail "keycloak.bootstrap.enabled requires either keycloak.bootstrap.adminCredentialsSecret (a pre-created K8s Secret) OR keycloak.bootstrap.adminCredentialsVaultPath (a Vault path the chart syncs via ESO). Both must contain keys KC_ADMIN_USER + KC_ADMIN_PASSWORD. The account needs roles view-realm, view-clients, manage-clients (+ view-users, manage-users when serviceAccounts.cloud.enabled=true) on the <TARGET_REALM>-realm client in the master realm. See keycloak.bootstrap in values.yaml for details." -}}
 {{- end -}}
 {{- $sa := .Values.keycloak.bootstrap.serviceAccounts -}}
 {{- if and $sa $sa.cloud $sa.cloud.enabled -}}
@@ -41,6 +44,25 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath }}
+      # Wait for ESO to sync the bootstrap creds Secret from Vault. The
+      # ExternalSecret is created at hook-weight -15 but ESO reconciles
+      # asynchronously, so the Secret may not exist yet when this Job
+      # starts. The kubelet retries the volume mount until the Secret
+      # exists, which gives us a wait-for-Secret with no kubectl/RBAC.
+      initContainers:
+        - name: wait-for-creds
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              test -s /creds/KC_ADMIN_USER && test -s /creds/KC_ADMIN_PASSWORD
+          volumeMounts:
+            - name: bootstrap-creds
+              mountPath: /creds
+              readOnly: true
+      {{- end }}
       containers:
         - name: bootstrap
           image: {{ include "srw.keycloakBootstrapImage" . | quote }}
@@ -61,16 +83,17 @@ spec:
               value: {{ default .Values.mcp.oauth.clientId .Values.keycloak.bootstrap.mcpClientId | quote }}
             - name: MCP_HOST
               value: {{ include "srw.host" (dict "context" . "key" "mcp" "default" "mcp") | quote }}
-            # Admin credentials: from the user-provided Secret.
+            # Admin credentials: from either a user-provided Secret or a
+            # chart-managed Secret synced from Vault (see srw.keycloakBootstrapAdminSecretName).
             - name: KC_ADMIN_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.keycloak.bootstrap.adminCredentialsSecret }}
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: KC_ADMIN_USER
             - name: KC_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.keycloak.bootstrap.adminCredentialsSecret }}
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: KC_ADMIN_PASSWORD
             # MCP client secret: from the main app secret. The same value the
             # MCP server reads at runtime, so the chart guarantees they match.
@@ -118,4 +141,9 @@ spec:
           configMap:
             name: {{ include "srw.keycloakBootstrapName" . }}
             defaultMode: 0755
+        {{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath }}
+        - name: bootstrap-creds
+          secret:
+            secretName: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
+        {{- end }}
 {{- end }}

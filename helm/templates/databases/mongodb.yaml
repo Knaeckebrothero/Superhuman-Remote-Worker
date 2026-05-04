@@ -5,6 +5,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-mongodb-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "mongodb") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce

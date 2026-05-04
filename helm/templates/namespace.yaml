@@ -1,0 +1,19 @@
+{{- if .Values.namespace.create }}
+# ---------------------------------------------------------------
+# Chart-managed namespace
+#
+# Annotated `helm.sh/resource-policy: keep` so `helm uninstall`
+# does NOT delete the namespace (which would cascade-delete every
+# PVC, including the databases). To fully wipe an installation:
+#   helm uninstall <release> -n <ns>
+#   kubectl delete namespace <ns>
+# ---------------------------------------------------------------
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/resource-policy": keep
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+{{- end }}

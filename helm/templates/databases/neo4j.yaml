@@ -11,6 +11,8 @@ metadata:
   name: {{ include "srw.fullname" . }}-neo4j-data
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
 spec:
   accessModes:
     - ReadWriteOnce
