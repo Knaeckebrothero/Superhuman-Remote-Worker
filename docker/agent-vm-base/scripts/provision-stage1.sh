@@ -47,20 +47,28 @@ _section_end() {
 
 _section "Configuring APT"
 
-# archive.ubuntu.com behind Canonical's load balancer is flaky; Azure mirror
-# is significantly faster from GHA Azure-hosted runners.
+# Prefer the Azure mirror (faster from GHA Azure-hosted runners) but keep
+# archive.ubuntu.com as a fallback so apt rotates to it during Azure outages.
+# We ate a 23-min hang on 2026-05-05 when Azure stopped responding mid-build.
+# Short timeouts make those failures fast instead of stalling.
 sudo sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
     /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || \
     sudo sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
     /etc/apt/sources.list
 
+sudo tee /etc/apt/sources.list.d/ubuntu-fallback.list > /dev/null <<'EOF'
+deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse
+EOF
+
 sudo tee /etc/apt/apt.conf.d/99-build-tuning > /dev/null <<'EOF'
 Acquire::Retries "5";
-Acquire::Retries::Delay::Maximum "30";
-Acquire::http::Timeout "30";
-Acquire::https::Timeout "30";
+Acquire::Retries::Delay::Maximum "10";
+Acquire::http::Timeout "15";
+Acquire::https::Timeout "15";
+Acquire::http::ConnectionAttemptDelayMsec "500";
 Acquire::http::Pipeline-Depth "10";
-Acquire::Queue-Mode "access";
 APT::Install-Recommends "false";
 EOF
 
