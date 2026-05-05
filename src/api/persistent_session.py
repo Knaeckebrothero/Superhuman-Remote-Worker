@@ -453,7 +453,10 @@ class PersistentSession:
         if not model_name.startswith(("o1", "o3", "o4")):
             bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
 
-        self.llm_with_tools = self._llm.bind_tools(self.tools, **bind_kwargs)
+        from src.services.guardrails import apply_guardrails_to_tools
+
+        bound_tools = apply_guardrails_to_tools(self.tools, model=self.config.llm.model)
+        self.llm_with_tools = self._llm.bind_tools(bound_tools, **bind_kwargs)
 
     # --- File checkpoints / undo ---
 

@@ -899,16 +899,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Confirmation message or error with guidance
-
-        Examples:
-            # Replace mode (default)
-            edit_file("plan.md", old_string="## Draft", new_string="## Final")
-
-            # Append mode - add to end of file
-            edit_file("notes.md", new_string="\\n## New Section", position="end")
-
-            # Prepend mode - add to start of file
-            edit_file("log.md", new_string="# Header\\n\\n", position="start")
         """
         try:
             if not workspace.exists(path):

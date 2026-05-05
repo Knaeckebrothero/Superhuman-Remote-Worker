@@ -88,8 +88,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         - Todo count (5-20 items required)
         - Each todo content (minimum 10 characters)
 
-        After calling this tool, complete your current strategic todo with
-        todo_complete(). The phase transition will apply the staged todos.
+        After calling this tool, complete your current strategic todo by
+        invoking the `todo_complete` tool. The phase transition will then
+        apply the staged todos.
 
         Args:
             todos: List of task descriptions. Each must be at least 10 characters.
@@ -98,18 +99,6 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Success message confirming todos were staged, or error if validation fails.
-
-        Example:
-            next_phase_todos(
-                todos=[
-                    "Extract document text from uploaded PDF",
-                    "Chunk document into processable segments",
-                    "Identify requirements in each chunk",
-                    "Validate extracted requirements",
-                    "Write requirements to database"
-                ],
-                phase_name="Phase 1: Document Processing"
-            )
         """
         try:
             # Enforcement of todo_guide.md read is now config-driven via
@@ -145,7 +134,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             remaining = [t for t in todo_mgr.list_pending()]
             if len(remaining) <= 1:
                 # Only the current todo (create todos) remains
-                return f"{result}\n\nAll strategic todos complete. Call todo_complete() to transition to tactical phase."
+                return f"{result}\n\nAll strategic todos complete. Invoke the `todo_complete` tool to transition to tactical phase."
             else:
                 remaining_list = "\n".join(f"  - {t.content}" for t in remaining)
                 return f"{result}\n\nRemaining strategic todos before transition:\n{remaining_list}"
@@ -171,7 +160,8 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
         This is the primary rhythm of work:
         1. Work on the current task
-        2. Call todo_complete() or todo_complete(todo_id="todo_X") when done
+        2. Invoke this tool when done — either with no arguments (completes
+           the first pending task) or with todo_id set to a specific id
         3. Read the response to see what's next
         4. Repeat
 
@@ -190,10 +180,6 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         Note:
             The response includes "PHASE_COMPLETE" when all tasks are done.
             This is detected by the graph to trigger phase transitions.
-
-        Examples:
-            todo_complete()  # Complete first pending task
-            todo_complete(todo_id="todo_1")  # Complete specific task
         """
         try:
             if todo_id and todo_id.strip():
@@ -204,8 +190,8 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                     return (
                         "Error: Complete one todo at a time. Each todo_complete call should "
                         "reflect verified work for that specific task.\n"
-                        f'Call todo_complete(todo_id="{ids[0]}") for the first task, '
-                        "then call again for each subsequent task."
+                        f"Invoke `todo_complete` with todo_id set to `{ids[0]}` first, "
+                        "then invoke it again for each subsequent task."
                     )
 
                 if len(ids) == 1:
@@ -319,7 +305,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
         Use this tool when you realize the current approach isn't working and
         you need to reconsider your strategy. This is NOT for normal task
-        completion - use todo_complete() for that.
+        completion — use the `todo_complete` tool for that.
 
         When to use todo_rewind:
         - You've hit a dead end that makes the current tasks impossible

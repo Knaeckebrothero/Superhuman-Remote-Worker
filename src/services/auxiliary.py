@@ -459,6 +459,9 @@ class AuxiliaryLLM:
             asyncio.TimeoutError: If any individual LLM call exceeds timeout
         """
         tools = task.get_tools()
+        from src.services.guardrails import apply_guardrails_to_tools
+
+        tools = apply_guardrails_to_tools(tools, model=_get_model_name(self.llm))
         llm_with_tools = self.llm.bind_tools(tools)
         tool_map = {t.name: t for t in tools}
 
