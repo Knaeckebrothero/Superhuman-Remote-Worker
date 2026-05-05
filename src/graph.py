@@ -3015,9 +3015,7 @@ def create_audited_tool_node(
                     msg.content = (
                         (msg.content or "")
                         + "\n\n"
-                        + format_nudge(
-                            "loop_warning_suffix", model=config.llm.model
-                        )
+                        + format_nudge("loop_warning_suffix", model=config.llm.model)
                     )
 
         # Check for workspace unavailable errors (VM connection lost).

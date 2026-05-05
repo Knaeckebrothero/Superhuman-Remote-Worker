@@ -110,7 +110,7 @@ def _replace_examples_block(description: str, replacement: str) -> str:
         return description.rstrip() + "\n\n" + rstripped_replacement
 
     before = description[: match.start()].rstrip()
-    after = description[match.end():]
+    after = description[match.end() :]
     parts = [before, rstripped_replacement]
     after = after.lstrip("\n")
     if after:
@@ -191,9 +191,7 @@ def apply_guardrails_to_tools(
 
             matrix = _load_guardrails_matrix(deployment_dir)
             default_guardrails = matrix.get("default", {})
-            family_guardrails = (
-                matrix.get(family, {}) if family != "default" else {}
-            )
+            family_guardrails = matrix.get(family, {}) if family != "default" else {}
             guardrails = deep_merge(default_guardrails, family_guardrails)
         else:
             guardrails = resolve_guardrails("", deployment_dir)
@@ -283,9 +281,7 @@ def format_nudge(
 
             matrix = _load_guardrails_matrix(deployment_dir)
             default_guardrails = matrix.get("default", {})
-            family_guardrails = (
-                matrix.get(family, {}) if family != "default" else {}
-            )
+            family_guardrails = matrix.get(family, {}) if family != "default" else {}
             guardrails = deep_merge(default_guardrails, family_guardrails)
         else:
             guardrails = resolve_guardrails("", deployment_dir)
