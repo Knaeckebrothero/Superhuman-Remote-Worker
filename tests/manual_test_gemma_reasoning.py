@@ -228,9 +228,7 @@ def list_models(client: httpx.Client, api_key: str) -> list[str]:
     return [m["id"] for m in r.json().get("data", [])]
 
 
-def run_thinking_nonstream(
-    client: httpx.Client, api_key: str, model: str
-) -> Finding:
+def run_thinking_nonstream(client: httpx.Client, api_key: str, model: str) -> Finding:
     f = Finding(model=model, scenario="A_think_nonstream", http_ok=False)
     payload = {
         "model": model,
@@ -261,9 +259,7 @@ def run_thinking_nonstream(
     return f
 
 
-def run_thinking_stream(
-    client: httpx.Client, api_key: str, model: str
-) -> Finding:
+def run_thinking_stream(client: httpx.Client, api_key: str, model: str) -> Finding:
     f = Finding(model=model, scenario="B_think_stream", http_ok=False)
     payload = {
         "model": model,
@@ -282,7 +278,7 @@ def run_thinking_stream(
             for line in r.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
-                data_str = line[len("data: "):]
+                data_str = line[len("data: ") :]
                 if data_str.strip() == "[DONE]":
                     break
                 try:
@@ -309,9 +305,7 @@ def run_thinking_stream(
     return f
 
 
-def run_tool_call_nonstream(
-    client: httpx.Client, api_key: str, model: str
-) -> Finding:
+def run_tool_call_nonstream(client: httpx.Client, api_key: str, model: str) -> Finding:
     f = Finding(model=model, scenario="C_tool_nonstream", http_ok=False)
     payload = {
         "model": model,
@@ -413,7 +407,7 @@ def run_thinking_force_stream(
             for line in r.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
-                data_str = line[len("data: "):]
+                data_str = line[len("data: ") :]
                 if data_str.strip() == "[DONE]":
                     break
                 try:
@@ -519,21 +513,15 @@ def report_finding(f: Finding) -> None:
 
     if f.leaked_reasoning_delims:
         print(
-            f"    *** REASONING DELIMS LEAKED in content: "
-            f"{f.leaked_reasoning_delims}"
+            f"    *** REASONING DELIMS LEAKED in content: {f.leaked_reasoning_delims}"
         )
     if f.leaked_tool_delims:
-        print(
-            f"    *** TOOL-CALL DELIMS LEAKED in content: "
-            f"{f.leaked_tool_delims}"
-        )
+        print(f"    *** TOOL-CALL DELIMS LEAKED in content: {f.leaked_tool_delims}")
     if f.wire_format_hits:
         print(f"    wire-format detected: {f.wire_format_hits}")
 
 
-def diagnose_model(
-    client: httpx.Client, api_key: str, model: str
-) -> list[Finding]:
+def diagnose_model(client: httpx.Client, api_key: str, model: str) -> list[Finding]:
     print(f"\n{'=' * 72}")
     print(f"  MODEL: {model}")
     print(f"{'=' * 72}")
@@ -565,15 +553,12 @@ def summary_table(all_findings: list[Finding]) -> None:
 
     def _tool_line(label: str, f: Finding) -> str:
         tc_status = (
-            f"{len(f.tool_calls)} structured"
-            if f.tool_calls
-            else "0 structured"
+            f"{len(f.tool_calls)} structured" if f.tool_calls else "0 structured"
         )
         leak_marker = "LEAKED" if f.leaked_tool_delims else "clean"
         wire = list(f.wire_format_hits.keys()) or ["(none detected)"]
         return (
-            f"    {label} : tool_calls={tc_status}, "
-            f"content={leak_marker}, wire={wire}"
+            f"    {label} : tool_calls={tc_status}, content={leak_marker}, wire={wire}"
         )
 
     for model, scenarios in by_model.items():
