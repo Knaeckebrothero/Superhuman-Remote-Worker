@@ -51,7 +51,7 @@ Stage2 builds depend on a pre-existing `:latest` tag on `ghcr.io/.../-agent-vm-b
 ### Known gaps to validate on first real run
 
 - `docker create + docker cp` against a `FROM scratch` image without a CMD. Should work (containers don't have to start to be `cp`-able), but the workflow has a defensive `|| docker create $IMAGE` fallback.
-- `replace(github.ref_name, '/', '-')` for OCI tag sanitization — used in registry cache refs but not exercised yet on a feature-branch PR.
+- ~~`replace(github.ref_name, '/', '-')` for OCI tag sanitization~~ — turned out GitHub Actions has no `replace()` expression function (the workflow validator rejected it on first commit). Replaced with static per-workflow cache keys: `:buildcache-develop` in `develop.yml`, `:buildcache-main` in `main.yml`. Per-branch isolation lost, but PRs can't write anyway (no `docker/login-action` on PRs, `ignore-error: true` swallows the silent failure), so all builds just read/write the workflow's shared cache. `concurrency: cancel-in-progress: false` already serializes pushes; with `mode=max,ignore-error=true` a race in concurrent writes lets the last writer win — no correctness issue.
 - PR builds keep the existing conditional `docker/login-action` (no GHCR auth on PRs), so PR cache reads/writes fail silently via `ignore-error: true`. PR validation runs are slightly slower as a result; push builds are fully cached.
 
 ---
@@ -361,7 +361,7 @@ The `cypher-shell + JRE` install in the workspace container also remains, for th
 Workstreams A, B, C, D2, D3 all shipped in one session. The original Phase 1 → 4 sequencing was collapsed since the user opted to land everything together. Remaining work:
 
 1. **Bootstrap stage1.** Run `stage1-rebuild.yml` via `workflow_dispatch` once before merging, so `:latest` exists on `ghcr.io/.../-agent-vm-base-stage1`. Without that the first stage2 build fails on `docker pull`.
-2. **First develop run after merge.** Watch for: stage2 successfully pulling stage1, `replace(github.ref_name, '/', '-')` resolving correctly on a feature-branch PR, registry cache writes succeeding (no silent `manifest unknown` errors).
+2. **First develop run after merge.** Watch for: stage2 successfully pulling stage1, registry cache writes succeeding (no silent `manifest unknown` errors), and the GHCR registry growing the right `:buildcache-develop` tags.
 3. **Drop `ignore-error: true` on a canary.** After a few weeks of stable registry-cache builds, drop it on `build-orchestrator` to surface silent failures. Roll out to others if green for a week.
 4. **Workstream D1 (cypher-shell removal)** — separate redesign needed. Sketch:
    - Add a `neo4j_query` tool in `src/tools/registry.py` that uses the existing Neo4j Python driver (`src/database/neo4j_db.py`)
