@@ -32,6 +32,12 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  # Lowercased repo path for GHCR cache refs. github.repository preserves
+  # GitHub's case-sensitive name (e.g. Knaeckebrothero/Uni-Projekt-Graph-RAG),
+  # but GHCR rejects uppercase image paths. docker/metadata-action handles
+  # this for production tags; YAML expressions can't lowercase, so we hardcode.
+  # Update this if the repo is renamed.
+  REPO_LOWER: knaeckebrothero/uni-projekt-graph-rag
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -212,6 +218,7 @@ jobs:
       cockpit: ${{ steps.check.outputs.cockpit }}
       mcp: ${{ steps.check.outputs.mcp }}
       vm-base: ${{ steps.check.outputs.vm-base }}
+      vm-base-stage1: ${{ steps.check.outputs.vm-base-stage1 }}
       vm-controller: ${{ steps.check.outputs.vm-controller }}
       sudo-gate: ${{ steps.check.outputs.sudo-gate }}
       workspace: ${{ steps.check.outputs.workspace }}
@@ -320,8 +327,28 @@ jobs:
           VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
             vm/controller/)
 
+          # Stage1 rebuilds on changes to the heavy provisioning script, the
+          # Packer template that drives it, .playwright-version, the cloud-init
+          # seed, or the stage1 containerDisk wrapper. Otherwise the existing
+          # GHCR :latest is reused — stage2 just pulls it.
+          VM_BASE_STAGE1=$(has_changes "$SHA_VM_BASE" \
+            docker/agent-vm-base/scripts/provision-stage1.sh \
+            docker/agent-vm-base/scripts/cleanup-stage1.sh \
+            docker/agent-vm-base/stage1.pkr.hcl \
+            docker/agent-vm-base/Dockerfile.containerDisk-stage1 \
+            docker/agent-vm-base/cloud-init/ \
+            .playwright-version)
+
+          # Stage2 (the per-commit image) rebuilds on changes to its provisioning
+          # script, Packer template, cleanup script, daemon/sudo-gate config
+          # files, or the containerDisk wrapper. Sudo-gate binary changes also
+          # trigger this via SUDO_GATE below.
           VM_BASE=$(has_changes "$SHA_VM_BASE" \
-            docker/agent-vm-base/ .playwright-version)
+            docker/agent-vm-base/scripts/provision-stage2.sh \
+            docker/agent-vm-base/scripts/cleanup.sh \
+            docker/agent-vm-base/stage2.pkr.hcl \
+            docker/agent-vm-base/Dockerfile.containerDisk \
+            docker/agent-vm-base/files/)
 
           SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
             vm/sudo-daemon/ vm/sudo-plugin/)
@@ -344,7 +371,7 @@ jobs:
           echo "Change detection results:"
           echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
           echo "  mcp=$MCP  workspace=$WORKSPACE"
-          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  sudo-gate=$SUDO_GATE"
+          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  vm-base-stage1=$VM_BASE_STAGE1  sudo-gate=$SUDO_GATE"
           echo "  chart=$CHART"
 
           {
@@ -355,6 +382,7 @@ jobs:
             echo "workspace=$WORKSPACE"
             echo "vm-controller=$VM_CONTROLLER"
             echo "vm-base=$VM_BASE"
+            echo "vm-base-stage1=$VM_BASE_STAGE1"
             echo "sudo-gate=$SUDO_GATE"
             echo "chart=$CHART"
           } >> "$GITHUB_OUTPUT"
@@ -457,8 +485,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=max,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
           build-args: |
             BUILD_SHA=${{ steps.short_sha.outputs.sha }}
 
@@ -505,8 +535,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-cockpit:
     needs: [changes, dependency-audit, test-python, test-cockpit]
@@ -551,8 +583,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-mcp:
     needs: [changes, dependency-audit, test-python, test-cockpit]
@@ -597,8 +631,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-workspace:
     needs: [changes, dependency-audit, test-python, test-cockpit]
@@ -648,8 +684,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=max,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-sudo-gate:
     needs: [changes, dependency-audit, test-python, test-cockpit]
@@ -691,16 +729,122 @@ jobs:
             vm/sudo-plugin/sudo_gate.so
           retention-days: 7
 
-  build-agent-vm-base:
-    needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate]
+  # ---------------------------------------------------------------------------
+  # Stage 1: heavy, stable provisioning (apt + datasource clients + Tailscale +
+  # Playwright + Node). Rebuilds only when stage1 inputs change. Published as
+  # ghcr.io/<repo>-agent-vm-base-stage1; stage2 pulls and layers on top.
+  # ---------------------------------------------------------------------------
+  build-agent-vm-base-stage1:
+    needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure')
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/chromium \
+            /usr/share/swift /usr/local/julia* /opt/hostedtoolcache
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+      - name: Compute cloud image cache key
+        id: img-key
+        run: echo "key=ubuntu-noble-cloudimg-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Cache Ubuntu cloud image
+        id: cloud-image-cache
+        uses: actions/cache@v4
+        with:
+          path: docker/agent-vm-base/input/noble-server-cloudimg-amd64.img
+          key: ${{ steps.img-key.outputs.key }}
+      - name: Download Ubuntu cloud image
+        if: steps.cloud-image-cache.outputs.cache-hit != 'true'
+        working-directory: docker/agent-vm-base
+        run: |
+          mkdir -p input
+          wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+            -O input/noble-server-cloudimg-amd64.img
+      - name: Verify Ubuntu cloud image
+        working-directory: docker/agent-vm-base
+        run: qemu-img info input/noble-server-cloudimg-amd64.img
+      - name: Packer init (stage1)
+        working-directory: docker/agent-vm-base
+        run: packer init stage1.pkr.hcl
+      - name: Packer build (stage1)
+        working-directory: docker/agent-vm-base
+        run: |
+          PW_VERSION=$(tr -d '[:space:]' < ../../.playwright-version)
+          test -n "$PW_VERSION" || { echo "::error::.playwright-version is empty"; exit 1; }
+          for attempt in 1 2; do
+            if packer build -var "playwright_version=${PW_VERSION}" stage1.pkr.hcl; then
+              exit 0
+            fi
+            echo "::warning::Stage1 packer build attempt ${attempt} failed"
+            rm -rf output-stage1
+          done
+          echo "::error::Stage1 packer build failed after 2 attempts"
+          exit 1
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }} stage1 containerDisk
+        working-directory: docker/agent-vm-base
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
+          else
+            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:experimental")
+          fi
+          BUILD_ARGS=()
+          for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            for T in "${TAGS[@]}"; do docker push "$T"; done
+            printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"
+          else
+            printf 'Built stage1 (PR validation, not pushed):\n'; printf '  %s\n' "${TAGS[@]}"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: light per-commit layer (user setup, SSH config, daemon, sudo gate).
+  # Pulls the stage1 containerDisk from GHCR, extracts the qcow2, and layers
+  # stage2 on top via stage2.pkr.hcl. Should finish in ~5-10 min.
+  # ---------------------------------------------------------------------------
+  build-agent-vm-base:
+    needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate, build-agent-vm-base-stage1]
+    if: >-
+      always() && !cancelled() &&
+      (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.test-python.result, 'failure') &&
+      !contains(needs.test-cockpit.result, 'failure') &&
+      needs.build-sudo-gate.result == 'success' &&
+      (needs.build-agent-vm-base-stage1.result == 'success' || needs.build-agent-vm-base-stage1.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -753,38 +897,41 @@ jobs:
       - uses: hashicorp/setup-packer@main
         with:
           version: latest
-      - name: Download Ubuntu cloud image
-        working-directory: docker/agent-vm-base
-        run: |
-          mkdir -p input
-          wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
-            -O input/noble-server-cloudimg-amd64.img
-          qemu-img info input/noble-server-cloudimg-amd64.img
-      - name: Packer init
-        working-directory: docker/agent-vm-base
-        run: packer init agent-vm-base.pkr.hcl
-      - name: Packer build
-        working-directory: docker/agent-vm-base
-        run: |
-          PW_VERSION=$(tr -d '[:space:]' < ../../.playwright-version)
-          test -n "$PW_VERSION" || { echo "::error::.playwright-version is empty"; exit 1; }
-          # Retry once on transient apt/network failures. Packer leaves output/
-          # behind on failure and refuses to overwrite it on the next run.
-          for attempt in 1 2; do
-            if packer build -var "playwright_version=${PW_VERSION}" agent-vm-base.pkr.hcl; then
-              exit 0
-            fi
-            echo "::warning::Packer build attempt ${attempt} failed"
-            rm -rf output
-          done
-          echo "::error::Packer build failed after 2 attempts"
-          exit 1
+      # Login is unconditional here — needed to PULL the stage1 containerDisk
+      # from GHCR even on PR validation runs. Push of the final image still
+      # gates on push events below.
       - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull stage1 containerDisk and extract qcow2
+        working-directory: docker/agent-vm-base
+        run: |
+          STAGE1_IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1:latest" | tr '[:upper:]' '[:lower:]')
+          docker pull "$STAGE1_IMAGE"
+          # FROM scratch images have no shell so a real CMD doesn't matter — we
+          # never start the container, just create-then-cp.
+          CID=$(docker create "$STAGE1_IMAGE" /noop 2>/dev/null || docker create "$STAGE1_IMAGE")
+          mkdir -p input
+          docker cp "$CID":/disk/agent-vm-base-stage1.qcow2 input/agent-vm-base-stage1.qcow2
+          docker rm "$CID"
+          qemu-img info input/agent-vm-base-stage1.qcow2
+      - name: Packer init (stage2)
+        working-directory: docker/agent-vm-base
+        run: packer init stage2.pkr.hcl
+      - name: Packer build (stage2)
+        working-directory: docker/agent-vm-base
+        run: |
+          for attempt in 1 2; do
+            if packer build stage2.pkr.hcl; then
+              exit 0
+            fi
+            echo "::warning::Stage2 packer build attempt ${attempt} failed"
+            rm -rf output
+          done
+          echo "::error::Stage2 packer build failed after 2 attempts"
+          exit 1
       - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }} containerDisk image
         working-directory: docker/agent-vm-base
         run: |
@@ -848,8 +995,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha,ignore-error=true
-          cache-to: type=gha,mode=min,ignore-error=true
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-${{ replace(github.ref_name, '/', '-') }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-develop
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
   # Publish dev Helm chart + update deployment config for Fleet.

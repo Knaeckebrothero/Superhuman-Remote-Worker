@@ -279,8 +279,8 @@ def format_read_info(info: Dict[str, Any], file_path: str) -> str:
             info["next_page"] + len(info["pages_read"]) - 1, info["total_pages"]
         )
         lines.append(
-            f'To continue: read_file("{file_path}", '
-            f"page_start={info['next_page']}, page_end={suggested_end})"
+            f"To continue, invoke the read_file tool again on `{file_path}` "
+            f"with page_start={info['next_page']} and page_end={suggested_end}."
         )
 
     lines.append(f"Total pages: {info['total_pages']}")

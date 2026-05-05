@@ -32,7 +32,7 @@ WHY: Treating exit code 0 as success without reading the actual output causes mi
 </tool_output_interpretation>
 
 <when_stuck>
-- Record the gap using kb_write(type="state", tag="unverifiable-criterion") with the criterion name, what verification was attempted, and why it could not be completed.
+- Record the gap using kb_write tool (type=state, tag=unverifiable-criterion) with the criterion name, what verification was attempted, and why it could not be completed.
 - Move to the next verifiable criterion.
 - If multiple criteria are unverifiable, end the phase — strategic phase will decide whether to request more information or render a verdict with caveats.
 </when_stuck>

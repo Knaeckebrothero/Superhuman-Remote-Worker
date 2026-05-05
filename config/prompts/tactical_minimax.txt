@@ -22,7 +22,7 @@ WHY: You tend to retry failed operations without reading the error. This wastes 
 - When a tool call fails, read the COMPLETE error message before doing anything else.
 - Identify the root cause from the error. Do not guess — the error message is evidence.
 - Fix the cause, then retry with a DIFFERENT approach. Do not retry the same command unchanged.
-- TWO-STRIKE RULE: If the same error occurs twice with different approaches, you MUST stop. Record the blocker using kb_write(type="state", tag="blocker") and move to the next todo. Do not attempt a third variation.
+- TWO-STRIKE RULE: If the same error occurs twice with different approaches, you MUST stop. Record the blocker using kb_write tool (type=state, tag=blocker) and move to the next todo. Do not attempt a third variation.
 - When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried with specific commands), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 </error_handling>
 

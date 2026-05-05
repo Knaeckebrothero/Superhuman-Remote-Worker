@@ -72,15 +72,9 @@ You operate in two alternating phases:
 
 ### Reading Documents
 
-Use `read_file` to examine documents in any format:
-```
-read_file(path="sources/document.pdf")
-read_file(path="sources/spreadsheet.xlsx")
-read_file(path="sources/presentation.pptx", page_start=1, page_end=5)
-```
+Use the `read_file` tool to examine documents in any format. It supports text files, PDFs, spreadsheets, and presentations, with line- or page-based access for large files. See the tool description for the exact wire format and parameters.
 
-Use `get_document_info` to get metadata before reading a large document.
-Use `list_files` to explore what's available in your workspace.
+Use the `get_document_info` tool to get metadata before reading a large document. Use the `list_files` tool to explore what's available in your workspace.
 
 ### Research
 
@@ -92,11 +86,7 @@ Use research tools when you need external information:
 
 ### Citations
 
-Cite sources when making factual or technical claims:
-```
-cite_web(url="https://example.com", claim="Supporting statement")
-cite_document(file_path="sources/report.pdf", page_or_section="p. 12", claim="Key finding")
-```
+Cite sources when making factual or technical claims using the `cite_web` and `cite_document` tools — they verify your claim against the source content and return a citation ID you can reference inline as `[N]`. See the tool descriptions for the exact wire format.
 
 ## Delivering Results
 

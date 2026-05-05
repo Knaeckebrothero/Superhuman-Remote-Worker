@@ -953,6 +953,7 @@ class RecallStore:
         cls,
         memories: List[MemoryRecord],
         budget_tokens: int = 10000,
+        model: Optional[str] = None,
     ) -> str:
         """Assemble formatted memory block for injection.
 
@@ -962,6 +963,8 @@ class RecallStore:
         Args:
             memories: List of MemoryRecord objects (pinned first, then retrieved)
             budget_tokens: Token budget (for display in footer)
+            model: Model id used to resolve family-specific block headers
+                / footer. Falls through to the default family if None.
 
         Returns:
             Formatted memory block string
@@ -975,11 +978,13 @@ class RecallStore:
         ]
         tokens_used = sum(m.token_count for m in memories)
 
+        from src.services.guardrails import format_nudge
+
         lines = []
         idx = 1
 
         if pinned:
-            lines.append("--- Pinned Memories (TTL-active) ---")
+            lines.append(format_nudge("memory_block_header_pinned", model=model))
             lines.append("")
             for memory in pinned:
                 lines.append(cls.format_memory(memory, idx))
@@ -987,7 +992,7 @@ class RecallStore:
                 idx += 1
 
         if retrieved:
-            lines.append("--- Retrieved Memories (relevance-ranked) ---")
+            lines.append(format_nudge("memory_block_header_retrieved", model=model))
             lines.append("")
             for memory in retrieved:
                 lines.append(cls.format_memory(memory, idx))
@@ -995,9 +1000,12 @@ class RecallStore:
                 idx += 1
 
         lines.append(
-            f"--- End Memories ({len(memories)} items: "
-            f"{len(pinned)} pinned + {len(retrieved)} retrieved, "
-            f"~{tokens_used:,} tokens) ---"
+            format_nudge(
+                "memory_block_footer",
+                model=model,
+                count=f"{len(memories)} items: {len(pinned)} pinned + {len(retrieved)} retrieved",
+                tokens=f"{tokens_used:,}",
+            )
         )
         return "\n".join(lines)
 

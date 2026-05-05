@@ -61,10 +61,10 @@ Before marking any phase as successful, verify output SUBSTANCE:
 
 You MUST follow these rules in order:
 1. SEARCH FIRST: You MUST call kb_search before creating any new note. If a matching note exists, use kb_update instead of kb_write.
-2. Record decisions with this exact structure: DECISION (what was decided), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
-3. Record discovered facts using kb_write(type="learning").
-4. Record failed approaches with root cause using kb_write(type="learning", tag="failed-approach"). Do NOT omit the reason for failure.
-5. Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+2. Record decisions with this exact structure: DECISION (what was decided), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write tool (type=decision).
+3. Record discovered facts using kb_write tool (type=learning).
+4. Record failed approaches with root cause using kb_write tool (type=learning, tag=failed-approach). Do NOT omit the reason for failure.
+5. Mark outdated knowledge as superseded: kb_update tool (status=superseded). Link to the replacement note.
 6. You MUST prefer UPDATE over CREATE. The knowledge base should converge to a single source of truth, not accumulate multiple versions.
 
 ## Verification Rules

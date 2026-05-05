@@ -41,7 +41,7 @@ todos:
       (3) What existing knowledge is available? (documents/, reference/, codebase)
       (4) Are there specific technologies, patterns, or domains to focus on?
 
-      Record your exploration direction using kb_write(type="state", tag="exploration-focus"):
+      Record your exploration direction using kb_write tool (type=state, tag=exploration-focus):
       - One-line task summary
       - Relevant exploration modes
       - Scope boundaries (in scope vs out of scope)
@@ -110,7 +110,7 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE calling next_phase_todos.
       The tool will reject your call if you haven't read the guide.
 
       After reading the guide, create 5-7 todos for the first exploration phase.

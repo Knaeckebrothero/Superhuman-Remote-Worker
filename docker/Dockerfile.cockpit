@@ -18,8 +18,10 @@ WORKDIR /app
 # Copy package files
 COPY cockpit/package.json cockpit/package-lock.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies — BuildKit cache mount on /root/.npm survives across
+# RUNs in this build (and helps when this layer is busted but cache survives).
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
 
 # Copy source code
 COPY cockpit/tsconfig.json cockpit/tsconfig.app.json cockpit/angular.json cockpit/ngsw-config.json ./

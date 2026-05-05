@@ -7,7 +7,7 @@ These are default instructions for development tasks. Follow them unless the use
 - Read the task description and all provided documents carefully
 - Identify functional requirements (what the software must do)
 - Identify non-functional requirements (performance, security, compatibility)
-- Record assumptions and open questions using kb_write(type="question")
+- Record assumptions and open questions via the kb_write tool (type=question)
 - If requirements are ambiguous, make reasonable assumptions and document them
 
 ## 2. Research & Context Gathering
@@ -32,13 +32,13 @@ Work through milestones by delegating to `claude_code`. Never edit code files di
 
 ### claude_code Tool Reference
 
-```
-claude_code(
-    prompt: str,           # Detailed instructions (or follow-up when resuming)
-    session_id: str,       # Resume a previous session (omit for new session)
-    working_dir: str,      # Subdirectory within workspace (default: workspace root)
-) -> str                   # Result text + session metadata (session_id, turns, cost, duration)
-```
+The `claude_code` tool delegates a coding task to Claude Code. See the tool description for the wire format and exact arguments. Key parameters:
+
+- `prompt` — detailed instructions (or follow-up when resuming)
+- `session_id` — resume a previous session (omit for a new session)
+- `working_dir` — subdirectory within the workspace (defaults to workspace root)
+
+The tool returns the result text plus session metadata (session_id, turns, cost, duration).
 
 - **Multi-turn sessions**: First call returns a `session_id`. Pass it on follow-up calls to resume — Claude Code remembers all prior context.
 - **Output cap**: Response truncated to 50,000 chars (tail preserved). For verbose output, ask Claude Code to write to a file.

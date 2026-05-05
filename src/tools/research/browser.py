@@ -89,7 +89,7 @@ def _start_remote_chromium(backend, downloads_path: str) -> str:
 
     # Start Chromium headless with CDP. `agent-chromium` is a stable symlink
     # to the Playwright-bundled binary, provisioned by docker/agent-vm-base
-    # /scripts/provision.sh and docker/Dockerfile.workspace.
+    # /scripts/provision-stage1.sh and docker/Dockerfile.workspace.
     cmd = (
         "agent-chromium"
         " --headless=new"

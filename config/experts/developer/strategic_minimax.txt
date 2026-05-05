@@ -7,9 +7,9 @@ Do NOT implement code or call claude_code. This phase is for reviewing, reflecti
 WHY: After context compaction, your memory of what happened is unreliable. Git evidence is the only source of truth about what Claude Code actually produced. Reviewing from memory causes you to skip broken commits and missed requirements.
 
 1. Use git tools to verify what Claude Code actually changed — not what it reported:
-   - `git_log(max_count=15)` for recent commits
-   - `git_diff(revision="phase_N_start")` for all changes since phase start
-   - `git_tags()` to check phase milestones
+   - `git_log` for recent commits (raise max_count to scan more history)
+   - `git_diff` against the phase-start tag for all changes since phase start
+   - `git_tags` to check phase milestones
    - `read_file` to spot-check key files (don't trust summaries alone)
 2. Search the knowledge base (kb_search) for failed approaches and blockers from previous phases — do not repeat strategies already marked as failed.
 3. Write findings to `archive/phase_N_retrospective.md`. This is ground truth after context compaction.
@@ -20,14 +20,14 @@ WHY: After context compaction, your memory of what happened is unreliable. Git e
 WHY: The knowledge base is your persistent memory that survives context compaction. If you do not maintain it, you will lose session IDs, repository conventions, and delegation context across phases.
 
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Record repository structure discoveries (key paths, entry points, conventions) using kb_write(type="learning").
-- Record integration points and dependencies using kb_write(type="learning").
-- Record pinned instructions from instructions.md using kb_write(type="state", tag="pinned").
-- Record blockers using kb_write(type="state", tag="blocker"). Include: BLOCKER (what), ATTEMPTED (what you tried), ROOT_CAUSE (why), IMPACT (which todos are blocked), NEEDED (what would unblock).
-- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
-- Record active session IDs for ongoing work using kb_write(type="state", tag="session").
-- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach").
-- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Record repository structure discoveries (key paths, entry points, conventions) using kb_write tool (type=learning).
+- Record integration points and dependencies using kb_write tool (type=learning).
+- Record pinned instructions from instructions.md using kb_write tool (type=state, tag=pinned).
+- Record blockers using kb_write tool (type=state, tag=blocker). Include: BLOCKER (what), ATTEMPTED (what you tried), ROOT_CAUSE (why), IMPACT (which todos are blocked), NEEDED (what would unblock).
+- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write tool (type=decision).
+- Record active session IDs for ongoing work using kb_write tool (type=state, tag=session).
+- Record failed approaches with the root cause using kb_write tool (type=learning, tag=failed-approach).
+- Mark outdated knowledge as superseded: kb_update tool (status=superseded). Link to the replacement note.
 - Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
 - After any significant discovery or decision, write it to the knowledge base immediately. Do not defer.
 </knowledge_maintenance>

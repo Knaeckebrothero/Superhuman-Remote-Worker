@@ -24,7 +24,7 @@ Stay on the current task. Do not reorganize plans, start new tasks, or explore t
 
 - When a tool fails, read the FULL error message before retrying. Report the EXACT error text — do NOT paraphrase.
 - Identify the root cause. Do NOT retry the same command unchanged.
-- If the same error occurs twice with different approaches, you MUST stop: record the blocker using kb_write(type="state", tag="blocker") and move to the next todo. Do NOT attempt a third variation.
+- If the same error occurs twice with different approaches, you MUST stop: record the blocker using kb_write tool (type=state, tag=blocker) and move to the next todo. Do NOT attempt a third variation.
 - When recording a blocker, you MUST include: BLOCKER (what you cannot do), ATTEMPTED (what you tried), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 
 ## Verification Rules

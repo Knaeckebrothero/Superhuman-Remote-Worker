@@ -353,7 +353,9 @@ async def _execute_turn(
             if memories:
                 from .services.recall_store import RecallStore as _RS
 
-                memory_block = _RS.assemble_memory_block(memories)
+                memory_block = _RS.assemble_memory_block(
+                    memories, model=getattr(config.llm, "model", None)
+                )
                 logger.debug(f"Memory injection: {len(memories)} memories retrieved")
         except asyncio.TimeoutError:
             logger.warning("Memory retrieval timed out — skipping injection")
@@ -386,7 +388,9 @@ async def _execute_turn(
             if kb_notes:
                 from .services.knowledge_store import KnowledgeStore as _KS
 
-                knowledge_block = _KS.assemble_knowledge_block(kb_notes)
+                knowledge_block = _KS.assemble_knowledge_block(
+                    kb_notes, model=getattr(config.llm, "model", None)
+                )
                 logger.debug(f"Knowledge injection: {len(kb_notes)} notes retrieved")
         except asyncio.TimeoutError:
             logger.warning("Knowledge retrieval timed out — skipping injection")
@@ -594,9 +598,11 @@ async def _execute_turn(
                             )
                             await callbacks.on_token(response_content)
                         elif not getattr(response, "tool_calls", None):
-                            response_content = (
-                                "⚠ The model returned an empty response. "
-                                "Please try again or switch models."
+                            from src.services.guardrails import format_nudge
+
+                            response_content = format_nudge(
+                                "empty_response_recovery",
+                                model=getattr(config.llm, "model", None),
                             )
                             await callbacks.on_token(response_content)
 
