@@ -8,6 +8,15 @@ name: develop
 #   - Images get SHA + :experimental tags (no version tags)
 #   - Helm chart published as "srw-dev" with 0.0.0-dev.sha.<hash> versions
 #   - deploy-experimental updates fleet.yaml chart version + image tags
+#
+# PR vs push behavior:
+#   - PR to develop: change-based image builds run with `push: false` —
+#     no docker login, no :experimental tag, no chart publish, no fleet
+#     update. Purely Dockerfile/Packer validation so a broken build is
+#     caught before merge instead of after. Docs-only PRs still pay nothing
+#     since change-detection skips the build jobs entirely.
+#   - Push to develop: same change-based builds, but `push: true` with
+#     SHA + :experimental tags, followed by deploy-experimental.
 
 on:
   push:
@@ -404,7 +413,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -425,6 +433,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -436,15 +445,15 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - id: short_sha
         run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - name: Build and push
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.agent
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -457,7 +466,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -475,6 +483,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -486,13 +495,13 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
-      - name: Build and push
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.orchestrator
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -503,7 +512,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -521,6 +529,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -532,13 +541,13 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
-      - name: Build and push
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.cockpit
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -549,7 +558,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -567,6 +575,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -578,13 +587,13 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
-      - name: Build and push
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.mcp
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -595,7 +604,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.workspace == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -613,6 +621,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -624,18 +633,18 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
       - name: Read Playwright version
         id: pw
         run: echo "version=$(tr -d '[:space:]' < .playwright-version)" >> "$GITHUB_OUTPUT"
-      - name: Build and push
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.workspace
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -646,7 +655,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -687,7 +695,6 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit, build-sudo-gate]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.sudo-gate == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -773,26 +780,35 @@ jobs:
           echo "::error::Packer build failed after 2 attempts"
           exit 1
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push containerDisk image
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }} containerDisk image
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
-          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR validation: build with a single throwaway tag, no push.
+            TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
+          else
+            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:experimental")
+          fi
           BUILD_ARGS=()
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
-          for T in "${TAGS[@]}"; do docker push "$T"; done
-          printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            for T in "${TAGS[@]}"; do docker push "$T"; done
+            printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
+          else
+            printf 'Built (PR validation, not pushed):\n'; printf '  %s\n' "${TAGS[@]}"
+          fi
 
   build-vm-controller:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
       (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
@@ -810,6 +826,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -821,13 +838,13 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=experimental
-      - name: Build and push
+            type=raw,value=experimental,enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: ./vm/controller
           file: ./vm/controller/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
