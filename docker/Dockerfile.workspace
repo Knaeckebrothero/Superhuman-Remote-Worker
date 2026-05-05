@@ -15,13 +15,16 @@ ARG CODE_SERVER_VERSION=4.100.3
 ARG NODE_MAJOR=22
 
 # ---------------------------------------------------------------------------
-# 0. Apt tuning: switch to Azure mirror (faster from GHA Azure runners and
-#    far more reliable than archive.ubuntu.com's load balancer) and enable
-#    retries + pipelining. Same config as agent-vm-base/scripts/provision-stage1.sh.
+# 0. Apt tuning: prefer Azure mirror (faster from GHA Azure runners) but keep
+#    archive.ubuntu.com as a fallback so apt rotates to it when Azure has an
+#    outage (we ate a 23-min hang on 2026-05-05 when Azure stopped responding).
+#    Short timeouts + retries make failures fast instead of stalling the build.
 # ---------------------------------------------------------------------------
 RUN { sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
       || sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; } \
-    && printf 'Acquire::Retries "5";\nAcquire::Retries::Delay::Maximum "30";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::http::Pipeline-Depth "10";\nAcquire::Queue-Mode "access";\nAPT::Install-Recommends "false";\n' \
+    && printf 'deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse\ndeb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse\ndeb http://security.ubuntu.com/ubuntu noble-security main restricted universe multiverse\n' \
+        > /etc/apt/sources.list.d/ubuntu-fallback.list \
+    && printf 'Acquire::Retries "5";\nAcquire::Retries::Delay::Maximum "10";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\nAcquire::http::ConnectionAttemptDelayMsec "500";\nAcquire::http::Pipeline-Depth "10";\nAPT::Install-Recommends "false";\n' \
         > /etc/apt/apt.conf.d/99-build-tuning \
     && rm -f /etc/apt/apt.conf.d/docker-clean \
     && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
