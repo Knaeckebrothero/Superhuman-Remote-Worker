@@ -1370,12 +1370,13 @@ def create_execute_node(
                         )
                         injected_reminder = HumanMessage(
                             content=(
-                                f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
+                                f"Action required: complete the current todo `{first.id}` now by invoking the `todo_complete` tool.\n\n"
                                 "If you already finished the work for this todo, that's perfectly fine — "
-                                "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
+                                "invoke `todo_complete` now to record it. You don't need to redo anything.\n\n"
                                 f"Pending todos ({len(remaining)}):\n"
                                 f"{todo_lines}\n\n"
-                                "Do NOT respond with text. Your next action must be a tool call."
+                                "Use the tool-call format defined in your system prompt — do not type the call as plain text. "
+                                "Your next action must be a tool call, not natural language."
                             )
                         )
 

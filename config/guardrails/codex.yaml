@@ -1,0 +1,10 @@
+# Codex (gpt-5.3-codex) guardrails
+#
+# Codex shares the GPT-5 wire format. This file is intentionally empty so
+# `codex` resolves through `default.yaml` exactly like `gpt_5.yaml`. Kept
+# as a separate file so codex-specific drift can be added later without
+# touching the matrix.
+
+tool_examples: {}
+
+nudges: {}

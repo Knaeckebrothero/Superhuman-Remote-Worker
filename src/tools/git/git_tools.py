@@ -116,11 +116,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Formatted commit history
-
-        Example:
-            git_log()  # Last 10 commits in compact format
-            git_log(max_count=5)  # Last 5 commits
-            git_log(oneline=False)  # Full commit details
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -147,12 +142,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Commit details including message and diff (or stats)
-
-        Example:
-            git_show()  # Show latest commit with full diff
-            git_show(stat_only=True)  # Show latest commit file list only
-            git_show(commit_ref="HEAD~3")  # Show commit from 3 commits ago
-            git_show(commit_ref="phase-1-tactical-complete")  # Show tagged commit
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -185,12 +174,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Diff output showing changes
-
-        Example:
-            git_diff()  # Show uncommitted changes
-            git_diff(ref1="HEAD~5")  # Changes in last 5 commits vs working dir
-            git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")  # Between tag and HEAD
-            git_diff(file_path="workspace.md")  # Uncommitted changes to specific file
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -216,21 +199,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Formatted status showing branch and file changes
-
-        Example output (clean):
-            Branch: master
-            Status: clean (no uncommitted changes)
-
-        Example output (dirty):
-            Branch: master
-            Status: dirty (uncommitted changes)
-
-            Staged (2):
-              + new_file.txt
-              + updated.md
-
-            Modified (1):
-              M workspace.md
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -256,12 +224,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Comma-separated list of matching tags, or message if none found
-
-        Example:
-            git_tags()  # List all phase tags for this job
-            git_tags(pattern="phase-1-*")  # Only phase 1 tags for this job
-            git_tags(pattern="*")  # All tags for this job
-            git_tags(all_jobs=True)  # Phase tags from all jobs in repo
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -299,10 +261,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
         Returns:
             Success message with commit info, or error details if merge failed.
             If merge conflicts occur, the message describes which files conflict.
-
-        Example:
-            git_merge_squash(branch="subagent/0")
-            git_merge_squash(branch="subagent/1", commit_message="Merge research results")
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
@@ -343,10 +301,6 @@ def create_git_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Status message about what was cleaned up.
-
-        Example:
-            git_worktree_cleanup(branch="subagent/0")
-            git_worktree_cleanup(branch="subagent/2", force=True)
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"

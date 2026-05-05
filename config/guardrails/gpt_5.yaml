@@ -1,0 +1,12 @@
+# GPT-5 guardrails
+#
+# GPT-5 (and GPT-5 family via the OpenAI Responses API) uses standard
+# OpenAI parens-form tool-calls. Examples and runtime nudges from
+# `default.yaml` apply unchanged.
+#
+# This file is the anchor for `codex` and `codex-spark` overrides — any
+# GPT-5-shared adjustment goes here first.
+
+tool_examples: {}
+
+nudges: {}

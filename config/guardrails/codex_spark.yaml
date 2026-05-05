@@ -1,0 +1,9 @@
+# Codex Spark (gpt-5.3-codex-spark distilled) guardrails
+#
+# Spark shares the GPT-5 wire format and benefits from the default examples.
+# This file exists to provide a guardrails handle in the matrix for future
+# drift (e.g. distilled model behavior differences).
+
+tool_examples: {}
+
+nudges: {}

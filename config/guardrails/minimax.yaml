@@ -1,0 +1,12 @@
+# MiniMax M2.7 guardrails
+#
+# M2.7 is a reasoning model served via OpenAI-compatible API (LangChain
+# ChatOpenAI). Tool calls use standard OpenAI parens-form serialization —
+# everything in `default.yaml` applies as-is.
+#
+# This file exists so the matrix has a guardrails entry for `minimax` and
+# any future drift can be added here without touching the matrix again.
+
+tool_examples: {}
+
+nudges: {}
