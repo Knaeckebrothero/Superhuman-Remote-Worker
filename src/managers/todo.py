@@ -406,9 +406,10 @@ class TodoManager:
         # Tool usage guide
         lines.append("")
         lines.append(
-            'Tools: Use `todo_complete(todo_id="<id>")` when a task is finished. '
-            'Use `todo_rewind(todo_id="<id>")` to revisit a completed task. '
-            "Use `mark_complete` to signal the current phase is done."
+            "Tools: `todo_complete` (mark a task finished — pass the todo id). "
+            "`todo_rewind` (revisit a completed task — pass the todo id). "
+            "`mark_complete` (signal the current phase is done). "
+            "Invoke them via the tool-call format defined in your system prompt."
         )
 
         return "\n".join(lines)

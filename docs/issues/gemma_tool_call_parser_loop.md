@@ -28,6 +28,7 @@ related:
 | #1 — No-tool-call streak detector (model-agnostic safety net) | **Shipped** | 11 unit tests pass; would catch this incident at iter ~22 instead of iter 1403 |
 | #2a — Gemma prompt variants (systemprompt/persona/strategic/tactical/summarization) | **Shipped** | End-to-end Jinja+format pipeline validated; canonical wire-format anchor at top + bottom of systemprompt, 6 worked examples in tactical |
 | #2b — Gemma instructions variant (`instructions_gemma.md`) | **Shipped** | All 5 Python-style examples in default `instructions.md` rewritten in canonical format; wired via matrix `gemma.instructions` |
+| #2c — Strip Python-parens examples from runtime nudges + `todo_complete` docstring (model-agnostic, true root cause) | **Shipped** | `src/graph.py:1373` recovery nudge, `src/managers/todo.py:409`, `src/tools/core/todo.py:174,196,207` rewritten format-neutral. See "Root cause 1b" below |
 | #3 — Don't dispatch worker jobs to `gemma-4-moe` (interim) | **N/A** | Superseded by #2; can dispatch once a real-job validation passes |
 | #4 — Backend failover (`gemma-4-moe` → `gemma-4-moe-strix`) | **Open** | Configmap + router multi-backend support change; not blocking |
 | #5 — Cockpit visibility for `parser_failure` freezes | **Open** | API + UI work; nice-to-have |
@@ -44,7 +45,7 @@ Gemma emitted what *looked* like its native tool-call wire format but with **par
 **Verdict: fixable on our side — keep the model.** Gemma 4 supports tool calling well when steered to its canonical format; the missing piece is `_gemma` prompt variants for the worker path (the auxiliary path already has them). vLLM's parser is correct and strict; there's no leniency flag.
 
 Three independent failures stacked:
-1. **Format-emission mismatch** — Gemma emits `(args="value")` instead of `{key:<|"|>value<|"|>}`. Model-side, prompt-fixable.
+1. **Format-emission mismatch** — Gemma emits `(args="value")` instead of `{key:<|"|>value<|"|>}`. Model-side, prompt-fixable. **Updated root cause (2026-05-05 evening):** the model wasn't drifting from generic training — our own runtime nudge (`src/graph.py:1373`) and the `todo_complete` tool docstring (LangChain serializes the docstring into `tools[].function.description`) literally taught the model `todo_complete(todo_id="todo_1")` Python syntax every iteration, then complained when it copied it back. Self-reinforcing loop. See "Root cause 1b" below for the diagnostic-script evidence.
 2. **Stuck-detector blind spot** — no `tool_name` ⇒ no fingerprint ⇒ no detection. Graph-side bug, model-agnostic.
 3. **Server pool of one** — `gemma-4-moe` resolves to a single workstation backend behind a VPN; ~50 req/min sustained eventually exhausted it. Infra-side.
 
@@ -141,6 +142,28 @@ The regex does not match, the parser yields no tool call, the entire response is
 
 This is **fixable with prompt scaffolding**, not a model capability gap.
 
+### 1b. Format-emission mismatch — actual mechanism (post-diagnostic)
+
+The diagnostic at `tests/manual_test_gemma_reasoning.py` (scenario C) calls the same vLLM backend with structured `tools=[]` and gets back perfect canonical-format structured `tool_calls` every time, in <139 prompt tokens. The same model in the same backend produced parens at 30k tokens in job 3c30d72e. Reading iter 21's full request (`69f9ae4d814035427a50d6c2`) revealed the actual mechanism:
+
+```
+[human]: Action required: call `todo_complete(todo_id="todo_1")` to mark your current task done. ...
+[assistant]: <|tool_call>call:todo_complete(todo_id="todo_1")<tool_call|>
+[human]: Action required: call `todo_complete(todo_id="todo_1")` to mark your current task done. ...
+[assistant]: <|tool_call>call:todo_complete(todo_id="todo_2")<tool_call|>
+[human]: Action required: call `todo_complete(todo_id="todo_1")` to mark your current task done. ...
+```
+
+The harness's recovery nudge **showed the model `todo_complete(todo_id="todo_1")` in literal Python parens** as the example of what to call. The model dutifully mirrored that exact format, parser rejected it, harness nudged again with the same parens example, repeat 1385×. The model wasn't drifting from generic training — it was copying our nudge.
+
+Three sources of parens-style examples in conversation context:
+
+1. **Recovery nudge** — `src/graph.py:1373` (HumanMessage injected into state every iteration the model fails to call a tool). Highest-leverage source; lands directly in conversation history with `Action required:` framing.
+2. **Todo-list footer** — `src/managers/todo.py:409-411` (Layer-2 injection in active_tasks block). Visible on every strategic-phase prompt.
+3. **`todo_complete` docstring** — `src/tools/core/todo.py:174, 196, 207`. LangChain serializes Python docstrings into `tools[].function.description`, which vLLM splices into the rendered chat template. The model literally sees `todo_complete(todo_id="todo_X")` as the canonical example for how to invoke this tool, in the same context that the system prompt says "use braces, never parens".
+
+This is a **model-agnostic** bug — any model on any backend, given mixed signals "use format A in the system prompt + use format B in every example", will drift to whichever format has more local context support. Gemma exposed it because its parser is strict; a more lenient parser (or a generic JSON parser) would have masked the underlying issue indefinitely.
+
 ### 2. Stuck-detector blind spot (graph-side)
 
 `src/graph.py` stuck detection fingerprints `(tool_name, args_hash)`. When `tool_name is None`, no fingerprint exists, so the detector never trips — even though 1385 consecutive identical responses is the textbook definition of stuck.
@@ -165,6 +188,8 @@ This is **model-agnostic**: any model on any backend that emits malformed tool c
 The `127.0.0.1:18090` backend is a VPN-tunnelled forward to the workstation at `10.18.2.105:8090` via the `vpn-workstation` sidecar (`20-deployment.yaml:110-149`). The router itself is pinned to `replicas: 1` because its rate limiter is in-memory.
 
 `gemma-4-moe-strix` exists in the same configmap as a separate model (in-cluster Strix Halo, `10.43.210.54:80`) but it has a **different model alias**, so it isn't a transparent failover target — the agent has to be configured to use it explicitly.
+
+**Backend stack difference (relevant to fix #4 design):** the strix backend is **llama.cpp `llama-server`** (`ghcr.io/knaeckebrothero/gemma4-moe-strix-llamacpp`, gguf model on AMD ROCm — see `HomeLab/deployments_unmanaged/gemma4-moe-strix/deployment.yaml:24-31`), not vLLM. The diagnostic at `tests/manual_test_gemma_reasoning.py` shows strix populates `reasoning_content` correctly on every scenario including with `tools=[]`, while the cluster vLLM never does — the parsers are wired up differently in the two engines and have different chat-template handling. This means a multi-backend route would need to normalise responses (specifically the `reasoning_content` field) across the two engines, or accept inconsistent thinking visibility for users who land on different backends.
 
 The "server pool" for `gemma-4-moe` is therefore a pool of **one** backend, with no failover. ~1400 requests in ~28 min (~50 req/min sustained, no real-work pauses since every tool call was a no-op) eventually saturated it. Without router/backend logs we can't pinpoint which: VPN tunnel reset, llama-server / vLLM OOM or restart, the router's health probe started failing, or an in-memory rate-limit threshold fired. All four converge on the same observable: `no available server`.
 
@@ -204,6 +229,23 @@ Plus positive-contrast guidance ("curly braces — never parentheses"; "string v
 Created `config/templates/instructions_gemma.md` (203 lines, +1018 chars vs default). Rewrote all 5 Python-style examples in the default `instructions.md` (`read_file(path=...)`, `cite_web(url=..., claim=...)`, `kb_write(type='learning', tag='failed-approach')`, `delegate_work(tasks=[...], context=...)`, etc.) in canonical Gemma wire format. Adds a top-of-document "Tool Call Format" primer.
 
 Wired in at `config/model_config_matrix.yaml` under `gemma.instructions.instructions`. Loaded into the agent's context every turn via `agent.py:1867-1868`. Without this fix, the prompt-side anchor saying "use braces" was contradicted by Pythonic examples in instructions.md every turn — Gemma got mixed signals. Now both pull in the same direction.
+
+### Fix 2c — Strip Python-parens examples from runtime nudges + tool docstrings — **SHIPPED**
+
+Patched the three sources identified in "Root cause 1b" to format-neutral phrasing:
+
+1. **`src/graph.py:1373`** — recovery nudge. Was `Action required: call `todo_complete(todo_id="{first.id}")` to mark...`. Now references the tool by name and the todo by id with no call-syntax example, and adds `Use the tool-call format defined in your system prompt — do not type the call as plain text.`
+2. **`src/managers/todo.py:409-411`** — todo-list footer. Was `Tools: Use `todo_complete(todo_id="<id>")` ...`. Now `Tools: `todo_complete` (mark a task finished — pass the todo id). ... Invoke them via the tool-call format defined in your system prompt.`
+3. **`src/tools/core/todo.py:174, 196, 207`** — `todo_complete` docstring (sent to model via `tools[].function.description`) and runtime error message. Examples rewritten as natural-language sentences ("Invoke with no arguments..." / "Invoke with todo_id set to a specific id..."), error message uses backticks-only references.
+
+After this fix, **no conversation context source teaches Python parens syntax** to the model. The model now has:
+
+- System prompt teaching canonical Gemma format (from #2a)
+- Instructions teaching canonical Gemma format (from #2b)
+- Tool descriptions in `tools[]` describing tool names/parameters in prose only (from #2c)
+- Recovery nudges referring to tools by name only, not by example syntax (from #2c)
+
+**Open follow-up:** other tool docstrings (`src/tools/git/git_tools.py`, `src/tools/shell/shell_tools.py`, etc.) still show Python parens in `Examples:` blocks. These didn't trigger the production loop because the loop centred on `todo_complete`, but they're a latent risk for any tool the harness nudges the model to call. Sweep deferred until #2c is validated in production.
 
 ### Fix 3 — Short-term: don't dispatch worker jobs to `gemma-4-moe` — superseded
 

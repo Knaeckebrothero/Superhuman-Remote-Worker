@@ -411,10 +411,6 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         Creates parent directories for destination if they don't exist.
         Works for both files and directories.
 
-        Examples:
-        - move_file("todos.yaml", "archive/todos_phase_1.yaml")  # move to subdir
-        - move_file("draft.md", "final.md")  # rename in place
-
         Args:
             source: Source path relative to workspace root
             dest: Destination path relative to workspace root

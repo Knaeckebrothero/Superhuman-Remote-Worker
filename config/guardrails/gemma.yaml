@@ -1,0 +1,155 @@
+# Gemma 4 guardrails — canonical brace wire format for vLLM `gemma4` parser
+#
+# Wire format (from instructions_gemma.md, mirrored by the vLLM parser regex
+# `<\|tool_call>call:(\w+)\{(.*?)\}(?:<tool_call\|>|<turn\|>)`):
+#
+#   <|tool_call>call:fn{key:<|"|>string val<|"|>,n:42,b:true}<tool_call|>
+#
+# Rules:
+#   - braces, never parens
+#   - string values wrapped in `<|"|> ... <|"|>` — never `"..."` or `'...'`
+#   - numbers and booleans bare (`count:42`, `enabled:true`)
+#   - closing tag `<tool_call|>` (pipe on the right)
+#   - one tool call per turn
+#
+# Anything not overridden here inherits from default.yaml.
+
+tool_examples:
+
+  # ----- src/tools/core/todo.py -----
+  next_phase_todos: |-
+    Examples:
+        <|tool_call>call:next_phase_todos{todos:[<|"|>Extract document text from uploaded PDF<|"|>,<|"|>Chunk document into processable segments<|"|>,<|"|>Identify requirements in each chunk<|"|>,<|"|>Validate extracted requirements<|"|>,<|"|>Write requirements to database<|"|>],phase_name:<|"|>Phase 1: Document Processing<|"|>}<tool_call|>
+
+  todo_complete: |-
+    Examples:
+        <|tool_call>call:todo_complete{}<tool_call|>                              # complete the first pending task
+        <|tool_call>call:todo_complete{todo_id:<|"|>todo_3<|"|>}<tool_call|>      # complete a specific task by id
+
+  # ----- src/tools/git/git_tools.py -----
+  git_log: |-
+    Examples:
+        <|tool_call>call:git_log{}<tool_call|>                       # last 10 commits, compact one-line format
+        <|tool_call>call:git_log{max_count:5}<tool_call|>            # last 5 commits
+        <|tool_call>call:git_log{oneline:false}<tool_call|>          # full commit details
+
+  git_show: |-
+    Examples:
+        <|tool_call>call:git_show{}<tool_call|>                                                       # latest commit, full diff
+        <|tool_call>call:git_show{stat_only:true}<tool_call|>                                         # latest commit, file list only
+        <|tool_call>call:git_show{commit_ref:<|"|>HEAD~3<|"|>}<tool_call|>                            # commit from 3 commits ago
+        <|tool_call>call:git_show{commit_ref:<|"|>phase-1-tactical-complete<|"|>}<tool_call|>         # tagged commit
+
+  git_diff: |-
+    Examples:
+        <|tool_call>call:git_diff{}<tool_call|>                                                                 # uncommitted changes
+        <|tool_call>call:git_diff{ref1:<|"|>HEAD~5<|"|>}<tool_call|>                                            # last 5 commits vs working dir
+        <|tool_call>call:git_diff{ref1:<|"|>phase-1-tactical-complete<|"|>,ref2:<|"|>HEAD<|"|>}<tool_call|>     # between tag and HEAD
+        <|tool_call>call:git_diff{file_path:<|"|>workspace.md<|"|>}<tool_call|>                                 # uncommitted changes in one file
+
+  git_status: |-
+    Example output (clean):
+        Branch: master
+        Status: clean (no uncommitted changes)
+
+    Example output (dirty):
+        Branch: master
+        Status: dirty (uncommitted changes)
+
+        Staged (2):
+          + new_file.txt
+          + updated.md
+
+        Modified (1):
+          M workspace.md
+
+  git_tags: |-
+    Examples:
+        <|tool_call>call:git_tags{}<tool_call|>                                  # phase tags for the current job
+        <|tool_call>call:git_tags{pattern:<|"|>phase-1-*<|"|>}<tool_call|>       # only phase 1 tags for this job
+        <|tool_call>call:git_tags{pattern:<|"|>*<|"|>}<tool_call|>               # all tags for this job
+        <|tool_call>call:git_tags{all_jobs:true}<tool_call|>                     # phase tags from every job in the repo
+
+  git_merge_squash: |-
+    Examples:
+        <|tool_call>call:git_merge_squash{branch:<|"|>subagent/0<|"|>}<tool_call|>
+        <|tool_call>call:git_merge_squash{branch:<|"|>subagent/1<|"|>,commit_message:<|"|>Merge research results<|"|>}<tool_call|>
+
+  git_worktree_cleanup: |-
+    Examples:
+        <|tool_call>call:git_worktree_cleanup{branch:<|"|>subagent/0<|"|>}<tool_call|>
+        <|tool_call>call:git_worktree_cleanup{branch:<|"|>subagent/2<|"|>,force:true}<tool_call|>
+
+  # ----- src/tools/shell/shell_tools.py -----
+  run_command: |-
+    Examples:
+        <|tool_call>call:run_command{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>git diff HEAD~1<|"|>,tail:100}<tool_call|>
+        <|tool_call>call:run_command{command:<|"|>npm run build<|"|>,timeout:300}<tool_call|>
+
+  shell_execute: |-
+    Examples:
+        <|tool_call>call:shell_execute{command:<|"|>pytest tests/ -x<|"|>}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>npm run dev<|"|>,name:<|"|>dev<|"|>,is_async:true}<tool_call|>
+        <|tool_call>call:shell_execute{command:<|"|>C-c<|"|>,name:<|"|>dev<|"|>,keys:true}<tool_call|>
+
+  shell_read: |-
+    Examples:
+        <|tool_call>call:shell_read{}<tool_call|>                                                  # tail of default tab
+        <|tool_call>call:shell_read{name:<|"|>build<|"|>,lines:100}<tool_call|>                    # last 100 lines of build tab
+        <|tool_call>call:shell_read{name:<|"|>srv<|"|>,offset:0,lines:50}<tool_call|>              # first 50 lines
+
+  # ----- src/tools/workspace/files.py and filesystem.py -----
+  edit_file: |-
+    Examples:
+        # Replace mode (default)
+        <|tool_call>call:edit_file{path:<|"|>plan.md<|"|>,old_string:<|"|>## Draft<|"|>,new_string:<|"|>## Final<|"|>}<tool_call|>
+
+        # Append mode — add to end of file
+        <|tool_call>call:edit_file{path:<|"|>notes.md<|"|>,new_string:<|"|>\n## New Section<|"|>,position:<|"|>end<|"|>}<tool_call|>
+
+        # Prepend mode — add to start of file
+        <|tool_call>call:edit_file{path:<|"|>log.md<|"|>,new_string:<|"|># Header\n\n<|"|>,position:<|"|>start<|"|>}<tool_call|>
+
+  move_file: |-
+    Examples:
+        <|tool_call>call:move_file{source:<|"|>todos.yaml<|"|>,dest:<|"|>archive/todos_phase_1.yaml<|"|>}<tool_call|>     # move to subdir
+        <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>final.md<|"|>}<tool_call|>                        # rename in place
+
+
+nudges:
+
+  # Family-sensitive: anything that mentions a tool name needs to remind the
+  # model of the brace format. Doubled `{{` / `}}` because str.format() will
+  # consume single braces — placeholder braces stay single, literal braces
+  # are doubled.
+
+  todo_action: |-
+    Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
+    The Gemma tool-call format is `<|tool_call>call:fn{{key:<|"|>val<|"|>}}<tool_call|>` — use braces, never parens.
+
+  budget_rewind: |-
+    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
+    Stage new todos by invoking the `next_phase_todos` tool. Use the canonical brace format defined in your system prompt — do not type Python-style calls.
+    Before staging:
+      1. Review what worked and what didn't
+      2. Identify root causes for the failures
+      3. Stage smaller, more focused todos
+
+  todo_list_footer: |-
+    Tools available: `todo_complete`, `todo_rewind`, `mark_complete`. Invocations use the canonical Gemma tool-call format from your system prompt: `<|tool_call>call:fn{{...}}<tool_call|>`.
+    Never type tool calls as plain text or with parens.
+
+  read_file_required_error: |-
+    Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
+    Read it first by invoking the `read_file` tool, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
+
+  phase_transition_tactical_to_strategic: |-
+    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}.
+    Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
+    All tool invocations use the canonical Gemma brace format from your system prompt.
+
+  # Other nudges (loop_warning_suffix, tool_not_found_suffix,
+  # phase_transition_strategic_to_tactical, degenerate_recovery_*,
+  # memory/knowledge headers/footers, empty_response_recovery)
+  # inherit from default.yaml unchanged — they don't reference a wire format.

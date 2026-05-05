@@ -176,7 +176,7 @@ def _load_model_config_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
                 continue
             normalized: Dict[str, Any] = {}
             for section, payload in family_block.items():
-                if section in ("prompts", "instructions", "settings"):
+                if section in ("prompts", "instructions", "settings", "guardrails"):
                     if isinstance(payload, dict):
                         normalized[section] = payload
                     else:
@@ -243,6 +243,113 @@ def _load_settings_matrix(deployment_dir: str = None) -> Dict[str, Dict[str, Any
     if not expert_settings:
         return base_settings
     return deep_merge(base_settings, expert_settings)
+
+
+_guardrails_file_cache: Dict[Path, Dict[str, Any]] = {}
+
+
+def _load_guardrails_file(path: Path) -> Dict[str, Any]:
+    """Parse a single guardrails YAML (cached by path).
+
+    Returns the raw dict shape: ``{tool_examples: {...}, nudges: {...}}``.
+    Falls back to an empty dict on any error so missing files don't break
+    the loader.
+    """
+    if path in _guardrails_file_cache:
+        return _guardrails_file_cache[path]
+    if not path.exists():
+        _guardrails_file_cache[path] = {}
+        return _guardrails_file_cache[path]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            logger.warning(
+                f"Invalid guardrails file {path}: expected dict, got {type(data)}"
+            )
+            _guardrails_file_cache[path] = {}
+            return _guardrails_file_cache[path]
+        _guardrails_file_cache[path] = data
+        return data
+    except Exception as e:
+        logger.warning(f"Failed to load guardrails file {path}: {e}")
+        _guardrails_file_cache[path] = {}
+        return _guardrails_file_cache[path]
+
+
+def _load_guardrails_matrix(
+    deployment_dir: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Return the ``guardrails`` subsection of the unified matrix.
+
+    The matrix value at each family is ``{file: <basename>}``. This loader
+    additionally dereferences the file pointer and returns the merged contents
+    keyed by family: ``{family: {tool_examples: {...}, nudges: {...}}}``.
+
+    Resolution per family:
+      base ``config/guardrails/<file>`` (cached) plus optional expert overlay
+      at ``<deployment_dir>/guardrails/<file>`` deep-merged on top.
+    """
+    base_path = get_project_root() / "config" / "model_config_matrix.yaml"
+    base_pointers = _matrix_subsection(
+        _load_model_config_matrix_file(base_path), "guardrails"
+    )
+
+    expert_pointers: Dict[str, Dict[str, Any]] = {}
+    if deployment_dir:
+        expert_path = Path(deployment_dir) / "model_config_matrix.yaml"
+        if expert_path.exists():
+            expert_pointers = _matrix_subsection(
+                _load_model_config_matrix_file(expert_path), "guardrails"
+            )
+
+    families = set(base_pointers) | set(expert_pointers)
+    out: Dict[str, Dict[str, Any]] = {}
+    project_root = get_project_root()
+
+    for family in families:
+        base_filename = base_pointers.get(family, {}).get("file")
+        merged: Dict[str, Any] = {}
+        if base_filename:
+            merged = _load_guardrails_file(
+                project_root / "config" / "guardrails" / base_filename
+            )
+
+        expert_filename = expert_pointers.get(family, {}).get("file")
+        if expert_filename and deployment_dir:
+            expert_data = _load_guardrails_file(
+                Path(deployment_dir) / "guardrails" / expert_filename
+            )
+            if expert_data:
+                merged = deep_merge(merged, expert_data)
+
+        if merged:
+            out[family] = merged
+
+    return out
+
+
+def resolve_guardrails(
+    model: str, deployment_dir: Optional[str] = None
+) -> Dict[str, Any]:
+    """Resolve the merged guardrails dict for a model.
+
+    Returns ``{tool_examples: {...}, nudges: {...}}`` produced by deep-merging
+    the family-specific guardrails on top of the ``default`` family. Callers
+    use this single dict for both tool docstring injection and runtime nudges.
+
+    Args:
+        model: Model name (e.g., ``"google/gemma-4-31b"``)
+        deployment_dir: Optional expert directory for per-expert overlay
+
+    Returns:
+        Merged guardrails dict; empty if no defaults exist.
+    """
+    family = family_of(model)
+    matrix = _load_guardrails_matrix(deployment_dir)
+    default_guardrails = matrix.get("default", {})
+    family_guardrails = matrix.get(family, {}) if family != "default" else {}
+    return deep_merge(default_guardrails, family_guardrails)
 
 
 def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, Any]:

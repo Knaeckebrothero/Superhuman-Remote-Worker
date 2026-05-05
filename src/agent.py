@@ -1822,6 +1822,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         strategic_tools = [t for t in self._tools if t.name in strategic_names]
         tactical_tools = [t for t in self._tools if t.name in tactical_names]
 
+        # Inject family-specific Examples blocks into tool descriptions before
+        # binding. This is where the model first sees the tool catalog and
+        # decides on a wire format — see docs/design/guardrails_matrix.md.
+        from src.services.guardrails import apply_guardrails_to_tools
+
+        strategic_tools = apply_guardrails_to_tools(
+            strategic_tools, model=self.config.llm.model
+        )
+        tactical_tools = apply_guardrails_to_tools(
+            tactical_tools, model=self.config.llm.model
+        )
+
         self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
             strategic_tools, **bind_kwargs
         )

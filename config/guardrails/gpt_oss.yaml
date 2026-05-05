@@ -1,0 +1,30 @@
+# gpt-oss guardrails — harmony channel + JSON tool-calls
+#
+# gpt-oss-120b uses OpenAI's harmony format with three channels (analysis,
+# commentary, final). Tool calls are emitted on the `commentary` channel as
+# JSON arguments to the OpenAI tool-call API. The parens-form Python
+# representation in `default.yaml` is what the model sees inside descriptions
+# and is fine for gpt-oss — what differs is the `next_phase_todos` example,
+# which is the most-fragile call (large argument shape) and benefits from
+# being explicitly anchored.
+#
+# Inherits everything else from `default.yaml`.
+
+tool_examples:
+
+  next_phase_todos: |-
+    # Tool calls are emitted on the `commentary` channel as JSON tool arguments.
+    Examples:
+        next_phase_todos(
+            todos=[
+                "Extract document text from uploaded PDF",
+                "Chunk document into processable segments",
+                "Identify requirements in each chunk",
+                "Validate extracted requirements",
+                "Write requirements to database",
+            ],
+            phase_name="Phase 1: Document Processing",
+        )
+
+# nudges: inherit from default.yaml — gpt-oss accepts the parens-form
+# language in error messages and runtime nudges without drift.

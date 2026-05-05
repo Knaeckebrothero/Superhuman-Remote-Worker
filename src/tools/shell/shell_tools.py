@@ -263,12 +263,6 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Exit code + stdout output (last `tail` lines), or error message.
-
-        Examples:
-            run_command(command="pytest tests/ -x")
-            run_command(command="git diff HEAD~1", tail=100)
-            run_command(command="npm run build", timeout=300)
-            run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'")
         """
         try:
             sm.ensure_tab("default")
@@ -358,11 +352,6 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
-
-        Examples:
-            shell_execute(command="pytest tests/ -x")
-            shell_execute(command="npm run dev", name="dev", is_async=True)
-            shell_execute(command="C-c", name="dev", keys=True)
         """
         try:
             # Ensure tab exists (auto-create if needed)
@@ -440,11 +429,6 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Tab header + terminal output with line count metadata.
-
-        Examples:
-            shell_read()                             # tail of default tab
-            shell_read(name="build", lines=100)      # last 100 lines of build
-            shell_read(name="srv", offset=0, lines=50)  # first 50 lines
         """
         try:
             capped_lines = min(lines, max_read_lines)
