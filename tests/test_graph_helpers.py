@@ -2,7 +2,7 @@
 
 Tests _extract_rate_limit_delay, _extract_tool_use_failed,
 _build_tool_use_failed_feedback, _is_tool_error, _extract_markdown_content,
-_check_empty_response_streak.
+_check_empty_response_streak, _check_no_tool_call_streak.
 """
 
 from unittest.mock import MagicMock
@@ -14,6 +14,7 @@ from src.graph import (
     _is_tool_error,
     _extract_markdown_content,
     _check_empty_response_streak,
+    _check_no_tool_call_streak,
 )
 
 
@@ -337,3 +338,150 @@ class TestCheckEmptyResponseStreak:
         s, fail = _check_empty_response_streak(0, 0, s)
         assert s == 1
         assert fail is False
+
+
+# =============================================================================
+# _check_no_tool_call_streak
+# =============================================================================
+
+
+class TestCheckNoToolCallStreak:
+    """Tests for the parser-failure circuit-breaker helper.
+
+    Catches the case from job 3c30d72e where Gemma emitted malformed tool-call
+    syntax that vLLM's gemma4 parser left as content text. tool_calls=None,
+    same 21-token response repeating verbatim 1385× in a row.
+    """
+
+    LEAKED = '<|tool_call>call:todo_complete(todo_id="todo_1")<tool_call|>'
+
+    def test_tool_call_present_resets(self):
+        """Any tool call resets streak and clears the hash."""
+        new_streak, should_fail, new_hash = _check_no_tool_call_streak(
+            content_str=self.LEAKED,
+            tool_calls_count=1,
+            current_streak=2,
+            last_hash="prev",
+        )
+        assert new_streak == 0
+        assert should_fail is False
+        assert new_hash == ""
+
+    def test_empty_content_resets(self):
+        """Empty content does not advance this streak (the empty-response
+        guard handles that separately)."""
+        new_streak, should_fail, new_hash = _check_no_tool_call_streak(
+            content_str="",
+            tool_calls_count=0,
+            current_streak=2,
+            last_hash="prev",
+        )
+        assert new_streak == 0
+        assert should_fail is False
+        assert new_hash == ""
+
+    def test_first_no_tool_call_starts_at_one(self):
+        """First no-tool-call response starts streak at 1 with new hash."""
+        new_streak, should_fail, new_hash = _check_no_tool_call_streak(
+            content_str=self.LEAKED,
+            tool_calls_count=0,
+            current_streak=0,
+            last_hash="",
+        )
+        assert new_streak == 1
+        assert should_fail is False
+        assert new_hash != ""
+
+    def test_different_content_resets_to_one(self):
+        """Different content with no tool calls resets streak to 1, not 0 —
+        the response *is* a no-tool-call response, just not stuck-yet."""
+        # First: content A
+        s1, _, h1 = _check_no_tool_call_streak(
+            content_str="response A",
+            tool_calls_count=0,
+            current_streak=0,
+            last_hash="",
+        )
+        assert s1 == 1
+        # Second: different content B → resets streak, new hash
+        s2, fail2, h2 = _check_no_tool_call_streak(
+            content_str="response B",
+            tool_calls_count=0,
+            current_streak=s1,
+            last_hash=h1,
+        )
+        assert s2 == 1
+        assert fail2 is False
+        assert h2 != h1
+
+    def test_identical_content_increments(self):
+        """Same content twice → streak 2."""
+        s1, _, h1 = _check_no_tool_call_streak(self.LEAKED, 0, 0, "")
+        s2, fail2, h2 = _check_no_tool_call_streak(self.LEAKED, 0, s1, h1)
+        assert s2 == 2
+        assert fail2 is False
+        assert h2 == h1
+
+    def test_below_threshold_does_not_fail(self):
+        """At threshold (3 identical) → not yet failing (uses strict >)."""
+        s, h = 0, ""
+        for _ in range(3):
+            s, fail, h = _check_no_tool_call_streak(self.LEAKED, 0, s, h)
+            assert fail is False
+        assert s == 3
+
+    def test_above_threshold_fails(self):
+        """Crossing the threshold triggers a fail at iter 4."""
+        s, h = 0, ""
+        for i in range(4):
+            s, fail, h = _check_no_tool_call_streak(self.LEAKED, 0, s, h)
+            if i < 3:
+                assert fail is False
+            else:
+                assert fail is True
+                assert s == 4
+
+    def test_custom_threshold(self):
+        """Threshold parameter is honored."""
+        s1, fail1, h1 = _check_no_tool_call_streak(self.LEAKED, 0, 0, "", threshold=1)
+        assert s1 == 1
+        assert fail1 is False
+        s2, fail2, _ = _check_no_tool_call_streak(self.LEAKED, 0, s1, h1, threshold=1)
+        assert s2 == 2
+        assert fail2 is True
+
+    def test_recovery_via_tool_call_then_relapse(self):
+        """Tool call mid-streak resets; subsequent identical no-tool-calls
+        start fresh from 1."""
+        # Two leaked-text responses
+        s, h = 0, ""
+        s, _, h = _check_no_tool_call_streak(self.LEAKED, 0, s, h)
+        s, _, h = _check_no_tool_call_streak(self.LEAKED, 0, s, h)
+        assert s == 2
+        # Recovery: a tool call lands
+        s, _, h = _check_no_tool_call_streak(self.LEAKED, 1, s, h)
+        assert s == 0
+        assert h == ""
+        # Same leaked text returns — must start at 1, not resume from 2
+        s, fail, _ = _check_no_tool_call_streak(self.LEAKED, 0, s, h)
+        assert s == 1
+        assert fail is False
+
+    def test_varied_responses_never_fail(self):
+        """A model that produces *different* no-tool-call responses across
+        many iterations (legitimate reflections) never trips the detector."""
+        responses = [f"reflection turn {i}" for i in range(20)]
+        s, h = 0, ""
+        for r in responses:
+            s, fail, h = _check_no_tool_call_streak(r, 0, s, h)
+            assert fail is False
+            assert s == 1  # always reset to 1 because hash differs
+
+    def test_unicode_content_hashes_stably(self):
+        """Non-ASCII content (e.g. user task descriptions in German) hashes
+        and matches without errors."""
+        umlaut = "Küppelsmühle — über uns"
+        s1, _, h1 = _check_no_tool_call_streak(umlaut, 0, 0, "")
+        s2, _, h2 = _check_no_tool_call_streak(umlaut, 0, s1, h1)
+        assert s2 == 2
+        assert h1 == h2
