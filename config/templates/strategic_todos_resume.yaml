@@ -18,7 +18,7 @@ todos:
           deliverable, quality concern, or factual error.
 
       {% if has_tool("kb_write") -%}
-      Record feedback analysis using kb_write(type="state", tag="feedback-summary"):
+      Record feedback analysis using the kb_write tool (type=state, tag=feedback-summary):
       - Each categorized feedback item (one bullet per item)
       - Severity assessment (critical / important / minor) for each
       - Which output file(s) each item affects
@@ -91,7 +91,7 @@ todos:
     content: >-
       CREATE CORRECTIVE TODOS: Call next_phase_todos with the first corrective phase.
 
-      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
 
       Create todos that:
       {% if has_tool("kb_search") -%}

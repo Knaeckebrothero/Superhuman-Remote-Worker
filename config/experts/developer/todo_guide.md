@@ -62,7 +62,7 @@ Purpose: Understand the repository before delegating any code changes.
 Example todos:
 - "Read repo/README.md and repo/package.json (or requirements.txt) to understand project structure and dependencies"
 {% if has_tool("kb_write") -%}
-- "Use list_files on repo/src/ to map the directory structure. Record key paths using kb_write(type='learning', tag='repository')"
+- "Use list_files on repo/src/ to map the directory structure. Record key paths via the kb_write tool (type=learning, tag=repository)"
 {% else -%}
 - "Use list_files on repo/src/ to map the directory structure. Record key paths in notes/repository_notes.md"
 {% endif -%}
@@ -70,7 +70,7 @@ Example todos:
 - "Read repo/tests/ to understand the test framework, conventions, and coverage"
 - "Read repo/.github/workflows/ (or CI config) to understand the build/test pipeline"
 {% if has_tool("kb_write") -%}
-- "Record framework, conventions, test command, key entry points, branch strategy using kb_write(type='learning', tag='repository')"
+- "Record framework, conventions, test command, key entry points, branch strategy via the kb_write tool (type=learning, tag=repository)"
 {% else -%}
 - "Record framework, conventions, test command, key entry points, branch strategy in notes/repository_notes.md"
 {% endif -%}
@@ -100,7 +100,7 @@ Example todos:
 Purpose: Create clean, focused commits and PRs.
 
 Example todos:
-- "Review all changes via git_diff(revision='phase_N_start') — confirm scope matches the feature"
+- "Review all changes via the git_diff tool against the phase_N_start tag — confirm scope matches the feature"
 - "Delegate: Clean up any debug prints, commented-out code, or TODO markers. Run linter. Run full test suite"
 - "Delegate: Stage all changes, commit with message 'feat: add user CRUD endpoints with tests', push to origin feature/users"
 - "Verify via git_log: confirm commit is clean and push succeeded"

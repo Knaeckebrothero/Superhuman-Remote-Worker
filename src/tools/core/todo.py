@@ -107,10 +107,18 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             if not context._instruction_files and not context.was_recently_read(
                 "todo_guide.md"
             ):
-                return (
-                    "Error: You must read_file('todo_guide.md') before creating todos. "
-                    "The guide contains critical instructions on how to craft effective, "
-                    "focused todos. Read it first, then call next_phase_todos again."
+                from src.services.guardrails import format_nudge
+
+                model = (
+                    context._llm_config.model
+                    if context._llm_config is not None
+                    else None
+                )
+                return format_nudge(
+                    "read_file_required_error",
+                    model=model,
+                    file_path="todo_guide.md",
+                    tool_name="next_phase_todos",
                 )
 
             # Convert to list if it's a string (JSON)

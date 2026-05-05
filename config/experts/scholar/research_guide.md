@@ -13,32 +13,25 @@ You are entering a tactical phase. This guide covers research methodology for yo
 ## Tool Usage
 
 ### Web Research
-```
-web_search(query="specific technical question")
-extract_webpage(url="https://...")       # Get full content from a promising result
-research_topic(topic="...", depth="moderate")  # Automated multi-source research
-```
+- `web_search` — broad keyword/topic search; vary your queries
+- `extract_webpage` — fetch full content from a promising result
+- `research_topic` — automated multi-source research workflow
 
 ### Academic Sources
-```
-search_papers(query="...")               # Find academic papers
-download_paper(url="...", filename="...") # Save to documents/
-get_paper_info(identifier="...")         # Metadata lookup
-```
+- `search_papers` — find academic papers (arxiv or Semantic Scholar)
+- `download_paper` — save the paper PDF to `documents/`
+- `get_paper_info` — metadata lookup
 
 ### Document Analysis
-```
-read_file(path="documents/report.pdf")
-read_file(path="documents/report.pdf", page_start=1, page_end=5)
-get_document_info(path="documents/report.pdf")  # Metadata before reading
-```
+- `read_file` — read a document by path; supports text lines (offset/limit) and document pages (page_start/page_end)
+- `get_document_info` — page count and structure preview before opening a large document
 
 ### Citations
 Every factual or technical claim must cite its source:
-```
-cite_web(url="https://...", claim="Supporting statement from source")
-cite_document(file_path="documents/report.pdf", page_or_section="p. 12", claim="Key finding")
-```
+- `cite_web` — verify a quoted claim against a URL
+- `cite_document` — verify a quoted claim against a workspace document by page or section
+
+See each tool's description for the exact wire format and arguments.
 
 ## Output Conventions
 

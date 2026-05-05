@@ -17,17 +17,29 @@ ARG NODE_MAJOR=22
 # ---------------------------------------------------------------------------
 # 0. Apt tuning: switch to Azure mirror (faster from GHA Azure runners and
 #    far more reliable than archive.ubuntu.com's load balancer) and enable
-#    retries + pipelining. Same config as agent-vm-base/scripts/provision.sh.
+#    retries + pipelining. Same config as agent-vm-base/scripts/provision-stage1.sh.
 # ---------------------------------------------------------------------------
 RUN { sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null \
       || sed -i 's|http://archive\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security\.ubuntu\.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' /etc/apt/sources.list; } \
-    && printf 'Acquire::Retries "5";\nAcquire::Retries::Delay::Maximum "30";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::http::Pipeline-Depth "10";\nAcquire::Queue-Mode "access";\n' \
-        > /etc/apt/apt.conf.d/99-build-tuning
+    && printf 'Acquire::Retries "5";\nAcquire::Retries::Delay::Maximum "30";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::http::Pipeline-Depth "10";\nAcquire::Queue-Mode "access";\nAPT::Install-Recommends "false";\n' \
+        > /etc/apt/apt.conf.d/99-build-tuning \
+    && rm -f /etc/apt/apt.conf.d/docker-clean \
+    && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
 # ---------------------------------------------------------------------------
-# 1. System packages (mirrors agent-vm-base/scripts/provision.sh lines 28-68)
+# 1. System packages (mirrors agent-vm-base/scripts/provision-stage1.sh lines 28-68)
 # ---------------------------------------------------------------------------
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
+# Install eatmydata first (small, cached forever in practice), then use it to
+# wrap the big install — eatmydata noop's dpkg's fsync calls (~30-50% faster).
+# APT::Install-Recommends is disabled globally via /etc/apt/apt.conf.d/99-build-tuning.
+# BuildKit cache mounts hold /var/cache/apt + /var/lib/apt across RUNs in this
+# build (and across rebuilds when the layer is cache-busted but apt cache
+# survives), so no &&rm -rf cleanup is needed — the lists never live in the layer.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -y \
+    && apt-get install -y eatmydata \
+    && eatmydata apt-get install -y \
     openssh-server \
     tmux \
     git \
@@ -68,8 +80,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     python3 \
     python3-venv \
     python3-dev \
-    python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+    python3-pip
 
 # Ensure python points to python3
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
@@ -77,64 +88,66 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || t
 # ---------------------------------------------------------------------------
 # 1b. Datasource CLI clients (psql, mongosh, cypher-shell)
 #     Needed for read-write datasource mode — agent runs queries via shell.
-#     Mirrors agent-vm-base/scripts/provision.sh section 1b.
+#     Mirrors agent-vm-base/scripts/provision-stage1.sh section 1b.
 # ---------------------------------------------------------------------------
 
-# PostgreSQL client (psql) — available in default Ubuntu repos
-RUN apt-get update -y && apt-get install -y --no-install-recommends \
-    postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
-
-# MongoDB Shell (mongosh) — from MongoDB's official APT repo
-RUN curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
+# Datasource CLI clients (psql, mongosh, cypher-shell). Add MongoDB + Neo4j
+# repos first, then a single apt-get update + install for all three packages
+# (postgresql-client comes from Ubuntu's default repos so no custom source).
+# One update instead of three; mirrors agent-vm-base provision.sh.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
         | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
         > /etc/apt/sources.list.d/mongodb-org-8.0.list \
-    && apt-get update -y && apt-get install -y --no-install-recommends \
-        mongodb-mongosh \
-    && rm -rf /var/lib/apt/lists/*
-
-# Neo4j Cypher Shell — requires JRE, from Neo4j's official APT repo
-RUN curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key \
+    && curl -fsSL https://debian.neo4j.com/neotechnology.gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/neo4j-archive-keyring.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/neo4j-archive-keyring.gpg] https://debian.neo4j.com stable latest" \
         > /etc/apt/sources.list.d/neo4j.list \
-    && apt-get update -y && apt-get install -y --no-install-recommends \
+    && apt-get update -y \
+    && eatmydata apt-get install -y \
+        postgresql-client \
+        mongodb-mongosh \
         openjdk-17-jre-headless \
-        cypher-shell \
-    && rm -rf /var/lib/apt/lists/*
+        cypher-shell
 
 # ---------------------------------------------------------------------------
 # 2. Node.js 22 + global packages
 # ---------------------------------------------------------------------------
-RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/* \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/root/.npm \
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - \
+    && eatmydata apt-get install -y nodejs \
+    # Trimmed global npm — typescript + prettier only (commonly invoked).
+    # ts-node, @angular/cli, eslint, yarn had zero usage in src/ or config/;
+    # corepack provides yarn/pnpm shims on demand if a job actually needs them.
     && npm install -g \
         typescript \
-        ts-node \
-        @angular/cli \
-        eslint \
         prettier \
-        yarn
+    && corepack enable
 
 # ---------------------------------------------------------------------------
 # 2b. Chromium via Playwright (replaces apt chromium-browser, which on Ubuntu
-#     Noble is a snap shim — see docker/agent-vm-base/scripts/provision.sh).
+#     Noble is a snap shim — see docker/agent-vm-base/scripts/provision-stage1.sh).
 #     PLAYWRIGHT_VERSION must match .playwright-version (also consumed by
 #     provision.sh and requirements.txt). Path matches Dockerfile.agent:80.
 # ---------------------------------------------------------------------------
 ARG PLAYWRIGHT_VERSION
-RUN test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg required" && exit 1) \
-    && pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
-    && apt-get update -y && apt-get install -y --no-install-recommends fonts-noto-core \
-    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright playwright install --with-deps chromium \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    --mount=type=cache,target=/root/.cache/pip \
+    test -n "$PLAYWRIGHT_VERSION" || (echo "PLAYWRIGHT_VERSION build-arg required" && exit 1) \
+    && eatmydata pip install --break-system-packages "playwright==${PLAYWRIGHT_VERSION}" \
+    && apt-get update -y && eatmydata apt-get install -y fonts-noto-core \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/playwright eatmydata playwright install --with-deps chromium \
     # Layout varies by version: older revs use chrome-linux/, newer (>=1.49) use
     # chrome-linux64/. Match both; exclude the headless-shell directory.
     && CHROMIUM_BIN=$(find /opt/playwright -maxdepth 4 -type f \( -path '*/chrome-linux/chrome' -o -path '*/chrome-linux64/chrome' \) ! -path '*headless_shell*' | head -1) \
     && test -n "$CHROMIUM_BIN" || (echo "chromium binary not found under /opt/playwright" && find /opt/playwright -maxdepth 4 -type d && exit 1) \
     && ln -sf "$CHROMIUM_BIN" /usr/local/bin/agent-chromium \
-    && rm -rf /var/lib/apt/lists/* /root/.cache/ms-playwright
+    && rm -rf /root/.cache/ms-playwright
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 # ---------------------------------------------------------------------------

@@ -47,9 +47,9 @@ Before marking any phase as successful, verify output substance:
 # Knowledge Maintenance
 
 1. Search before creating. Call kb_search first. If a match exists, use kb_update instead of kb_write.
-2. Record decisions: DECISION, RATIONALE, ALTERNATIVES. Use kb_write(type="decision").
-3. Record facts using kb_write(type="learning").
-4. Record failed approaches with root cause using kb_write(type="learning", tag="failed-approach").
+2. Record decisions: DECISION, RATIONALE, ALTERNATIVES. Use kb_write tool (type=decision).
+3. Record facts using kb_write tool (type=learning).
+4. Record failed approaches with root cause using kb_write tool (type=learning, tag=failed-approach).
 5. Prefer UPDATE over CREATE.
 
 {% if has_tool("delegate_work") -%}

@@ -87,6 +87,7 @@ from .core.state import UniversalAgentState
 from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
+from .services.guardrails import format_nudge
 from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -768,7 +769,9 @@ def create_execute_node(
                 if memories:
                     from src.services.recall_store import RecallStore as _RS
 
-                    _memory_block[0] = _RS.assemble_memory_block(memories)
+                    _memory_block[0] = _RS.assemble_memory_block(
+                        memories, model=config.llm.model
+                    )
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
                     )
@@ -827,7 +830,9 @@ def create_execute_node(
                     match_count=5,
                 )
                 if kb_notes:
-                    _knowledge_block[0] = _KS.assemble_knowledge_block(kb_notes)
+                    _knowledge_block[0] = _KS.assemble_knowledge_block(
+                        kb_notes, model=config.llm.model
+                    )
                     logger.debug(
                         f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
                     )
@@ -1191,20 +1196,16 @@ def create_execute_node(
                             )
 
                             ai_summary = AIMessage(
-                                content=(
-                                    "My previous response was degenerate — it contained repetitive or "
-                                    "malformed output that cannot be used. Detected patterns: "
-                                    f"{', '.join(pattern_names)}. I need to retry with a shorter, "
-                                    "more focused response."
+                                content=format_nudge(
+                                    "degenerate_recovery_assistant",
+                                    model=config.llm.model,
                                 )
                             )
                             human_feedback = HumanMessage(
-                                content=(
-                                    "Your last response was detected as degenerate and has been discarded. "
-                                    f"Issues found: {pattern_details}\n\n"
-                                    "Please retry your action. Keep your response concise and focused. "
-                                    "If you were trying to call a tool, make the call with smaller arguments. "
-                                    "Do NOT repeat the same output."
+                                content=format_nudge(
+                                    "degenerate_recovery_user",
+                                    model=config.llm.model,
+                                    pattern_detail=pattern_details,
                                 )
                             )
 
@@ -1370,13 +1371,16 @@ def create_execute_node(
                         )
                         injected_reminder = HumanMessage(
                             content=(
-                                f"Action required: complete the current todo `{first.id}` now by invoking the `todo_complete` tool.\n\n"
+                                format_nudge(
+                                    "todo_action",
+                                    model=config.llm.model,
+                                    todo_id=first.id,
+                                )
+                                + "\n\n"
                                 "If you already finished the work for this todo, that's perfectly fine — "
                                 "invoke `todo_complete` now to record it. You don't need to redo anything.\n\n"
                                 f"Pending todos ({len(remaining)}):\n"
-                                f"{todo_lines}\n\n"
-                                "Use the tool-call format defined in your system prompt — do not type the call as plain text. "
-                                "Your next action must be a tool call, not natural language."
+                                f"{todo_lines}"
                             )
                         )
 
@@ -2937,17 +2941,11 @@ def create_audited_tool_node(
                 _reflection_injected[0] = False
 
                 rewind_msg = SystemMessage(
-                    content=(
-                        f"PHASE BUDGET REACHED: "
-                        f"{calls_used}/{_HARD_CAP} tool calls "
-                        "consumed without completing this phase's objectives. "
-                        "Current todos have been archived.\n\n"
-                        "Before creating new todos:\n"
-                        "1. Review what worked and what didn't in this phase\n"
-                        "2. Update plan.md if the approach needs to change\n"
-                        "3. Create smaller, more focused todos with "
-                        "next_phase_todos()\n\n"
-                        "Do not repeat the same sequence of actions."
+                    content=format_nudge(
+                        "budget_rewind",
+                        model=config.llm.model,
+                        used=calls_used,
+                        cap=_HARD_CAP,
                     )
                 )
                 # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
@@ -3016,11 +3014,10 @@ def create_audited_tool_node(
                 ):
                     msg.content = (
                         (msg.content or "")
-                        + "\n\n[LOOP WARNING] You have called this tool with the "
-                        "same arguments multiple times. You may be stuck in a "
-                        "loop. Consider a different approach: try different "
-                        "arguments, use a different tool, or mark the current "
-                        "todo as blocked and move on."
+                        + "\n\n"
+                        + format_nudge(
+                            "loop_warning_suffix", model=config.llm.model
+                        )
                     )
 
         # Check for workspace unavailable errors (VM connection lost).
@@ -3045,10 +3042,8 @@ def create_audited_tool_node(
                     and msg.content
                     and TOOL_NOT_FOUND_PATTERN in msg.content
                 ):
-                    msg.content += (
-                        "\n\nIf your current todo requires this tool, mark it "
-                        "as blocked using todo_complete with a note explaining "
-                        "which tool is needed, and proceed with the next todo."
+                    msg.content += "\n\n" + format_nudge(
+                        "tool_not_found_suffix", model=config.llm.model
                     )
 
         # Track category failures for logging

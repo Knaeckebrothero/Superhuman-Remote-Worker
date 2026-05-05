@@ -52,7 +52,7 @@ Every todo must be specific enough that you know *exactly* when it's done.
 Before finalizing each todo, ask: "What artifact does this produce?"
 - "Research error handling" → No artifact named. Too vague.
 {% if has_tool("kb_write") -%}
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end using kb_write(type='learning', tag='dead-end')" → Clear artifact. Specific.
+- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end via the kb_write tool (type=learning, tag=dead-end)" → Clear artifact. Specific.
 {% else -%}
 - "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
 {% endif -%}
@@ -72,7 +72,7 @@ Example todos:
 - "Extract full content from [specific URL found in prior search] — summarize key techniques"
 - "Write idea artifacts for any actionable findings from web research"
 {% if has_tool("kb_write") -%}
-- "Record sources discovered using kb_write(type='source') and dead ends using kb_write(type='learning', tag='dead-end')"
+- "Record sources discovered via the kb_write tool (type=source) and dead ends via the kb_write tool (type=learning, tag=dead-end)"
 {% else -%}
 - "Record sources discovered to notes/research_log.md and dead ends to notes/dead_ends.md"
 {% endif -%}
@@ -85,7 +85,7 @@ Example todos:
 - "Map directory structure of src/tools/ — read each __init__.py to understand tool categories"
 - "Search for 'except Exception' across src/ — catalog overly broad exception handling"
 - "Read src/core/context.py and src/core/workspace_injection.py — look for optimization opportunities"
-- "Use git_log(max_count=30) to identify most frequently changed files — check for code churn patterns"
+- "Use the git_log tool (max_count=30) to identify most frequently changed files — check for code churn patterns"
 - "Run shell: ruff check src/ 2>&1 | head -50 — catalog lint issues by category"
 - "Write idea artifacts for each finding with specific file:line references"
 
@@ -153,12 +153,12 @@ Example todos:
 - "Cross-reference ideas in output/ideas/ against task description — identify coverage gaps"
 - "Check for related ideas that could be combined into a single stronger proposal"
 {% if has_tool("kb_write") -%}
-- "Record final coverage assessment using kb_write(type='state', tag='coverage')"
+- "Record final coverage assessment via the kb_write tool (type=state, tag=coverage)"
 {% else -%}
 - "Record final coverage assessment to notes/coverage.md"
 {% endif -%}
 {% if has_tool("kb_write") -%}
-- "Self-assess: list aspects of the task not yet explored, record as open questions using kb_write(type='question')"
+- "Self-assess: list aspects of the task not yet explored, record as open questions via the kb_write tool (type=question)"
 {% else -%}
 - "Self-assess: list aspects of the task not yet explored, record as open questions to notes/open_questions.md"
 {% endif -%}

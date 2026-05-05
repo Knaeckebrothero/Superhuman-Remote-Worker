@@ -47,8 +47,8 @@ todos:
       - Gaps: patterns the new feature needs that don't exist yet
 
       Record as knowledge notes:
-      - Component inventory → kb_write(type="learning", tag="component-inventory")
-      - Design patterns observed → kb_write(type="learning", tag="design-patterns")
+      - Component inventory → kb_write tool (type=learning, tag=component-inventory)
+      - Design patterns observed → kb_write tool (type=learning, tag=design-patterns)
 
       COMPLETION CRITERIA: reference/pattern_audit.md exists with component inventory,
       patterns observed, and gaps identified. Knowledge notes created.
@@ -113,7 +113,7 @@ todos:
     content: >-
       CREATE first phase mockup todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST read_file('design_guide.md') BEFORE calling next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `design_guide.md` BEFORE calling next_phase_todos.
       This file contains the design system tokens and component patterns you MUST use
       in every mockup.
 

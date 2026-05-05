@@ -127,6 +127,105 @@ tool_examples:
         move_file(source="todos.yaml", dest="archive/todos_phase_1.yaml")    # move to subdir
         move_file(source="draft.md", dest="final.md")                        # rename in place
 
+  read_file: |-
+    Examples:
+        read_file(path="documents/report.pdf")                                  # whole document, default limits
+        read_file(path="documents/report.pdf", page_start=1, page_end=5)        # specific pages
+        read_file(path="output/notes.md", offset=500, limit=100)                # text lines 500-599
+
+  write_file: |-
+    Examples:
+        write_file(path="output/summary.md", content="# Summary\n\n...")
+        write_file(path="notes/observations.md", content="...")
+
+  get_document_info: |-
+    Examples:
+        get_document_info(path="documents/report.pdf")                          # page count + structure preview
+
+  # ----- src/tools/knowledge/knowledge_tools.py -----
+  kb_write: |-
+    Examples:
+        kb_write(
+            title="Chose JWT over OAuth",
+            type="decision",
+            content="...",
+            tags=["authentication", "security"],
+        )
+        kb_write(
+            title="API rate limit experiment",
+            type="learning",
+            content="...",
+            tags=["api", "rate-limits"],
+        )
+
+  kb_search: |-
+    Examples:
+        kb_search(query="how do we authenticate API requests")
+        kb_search(query="prior decisions about rate limiting", max_results=20)
+
+  kb_read: |-
+    Examples:
+        kb_read(note="chose-jwt-over-oauth")          # by slug
+        kb_read(note="api-rate-limit-experiment")
+
+  kb_update: |-
+    Examples:
+        kb_update(note="chose-jwt-over-oauth", append="Update: also adopted refresh-token rotation.")
+        kb_update(note="api-rate-limit-experiment", status="resolved", confidence="high")
+
+  # ----- src/tools/citation/sources.py -----
+  cite_web: |-
+    Examples:
+        cite_web(
+            text="LLMs hallucinate at higher rates on out-of-distribution prompts.",
+            url="https://example.com/llm-hallucinations",
+            claim="Out-of-distribution prompts increase hallucination risk.",
+        )
+
+  cite_document: |-
+    Examples:
+        cite_document(
+            text="Total revenue rose 12% YoY.",
+            document_path="documents/q3_report.pdf",
+            page=12,
+            claim="Q3 revenue grew 12% year-over-year.",
+        )
+
+  # ----- src/tools/delegation/delegate_work.py -----
+  delegate_work: |-
+    Examples:
+        delegate_work(
+            tasks=[
+                {"description": "Research arxiv for transformer scaling laws", "expert": "scholar"},
+                {"description": "Implement the rate limiter prototype", "expert": "developer"},
+            ],
+            context="We need both literature review and a working prototype before phase 3.",
+        )
+
+  # ----- src/tools/research/web.py -----
+  web_search: |-
+    Examples:
+        web_search(query="vLLM gemma4 tool-call parser regex")
+        web_search(query="recent layoffs in semiconductor industry", topic="news", time_range="month")
+        web_search(query="OpenAI revenue 2026", topic="finance", search_depth="advanced")
+
+  extract_webpage: |-
+    Examples:
+        extract_webpage(urls="https://docs.vllm.ai/en/latest/models/supported_models.html")
+        extract_webpage(urls="https://example.com/a, https://example.com/b", query="rate limiting strategies")
+
+  # ----- src/tools/research/papers.py -----
+  search_papers: |-
+    Examples:
+        search_papers(query="speculative decoding")                      # arxiv default
+        search_papers(query="retrieval augmented generation", source="semantic_scholar", max_results=20)
+
+  download_paper: |-
+    Examples:
+        download_paper(identifier="2408.08921")                          # arXiv ID
+        download_paper(identifier="10.1038/nature12373")                 # DOI
+        download_paper(identifier="https://arxiv.org/pdf/2408.08921")    # URL
+
 
 nudges:
 
@@ -161,22 +260,19 @@ nudges:
     [LOOP WARNING] You have called this tool with the same arguments multiple times. You may be stuck in a loop.
     Consider a different approach: try different arguments, use a different tool, or mark the current todo as blocked and move on.
 
-  # Sites: src/graph.py:3048-3051 (tool-not-found recovery suffix)
-  # Placeholders: {tool_name}
+  # Sites: src/graph.py tool-not-found recovery suffix
   tool_not_found_suffix: |-
-    If your current todo requires {tool_name}, mark it as blocked using the `todo_complete` tool with a note explaining which tool is needed, and proceed with the next todo.
+    If your current todo requires this tool, mark it as blocked using the `todo_complete` tool with a note explaining which tool is needed, and proceed with the next todo.
 
-  # Sites: src/core/phase.py:1140-1145
+  # Sites: src/core/phase.py on_strategic_phase_complete()
   # Placeholders: {phase_number}, {phase_name}, {todo_count}
   phase_transition_strategic_to_tactical: |-
-    [PHASE_TRANSITION] Strategic phase complete. Entering tactical phase {phase_number}: {phase_name} ({todo_count} todos).
-    Work through the todos using your tools.
+    [PHASE_TRANSITION] Strategic phase complete. Entering tactical phase {phase_number}: {phase_name} ({todo_count} todos). Work through the todos using your tools.
 
-  # Sites: src/core/phase.py:1230-1236
+  # Sites: src/core/phase.py on_tactical_phase_complete()
   # Placeholders: {phase_number}
   phase_transition_tactical_to_strategic: |-
-    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}.
-    Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
+    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
 
   # ----- src/managers/todo.py -----
 
@@ -189,13 +285,14 @@ nudges:
 
   memory_block_header_pinned: "--- Pinned Memories (TTL-active) ---"
   memory_block_header_retrieved: "--- Retrieved Memories (relevance-ranked) ---"
-  # Placeholders: {count}, {tokens}
-  memory_block_footer: "--- End Memories ({count} items, ~{tokens} tokens) ---"
+  # Placeholders: {count} (full summary string e.g. "2 items: 0 pinned + 2 retrieved"),
+  # {tokens} (already-formatted, e.g. "150")
+  memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
 
   # ----- src/services/knowledge_store.py -----
 
   knowledge_block_header: "--- Project Knowledge ---"
-  # Placeholders: {count}, {tokens}
+  # Placeholders: {count} (number of notes), {tokens} (already-formatted)
   knowledge_block_footer: "--- End Knowledge ({count} notes, ~{tokens} tokens) ---"
 
   # ----- src/persistent_graph.py -----

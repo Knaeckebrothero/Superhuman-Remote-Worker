@@ -628,10 +628,18 @@ def apply_instruction_enforcement(
             def wrapper(*args, **kwargs):
                 for file_path in files:
                     if not context.was_recently_read(file_path):
-                        return (
-                            f"Error: You must read_file('{file_path}') before using "
-                            f"{name}. It contains critical instructions for this "
-                            f"operation. Read it first, then call {name} again."
+                        from src.services.guardrails import format_nudge
+
+                        model = (
+                            context._llm_config.model
+                            if context._llm_config is not None
+                            else None
+                        )
+                        return format_nudge(
+                            "read_file_required_error",
+                            model=model,
+                            file_path=file_path,
+                            tool_name=name,
                         )
                 return orig(*args, **kwargs)
 

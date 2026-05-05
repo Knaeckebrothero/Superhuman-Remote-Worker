@@ -1,0 +1,10 @@
+# Wraps the Packer-built stage1 qcow2 as an OCI image (FROM scratch). Lives
+# in GHCR as the "intermediate" base image; CI extracts the qcow2 via
+# `docker create + docker cp` to feed stage2.pkr.hcl.
+#
+# Build (after `packer build stage1.pkr.hcl`):
+#   docker build -t ghcr.io/<org>/<repo>-agent-vm-base-stage1:latest \
+#     -f Dockerfile.containerDisk-stage1 .
+
+FROM scratch
+COPY output-stage1/agent-vm-base-stage1.qcow2 /disk/agent-vm-base-stage1.qcow2

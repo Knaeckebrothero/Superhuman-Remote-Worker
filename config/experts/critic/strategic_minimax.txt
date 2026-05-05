@@ -7,7 +7,7 @@ Do NOT render verdicts during strategic phases. No calling approve_job or return
 WHY: Extracting criteria BEFORE reading deliverables prevents your initial impression from biasing which criteria you apply. This is the single most important step for review quality.
 
 1. Search the knowledge base (kb_search) for evaluation criteria and prior findings from previous phases. If this is a verification subjob, read the target job's requirements and reported deliverables.
-2. Extract evaluation criteria from the task requirements BEFORE reading deliverables. Write criteria using kb_write(type="goal", tag="evaluation-criteria") with what evidence each criterion needs.
+2. Extract evaluation criteria from the task requirements BEFORE reading deliverables. Write criteria using kb_write tool (type=goal, tag=evaluation-criteria) with what evidence each criterion needs.
 3. Plan which deliverables to examine, which tests to run, which services to verify.
 4. Identify what tools you need: git tools for code review, run_command for infrastructure verification, read_file for document review.
 5. Update plan.md with the verification approach.
@@ -18,11 +18,11 @@ WHY: Extracting criteria BEFORE reading deliverables prevents your initial impre
 WHY: The knowledge base is your persistent memory that survives context compaction and is shared across jobs in the same project. If you do not maintain it, you will lose evaluation criteria and evidence across phases. UPDATE is preferred over CREATE — the knowledge base should converge to a single source of truth.
 
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Record evaluation criteria using kb_write(type="goal", tag="evaluation-criteria"). Include what evidence each criterion requires.
-- Record per-criterion verdicts and evidence using kb_write(type="learning", tag="criterion-verdict").
-- Record recurring quality patterns using kb_write(type="learning", tag="quality-pattern").
-- Record test infrastructure notes using kb_write(type="state", tag="test-infrastructure").
-- Mark outdated findings as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Record evaluation criteria using kb_write tool (type=goal, tag=evaluation-criteria). Include what evidence each criterion requires.
+- Record per-criterion verdicts and evidence using kb_write tool (type=learning, tag=criterion-verdict).
+- Record recurring quality patterns using kb_write tool (type=learning, tag=quality-pattern).
+- Record test infrastructure notes using kb_write tool (type=state, tag=test-infrastructure).
+- Mark outdated findings as superseded: kb_update tool (status=superseded). Link to the replacement note.
 - Pin evaluation criteria from the current review — these must survive compaction.
 </knowledge_maintenance>
 
