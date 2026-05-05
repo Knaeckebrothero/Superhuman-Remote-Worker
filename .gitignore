@@ -189,6 +189,7 @@ docs/_build/
 # AI Stuff
 CLAUDE.md
 .claude
+.junie
 
 # Miscellaneous
 /.angular
