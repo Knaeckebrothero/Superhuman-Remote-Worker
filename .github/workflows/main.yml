@@ -7,7 +7,11 @@ name: main
 # with :sha, :latest, and :vX.Y.Z tags, the Helm chart is published to
 # OCI under its real name (superhuman-remote-worker), and a git tag is pushed.
 #
-# PRs to main run lint + tests only (no builds).
+# PRs to main run the full pipeline INCLUDING image builds, but skip the
+# registry push (no login, no version tagging, no chart release). This
+# catches Dockerfile / Packer breakages before they reach main and block
+# the release process. Trade-off: PR feedback is slower, but a broken
+# build post-merge is far more expensive than waiting for the build pre-merge.
 
 on:
   push:
@@ -236,15 +240,22 @@ jobs:
           echo "Last tag: $LAST -> next: v$NEW"
 
   # ---------------------------------------------------------------------------
-  # Image builds — always build everything on main
+  # Image builds — run on main pushes AND on PRs to main.
+  # On push: build + push (sha + latest + version tags), full release flow.
+  # On PR: build only — no docker login, no version tag, no registry push.
+  # The Packer / Dockerfile invocations themselves still execute, which is
+  # the whole point: we catch broken builds before merge instead of after.
   # All require lint + dep-audit + tests to pass.
   # ---------------------------------------------------------------------------
   build-agent:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -261,6 +272,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -272,16 +284,16 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
       - id: short_sha
         run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - name: Build and push
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.agent
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -294,8 +306,11 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -309,6 +324,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -320,14 +336,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
-      - name: Build and push
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.orchestrator
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -338,8 +354,11 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -353,6 +372,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -364,14 +384,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
-      - name: Build and push
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.cockpit
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -382,8 +402,11 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -397,6 +420,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -408,14 +432,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
-      - name: Build and push
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.mcp
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -426,10 +450,13 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -441,6 +468,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -452,19 +480,19 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-workspace
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
       - name: Read Playwright version
         id: pw
         run: echo "version=$(tr -d '[:space:]' < .playwright-version)" >> "$GITHUB_OUTPUT"
-      - name: Build and push
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./docker/Dockerfile.workspace
           build-args: |
             PLAYWRIGHT_VERSION=${{ steps.pw.outputs.version }}
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
@@ -475,8 +503,11 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -513,10 +544,14 @@ jobs:
     needs: [lint, dependency-audit, test-python, test-cockpit, build-sudo-gate, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.build-sudo-gate.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
       packages: write
@@ -596,27 +631,40 @@ jobs:
           echo "::error::Packer build failed after 2 attempts"
           exit 1
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push containerDisk image
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }} containerDisk image
         working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
-          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:${{ needs.resolve-version.outputs.tag }}")
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR validation: build with a single throwaway tag, no push.
+            TAGS=("${IMAGE}:pr-validate-${GITHUB_SHA::7}")
+          else
+            TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:${{ needs.resolve-version.outputs.tag }}")
+          fi
           BUILD_ARGS=()
           for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
           docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk .
-          for T in "${TAGS[@]}"; do docker push "$T"; done
-          printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            for T in "${TAGS[@]}"; do docker push "$T"; done
+            printf 'Pushed:\n'; printf '  %s\n' "${TAGS[@]}"
+          else
+            printf 'Built (PR validation, not pushed):\n'; printf '  %s\n' "${TAGS[@]}"
+          fi
 
   build-vm-controller:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
     if: >-
       always() && !cancelled() &&
-      github.event_name != 'pull_request' &&
-      needs.resolve-version.result == 'success'
+      needs.lint.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      (needs.resolve-version.result == 'success' || needs.resolve-version.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -630,6 +678,7 @@ jobs:
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -641,14 +690,14 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller
           tags: |
             type=sha,format=short,prefix=sha-
-            type=raw,value=latest
-            type=raw,value=${{ needs.resolve-version.outputs.tag }}
-      - name: Build and push
+            type=raw,value=latest,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=${{ needs.resolve-version.outputs.tag }},enable=${{ github.event_name != 'pull_request' }}
+      - name: Build${{ github.event_name == 'pull_request' && ' (PR validation, no push)' || ' and push' }}
         uses: docker/build-push-action@v5
         with:
           context: ./vm/controller
           file: ./vm/controller/Dockerfile
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false

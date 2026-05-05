@@ -601,7 +601,7 @@ jobs:
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
       packages: write
@@ -693,7 +693,7 @@ jobs:
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
       packages: write
