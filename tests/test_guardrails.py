@@ -60,8 +60,10 @@ class TestResolveGuardrails:
     def test_gpt_oss_inherits_most_from_default(self):
         g = resolve_guardrails("openai/gpt-oss-120b")
         # gpt_oss.yaml only overrides next_phase_todos
-        assert "harmony" in g["tool_examples"]["next_phase_todos"].lower() or \
-               "commentary" in g["tool_examples"]["next_phase_todos"].lower()
+        assert (
+            "harmony" in g["tool_examples"]["next_phase_todos"].lower()
+            or "commentary" in g["tool_examples"]["next_phase_todos"].lower()
+        )
         # Other tools come from default
         assert "git_log()" in g["tool_examples"]["git_log"]
 
@@ -175,17 +177,13 @@ class TestApplyGuardrailsToTools:
         guardrails = _fake_guardrails(
             examples={"_fake_git_log": "Examples:\n    BRACE_FORM_PLACEHOLDER"}
         )
-        out = apply_guardrails_to_tools(
-            [_fake_git_log], guardrails=guardrails
-        )
+        out = apply_guardrails_to_tools([_fake_git_log], guardrails=guardrails)
         assert "BRACE_FORM_PLACEHOLDER" in out[0].description
         assert "git_log()" not in out[0].description
 
     def test_leaves_unknown_tool_untouched(self):
         guardrails = _fake_guardrails(examples={"_fake_git_log": "X"})
-        out = apply_guardrails_to_tools(
-            [_fake_unknown], guardrails=guardrails
-        )
+        out = apply_guardrails_to_tools([_fake_unknown], guardrails=guardrails)
         # Same description (object equality not required, but content is)
         assert out[0].description == _fake_unknown.description
 
@@ -222,9 +220,7 @@ class TestFormatNudge:
         assert "todo_3" in out
 
     def test_gemma_overrides_todo_action(self):
-        out = format_nudge(
-            "todo_action", model="google/gemma-4-31b", todo_id="todo_3"
-        )
+        out = format_nudge("todo_action", model="google/gemma-4-31b", todo_id="todo_3")
         assert "Gemma" in out
         assert "{todo_id}" not in out  # placeholder must be substituted
 
@@ -234,9 +230,7 @@ class TestFormatNudge:
 
     def test_unexpected_placeholder_raises(self):
         with pytest.raises(GuardrailFormatError, match="unexpected placeholders"):
-            format_nudge(
-                "todo_action", model="gpt-4o", todo_id="x", surprise="y"
-            )
+            format_nudge("todo_action", model="gpt-4o", todo_id="x", surprise="y")
 
     def test_missing_placeholder_raises_keyerror(self):
         with pytest.raises(KeyError):

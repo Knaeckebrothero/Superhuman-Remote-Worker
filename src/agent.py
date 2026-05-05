@@ -1249,9 +1249,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(
-                    workspace=self._workspace_manager,
-                    model_name=self.config.llm.model,
-                )
+                workspace=self._workspace_manager,
+                model_name=self.config.llm.model,
+            )
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}
@@ -1587,9 +1587,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(
-                    workspace=self._workspace_manager,
-                    model_name=self.config.llm.model,
-                )
+            workspace=self._workspace_manager,
+            model_name=self.config.llm.model,
+        )
 
         # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
         # are deployed in _deploy_instruction_files() after tools are loaded, so that

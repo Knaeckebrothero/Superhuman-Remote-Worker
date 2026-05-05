@@ -565,11 +565,7 @@ class ToolContext:
             if not self.was_recently_read(file_path):
                 from src.services.guardrails import format_nudge
 
-                model = (
-                    self._llm_config.model
-                    if self._llm_config is not None
-                    else None
-                )
+                model = self._llm_config.model if self._llm_config is not None else None
                 return format_nudge(
                     "read_file_required_error",
                     model=model,
