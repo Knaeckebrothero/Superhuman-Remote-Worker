@@ -303,10 +303,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-agent:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
           build-args: |
             BUILD_SHA=${{ steps.short_sha.outputs.sha }}
 
@@ -355,10 +353,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-orchestrator:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-cockpit:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
@@ -405,10 +401,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-cockpit:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-mcp:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
@@ -455,10 +449,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-mcp:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-workspace:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
@@ -510,10 +502,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-workspace:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   build-sudo-gate:
     needs: [lint, dependency-audit, test-python, test-cockpit, resolve-version]
@@ -818,10 +808,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-${{ replace(github.ref_name, '/', '-') }}
-            type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-main
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-${{ replace(github.ref_name, '/', '-') }},mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.REPO_LOWER }}-vm-controller:buildcache-main,mode=max,image-manifest=true,oci-mediatypes=true,compression=zstd,ignore-error=true
 
   # ---------------------------------------------------------------------------
   # Package and publish Helm chart at the auto-bumped version.
