@@ -116,6 +116,80 @@ tool_examples:
         <|tool_call>call:move_file{source:<|"|>todos.yaml<|"|>,dest:<|"|>archive/todos_phase_1.yaml<|"|>}<tool_call|>     # move to subdir
         <|tool_call>call:move_file{source:<|"|>draft.md<|"|>,dest:<|"|>final.md<|"|>}<tool_call|>                        # rename in place
 
+  read_file: |-
+    Examples:
+        <|tool_call>call:read_file{path:<|"|>documents/report.pdf<|"|>}<tool_call|>                                                  # whole document
+        <|tool_call>call:read_file{path:<|"|>documents/report.pdf<|"|>,page_start:1,page_end:5}<tool_call|>                          # specific pages
+        <|tool_call>call:read_file{path:<|"|>output/notes.md<|"|>,offset:500,limit:100}<tool_call|>                                  # text lines 500-599
+
+  write_file: |-
+    Examples:
+        <|tool_call>call:write_file{path:<|"|>output/summary.md<|"|>,content:<|"|># Summary\n\n...<|"|>}<tool_call|>
+        <|tool_call>call:write_file{path:<|"|>notes/observations.md<|"|>,content:<|"|>...<|"|>}<tool_call|>
+
+  get_document_info: |-
+    Examples:
+        <|tool_call>call:get_document_info{path:<|"|>documents/report.pdf<|"|>}<tool_call|>                                          # page count + structure preview
+
+  # ----- src/tools/knowledge/knowledge_tools.py -----
+  kb_write: |-
+    Examples:
+        <|tool_call>call:kb_write{title:<|"|>Chose JWT over OAuth<|"|>,type:<|"|>decision<|"|>,content:<|"|>...<|"|>,tags:[<|"|>authentication<|"|>,<|"|>security<|"|>]}<tool_call|>
+        <|tool_call>call:kb_write{title:<|"|>API rate limit experiment<|"|>,type:<|"|>learning<|"|>,content:<|"|>...<|"|>,tags:[<|"|>api<|"|>,<|"|>rate-limits<|"|>]}<tool_call|>
+
+  kb_search: |-
+    Examples:
+        <|tool_call>call:kb_search{query:<|"|>how do we authenticate API requests<|"|>}<tool_call|>
+        <|tool_call>call:kb_search{query:<|"|>prior decisions about rate limiting<|"|>,max_results:20}<tool_call|>
+
+  kb_read: |-
+    Examples:
+        <|tool_call>call:kb_read{note:<|"|>chose-jwt-over-oauth<|"|>}<tool_call|>                  # by slug
+        <|tool_call>call:kb_read{note:<|"|>api-rate-limit-experiment<|"|>}<tool_call|>
+
+  kb_update: |-
+    Examples:
+        <|tool_call>call:kb_update{note:<|"|>chose-jwt-over-oauth<|"|>,append:<|"|>Update: also adopted refresh-token rotation.<|"|>}<tool_call|>
+        <|tool_call>call:kb_update{note:<|"|>api-rate-limit-experiment<|"|>,status:<|"|>resolved<|"|>,confidence:<|"|>high<|"|>}<tool_call|>
+
+  # ----- src/tools/citation/sources.py -----
+  cite_web: |-
+    Examples:
+        <|tool_call>call:cite_web{text:<|"|>LLMs hallucinate at higher rates on out-of-distribution prompts.<|"|>,url:<|"|>https://example.com/llm-hallucinations<|"|>,claim:<|"|>Out-of-distribution prompts increase hallucination risk.<|"|>}<tool_call|>
+
+  cite_document: |-
+    Examples:
+        <|tool_call>call:cite_document{text:<|"|>Total revenue rose 12% YoY.<|"|>,document_path:<|"|>documents/q3_report.pdf<|"|>,page:12,claim:<|"|>Q3 revenue grew 12% year-over-year.<|"|>}<tool_call|>
+
+  # ----- src/tools/delegation/delegate_work.py -----
+  delegate_work: |-
+    Examples:
+        <|tool_call>call:delegate_work{tasks:[{description:<|"|>Research arxiv for transformer scaling laws<|"|>,expert:<|"|>scholar<|"|>},{description:<|"|>Implement the rate limiter prototype<|"|>,expert:<|"|>developer<|"|>}],context:<|"|>We need both literature review and a working prototype before phase 3.<|"|>}<tool_call|>
+
+  # ----- src/tools/research/web.py -----
+  web_search: |-
+    Examples:
+        <|tool_call>call:web_search{query:<|"|>vLLM gemma4 tool-call parser regex<|"|>}<tool_call|>
+        <|tool_call>call:web_search{query:<|"|>recent layoffs in semiconductor industry<|"|>,topic:<|"|>news<|"|>,time_range:<|"|>month<|"|>}<tool_call|>
+        <|tool_call>call:web_search{query:<|"|>OpenAI revenue 2026<|"|>,topic:<|"|>finance<|"|>,search_depth:<|"|>advanced<|"|>}<tool_call|>
+
+  extract_webpage: |-
+    Examples:
+        <|tool_call>call:extract_webpage{urls:<|"|>https://docs.vllm.ai/en/latest/models/supported_models.html<|"|>}<tool_call|>
+        <|tool_call>call:extract_webpage{urls:<|"|>https://example.com/a, https://example.com/b<|"|>,query:<|"|>rate limiting strategies<|"|>}<tool_call|>
+
+  # ----- src/tools/research/papers.py -----
+  search_papers: |-
+    Examples:
+        <|tool_call>call:search_papers{query:<|"|>speculative decoding<|"|>}<tool_call|>                      # arxiv default
+        <|tool_call>call:search_papers{query:<|"|>retrieval augmented generation<|"|>,source:<|"|>semantic_scholar<|"|>,max_results:20}<tool_call|>
+
+  download_paper: |-
+    Examples:
+        <|tool_call>call:download_paper{identifier:<|"|>2408.08921<|"|>}<tool_call|>                          # arXiv ID
+        <|tool_call>call:download_paper{identifier:<|"|>10.1038/nature12373<|"|>}<tool_call|>                 # DOI
+        <|tool_call>call:download_paper{identifier:<|"|>https://arxiv.org/pdf/2408.08921<|"|>}<tool_call|>    # URL
+
 
 nudges:
 
@@ -145,9 +219,7 @@ nudges:
     Read it first by invoking the `read_file` tool, then invoke {tool_name} again. Use the canonical Gemma tool-call format — braces only.
 
   phase_transition_tactical_to_strategic: |-
-    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}.
-    Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
-    All tool invocations use the canonical Gemma brace format from your system prompt.
+    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool. All tool invocations use the canonical Gemma brace format from your system prompt.
 
   # Other nudges (loop_warning_suffix, tool_not_found_suffix,
   # phase_transition_strategic_to_tactical, degenerate_recovery_*,

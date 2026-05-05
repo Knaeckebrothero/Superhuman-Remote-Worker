@@ -523,11 +523,14 @@ class KnowledgeStore:
     def assemble_knowledge_block(
         cls,
         notes: List[KnowledgeRecord],
+        model: Optional[str] = None,
     ) -> str:
         """Assemble formatted knowledge block for context injection.
 
         Args:
             notes: List of KnowledgeRecord objects
+            model: Model id used to resolve family-specific block headers
+                / footer. Falls through to the default family if None.
 
         Returns:
             Formatted knowledge block string
@@ -535,14 +538,21 @@ class KnowledgeStore:
         if not notes:
             return ""
 
-        lines = ["--- Project Knowledge ---", ""]
+        from src.services.guardrails import format_nudge
+
+        lines = [format_nudge("knowledge_block_header", model=model), ""]
         for i, note in enumerate(notes, 1):
             lines.append(cls.format_note(note, i))
             lines.append("")
 
         tokens_est = sum(len(n.content) // 4 for n in notes)
         lines.append(
-            f"--- End Knowledge ({len(notes)} notes, ~{tokens_est:,} tokens) ---"
+            format_nudge(
+                "knowledge_block_footer",
+                model=model,
+                count=len(notes),
+                tokens=f"{tokens_est:,}",
+            )
         )
         return "\n".join(lines)
 

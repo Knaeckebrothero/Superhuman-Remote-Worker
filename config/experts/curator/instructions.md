@@ -119,8 +119,8 @@ Assign confidence based on the source:
 
 Track your curation progress via knowledge notes:
 - Use kb_list to review notes written this session
-- Record current phase being processed as kb_write(type="state", tag="curation-progress")
-- Record open questions or contradictions found as kb_write(type="question")
+- Record current phase being processed via the kb_write tool (type=state, tag=curation-progress)
+- Record open questions or contradictions found via the kb_write tool (type=question)
 
 ## Working Principles
 

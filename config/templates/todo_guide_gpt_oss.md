@@ -65,8 +65,8 @@ Every todo must be specific enough that you know exactly when it's done.
 
 Example todos:
 {% if has_tool("kb_write") -%}
-- "Web search for 'topic X state of the art 2025' and record key findings using kb_write(type='learning')"
-- "Read documents/brief.pdf pages 1-10 and record key themes using kb_write(type='learning')"
+- "Web search for 'topic X state of the art 2025' and record key findings via the kb_write tool (type=learning)"
+- "Read documents/brief.pdf pages 1-10 and record key themes via the kb_write tool (type=learning)"
 - "Record research findings as knowledge notes using kb_write"
 {% else -%}
 - "Web search for 'topic X state of the art 2025' and record key findings in notes/research_notes.md"

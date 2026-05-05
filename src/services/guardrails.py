@@ -42,7 +42,7 @@ KNOWN_NUDGES: Dict[str, Set[str]] = {
     "degenerate_recovery_assistant": set(),
     "degenerate_recovery_user": {"pattern_detail"},
     "loop_warning_suffix": set(),
-    "tool_not_found_suffix": {"tool_name"},
+    "tool_not_found_suffix": set(),
     "phase_transition_strategic_to_tactical": {
         "phase_number",
         "phase_name",
@@ -202,11 +202,15 @@ def apply_guardrails_to_tools(
     out: List[Any] = []
     for tool in tools:
         name = getattr(tool, "name", None)
-        replacement = tool_examples.get(name) if name else None
+        replacement = tool_examples.get(name) if isinstance(name, str) else None
         if not replacement:
             out.append(tool)
             continue
-        original = getattr(tool, "description", "") or ""
+        original = getattr(tool, "description", None)
+        if not isinstance(original, str):
+            # Tool isn't a real LangChain tool (e.g. a test mock); leave it.
+            out.append(tool)
+            continue
         new_description = _replace_examples_block(original, replacement)
         if new_description == original:
             out.append(tool)
@@ -268,13 +272,13 @@ def format_nudge(
         )
 
     if guardrails is None:
-        if model is None and family is None:
-            raise ValueError(
-                "format_nudge requires `family`, `model`, or `guardrails`"
-            )
-        if model is not None:
+        # None/empty model → fall back to the `default` family. Call sites
+        # at the edge of the agent (managers, services, ToolContext) may not
+        # always have the model name in scope; the default family is the
+        # safe baseline.
+        if model:
             guardrails = resolve_guardrails(model, deployment_dir)
-        else:
+        elif family:
             from src.core.loader import _load_guardrails_matrix, deep_merge
 
             matrix = _load_guardrails_matrix(deployment_dir)
@@ -283,6 +287,8 @@ def format_nudge(
                 matrix.get(family, {}) if family != "default" else {}
             )
             guardrails = deep_merge(default_guardrails, family_guardrails)
+        else:
+            guardrails = resolve_guardrails("", deployment_dir)
 
     template = (guardrails.get("nudges") or {}).get(key)
     if not template:

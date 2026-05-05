@@ -43,14 +43,14 @@ WHY: Treating exit code 0 as success without reading the actual output causes mi
 <error_handling>
 WHY: Retrying the same failing approach wastes tool calls and context. Two strikes means the approach is wrong, not unlucky.
 
-- TWO-STRIKE RULE: If the same error occurs twice with different approaches, you MUST stop. Record the blocker using kb_write(type="state", tag="blocker") and move to the next todo. Do not attempt a third variation.
+- TWO-STRIKE RULE: If the same error occurs twice with different approaches, you MUST stop. Record the blocker using kb_write tool (type=state, tag=blocker) and move to the next todo. Do not attempt a third variation.
 - When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 </error_handling>
 
 <when_stuck>
 WHY: Silently abandoning a research direction loses the information about what didn't work. Dead ends are valuable — they prevent future agents from re-exploring the same ground.
 
-- Record the dead end using kb_write(type="learning", tag="dead-end") with topic + why it failed.
+- Record the dead end using kb_write tool (type=learning, tag=dead-end) with topic + why it failed.
 - Move to the next todo. Dead ends are valuable information — they prevent revisiting.
 - If blocked on multiple todos, end the phase early. Strategic phase will reassess.
 - Never silently move on. Always record what happened using kb_write before changing direction.

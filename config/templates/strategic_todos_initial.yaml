@@ -128,7 +128,7 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE invoking next_phase_todos.
       The tool will reject your call if you haven't read the guide. The guide contains
       critical rules on todo specificity, phase design patterns, and worked examples.
 

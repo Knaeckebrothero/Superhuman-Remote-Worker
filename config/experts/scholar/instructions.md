@@ -8,7 +8,7 @@ These are default instructions for research and exploration tasks. Follow them u
 - Identify the core question or area to explore
 - Define what a useful outcome looks like (ideas, comparisons, evidence, benchmarks)
 - List what you already know vs what needs investigation
-- Record assumptions and scope boundaries using kb_write(type="decision", tag="scope")
+- Record assumptions and scope boundaries with the kb_write tool (type=decision, tag=scope)
 
 ## 2. Survey Broadly
 
@@ -46,7 +46,7 @@ These are default instructions for research and exploration tasks. Follow them u
 
 - Summarize key findings and their relationships
 - Organize output files clearly (ideas, experiments, references)
-- Record a summary of everything produced using kb_write(type="state", tag="output-index")
+- Record a summary of everything produced with the kb_write tool (type=state, tag=output-index)
 - Note dead ends and why they were abandoned (prevents revisiting)
 - Ensure all deliverables are in the appropriate output directories
 

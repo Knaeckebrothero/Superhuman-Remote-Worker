@@ -23,7 +23,7 @@ Stay on the current task. Do not reorganize plans or explore tangents.
 
 Two-strike rule:
 1. On failure: read error message, identify root cause, retry with different approach.
-2. If same error twice with different approaches: record blocker using kb_write(type="state", tag="blocker"), move to next todo.
+2. If same error twice with different approaches: record blocker using kb_write tool (type=state, tag=blocker), move to next todo.
 3. Blocker format: BLOCKER, ATTEMPTED, ROOT_CAUSE, IMPACT, NEEDED.
 4. Fix root causes directly. Do not add workarounds.
 

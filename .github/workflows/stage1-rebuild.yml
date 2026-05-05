@@ -1,0 +1,116 @@
+name: stage1-rebuild
+
+# Weekly refresh of the agent-vm-base-stage1 image against upstream apt
+# updates. Stage1 only rebuilds on input change otherwise (provision-stage1.sh,
+# .playwright-version, etc.), which means a long-stable stage1 accumulates
+# missed security updates. This cron forces a fresh build every Monday so the
+# baseline never drifts more than a week.
+#
+# Triggers: weekly cron + manual workflow_dispatch (for emergency refreshes).
+# The job dispatches to the same `build-agent-vm-base-stage1` flow used in
+# develop.yml — pushes to GHCR with both `:sha-<short>` and `:latest` tags.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC — outside business hours for both EU and US timezones.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-agent-vm-base-stage1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/chromium \
+            /usr/share/swift /usr/local/julia* /opt/hostedtoolcache
+
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Compute cloud image cache key
+        id: img-key
+        run: echo "key=ubuntu-noble-cloudimg-$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Ubuntu cloud image
+        id: cloud-image-cache
+        uses: actions/cache@v4
+        with:
+          path: docker/agent-vm-base/input/noble-server-cloudimg-amd64.img
+          key: ${{ steps.img-key.outputs.key }}
+
+      - name: Download Ubuntu cloud image
+        if: steps.cloud-image-cache.outputs.cache-hit != 'true'
+        working-directory: docker/agent-vm-base
+        run: |
+          mkdir -p input
+          wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+            -O input/noble-server-cloudimg-amd64.img
+
+      - name: Verify Ubuntu cloud image
+        working-directory: docker/agent-vm-base
+        run: qemu-img info input/noble-server-cloudimg-amd64.img
+
+      - name: Packer init
+        working-directory: docker/agent-vm-base
+        run: packer init stage1.pkr.hcl
+
+      - name: Packer build (stage1)
+        working-directory: docker/agent-vm-base
+        run: |
+          PW_VERSION=$(tr -d '[:space:]' < ../../.playwright-version)
+          test -n "$PW_VERSION" || { echo "::error::.playwright-version is empty"; exit 1; }
+          for attempt in 1 2; do
+            if packer build -var "playwright_version=${PW_VERSION}" stage1.pkr.hcl; then
+              exit 0
+            fi
+            echo "::warning::Stage1 packer build attempt ${attempt} failed"
+            rm -rf output-stage1
+          done
+          echo "::error::Stage1 packer build failed after 2 attempts"
+          exit 1
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push stage1 containerDisk image
+        working-directory: docker/agent-vm-base
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base-stage1" | tr '[:upper:]' '[:lower:]')
+          TAGS=("${IMAGE}:sha-${GITHUB_SHA::7}" "${IMAGE}:latest" "${IMAGE}:cron-$(date -u +%Y%m%d)")
+          BUILD_ARGS=()
+          for T in "${TAGS[@]}"; do BUILD_ARGS+=(-t "$T"); done
+          docker build "${BUILD_ARGS[@]}" -f Dockerfile.containerDisk-stage1 .
+          for T in "${TAGS[@]}"; do docker push "$T"; done
+          printf 'Pushed stage1:\n'; printf '  %s\n' "${TAGS[@]}"

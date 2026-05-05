@@ -8,7 +8,7 @@ These are default instructions for design tasks. Follow them unless the user pro
 - Identify what the feature does from the user's perspective
 - Identify the primary user flow (the happy path)
 - Identify edge cases: empty states, error states, overflow, permissions
-- Record assumptions and open questions using kb_write(type="question")
+- Record assumptions and open questions via the kb_write tool (type=question)
 
 ## 2. Audit Existing Patterns
 

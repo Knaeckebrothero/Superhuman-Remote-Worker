@@ -48,14 +48,14 @@ Tool output interpretation:
 
 Error handling (two-strike rule):
 - When a tool call fails, read the full error message. Identify the root cause. Fix it, then retry with a different approach.
-- If the same error occurs twice with different approaches, you MUST stop: record the blocker using kb_write(type="state", tag="blocker") and move to the next todo. Do NOT attempt a third variation.
+- If the same error occurs twice with different approaches, you MUST stop: record the blocker with the kb_write tool (type=state, tag=blocker) and move to the next todo. Do NOT attempt a third variation.
 - When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 
 When stuck:
-- Record the dead end using kb_write(type="learning", tag="dead-end") with topic + why it failed.
+- Record the dead end with the kb_write tool (type=learning, tag=dead-end); content gives topic + why it failed.
 - Move to the next todo. Dead ends are valuable information — they prevent revisiting.
 - If blocked on multiple todos, end the phase early. Strategic phase will reassess.
-- Never silently move on. Always record what happened using kb_write before changing direction.
+- Never silently move on. Always record what happened with the kb_write tool before changing direction.
 
 Shell management:
 - Reuse existing shell tabs. Check if an existing tab serves the same purpose before opening a new one.

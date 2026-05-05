@@ -1202,7 +1202,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if metadata.get("repositories"):
                     self._workspace_manager._clone_auxiliary_repos()
 
-                self._todo_manager = TodoManager(workspace=self._workspace_manager)
+                self._todo_manager = TodoManager(
+                    workspace=self._workspace_manager,
+                    model_name=self.config.llm.model,
+                )
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
             logger.warning(
@@ -1245,7 +1248,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.info(f"Switched to expected branch: {expected}")
 
             # Create todo manager for this workspace
-            self._todo_manager = TodoManager(workspace=self._workspace_manager)
+            self._todo_manager = TodoManager(
+                    workspace=self._workspace_manager,
+                    model_name=self.config.llm.model,
+                )
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}
@@ -1580,7 +1586,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info("Wrote requirement to analysis/requirement_input.md")
 
         # Create todo manager for this workspace
-        self._todo_manager = TodoManager(workspace=self._workspace_manager)
+        self._todo_manager = TodoManager(
+                    workspace=self._workspace_manager,
+                    model_name=self.config.llm.model,
+                )
 
         # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
         # are deployed in _deploy_instruction_files() after tools are loaded, so that

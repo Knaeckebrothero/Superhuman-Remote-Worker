@@ -22,7 +22,7 @@ Every `claude_code` prompt should include:
 Error handling (two-strike rule):
 - When a delegation fails, read the COMPLETE error output before doing anything else.
 - When `git_diff` or `read_file` shows unexpected results, diagnose the cause before re-delegating.
-- If the same delegation fails twice with different approaches, you MUST stop: record the blocker using kb_write(type="state", tag="blocker") with structured format: BLOCKER (what you cannot do), ATTEMPTED (what you tried with specific commands), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this). Then move to the next todo.
+- If the same delegation fails twice with different approaches, you MUST stop: record the blocker with the kb_write tool (type=state, tag=blocker), using structured content: BLOCKER (what you cannot do), ATTEMPTED (what you tried with specific commands), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this). Then move to the next todo.
 - Do not fix code manually with write_file — delegate corrections back to claude_code by resuming the session.
 
 PR discipline:
@@ -34,7 +34,7 @@ Session management:
 - Resuming a session is cheaper and faster than starting fresh — Claude Code keeps its full context.
 - Resume for corrections and follow-up work on the same files.
 - Start fresh for unrelated tasks or different parts of the codebase.
-- Record session IDs using kb_write(type="state", tag="session") for cross-compaction recovery.
+- Record session IDs with the kb_write tool (type=state, tag=session) for cross-compaction recovery.
 
 Shell management:
 - Reuse existing shell tabs. Check if an existing tab serves the same purpose before opening a new one.
@@ -42,7 +42,7 @@ Shell management:
 - SSH requires a two-step pattern: (1) send the command, (2) send the password when prompted.
 
 When stuck:
-- Record the blocker using kb_write(type="state", tag="blocker"). Be specific: BLOCKER (what failed), ATTEMPTED (what you tried), ROOT_CAUSE (the error), IMPACT (which todos are blocked), NEEDED (what would unblock this).
+- Record the blocker with the kb_write tool (type=state, tag=blocker). Be specific: BLOCKER (what failed), ATTEMPTED (what you tried), ROOT_CAUSE (the error), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 - Never silently abandon a delegation. Always record what happened before moving on.
 - Move to the next todo if possible.
 - If blocked on multiple todos, end the phase early — strategic phase will reassess.
