@@ -72,11 +72,19 @@ data:
     # Client: get-or-create. Returns the client UUID (internal id).
     # Args: <clientId> <payload-file>
     # ------------------------------------------------------------------
+    # kcadm CSV-output behaviour changed across versions: older releases
+    # printed a header line ("id") followed by the value, newer ones (26+)
+    # print just the value. Strip surrounding whitespace/quotes/newlines and
+    # reject anything literally equal to "id" so both layouts work.
+    extract_id() {
+      awk 'BEGIN{FS=","} {gsub(/[" \r\n]/,"",$1); if ($1!="" && $1!="id") {print $1; exit}}'
+    }
+
     upsert_client() {
       local cid="$1" payload="$2" uuid
       uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
         --fields id --format csv --noquotes 2>/dev/null \
-        | tail -n +2 | head -n1 | tr -d '\r\n' || true)
+        | extract_id || true)
       if [ -n "$uuid" ]; then
         echo "[bootstrap]   updating $cid (id=$uuid)"
         "$KCADM" update "clients/$uuid" -r "$TARGET_REALM" -f "$payload"
@@ -85,7 +93,7 @@ data:
         "$KCADM" create clients -r "$TARGET_REALM" -f "$payload"
         uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
           --fields id --format csv --noquotes 2>/dev/null \
-          | tail -n +2 | head -n1 | tr -d '\r\n')
+          | extract_id)
       fi
       echo "$uuid"
     }
@@ -171,7 +179,7 @@ data:
       echo "[bootstrap] === cloud service account: $CLOUD_USER (realm $TARGET_REALM) ==="
       USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
         --fields id --format csv --noquotes 2>/dev/null \
-        | tail -n +2 | head -n1 | tr -d '\r\n' || true)
+        | extract_id || true)
       if [ -n "$USER_ID" ]; then
         echo "[bootstrap]   updating user (id=$USER_ID)"
         "$KCADM" update "users/$USER_ID" -r "$TARGET_REALM" \
@@ -189,7 +197,7 @@ data:
           ${BOOTSTRAP_CLOUD_LAST_NAME:+-s "lastName=$BOOTSTRAP_CLOUD_LAST_NAME"} >/dev/null
         USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
           --fields id --format csv --noquotes 2>/dev/null \
-          | tail -n +2 | head -n1 | tr -d '\r\n')
+          | extract_id)
       fi
       # Force-set the password each run — handles rotation in Vault. The
       # `--temporary=false` flag is critical: without it Keycloak forces the
