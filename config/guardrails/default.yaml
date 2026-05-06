@@ -1,0 +1,307 @@
+# Default guardrails — OpenAI-compatible parens form
+#
+# This file is the baseline for every model family. Family-specific files
+# (gemma.yaml, gpt_oss.yaml, ...) deep-merge on top, so they only need to
+# define keys whose surface form differs.
+#
+# Two top-level sections:
+#   tool_examples: per-tool `Examples:` block injected into the LangChain
+#                  tool description at bind time (replaces any Examples:
+#                  block already in the docstring).
+#   nudges:        keyed runtime strings used by graph/manager/service
+#                  injection sites. Placeholder contracts are validated
+#                  against KNOWN_NUDGES in src/services/guardrails.py.
+#
+# When adding a new tool, drop its name here. When adding a new nudge
+# call site, add the key here AND in KNOWN_NUDGES.
+
+tool_examples:
+
+  # ----- src/tools/core/todo.py -----
+  next_phase_todos: |-
+    Examples:
+        next_phase_todos(
+            todos=[
+                "Extract document text from uploaded PDF",
+                "Chunk document into processable segments",
+                "Identify requirements in each chunk",
+                "Validate extracted requirements",
+                "Write requirements to database",
+            ],
+            phase_name="Phase 1: Document Processing",
+        )
+
+  todo_complete: |-
+    Examples:
+        todo_complete()                       # complete the first pending task
+        todo_complete(todo_id="todo_3")       # complete a specific task by id
+
+  # ----- src/tools/git/git_tools.py -----
+  git_log: |-
+    Examples:
+        git_log()                  # last 10 commits, compact one-line format
+        git_log(max_count=5)       # last 5 commits
+        git_log(oneline=False)     # full commit details
+
+  git_show: |-
+    Examples:
+        git_show()                                              # latest commit, full diff
+        git_show(stat_only=True)                                # latest commit, file list only
+        git_show(commit_ref="HEAD~3")                           # commit from 3 commits ago
+        git_show(commit_ref="phase-1-tactical-complete")        # tagged commit
+
+  git_diff: |-
+    Examples:
+        git_diff()                                                          # uncommitted changes
+        git_diff(ref1="HEAD~5")                                             # last 5 commits vs working dir
+        git_diff(ref1="phase-1-tactical-complete", ref2="HEAD")             # between tag and HEAD
+        git_diff(file_path="workspace.md")                                  # uncommitted changes in one file
+
+  git_status: |-
+    Example output (clean):
+        Branch: master
+        Status: clean (no uncommitted changes)
+
+    Example output (dirty):
+        Branch: master
+        Status: dirty (uncommitted changes)
+
+        Staged (2):
+          + new_file.txt
+          + updated.md
+
+        Modified (1):
+          M workspace.md
+
+  git_tags: |-
+    Examples:
+        git_tags()                          # phase tags for the current job
+        git_tags(pattern="phase-1-*")       # only phase 1 tags for this job
+        git_tags(pattern="*")               # all tags for this job
+        git_tags(all_jobs=True)             # phase tags from every job in the repo
+
+  git_merge_squash: |-
+    Examples:
+        git_merge_squash(branch="subagent/0")
+        git_merge_squash(branch="subagent/1", commit_message="Merge research results")
+
+  git_worktree_cleanup: |-
+    Examples:
+        git_worktree_cleanup(branch="subagent/0")
+        git_worktree_cleanup(branch="subagent/2", force=True)
+
+  # ----- src/tools/shell/shell_tools.py -----
+  run_command: |-
+    Examples:
+        run_command(command="pytest tests/ -x")
+        run_command(command="git diff HEAD~1", tail=100)
+        run_command(command="npm run build", timeout=300)
+        run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'")
+
+  shell_execute: |-
+    Examples:
+        shell_execute(command="pytest tests/ -x")
+        shell_execute(command="npm run dev", name="dev", is_async=True)
+        shell_execute(command="C-c", name="dev", keys=True)
+
+  shell_read: |-
+    Examples:
+        shell_read()                                       # tail of default tab
+        shell_read(name="build", lines=100)                # last 100 lines of build tab
+        shell_read(name="srv", offset=0, lines=50)         # first 50 lines
+
+  # ----- src/tools/workspace/files.py and filesystem.py -----
+  edit_file: |-
+    Examples:
+        # Replace mode (default)
+        edit_file(path="plan.md", old_string="## Draft", new_string="## Final")
+
+        # Append mode — add to end of file
+        edit_file(path="notes.md", new_string="\n## New Section", position="end")
+
+        # Prepend mode — add to start of file
+        edit_file(path="log.md", new_string="# Header\n\n", position="start")
+
+  move_file: |-
+    Examples:
+        move_file(source="todos.yaml", dest="archive/todos_phase_1.yaml")    # move to subdir
+        move_file(source="draft.md", dest="final.md")                        # rename in place
+
+  read_file: |-
+    Examples:
+        read_file(path="documents/report.pdf")                                  # whole document, default limits
+        read_file(path="documents/report.pdf", page_start=1, page_end=5)        # specific pages
+        read_file(path="output/notes.md", offset=500, limit=100)                # text lines 500-599
+
+  write_file: |-
+    Examples:
+        write_file(path="output/summary.md", content="# Summary\n\n...")
+        write_file(path="notes/observations.md", content="...")
+
+  get_document_info: |-
+    Examples:
+        get_document_info(path="documents/report.pdf")                          # page count + structure preview
+
+  # ----- src/tools/knowledge/knowledge_tools.py -----
+  kb_write: |-
+    Examples:
+        kb_write(
+            title="Chose JWT over OAuth",
+            type="decision",
+            content="...",
+            tags=["authentication", "security"],
+        )
+        kb_write(
+            title="API rate limit experiment",
+            type="learning",
+            content="...",
+            tags=["api", "rate-limits"],
+        )
+
+  kb_search: |-
+    Examples:
+        kb_search(query="how do we authenticate API requests")
+        kb_search(query="prior decisions about rate limiting", max_results=20)
+
+  kb_read: |-
+    Examples:
+        kb_read(note="chose-jwt-over-oauth")          # by slug
+        kb_read(note="api-rate-limit-experiment")
+
+  kb_update: |-
+    Examples:
+        kb_update(note="chose-jwt-over-oauth", append="Update: also adopted refresh-token rotation.")
+        kb_update(note="api-rate-limit-experiment", status="resolved", confidence="high")
+
+  # ----- src/tools/citation/sources.py -----
+  cite_web: |-
+    Examples:
+        cite_web(
+            text="LLMs hallucinate at higher rates on out-of-distribution prompts.",
+            url="https://example.com/llm-hallucinations",
+            claim="Out-of-distribution prompts increase hallucination risk.",
+        )
+
+  cite_document: |-
+    Examples:
+        cite_document(
+            text="Total revenue rose 12% YoY.",
+            document_path="documents/q3_report.pdf",
+            page=12,
+            claim="Q3 revenue grew 12% year-over-year.",
+        )
+
+  # ----- src/tools/delegation/delegate_work.py -----
+  delegate_work: |-
+    Examples:
+        delegate_work(
+            tasks=[
+                {"description": "Research arxiv for transformer scaling laws", "expert": "scholar"},
+                {"description": "Implement the rate limiter prototype", "expert": "developer"},
+            ],
+            context="We need both literature review and a working prototype before phase 3.",
+        )
+
+  # ----- src/tools/research/web.py -----
+  web_search: |-
+    Examples:
+        web_search(query="vLLM gemma4 tool-call parser regex")
+        web_search(query="recent layoffs in semiconductor industry", topic="news", time_range="month")
+        web_search(query="OpenAI revenue 2026", topic="finance", search_depth="advanced")
+
+  extract_webpage: |-
+    Examples:
+        extract_webpage(urls="https://docs.vllm.ai/en/latest/models/supported_models.html")
+        extract_webpage(urls="https://example.com/a, https://example.com/b", query="rate limiting strategies")
+
+  # ----- src/tools/research/papers.py -----
+  search_papers: |-
+    Examples:
+        search_papers(query="speculative decoding")                      # arxiv default
+        search_papers(query="retrieval augmented generation", source="semantic_scholar", max_results=20)
+
+  download_paper: |-
+    Examples:
+        download_paper(identifier="2408.08921")                          # arXiv ID
+        download_paper(identifier="10.1038/nature12373")                 # DOI
+        download_paper(identifier="https://arxiv.org/pdf/2408.08921")    # URL
+
+
+nudges:
+
+  # ----- src/graph.py recovery + phase nudges -----
+
+  # Sites: src/graph.py:1371-1380 (todo-action recovery nudge)
+  # Placeholders: {todo_id}
+  todo_action: |-
+    Action required: complete the current todo `{todo_id}` now by invoking the `todo_complete` tool.
+    Use the tool-call format defined in your system prompt — do not type the call as plain text.
+
+  # Sites: src/graph.py:2939-2951 (phase-budget hard cap rewind)
+  # Placeholders: {used}, {cap}
+  budget_rewind: |-
+    PHASE BUDGET REACHED: {used}/{cap} tool calls consumed.
+    Before staging new todos with the `next_phase_todos` tool:
+      1. Review what worked and what didn't
+      2. Identify root causes for the failures
+      3. Stage smaller, more focused todos
+    Do not repeat the same sequence of calls.
+
+  # Sites: src/graph.py:1193-1208 (degenerate-response recovery)
+  degenerate_recovery_assistant: |-
+    My previous response was degenerate — it contained repetitive or malformed output. I need to retry with a shorter, well-formed response.
+
+  degenerate_recovery_user: |-
+    Your last response was detected as degenerate and has been discarded. Issues found: {pattern_detail}.
+    If you were trying to call a tool, retry with smaller arguments or a different approach.
+
+  # Sites: src/graph.py:3020-3023 (loop-warning suffix appended to ToolMessage)
+  loop_warning_suffix: |-
+    [LOOP WARNING] You have called this tool with the same arguments multiple times. You may be stuck in a loop.
+    Consider a different approach: try different arguments, use a different tool, or mark the current todo as blocked and move on.
+
+  # Sites: src/graph.py tool-not-found recovery suffix
+  tool_not_found_suffix: |-
+    If your current todo requires this tool, mark it as blocked using the `todo_complete` tool with a note explaining which tool is needed, and proceed with the next todo.
+
+  # Sites: src/core/phase.py on_strategic_phase_complete()
+  # Placeholders: {phase_number}, {phase_name}, {todo_count}
+  phase_transition_strategic_to_tactical: |-
+    [PHASE_TRANSITION] Strategic phase complete. Entering tactical phase {phase_number}: {phase_name} ({todo_count} todos). Work through the todos using your tools.
+
+  # Sites: src/core/phase.py on_tactical_phase_complete()
+  # Placeholders: {phase_number}
+  phase_transition_tactical_to_strategic: |-
+    [PHASE_TRANSITION] Tactical phase complete. Entering strategic phase {phase_number}. Review what was accomplished, update workspace.md and plan.md, then either stage todos for the next tactical phase using the `next_phase_todos` tool or invoke the `job_complete` tool.
+
+  # ----- src/managers/todo.py -----
+
+  # Sites: src/managers/todo.py:409 (todo-list footer)
+  todo_list_footer: |-
+    Tools available: `todo_complete` (mark a task finished — pass the todo id), `todo_rewind` (revisit a completed task — pass the todo id), `mark_complete` (signal the current phase is done).
+    Invoke them via the tool-call format defined in your system prompt.
+
+  # ----- src/services/recall_store.py -----
+
+  memory_block_header_pinned: "--- Pinned Memories (TTL-active) ---"
+  memory_block_header_retrieved: "--- Retrieved Memories (relevance-ranked) ---"
+  # Placeholders: {count} (full summary string e.g. "2 items: 0 pinned + 2 retrieved"),
+  # {tokens} (already-formatted, e.g. "150")
+  memory_block_footer: "--- End Memories ({count}, ~{tokens} tokens) ---"
+
+  # ----- src/services/knowledge_store.py -----
+
+  knowledge_block_header: "--- Project Knowledge ---"
+  # Placeholders: {count} (number of notes), {tokens} (already-formatted)
+  knowledge_block_footer: "--- End Knowledge ({count} notes, ~{tokens} tokens) ---"
+
+  # ----- src/persistent_graph.py -----
+
+  empty_response_recovery: "⚠ The model returned an empty response. Please try again or switch models."
+
+  # ----- src/tools/context.py, src/tools/registry.py, src/tools/workspace/files.py -----
+
+  # Placeholders: {file_path}, {tool_name}
+  read_file_required_error: |-
+    Error: You must read `{file_path}` before using {tool_name}. It contains critical instructions for this operation.
+    Read it first by invoking the `read_file` tool, then invoke {tool_name} again.

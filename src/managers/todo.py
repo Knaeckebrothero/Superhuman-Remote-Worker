@@ -114,6 +114,7 @@ class TodoManager:
         workspace: "WorkspaceManager",
         min_todos: int = 5,
         max_todos: int = 20,
+        model_name: Optional[str] = None,
     ):
         """Initialize todo manager.
 
@@ -121,12 +122,17 @@ class TodoManager:
             workspace: WorkspaceManager for archive operations
             min_todos: Minimum todos required for tactical phases (default: 5)
             max_todos: Maximum todos allowed for tactical phases (default: 20)
+            model_name: Optional model id used to resolve family-specific
+                runtime nudges (e.g. the todo-list footer rendered into
+                injected context). Falls through to the default family
+                when not supplied.
         """
         self._workspace = workspace
         self._todos: List[TodoItem] = []
         self._next_id = 1
         self._min_todos = min_todos
         self._max_todos = max_todos
+        self._model_name = model_name
         # Staging for next phase todos
         self._staged_todos: List[TodoItem] = []
         self._staged_phase_name: str = ""
@@ -403,13 +409,11 @@ class TodoManager:
             for todo in pending_sorted:
                 lines.append(f"  - [ ] {todo.id}: {todo.content}")
 
-        # Tool usage guide
+        # Tool usage guide — resolved per-family via the guardrails matrix
+        from src.services.guardrails import format_nudge
+
         lines.append("")
-        lines.append(
-            'Tools: Use `todo_complete(todo_id="<id>")` when a task is finished. '
-            'Use `todo_rewind(todo_id="<id>")` to revisit a completed task. '
-            "Use `mark_complete` to signal the current phase is done."
-        )
+        lines.append(format_nudge("todo_list_footer", model=self._model_name))
 
         return "\n".join(lines)
 

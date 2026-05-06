@@ -1137,11 +1137,16 @@ def on_strategic_phase_complete(
         f"[{job_id}] Transitioning to tactical phase: {phase_name} ({todo_count} todos)"
     )
 
+    from src.services.guardrails import format_nudge
+
+    model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=(
-            f"[PHASE_TRANSITION] Strategic phase complete. "
-            f"Entering tactical phase {phase_number + 1}: {phase_name} "
-            f"({todo_count} todos). Work through the todos using your tools."
+        content=format_nudge(
+            "phase_transition_strategic_to_tactical",
+            model=model,
+            phase_number=phase_number + 1,
+            phase_name=phase_name,
+            todo_count=todo_count,
         )
     )
 
@@ -1227,12 +1232,14 @@ def on_tactical_phase_complete(
         f"({len(strategic_todos)} predefined todos)"
     )
 
+    from src.services.guardrails import format_nudge
+
+    model = config.llm.model if (config and config.llm) else None
     phase_marker = HumanMessage(
-        content=(
-            f"[PHASE_TRANSITION] Tactical phase complete. "
-            f"Entering strategic phase {phase_number + 1}. "
-            f"Review what was accomplished, update workspace.md and plan.md, "
-            f"then create todos for the next tactical phase or call job_complete."
+        content=format_nudge(
+            "phase_transition_tactical_to_strategic",
+            model=model,
+            phase_number=phase_number + 1,
         )
     )
 

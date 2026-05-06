@@ -53,7 +53,7 @@ todos:
       (6) Check for CI config (repo/.github/workflows/, repo/.gitlab-ci.yml, etc.)
           to understand the build/test/lint pipeline.
 
-      Record your findings as knowledge notes using kb_write(type="learning", tag="repository"):
+      Record your findings as knowledge notes using kb_write tool (type=learning, tag=repository):
       - Framework and language version
       - Project structure (key directories and their purposes)
       - Naming conventions observed (file naming, function naming, class naming)
@@ -139,7 +139,7 @@ todos:
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE calling next_phase_todos.
       The tool will reject your call if you haven't read the guide. The guide contains
       critical rules on delegation-ready todo specificity, phase design patterns for
       code work, and verification discipline.

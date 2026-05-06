@@ -10,8 +10,8 @@ todos:
       REVIEW: Examine what the previous phase accomplished using git evidence.
 
       Steps:
-      (1) Use git_tags() to confirm phase boundary tags exist.
-      (2) Use git_log(max_count=15) to see commits from the previous phase.
+      (1) Use the git_tags tool to confirm phase boundary tags exist.
+      (2) Use the git_log tool (max_count=15) to see commits from the previous phase.
       (3) Use git_diff with the phase start tag to see all file changes.
       (4) CONTENT CHECK: For every file in output/ that was created or modified,
           use read_file to examine its actual content. Check specifically:
@@ -40,14 +40,15 @@ todos:
       REFLECT on project knowledge: Review and update the knowledge base.
 
       After the retrospective, update the project knowledge base:
-      (1) Search for existing notes related to this phase's work (kb_search).
-      (2) Record new decisions with reasoning using kb_write(type="decision").
-      (3) Record discovered facts (IDs, paths, configurations) using kb_write(type="learning").
-      (4) Record failed approaches using kb_write(type="learning", tag="failed-approach")
-          with the reason they failed — this prevents retrying the same strategy.
-      (5) If any existing notes are now outdated, update them:
-          kb_update(note_id, status="superseded") or kb_update with corrected content.
-      (6) Link related notes using kb_update(note_id, links=["references:other-note"]).
+      (1) Search for existing notes related to this phase's work using the kb_search tool.
+      (2) Record new decisions with reasoning using the kb_write tool with type=decision.
+      (3) Record discovered facts (IDs, paths, configurations) using the kb_write tool with type=learning.
+      (4) Record failed approaches using the kb_write tool with type=learning and tag=failed-approach,
+          including the reason they failed — this prevents retrying the same strategy.
+      (5) If any existing notes are now outdated, update them with the kb_update tool —
+          either set status=superseded or supply corrected content.
+      (6) Link related notes using the kb_update tool's links argument
+          (entries like {"target": "other-note", "type": "REFERENCES"}).
 
       COMPLETION CRITERIA: Knowledge base updated with decisions, facts, and failed
       approaches from the completed phase. No duplicate notes created.

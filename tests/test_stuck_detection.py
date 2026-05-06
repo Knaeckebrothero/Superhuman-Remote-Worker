@@ -12,6 +12,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -51,12 +52,20 @@ class FakeToolsConfig:
 
 
 @dataclass
+class FakeLLMConfig:
+    """Minimal LLM-config slice for guardrails resolution."""
+
+    model: Optional[str] = None
+
+
+@dataclass
 class FakeConfig:
     """Minimal config matching what create_audited_tool_node reads."""
 
     agent_id: str = "test_agent"
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     tools: FakeToolsConfig = field(default_factory=FakeToolsConfig)
+    llm: FakeLLMConfig = field(default_factory=FakeLLMConfig)
 
 
 def make_tool_call(name: str, args: dict = None, call_id: str = None):

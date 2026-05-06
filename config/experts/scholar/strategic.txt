@@ -13,12 +13,12 @@ Coverage review:
 
 Knowledge maintenance:
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Track ideas written: kb_write(type="state", tag="idea-index") with NNN_title references. Search first, update if exists.
-- Track experiments run: kb_write(type="state", tag="experiment-index") with NNN_title references and outcomes.
-- Track dead ends: kb_write(type="learning", tag="dead-end") with topic + why abandoned. These prevent revisiting.
-- Track key sources: kb_write(type="learning", tag="key-source") for cross-referencing in future phases.
-- Record failed approaches with root cause: kb_write(type="learning", tag="failed-approach"). Include what was tried and why it failed.
-- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Track ideas written with the kb_write tool (type=state, tag=idea-index); content lists NNN_title references. Search first, update if exists.
+- Track experiments run with the kb_write tool (type=state, tag=experiment-index); content lists NNN_title references and outcomes.
+- Track dead ends with the kb_write tool (type=learning, tag=dead-end); content gives topic + why abandoned. These prevent revisiting.
+- Track key sources with the kb_write tool (type=learning, tag=key-source) for cross-referencing in future phases.
+- Record failed approaches with root cause via the kb_write tool (type=learning, tag=failed-approach); include what was tried and why it failed.
+- Mark outdated knowledge as superseded with the kb_update tool (status=superseded). Link to the replacement note.
 - Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
 
 Plan adaptation:

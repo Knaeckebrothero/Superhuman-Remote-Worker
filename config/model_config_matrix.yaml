@@ -30,6 +30,8 @@ default:
     strategic_todos_resume: strategic_todos_resume.yaml
     workspace_template: workspace_template.md
     todo_guide: todo_guide.md
+  guardrails:
+    file: default.yaml
   settings:
     temperature: 0.0
     multimodal: false
@@ -51,6 +53,8 @@ minimax:
     summarization: summarization_prompt_minimax.txt
   instructions:
     instructions: instructions_minimax.md
+  guardrails:
+    file: minimax.yaml
   settings:
     temperature: 1.0  # M2.7 is a reasoning model; use default
     top_p: 0.95
@@ -125,6 +129,8 @@ gpt-5:
     strategic: strategic_gpt_5.txt
     tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
+  guardrails:
+    file: gpt_5.yaml
   settings:
     temperature: 1.0  # Reasoning model: only default 1.0 is supported
     multimodal: true  # GPT-5 supports image inputs
@@ -148,6 +154,8 @@ codex:
     strategic: strategic_gpt_5.txt
     tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
+  guardrails:
+    file: codex.yaml
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: true  # gpt-5.3-codex supports image inputs (screenshots, diagrams, UI)
@@ -169,6 +177,8 @@ codex-spark:
     strategic: strategic_codex_spark.txt
     tactical: tactical_codex_spark.txt
     summarization: summarization_prompt_gpt_5.txt
+  guardrails:
+    file: codex_spark.yaml
   settings:
     temperature: 1.0  # Reasoning model: temperature effectively disabled
     multimodal: false  # Codex Spark is code-focused, no vision
@@ -196,6 +206,8 @@ gpt-oss:
     instructions: instructions_gpt_oss.md
     todo_guide: todo_guide_gpt_oss.md
     strategic_todos_transition: strategic_todos_transition_gpt_oss.yaml
+  guardrails:
+    file: gpt_oss.yaml
   settings:
     temperature: 1.0  # OpenAI official: use 1.0 for full reasoning capability
     top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution
@@ -211,17 +223,45 @@ gpt-oss:
       summarization_chunk_size: 75000
       message_count_min_tokens: 60000
 
-# Gemma 4 has native system role and strong instruction following — the default
-# Markdown prompts work well for systemprompt/persona/strategic/tactical/summarization.
-# Only the structured-output tasks get gemma-specific variants: they add explicit
-# anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON schema can trigger
-# infinite repetition loops). The complementary repetition_penalty / frequency_penalty
-# in `settings:` is the runtime-side mitigation.
+# Gemma 4 has native system role, native multimodality, and strong Markdown
+# instruction following. Two integration challenges drove the variants below:
+#
+# 1. Tool-call wire format: vLLM's `gemma4` parser is regex-strict and only
+#    accepts Gemma's canonical `<|tool_call>call:fn{k:<|"|>v<|"|>}<tool_call|>`
+#    syntax — no parens, no JSON, no equals. The model drifts to Python-style
+#    parens when its prompts/instructions show parens-style examples, and the
+#    parser silently rejects the call. The worker-path prompts and
+#    `instructions_gemma.md` teach the canonical format with concrete examples
+#    and a positive contrast ("braces, never parens"). The runtime-side
+#    no-tool-call streak detector in `src/graph.py` is the safety net.
+#    Precipitating incident: docs/issues/gemma_tool_call_parser_loop.md.
+#
+# 2. Repetition loops: the structured-output (memory/curation) variants add
+#    explicit anti-repetition guidance to mitigate vllm#40080 (xgrammar JSON
+#    schema can trigger infinite repetition). The complementary
+#    `repetition_penalty` / `frequency_penalty` below are the runtime-side
+#    mitigation.
 gemma:
   prompts:
+    # Worker-path variants
+    systemprompt: systemprompt_gemma.txt
+    persona: persona_gemma.txt
+    strategic: strategic_gemma.txt
+    tactical: tactical_gemma.txt
+    summarization: summarization_prompt_gemma.txt
+    # Auxiliary-path variants (anti-repetition; mitigate vllm#40080)
     memory_extraction: memory_extraction_prompt_gemma.txt
     memory_assembler: memory_assembler_prompt_gemma.txt
     curation: curation_prompt_gemma.txt
+  instructions:
+    # instructions.md is loaded into agent context every turn — its tool-call
+    # examples train the model's surface form. The default uses Python-style
+    # `read_file(path="...")` which directly contradicts the canonical Gemma
+    # wire format. The Gemma variant rewrites every example with braces and
+    # `<|"|>` string delimiters.
+    instructions: instructions_gemma.md
+  guardrails:
+    file: gemma.yaml
   settings:
     # Google official for Gemma 4 instruct is temp=1.0, top_p=0.95, top_k=64.
     # We run temp=0.3 because the workload is heavy tool-calling / structured

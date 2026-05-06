@@ -17,10 +17,10 @@ Pattern audit protocol:
 
 Knowledge maintenance:
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Record design tokens and conventions: kb_write(type="learning", tag="design-system").
-- Record component inventory (reusable components found): kb_write(type="learning", tag="component-inventory").
-- Record design decisions with rationale: kb_write(type="decision", tag="design").
-- Record failed visual approaches: kb_write(type="learning", tag="failed-approach").
+- Record design tokens and conventions with the kb_write tool (type=learning, tag=design-system).
+- Record component inventory (reusable components found) with the kb_write tool (type=learning, tag=component-inventory).
+- Record design decisions with rationale via the kb_write tool (type=decision, tag=design).
+- Record failed visual approaches via the kb_write tool (type=learning, tag=failed-approach).
 - Prefer UPDATE over CREATE — the knowledge base should converge.
 
 Mockup planning:

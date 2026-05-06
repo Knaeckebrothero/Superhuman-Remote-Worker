@@ -11,7 +11,7 @@ Every review follows this sequence. Do not skip steps or reorder them.
 Read the task description and requirements FIRST. Before examining any deliverables:
 1. List every acceptance criterion (explicit or implied)
 2. For each criterion, define what evidence would demonstrate it is met
-3. Write the criteria using kb_write(type="goal", tag="evaluation-criteria")
+3. Write the criteria with the kb_write tool (type=goal, tag=evaluation-criteria)
 
 This prevents your initial impression of the deliverables from biasing which criteria you apply.
 
@@ -55,7 +55,7 @@ Only after Steps 1-4, write the review report and issue your verdict.
 Review code changes by examining diffs, reading files, and running tests.
 
 1. Get the scope: `git_log` to see commits, `git_tags` to identify phase boundaries
-2. Read the diff: `git_diff(revision="<base>")` to see all changes
+2. Read the diff: invoke `git_diff` against the base revision to see all changes
 3. Read full files for context (diffs alone can mislead)
 4. Run tests: `run_command` with the project's test suite
 5. Run linters/type checkers if available
@@ -212,10 +212,10 @@ Actively look for contradictions — things that don't match:
 ## Knowledge Base Usage
 
 Record your evaluation state using the project knowledge base:
-- Evaluation criteria → kb_write(type="goal", tag="evaluation-criteria")
-- Verdicts issued → kb_write(type="decision", tag="verdict") with one-liner reason
-- Recurring patterns (issues seen multiple times) → kb_write(type="learning", tag="audit-target")
-- Test infrastructure notes (how to run tests, known flaky tests) → kb_write(type="learning", tag="test-infra")
+- Evaluation criteria → kb_write tool (type=goal, tag=evaluation-criteria)
+- Verdicts issued → kb_write tool (type=decision, tag=verdict), one-liner reason in content
+- Recurring patterns (issues seen multiple times) → kb_write tool (type=learning, tag=audit-target)
+- Test infrastructure notes (how to run tests, known flaky tests) → kb_write tool (type=learning, tag=test-infra)
 
 ## Working Principles
 

@@ -563,10 +563,14 @@ class ToolContext:
         required_files = self.get_enforcement_files(tool_name)
         for file_path in required_files:
             if not self.was_recently_read(file_path):
-                return (
-                    f"Error: You must read_file('{file_path}') before using {tool_name}. "
-                    f"It contains critical instructions for this operation. "
-                    f"Read it first, then call {tool_name} again."
+                from src.services.guardrails import format_nudge
+
+                model = self._llm_config.model if self._llm_config is not None else None
+                return format_nudge(
+                    "read_file_required_error",
+                    model=model,
+                    file_path=file_path,
+                    tool_name=tool_name,
                 )
         return None
 

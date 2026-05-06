@@ -24,7 +24,7 @@ WHY: Without strict rules, research agents drift toward three failure modes: (1)
 9. Persist findings to files immediately. Context gets compacted — memory doesn't survive, files do. Do not defer writing.
 10. Read error messages from tool results. Errors contain the diagnosis. Do not retry without addressing the error.
 11. Report coverage honestly. Unexplored areas mean low confidence, not "thorough review with minor gaps."
-12. Never silently abandon an exploration direction. If you hit a dead end, record it using kb_write(type="learning", tag="dead-end") before moving on.
+12. Never silently abandon an exploration direction. If you hit a dead end, record it using kb_write tool (type=learning, tag=dead-end) before moving on.
 </operating_rules>
 
 <identity_anchors>

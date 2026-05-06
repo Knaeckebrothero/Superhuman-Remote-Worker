@@ -847,10 +847,18 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if workspace.exists(path) and not context.was_recently_read(path):
                 existing = workspace.read_file(path)
                 if existing.strip():
-                    return (
-                        f"Error: You must read_file('{path}') before overwriting an existing file. "
-                        f"This ensures you understand the current contents before replacing them. "
-                        f"Read the file first, then call write_file again."
+                    from src.services.guardrails import format_nudge
+
+                    model = (
+                        context._llm_config.model
+                        if context._llm_config is not None
+                        else None
+                    )
+                    return format_nudge(
+                        "read_file_required_error",
+                        model=model,
+                        file_path=path,
+                        tool_name="write_file",
                     )
 
             # Snapshot for undo before writing
@@ -899,16 +907,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Confirmation message or error with guidance
-
-        Examples:
-            # Replace mode (default)
-            edit_file("plan.md", old_string="## Draft", new_string="## Final")
-
-            # Append mode - add to end of file
-            edit_file("notes.md", new_string="\\n## New Section", position="end")
-
-            # Prepend mode - add to start of file
-            edit_file("log.md", new_string="# Header\\n\\n", position="start")
         """
         try:
             if not workspace.exists(path):
@@ -922,10 +920,18 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if not context.was_recently_read(path):
                 existing = workspace.read_file(path)
                 if existing.strip():
-                    return (
-                        f"Error: You must read_file('{path}') before editing. "
-                        f"This ensures you understand the file's current contents. "
-                        f"Read the file first, then call edit_file again."
+                    from src.services.guardrails import format_nudge
+
+                    model = (
+                        context._llm_config.model
+                        if context._llm_config is not None
+                        else None
+                    )
+                    return format_nudge(
+                        "read_file_required_error",
+                        model=model,
+                        file_path=path,
+                        tool_name="edit_file",
                     )
 
             # Validate position parameter

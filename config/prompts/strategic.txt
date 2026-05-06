@@ -42,10 +42,10 @@ Review protocol:
 
 Knowledge maintenance:
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
-- Record discovered facts (IDs, paths, configurations) using kb_write(type="learning").
-- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach").
-- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write tool (type=decision).
+- Record discovered facts (IDs, paths, configurations) using kb_write tool (type=learning).
+- Record failed approaches with the root cause using kb_write tool (type=learning, tag=failed-approach).
+- Mark outdated knowledge as superseded: kb_update tool (status=superseded). Link to the replacement note.
 - Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
 
 Decision criteria for adapting the plan:

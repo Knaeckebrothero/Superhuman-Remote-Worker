@@ -1202,7 +1202,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if metadata.get("repositories"):
                     self._workspace_manager._clone_auxiliary_repos()
 
-                self._todo_manager = TodoManager(workspace=self._workspace_manager)
+                self._todo_manager = TodoManager(
+                    workspace=self._workspace_manager,
+                    model_name=self.config.llm.model,
+                )
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
             logger.warning(
@@ -1245,7 +1248,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.info(f"Switched to expected branch: {expected}")
 
             # Create todo manager for this workspace
-            self._todo_manager = TodoManager(workspace=self._workspace_manager)
+            self._todo_manager = TodoManager(
+                workspace=self._workspace_manager,
+                model_name=self.config.llm.model,
+            )
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}
@@ -1580,7 +1586,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info("Wrote requirement to analysis/requirement_input.md")
 
         # Create todo manager for this workspace
-        self._todo_manager = TodoManager(workspace=self._workspace_manager)
+        self._todo_manager = TodoManager(
+            workspace=self._workspace_manager,
+            model_name=self.config.llm.model,
+        )
 
         # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
         # are deployed in _deploy_instruction_files() after tools are loaded, so that
@@ -1821,6 +1830,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
         strategic_tools = [t for t in self._tools if t.name in strategic_names]
         tactical_tools = [t for t in self._tools if t.name in tactical_names]
+
+        # Inject family-specific Examples blocks into tool descriptions before
+        # binding. This is where the model first sees the tool catalog and
+        # decides on a wire format — see docs/design/guardrails_matrix.md.
+        from src.services.guardrails import apply_guardrails_to_tools
+
+        strategic_tools = apply_guardrails_to_tools(
+            strategic_tools, model=self.config.llm.model
+        )
+        tactical_tools = apply_guardrails_to_tools(
+            tactical_tools, model=self.config.llm.model
+        )
 
         self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
             strategic_tools, **bind_kwargs

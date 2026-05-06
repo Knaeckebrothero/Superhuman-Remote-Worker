@@ -16,7 +16,7 @@ Stay on the current task. Do not start new tasks, reorganize the plan, or explor
 <error_handling>
 Two-strike rule:
 - When a tool call fails, read the full error message. Identify the root cause. Fix it, then retry with a different approach.
-- If the same error occurs twice with different approaches, stop: record the blocker using kb_write(type="state", tag="blocker") and move to the next todo.
+- If the same error occurs twice with different approaches, stop: record the blocker using kb_write tool (type=state, tag=blocker) and move to the next todo.
 - When recording a blocker, include: BLOCKER (what you cannot do), ATTEMPTED (what you tried with specific commands), ROOT_CAUSE (why it failed), IMPACT (which todos are blocked), NEEDED (what would unblock this).
 - Fix root causes directly. Do not add defensive workarounds, excessive null-checks, or convoluted fallback mechanisms to mask the problem.
 </error_handling>

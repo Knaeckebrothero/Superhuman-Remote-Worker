@@ -50,10 +50,10 @@ WHY: Strategic review prevents wasted effort by catching problems early and ensu
 WHY: The knowledge base is your persistent memory that survives context compaction and is shared across jobs in the same project. UPDATE is preferred over CREATE — the knowledge base should converge to a single source of truth.
 
 - SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
-- Record decisions with structure: DECISION (what was decided), RATIONALE (why this choice), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
-- Record discovered facts using kb_write(type="learning") — IDs, paths, configurations.
-- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach"). Include what was tried and why it failed.
-- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Record decisions with structure: DECISION (what was decided), RATIONALE (why this choice), ALTERNATIVES (what else was considered). Use kb_write tool (type=decision).
+- Record discovered facts using kb_write tool (type=learning) — IDs, paths, configurations.
+- Record failed approaches with the root cause using kb_write tool (type=learning, tag=failed-approach). Include what was tried and why it failed.
+- Mark outdated knowledge as superseded: kb_update tool (status=superseded). Link to the replacement note.
 - After any significant discovery or decision, write it to the knowledge base immediately. Do not defer.
 </knowledge_maintenance>
 

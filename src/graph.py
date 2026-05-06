@@ -87,6 +87,7 @@ from .core.state import UniversalAgentState
 from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
+from .services.guardrails import format_nudge
 from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -311,6 +312,56 @@ def _check_empty_response_streak(
     return 0, False
 
 
+def _check_no_tool_call_streak(
+    content_str: str,
+    tool_calls_count: int,
+    current_streak: int,
+    last_hash: str,
+    threshold: int = 3,
+) -> tuple[int, bool, str]:
+    """Track consecutive identical no-tool-call responses (parser-failure signal).
+
+    Catches the case where a response has non-empty content but zero tool calls
+    AND the content repeats verbatim across iterations — the upstream tool-call
+    parser is failing to lift the model's output into structured tool_calls and
+    the agent would otherwise loop forever calling the LLM with unchanged
+    context (e.g. job 3c30d72e: Gemma 4 emitted Python-style ``call:fn(args)``
+    instead of canonical ``call:fn{args}``; vLLM's gemma4 parser refused the
+    format and ``tool_calls`` stayed None for 1385 iterations).
+
+    Distinct from _check_empty_response_streak (which requires content==0).
+    The hash-match condition prevents false positives on legitimate
+    natural-language reflections that happen to produce no tool calls — those
+    vary across iterations and won't accumulate.
+
+    Args:
+        content_str: The response's text content (post-normalization).
+        tool_calls_count: Number of tool calls extracted from the response.
+        current_streak: Current streak count.
+        last_hash: Truncated SHA-256 of the previous iteration's content. Empty
+            string on first call or after a reset.
+        threshold: Number of consecutive identical no-tool responses tolerated.
+
+    Returns:
+        Tuple of (new_streak, should_fail, new_hash). Streak resets to 0 (and
+        new_hash to "") when a tool call is present or content is empty. On a
+        no-tool-call response with new content, streak resets to 1 with the
+        new hash. On a hash match, streak increments.
+    """
+    import hashlib
+
+    if tool_calls_count > 0 or not content_str:
+        return 0, False, ""
+
+    new_hash = hashlib.sha256(
+        content_str.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    if new_hash == last_hash:
+        new_streak = current_streak + 1
+        return new_streak, new_streak > threshold, new_hash
+    return 1, False, new_hash
+
+
 # =============================================================================
 # INITIALIZATION NODES
 # =============================================================================
@@ -528,6 +579,13 @@ def create_execute_node(
     # Codex proxy + langchain Responses API non-streaming path can return
     # stub AIMessages with empty content and dropped tool_calls (#35782).
     _empty_response_streak = [0]
+    # Track consecutive identical no-tool-call responses (parser-failure
+    # signal). Catches malformed tool-call wire formats that the upstream
+    # parser leaves as content text — the empty-response guard above misses
+    # these because content is non-empty.
+    # See docs/issues/gemma_tool_call_parser_loop.md.
+    _no_tool_call_streak = [0]
+    _no_tool_call_last_hash = [""]
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -711,7 +769,9 @@ def create_execute_node(
                 if memories:
                     from src.services.recall_store import RecallStore as _RS
 
-                    _memory_block[0] = _RS.assemble_memory_block(memories)
+                    _memory_block[0] = _RS.assemble_memory_block(
+                        memories, model=config.llm.model
+                    )
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
                     )
@@ -770,7 +830,9 @@ def create_execute_node(
                     match_count=5,
                 )
                 if kb_notes:
-                    _knowledge_block[0] = _KS.assemble_knowledge_block(kb_notes)
+                    _knowledge_block[0] = _KS.assemble_knowledge_block(
+                        kb_notes, model=config.llm.model
+                    )
                     logger.debug(
                         f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
                     )
@@ -1023,6 +1085,85 @@ def create_execute_node(
                         "iteration": iteration + 1,
                     }
 
+                # --- No-tool-call circuit breaker ---
+                # Empty-response guard above misses the case where content is
+                # non-empty but tool_calls is None — happens when the upstream
+                # tool-call parser refuses the model's wire format and returns
+                # the raw output as content (e.g. Gemma 4 emitting parens
+                # instead of canonical braces). Hash-match across iterations
+                # makes this deterministic: legitimate natural-language
+                # reflections vary and won't trip it.
+                content_for_streak = content_str if isinstance(content_str, str) else ""
+                no_tc_streak, no_tc_should_fail, no_tc_hash = (
+                    _check_no_tool_call_streak(
+                        content_str=content_for_streak,
+                        tool_calls_count=tool_calls_count,
+                        current_streak=_no_tool_call_streak[0],
+                        last_hash=_no_tool_call_last_hash[0],
+                    )
+                )
+                _no_tool_call_streak[0] = no_tc_streak
+                _no_tool_call_last_hash[0] = no_tc_hash
+                if no_tc_streak >= 2:
+                    sample = content_for_streak[:200]
+                    logger.warning(
+                        f"[{job_id}] No-tool-call streak {no_tc_streak}/3 "
+                        f"(model={phase_model}, content_sample={sample!r})"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="warning",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "parser_failure",
+                                    "message": (
+                                        "LLM response has content but no "
+                                        "tool_calls; same content repeating "
+                                        "across iterations"
+                                    ),
+                                    "streak": no_tc_streak,
+                                    "model": phase_model,
+                                    "content_sample": sample,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                if no_tc_should_fail:
+                    sample = content_for_streak[:500]
+                    logger.error(
+                        f"[{job_id}] No-tool-call streak exceeded "
+                        f"(streak {no_tc_streak}, model={phase_model}): "
+                        f"failing job"
+                    )
+                    return {
+                        "error": {
+                            "message": (
+                                f"LLM emitted identical non-empty content "
+                                f"with no tool_calls for {no_tc_streak} "
+                                f"consecutive iterations. Likely a tool-call "
+                                f"parser failure — the upstream inference "
+                                f"backend may be returning malformed "
+                                f"tool-call syntax that the parser cannot "
+                                f"lift into structured tool_calls. Verify "
+                                f"the model is emitting the parser's "
+                                f"canonical format. Model: {phase_model}. "
+                                f"Sample: {sample!r}"
+                            ),
+                            "type": "parser_failure",
+                            "recoverable": False,
+                            "streak": no_tc_streak,
+                            "model": phase_model,
+                            "content_sample": sample,
+                        },
+                        "iteration": iteration + 1,
+                    }
+
                 # --- Response degeneration validation ---
                 rv_config = config.limits.response_validation
                 if rv_config.enabled and isinstance(content_str, str) and content_str:
@@ -1055,20 +1196,16 @@ def create_execute_node(
                             )
 
                             ai_summary = AIMessage(
-                                content=(
-                                    "My previous response was degenerate — it contained repetitive or "
-                                    "malformed output that cannot be used. Detected patterns: "
-                                    f"{', '.join(pattern_names)}. I need to retry with a shorter, "
-                                    "more focused response."
+                                content=format_nudge(
+                                    "degenerate_recovery_assistant",
+                                    model=config.llm.model,
                                 )
                             )
                             human_feedback = HumanMessage(
-                                content=(
-                                    "Your last response was detected as degenerate and has been discarded. "
-                                    f"Issues found: {pattern_details}\n\n"
-                                    "Please retry your action. Keep your response concise and focused. "
-                                    "If you were trying to call a tool, make the call with smaller arguments. "
-                                    "Do NOT repeat the same output."
+                                content=format_nudge(
+                                    "degenerate_recovery_user",
+                                    model=config.llm.model,
+                                    pattern_detail=pattern_details,
                                 )
                             )
 
@@ -1234,12 +1371,16 @@ def create_execute_node(
                         )
                         injected_reminder = HumanMessage(
                             content=(
-                                f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
+                                format_nudge(
+                                    "todo_action",
+                                    model=config.llm.model,
+                                    todo_id=first.id,
+                                )
+                                + "\n\n"
                                 "If you already finished the work for this todo, that's perfectly fine — "
-                                "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
+                                "invoke `todo_complete` now to record it. You don't need to redo anything.\n\n"
                                 f"Pending todos ({len(remaining)}):\n"
-                                f"{todo_lines}\n\n"
-                                "Do NOT respond with text. Your next action must be a tool call."
+                                f"{todo_lines}"
                             )
                         )
 
@@ -2800,17 +2941,11 @@ def create_audited_tool_node(
                 _reflection_injected[0] = False
 
                 rewind_msg = SystemMessage(
-                    content=(
-                        f"PHASE BUDGET REACHED: "
-                        f"{calls_used}/{_HARD_CAP} tool calls "
-                        "consumed without completing this phase's objectives. "
-                        "Current todos have been archived.\n\n"
-                        "Before creating new todos:\n"
-                        "1. Review what worked and what didn't in this phase\n"
-                        "2. Update plan.md if the approach needs to change\n"
-                        "3. Create smaller, more focused todos with "
-                        "next_phase_todos()\n\n"
-                        "Do not repeat the same sequence of actions."
+                    content=format_nudge(
+                        "budget_rewind",
+                        model=config.llm.model,
+                        used=calls_used,
+                        cap=_HARD_CAP,
                     )
                 )
                 # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
@@ -2879,11 +3014,8 @@ def create_audited_tool_node(
                 ):
                     msg.content = (
                         (msg.content or "")
-                        + "\n\n[LOOP WARNING] You have called this tool with the "
-                        "same arguments multiple times. You may be stuck in a "
-                        "loop. Consider a different approach: try different "
-                        "arguments, use a different tool, or mark the current "
-                        "todo as blocked and move on."
+                        + "\n\n"
+                        + format_nudge("loop_warning_suffix", model=config.llm.model)
                     )
 
         # Check for workspace unavailable errors (VM connection lost).
@@ -2908,10 +3040,8 @@ def create_audited_tool_node(
                     and msg.content
                     and TOOL_NOT_FOUND_PATTERN in msg.content
                 ):
-                    msg.content += (
-                        "\n\nIf your current todo requires this tool, mark it "
-                        "as blocked using todo_complete with a note explaining "
-                        "which tool is needed, and proceed with the next todo."
+                    msg.content += "\n\n" + format_nudge(
+                        "tool_not_found_suffix", model=config.llm.model
                     )
 
         # Track category failures for logging

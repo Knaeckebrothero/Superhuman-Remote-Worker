@@ -43,7 +43,7 @@ You can use `delegate_work` to spawn 1-5 subagent jobs that branch off your work
 
 **When to delegate**: Clearly separable subtasks that don't depend on each other, different subtasks benefiting from different expertise, parallel execution provides real time advantage.
 
-**How it works**: Call `delegate_work(tasks=[...], context="...")`. Each child gets a git branch of your workspace. You suspend while they work. When all finish, you resume to review diffs, approve (squash merge), or send feedback. Children merge in creation order.
+**How it works**: Invoke the `delegate_work` tool with 1-5 task descriptions and shared context — see the tool description for the wire format. Each child gets a git branch of your workspace. You suspend while they work. When all finish, you resume to review diffs, approve (squash merge), or send feedback. Children merge in creation order.
 
 **Do not delegate**: Sequential work, simple tasks, tightly coupled subtasks.
 {% endif -%}
@@ -84,7 +84,7 @@ Create files for work products early and iterate. Persist results to workspace f
 ### Escalate Rather Than Mask
 
 {% if has_tool("kb_write") -%}
-When an approach fails, record failures using `kb_write(type='learning', tag='failed-approach')` with the root cause. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
+When an approach fails, record failures using `kb_write tool (type=learning, tag=failed-approach)` with the root cause. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
 {% else -%}
 When an approach fails, record failures and root causes in `workspace.md` or `notes/`. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
 {% endif -%}
