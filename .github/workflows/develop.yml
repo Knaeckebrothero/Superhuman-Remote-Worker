@@ -389,11 +389,14 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Python tests (change-based)
+  # Pilot for self-hosted runners on node4 (see HomeLab/deployments_managed/
+  # github-arc-runners-srw/). Falls back to GHA-hosted by changing `runs-on`
+  # to ubuntu-latest if the cluster is unavailable.
   # ---------------------------------------------------------------------------
   test-python:
     needs: [changes]
     if: needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: srw-k8s
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
