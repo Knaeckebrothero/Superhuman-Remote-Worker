@@ -114,10 +114,14 @@ vmController:
 headscale:
   url: ""
   user: "srw"
-  # -- Provide EXACTLY ONE of:
+  # -- Provide EXACTLY ONE source (or leave both empty to fall back to
+  # externalSecrets.vaultPath — see "Layout B" in external-secret.yaml):
   #   apiKeySecret      — name of a pre-existing K8s Secret in this namespace
   #                       with key `api-key` (you create it before install).
   #   apiKeyVaultPath   — Vault path with key `api-key` (chart syncs via ESO).
+  #   <neither>         — the chart pulls HEADSCALE_API_KEY from
+  #                       externalSecrets.vaultPath (the per-controller
+  #                       bundle) when that's set.
   apiKeySecret: ""
   apiKeyVaultPath: ""
 
@@ -128,9 +132,12 @@ headscale:
 # vm-ssh-key Secret). When the orchestrator SSHs into a provisioned VM, the
 # VM's authorized_keys must contain this public key.
 ssh:
-  # -- Provide EXACTLY ONE of:
-  #   publicKey         — inline ssh-ed25519 / ssh-rsa string
+  # -- Provide EXACTLY ONE source (or leave both empty to fall back to
+  # externalSecrets.vaultPath):
+  #   publicKey          — inline ssh-ed25519 / ssh-rsa string
   #   publicKeyVaultPath — Vault path with key `ssh-publickey` (chart syncs via ESO)
+  #   <neither>          — the chart pulls VM_SSH_PUBLIC_KEY from
+  #                        externalSecrets.vaultPath (the per-controller bundle).
   publicKey: ""
   publicKeyVaultPath: ""
 
@@ -142,10 +149,13 @@ ssh:
 # 1's agent.tailscale.enabled) needs to be on the same tailnet to reach them.
 tailscale:
   enabled: false
-  # -- Provide EXACTLY ONE when enabled=true:
+  # -- Provide EXACTLY ONE source when enabled=true (or leave both empty to
+  # fall back to externalSecrets.vaultPath):
   #   authKeySecret     — name of a pre-existing K8s Secret with key
   #                       TAILSCALE_AUTH_KEY (you create it before install).
   #   authKeyVaultPath  — Vault path with key TAILSCALE_AUTH_KEY.
+  #   <neither>         — the chart pulls TAILSCALE_AUTH_KEY from
+  #                       externalSecrets.vaultPath (the per-controller bundle).
   authKeySecret: ""
   authKeyVaultPath: ""
 
