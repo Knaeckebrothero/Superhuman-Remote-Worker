@@ -6,7 +6,7 @@ defaultNamespace: agent-vms
 helm:
   releaseName: srw-vm
   chart: "oci://ghcr.io/knaeckebrothero/charts/srw-dev-vm-cluster"
-  version: "0.0.0-dev.sha.f50eade"
+  version: "0.0.0-dev.sha.4e1a937"
   takeOwnership: true
   values:
     license:
@@ -47,7 +47,7 @@ helm:
     # in-place via yq.
     image:
       vmController:
-        tag: "sha-f50eade"
+        tag: "sha-4e1a937"
     vmController:
       defaultVmImage: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-f50eade"
 dependsOn: []
