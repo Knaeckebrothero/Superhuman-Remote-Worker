@@ -49,6 +49,16 @@ class PersistentProvisioner:
         self._storage_class: str = os.environ.get(
             "WORKSPACE_STORAGE_CLASS", "longhorn-ephemeral"
         )
+        # host/port for the agent's `wait-for-orchestrator` init container,
+        # derived from the chart-injected ORCHESTRATOR_URL (default tracks
+        # the dev release name).
+        from urllib.parse import urlparse
+
+        _orch = urlparse(
+            os.environ.get("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        )
+        self._orchestrator_host: str = _orch.hostname or "srw-orchestrator"
+        self._orchestrator_port: int = _orch.port or 8085
 
     @property
     def is_available(self) -> bool:
@@ -418,7 +428,11 @@ class PersistentProvisioner:
                 "securityContext": {
                     "seccompProfile": {"type": "RuntimeDefault"},
                 },
-                # Wait for orchestrator before starting agent
+                # Wait for orchestrator before starting agent. The host:port
+                # comes from ORCHESTRATOR_URL (chart-injected, defaults to
+                # `http://srw-orchestrator:8085`) so a non-default
+                # fullnameOverride doesn't desync agent init from the actual
+                # orchestrator Service name.
                 "initContainers": [
                     {
                         "name": "wait-for-orchestrator",
@@ -426,7 +440,8 @@ class PersistentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            "until nc -z srw-orchestrator 8085; do sleep 2; done",
+                            f"until nc -z {self._orchestrator_host} "
+                            f"{self._orchestrator_port}; do sleep 2; done",
                         ],
                     }
                 ],
