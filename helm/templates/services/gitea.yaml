@@ -40,10 +40,12 @@ spec:
       {{- end }}
       securityContext:
         fsGroup: 1000
+      {{- if .Values.keycloak.internal }}
       initContainers:
         - name: wait-for-keycloak
           image: busybox:1.36
           command: ["sh", "-c", "until nc -z {{ include "srw.fullname" . }}-keycloak 8080; do sleep 2; done"]
+      {{- end }}
       containers:
         - name: gitea
           image: {{ .Values.gitea.image }}
