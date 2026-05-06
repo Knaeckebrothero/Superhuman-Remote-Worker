@@ -496,10 +496,164 @@ Reproduces 2026-05-05 result; no behavioural drift.
 `tools=[]` being in the request. No change required — flagged here
 only as a reproducibility check.
 
+### Activation hunt — all knobs failed
+
+Added scenarios G, H, I and `probe_deployment()` to
+`tests/manual_test_gemma_reasoning.py` and re-ran against `gemma-4-moe`.
+All four activation paths returned `reasoning_content=empty/absent`:
+
+- **G** — `<|think|>` literal token as a system-prompt prefix.
+- **H** — `developer`-role system message instructing thought-channel
+  format (request was accepted, no HTTP error — the role parses, just
+  doesn't trigger thinking).
+- **I** — thinking prompt + `tools=[]` envelope with `tool_choice="none"`.
+- **D / D_stream re-run** — `chat_template_kwargs.enable_thinking=True`,
+  same as the 2026-05-05 run.
+
+Deployment introspection probes:
+
+- `GET /v1/models/{id}` — returns a minimal model card with no
+  `chat_template` field. The router doesn't expose the template that
+  way.
+- `POST /v1/tokenize` — HTTP 404. Endpoint not enabled on this
+  deployment, so we can't read the rendered prompt to see what tokens
+  the chat template inserts automatically.
+
+**Most informative single data point:** D's `completion_tokens=790` vs
+A's `completion_tokens=270` on the same prompt. The kwarg IS reaching
+vLLM and IS changing the rendered prompt — D's output is nearly 3×
+longer and consistently picks the difference-of-squares approach
+instead of A's distributive-property approach. So the chat template
+responds to `enable_thinking=True` *somehow*; it just doesn't add the
+structural channel-opener tokens that
+`--reasoning-parser gemma4` scans for.
+
+### Deployed cluster ground truth
+
+Inspected `Scripts-and-Notebooks/llm_containers/gemma4-moe-vllm/`:
+
+| Knob | Value |
+|---|---|
+| Default `MODEL` | `google/gemma-4-26B-A4B-it` (`entrypoint.sh:109`) |
+| Base image | `vllm/vllm-openai:v0.19.1` (`Dockerfile:27`) |
+| `TOOL_CALL_PARSER` | `gemma4` (`entrypoint.sh:141`) |
+| `REASONING_PARSER` | `gemma4` (`entrypoint.sh:142`, README claim: "Extracts thinking content") |
+| Auto tool choice | enabled — `--enable-auto-tool-choice --tool-call-parser gemma4` |
+
+The container README says: *"Gemma 4 tool parser is young — pin vLLM ≥
+0.19.0 for fixes (PR #38847, #39468)"*. So the operator team
+believed the reasoning parser would lift thinking content. The flags
+are wired correctly.
+
+### What "the model isn't thinking" actually means
+
+The model **is** producing chain-of-thought prose in every scenario —
+it breaks down the multiplication, picks methods, shows work. The
+reasoning is real. What's missing is the structural marker layer.
+vLLM's `--reasoning-parser gemma4` looks for
+`<|channel>thought ... <channel|>` delimiters in the output stream
+and lifts the wrapped content into `reasoning_content`. Our model
+never emits those delimiters, so the parser has nothing to lift,
+regardless of which activation we try.
+
+Two cleanly separable causes (the website-search Step 4 below should
+pin which one applies):
+
+1. **The deployed model variant doesn't emit channel tokens at all.**
+   Even if base Gemma 4 was trained with thinking-channel emission,
+   `google/gemma-4-26B-A4B-it` (the instruction-tuned MoE) may have
+   shed that capability during fine-tuning, or the README hint about
+   "lower capability ceiling than the 31B dense" may include thinking.
+   No chat-template knob can recover what the model can't emit.
+2. **The chat template has no thinking branch — only a "weak" one.**
+   D's `completion_tokens=790` proves the template responds to
+   `enable_thinking=True`, but probably with a natural-language nudge
+   ("think step by step") rather than channel-opener tokens. A
+   different model with the same template might emit channels; ours
+   doesn't.
+
+These are testable cheaply:
+
+1. **Pull `tokenizer_config.json` from HuggingFace** for
+   `google/gemma-4-26B-A4B-it`. Read the `chat_template` Jinja. If any
+   branch emits `<|channel>thought`, cause #2 is dead — model variant
+   is the issue. If no branch ever emits it, cause #2 is the issue
+   (and a chat-template override would unblock thinking).
+2. **Read vLLM's `gemma4` reasoning parser source code** to confirm
+   what tokens it actually scans for. We assumed `<|channel>thought`
+   based on the leaked-content delimiter pattern from the cockpit
+   screenshot; vLLM may scan for a different opener.
+3. **Web-search for "google/gemma-4-26B-A4B-it" + thinking / channel /
+   reasoning** to see whether anyone else has gotten `reasoning_content`
+   populated on this model under vLLM, and if so, what config they
+   used.
+
+### Cockpit screenshot reframed
+
+Confirmed by user: the screenshot leak came from **cluster
+`gemma-4-moe`** (not Strix) in a **persistent (interactive) session**
+(not a worker job). That's significant because:
+
+- Our diagnostic uses raw httpx + `/v1/chat/completions` non-streaming
+  (worker shape). The persistent path uses LangChain's `astream` via
+  `ChatOpenAI` → `ReasoningChatOpenAI` (`src/llm/reasoning_chat.py`),
+  consumes per-chunk deltas through `src/persistent_graph.py:722`,
+  separately accumulates `delta.content` and `delta.reasoning_content`,
+  and surfaces them to the cockpit via different callback events.
+- If the screenshot showed `<|channel>thought ... <channel|>` text in
+  the user-facing transcript despite cluster-side parser introspection
+  always finding it idle, the leak likely lives in the persistent
+  streaming path or in cockpit's rendering — not in cluster parser
+  configuration.
+
+Updated working hypothesis for the screenshot, in priority order:
+
+1. **Streaming-only delimiter-boundary bug.** vLLM's reasoning-parser
+   state machine (the streaming variant, separate from non-streaming)
+   may match `<|channel>thought` on some delta-chunk boundary
+   conditions but not others. If a chunk arrives mid-delimiter, the
+   parser may surface the partial open tag in `delta.content` before
+   later "correcting" it. Streaming consumers that never receive the
+   correction render the leak.
+2. **Cockpit reasoning rendering.** The cockpit may display
+   `reasoning_content` by re-wrapping it in delimiters for the user
+   ("here's the thinking") and then incorrectly overlay it onto the
+   chat history. Worth auditing how `simple/` and `pages/` render
+   reasoning events.
+3. **A persistent-session-only flag.** `src/persistent_graph.py` or
+   `src/api/persistent_session.py` may set a different `extra_body`
+   that activates thinking — something we don't send from the
+   diagnostic. Worth grepping the persistent path for
+   `extra_body`, `chat_template_kwargs`, `enable_thinking`.
+
+Concrete next probes for the screenshot investigation (separable from
+the cluster activation question, and actually higher-leverage now):
+
+1. **Re-run the thinking diagnostic via LangChain `ChatOpenAI` +
+   astream** rather than raw httpx — same target model, same prompt,
+   same activation kwargs, but production's exact code path. If
+   `reasoning_content` populates this way but not the raw httpx way,
+   the answer is "the persistent streaming path receives signals the
+   non-streaming path doesn't" and we have our screenshot source.
+2. **Grep `src/persistent_graph.py`, `src/api/persistent_session.py`,
+   `src/llm/reasoning_chat.py` for `extra_body`,
+   `chat_template_kwargs`, `enable_thinking`, `<|think|>`** — whatever
+   activation knob the persistent path uses (if any). Quick.
+3. **Find the actual screenshot job/session.** The cockpit chat
+   history should preserve enough metadata to identify which
+   conversation it came from. Extracting the actual prompts from that
+   session would let us replay it locally.
+
+Until #1 or #2 produces signal, the working explanation for the
+screenshot is **persistent-path streaming code (LangChain wrapper,
+cockpit rendering, or a session-only kwarg) leaks delimiters into
+user-visible content** — NOT the cluster activation gap that today's
+hunt failed to close.
+
 ### Files Touched 2026-05-06
 
 ```
-M  tests/manual_test_gemma_reasoning.py              (added scenario F: run_prod_shape_tool_nonstream + ~38 tool defs + multi-turn history + recovery-nudge user turn)
+M  tests/manual_test_gemma_reasoning.py              (added scenario F: run_prod_shape_tool_nonstream + ~38 tool defs + multi-turn history + recovery-nudge user turn; later added scenarios G/H/I + probe_deployment for the activation hunt)
 M  docs/issues/gemma_session_findings.md             (this section)
 ```
 
