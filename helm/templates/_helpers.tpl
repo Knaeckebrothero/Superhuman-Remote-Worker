@@ -274,18 +274,32 @@ Setting both nats.internal=true and nats.url is a chart-render error
 {{- end }}
 
 {{/*
-Name of the K8s Secret holding the bootstrap admin credentials (KC_ADMIN_USER /
-KC_ADMIN_PASSWORD). Resolves to either:
+Effective Vault path the bootstrap ExternalSecret reads from.
+  - If keycloak.bootstrap.adminCredentialsVaultPath is set explicitly, use it.
+  - Otherwise fall back to externalSecrets.vaultPath (the main bundle).
+The fallback lets a single Vault entry serve both runtime and bootstrap, which
+is the common case — KC_ADMIN_*, MCP_OIDC_CLIENT_SECRET, and CLOUD_SERVICE_*
+live alongside the rest of the runtime config.
+Returns "" when neither path is set.
+*/}}
+{{- define "srw.keycloakBootstrapVaultPath" -}}
+{{- coalesce .Values.keycloak.bootstrap.adminCredentialsVaultPath .Values.externalSecrets.vaultPath -}}
+{{- end }}
+
+{{/*
+Name of the K8s Secret holding the bootstrap admin credentials (KC_ADMIN_USER,
+KC_ADMIN_PASSWORD, MCP_OIDC_CLIENT_SECRET, and optionally CLOUD_SERVICE_USER /
+CLOUD_SERVICE_PASSWORD). Resolves to either:
   - the user-provided pre-existing Secret (.Values.keycloak.bootstrap.adminCredentialsSecret), or
   - the chart-managed Secret synced by the bootstrap ExternalSecret pre-install
-    hook (when .Values.keycloak.bootstrap.adminCredentialsVaultPath is set):
+    hook (when an effective Vault path resolves):
     `<fullname>-keycloak-bootstrap-creds`
 */}}
 {{- define "srw.keycloakBootstrapAdminSecretName" -}}
-{{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath -}}
-{{- printf "%s-keycloak-bootstrap-creds" (include "srw.fullname" .) -}}
-{{- else -}}
+{{- if .Values.keycloak.bootstrap.adminCredentialsSecret -}}
 {{- .Values.keycloak.bootstrap.adminCredentialsSecret -}}
+{{- else if include "srw.keycloakBootstrapVaultPath" . -}}
+{{- printf "%s-keycloak-bootstrap-creds" (include "srw.fullname" .) -}}
 {{- end -}}
 {{- end }}
 

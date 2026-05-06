@@ -102,11 +102,13 @@ when .Values.vmController.defaultVmImage is empty.
 {{- end }}
 
 {{/*
-Headscale API key Secret name. Resolves to the user-provided pre-existing
-Secret name OR the chart-managed Secret synced by ESO from Vault.
+Headscale API key Secret name. Returns the chart-managed Secret name when
+either the dedicated Vault path is set OR the bundle path provides it
+(externalSecrets.vaultPath with the HEADSCALE_API_KEY field). Falls back
+to the user-provided pre-existing Secret name.
 */}}
 {{- define "srwvm.headscaleApiKeySecretName" -}}
-{{- if .Values.headscale.apiKeyVaultPath -}}
+{{- if or .Values.headscale.apiKeyVaultPath (and .Values.externalSecrets.enabled .Values.externalSecrets.vaultPath) -}}
 {{- printf "%s-headscale-api-key" (include "srwvm.fullname" .) -}}
 {{- else -}}
 {{- .Values.headscale.apiKeySecret -}}
@@ -114,18 +116,31 @@ Secret name OR the chart-managed Secret synced by ESO from Vault.
 {{- end }}
 
 {{/*
-SSH public key Secret name (used when publicKeyVaultPath is set; otherwise
-the public key goes inline into the VM template ConfigMap).
+SSH public key Secret name (used when the public key is sourced via Vault —
+either the dedicated path or the bundle path). When ssh.publicKey is inline,
+the deployment templates use the inline value directly; this name is unused.
 */}}
 {{- define "srwvm.sshPubKeySecretName" -}}
 {{- printf "%s-ssh-pubkey" (include "srwvm.fullname" .) -}}
 {{- end }}
 
 {{/*
-Tailscale auth key Secret name. Two-way fallback like headscale.
+Whether the SSH public key is provided via a chart-managed Secret (ESO sync
+from either dedicated or bundle path). When false, ssh.publicKey is inline.
+*/}}
+{{- define "srwvm.sshPubKeyFromSecret" -}}
+{{- if .Values.ssh.publicKey -}}
+{{- /* inline */ -}}
+{{- else if or .Values.ssh.publicKeyVaultPath (and .Values.externalSecrets.enabled .Values.externalSecrets.vaultPath) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Tailscale auth key Secret name. Same dedicated-or-bundle resolution.
 */}}
 {{- define "srwvm.tailscaleAuthKeySecretName" -}}
-{{- if .Values.tailscale.authKeyVaultPath -}}
+{{- if or .Values.tailscale.authKeyVaultPath (and .Values.externalSecrets.enabled .Values.externalSecrets.vaultPath) -}}
 {{- printf "%s-tailscale-auth-key" (include "srwvm.fullname" .) -}}
 {{- else -}}
 {{- .Values.tailscale.authKeySecret -}}

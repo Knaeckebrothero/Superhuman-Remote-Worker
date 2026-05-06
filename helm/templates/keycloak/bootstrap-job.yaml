@@ -1,9 +1,10 @@
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.bootstrap.enabled }}
+{{- $effectivePath := include "srw.keycloakBootstrapVaultPath" . -}}
 {{- if and .Values.keycloak.bootstrap.adminCredentialsSecret .Values.keycloak.bootstrap.adminCredentialsVaultPath -}}
 {{- fail "keycloak.bootstrap.adminCredentialsSecret and keycloak.bootstrap.adminCredentialsVaultPath are mutually exclusive — set exactly one. See keycloak.bootstrap in values.yaml." -}}
 {{- end -}}
-{{- if and (not .Values.keycloak.bootstrap.adminCredentialsSecret) (not .Values.keycloak.bootstrap.adminCredentialsVaultPath) -}}
-{{- fail "keycloak.bootstrap.enabled requires either keycloak.bootstrap.adminCredentialsSecret (a pre-created K8s Secret) OR keycloak.bootstrap.adminCredentialsVaultPath (a Vault path the chart syncs via ESO). Both must contain keys KC_ADMIN_USER + KC_ADMIN_PASSWORD. The account needs roles view-realm, view-clients, manage-clients (+ view-users, manage-users when serviceAccounts.cloud.enabled=true) on the <TARGET_REALM>-realm client in the master realm. See keycloak.bootstrap in values.yaml for details." -}}
+{{- if and (not .Values.keycloak.bootstrap.adminCredentialsSecret) (not $effectivePath) -}}
+{{- fail "keycloak.bootstrap.enabled requires a credential source. Either: (a) set keycloak.bootstrap.adminCredentialsSecret to a pre-created K8s Secret (with keys KC_ADMIN_USER, KC_ADMIN_PASSWORD, MCP_OIDC_CLIENT_SECRET, plus CLOUD_SERVICE_USER/PASSWORD when serviceAccounts.cloud.enabled=true); (b) set keycloak.bootstrap.adminCredentialsVaultPath to a dedicated Vault path the chart syncs via ESO; or (c) leave both empty and rely on externalSecrets.vaultPath (the main runtime bundle) — the chart will pull the same keys from there. The Keycloak admin account needs roles view-realm, view-clients, manage-clients (+ view-users, manage-users when serviceAccounts.cloud.enabled=true) on the <TARGET_REALM>-realm client in the master realm." -}}
 {{- end -}}
 {{- $sa := .Values.keycloak.bootstrap.serviceAccounts -}}
 {{- if and $sa $sa.cloud $sa.cloud.enabled -}}
@@ -44,7 +45,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath }}
+      {{- if $effectivePath }}
       # Wait for ESO to sync the bootstrap creds Secret from Vault. The
       # ExternalSecret is created at hook-weight -15 but ESO reconciles
       # asynchronously, so the Secret may not exist yet when this Job
@@ -57,7 +58,9 @@ spec:
             - sh
             - -c
             - |
-              test -s /creds/KC_ADMIN_USER && test -s /creds/KC_ADMIN_PASSWORD
+              test -s /creds/KC_ADMIN_USER && \
+              test -s /creds/KC_ADMIN_PASSWORD && \
+              test -s /creds/MCP_OIDC_CLIENT_SECRET
           volumeMounts:
             - name: bootstrap-creds
               mountPath: /creds
@@ -95,12 +98,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: KC_ADMIN_PASSWORD
-            # MCP client secret: from the main app secret. The same value the
-            # MCP server reads at runtime, so the chart guarantees they match.
+            # MCP client secret: pulled from the bootstrap-creds Secret (same
+            # Vault path as the runtime srw Secret by default), so the value
+            # the kcadm Job registers in Keycloak matches what the MCP server
+            # reads at runtime. Sourced via the bootstrap-creds Secret instead
+            # of the runtime srw Secret to avoid the pre-install / main-install
+            # hook-ordering race (the runtime Secret doesn't exist yet here).
             - name: MCP_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: MCP_OIDC_CLIENT_SECRET
             {{- if and $sa $sa.cloud $sa.cloud.enabled }}
             # Cloud service-account user — created in TARGET_REALM. Username
@@ -121,13 +128,13 @@ spec:
             - name: CLOUD_SERVICE_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: CLOUD_SERVICE_USER
                   optional: true
             - name: CLOUD_SERVICE_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: CLOUD_SERVICE_PASSWORD
             {{- end }}
           volumeMounts:
@@ -141,7 +148,7 @@ spec:
           configMap:
             name: {{ include "srw.keycloakBootstrapName" . }}
             defaultMode: 0755
-        {{- if .Values.keycloak.bootstrap.adminCredentialsVaultPath }}
+        {{- if $effectivePath }}
         - name: bootstrap-creds
           secret:
             secretName: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
