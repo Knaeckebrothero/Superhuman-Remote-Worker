@@ -393,9 +393,119 @@ M  docs/issues/gemma_tool_call_parser_loop.md        (status table, root cause 1
 A  docs/issues/gemma_session_findings.md             (this doc)
 ```
 
+## 2026-05-06 Validation Run
+
+Re-ran the diagnostic script against `gemma-4-moe` after the 2026-05-05
+patches. Three results to log.
+
+### Scenario F — implemented, **clean**
+
+Production-shape replay of job `3c30d72e` mid-job conditions (proposal B
+above) is now in `tests/manual_test_gemma_reasoning.py` as
+`run_prod_shape_tool_nonstream`:
+
+- Two system messages totalling ~2.4k tokens — rendered
+  `systemprompt_gemma` + tactical phase directive + task instructions.
+- 38 OpenAI-format tool definitions mirroring the worker registry
+  (`read_file`, `write_file`, `kb_search`, `kb_write`, `cite_*`,
+  `web_search`, `search_papers`, git tools, shell tools, todo
+  management, …).
+- Multi-turn history with three prior assistant `tool_calls`
+  (kb_search → read_file → write_file), each followed by a substantive
+  tool result (KB search excerpt, plan.md content, write confirmation).
+- Final `user` turn = verbatim format-neutral recovery nudge from
+  `config/guardrails/gemma.yaml` `todo_action` plus the suffix wired
+  in `src/graph.py:1380`.
+- Total: `prompt_tokens=5028`, `completion_tokens=47`,
+  `finish_reason=tool_calls`.
+
+**Result:** structured `tool_calls[0]: name=todo_complete args={"result":
+"Searched KB for ..."}`. Content empty, no leaked delimiters,
+`wire=(none detected)`. The model emitted exactly the canonical brace
+form, vLLM's `gemma4` parser lifted it into structured tool_calls, and
+the harness would proceed cleanly.
+
+**Implication:** The 2026-05-05 prompt fixes hold up at production
+scale. The hypothesis "prompt scale alone triggers parens drift even
+with `tools=[]`" is **disconfirmed at ~5k prompt tokens**. **Proposal
+B status: DONE / PASSED.**
+
+Caveat: F is still smaller than the real failing job (~5k vs ~30k
+prompt tokens at iter 18-21). If a future failure recurs at higher
+scale, F can be extended (longer history, larger tool_results) before
+concluding scale is irrelevant. For now the smaller repro is sufficient
+evidence that the patches do their job under realistic-but-moderate
+load.
+
+### Scenarios D and D_stream — re-run, still empty
+
+Both D variants (`chat_template_kwargs.enable_thinking=True`,
+non-stream and stream) returned `reasoning_content=empty/absent` on
+this run, identical to the 2026-05-05 result. The kwarg is confirmed
+not to activate the reasoning channel on this deployment. One subtle
+data point worth recording: D's `completion_tokens=490` was nearly
+double A's `completion_tokens=259` on the same prompt, and the two
+runs picked different mathematical approaches (A: distributive
+property; D: difference of squares). The kwarg is having *some*
+prompt-level effect, just not the structural one we want — vLLM's
+parser is not lifting any of the longer output into
+`reasoning_content`.
+
+**Implication:** Eliminates "we just need to send the right kwarg" as
+a quick fix. Among the three hypotheses listed in finding 4,
+hypothesis 3 ("Gemma 4 needs a different thinking-mode trigger") is
+now the working one. The thinking-mode investigation needs in-script
+probes to locate the actual activation knob before any agent-side
+change makes sense — wiring `enable_thinking=True` into
+`config/settings_matrix.yaml` would just send a flag we already know
+does nothing.
+
+Probes ahead, to be added to the diagnostic script:
+
+1. **Deployment introspection.** `GET /v1/models/{id}` and
+   `POST /v1/tokenize` with `add_generation_prompt=True` — read what
+   the chat template actually renders, including any thinking-mode
+   tokens the template inserts automatically.
+2. **Scenario G — `<|think|>` literal token as system-prompt prefix.**
+   Some chat templates gate thinking on a literal token in the
+   prompt rather than a kwarg.
+3. **Scenario H — `developer`-role system message** instructing the
+   thought-channel format explicitly. OpenAI introduced `developer`
+   role in late 2024; some chat templates branch on it.
+4. **Scenario I — thinking prompt combined with `tools=[]`
+   envelope** (`tool_choice="none"` so the model isn't forced to
+   call a tool). Tests whether tools-mode forces thinking off, which
+   would make production thinking impossible regardless of activation
+   knob — every worker request ships with `tools=[]`.
+
+**Proposal C status: NARROWED.** No longer "investigate the leak path"
+ — now "find the activation knob, then audit `src/persistent_graph.py:722`
+and `src/core/archiver.py:599` to confirm the captured field flows
+through both worker and persistent paths."
+
+### Scenario E — re-run, reproduced
+
+`gemma-4-moe` again emitted
+`<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>`
+perfectly when the tool was described in the system prompt without
+a `tools=[]` envelope. vLLM did not lift it: `finish_reason=stop`,
+`tool_calls=null`, `wire_format_hits=['canonical_braces']`.
+Reproduces 2026-05-05 result; no behavioural drift.
+
+**Implication:** vLLM's `gemma4` tool-call parser remains gated on
+`tools=[]` being in the request. No change required — flagged here
+only as a reproducibility check.
+
+### Files Touched 2026-05-06
+
+```
+M  tests/manual_test_gemma_reasoning.py              (added scenario F: run_prod_shape_tool_nonstream + ~38 tool defs + multi-turn history + recovery-nudge user turn)
+M  docs/issues/gemma_session_findings.md             (this section)
+```
+
 ## References
 
-- `tests/manual_test_gemma_reasoning.py` — diagnostic script (6 scenarios)
+- `tests/manual_test_gemma_reasoning.py` — diagnostic script (10 scenarios as of 2026-05-06: A/B baseline thinking, C/E/F tool-call shape, D/D_stream `enable_thinking` kwarg, G/H/I thinking-activation hunt, plus per-model `/v1/models` and `/v1/tokenize` introspection probe)
 - `docs/issues/gemma_tool_call_parser_loop.md` — incident-focused issue doc
 - `docs/model_issues.md` — earlier failed-job notes
 - `Scripts-and-Notebooks/llm_containers/gemma4-moe-vllm/entrypoint.sh` — cluster vLLM launch flags
