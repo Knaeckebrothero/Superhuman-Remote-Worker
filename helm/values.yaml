@@ -419,30 +419,40 @@ keycloak:
   # Keycloak image we already pull for internal mode, so no extra build.
   #
   # MCP secret is *supplied* (not generated): the Job reads MCP_OIDC_CLIENT_SECRET
-  # from the main app Secret and registers it in Keycloak. This keeps Vault as
-  # the source of truth for the secret and avoids chart-owned writeback.
+  # from Vault and registers it in Keycloak. This keeps Vault as the source of
+  # truth for the secret and avoids chart-owned writeback.
   bootstrap:
     enabled: false
-    # -- Source of the bootstrap admin credentials (KC_ADMIN_USER + KC_ADMIN_PASSWORD)
-    # used by the Job to drive kcadm. When bootstrap.enabled=true, set EXACTLY ONE of:
+    # -- Source of the bootstrap credentials. The bootstrap Job needs:
+    #     • KC_ADMIN_USER, KC_ADMIN_PASSWORD     (always)
+    #     • MCP_OIDC_CLIENT_SECRET               (always)
+    #     • CLOUD_SERVICE_USER, CLOUD_SERVICE_PASSWORD
+    #                                            (when serviceAccounts.cloud.enabled=true)
+    #
+    # When bootstrap.enabled=true, pick one of:
     #
     #   adminCredentialsSecret       — name of a pre-existing K8s Secret in the
-    #                                  release namespace, with keys KC_ADMIN_USER
-    #                                  and KC_ADMIN_PASSWORD. You create it before
-    #                                  `helm install` (kubectl create secret ...).
+    #                                  release namespace, holding ALL of the keys
+    #                                  above. You create it before `helm install`
+    #                                  (kubectl create secret ...).
     #
     #   adminCredentialsVaultPath    — Vault path (e.g.
-    #                                  "homelab/<ns>/keycloak-bootstrap") containing
-    #                                  the same two keys. The chart renders an
+    #                                  "homelab/<ns>/keycloak-bootstrap") holding
+    #                                  the keys above. The chart renders an
     #                                  ExternalSecret as a pre-install hook
     #                                  (weight -15, runs before the bootstrap Job
-    #                                  at -5); ESO syncs Vault → K8s Secret. The
-    #                                  bootstrap Job's init container waits for
-    #                                  the Secret to materialize before the main
-    #                                  container runs. Requires externalSecrets.enabled=true
-    #                                  and externalSecrets.secretStoreRef configured.
+    #                                  at -5) that ESO syncs into a K8s Secret.
+    #                                  Requires externalSecrets.enabled=true.
     #
-    # Setting both, or neither, is a chart-render error.
+    #   <neither set>                — when both knobs are empty, the chart falls
+    #                                  back to externalSecrets.vaultPath (the main
+    #                                  runtime bundle) and ESO selects the keys
+    #                                  above from there. Recommended for new
+    #                                  deployments — one Vault entry serves both
+    #                                  runtime and bootstrap.
+    #
+    # Setting BOTH adminCredentialsSecret and adminCredentialsVaultPath is a
+    # chart-render error.
     #
     # Required roles for the credentials (assign via the master realm, on the
     # `<TARGET_REALM>-realm` client — e.g. `home-realm` if you're bootstrapping
