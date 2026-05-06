@@ -82,22 +82,25 @@ data:
       sed -e 's/["[:space:]\r]//g' -e '/^$/d' -e '/^id$/d' | head -n1
     }
 
+    # All diagnostic + kcadm output goes to stderr; only the final UUID
+    # lands on stdout, so callers can do `MCP_UUID=$(upsert_client ...)`
+    # without capturing the "[bootstrap] updating ..." log lines.
     upsert_client() {
       local cid="$1" payload="$2" uuid
       uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
         --fields id --format csv --noquotes 2>/dev/null \
         | extract_id || true)
       if [ -n "$uuid" ]; then
-        echo "[bootstrap]   updating $cid (id=$uuid)"
-        "$KCADM" update "clients/$uuid" -r "$TARGET_REALM" -f "$payload"
+        echo "[bootstrap]   updating $cid (id=$uuid)" >&2
+        "$KCADM" update "clients/$uuid" -r "$TARGET_REALM" -f "$payload" >&2
       else
-        echo "[bootstrap]   creating $cid"
-        "$KCADM" create clients -r "$TARGET_REALM" -f "$payload"
+        echo "[bootstrap]   creating $cid" >&2
+        "$KCADM" create clients -r "$TARGET_REALM" -f "$payload" >&2
         uuid=$("$KCADM" get clients -r "$TARGET_REALM" -q "clientId=$cid" \
           --fields id --format csv --noquotes 2>/dev/null \
           | extract_id)
       fi
-      echo "$uuid"
+      printf '%s' "$uuid"
     }
 
     # ------------------------------------------------------------------
@@ -179,7 +182,7 @@ data:
         exit 1
       fi
       echo "[bootstrap] === cloud service account: $CLOUD_USER (realm $TARGET_REALM) ==="
-      USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
+      USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" -q "exact=true" \
         --fields id --format csv --noquotes 2>/dev/null \
         | extract_id || true)
       if [ -n "$USER_ID" ]; then
@@ -197,7 +200,7 @@ data:
           ${BOOTSTRAP_CLOUD_EMAIL:+-s "email=$BOOTSTRAP_CLOUD_EMAIL" -s "emailVerified=true"} \
           ${BOOTSTRAP_CLOUD_FIRST_NAME:+-s "firstName=$BOOTSTRAP_CLOUD_FIRST_NAME"} \
           ${BOOTSTRAP_CLOUD_LAST_NAME:+-s "lastName=$BOOTSTRAP_CLOUD_LAST_NAME"} >/dev/null
-        USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" --exact \
+        USER_ID=$("$KCADM" get users -r "$TARGET_REALM" -q "username=$CLOUD_USER" -q "exact=true" \
           --fields id --format csv --noquotes 2>/dev/null \
           | extract_id)
       fi
