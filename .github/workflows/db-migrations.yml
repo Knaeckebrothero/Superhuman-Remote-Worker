@@ -122,14 +122,14 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
         run: |
-          python orchestrator/database/migrate.py \
+          python -m orchestrator.database.migrate \
             --dir orchestrator/database/migrations/app \
             --dry-run
       - name: Dry-run vector migrations
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
         run: |
-          python orchestrator/database/migrate.py \
+          python -m orchestrator.database.migrate \
             --dir orchestrator/database/migrations/vector \
             --dry-run
 
