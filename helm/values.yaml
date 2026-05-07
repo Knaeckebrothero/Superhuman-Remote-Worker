@@ -232,12 +232,18 @@ headscale:
 databases:
   postgres:
     enabled: true
-    # -- Deploy StatefulSet within chart (false = external database — set externalUrl)
+    # -- Deploy StatefulSet within chart (false = external database — set
+    # externalHost/externalPort/externalDb below)
     internal: true
-    # -- Full database URL for external mode. Required when internal=false.
-    # When internal=true, DATABASE_URL is read from secrets.
-    # Example: "postgres://user:pass@my-pg.db.svc:5432/srw"
-    externalUrl: ""
+    # -- External mode connection parts (used when internal=false). The
+    # DSN is composed at runtime as
+    # ``postgresql://<user>:<password>@<externalHost>:<externalPort>/<externalDb>``
+    # where user/password come from the Secret (POSTGRES_USER /
+    # POSTGRES_PASSWORD) — never from a single bundled URL key. This avoids
+    # the urlsplit/`/`-encoding footgun of ``DATABASE_URL`` in Vault.
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "srw"
     image: pgvector/pgvector:pg15
     storageClass: ""
     storageSize: "10Gi"
@@ -251,8 +257,11 @@ databases:
   vector:
     enabled: true
     internal: true
-    # -- Full vector DB URL for external mode. Example: "postgresql://user:pass@vector-pg:5432/srw_vector"
-    externalUrl: ""
+    # -- External mode connection parts. See ``databases.postgres`` above for
+    # the rationale (credentials live in the Secret, not a bundled URL).
+    externalHost: ""
+    externalPort: 5432
+    externalDb: "srw_vector"
     image: pgvector/pgvector:pg15
     storageClass: ""
     storageSize: "10Gi"
@@ -305,6 +314,16 @@ databases:
     internal: true
     # -- Full Neo4j Bolt URL for external mode. Example: "bolt://my-neo4j.db.svc:7687"
     externalUrl: ""
+    # -- Auth user. Community edition allows only "neo4j"; enterprise can
+    # admit a different name. The chart composes NEO4J_AUTH for the server
+    # image as ``<username>/$(NEO4J_PASSWORD)``, so only the password lives
+    # in Vault — username + URL are non-secret.
+    #
+    # NOTE: don't put a "/" in NEO4J_PASSWORD. The Neo4j image splits
+    # NEO4J_AUTH on the first slash, so a "/"-bearing password mis-parses
+    # server-side and Bolt comes up unauthenticated. Use URL-safe base64
+    # or any alphabet without "/".
+    username: "neo4j"
     # -- Edition: "community" (default) or "enterprise". Enterprise unlocks
     #    multi-database, fine-grained RBAC, online backup, hot replicas, and
     #    better query planning. Free under Neo4j's Startup Program (<$10M
@@ -321,13 +340,37 @@ databases:
     image: ""
     storageClass: ""
     storageSize: "10Gi"
+    # -- Neo4j Browser web UI (HTTP/7474) Ingress. Off by default — the DB
+    # itself is reachable in-cluster on the Bolt port via the always-on
+    # ClusterIP service, which is all the orchestrator/agents need. Turn this
+    # on only if a human operator wants the Browser SPA. NOTE: enabling this
+    # alone produces a *non-functional* UI — the SPA opens a Bolt WebSocket
+    # back to NEO4J_server_bolt_advertised__address, so you also need
+    # loadBalancer.enabled + boltTls.enabled below, plus a DNS record for the
+    # neo4jBolt hostname pointing at the LoadBalancer IP.
+    browser:
+      enabled: false
     # -- Bolt TLS certificate via cert-manager (optional, internal-only)
     boltTls:
       enabled: false
       issuerName: ""
-    # -- LoadBalancer for direct Bolt access (optional, internal-only)
+    # -- LoadBalancer for direct Bolt access (optional, internal-only).
+    # Required when the Neo4j Browser UI is exposed via Ingress: the JS app
+    # served at 7474 opens a Bolt WebSocket from the user's browser back to
+    # NEO4J_server_bolt_advertised__address (i.e. <neo4jBolt host>:7688), so
+    # that hostname must resolve to a TCP-reachable IP. Traefik HTTP ingress
+    # can't carry raw Bolt — this Service exposes it via MetalLB instead.
     loadBalancer:
       enabled: false
+      # -- Pin a specific IP from the MetalLB pool. Rendered as the
+      # `metallb.universe.tf/loadBalancerIPs` annotation (preferred over the
+      # deprecated `spec.loadBalancerIP` field). Leave empty to let MetalLB
+      # auto-assign from the pool.
+      ip: ""
+      # -- Name of the MetalLB IPAddressPool to draw from. Rendered as the
+      # `metallb.universe.tf/ip-address-pool` annotation. Leave empty to use
+      # MetalLB's default pool selection.
+      ipAddressPool: ""
     # -- JVM heap and OS-level page cache. Neo4j 5 auto-detects from the cgroup
     #    limit and routinely overshoots, refusing to start with "Invalid memory
     #    configuration - exceeds physical memory". Pin both explicitly. Together

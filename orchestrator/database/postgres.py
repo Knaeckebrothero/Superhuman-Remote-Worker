@@ -33,6 +33,8 @@ from security.crypto import (
     is_encrypted,
 )
 
+from orchestrator.utils.db_url import build_postgres_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,9 +211,13 @@ class PostgresDB:
                 "Install it with: pip install asyncpg"
             )
 
-        self._connection_string = connection_string or os.getenv(
-            "DATABASE_URL",
-            "postgresql://srw:srw_password@localhost:5432/srw",
+        self._connection_string = (
+            connection_string
+            or build_postgres_url(
+                "POSTGRES",
+                fallback_env="DATABASE_URL",
+            )
+            or "postgresql://srw:srw_password@localhost:5432/srw"
         )
 
         self._min_connections = min_connections or int(

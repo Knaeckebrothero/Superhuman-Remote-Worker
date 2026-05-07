@@ -5,13 +5,27 @@ metadata:
   labels:
     {{- include "srw.labels" . | nindent 4 }}
 data:
-  # PostgreSQL (App DB) — non-secret config only
-  # DATABASE_URL (with credentials) is in the Secret
-  POSTGRES_DB: {{ "srw" | quote }}
+  # PostgreSQL (App DB) — non-secret connection parts. The DSN is composed
+  # at runtime from these + POSTGRES_USER/POSTGRES_PASSWORD (Secret), with
+  # URL-quoting applied to the credentials. Storing a full DATABASE_URL in
+  # the Secret was redundant and a footgun (urlsplit truncates netlocs at
+  # the first ``/`` — passwords with a slash broke config parsing).
+  POSTGRES_HOST: {{ include "srw.postgresHost" . | quote }}
+  POSTGRES_PORT: {{ include "srw.postgresPort" . | quote }}
+  POSTGRES_DB: {{ include "srw.postgresDb" . | quote }}
 
-  # Vector DB — non-secret config only
-  # VECTOR_DB_URL (with credentials) is in the Secret
-  VECTOR_POSTGRES_DB: {{ "srw_vector" | quote }}
+  # Vector DB — non-secret connection parts. Composed with
+  # VECTOR_POSTGRES_USER/VECTOR_POSTGRES_PASSWORD from the Secret.
+  VECTOR_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
+  VECTOR_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
+  VECTOR_POSTGRES_DB: {{ include "srw.vectorPostgresDb" . | quote }}
+
+  # Citation Engine DB — runs on the pgvector instance under its own role
+  # (srw_citations) and dedicated database (citation_engine). Composed with
+  # CITATION_POSTGRES_USER/PASSWORD from the Secret.
+  CITATION_POSTGRES_HOST: {{ include "srw.vectorPostgresHost" . | quote }}
+  CITATION_POSTGRES_PORT: {{ include "srw.vectorPostgresPort" . | quote }}
+  CITATION_POSTGRES_DB: {{ "citation_engine" | quote }}
 
   # MongoDB
   MONGODB_URL: {{ include "srw.mongodbUrl" . | quote }}
@@ -58,8 +72,9 @@ data:
   KEY_COOLDOWN_SECONDS: {{ .Values.llm.keyCooldownSeconds | quote }}
 
   # Citation Engine — embedding lives outside the catalog table for now
-  # (separate code path; not gated by readiness). Stays env-driven.
-  # CITATION_DB_URL (with credentials) is in the Secret.
+  # (separate code path; not gated by readiness). Stays env-driven. The
+  # citation DSN is composed from CITATION_POSTGRES_* above + the user/
+  # password from the Secret (no CITATION_DB_URL key needed in Vault).
   CITATION_EMBEDDING_MODEL: {{ .Values.citation.embeddingModel | quote }}
   CITATION_EMBEDDING_URL: {{ .Values.citation.embeddingUrl | quote }}
 
@@ -70,9 +85,14 @@ data:
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
 
-  # Neo4j
+  # Neo4j — username is non-secret config (community edition only allows
+  # "neo4j" anyway; enterprise can override via databases.neo4j.username).
+  # The Neo4j server image's NEO4J_AUTH env var is composed at pod-start
+  # from this + NEO4J_PASSWORD via K8s $(VAR) substitution, so Vault only
+  # needs to hold NEO4J_PASSWORD.
   {{- if .Values.databases.neo4j.enabled }}
   NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
+  NEO4J_USERNAME: {{ .Values.databases.neo4j.username | default "neo4j" | quote }}
   DEFAULT_DS_NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
   DEFAULT_DS_NEO4J_NAME: {{ "Default Neo4j" | quote }}
   DEFAULT_DS_NEO4J_READ_ONLY: {{ "false" | quote }}
