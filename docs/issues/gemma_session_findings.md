@@ -668,3 +668,308 @@ M  docs/issues/gemma_session_findings.md             (this section)
   - `69f9ae29814035427a50d671` — job 3c30d72e iter 0 (clean strategic phase request)
   - `69f9ae49814035427a50d6b9` — iter 18 (first parens drift; 30k prompt tokens)
   - `69f9ae4d814035427a50d6c2` — iter 21 (smoking gun: recovery nudge teaches parens, model copies them back)
+
+## 2026-05-07 — vLLM #38855 hypothesis tested, disconfirmed
+
+After the 2026-05-06 hunt failed to find an activation knob, web research
+on `google/gemma-4-26B-A4B-it` + vLLM thinking surfaced what looked like
+the real cause: vLLM Issue #38855 (tokenizer detokenization strips
+`<|channel>` markers before the gemma4 reasoning parser scans them).
+The proposed fix was a two-knob combo (`enable_thinking=True` +
+`skip_special_tokens=False`). We added scenarios J and K to
+`tests/manual_test_gemma_reasoning.py`, ran them against
+`gemma-4-moe`, and the workaround **did not apply** on this
+deployment. The hypothesis-and-fix sub-section below is preserved as
+context; the validation sub-section after it records what actually
+happened and the revised working theory.
+
+### Cause: vLLM tokenizer detokenization strips channel tokens before parsing
+
+Per the HuggingFace model card for `google/gemma-4-26B-A4B-it`:
+
+- The model **does** emit `<|channel>thought\n[reasoning]<channel|>[answer]`
+  natively when thinking is activated.
+- Activation is `<|think|>` token (id `98`) at the start of the system
+  prompt — which is exactly what
+  `chat_template_kwargs.enable_thinking=True` injects via the model's
+  bundled chat template.
+- vLLM's `--reasoning-parser gemma4` (a purpose-built parser, not generic)
+  is wired to lift those exact delimiters into `reasoning_content`.
+
+So why was scenario D returning empty `reasoning_content` despite
+`completion_tokens=790` (model thinking 3× longer than baseline)?
+
+**vLLM Issue #38855:** the OpenAI-compatible chat completion endpoint
+runs detokenization with `skip_special_tokens=True` by default, **which
+strips `<|channel>` / `<channel|>` from the text stream BEFORE the
+gemma4 reasoning parser scans for them**. The parser sees text without
+delimiters, has nothing to lift, returns empty `reasoning_content`. The
+model's reasoning prose ends up in `content` (without the delimiters,
+since they were already stripped — which is exactly why scenario A's
+`content` looked clean and conversational rather than channel-formatted).
+
+This explains every previously-puzzling observation:
+
+| Observation | Now explained |
+|---|---|
+| D `completion_tokens=790` vs A `=270` | Model IS thinking longer with the kwarg; the kwarg works |
+| D `reasoning_content` always empty | Delimiters stripped before parser sees them |
+| D `content` reads as long natural-language reasoning | Delimiters stripped, prose remains |
+| Scenario E (no `tools=[]`) shows `wire_format_hits=['canonical_braces']` for tool calls | Tool-call parser's `<|tool_call>` markers ARE preserved in some code paths — confirms not all special tokens are stripped uniformly. The reasoning markers specifically suffer #38855. |
+| All of G/H/I empty | Same root cause; activation isn't the problem |
+
+### The fix: two-knob combo from the vLLM Gemma 4 recipe page
+
+```python
+extra_body={
+    "skip_special_tokens": False,
+    "chat_template_kwargs": {"enable_thinking": True},
+}
+```
+
+Captured in `tests/manual_test_gemma_reasoning.py` as:
+
+- **Scenario J** — non-streaming with both flags. Confirms the workaround
+  on the cluster.
+- **Scenario K** — same payload, streaming. Tests whether the streaming
+  reasoning parser (a separate incremental state machine) is fixed by
+  the same flag.
+
+Pending validation run. Expected outcomes:
+
+- J populated + content clean → confirms #38855; fix is one config-matrix entry.
+- K populated → both paths fixed; cockpit leak is downstream rendering.
+- K empty/LEAKED → streaming parser still bugged; persistent path needs separate mitigation.
+
+### Persistent-path audit: no divergent request envelope
+
+Grepped `src/persistent_graph.py`, `src/api/persistent_session.py`,
+`src/api/persistent_app.py`, `src/llm/reasoning_chat.py`,
+`src/core/loader.py`, `orchestrator/`, and `config/` for
+`extra_body`, `skip_special_tokens`, `chat_template_kwargs`,
+`enable_thinking`, `<|think|>`, `<|channel>`. **Zero hits anywhere
+except `src/core/loader.py`, where `extra_body` carries only
+`top_k`** (lines 1932-1937, 2225-2227, 2344-2346 for the three
+provider branches).
+
+This kills hypothesis 3 from the 2026-05-06 cockpit-screenshot section
+("a persistent-session-only flag activates thinking"). Worker and
+persistent paths share `loader.py` and ship **identical request
+envelopes** to vLLM. The screenshot leak cannot be attributed to a
+divergent request shape — it must come from one of:
+
+1. **vLLM streaming-parser variant of #38855** — the streaming
+   incremental state machine may handle delimiter boundaries differently
+   from the non-streaming path, leaking partial channel markers into
+   `delta.content` chunks. Scenario K resolves this.
+2. **Cockpit rendering** — reasoning content is rendered with
+   delimiter wrapping somewhere in `cockpit/src/app/simple/` or
+   `cockpit/src/app/pages/` chat views, then incorrectly overlaid on
+   the chat history. Audit downstream of `PersistentChatService`
+   reasoning event handlers.
+3. **LangChain wrapper passthrough** — `src/llm/reasoning_chat.py`
+   accumulates `reasoning_content` from delta chunks into
+   `additional_kwargs`. If a delta contains `<|channel>thought` text
+   in the `content` field (because the streaming parser leaked it),
+   the wrapper has no logic to strip it — it just forwards content to
+   the consumer.
+
+### Open question: why does the screenshot show delimiters at all?
+
+If both worker and persistent paths send identical envelopes WITHOUT
+`skip_special_tokens=False`, vLLM should be stripping delimiters on
+both — yet the cockpit screenshot showed raw `<|channel>thought ...
+<channel|>` text in user-visible content. Two possibilities:
+
+- **Streaming detokenization races.** vLLM's streaming detokenizer may
+  surface a partial delimiter (e.g. `<|channel>` arrives in chunk N,
+  `thought` in chunk N+1) before `skip_special_tokens=True` is applied
+  retroactively. The user briefly sees the partial token; the
+  finalization "corrects" it but the streaming consumer already
+  rendered.
+- **The screenshot session ran on a different deployment version.**
+  vLLM #38855 is open against current main; the cluster is on
+  `vllm/vllm-openai:v0.19.1`. If 0.19.1 stripped tokens unreliably and
+  the bug was tightened in a later patch (or vice versa), behaviour
+  would have been different at screenshot time.
+
+Both are answerable from the current diagnostic + a re-screenshot of
+a fresh persistent session against the same model. Defer until J/K
+results are in.
+
+### Validation: J/K results — workaround insufficient
+
+Ran scenarios J and K against `gemma-4-moe` after appending them to the
+diagnostic script.
+
+| Scenario | reasoning_content | content | completion_tokens | finish_reason |
+|---|---|---|---|---|
+| A baseline (no kwargs) | empty | clean prose | 220 | stop |
+| D (`enable_thinking=True`) | empty | clean prose | 524 | stop |
+| **J (D + `skip_special_tokens=False`)** | **empty** | **clean prose** | **738** | **stop** |
+| K (J + streaming) | empty | clean prose (cut off, finish=length at 800) | n/a | length |
+| E (tool-in-prompt, no `tools=[]`) | empty | `<|tool_call>...<tool_call|>` LEAKED | 15 | stop |
+
+Two data points falsify the #38855 hypothesis as our cluster's actual
+cause:
+
+1. **Selective strip pattern.** Scenario E shows `<|tool_call>` markers
+   surviving detokenization intact in `content`
+   (`wire_format_hits=['canonical_braces']`). If `skip_special_tokens=
+   True` was uniformly stripping all special tokens before the response
+   left vLLM, those tool-call markers would be gone too. They aren't.
+   So vLLM is not blanket-stripping `<|channel>` tokens via the
+   detokenization path; the strip pattern is selective in a way that
+   #38855 doesn't describe.
+2. **`skip_special_tokens=False` does change vLLM's behavior — but in a
+   way that doesn't surface delimiters anywhere.** J's
+   `completion_tokens=738` is 40% higher than D's 524 and 3.4× the
+   baseline A's 220. The flag IS reaching vLLM and IS having a
+   server-side effect on how thinking-mode renders. But the additional
+   output is still clean prose — no `<|channel>` markers appear in
+   `content`, `reasoning_content`, or anywhere else. If the model were
+   emitting channel delimiters and we'd merely been losing them to
+   detokenization, scenario J should have surfaced them in *one* of
+   those fields.
+
+### Revised working theory
+
+The deployed cluster `google/gemma-4-26B-A4B-it` (vLLM 0.19.1) **is not
+emitting `<|channel>thought` tokens at all under any prompt or kwarg we
+have tried**. The model's reasoning happens — completion_tokens climb
+visibly with `enable_thinking=True` — but it is delivered as
+natural-language prose ("To multiply 17 by 23, you can use the
+difference of squares method: 1. ..."), not as a structured channel
+block.
+
+Most likely root cause: the bundled chat template's "thinking branch"
+inserts a natural-language nudge ("think step by step before
+answering") rather than the `<|think|>` activation token (id 98) that
+the official model card describes as the channel-emission trigger. The
+template responds to `enable_thinking=True` by extending generation
+length; it does not change the *structure* of generation.
+
+This puts us back at **cause #1 / cause #2 from the 2026-05-06
+"What 'the model isn't thinking' actually means" sub-section**. Those
+hypotheses remain testable cheaply: pull `tokenizer_config.json` from
+HuggingFace for `google/gemma-4-26B-A4B-it`, read the chat template
+Jinja, look for any branch that emits `<|channel>thought` or
+`<|think|>` directly. If no branch ever does, the deployed
+configuration cannot produce channel-delimited output regardless of
+kwargs — the workaround search for *this* deployment is over.
+
+### Implications
+
+- **Do not wire `skip_special_tokens=False` into production.** The
+  workaround doesn't help on this cluster, and disabling the flag
+  globally for Gemma could change emission behavior in ways we don't
+  yet understand (E's tool-call markers survive without the flag — we
+  don't want to risk new leak surfaces by toggling it).
+- **The cockpit screenshot needs a new explanation.** If the cluster
+  model genuinely cannot emit `<|channel>thought` in the current
+  configuration, the screenshot's channel-delimited content cannot
+  have come from this model in this configuration. Plausible alternate
+  sources, in priority order:
+  1. **Strix `gemma-4-moe-strix` (llama-server)** — finding 4 already
+     established this backend surfaces `reasoning_content` natively with
+     channel-delimited content. If a session somehow routed there
+     (manual selection, dispatcher fallback, alias resolution), the
+     screenshot fits.
+  2. **A different model entirely** (gpt-oss family, kimi-k2) being
+     rendered by cockpit's persistent UI — if cockpit's chat view
+     preserves raw channel markers from any reasoning-emitting model,
+     the leak isn't Gemma-specific.
+  3. **An older deployment** before the current vLLM image was rolled
+     out, with different chat-template behavior.
+- **The persistent-path audit conclusion still stands.** Worker and
+  persistent paths share `loader.py` and ship identical envelopes.
+  Any production-wiring fix lands in both paths simultaneously when it
+  does land.
+
+### Action items (in order)
+
+1. **Read the model's chat-template Jinja directly.** Pull
+   `tokenizer_config.json` from HuggingFace for
+   `google/gemma-4-26B-A4B-it`, find the `chat_template` field, grep
+   for `<|channel>`, `<|think|>`, `enable_thinking`. This is the
+   cheapest way to disambiguate cause #1 (model variant doesn't emit)
+   from cause #2 (template doesn't have channel branch). 5-10 minutes.
+2. **Read vLLM's `gemma4` reasoning parser source code.** Confirm what
+   tokens it actually scans for. We've assumed `<|channel>thought`
+   based on the cockpit screenshot pattern, but the parser may scan
+   for a different opener entirely — in which case the model emits
+   channels we never recognize.
+3. **Identify the cockpit screenshot's actual session** if the user
+   can find it. Cockpit chat history should preserve enough metadata
+   to identify model + thread + timestamp. Even one concrete session
+   would let us distinguish whether the leak source was Strix
+   llama-server, an older vLLM, or something else.
+4. **Defer any production matrix change** until (1) and (2) produce
+   signal. Wiring kwargs that don't change behavior is dead weight in
+   the matrix; wiring kwargs whose side effects we don't fully
+   understand (J's 40% more completion tokens for the same prompt)
+   risks regressions.
+5. **Audit cockpit reasoning rendering** as a defense-in-depth fix
+   regardless of upstream resolution. Whatever model emits channel
+   markers in the future, the cockpit shouldn't leak them to the user
+   verbatim — it should either render them as a thinking block or
+   strip them. This is independent of the cluster activation
+   question.
+
+### Action items
+
+1. **Run scenarios J/K** against `gemma-4-moe`. Confirm or rule out the
+   non-streaming workaround and the streaming variant.
+2. **If J passes**: add a `gemma` family entry under
+   `config/settings_matrix.yaml` (or wherever provider-specific
+   `extra_body` lives — see `src/core/loader.py:1935`) that injects
+   `{"skip_special_tokens": False, "chat_template_kwargs":
+   {"enable_thinking": True}}` for every Gemma request. The capture
+   path in `src/llm/reasoning_chat.py` (lines 192-214 store
+   `reasoning_content` into `additional_kwargs`) and the persistent
+   consumer at `src/persistent_graph.py:722` are already wired
+   correctly — they just never receive the field today.
+3. **If K passes**: persistent path is fully fixed by (2). Close
+   proposal C as resolved.
+4. **If K fails**: streaming-only mitigation needed. Options: keep
+   thinking off on persistent path (override the matrix entry), wait
+   for vLLM patch, or strip delimiter sequences in
+   `src/llm/reasoning_chat.py` post-receive.
+5. **Audit cockpit reasoning rendering** regardless of K outcome —
+   the screenshot leak preceded any of these fixes, so the rendering
+   path needs to handle delimiter-bearing content gracefully (it should
+   never leak markers to the user even if vLLM ships them).
+
+(↑ Original action items, preserved as audit trail. Superseded by the
+revised list above after J/K validation.)
+
+Note also **vLLM Issue #39130**: setting `enable_thinking=False`
+silently disables xgrammar (structured output enforcement). Worth
+remembering if we ever opt to disable thinking per-job for cost
+reasons — we'd lose schema enforcement on tool calls as a side effect.
+
+### Files Touched 2026-05-07
+
+```
+M  tests/manual_test_gemma_reasoning.py              (added scenarios J + K: vLLM #38855 workaround non-stream + stream)
+M  docs/issues/gemma_session_findings.md             (this section + later validation sub-section recording the disconfirmation)
+```
+
+Validation run executed against `gemma-4-moe` after adding J/K. Results
+recorded inline in the "Validation: J/K results" sub-section above —
+both J and K returned empty `reasoning_content`, falsifying the #38855
+hypothesis as our cluster's cause and pivoting the working theory back
+to the model-or-template-emission question.
+
+### Web sources
+
+- vLLM gemma4_reasoning_parser API docs — https://docs.vllm.ai/en/latest/api/vllm/reasoning/gemma4_reasoning_parser/
+- vLLM Gemma 4 Usage Guide (recipes) — https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html
+- vLLM Issue #38855 — gemma4 reasoning parser fails: `<|channel>` tokens stripped before parsing — https://github.com/vllm-project/vllm/issues/38855
+- vLLM Issue #39130 — `--reasoning-parser gemma4` silently disables xgrammar when `enable_thinking=false` — https://github.com/vllm-project/vllm/issues/39130
+- HuggingFace `google/gemma-4-26B-A4B-it` model card — https://huggingface.co/google/gemma-4-26B-A4B-it
+- HuggingFace `gemma-4-31B-it` discussion #28 — missing reasoning field on vLLM — https://huggingface.co/google/gemma-4-31B-it/discussions/28
+- Google AI for Developers — Thinking mode in Gemma — https://ai.google.dev/gemma/docs/capabilities/thinking
+- vLLM blog — Announcing Gemma 4 on vLLM — https://vllm-project.github.io/2026/04/02/gemma4.html
+- vLLM Recipes — `google/gemma-4-26B-A4B-it` — https://recipes.vllm.ai/Google/gemma-4-26B-A4B-it
+- vLLM-project recipes repo — Gemma4.md — https://github.com/vllm-project/recipes/blob/main/Google/Gemma4.md
