@@ -3,6 +3,7 @@ import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
+import {AdminLlmCoordinatorService} from '../llm/admin-llm-coordinator.service';
 import {
   ApiKeyProvider,
   CATALOG_CAPABILITIES,
@@ -332,6 +333,13 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                       {{ testingEndpointId() === endpoint.id
                           ? ('admin.providers.endpoints.testing' | transloco)
                           : ('admin.providers.endpoints.testButton' | transloco) }}
+                    </app-button>
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      (clicked)="discoverEndpoint(endpoint.id)"
+                    >
+                      Discover
                     </app-button>
                     @if (!isCodexEndpoint(endpoint.label)) {
                       <app-button
@@ -763,6 +771,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
 export class AdminProvidersComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly catalog = inject(AdminModelsService);
+  private readonly coordinator = inject(AdminLlmCoordinatorService);
   private readonly transloco = inject(TranslocoService);
 
   readonly switchTab = output<'providers' | 'models'>();
@@ -1131,6 +1140,13 @@ export class AdminProvidersComponent implements OnInit {
       },
       error: () => this.testingEndpointId.set(null),
     });
+  }
+
+  /** Hand off to the Models tab with this endpoint pre-selected and
+   * discovery auto-fired. The Models tab subscribes to the coordinator. */
+  discoverEndpoint(endpointId: string): void {
+    this.coordinator.discoverEndpoint$.next(endpointId);
+    this.switchTab.emit('models');
   }
 
   startEditEndpoint(endpoint: LlmEndpoint): void {

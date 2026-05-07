@@ -1,6 +1,8 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnInit, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
+import {AdminLlmCoordinatorService} from '../llm/admin-llm-coordinator.service';
 import {
   CATALOG_CAPABILITIES,
   CatalogCapability,
@@ -193,7 +195,7 @@ function hintsToCapabilities(
             </div>
 
             @if (selectedEndpointRef(); as endpointRef) {
-              <div class="discover-pane">
+              <div class="discover-pane" #discoverPane>
                 @if (selectedIsCodex()) {
                   @if (providers.codexAvailability(); as codex) {
                     <div
@@ -483,6 +485,9 @@ function hintsToCapabilities(
 export class AdminModelsComponent implements OnInit {
   readonly models = inject(AdminModelsService);
   readonly providers = inject(AdminProvidersService);
+  private readonly coordinator = inject(AdminLlmCoordinatorService);
+
+  private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
 
   readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
   readonly creating = signal(false);
@@ -585,6 +590,32 @@ export class AdminModelsComponent implements OnInit {
     this.providers.loadSystemApiKeys();
     this.providers.loadSystemEndpoints();
     this.providers.loadCodexAvailability();
+
+    this.coordinator.discoverEndpoint$
+      .pipe(takeUntilDestroyed())
+      .subscribe((endpointId) => this.preselectAndDiscover(endpointId));
+  }
+
+  /** Cross-tab handoff target — Providers tab fires this when the operator
+   * clicks "Discover" on an endpoint card. Resets the form to that
+   * endpoint, kicks off the probe, and scrolls the discover pane into
+   * view (parent will have already flipped the tab). */
+  private preselectAndDiscover(endpointId: string): void {
+    this.formProviderKey.set(`endpoint:${endpointId}`);
+    this.formModelId.set('');
+    this.formDisplayLabel.set('');
+    this.formFamily.set('default');
+    this.formContextWindow.set(null);
+    this.formError.set('');
+    this.discoveredModels.set([]);
+    this.discoverError.set('');
+    this.discoverFromEndpoint(endpointId);
+    queueMicrotask(() => {
+      this.discoverPaneRef()?.nativeElement.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+    });
   }
 
   endpointLabel(refId: string): string {
