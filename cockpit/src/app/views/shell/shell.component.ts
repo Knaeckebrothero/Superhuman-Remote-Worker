@@ -60,7 +60,7 @@ import {AppIconComponent} from '../../ui/icon';
                 @if (modelGroups().length === 0) {
                   <div class="model-empty">
                     <span class="model-empty-title">{{ 'shell.noModelsTitle' | transloco }}</span>
-                    <a routerLink="/admin/providers" class="model-empty-link" (click)="showModelDropdown.set(false)">
+                    <a routerLink="/admin/llm" class="model-empty-link" (click)="showModelDropdown.set(false)">
                       {{ 'shell.noModelsCta' | transloco }} →
                     </a>
                   </div>

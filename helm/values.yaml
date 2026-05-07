@@ -314,16 +314,20 @@ databases:
     internal: true
     # -- Full Neo4j Bolt URL for external mode. Example: "bolt://my-neo4j.db.svc:7687"
     externalUrl: ""
-    # -- Auth user. Community edition allows only "neo4j"; enterprise can
-    # admit a different name. The chart composes NEO4J_AUTH for the server
-    # image as ``<username>/$(NEO4J_PASSWORD)``, so only the password lives
-    # in Vault — username + URL are non-secret.
+    # -- Auth credentials for the bundled Neo4j: both NEO4J_USERNAME and
+    # NEO4J_PASSWORD live in the Secret (Vault), mirroring how the
+    # POSTGRES_USER / VECTOR_POSTGRES_USER / CITATION_POSTGRES_USER pairs
+    # work — there is no chart-level value for the username. Community
+    # edition allows only "neo4j"; enterprise can admit a different name,
+    # but in either case the value is set via Vault, not values.yaml.
+    # The chart composes NEO4J_AUTH for the server image as
+    # ``$(NEO4J_USERNAME)/$(NEO4J_PASSWORD)``, so the Vault entry
+    # ``NEO4J_AUTH`` itself is dead and can be removed.
     #
     # NOTE: don't put a "/" in NEO4J_PASSWORD. The Neo4j image splits
     # NEO4J_AUTH on the first slash, so a "/"-bearing password mis-parses
     # server-side and Bolt comes up unauthenticated. Use URL-safe base64
     # or any alphabet without "/".
-    username: "neo4j"
     # -- Edition: "community" (default) or "enterprise". Enterprise unlocks
     #    multi-database, fine-grained RBAC, online backup, hot replicas, and
     #    better query planning. Free under Neo4j's Startup Program (<$10M

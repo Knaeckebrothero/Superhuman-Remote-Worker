@@ -6,8 +6,8 @@
   <base href="/">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="manifest" href="manifest.webmanifest">
-  <meta name="theme-color" content="#9c1f2e" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#0c0c0d" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#9c2832" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#141418" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="favicon.ico" sizes="any">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="icon" href="favicon-16.png" sizes="16x16" type="image/png">
@@ -16,7 +16,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="SRW">
-  <meta name="msapplication-TileColor" content="#9c1f2e">
+  <meta name="msapplication-TileColor" content="#9c2832">
   <meta property="og:title" content="SRW · Cockpit">
   <meta property="og:description" content="Command center for remote AI workers.">
   <meta property="og:image" content="assets/social/og-1200x630.png">
@@ -53,9 +53,9 @@
     (function () {
       try {
         var raw = window.localStorage.getItem('cockpit:theme');
-        var migrate = {dark: 'senate', light: 'travertine'};
+        var migrate = {dark: 'senate', light: 'travertine', praetorian: 'senate'};
         var pref = (raw && migrate[raw]) || raw || 'system';
-        var valid = {travertine: 1, senate: 1, praetorian: 1, system: 1};
+        var valid = {travertine: 1, senate: 1, system: 1};
         if (!valid[pref]) pref = 'system';
         var resolved = pref;
         if (pref === 'system') {

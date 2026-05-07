@@ -89,11 +89,11 @@ describe('ThemeService', () => {
     });
 
     it('reads stored Roman theme preference', () => {
-      window.localStorage.setItem('cockpit:theme', 'praetorian');
+      window.localStorage.setItem('cockpit:theme', 'senate');
       const service = makeService();
-      expect(service.preference()).toBe('praetorian');
-      expect(service.resolved()).toBe('praetorian');
-      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
+      expect(service.preference()).toBe('senate');
+      expect(service.resolved()).toBe('senate');
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
     });
 
     it('migrates legacy "dark" preference to senate', () => {
@@ -111,6 +111,15 @@ describe('ThemeService', () => {
       expect(service.preference()).toBe('travertine');
       expect(document.body.classList.contains('theme-travertine')).toBe(true);
       expect(window.localStorage.getItem('cockpit:theme')).toBe('travertine');
+    });
+
+    it('migrates retired "praetorian" preference to senate', () => {
+      window.localStorage.setItem('cockpit:theme', 'praetorian');
+      const service = makeService();
+      expect(service.preference()).toBe('senate');
+      expect(document.body.classList.contains('theme-senate')).toBe(true);
+      expect(document.body.classList.contains('theme-praetorian')).toBe(false);
+      expect(window.localStorage.getItem('cockpit:theme')).toBe('senate');
     });
   });
 
@@ -146,22 +155,10 @@ describe('ThemeService', () => {
       TestBed.tick();
       expect(document.body.classList.contains('theme-senate')).toBe(true);
 
-      service.setPreference('praetorian');
-      TestBed.tick();
-      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
-      expect(document.body.classList.contains('theme-senate')).toBe(false);
-    });
-
-    it('switches between travertine and praetorian', () => {
-      const service = makeService();
       service.setPreference('travertine');
       TestBed.tick();
       expect(document.body.classList.contains('theme-travertine')).toBe(true);
-
-      service.setPreference('praetorian');
-      TestBed.tick();
-      expect(document.body.classList.contains('theme-praetorian')).toBe(true);
-      expect(document.body.classList.contains('theme-travertine')).toBe(false);
+      expect(document.body.classList.contains('theme-senate')).toBe(false);
     });
   });
 

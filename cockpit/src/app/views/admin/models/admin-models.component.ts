@@ -1,5 +1,4 @@
 import {ChangeDetectionStrategy, Component, computed, inject, OnInit, signal} from '@angular/core';
-import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {
@@ -61,7 +60,6 @@ function hintsToCapabilities(
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
-    SidebarToggleComponent,
     AppButtonComponent,
     AppInputComponent,
     AppSelectComponent,
@@ -70,19 +68,14 @@ function hintsToCapabilities(
     AppBadgeComponent,
   ],
   template: `
-    <div class="admin-page">
-      <div class="admin-container">
-        <div class="page-header">
-          <app-sidebar-toggle />
-          <h1 class="page-title">Models Catalog</h1>
-        </div>
-        <p class="page-desc">
-          Curate the LLM offerings available in builder, sessions, and jobs.
-          Each model anchors to a configured provider (system API key) or a
-          system endpoint.
-        </p>
+    <div class="admin-models">
+      <p class="section-intro">
+        Curate the LLM offerings available in builder, sessions, and jobs.
+        Each model anchors to a configured provider (system API key) or a
+        system endpoint.
+      </p>
 
-        <!-- Models list -->
+      <!-- Models list -->
         <section class="admin-section">
           <h2 class="section-title">Catalog rows</h2>
 
@@ -317,25 +310,20 @@ function hintsToCapabilities(
             </div>
           </div>
         </section>
-      </div>
     </div>
   `,
   styles: [`
     :host {
       display: block;
-      height: 100%;
-      overflow: auto;
     }
-    .admin-page { padding: 24px; }
-    .admin-container { max-width: 1100px; margin: 0 auto; }
-    .page-header { display: flex; align-items: center; gap: 12px; }
-    .page-title {
-      font-size: 22px;
-      font-weight: 600;
-      margin: 0;
-      color: var(--text-primary);
+    .admin-models {
+      display: block;
     }
-    .page-desc { color: var(--text-muted); margin: 8px 0 24px 0; }
+    .section-intro {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin: 0 0 16px 0;
+    }
     .admin-section { margin-bottom: 32px; }
     .section-title {
       font-size: 16px;

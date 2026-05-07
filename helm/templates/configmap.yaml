@@ -85,14 +85,13 @@ data:
   # Orchestrator settings
   AUTO_ASSIGN_ENABLED: {{ .Values.orchestrator.autoAssignEnabled | quote }}
 
-  # Neo4j — username is non-secret config (community edition only allows
-  # "neo4j" anyway; enterprise can override via databases.neo4j.username).
-  # The Neo4j server image's NEO4J_AUTH env var is composed at pod-start
-  # from this + NEO4J_PASSWORD via K8s $(VAR) substitution, so Vault only
-  # needs to hold NEO4J_PASSWORD.
+  # Neo4j — only the Bolt URL is non-secret. Both NEO4J_USERNAME and
+  # NEO4J_PASSWORD live in the Secret/Vault, mirroring the POSTGRES_USER /
+  # VECTOR_POSTGRES_USER / CITATION_POSTGRES_USER pattern. The Neo4j server
+  # image's NEO4J_AUTH env var is composed at pod-start from those two via
+  # K8s $(VAR) substitution.
   {{- if .Values.databases.neo4j.enabled }}
   NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
-  NEO4J_USERNAME: {{ .Values.databases.neo4j.username | default "neo4j" | quote }}
   DEFAULT_DS_NEO4J_URL: {{ include "srw.neo4jUrl" . | quote }}
   DEFAULT_DS_NEO4J_NAME: {{ "Default Neo4j" | quote }}
   DEFAULT_DS_NEO4J_READ_ONLY: {{ "false" | quote }}

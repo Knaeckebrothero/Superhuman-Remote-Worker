@@ -1128,8 +1128,7 @@
       "shell": "Shell",
       "research": "Recherche & Browser",
       "auxiliary": "Hilfs-LLM",
-      "session": "Sitzung",
-      "viewResolvedConfig": "Aufgelöste Konfiguration anzeigen (JSON)"
+      "session": "Sitzung"
     },
     "phases": {
       "strategic": "Strategisch",

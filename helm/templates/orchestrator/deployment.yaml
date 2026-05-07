@@ -238,7 +238,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: DEFAULT_DS_NEO4J_USERNAME
+                  key: NEO4J_USERNAME
                   optional: true
             - name: DEFAULT_DS_NEO4J_PASSWORD
               valueFrom:

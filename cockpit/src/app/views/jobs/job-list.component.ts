@@ -632,11 +632,15 @@ interface JobRow {
       /* Actions */
       .actions-cell {
         white-space: nowrap;
-        overflow: hidden;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 3px;
-        align-items: center;
+        text-align: right;
+      }
+
+      .actions-cell app-button {
+        vertical-align: middle;
+      }
+
+      .actions-cell app-button + app-button {
+        margin-left: 3px;
       }
 
       /* Footer */

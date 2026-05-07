@@ -8,7 +8,7 @@ import {UserService} from '../../core/services/user.service';
 
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
- * One level of accordion only (no nesting). Includes the read-only resolved config viewer.
+ * One level of accordion only (no nesting).
  */
 @Component({
   selector: 'app-advanced-accordion',
@@ -686,18 +686,6 @@ import {UserService} from '../../core/services/user.service';
         </div>
       }
 
-      <!-- Resolved Config Viewer -->
-      <div class="config-viewer-section">
-        <button type="button" class="accordion-header" (click)="showResolvedConfig.set(!showResolvedConfig())">
-          <app-icon size="md" class="accordion-icon">{{ showResolvedConfig() ? 'expand_less' : 'expand_more' }}</app-icon>
-          {{ 'advanced.sections.viewResolvedConfig' | transloco }}
-        </button>
-        @if (showResolvedConfig()) {
-          <div class="config-viewer">
-            <pre class="config-json">{{ resolvedConfigJson() }}</pre>
-          </div>
-        }
-      </div>
     </div>
   `,
   styles: [`
@@ -866,27 +854,6 @@ import {UserService} from '../../core/services/user.service';
       background: var(--danger-tint);
       color: var(--danger);
     }
-    .config-viewer-section {
-      margin-top: 12px;
-      border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
-      overflow: hidden;
-    }
-    .config-viewer {
-      max-height: 300px;
-      overflow: auto;
-      background: var(--surface-0, var(--surface-0));
-    }
-    .config-json {
-      padding: 12px 14px;
-      margin: 0;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 11px;
-      line-height: 1.5;
-      color: var(--text-primary, var(--text-primary));
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
   `],
 })
 export class AdvancedAccordionComponent {
@@ -904,7 +871,6 @@ export class AdvancedAccordionComponent {
 
   // Accordion state
   readonly expanded = signal<Set<string>>(new Set());
-  readonly showResolvedConfig = signal(false);
 
   // --- Inference params ---
   readonly strategicReasoning = signal<string | null>(null);
@@ -1090,14 +1056,6 @@ export class AdvancedAccordionComponent {
     if (this.maxOutputTokens() !== null) c++;
     if (this.parallelToolCalls() !== null) c++;
     return c;
-  });
-
-  readonly resolvedConfigJson = computed(() => {
-    try {
-      return JSON.stringify(this.config(), null, 2);
-    } catch {
-      return '{}';
-    }
   });
 
   // ===== Event handlers =====

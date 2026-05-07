@@ -360,8 +360,15 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       /* Action Buttons */
       .actions {
         white-space: nowrap;
-        display: flex;
-        gap: 6px;
+        text-align: right;
+      }
+
+      .actions app-button {
+        vertical-align: middle;
+      }
+
+      .actions app-button + app-button {
+        margin-left: 6px;
       }
 
       /* Footer */

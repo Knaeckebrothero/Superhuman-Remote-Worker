@@ -42,7 +42,7 @@ import {UserService} from '../../core/services/user.service';
               @if (hasProvider()) {
                 ✓
               } @else {
-                <a routerLink="/admin/providers" class="banner-link">Configure a provider key or endpoint</a>
+                <a routerLink="/admin/llm" class="banner-link">Configure a provider key or endpoint</a>
               }
               @if (hasProvider()) {
                 <span>Provider configured</span>
@@ -52,7 +52,7 @@ import {UserService} from '../../core/services/user.service';
               @if (hasAllCapabilities()) {
                 ✓ <span>Models added for chat, embedding, auxiliary</span>
               } @else {
-                <a routerLink="/admin/models" class="banner-link">
+                <a routerLink="/admin/llm" [queryParams]="{tab: 'models'}" class="banner-link">
                   Add models for: {{ missingCapabilitiesText() }}
                 </a>
               }
@@ -61,7 +61,7 @@ import {UserService} from '../../core/services/user.service';
               @if (hasAllDefaults()) {
                 ✓ <span>Required defaults pinned</span>
               } @else if (missingDefaultsText()) {
-                <a routerLink="/admin/providers" fragment="defaults" class="banner-link">
+                <a routerLink="/admin/llm" [queryParams]="{tab: 'defaults'}" class="banner-link">
                   Pin defaults for required models: {{ missingDefaultsText() }}
                 </a>
               } @else {
