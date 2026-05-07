@@ -137,6 +137,24 @@ spec:
                   name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: CLOUD_SERVICE_PASSWORD
             {{- end }}
+            {{- if or .Values.opencloud.enabled (eq (default "" .Values.cloud.externalBackend) "opencloud") }}
+            # OpenCloud orchestrator client — needed for the orchestrator's
+            # OAuth2 client_credentials flow against OpenCloud's Graph API.
+            # Auto-enabled when opencloud is the active cloud backend; the
+            # secret comes from the same Vault entry the runtime reads, so
+            # rotations propagate to both sides on the next upgrade.
+            - name: BOOTSTRAP_OPENCLOUD_ENABLED
+              value: "true"
+            - name: OPENCLOUD_KEYCLOAK_CLIENT_ID
+              value: "opencloud-orchestrator"
+            - name: OPENCLOUD_ADMIN_GROUP
+              value: "opencloudAdmin"
+            - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
+                  key: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
+            {{- end }}
           volumeMounts:
             - name: bootstrap-script
               mountPath: /scripts
