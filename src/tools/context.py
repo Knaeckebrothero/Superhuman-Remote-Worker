@@ -257,7 +257,8 @@ class ToolContext:
         """Lazily initialize and return CitationEngine.
 
         Creates a CitationEngine instance on first call, reuses it afterwards.
-        Uses multi-agent mode (PostgreSQL) via CITATION_DB_URL environment variable.
+        Uses multi-agent mode (PostgreSQL); the DSN is composed at runtime
+        from CITATION_POSTGRES_* env vars (with fallback to legacy URL envs).
 
         Returns:
             CitationEngine instance
@@ -268,14 +269,22 @@ class ToolContext:
         if self.citation_engine is None:
             from citation_engine import CitationEngine, CitationContext
 
+            from src.utils.db_url import build_postgres_url
+
             # Create context for audit trails using job_id as session
             ctx = CitationContext(
                 session_id=self.job_id or "unknown",
                 agent_id=self.config.get("agent_id", "unknown"),
             )
 
-            # Use multi-agent mode (PostgreSQL) - reads CITATION_DB_URL from env
-            self.citation_engine = CitationEngine(mode="multi-agent", context=ctx)
+            db_url = (
+                build_postgres_url("CITATION_POSTGRES", fallback_env="CITATION_DB_URL")
+                or build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
+                or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
+            )
+            self.citation_engine = CitationEngine(
+                mode="multi-agent", context=ctx, db_url=db_url
+            )
             self.citation_engine._connect()
 
         return self.citation_engine

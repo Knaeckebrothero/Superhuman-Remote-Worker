@@ -61,7 +61,7 @@ spec:
                   key: MCP_OIDC_CLIENT_SECRET
                   optional: true
             - name: MCP_OIDC_CONFIG_URL
-              value: "http://{{ include "srw.fullname" . }}-keycloak:8080/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
+              value: "{{ include "srw.keycloakInternalUrl" . }}/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
             {{- end }}
             - name: MCP_BASE_URL
               value: {{ include "srw.mcpUrl" . | quote }}

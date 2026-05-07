@@ -82,11 +82,22 @@ spec:
             - containerPort: 7688
               name: bolt
           env:
-            - name: NEO4J_AUTH
+            # Compose NEO4J_AUTH at pod-start from the configurable
+            # username (ConfigMap) + the password (Secret). Drops the
+            # redundant NEO4J_AUTH Vault key. K8s expands $(VAR) only when
+            # VAR is declared earlier in the same env block.
+            - name: NEO4J_USERNAME
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: NEO4J_USERNAME
+            - name: NEO4J_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: NEO4J_AUTH
+                  key: NEO4J_PASSWORD
+            - name: NEO4J_AUTH
+              value: "$(NEO4J_USERNAME)/$(NEO4J_PASSWORD)"
             {{- if eq $edition "enterprise" }}
             - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
               value: {{ .Values.databases.neo4j.acceptLicense | quote }}
@@ -172,13 +183,25 @@ spec:
     {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
 {{- if .Values.databases.neo4j.loadBalancer.enabled }}
 ---
-# LoadBalancer for direct Bolt access
+# LoadBalancer for direct Bolt access. Required so the Neo4j Browser SPA
+# (loaded via Traefik at 7474) can open its Bolt WebSocket back to the
+# advertised address. Annotations follow the homelab MetalLB convention:
+# pin a specific IP from a named pool, and suppress K3s servicelb so it
+# doesn't race MetalLB for ownership.
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "srw.fullname" . }}-neo4j-lb
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "neo4j") | nindent 4 }}
+  annotations:
+    svccontroller.k3s.cattle.io/enablelb: "false"
+    {{- with .Values.databases.neo4j.loadBalancer.ipAddressPool }}
+    metallb.universe.tf/ip-address-pool: {{ . | quote }}
+    {{- end }}
+    {{- with .Values.databases.neo4j.loadBalancer.ip }}
+    metallb.universe.tf/loadBalancerIPs: {{ . | quote }}
+    {{- end }}
 spec:
   type: LoadBalancer
   ports:

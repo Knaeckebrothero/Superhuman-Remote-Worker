@@ -89,6 +89,16 @@ class AgentProvisioner:
             "AGENT_TAILSCALE_ENABLED", "false"
         ).strip().lower() in ("true", "1", "yes")
         self._headscale_url: str = os.environ.get("HEADSCALE_URL", "").strip()
+        # host/port for the agent's `wait-for-orchestrator` init container,
+        # derived from the chart-injected ORCHESTRATOR_URL (default tracks
+        # the dev release name).
+        from urllib.parse import urlparse
+
+        _orch = urlparse(
+            os.environ.get("ORCHESTRATOR_URL", "http://srw-orchestrator:8085")
+        )
+        self._orchestrator_host: str = _orch.hostname or "srw-orchestrator"
+        self._orchestrator_port: int = _orch.port or 8085
 
     # =========================================================================
     # Properties
@@ -998,7 +1008,11 @@ class AgentProvisioner:
                 "securityContext": {
                     "seccompProfile": {"type": "RuntimeDefault"},
                 },
-                # Wait for orchestrator before starting agent
+                # Wait for orchestrator before starting agent. The host:port
+                # comes from ORCHESTRATOR_URL (chart-injected, defaults to
+                # `http://srw-orchestrator:8085`) so a non-default
+                # fullnameOverride doesn't desync agent init from the actual
+                # orchestrator Service name.
                 "initContainers": [
                     {
                         "name": "wait-for-orchestrator",
@@ -1006,7 +1020,8 @@ class AgentProvisioner:
                         "command": [
                             "sh",
                             "-c",
-                            "until nc -z srw-orchestrator 8085; do sleep 2; done",
+                            f"until nc -z {self._orchestrator_host} "
+                            f"{self._orchestrator_port}; do sleep 2; done",
                         ],
                     }
                 ],

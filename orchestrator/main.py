@@ -171,9 +171,15 @@ keycloak_groups = KeycloakGroupSync()
 main_cloud_router = MainCloudRouter(build_backend())
 
 # Vector DB — separate pgvector instance for citations, memories + knowledge_index.
-_vector_url = os.getenv("VECTOR_DB_URL")
+from utils.db_url import build_postgres_url as _build_pg_url  # noqa: E402
+
+_vector_url = _build_pg_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
 if not _vector_url:
-    raise RuntimeError("VECTOR_DB_URL environment variable is required")
+    raise RuntimeError(
+        "Vector DB credentials missing — set VECTOR_POSTGRES_USER + "
+        "VECTOR_POSTGRES_PASSWORD (with VECTOR_POSTGRES_HOST/PORT/DB from "
+        "ConfigMap), or fall back to VECTOR_DB_URL"
+    )
 vector_db = PostgresDB(
     connection_string=_vector_url,
     migrations_dir=MIGRATIONS_VECTOR_DIR,
