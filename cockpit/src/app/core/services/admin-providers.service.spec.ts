@@ -3,6 +3,8 @@ import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of} from 'rxjs';
 import {AdminProvidersService} from './admin-providers.service';
+import {ReadinessService} from './readiness.service';
+import {ModelService} from './model.service';
 
 function createService(mockHttp?: any) {
   const http = mockHttp ?? {
@@ -14,7 +16,11 @@ function createService(mockHttp?: any) {
   };
 
   const injector = Injector.create({
-    providers: [{provide: HttpClient, useValue: http}],
+    providers: [
+      {provide: HttpClient, useValue: http},
+      {provide: ReadinessService, useValue: {load: vi.fn()}},
+      {provide: ModelService, useValue: {load: vi.fn()}},
+    ],
   });
 
   const service = runInInjectionContext(injector, () => new AdminProvidersService());
