@@ -171,7 +171,7 @@ keycloak_groups = KeycloakGroupSync()
 main_cloud_router = MainCloudRouter(build_backend())
 
 # Vector DB — separate pgvector instance for citations, memories + knowledge_index.
-from orchestrator.utils.db_url import build_postgres_url as _build_pg_url  # noqa: E402
+from utils.db_url import build_postgres_url as _build_pg_url  # noqa: E402
 
 _vector_url = _build_pg_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
 if not _vector_url:

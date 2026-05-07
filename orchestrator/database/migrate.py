@@ -16,7 +16,7 @@ from pathlib import Path
 
 import asyncpg
 
-from orchestrator.utils.db_url import build_postgres_url
+from utils.db_url import build_postgres_url
 
 LOCK_ID = 0x5352575F4D4947  # "SRW_MIG" packed into int64.
 NOTX_SUFFIX = ".notx.sql"
