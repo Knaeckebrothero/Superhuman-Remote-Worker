@@ -9,6 +9,8 @@ import {
   CatalogModelUpdateRequest,
 } from '../models/api.model';
 import {environment} from '../environment';
+import {ModelService} from './model.service';
+import {ReadinessService} from './readiness.service';
 
 /**
  * REST client for the `/api/admin/providers/models` surface and the
@@ -22,6 +24,8 @@ import {environment} from '../environment';
 @Injectable({providedIn: 'root'})
 export class AdminModelsService {
   private readonly http = inject(HttpClient);
+  private readonly readiness = inject(ReadinessService);
+  private readonly modelService = inject(ModelService);
   private readonly baseUrl = environment.apiUrl;
 
   readonly models = signal<CatalogModel[]>([]);
@@ -65,19 +69,37 @@ export class AdminModelsService {
   createModel(body: CatalogModelCreateRequest): Observable<CatalogModel> {
     return this.http
       .post<CatalogModel>(`${this.baseUrl}/admin/providers/models`, body)
-      .pipe(tap(() => this.loadModels()));
+      .pipe(
+        tap(() => {
+          this.loadModels();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   updateModel(id: string, body: CatalogModelUpdateRequest): Observable<CatalogModel> {
     return this.http
       .patch<CatalogModel>(`${this.baseUrl}/admin/providers/models/${id}`, body)
-      .pipe(tap(() => this.loadModels()));
+      .pipe(
+        tap(() => {
+          this.loadModels();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   deleteModel(id: string): Observable<CatalogModelDeleteResult> {
     return this.http
       .delete<CatalogModelDeleteResult>(`${this.baseUrl}/admin/providers/models/${id}`)
-      .pipe(tap(() => this.loadModels()));
+      .pipe(
+        tap(() => {
+          this.loadModels();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   testModel(id: string): Observable<CatalogModelTestResult> {

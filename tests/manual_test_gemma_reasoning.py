@@ -69,6 +69,25 @@ models and runs five checks per model:
      thinking, our agent will never see `reasoning_content` regardless
      of any activation knob we find.
 
+  J. Thinking prompt with BOTH `chat_template_kwargs.enable_thinking=True`
+     AND `skip_special_tokens=False`. Per vLLM Issue #38855, vLLM's
+     tokenizer detokenization runs with `skip_special_tokens=True` by
+     default and strips `<|channel>thought` / `<channel|>` from the
+     text stream BEFORE the gemma4 reasoning parser scans for them —
+     so even when the model is correctly emitting thought channels
+     (which scenario D's tripled completion_tokens already proved),
+     the parser sees text with no delimiters and returns empty.
+     Passing `skip_special_tokens=False` preserves the delimiters.
+     This is the two-knob combo from the vLLM Gemma 4 recipe page.
+
+  K. Same as J but streaming. vLLM's streaming reasoning parser is a
+     separate incremental state machine that matches delimiters across
+     chunk boundaries; it may have its own #38855 variant fixed (or
+     not) by the same flag. If K leaks where J doesn't, that pinpoints
+     a streaming-only parser bug — exactly the fault profile that
+     would explain the cockpit `<|channel>thought` leak observed on
+     the persistent (streaming) path.
+
 Plus a one-shot deployment-introspection probe per model: `GET
 /v1/models/{id}` and `POST /v1/tokenize` with `add_generation_prompt=
 True`. The rendered prompt from the latter shows what tokens the chat
@@ -773,7 +792,7 @@ class Finding:
     """One diagnostic observation per (model, scenario)."""
 
     model: str
-    scenario: str  # 'A_think_nonstream' | ... | 'I_think_with_tools'
+    scenario: str  # 'A_think_nonstream' | ... | 'K_think_workaround_stream'
     http_ok: bool
     error: str | None = None
     content: str = ""
@@ -1348,6 +1367,138 @@ def run_thinking_with_tools(client: httpx.Client, api_key: str, model: str) -> F
     return f
 
 
+def run_thinking_workaround_nonstream(
+    client: httpx.Client, api_key: str, model: str
+) -> Finding:
+    """Scenario J — vLLM #38855 workaround: enable_thinking + skip_special_tokens=False.
+
+    Per vLLM Issue #38855: vLLM's tokenizer detokenization runs with
+    `skip_special_tokens=True` by default, which strips
+    `<|channel>thought` / `<channel|>` from the text stream BEFORE the
+    `gemma4` reasoning parser scans for them. The parser then sees
+    text with no delimiters, has nothing to lift, and returns empty
+    `reasoning_content`. The reasoning prose ends up in `content`
+    (without the delimiters, since they were already stripped). This
+    matches our scenario-D observation exactly: `completion_tokens=790`
+    (model is thinking longer) but `reasoning_content` empty.
+
+    The fix is the two-knob combo from the vLLM Gemma 4 recipe page:
+    pass `skip_special_tokens=False` alongside
+    `chat_template_kwargs.enable_thinking=True`.
+
+    Reading the result vs. scenario D:
+      - D=empty + J=populated → confirms #38855 is the cause; production
+        wiring needs `skip_special_tokens=False` for the gemma family.
+      - D=empty + J=empty → activation does nothing on this deployment
+        regardless of token preservation; chat template doesn't gate on
+        `enable_thinking` here, look for a different knob.
+      - J=populated + content=clean → ideal: parser working as designed
+        once delimiters survive detokenization.
+      - J=populated + content=LEAKED `<|channel>thought` → parser
+        partially working; some delimiters preserved but not lifted.
+    """
+    f = Finding(model=model, scenario="J_think_workaround_nonstream", http_ok=False)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": THINKING_PROMPT}],
+        "temperature": 0.3,
+        "max_tokens": 800,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "skip_special_tokens": False,
+    }
+    try:
+        r = _post(client, api_key, payload, stream=False)
+        r.raise_for_status()
+        f.http_ok = True
+        body = r.json()
+        choice = body["choices"][0]
+        msg = choice.get("message", {})
+        f.content = msg.get("content") or ""
+        f.reasoning_content = msg.get("reasoning_content")
+        f.finish_reason = choice.get("finish_reason")
+        usage = body.get("usage", {})
+        f.prompt_tokens = usage.get("prompt_tokens")
+        f.completion_tokens = usage.get("completion_tokens")
+    except httpx.HTTPStatusError as e:
+        f.error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+    except Exception as e:
+        f.error = f"{type(e).__name__}: {e}"
+    f.derive_flags()
+    return f
+
+
+def run_thinking_workaround_stream(
+    client: httpx.Client, api_key: str, model: str
+) -> Finding:
+    """Scenario K — same as J but streaming.
+
+    vLLM's streaming reasoning parser is a separate incremental state
+    machine that matches delimiters across chunk boundaries. The
+    workaround for #38855 may not apply uniformly — the streaming
+    parser could still drop fragments at chunk seams.
+
+    Cross-check vs. cockpit screenshot:
+      - K=populated + content=clean → streaming path also fixed by the
+        flag. The cockpit `<|channel>thought` leak must be in our
+        LangChain wrapper (`src/llm/reasoning_chat.py`) or in the
+        cockpit UI dropping reasoning_content into the visible
+        content stream.
+      - K=empty + content=LEAKED `<|channel>thought` → streaming
+        parser doesn't lift even with the flag; cockpit leak traced
+        to vLLM streaming bug, not our code. Persistent path needs a
+        different mitigation (server-side flag, cockpit-side parsing,
+        or skip thinking on persistent path entirely).
+      - J=populated + K=empty → flag works for non-stream but not
+        stream; production wiring should set the flag on workers and
+        keep thinking off on the persistent path until vLLM fixes
+        the streaming variant.
+    """
+    f = Finding(model=model, scenario="K_think_workaround_stream", http_ok=False)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": THINKING_PROMPT}],
+        "temperature": 0.3,
+        "max_tokens": 800,
+        "stream": True,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "skip_special_tokens": False,
+    }
+    accumulated_content: list[str] = []
+    accumulated_reasoning: list[str] = []
+    try:
+        with _post(client, api_key, payload, stream=True) as r:
+            r.raise_for_status()
+            f.http_ok = True
+            for line in r.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[len("data: ") :]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choice = (chunk.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                if "content" in delta and delta["content"]:
+                    accumulated_content.append(delta["content"])
+                if "reasoning_content" in delta and delta["reasoning_content"]:
+                    accumulated_reasoning.append(delta["reasoning_content"])
+                if choice.get("finish_reason"):
+                    f.finish_reason = choice["finish_reason"]
+        f.content = "".join(accumulated_content)
+        rc = "".join(accumulated_reasoning)
+        f.reasoning_content = rc if rc else None
+    except httpx.HTTPStatusError as e:
+        f.error = f"HTTP {e.response.status_code}: {e.response.text[:300]}"
+    except Exception as e:
+        f.error = f"{type(e).__name__}: {e}"
+    f.derive_flags()
+    return f
+
+
 def _truncate(s: str | None, n: int = 200) -> str:
     if not s:
         return "<empty>"
@@ -1405,6 +1556,8 @@ def diagnose_model(client: httpx.Client, api_key: str, model: str) -> list[Findi
         run_thinking_token_prefix(client, api_key, model),
         run_thinking_developer_role(client, api_key, model),
         run_thinking_with_tools(client, api_key, model),
+        run_thinking_workaround_nonstream(client, api_key, model),
+        run_thinking_workaround_stream(client, api_key, model),
     ]
     for f in findings:
         report_finding(f)
@@ -1446,6 +1599,8 @@ def summary_table(all_findings: list[Finding]) -> None:
         g = scenarios.get("G_think_token_prefix")
         h = scenarios.get("H_dev_role_instruction")
         i = scenarios.get("I_think_with_tools")
+        j = scenarios.get("J_think_workaround_nonstream")
+        k = scenarios.get("K_think_workaround_stream")
 
         if a and a.http_ok:
             print(_rc_line("A non-stream thinking (default)              ", a))
@@ -1480,6 +1635,10 @@ def summary_table(all_findings: list[Finding]) -> None:
             )
         if i and i.http_ok:
             print(_rc_line("I non-stream thinking (+ tools=[], none)      ", i))
+        if j and j.http_ok:
+            print(_rc_line("J non-stream thinking (#38855 workaround)     ", j))
+        if k and k.http_ok:
+            print(_rc_line("K streaming  thinking (#38855 workaround)     ", k))
 
     # Verdicts
     print("\n  VERDICT (per check)")
@@ -1519,6 +1678,20 @@ def summary_table(all_findings: list[Finding]) -> None:
         "All of D/G/H/I empty → none of the obvious activation knobs work on this "
         "deployment; read the chat template (probe output above) to find what "
         "the template actually gates on, or accept that thinking is off."
+    )
+    print(
+        "    #38855 workaround crosscheck: D empty + J populated → confirms the "
+        "delimiters were being stripped by `skip_special_tokens=True`; production "
+        "wiring should pass `skip_special_tokens=False` + `enable_thinking=True` "
+        "for the gemma family. "
+        "J populated + K empty/LEAKED → non-stream parser fixed by the flag, "
+        "streaming parser still bugged; persistent path needs a different "
+        "mitigation. "
+        "J populated + K populated → both paths fixed by the flag; cockpit "
+        "screenshot leak is downstream (LangChain wrapper or cockpit UI), not "
+        "vLLM. "
+        "J empty → workaround insufficient on this deployment; bug deeper than "
+        "tokenizer detokenization, escalate to vLLM upstream."
     )
 
 
