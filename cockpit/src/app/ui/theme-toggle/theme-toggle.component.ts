@@ -16,8 +16,7 @@ const LIGHT_OPTIONS: readonly ThemeOption[] = [
 ] as const;
 
 const DARK_OPTIONS: readonly ThemeOption[] = [
-  {value: 'senate',     label: 'Senate',     group: 'dark'},
-  {value: 'praetorian', label: 'Praetorian', group: 'dark'},
+  {value: 'senate', label: 'Senate', group: 'dark'},
 ] as const;
 
 @Component({

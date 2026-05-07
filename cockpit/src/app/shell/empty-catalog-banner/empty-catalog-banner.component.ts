@@ -20,7 +20,7 @@ import {UserService} from '../../core/services/user.service';
         <span class="banner-text">
           @if (isAdmin()) {
             {{ 'emptyCatalog.bannerAdmin' | transloco }}
-            <a routerLink="/admin/providers" class="banner-link">
+            <a routerLink="/admin/llm" class="banner-link">
               {{ 'admin.providers.title' | transloco }} →
             </a>
           } @else {

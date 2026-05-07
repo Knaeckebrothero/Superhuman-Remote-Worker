@@ -212,13 +212,15 @@ aren't set), but the URL form is legacy and a footgun under `urlsplit`.
 - `CITATION_POSTGRES_USER`, `CITATION_POSTGRES_PASSWORD` — citation
   engine runs as its own role (`srw_citations`) on the pgvector instance
   with a dedicated `citation_engine` database.
-- `NEO4J_PASSWORD` — username is configurable in values
-  (`databases.neo4j.username`, defaults to `neo4j`) and lives in the
-  ConfigMap alongside the Bolt URL. The Neo4j server image's `NEO4J_AUTH`
-  is composed at pod-start from these two; don't ship it as a separate
-  Vault key. **Don't include `/` in the password** — the Neo4j image
-  splits `NEO4J_AUTH` on the first `/`, so a slash mis-parses server-side
-  and the Bolt port comes up unauthenticated. URL-safe base64 (or any
+- `NEO4J_USERNAME`, `NEO4J_PASSWORD` — both live in Vault (mirroring
+  the `POSTGRES_USER` / `VECTOR_POSTGRES_USER` / `CITATION_POSTGRES_USER`
+  pattern, so all DB credentials sit in one place). Community edition
+  expects `NEO4J_USERNAME=neo4j`; enterprise can use a different value.
+  The Neo4j server image's `NEO4J_AUTH` is composed at pod-start from
+  these two; don't ship `NEO4J_AUTH` as a separate Vault key — it's
+  dead. **Don't include `/` in the password** — the Neo4j image splits
+  `NEO4J_AUTH` on the first `/`, so a slash mis-parses server-side and
+  the Bolt port comes up unauthenticated. URL-safe base64 (or any
   alphabet without `/`) avoids it.
 
 For external-mode databases (`internal: false`), the host/port/db come

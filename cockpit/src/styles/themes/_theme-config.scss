@@ -4,17 +4,24 @@
 // Token-naming convention: keep existing bare names (--app-bg, --text-primary,
 // --accent-color, etc.) so existing feature components continue to resolve.
 //
-// Active themes: Travertine (light default), Senate (dark default), Praetorian
-// (high-contrast dark). The legacy Catppuccin dark/light maps were removed —
-// theme.service.ts migrates old `dark`/`light` localStorage values to the
-// Roman defaults on read.
+// Active themes: Travertine (light default), Senate (dark default).
+// Both share a closed four-hue Imperial palette — Blood (accent/danger),
+// Gold (warning), Lapis (info), Laurel (success) — OKLCH-calibrated to
+// read as a tight family on each background.
+//
+// Praetorian was retired in favor of a lifted Senate that meets contrast
+// targets on its own. Legacy localStorage values ('praetorian', 'dark',
+// 'light') migrate to senate/travertine in theme.service.ts.
 
 // =============================================================================
-// LEGION — TRAVERTINE (light)
+// LEGION — TRAVERTINE (light · Imperial T3 calibrated)
 // Travertine cream + porphyry red + gold ochre. Daytime default.
+// All semantic hues calibrated to share lightness ~L40 in OKLCH so they read
+// as a tight family on cream. Gold sits slightly lighter (~L53) to still
+// read as gold rather than mud.
 // =============================================================================
 $travertine-theme: (
-  // Surfaces
+  // Surfaces — lifted slate of cream
   'app-bg':          #f3ece0, // travertine
   'panel-bg':        #fbf6ec,
   'panel-header-bg': #fbf6ec,
@@ -31,9 +38,9 @@ $travertine-theme: (
   'text-secondary': #5a4632,
   'text-muted':     #8a7b66,
 
-  // Accent (porphyry red)
-  'accent-color': #9c1f2e,
-  'accent-hover': #7a1822,
+  // Accent (porphyry red — L≈38)
+  'accent-color': #9c2832,
+  'accent-hover': #7d1e26,
 
   // Track / gutter
   'track-bg':      #ede4d2,
@@ -44,22 +51,22 @@ $travertine-theme: (
   'hover':  rgba(42, 29, 18, 0.04),
   'active': rgba(42, 29, 18, 0.08),
 
-  // Semantic colors (Roman-tinted)
-  'success':      #4a6b2a, // olive
-  'warning':      #a07a1c, // gold ochre
-  'alert':        #c2722a,
-  'info':         #3a6b8c, // muted lapis
-  'danger':       #9c1f2e, // porphyry red
-  'success-tint': rgba(74, 107, 42, 0.15),
-  'warning-tint': rgba(160, 122, 28, 0.15),
+  // Semantic colors — Imperial T3 calibrated (all share L≈40 except gold)
+  'success':      #446b3e, // laurel
+  'warning':      #9a7822, // gold ochre (L≈53 — must stay lighter)
+  'alert':        #c2722a, // copper
+  'info':         #3f5e8c, // lapis
+  'danger':       #9c2832, // porphyry
+  'success-tint': rgba(68, 107, 62, 0.15),
+  'warning-tint': rgba(154, 120, 34, 0.15),
   'alert-tint':   rgba(194, 114, 42, 0.15),
-  'info-tint':    rgba(58, 107, 140, 0.15),
-  'danger-tint':  rgba(156, 31, 46, 0.15),
+  'info-tint':    rgba(63, 94, 140, 0.15),
+  'danger-tint':  rgba(156, 40, 50, 0.15),
 
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(42, 29, 18, 0.06)',
   'shadow-md':   '0 1px 2px rgba(42,29,18,0.05), 0 12px 28px rgba(42,29,18,0.08)',
-  'shadow-glow': '0 0 20px rgba(156, 31, 46, 0.12)',
+  'shadow-glow': '0 0 20px rgba(156, 40, 50, 0.12)',
 
   // Chat bubble tokens
   'user-bubble':      #fbe4d4,
@@ -67,120 +74,66 @@ $travertine-theme: (
 );
 
 // =============================================================================
-// SENATE (dark) — pure blood red on charcoal. The standard dark.
+// SENATE (dark · Imperial v3) — lifted slate base
+// The lift (from #0c/#11/#18 to #14/#1c/#24) was the contrast fix that
+// obviated Praetorian. Five-hue semantic palette tuned to ~L68 OKLCH so
+// every chip reads as a family member on the dark surface.
 // =============================================================================
 $senate-theme: (
-  // Surfaces
-  'app-bg':          #0c0c0d,
-  'panel-bg':        #111114,
-  'panel-header-bg': #111114,
-  'timeline-bg':     #08080a,
-  'surface-0':       #181820, // raised panel / agent bubble
-  'surface-1':       #26262e, // stronger border
-  'surface-2':       #37373f,
+  // Surfaces — lifted from the original #0c/#11/#18 to fix contrast
+  'app-bg':          #141418,
+  'panel-bg':        #1c1c22,
+  'panel-header-bg': #1c1c22,
+  'timeline-bg':     #131318,
+  'surface-0':       #24242c, // raised panel / agent bubble
+  'surface-1':       #33333d, // stronger border
+  'surface-2':       #46464f,
 
   // Borders
-  'border-color': #26262e,
+  'border-color': #33333d,
 
-  // Text
-  'text-primary':   #eceaea,
-  'text-secondary': #b8b3b0,
-  'text-muted':     #74706e,
+  // Text — body lifted to F4 for ~13:1 contrast, muted lifted to ~5.5:1
+  'text-primary':   #f4f2ee,
+  'text-secondary': #c9c5be,
+  'text-muted':     #8c8a87,
 
-  // Accent (blood red)
-  'accent-color': #a8232a,
-  'accent-hover': #c42f37,
+  // Accent (blood red — L≈58)
+  'accent-color': #cc4647,
+  'accent-hover': #d65a5b,
 
   // Track / gutter
-  'track-bg':      #181820,
-  'gutter-color':  #26262e,
-  'gutter-hover':  #37373f,
+  'track-bg':      #24242c,
+  'gutter-color':  #33333d,
+  'gutter-hover':  #46464f,
 
   // Interactive overlays
   'hover':  rgba(255, 255, 255, 0.04),
   'active': rgba(255, 255, 255, 0.08),
 
-  // Semantic colors
-  'success':      #85a060,
-  'warning':      #caa658,
-  'alert':        #c2722a,
-  'info':         #6b8ba8,
-  'danger':       #a8232a,
-  'success-tint': rgba(133, 160, 96, 0.18),
-  'warning-tint': rgba(202, 166, 88, 0.18),
-  'alert-tint':   rgba(194, 114, 42, 0.18),
-  'info-tint':    rgba(107, 139, 168, 0.18),
-  'danger-tint':  rgba(168, 35, 42, 0.20),
+  // Semantic colors — Imperial v3 calibrated (all share L≈68)
+  'success':      #82b178, // laurel
+  'warning':      #cdab68, // gold (L≈73)
+  'alert':        #d48a4d, // copper
+  'info':         #7a9bc6, // lapis
+  'danger':       #cc4647, // blood
+  'success-tint': rgba(130, 177, 120, 0.18),
+  'warning-tint': rgba(205, 171, 104, 0.18),
+  'alert-tint':   rgba(212, 138, 77, 0.18),
+  'info-tint':    rgba(122, 155, 198, 0.18),
+  'danger-tint':  rgba(204, 70, 71, 0.20),
 
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(0, 0, 0, 0.5)',
-  'shadow-md':   '0 1px 0 rgba(168,35,42,0.10) inset, 0 14px 36px rgba(0,0,0,0.7)',
-  'shadow-glow': '0 0 20px rgba(168, 35, 42, 0.25)',
+  'shadow-md':   '0 1px 0 rgba(204,70,71,0.14) inset, 0 12px 30px rgba(0,0,0,0.6)',
+  'shadow-glow': '0 0 20px rgba(204, 70, 71, 0.25)',
 
   // Chat bubbles
-  'user-bubble':      #241015,
-  'user-bubble-text': #f0c8c8,
-);
-
-// =============================================================================
-// PRAETORIAN (high contrast) — pure black, crimson, ivory. No mid-grays.
-// =============================================================================
-$praetorian-theme: (
-  // Surfaces
-  'app-bg':          #000000,
-  'panel-bg':        #0a0a0a,
-  'panel-header-bg': #0a0a0a,
-  'timeline-bg':     #000000,
-  'surface-0':       #141414,
-  'surface-1':       #222222,
-  'surface-2':       #3a3a3a,
-
-  // Borders
-  'border-color': #222222,
-
-  // Text
-  'text-primary':   #f5f1e6,
-  'text-secondary': #b8b3a4,
-  'text-muted':     #666057,
-
-  // Accent (crimson)
-  'accent-color': #dc1f2a,
-  'accent-hover': #f03540,
-
-  // Track / gutter
-  'track-bg':      #141414,
-  'gutter-color':  #222222,
-  'gutter-hover':  #3a3a3a,
-
-  // Interactive overlays
-  'hover':  rgba(245, 241, 230, 0.05),
-  'active': rgba(245, 241, 230, 0.10),
-
-  // Semantic colors
-  'success':      #7da855,
-  'warning':      #d4ad58,
-  'alert':        #d4842e,
-  'info':         #88a8c4,
-  'danger':       #dc1f2a,
-  'success-tint': rgba(125, 168, 85, 0.18),
-  'warning-tint': rgba(212, 173, 88, 0.18),
-  'alert-tint':   rgba(212, 132, 46, 0.18),
-  'info-tint':    rgba(136, 168, 196, 0.18),
-  'danger-tint':  rgba(220, 31, 42, 0.22),
-
-  // Shadows — Praetorian is shadow-less for max contrast
-  'shadow-sm':   '0 0 0 1px rgba(245, 241, 230, 0.08)',
-  'shadow-md':   '0 0 0 1px rgba(245, 241, 230, 0.10)',
-  'shadow-glow': '0 0 24px rgba(220, 31, 42, 0.30)',
-
-  // Chat bubbles
-  'user-bubble':      #1a0608,
-  'user-bubble-text': #f5d8d8,
+  'user-bubble':      #3a1620,
+  'user-bubble-text': #ffd9d9,
 );
 
 // Central registry. apply-app-theme($name) reads from this.
 $themes: (
   'travertine': $travertine-theme,
   'senate':     $senate-theme,
-  'praetorian': $praetorian-theme,
 );

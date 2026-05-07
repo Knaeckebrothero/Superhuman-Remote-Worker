@@ -10,7 +10,7 @@ import {AdvancedAccordionComponent} from './advanced-accordion.component';
 import {AppTabNavComponent, AppTabNavItemComponent} from '../../ui/tab-nav';
 import {AppBadgeComponent} from '../../ui/badge';
 
-type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
+type AgentSettingsTab = 'settings' | 'instructions' | 'advanced' | 'resolved';
 
 /**
  * Host component for agent settings. Composes all sub-components with a tabbed layout.
@@ -58,6 +58,7 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
           </app-tab-nav-item>
         }
         <app-tab-nav-item value="advanced">Advanced</app-tab-nav-item>
+        <app-tab-nav-item value="resolved">Resolved</app-tab-nav-item>
       </app-tab-nav>
 
       <!-- Tab content -->
@@ -121,6 +122,10 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
             (change)="onChange()"
           />
         </div>
+
+        <div class="tab-panel resolved-panel" [class.tab-hidden]="activeTab() !== 'resolved'">
+          <pre class="config-json">{{ resolvedConfigJson() }}</pre>
+        </div>
       </div>
     </div>
   `,
@@ -160,6 +165,21 @@ type AgentSettingsTab = 'settings' | 'instructions' | 'advanced';
       display: flex;
       flex-direction: column;
       height: 100%;
+    }
+
+    .resolved-panel {
+      padding: 0;
+    }
+    .resolved-panel .config-json {
+      margin: 0;
+      padding: 12px 14px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      color: var(--text-primary);
+      background: var(--surface-0);
+      white-space: pre-wrap;
+      word-break: break-all;
     }
 
     .modified-summary {
@@ -206,10 +226,18 @@ export class AgentSettingsComponent {
   readonly activeTab = signal<AgentSettingsTab>('settings');
 
   protected onTabChange(value: AgentSettingsTab | null): void {
-    if (value === 'settings' || value === 'instructions' || value === 'advanced') {
+    if (value === 'settings' || value === 'instructions' || value === 'advanced' || value === 'resolved') {
       this.activeTab.set(value);
     }
   }
+
+  readonly resolvedConfigJson = computed(() => {
+    try {
+      return JSON.stringify(this.config(), null, 2);
+    } catch {
+      return '{}';
+    }
+  });
 
   constructor() {
     effect(() => {

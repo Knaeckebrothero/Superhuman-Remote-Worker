@@ -97,19 +97,11 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
           @if (userService.currentUser()?.is_admin) {
             <a
               class="nav-link"
-              routerLink="/admin/providers"
-              routerLinkActive="active"
-            >
-              <app-icon size="md" class="nav-icon">key</app-icon>
-              Admin · Providers
-            </a>
-            <a
-              class="nav-link"
-              routerLink="/admin/models"
+              routerLink="/admin/llm"
               routerLinkActive="active"
             >
               <app-icon size="md" class="nav-icon">smart_toy</app-icon>
-              Admin · Models
+              Admin · LLM
             </a>
             <a
               class="nav-link"
