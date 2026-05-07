@@ -130,6 +130,11 @@ export class ReadinessGateBannerComponent implements OnInit {
   });
 
   readonly hasAllDefaults = computed(() => {
+    // Step 3 stays incomplete until step 2 is — backend reports
+    // missing_defaults=[] when no catalog rows exist (you can't pin
+    // defaults that don't exist), but showing ✓ at that point misleads
+    // the operator into thinking they're further along than they are.
+    if (!this.hasAllCapabilities()) return false;
     return this.readiness.readiness().missing_defaults.length === 0;
   });
 

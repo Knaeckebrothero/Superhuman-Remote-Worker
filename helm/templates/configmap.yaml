@@ -161,6 +161,8 @@ data:
   {{- else if eq .Values.cloud.externalBackend "opencloud" }}
   OPENCLOUD_URL: {{ include "srw.cloudServiceUrl" . | quote }}
   OPENCLOUD_PUBLIC_URL: {{ required "cloud.externalUrl is required when cloud.externalBackend is set" .Values.cloud.externalUrl | quote }}
+  OPENCLOUD_KEYCLOAK_ISSUER: {{ printf "%s/realms/%s" (include "srw.keycloakInternalUrl" .) .Values.keycloak.realm | quote }}
+  OPENCLOUD_KEYCLOAK_CLIENT_ID: {{ "opencloud-orchestrator" | quote }}
   {{- else if eq .Values.cloud.externalBackend "webdav" }}
   DEFAULT_DS_WEBDAV_URL: {{ include "srw.cloudServiceUrl" . | quote }}
   DEFAULT_DS_WEBDAV_NAME: {{ "External WebDAV" | quote }}
