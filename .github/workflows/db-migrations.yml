@@ -118,19 +118,25 @@ jobs:
           # (uuid-ossp on both DBs, vector on the vector DB), so we only
           # need to ensure the second database exists.
           psql -h localhost -U ci -d ci_app -c "CREATE DATABASE ci_vector;"
+      # Mirror production's import root: Dockerfile.orchestrator copies the
+      # contents of orchestrator/ into /app/, so the package treats orchestrator/
+      # as the top of sys.path (e.g. `from security.crypto import ...`,
+      # `from utils.db_url import ...`). Run the migration runner the same way.
       - name: Dry-run app migrations
+        working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_app
         run: |
-          python -m orchestrator.database.migrate \
-            --dir orchestrator/database/migrations/app \
+          python -m database.migrate \
+            --dir database/migrations/app \
             --dry-run
       - name: Dry-run vector migrations
+        working-directory: orchestrator
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci_vector
         run: |
-          python -m orchestrator.database.migrate \
-            --dir orchestrator/database/migrations/vector \
+          python -m database.migrate \
+            --dir database/migrations/vector \
             --dry-run
 
   uniqueness:

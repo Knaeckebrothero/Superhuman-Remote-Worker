@@ -33,7 +33,7 @@ from security.crypto import (
     is_encrypted,
 )
 
-from orchestrator.utils.db_url import build_postgres_url
+from utils.db_url import build_postgres_url
 
 logger = logging.getLogger(__name__)
 

@@ -88,7 +88,7 @@ def get_postgres_connection_string() -> str:
     so passwords with ``/`` and other DSN-significant characters get URL-
     quoted correctly. Falls back to ``$DATABASE_URL`` for legacy stacks.
     """
-    from orchestrator.utils.db_url import build_postgres_url
+    from utils.db_url import build_postgres_url
 
     return (
         build_postgres_url(
@@ -238,7 +238,7 @@ def get_vector_connection_string() -> Optional[str]:
     (VECTOR_POSTGRES_USER/PASSWORD/HOST/PORT/DB) nor the legacy
     VECTOR_DB_URL is set (single-DB mode).
     """
-    from orchestrator.utils.db_url import build_postgres_url
+    from utils.db_url import build_postgres_url
 
     return build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
 
