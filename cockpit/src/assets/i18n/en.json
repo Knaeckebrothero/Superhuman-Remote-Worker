@@ -268,7 +268,10 @@
         "errorUrlScheme": "Base URL must start with http:// or https://",
         "errorHttpNeedsOptIn": "http:// URLs require the Allow http:// checkbox.",
         "catalogHint": "Models served by this endpoint are managed in the catalog.",
-        "catalogHintLink": "Open Admin · Models →"
+        "catalogHintLink": "Open Admin · Models →",
+        "editTitle": "Edit Endpoint",
+        "apiKeyPlaceholderEdit": "API key (leave blank to keep existing)",
+        "removeKey": "Remove existing API key on save"
       },
       "defaults": {
         "title": "Default Models",
