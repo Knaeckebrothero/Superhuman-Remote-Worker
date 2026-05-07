@@ -73,17 +73,60 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: APP_ENCRYPTION_KEY
-            # Core databases
-            - name: DATABASE_URL
+            # Core databases — DSNs are composed at runtime from the parts
+            # below (orchestrator/utils/db_url.py). Storing a full URL in
+            # the Secret is no longer needed and was a footgun: passwords
+            # with `/` truncated the netloc under urlsplit.
+            - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: DATABASE_URL
-            - name: VECTOR_DB_URL
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VECTOR_DB_URL
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_DB
+            - name: VECTOR_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_POSTGRES_USER
+            - name: VECTOR_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_POSTGRES_PASSWORD
+            - name: VECTOR_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_HOST
+            - name: VECTOR_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_PORT
+            - name: VECTOR_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_DB
             - name: MONGODB_URL
               valueFrom:
                 configMapKeyRef:

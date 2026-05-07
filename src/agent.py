@@ -383,20 +383,26 @@ class UniversalAgent:
         External datasources (Neo4j, MongoDB, etc.) are resolved per-job
         via the datasource connector system — see docs/datasources.md.
         """
+        from src.utils.db_url import build_postgres_url
+
         # PostgreSQL connection (always required for job management)
         if self.postgres_conn is None and self.config.connections.postgres:
             from src.database.postgres_db import PostgresDB
 
-            db_url = os.getenv("DATABASE_URL")
+            db_url = build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
             if db_url:
                 self.postgres_conn = PostgresDB(connection_string=db_url)
                 await self.postgres_conn.connect()
                 logger.info("PostgreSQL connection established (PostgresDB)")
             else:
-                logger.warning("DATABASE_URL not set, PostgreSQL unavailable")
+                logger.warning(
+                    "Postgres credentials not set "
+                    "(POSTGRES_USER/PASSWORD or DATABASE_URL), "
+                    "PostgreSQL unavailable"
+                )
 
         # Vector DB connection (for citations, memories + knowledge index)
-        vector_url = os.getenv("VECTOR_DB_URL")
+        vector_url = build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
         if vector_url:
             from src.database.postgres_db import PostgresDB as _VectorDB
 
@@ -404,7 +410,11 @@ class UniversalAgent:
             await self.vector_conn.connect()
             logger.info("Vector DB connection established (separate instance)")
         else:
-            logger.warning("VECTOR_DB_URL not set, vector features unavailable")
+            logger.warning(
+                "Vector DB credentials not set "
+                "(VECTOR_POSTGRES_USER/PASSWORD or VECTOR_DB_URL), "
+                "vector features unavailable"
+            )
             self.vector_conn = None
 
     async def process_job(

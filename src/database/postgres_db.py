@@ -79,11 +79,17 @@ class PostgresDB:
                 "Install it with: pip install asyncpg"
             )
 
-        self._connection_string = connection_string or os.getenv("DATABASE_URL")
+        from src.utils.db_url import build_postgres_url
+
+        self._connection_string = connection_string or build_postgres_url(
+            "POSTGRES",
+            fallback_env="DATABASE_URL",
+        )
         if not self._connection_string:
             raise ValueError(
-                "Database connection string required. "
-                "Set DATABASE_URL environment variable or pass connection_string."
+                "Database connection string required. Set "
+                "POSTGRES_USER + POSTGRES_PASSWORD (with POSTGRES_HOST/PORT/DB "
+                "from ConfigMap) or DATABASE_URL, or pass connection_string."
             )
 
         self._min_connections = min_connections or int(

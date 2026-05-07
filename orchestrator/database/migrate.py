@@ -11,11 +11,12 @@ import argparse
 import asyncio
 import hashlib
 import logging
-import os
 import time
 from pathlib import Path
 
 import asyncpg
+
+from orchestrator.utils.db_url import build_postgres_url
 
 LOCK_ID = 0x5352575F4D4947  # "SRW_MIG" packed into int64.
 NOTX_SUFFIX = ".notx.sql"
@@ -290,8 +291,11 @@ async def _main() -> int:
     )
     parser.add_argument(
         "--database-url",
-        default=os.environ.get("DATABASE_URL"),
-        help="Postgres URL (defaults to $DATABASE_URL)",
+        default=build_postgres_url("POSTGRES", fallback_env="DATABASE_URL"),
+        help=(
+            "Postgres URL (defaults to a DSN built from "
+            "POSTGRES_USER/PASSWORD/HOST/PORT/DB, falling back to $DATABASE_URL)"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -301,7 +305,10 @@ async def _main() -> int:
     args = parser.parse_args()
 
     if not args.database_url:
-        parser.error("--database-url or $DATABASE_URL is required")
+        parser.error(
+            "--database-url is required (or set POSTGRES_USER/PASSWORD plus "
+            "POSTGRES_HOST/PORT/DB, or $DATABASE_URL)"
+        )
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
