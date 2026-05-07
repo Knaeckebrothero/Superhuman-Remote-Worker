@@ -9,7 +9,14 @@
 # Required permissions on the kcadm account (KC_ADMIN_USER), assigned via the
 # master realm on client `<TARGET_REALM>-realm`:
 #   view-realm, view-clients, manage-clients
-#   + view-users, manage-users  (only when serviceAccounts.cloud.enabled=true)
+#   + view-users, manage-users  (only when serviceAccounts.cloud.enabled=true,
+#                                or opencloud is the active cloud backend —
+#                                needed to add the orchestrator service-account
+#                                user to the opencloudAdmin group)
+#   + manage-realm              (only when opencloud is the active cloud backend
+#                                AND the opencloudAdmin group needs creation —
+#                                if the group already exists in the realm,
+#                                this role is not required)
 #   + master-realm create-realm (only when CREATE_REALM=true)
 # The composite `realm-admin` role no longer exists in modern Keycloak (24+);
 # the granular roles above are the minimum.
@@ -210,6 +217,79 @@ data:
       echo "[bootstrap]   syncing password (rotation-safe)"
       "$KCADM" set-password -r "$TARGET_REALM" --userid "$USER_ID" \
         --new-password "$CLOUD_SERVICE_PASSWORD" --temporary=false
+    fi
+
+    # ------------------------------------------------------------------
+    # OpenCloud orchestrator client (auto-enabled when opencloud is the
+    # active cloud backend). The orchestrator authenticates to
+    # OpenCloud's Graph API via OAuth2 client_credentials, so we need:
+    #   1. A confidential client with serviceAccountsEnabled=true whose
+    #      secret matches OPENCLOUD_KEYCLOAK_CLIENT_SECRET in Vault.
+    #   2. The client's service-account user in the OpenCloud admin
+    #      group, so admin operations (autoprovision, set quota) work.
+    # Mirrors the bundled-Keycloak postStart hook (services/keycloak.yaml)
+    # for the external-Keycloak case.
+    # ------------------------------------------------------------------
+    if [ "${BOOTSTRAP_OPENCLOUD_ENABLED:-false}" = "true" ]; then
+      : "${OPENCLOUD_KEYCLOAK_CLIENT_ID:?missing OPENCLOUD_KEYCLOAK_CLIENT_ID}"
+      : "${OPENCLOUD_KEYCLOAK_CLIENT_SECRET:?missing OPENCLOUD_KEYCLOAK_CLIENT_SECRET (must be in main chart secret)}"
+      ADMIN_GROUP="${OPENCLOUD_ADMIN_GROUP:-opencloudAdmin}"
+
+      echo "[bootstrap] === $OPENCLOUD_KEYCLOAK_CLIENT_ID (service-account in realm $TARGET_REALM) ==="
+
+      # Group: get-or-create. If the bootstrap account lacks `manage-realm`
+      # the create call fails silently; we log a warning and skip the
+      # group-membership step. The orchestrator can still authenticate, but
+      # admin endpoints (user autoprovision, quota set) will return 403.
+      GROUP_ID=$("$KCADM" get groups -r "$TARGET_REALM" -q "search=$ADMIN_GROUP" --fields id,name 2>/dev/null \
+        | grep -B1 "\"name\" : \"$ADMIN_GROUP\"" | grep '"id"' | head -1 | sed 's/.*"id" : "//;s/".*//' || true)
+      if [ -z "$GROUP_ID" ]; then
+        echo "[bootstrap]   creating group $ADMIN_GROUP"
+        GROUP_ID=$("$KCADM" create groups -r "$TARGET_REALM" -s "name=$ADMIN_GROUP" -i 2>/dev/null || true)
+        if [ -z "$GROUP_ID" ]; then
+          echo "[bootstrap]   WARN: could not create group $ADMIN_GROUP — orchestrator service account will not be added (does the bootstrap account have manage-realm?)"
+        fi
+      fi
+
+      cat >/tmp/opencloud-orchestrator.json <<JSON
+      {
+        "clientId": "$OPENCLOUD_KEYCLOAK_CLIENT_ID",
+        "name": "OpenCloud Orchestrator",
+        "enabled": true,
+        "protocol": "openid-connect",
+        "publicClient": false,
+        "clientAuthenticatorType": "client-secret",
+        "secret": "$OPENCLOUD_KEYCLOAK_CLIENT_SECRET",
+        "standardFlowEnabled": false,
+        "directAccessGrantsEnabled": false,
+        "implicitFlowEnabled": false,
+        "serviceAccountsEnabled": true
+      }
+    JSON
+      OC_UUID=$(upsert_client "$OPENCLOUD_KEYCLOAK_CLIENT_ID" /tmp/opencloud-orchestrator.json)
+
+      # kcadm `update` ignores the `secret` field in the payload — set it
+      # explicitly so a rotated OPENCLOUD_KEYCLOAK_CLIENT_SECRET in Vault
+      # is honoured on the next upgrade.
+      if [ -n "$OC_UUID" ]; then
+        echo "[bootstrap]   syncing client secret"
+        "$KCADM" update "clients/$OC_UUID" -r "$TARGET_REALM" \
+          -s "secret=$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" >/dev/null
+      fi
+
+      # Add the service-account user to the admin group so the orchestrator
+      # can call OpenCloud admin endpoints (user autoprovision, quota set).
+      if [ -n "$OC_UUID" ] && [ -n "$GROUP_ID" ]; then
+        SA_ID=$("$KCADM" get "clients/$OC_UUID/service-account-user" -r "$TARGET_REALM" \
+          --fields id --format csv --noquotes 2>/dev/null \
+          | extract_id || true)
+        if [ -n "$SA_ID" ]; then
+          echo "[bootstrap]   adding service account to $ADMIN_GROUP"
+          "$KCADM" update "users/$SA_ID/groups/$GROUP_ID" -r "$TARGET_REALM" \
+            -s "realm=$TARGET_REALM" -s "userId=$SA_ID" -s "groupId=$GROUP_ID" -n 2>/dev/null \
+            || echo "[bootstrap]   WARN: failed to add service account to $ADMIN_GROUP (does the bootstrap account have manage-users?)"
+        fi
+      fi
     fi
 
     echo "[bootstrap] done"
