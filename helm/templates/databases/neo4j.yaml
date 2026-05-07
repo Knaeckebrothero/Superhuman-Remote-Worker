@@ -82,8 +82,9 @@ spec:
             - containerPort: 7688
               name: bolt
           env:
-            # Compose NEO4J_AUTH at pod-start from the configurable
-            # username (ConfigMap) + the password (Secret). Drops the
+            # Compose NEO4J_AUTH at pod-start from the username + password
+            # in the Secret (mirroring the POSTGRES_USER/PASSWORD pattern —
+            # both halves of every DB credential live in Vault). Drops the
             # redundant NEO4J_AUTH Vault key. K8s expands $(VAR) only when
             # VAR is declared earlier in the same env block.
             #
@@ -94,8 +95,8 @@ spec:
             # ("Unrecognized setting. No declared setting with name: PASSWORD").
             - name: AUTH_USER
               valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
                   key: NEO4J_USERNAME
             - name: AUTH_PASSWORD
               valueFrom:

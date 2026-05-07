@@ -20,15 +20,16 @@ If you're tempted to copy a hex value out of a mockup into a component file, sto
 
 ## Themes
 
-The cockpit currently ships three Roman-themed appearances. The pre-Roman Catppuccin Mocha/Latte themes were removed; legacy `dark` / `light` localStorage values migrate transparently to Senate / Travertine on first read.
+The cockpit ships two Roman-themed appearances. Both share a closed four-hue Imperial palette (Blood / Gold / Lapis / Laurel), OKLCH-calibrated to read as a tight family on each background. Legacy localStorage values (`dark`, `light`, `praetorian`) migrate transparently to Senate / Travertine on first read.
 
 | Key | Mode | Personality | Default |
 |---|---|---|---|
 | **Travertine** | Light | Cream stone, porphyry red, gold ochre. Daytime, formal. | **Light default + initial paint fallback** |
-| **Senate** | Dark | Pure blood red on charcoal. The standard dark. | Dark default |
-| **Praetorian** | Dark, high-contrast | Pure black, crimson, ivory. No mid-grays. | Accessibility / focus mode |
+| **Senate** | Dark | Lifted slate, brighter blood red. Calibrated for legibility without becoming cold. | Dark default |
 
 First-run preference is `system` — the app follows OS dark/light. `system` resolves to **Senate** when the OS prefers dark and **Travertine** when it prefers light.
+
+The earlier high-contrast **Praetorian** theme was retired: lifting Senate's surfaces and text obviated the need for a third dark variant. Users with maximum-contrast needs are better served by OS forced-colors mode. The Praetorian palette is preserved outside the repo for a future rework.
 
 See [`themes/README.md`](./themes/README.md) for the palette breakdown and the rationale behind each theme's color choices.
 

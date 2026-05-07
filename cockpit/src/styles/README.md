@@ -37,12 +37,14 @@ Token names are bare (`--accent-color`, `--panel-bg`, `--text-primary`) — no p
 | Key | Mode | Notes |
 |---|---|---|
 | `travertine` | Light | **Light default + initial paint fallback.** Default when `system` resolves to light. |
-| `senate` | Dark | Default when `system` resolves to dark. |
-| `praetorian` | Dark, high-contrast | Shadow-less. |
+| `senate` | Dark | Default when `system` resolves to dark. Lifted slate base (was charcoal in earlier revisions — the lift fixed contrast and obviated Praetorian). |
 
 First-run preference is `'system'` — the app respects the OS preference. A pre-paint script in `index.html` resolves the right body class before Angular hydrates so dark-OS users don't flash through the Travertine fallback.
 
-The legacy Catppuccin `dark` / `light` themes were removed; `theme.service.ts` migrates old localStorage values transparently (`dark` → `senate`, `light` → `travertine`).
+`theme.service.ts` migrates legacy localStorage values transparently:
+- `dark` → `senate` (Catppuccin era)
+- `light` → `travertine` (Catppuccin era)
+- `praetorian` → `senate` (retired high-contrast theme)
 
 ## How to add a theme
 
@@ -52,7 +54,6 @@ The legacy Catppuccin `dark` / `light` themes were removed; `theme.service.ts` m
    $themes: (
      'travertine': $travertine-theme,
      'senate':     $senate-theme,
-     'praetorian': $praetorian-theme,
      'mytheme':    $mytheme-theme,   // <-- here
    );
    ```
@@ -62,7 +63,7 @@ The legacy Catppuccin `dark` / `light` themes were removed; `theme.service.ts` m
    ```
 4. **Extend the type union** in `src/app/core/services/theme.service.ts`:
    ```ts
-   export type ConcreteTheme = 'travertine' | 'senate' | 'praetorian' | 'mytheme';
+   export type ConcreteTheme = 'travertine' | 'senate' | 'mytheme';
    ```
    And add `'mytheme'` to `VALID_PREFERENCES`.
 5. **Add it to the picker** — `OPTIONS` in `src/app/ui/theme-toggle/theme-toggle.component.ts`. Pick a `group` (`'light'` or `'dark'`) so it lands in the right `<optgroup>`.
@@ -99,7 +100,9 @@ Don't introduce hex literals in component SCSS. If a needed token is missing, ad
 
 ## Shape overrides
 
-`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate, .theme-praetorian` and applies the Roman shape language (sharp radii, Cinzel headings, banded bubbles, square avatars, accent left-rule on approval cards). Per-theme tweaks (Travertine's gold inlay, Praetorian's shadow removal) follow in their own scoped blocks.
+`_shape-overrides.scss` is scoped under `.theme-travertine, .theme-senate` and applies the Roman shape language (sharp radii, Cinzel headings, banded bubbles, Inset Stamp buttons, square avatars, accent left-rule on approval cards). Per-theme tweaks (Travertine's gold inlay under panel headers, Senate's blood-red equivalent) follow in their own scoped blocks.
+
+The Inset Stamp button treatment (`.btn`, `.btn-primary`) emits dual inner highlight/shadow + an accent-colored drop, with a 1px translateY on `:active` — the visual metaphor is "stamped into stone."
 
 Selectors target generic structural classes (`.session-message .message-bubble`, `.approval-card`, `.sidebar-brand`). When you add a new component, prefer landing on those existing class names where it makes sense — the shape pass picks them up automatically.
 

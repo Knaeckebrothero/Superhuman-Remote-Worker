@@ -17,6 +17,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {AppTooltipDirective} from '../../ui/tooltip';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -34,6 +35,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
     AppIconComponent,
     AppSpinnerComponent,
     AppFormFieldComponent,
+    AppTooltipDirective,
   ],
   template: `
     <div class="job-create-container">
@@ -119,14 +121,15 @@ import {AppFormFieldComponent} from '../../ui/form-field';
                     type="button"
                     class="expert-card"
                     [class.selected]="selectedExpert()?.id === expert.id"
-                    [style.--expert-color]="expert.color"
+                    [appTooltip]="expert.description"
+                    tooltipPlacement="top"
                     (click)="toggleExpert(expert)"
                     [disabled]="isSubmitting()"
                   >
                     @if (selectedExpert()?.id === expert.id) {
                       <app-icon size="lg" class="expert-check">check_circle</app-icon>
                     }
-                    <app-icon size="inherit" class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</app-icon>
+                    <app-icon size="inherit" class="expert-icon">{{ expert.icon }}</app-icon>
                     <span class="expert-name">{{ expert.display_name }}</span>
                     <span class="expert-desc">{{ expert.description }}</span>
                     @if (expert.tags.length > 0) {
@@ -697,6 +700,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: flex-start;
         gap: 6px;
         padding: 14px;
+        min-width: 0;
+        overflow: hidden;
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 8px;
         background: var(--surface-0, var(--surface-0));
@@ -708,14 +713,14 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       }
 
       .expert-card:hover:not(:disabled) {
-        border-color: var(--expert-color, var(--accent-color));
+        border-color: var(--accent-color);
         background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       }
 
       .expert-card.selected {
-        border-color: var(--expert-color, var(--accent-color));
+        border-color: var(--accent-color);
         background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-        box-shadow: 0 0 0 1px var(--expert-color, var(--accent-color));
+        box-shadow: 0 0 0 1px var(--accent-color);
       }
 
       .expert-card:disabled {
@@ -727,17 +732,20 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         position: absolute;
         top: 8px;
         right: 8px;
-        color: var(--expert-color, var(--accent-color));
+        color: var(--accent-color);
       }
 
       .expert-icon {
         font-size: 28px;
+        color: color-mix(in srgb, var(--accent-color) 25%, var(--text-secondary) 75%);
       }
 
       .expert-name {
         font-size: 13px;
         font-weight: 600;
         color: var(--text-primary, var(--text-primary));
+        max-width: 100%;
+        overflow-wrap: break-word;
       }
 
       .expert-desc {
@@ -748,6 +756,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
         overflow: hidden;
+        overflow-wrap: break-word;
+        max-width: 100%;
       }
 
       .expert-tags {
@@ -761,8 +771,8 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         font-size: 10px;
         padding: 1px 6px;
         border-radius: 3px;
-        background: rgba(205, 214, 244, 0.08);
-        color: var(--text-muted, #6c7086);
+        background: color-mix(in srgb, var(--accent-color) 8%, transparent);
+        color: color-mix(in srgb, var(--accent-color) 35%, var(--text-secondary) 65%);
       }
 
       /* Dropzone */

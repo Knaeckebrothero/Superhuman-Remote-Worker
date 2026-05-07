@@ -9,7 +9,7 @@ description: |
   with working agents, extracting structured knowledge notes from job artifacts
   (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
   base via kb_write/kb_update. See docs/features/project_knowledge_base.md.
-icon: book-open
+icon: menu_book
 color: "#a6e3a1"
 tags:
   - knowledge

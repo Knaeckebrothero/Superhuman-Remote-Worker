@@ -285,8 +285,8 @@ spec:
                   optional: true
             - name: NEO4J_USERNAME
               valueFrom:
-                configMapKeyRef:
-                  name: {{ include "srw.configMapName" . }}
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
                   key: NEO4J_USERNAME
                   optional: true
             - name: NEO4J_PASSWORD

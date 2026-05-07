@@ -1,14 +1,8 @@
-import {ChangeDetectionStrategy, Component, computed, inject, OnInit, signal} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, inject, OnInit, output, signal} from '@angular/core';
 import {RouterLink} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-toggle.component';
-import {
-  AdminProvidersService,
-  DEFAULT_MODEL_KINDS,
-  DefaultModelKind,
-} from '../../../core/services/admin-providers.service';
+import {AdminProvidersService} from '../../../core/services/admin-providers.service';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
-import {ModelService} from '../../../core/services/model.service';
 import {
   ApiKeyProvider,
   CATALOG_CAPABILITIES,
@@ -55,7 +49,6 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [
     RouterLink,
-    SidebarToggleComponent,
     TranslocoPipe,
     AppButtonComponent,
     AppInputComponent,
@@ -65,15 +58,8 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     AppFormFieldComponent,
   ],
   template: `
-    <div class="admin-page">
-      <div class="admin-container">
-        <div class="page-header">
-          <app-sidebar-toggle />
-          <h1 class="page-title">{{ 'admin.providers.title' | transloco }}</h1>
-        </div>
-        <p class="page-desc">{{ 'admin.providers.desc' | transloco }}</p>
-
-        <!-- Provider Keys -->
+    <div class="admin-providers">
+      <!-- Provider Keys -->
         <section class="admin-section">
           <h2 class="section-title">{{ 'admin.providers.keys.title' | transloco }}</h2>
           <p class="section-desc">{{ 'admin.providers.keys.desc' | transloco }}</p>
@@ -462,9 +448,13 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
 
                 <p class="catalog-hint">
                   {{ 'admin.providers.endpoints.catalogHint' | transloco }}
-                  <a routerLink="/admin/models" class="catalog-hint-link">
+                  <button
+                    type="button"
+                    class="catalog-hint-link catalog-hint-button"
+                    (click)="switchTab.emit('models')"
+                  >
                     {{ 'admin.providers.endpoints.catalogHintLink' | transloco }}
-                  </a>
+                  </button>
                   @if (isCodexEndpoint(endpoint.label)) {
                     <span class="codex-aside">
                       ·
@@ -535,98 +525,14 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
             </app-button>
           </div>
         </section>
-
-        <!-- Defaults -->
-        <section class="admin-section section-spacer">
-          <h2 class="section-title">{{ 'admin.providers.defaults.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'admin.providers.defaults.desc' | transloco }}</p>
-
-          @if (catalogEmpty()) {
-            <p class="empty-state">{{ 'admin.providers.defaults.emptyCatalog' | transloco }}</p>
-          } @else {
-            <div class="defaults-form">
-              @for (kind of defaultKinds; track kind) {
-                <app-form-field
-                  [label]="('admin.providers.defaults.kind.' + kind) | transloco"
-                >
-                  <app-select
-                    [value]="admin.defaults()[kind] ?? ''"
-                    (changed)="setDefault(kind, $event ?? '')"
-                  >
-                    <option value="">{{ 'admin.providers.defaults.unset' | transloco }}</option>
-                    @if (kind === 'embedding') {
-                      @for (m of modelService.embeddingModels(); track m.id) {
-                        <option [value]="m.id">{{ m.label }}</option>
-                      }
-                    } @else if (kind === 'vision') {
-                      @for (m of modelService.visionModels(); track m.id) {
-                        <option [value]="m.id">{{ m.label }}</option>
-                      }
-                    } @else if (kind === 'whisper') {
-                      @for (m of modelService.whisperModels(); track m.id) {
-                        <option [value]="m.id">{{ m.label }}</option>
-                      }
-                    } @else if (kind === 'tts') {
-                      @for (m of modelService.ttsModels(); track m.id) {
-                        <option [value]="m.id">{{ m.label }}</option>
-                      }
-                    } @else if (kind === 'auxiliary') {
-                      <!-- Strict: only rows whose capabilities[] includes
-                           'auxiliary'. Under the array fan-out a chat row
-                           registered as ['chat','auxiliary'] surfaces
-                           here too — same row serves both slots. -->
-                      @for (m of modelService.auxiliaryModels(); track m.id) {
-                        <option [value]="m.id">{{ m.label }}</option>
-                      }
-                    } @else {
-                      <!-- Chat-slot kinds (chat/builder/browser/citation):
-                           strict filter by 'chat' capability via the
-                           pre-bucketed groups list. -->
-                      @for (group of modelService.models(); track group.group) {
-                        <optgroup [label]="group.group">
-                          @for (model of group.models; track model) {
-                            <option [value]="model">{{ model }}</option>
-                          }
-                        </optgroup>
-                      }
-                    }
-                  </app-select>
-                </app-form-field>
-              }
-            </div>
-          }
-        </section>
-      </div>
     </div>
   `,
   styles: [`
     :host {
       display: block;
-      height: 100%;
-      overflow: auto;
     }
-    .admin-page {
-      padding: 32px;
-      max-width: 900px;
-      margin: 0 auto;
-      color: var(--text-primary);
-    }
-    .page-header {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 8px;
-    }
-    .page-title {
-      font-size: 24px;
-      font-weight: 700;
-      margin: 0;
-      color: var(--text-primary);
-    }
-    .page-desc {
-      font-size: 13px;
-      color: var(--text-muted);
-      margin: 0 0 32px 0;
+    .admin-providers {
+      display: block;
     }
     .admin-section {
       background: var(--panel-bg);
@@ -738,6 +644,13 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       margin-left: 4px;
     }
     .catalog-hint-link:hover { text-decoration: underline; }
+    .catalog-hint-button {
+      background: none;
+      border: 0;
+      padding: 0;
+      font: inherit;
+      cursor: pointer;
+    }
     .codex-aside { margin-left: 6px; }
     .create-form {
       margin-top: 12px;
@@ -753,11 +666,6 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       display: flex;
       gap: 8px;
       margin-top: 8px;
-    }
-    .defaults-form {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
     }
     .form-row {
       display: flex;
@@ -855,14 +763,12 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
 export class AdminProvidersComponent implements OnInit {
   readonly admin = inject(AdminProvidersService);
   readonly catalog = inject(AdminModelsService);
-  readonly modelService = inject(ModelService);
   private readonly transloco = inject(TranslocoService);
 
-  readonly providers = SYSTEM_PROVIDERS;
-  readonly defaultKinds: DefaultModelKind[] = DEFAULT_MODEL_KINDS;
-  readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
+  readonly switchTab = output<'providers' | 'models'>();
 
-  readonly catalogEmpty = computed(() => this.modelService.models().length === 0);
+  readonly providers = SYSTEM_PROVIDERS;
+  readonly capabilities: CatalogCapability[] = CATALOG_CAPABILITIES;
 
   // API key form
   readonly keyProvider = signal<SystemProviderValue>('openai');
@@ -918,8 +824,6 @@ export class AdminProvidersComponent implements OnInit {
   ngOnInit(): void {
     this.admin.loadSystemApiKeys();
     this.admin.loadSystemEndpoints();
-    this.admin.loadDefaults();
-    this.modelService.load();
   }
 
   providerLabel(p: string): string {
@@ -1293,11 +1197,5 @@ export class AdminProvidersComponent implements OnInit {
         this.savingEdit.set(false);
       },
     });
-  }
-
-  // ── Defaults ────────────────────────────────────────────────────
-
-  setDefault(kind: DefaultModelKind, model: string): void {
-    this.admin.setDefault(kind, model).subscribe();
   }
 }

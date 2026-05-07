@@ -8,7 +8,6 @@
 // Switching is one class swap on <body>; no per-component theme logic.
 .theme-travertine { @include theme.apply-app-theme('travertine'); }
 .theme-senate     { @include theme.apply-app-theme('senate'); }
-.theme-praetorian { @include theme.apply-app-theme('praetorian'); }
 
 // --- Reset ---
 *,

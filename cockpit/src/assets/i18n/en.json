@@ -1128,8 +1128,7 @@
       "shell": "Shell",
       "research": "Research & Browser",
       "auxiliary": "Auxiliary LLM",
-      "session": "Session",
-      "viewResolvedConfig": "View resolved config (JSON)"
+      "session": "Session"
     },
     "phases": {
       "strategic": "Strategic",
