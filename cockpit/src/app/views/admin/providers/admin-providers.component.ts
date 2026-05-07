@@ -15,7 +15,9 @@ import {
   CatalogCapability,
   DiscoveryCandidate,
   DiscoveryResponse,
+  LlmEndpoint,
   LlmEndpointTestResult,
+  LlmEndpointUpdateRequest,
 } from '../../../core/models/api.model';
 import {timer} from 'rxjs';
 import {filter, switchMap, take} from 'rxjs/operators';
@@ -345,6 +347,16 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                           ? ('admin.providers.endpoints.testing' | transloco)
                           : ('admin.providers.endpoints.testButton' | transloco) }}
                     </app-button>
+                    @if (!isCodexEndpoint(endpoint.label)) {
+                      <app-button
+                        variant="ghost"
+                        size="sm"
+                        [disabled]="editingEndpointId() === endpoint.id"
+                        (clicked)="startEditEndpoint(endpoint)"
+                      >
+                        {{ 'common.edit' | transloco }}
+                      </app-button>
+                    }
                     <app-button
                       variant="danger"
                       size="sm"
@@ -368,6 +380,83 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
                         {status: result.status ?? '-',
                          error: result.error ?? ''} }}
                     }
+                  </div>
+                }
+
+                @if (editingEndpointId() === endpoint.id) {
+                  <div class="edit-form">
+                    <h4 class="form-title">
+                      {{ 'admin.providers.endpoints.editTitle' | transloco }}
+                    </h4>
+                    <div class="form-row two-col">
+                      <app-form-field>
+                        <app-input
+                          [value]="editEndpointLabel()"
+                          [placeholder]="'admin.providers.endpoints.labelPlaceholder' | transloco"
+                          [disabled]="savingEdit()"
+                          (changed)="editEndpointLabel.set($event)"
+                        />
+                      </app-form-field>
+                      <app-form-field>
+                        <app-input
+                          [value]="editEndpointBaseUrl()"
+                          [placeholder]="'admin.providers.endpoints.baseUrlPlaceholder' | transloco"
+                          [disabled]="savingEdit()"
+                          (changed)="editEndpointBaseUrl.set($event)"
+                        />
+                      </app-form-field>
+                    </div>
+                    <div class="form-row">
+                      <app-form-field>
+                        <app-input
+                          type="password"
+                          [value]="editEndpointApiKey()"
+                          [placeholder]="'admin.providers.endpoints.apiKeyPlaceholderEdit' | transloco"
+                          [disabled]="savingEdit() || editEndpointClearKey()"
+                          (changed)="editEndpointApiKey.set($event)"
+                        />
+                      </app-form-field>
+                    </div>
+                    <app-checkbox
+                      size="sm"
+                      [checked]="editEndpointClearKey()"
+                      [disabled]="savingEdit() || !!editEndpointApiKey().trim()"
+                      (changed)="editEndpointClearKey.set($event)"
+                    >
+                      {{ 'admin.providers.endpoints.removeKey' | transloco }}
+                    </app-checkbox>
+                    <app-checkbox
+                      size="sm"
+                      [checked]="editEndpointAllowInsecure()"
+                      [disabled]="savingEdit()"
+                      (changed)="editEndpointAllowInsecure.set($event)"
+                    >
+                      {{ 'admin.providers.endpoints.allowInsecure' | transloco }}
+                    </app-checkbox>
+                    @if (editFormError()) {
+                      <p class="form-error">{{ editFormError() }}</p>
+                    }
+                    <div class="edit-form-actions">
+                      <app-button
+                        variant="primary"
+                        size="md"
+                        [loading]="savingEdit()"
+                        [disabled]="savingEdit() || !editEndpointLabel().trim() || !editEndpointBaseUrl().trim()"
+                        (clicked)="saveEditEndpoint()"
+                      >
+                        {{ savingEdit()
+                            ? ('common.saving' | transloco)
+                            : ('common.save' | transloco) }}
+                      </app-button>
+                      <app-button
+                        variant="ghost"
+                        size="md"
+                        [disabled]="savingEdit()"
+                        (clicked)="cancelEditEndpoint()"
+                      >
+                        {{ 'common.cancel' | transloco }}
+                      </app-button>
+                    </div>
                   </div>
                 }
 
@@ -655,6 +744,16 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       padding-top: 12px;
       border-top: 1px dashed var(--border-color);
     }
+    .edit-form {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border-color);
+    }
+    .edit-form-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
     .defaults-form {
       display: flex;
       flex-direction: column;
@@ -801,6 +900,20 @@ export class AdminProvidersComponent implements OnInit {
   readonly endpointFormError = signal<string>('');
   readonly testingEndpointId = signal<string | null>(null);
   readonly testResults = signal<Record<string, LlmEndpointTestResult>>({});
+
+  // Endpoint edit form. Active for at most one row at a time; opens
+  // pre-filled with the row's current values. The actual API key is
+  // never returned by the backend (only the prefix), so the api_key
+  // input represents "replace with this value" — blank means "keep
+  // existing", and an explicit checkbox flips to clear_api_key=true.
+  readonly editingEndpointId = signal<string | null>(null);
+  readonly editEndpointLabel = signal('');
+  readonly editEndpointBaseUrl = signal('');
+  readonly editEndpointApiKey = signal('');
+  readonly editEndpointClearKey = signal(false);
+  readonly editEndpointAllowInsecure = signal(false);
+  readonly savingEdit = signal(false);
+  readonly editFormError = signal<string>('');
 
   ngOnInit(): void {
     this.admin.loadSystemApiKeys();
@@ -1113,6 +1226,72 @@ export class AdminProvidersComponent implements OnInit {
         this.testingEndpointId.set(null);
       },
       error: () => this.testingEndpointId.set(null),
+    });
+  }
+
+  startEditEndpoint(endpoint: LlmEndpoint): void {
+    this.editingEndpointId.set(endpoint.id);
+    this.editEndpointLabel.set(endpoint.label);
+    this.editEndpointBaseUrl.set(endpoint.base_url);
+    this.editEndpointApiKey.set('');
+    this.editEndpointClearKey.set(false);
+    this.editEndpointAllowInsecure.set(
+      endpoint.base_url.toLowerCase().startsWith('http://'),
+    );
+    this.editFormError.set('');
+  }
+
+  cancelEditEndpoint(): void {
+    this.editingEndpointId.set(null);
+    this.editFormError.set('');
+  }
+
+  saveEditEndpoint(): void {
+    const endpointId = this.editingEndpointId();
+    if (!endpointId) return;
+    const label = this.editEndpointLabel().trim();
+    const baseUrl = this.editEndpointBaseUrl().trim();
+    if (!label || !baseUrl) return;
+
+    if (!/^https?:\/\//i.test(baseUrl)) {
+      this.editFormError.set(
+        this.transloco.translate('admin.providers.endpoints.errorUrlScheme'),
+      );
+      return;
+    }
+    if (
+      baseUrl.toLowerCase().startsWith('http://') &&
+      !this.editEndpointAllowInsecure()
+    ) {
+      this.editFormError.set(
+        this.transloco.translate('admin.providers.endpoints.errorHttpNeedsOptIn'),
+      );
+      return;
+    }
+
+    const newKey = this.editEndpointApiKey().trim();
+    const body: LlmEndpointUpdateRequest = {
+      label,
+      base_url: baseUrl,
+      allow_insecure: this.editEndpointAllowInsecure(),
+    };
+    if (newKey) {
+      body.api_key = newKey;
+    } else if (this.editEndpointClearKey()) {
+      body.clear_api_key = true;
+    }
+
+    this.editFormError.set('');
+    this.savingEdit.set(true);
+    this.admin.updateSystemEndpoint(endpointId, body).subscribe({
+      next: () => {
+        this.savingEdit.set(false);
+        this.editingEndpointId.set(null);
+      },
+      error: (err) => {
+        this.editFormError.set(err?.error?.detail ?? String(err));
+        this.savingEdit.set(false);
+      },
     });
   }
 

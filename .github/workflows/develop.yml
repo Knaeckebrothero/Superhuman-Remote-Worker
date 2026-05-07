@@ -686,7 +686,7 @@ jobs:
     needs: [changes, dependency-audit, test-python, test-cockpit]
     if: >-
       always() && !cancelled() &&
-      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch') &&
+      (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || needs.changes.outputs.vm-base-stage1 == 'true' || github.event_name == 'workflow_dispatch') &&
       needs.dependency-audit.result == 'success' &&
       !contains(needs.test-python.result, 'failure') &&
       !contains(needs.test-cockpit.result, 'failure')
