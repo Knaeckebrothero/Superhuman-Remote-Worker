@@ -277,17 +277,68 @@ data:
           -s "secret=$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" >/dev/null
       fi
 
-      # Add the service-account user to the admin group so the orchestrator
-      # can call OpenCloud admin endpoints (user autoprovision, quota set).
-      if [ -n "$OC_UUID" ] && [ -n "$GROUP_ID" ]; then
+      # Resolve the service-account user — needed for group membership,
+      # profile fields, and realm-role assignment below. We fetch it once
+      # here so the subsequent blocks can each use the cached UUID.
+      SA_ID=""
+      if [ -n "$OC_UUID" ]; then
         SA_ID=$("$KCADM" get "clients/$OC_UUID/service-account-user" -r "$TARGET_REALM" \
           --fields id --format csv --noquotes 2>/dev/null \
           | extract_id || true)
-        if [ -n "$SA_ID" ]; then
-          echo "[bootstrap]   adding service account to $ADMIN_GROUP"
-          "$KCADM" update "users/$SA_ID/groups/$GROUP_ID" -r "$TARGET_REALM" \
-            -s "realm=$TARGET_REALM" -s "userId=$SA_ID" -s "groupId=$GROUP_ID" -n 2>/dev/null \
-            || echo "[bootstrap]   WARN: failed to add service account to $ADMIN_GROUP (does the bootstrap account have manage-users?)"
+      fi
+
+      # Add the service-account user to the admin group so the orchestrator
+      # can call OpenCloud admin endpoints (user autoprovision, quota set).
+      # Required for OpenCloud deployments configured to read role assignment
+      # from the `groups` claim (PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM=groups).
+      if [ -n "$SA_ID" ] && [ -n "$GROUP_ID" ]; then
+        echo "[bootstrap]   adding service account to $ADMIN_GROUP"
+        "$KCADM" update "users/$SA_ID/groups/$GROUP_ID" -r "$TARGET_REALM" \
+          -s "realm=$TARGET_REALM" -s "userId=$SA_ID" -s "groupId=$GROUP_ID" -n 2>/dev/null \
+          || echo "[bootstrap]   WARN: failed to add service account to $ADMIN_GROUP (does the bootstrap account have manage-users?)"
+      fi
+
+      # Populate the SA user's profile. OpenCloud's autoprovisioner
+      # rejects tokens lacking the `name` claim with HTTP 500 on
+      # /graph/v1beta1/roleManagement/permissions/roleDefinitions.
+      # The `profile` client scope's full-name mapper composes `name`
+      # from firstName + lastName, so both must be set on the SA user.
+      if [ -n "$SA_ID" ]; then
+        echo "[bootstrap]   setting service account profile"
+        "$KCADM" update "users/$SA_ID" -r "$TARGET_REALM" \
+          -s firstName=OpenCloud -s lastName=Orchestrator -s email=orchestrator@srw.local 2>/dev/null \
+          || echo "[bootstrap]   WARN: failed to set service account profile (does the bootstrap account have manage-users?)"
+      fi
+
+      # Add a realm-role mapper to the client so any realm roles the SA
+      # holds (e.g. opencloudAdmin) appear as a top-level `roles` claim.
+      # Required for OpenCloud deployments configured to read role
+      # assignment from the `roles` claim (PROXY_ROLE_ASSIGNMENT_OIDC_CLAIM=roles)
+      # — this is the case for realms that pre-date the chart and use
+      # realm roles for OpenCloud authorization (vs the bundled chart's
+      # group-based scheme). Keycloak rejects duplicate mappers with 409,
+      # which we ignore so the operation is idempotent.
+      if [ -n "$OC_UUID" ]; then
+        echo "[bootstrap]   ensuring realm-role mapper on client"
+        printf '%s' '{"name":"opencloud-roles","protocol":"openid-connect","protocolMapper":"oidc-usermodel-realm-role-mapper","config":{"id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","introspection.token.claim":"true","multivalued":"true","claim.name":"roles","jsonType.label":"String"}}' \
+          | "$KCADM" create "clients/$OC_UUID/protocol-mappers/models" -r "$TARGET_REALM" -f - 2>/dev/null \
+          || true
+      fi
+
+      # Assign the admin realm role to the SA, if the role exists. Realms
+      # that use the GROUP scheme don't have this realm role — the lookup
+      # returns empty and we skip. Realms that use the ROLE scheme (like
+      # the home realm under realm-roles-managed OpenCloud setups) need
+      # this for the `roles` claim above to actually contain the admin role.
+      if [ -n "$SA_ID" ]; then
+        if "$KCADM" get "roles/$ADMIN_GROUP" -r "$TARGET_REALM" --fields name >/dev/null 2>&1; then
+          echo "[bootstrap]   assigning realm role $ADMIN_GROUP to service account"
+          "$KCADM" add-roles -r "$TARGET_REALM" \
+            --uusername "service-account-${OPENCLOUD_KEYCLOAK_CLIENT_ID}" \
+            --rolename "$ADMIN_GROUP" 2>/dev/null \
+            || echo "[bootstrap]   WARN: failed to assign realm role $ADMIN_GROUP (does the bootstrap account have manage-users?)"
+        else
+          echo "[bootstrap]   realm role $ADMIN_GROUP does not exist in $TARGET_REALM — skipping (group-based scheme)"
         fi
       fi
     fi
