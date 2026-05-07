@@ -13,10 +13,14 @@ import {
   UserSettings,
 } from '../models/api.model';
 import {environment} from '../environment';
+import {AdminProvidersService} from './admin-providers.service';
+import {ReadinessService} from './readiness.service';
 
 @Injectable({ providedIn: 'root' })
 export class SettingsService {
   private readonly http = inject(HttpClient);
+  private readonly readiness = inject(ReadinessService);
+  private readonly adminProviders = inject(AdminProvidersService);
   private readonly baseUrl = environment.apiUrl;
 
   /** Current user's API keys (prefix only, no full keys). */
@@ -150,12 +154,24 @@ export class SettingsService {
 
   completeCodexLogin(callbackUrl: string): Observable<Record<string, unknown>> {
     return this.http
-      .post<Record<string, unknown>>(`${this.baseUrl}/codex/callback`, { url: callbackUrl });
+      .post<Record<string, unknown>>(`${this.baseUrl}/codex/callback`, { url: callbackUrl })
+      .pipe(
+        tap(() => {
+          this.readiness.load();
+          this.adminProviders.loadCodexAvailability();
+        }),
+      );
   }
 
   deleteCodexCredential(name: string): Observable<{ status: string }> {
     return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/codex/credentials/${encodeURIComponent(name)}`);
+      .delete<{ status: string }>(`${this.baseUrl}/codex/credentials/${encodeURIComponent(name)}`)
+      .pipe(
+        tap(() => {
+          this.readiness.load();
+          this.adminProviders.loadCodexAvailability();
+        }),
+      );
   }
 
   // ── Main Cloud System Settings (Admin — Phase 4) ──────────────

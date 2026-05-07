@@ -86,18 +86,24 @@ spec:
             # username (ConfigMap) + the password (Secret). Drops the
             # redundant NEO4J_AUTH Vault key. K8s expands $(VAR) only when
             # VAR is declared earlier in the same env block.
-            - name: NEO4J_USERNAME
+            #
+            # The intermediate vars must NOT start with `NEO4J_` — the
+            # Neo4j image's entrypoint treats every `NEO4J_<X>` env var as
+            # a config setting (translating to dotted form), so naming
+            # them e.g. `NEO4J_PASSWORD` triggers strict-validation rejection
+            # ("Unrecognized setting. No declared setting with name: PASSWORD").
+            - name: AUTH_USER
               valueFrom:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: NEO4J_USERNAME
-            - name: NEO4J_PASSWORD
+            - name: AUTH_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: NEO4J_PASSWORD
             - name: NEO4J_AUTH
-              value: "$(NEO4J_USERNAME)/$(NEO4J_PASSWORD)"
+              value: "$(AUTH_USER)/$(AUTH_PASSWORD)"
             {{- if eq $edition "enterprise" }}
             - name: NEO4J_ACCEPT_LICENSE_AGREEMENT
               value: {{ .Values.databases.neo4j.acceptLicense | quote }}

@@ -12,6 +12,8 @@ import {
   LlmEndpointUpdateRequest,
 } from '../models/api.model';
 import {environment} from '../environment';
+import {ModelService} from './model.service';
+import {ReadinessService} from './readiness.service';
 
 /**
  * A system-scoped provider API key row. Mirrors `user_api_keys` but with a
@@ -98,6 +100,8 @@ const EMPTY_CODEX_AVAILABILITY: CodexAvailability = {
 @Injectable({providedIn: 'root'})
 export class AdminProvidersService {
   private readonly http = inject(HttpClient);
+  private readonly readiness = inject(ReadinessService);
+  private readonly modelService = inject(ModelService);
   private readonly baseUrl = environment.apiUrl;
 
   readonly systemApiKeys = signal<SystemApiKeyEntry[]>([]);
@@ -117,13 +121,25 @@ export class AdminProvidersService {
   setSystemApiKey(provider: string, body: ApiKeySetRequest): Observable<SystemApiKeyEntry> {
     return this.http
       .put<SystemApiKeyEntry>(`${this.baseUrl}/admin/providers/keys/${provider}`, body)
-      .pipe(tap(() => this.loadSystemApiKeys()));
+      .pipe(
+        tap(() => {
+          this.loadSystemApiKeys();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   deleteSystemApiKey(provider: string): Observable<{status: string}> {
     return this.http
       .delete<{status: string}>(`${this.baseUrl}/admin/providers/keys/${provider}`)
-      .pipe(tap(() => this.loadSystemApiKeys()));
+      .pipe(
+        tap(() => {
+          this.loadSystemApiKeys();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   /**
@@ -170,7 +186,13 @@ export class AdminProvidersService {
   createSystemEndpoint(body: LlmEndpointCreateRequest): Observable<LlmEndpoint> {
     return this.http
       .post<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints`, body)
-      .pipe(tap(() => this.loadSystemEndpoints()));
+      .pipe(
+        tap(() => {
+          this.loadSystemEndpoints();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   updateSystemEndpoint(
@@ -179,13 +201,25 @@ export class AdminProvidersService {
   ): Observable<LlmEndpoint> {
     return this.http
       .patch<LlmEndpoint>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}`, body)
-      .pipe(tap(() => this.loadSystemEndpoints()));
+      .pipe(
+        tap(() => {
+          this.loadSystemEndpoints();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   deleteSystemEndpoint(endpointId: string): Observable<{status: string}> {
     return this.http
       .delete<{status: string}>(`${this.baseUrl}/admin/providers/endpoints/${endpointId}`)
-      .pipe(tap(() => this.loadSystemEndpoints()));
+      .pipe(
+        tap(() => {
+          this.loadSystemEndpoints();
+          this.readiness.load();
+          this.modelService.load(undefined, true);
+        }),
+      );
   }
 
   testSystemEndpoint(endpointId: string): Observable<LlmEndpointTestResult> {
@@ -221,7 +255,12 @@ export class AdminProvidersService {
         `${this.baseUrl}/admin/providers/defaults/${kind}`,
         {model},
       )
-      .pipe(tap(() => this.loadDefaults()));
+      .pipe(
+        tap(() => {
+          this.loadDefaults();
+          this.readiness.load();
+        }),
+      );
   }
 
   // ── Codex Proxy Availability ──────────────────────────────────────

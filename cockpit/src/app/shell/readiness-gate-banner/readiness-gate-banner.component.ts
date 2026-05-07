@@ -59,13 +59,13 @@ import {UserService} from '../../core/services/user.service';
             </li>
             <li [class.done]="hasAllDefaults()">
               @if (hasAllDefaults()) {
-                ✓ <span>Defaults pinned</span>
+                ✓ <span>Required defaults pinned</span>
               } @else if (missingDefaultsText()) {
                 <a routerLink="/admin/providers" fragment="defaults" class="banner-link">
-                  Pin a default for: {{ missingDefaultsText() }}
+                  Pin defaults for required models: {{ missingDefaultsText() }}
                 </a>
               } @else {
-                <span>(Pinning defaults available once each capability has a model.)</span>
+                <span>(Required defaults can be pinned once each capability has a model.)</span>
               }
             </li>
           </ol>

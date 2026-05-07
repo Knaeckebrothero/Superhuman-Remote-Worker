@@ -604,6 +604,17 @@ spec:
               value: {{ include "srw.secretName" . | quote }}
             - name: AGENT_CONFIGMAP
               value: {{ include "srw.configMapName" . | quote }}
+            # Used by AgentProvisioner / PersistentProvisioner to derive
+            # the host:port for the wait-for-orchestrator init container
+            # injected into dynamically-spawned agent pods. Without this
+            # the provisioners fall back to the hardcoded "srw-orchestrator"
+            # default — which only matches the dev install's fullnameOverride
+            # and breaks every other install (e.g. srw-prod, srw-prod-vm).
+            - name: ORCHESTRATOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: ORCHESTRATOR_URL
             # Chart-standard labels for dynamically-provisioned agent pods.
             # The chart's database NetworkPolicies match on these labels;
             # without them, dynamic agent pods are blocked from reaching
