@@ -467,6 +467,78 @@ class TestRemoteBackendWriteFile:
         file_obj.write.assert_called_once_with(b"Hello")
 
 
+class TestRemoteBackendHomeFile:
+    """Tests for RemoteBackend.write_home_file() and resolve_home_path()."""
+
+    def _setup(self, remote_backend, *, home: str = "/home/agent-host"):
+        backend, mock_ssh, mock_sftp = remote_backend
+        backend.connect()
+        mock_sftp.normalize.return_value = home
+        # Make _ensure_remote_dir's stat probe see existing parents so the
+        # mkdir loop terminates immediately.
+        mock_sftp.stat.return_value = _make_sftp_attr(is_dir=True)
+        return backend, mock_ssh, mock_sftp
+
+    def test_resolve_home_path_joins_home(self, remote_backend):
+        backend, _, mock_sftp = self._setup(remote_backend)
+        assert backend.resolve_home_path(".ssh/repo_x") == (
+            "/home/agent-host/.ssh/repo_x"
+        )
+        # Cached after first call: normalize called exactly once.
+        backend.resolve_home_path(".ssh/repo_y")
+        mock_sftp.normalize.assert_called_once_with(".")
+
+    def test_resolve_home_path_normalizes(self, remote_backend):
+        backend, _, _ = self._setup(remote_backend)
+        assert (
+            backend.resolve_home_path(".ssh/./nested/../repo")
+            == "/home/agent-host/.ssh/repo"
+        )
+
+    def test_resolve_home_path_rejects_empty(self, remote_backend):
+        backend, _, _ = self._setup(remote_backend)
+        with pytest.raises(ValueError, match="non-empty"):
+            backend.resolve_home_path("")
+        with pytest.raises(ValueError, match="non-empty"):
+            backend.resolve_home_path(".")
+
+    def test_resolve_home_path_rejects_absolute(self, remote_backend):
+        backend, _, _ = self._setup(remote_backend)
+        with pytest.raises(ValueError, match="escapes home directory"):
+            backend.resolve_home_path("/etc/passwd")
+
+    def test_resolve_home_path_rejects_traversal(self, remote_backend):
+        backend, _, _ = self._setup(remote_backend)
+        with pytest.raises(ValueError, match="escapes home directory"):
+            backend.resolve_home_path("../../etc/passwd")
+
+    def test_write_home_file_writes_under_home(self, remote_backend):
+        backend, _, mock_sftp = self._setup(remote_backend)
+        file_obj = MagicMock()
+        mock_sftp.open.return_value.__enter__ = MagicMock(return_value=file_obj)
+        mock_sftp.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        backend.write_home_file(".ssh/repo_foo", "PRIVATE KEY")
+        mock_sftp.open.assert_called_with("/home/agent-host/.ssh/repo_foo", "wb")
+        file_obj.write.assert_called_once_with(b"PRIVATE KEY")
+
+    def test_write_home_file_accepts_bytes(self, remote_backend):
+        backend, _, mock_sftp = self._setup(remote_backend)
+        file_obj = MagicMock()
+        mock_sftp.open.return_value.__enter__ = MagicMock(return_value=file_obj)
+        mock_sftp.open.return_value.__exit__ = MagicMock(return_value=False)
+
+        backend.write_home_file(".ssh/repo_bin", b"\x00\xff")
+        file_obj.write.assert_called_once_with(b"\x00\xff")
+
+    def test_write_home_file_rejects_escape(self, remote_backend):
+        backend, _, _ = self._setup(remote_backend)
+        with pytest.raises(ValueError, match="escapes home directory"):
+            backend.write_home_file("/etc/passwd", "x")
+        with pytest.raises(ValueError, match="escapes home directory"):
+            backend.write_home_file("../escape", "x")
+
+
 class TestRemoteBackendAppendFile:
     """Tests for RemoteBackend.append_file()."""
 

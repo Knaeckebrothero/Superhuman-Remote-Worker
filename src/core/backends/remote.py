@@ -153,6 +153,11 @@ class RemoteBackend(WorkspaceBackend):
             threading.RLock()
         )  # Guards all SFTP operations (not thread-safe)
 
+        # Lazily-resolved $HOME on the remote (cached after first lookup).
+        # Used by write_home_file / resolve_home_path for setup writes
+        # outside the workspace tree (SSH key/config, etc.).
+        self._home_dir: Optional[str] = None
+
         # Shell state
         self._session_name = f"agent_{job_id[:12]}" if job_id else "agent_remote"
         self._tabs: OrderedDict[str, _RemoteTab] = OrderedDict()
@@ -330,6 +335,33 @@ class RemoteBackend(WorkspaceBackend):
     def resolve_path(self, relative_path: str) -> str:
         return self._resolve(relative_path)
 
+    def _get_home_dir(self) -> str:
+        """Lazily resolve and cache the agent user's $HOME via SFTP.
+
+        SFTP's default cwd after connection is the user's home directory,
+        so normalize(".") returns its canonical absolute path. Cached for
+        the lifetime of the backend.
+        """
+        if self._home_dir is not None:
+            return self._home_dir
+        self._ensure_connected()
+        with self._sftp_lock:
+            self._home_dir = self._sftp.normalize(".")
+        return self._home_dir
+
+    def _resolve_home_path(self, relative_path: str) -> str:
+        """Resolve a path under $HOME, rejecting empty/absolute/escaping inputs."""
+        if not relative_path or relative_path == ".":
+            raise ValueError("resolve_home_path requires a non-empty relative path")
+        cleaned = posixpath.normpath(relative_path)
+        if cleaned.startswith("..") or cleaned.startswith("/"):
+            raise ValueError(f"Path '{relative_path}' escapes home directory")
+        home = self._get_home_dir()
+        full = posixpath.join(home, cleaned)
+        if not full.startswith(home + "/") and full != home:
+            raise ValueError(f"Path '{relative_path}' escapes home directory")
+        return full
+
     def _remote_stat(self, remote_path: str) -> Optional[paramiko.SFTPAttributes]:
         """Get SFTP stat, returning None if path doesn't exist."""
         self._ensure_connected()
@@ -392,6 +424,21 @@ class RemoteBackend(WorkspaceBackend):
             with self._sftp.open(remote_path, "wb") as f:
                 f.write(data)
         logger.debug(f"Wrote remote file: {path}")
+
+    def write_home_file(self, relative_path: str, content: str | bytes) -> None:
+        self._ensure_connected()
+        remote_path = self._resolve_home_path(relative_path)
+        parent = posixpath.dirname(remote_path)
+        self._ensure_remote_dir(parent)
+
+        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        with self._sftp_lock:
+            with self._sftp.open(remote_path, "wb") as f:
+                f.write(data)
+        logger.debug(f"Wrote remote home file: {relative_path}")
+
+    def resolve_home_path(self, relative_path: str) -> str:
+        return self._resolve_home_path(relative_path)
 
     def append_file(self, path: str, content: str) -> None:
         self._ensure_connected()

@@ -529,17 +529,19 @@ async def _attach_session(
                     host = parsed.hostname or "localhost"
 
                     if use_backend:
-                        # Write SSH key and configure on the remote container
-                        key_path = f"/home/agent-host/.ssh/repo_{name}"
+                        # Write SSH key and configure on the remote container.
+                        # write_home_file lands the key under $HOME without
+                        # tripping the workspace-boundary check on write_file;
+                        # resolve_home_path gives us the absolute path for the
+                        # subsequent chmod and SSH config IdentityFile entry.
+                        rel_key = f".ssh/repo_{name}"
+                        key_path = backend.resolve_home_path(rel_key)
                         backend.shell_run(
                             "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
                             timeout=10,
                             tab_name="git",
                         )
-                        backend.write_file(
-                            f"/home/agent-host/.ssh/repo_{name}",
-                            creds["ssh_key"],
-                        )
+                        backend.write_home_file(rel_key, creds["ssh_key"])
                         backend.shell_run(
                             f"chmod 600 {shlex.quote(key_path)}",
                             timeout=10,
