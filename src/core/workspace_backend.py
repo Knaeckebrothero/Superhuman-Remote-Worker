@@ -65,6 +65,50 @@ class WorkspaceBackend(ABC):
         """
         ...
 
+    def write_home_file(self, relative_path: str, content: str | bytes) -> None:
+        """Write a file under the agent user's home directory ($HOME).
+
+        Reserved for one-time setup that legitimately lives outside the
+        workspace tree — e.g. SSH keys/config under ~/.ssh — without
+        relaxing the boundary check that protects normal write_file calls.
+        The path is interpreted relative to $HOME, so callers cannot write
+        to arbitrary absolute paths.
+
+        Default raises NotImplementedError; backends with a home concept
+        (RemoteBackend) override.
+
+        Args:
+            relative_path: Path relative to $HOME (e.g. ".ssh/repo_foo").
+            content: Content to write (str or bytes).
+
+        Raises:
+            ValueError: If path is empty, absolute, or escapes $HOME.
+            NotImplementedError: If the backend has no home concept.
+        """
+        raise NotImplementedError("write_home_file not supported by this backend")
+
+    def resolve_home_path(self, relative_path: str) -> str:
+        """Resolve a path under $HOME to its canonical absolute form.
+
+        Companion to write_home_file: lets callers obtain the absolute
+        path they need to pass to shell commands (chmod, SSH config
+        IdentityFile, etc.) without hard-coding the home directory.
+
+        Default raises NotImplementedError; backends with a home concept
+        override.
+
+        Args:
+            relative_path: Path relative to $HOME.
+
+        Returns:
+            Absolute path string.
+
+        Raises:
+            ValueError: If path is empty, absolute, or escapes $HOME.
+            NotImplementedError: If the backend has no home concept.
+        """
+        raise NotImplementedError("resolve_home_path not supported by this backend")
+
     @abstractmethod
     def append_file(self, path: str, content: str) -> None:
         """Append content to a file. Creates the file if it doesn't exist.
