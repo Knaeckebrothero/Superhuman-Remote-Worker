@@ -386,11 +386,64 @@ they're consumed only as ingress hosts and as window.env.* deep-links.
 {{- end }}
 
 {{/*
-Database connection URLs — internal cluster service or external URL.
-For postgres + vector, the URL is fully read from secrets when internal=true, since
-credentials are part of the URL. The configmap values are only the *non-credential*
-portion (host, port, dbname). For external mode, the full URL is provided in values.
+Database connection parts — host/port/db for postgres + vector + citation.
+
+Credentials (user/password) live in the Secret only; the DSN is composed at
+runtime by the application (orchestrator/utils/db_url.py and src/utils/
+db_url.py). That avoids the redundancy + URL-encoding footgun of also
+shipping a DATABASE_URL/VECTOR_DB_URL/CITATION_DB_URL Vault key.
+
+For external mode, set databases.<which>.externalHost/externalPort/
+externalDb in values; the chart still injects the host/port/db via
+ConfigMap, and only the credentials come from the Secret.
 */}}
+{{- define "srw.postgresHost" -}}
+{{- if .Values.databases.postgres.internal -}}
+{{- printf "%s-postgres" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- required "databases.postgres.externalHost is required when internal=false" .Values.databases.postgres.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.postgresPort" -}}
+{{- if .Values.databases.postgres.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.postgres.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.postgresDb" -}}
+{{- if .Values.databases.postgres.internal -}}
+srw
+{{- else -}}
+{{- .Values.databases.postgres.externalDb | default "srw" -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.vectorPostgresHost" -}}
+{{- if .Values.databases.vector.internal -}}
+{{- printf "%s-pgvector" (include "srw.fullname" .) -}}
+{{- else -}}
+{{- required "databases.vector.externalHost is required when internal=false" .Values.databases.vector.externalHost -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.vectorPostgresPort" -}}
+{{- if .Values.databases.vector.internal -}}
+5432
+{{- else -}}
+{{- .Values.databases.vector.externalPort | default 5432 -}}
+{{- end -}}
+{{- end }}
+
+{{- define "srw.vectorPostgresDb" -}}
+{{- if .Values.databases.vector.internal -}}
+srw_vector
+{{- else -}}
+{{- .Values.databases.vector.externalDb | default "srw_vector" -}}
+{{- end -}}
+{{- end }}
 
 {{/*
 MongoDB URL — supports external mode (no auth in current setup, so URL is non-secret).

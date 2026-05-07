@@ -82,16 +82,23 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def get_postgres_connection_string() -> str:
-    """Get PostgreSQL connection string from environment."""
-    connection_string = os.getenv("DATABASE_URL")
-    if not connection_string:
-        host = os.getenv("POSTGRES_HOST", "localhost")
-        port = os.getenv("POSTGRES_PORT", "5432")
-        user = os.getenv("POSTGRES_USER", "srw")
-        password = os.getenv("POSTGRES_PASSWORD", "srw_password")
-        database = os.getenv("POSTGRES_DB", "srw")
-        connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-    return connection_string
+    """Get PostgreSQL connection string from environment.
+
+    Prefers the discrete-parts layout (POSTGRES_USER/PASSWORD/HOST/PORT/DB)
+    so passwords with ``/`` and other DSN-significant characters get URL-
+    quoted correctly. Falls back to ``$DATABASE_URL`` for legacy stacks.
+    """
+    from orchestrator.utils.db_url import build_postgres_url
+
+    return (
+        build_postgres_url(
+            "POSTGRES",
+            fallback_env="DATABASE_URL",
+            default_host="localhost",
+            default_db="srw",
+        )
+        or "postgresql://srw:srw_password@localhost:5432/srw"
+    )
 
 
 def _parse_connection_string(connection_string: str) -> dict:
@@ -227,9 +234,13 @@ async def init_postgres(force_reset: bool = False) -> bool:
 def get_vector_connection_string() -> Optional[str]:
     """Get Vector DB connection string from environment.
 
-    Returns None if VECTOR_DB_URL is not set (single-DB mode).
+    Returns None when neither the discrete-parts layout
+    (VECTOR_POSTGRES_USER/PASSWORD/HOST/PORT/DB) nor the legacy
+    VECTOR_DB_URL is set (single-DB mode).
     """
-    return os.getenv("VECTOR_DB_URL")
+    from orchestrator.utils.db_url import build_postgres_url
+
+    return build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
 
 
 async def init_vector_db(force_reset: bool = False) -> bool:

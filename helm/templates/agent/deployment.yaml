@@ -61,16 +61,59 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: AGENT_PORT
-            - name: DATABASE_URL
+            # Postgres + vector DSNs are composed at runtime from the
+            # parts below (src/utils/db_url.py). See orchestrator deployment
+            # for the full rationale.
+            - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: DATABASE_URL
-            - name: VECTOR_DB_URL
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: VECTOR_DB_URL
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_DB
+            - name: VECTOR_POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_POSTGRES_USER
+            - name: VECTOR_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: VECTOR_POSTGRES_PASSWORD
+            - name: VECTOR_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_HOST
+            - name: VECTOR_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_PORT
+            - name: VECTOR_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: VECTOR_POSTGRES_DB
             - name: MONGODB_URL
               valueFrom:
                 configMapKeyRef:
@@ -165,12 +208,32 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: BROWSER_LLM_BASE_URL
-            # Citation Engine
-            - name: CITATION_DB_URL
+            # Citation Engine — separate role + DB on the pgvector instance
+            - name: CITATION_POSTGRES_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: CITATION_DB_URL
+                  key: CITATION_POSTGRES_USER
+            - name: CITATION_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: CITATION_POSTGRES_PASSWORD
+            - name: CITATION_POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_POSTGRES_HOST
+            - name: CITATION_POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_POSTGRES_PORT
+            - name: CITATION_POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: CITATION_POSTGRES_DB
             - name: CITATION_LLM_URL
               valueFrom:
                 configMapKeyRef:
@@ -222,8 +285,8 @@ spec:
                   optional: true
             - name: NEO4J_USERNAME
               valueFrom:
-                secretKeyRef:
-                  name: {{ include "srw.secretName" . }}
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
                   key: NEO4J_USERNAME
                   optional: true
             - name: NEO4J_PASSWORD

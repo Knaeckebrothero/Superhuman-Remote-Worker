@@ -71,8 +71,15 @@ def get_citation_engine_config(
 
     llm_url = overrides.get("llm_url") or os.getenv("CITATION_LLM_URL")
 
-    db_url = overrides.get("db_url") or os.getenv(
-        "CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))
+    # Citation engine has its own role + database on the pgvector instance
+    # (CITATION_POSTGRES_*). Falls back through legacy URL envs for compat.
+    from src.utils.db_url import build_postgres_url
+
+    db_url = (
+        overrides.get("db_url")
+        or build_postgres_url("CITATION_POSTGRES", fallback_env="CITATION_DB_URL")
+        or build_postgres_url("VECTOR_POSTGRES", fallback_env="VECTOR_DB_URL")
+        or build_postgres_url("POSTGRES", fallback_env="DATABASE_URL")
     )
 
     reasoning = overrides.get("reasoning_required") or os.getenv(

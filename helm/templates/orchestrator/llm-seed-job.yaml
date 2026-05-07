@@ -59,11 +59,33 @@ spec:
           command: ["python", "-m", "seed.llm_config"]
           args: ["--payload", "/seed/llm.yaml"]
           env:
-            - name: DATABASE_URL
+            # Postgres DSN is composed at runtime by the seeder
+            # (orchestrator/utils/db_url.py).
+            - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: DATABASE_URL
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_HOST
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_PORT
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: POSTGRES_DB
             - name: APP_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

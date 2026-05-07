@@ -199,13 +199,31 @@ deployment — what you need depends on which optional components you enable.
   keys and LLM endpoint credentials at rest. **If lost, all stored credentials
   become unrecoverable.** Back up immediately after install.
 
-**Database credentials** (only when `internal: true` for that database):
-- `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`
-- `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD`, `VECTOR_POSTGRES_DB` — pgvector has its own superuser password key (separate from the main Postgres) so a credential leak on one instance doesn't compromise the other. Embed the same value in `VECTOR_DB_URL` if you also set that key for external-mode deployments.
-- `NEO` — Neo4j auth string (`neo4j/<password>`)
+**Database credentials** — discrete user + password keys only. The chart
+composes the DSN at runtime from these + ConfigMap-provided host/port/db,
+so `/`, `@`, `=`, and `+` in passwords are URL-quoted automatically. Don't
+ship a bundled `DATABASE_URL` / `VECTOR_DB_URL` / `CITATION_DB_URL` Vault
+key — both layouts coexist (the app falls back to the URL if user+password
+aren't set), but the URL form is legacy and a footgun under `urlsplit`.
+- `POSTGRES_USER`, `POSTGRES_PASSWORD`
+- `VECTOR_POSTGRES_USER`, `VECTOR_POSTGRES_PASSWORD` — pgvector has its
+  own superuser password (separate from the main Postgres) so a credential
+  leak on one instance doesn't compromise the other.
+- `CITATION_POSTGRES_USER`, `CITATION_POSTGRES_PASSWORD` — citation
+  engine runs as its own role (`srw_citations`) on the pgvector instance
+  with a dedicated `citation_engine` database.
+- `NEO4J_PASSWORD` — username is configurable in values
+  (`databases.neo4j.username`, defaults to `neo4j`) and lives in the
+  ConfigMap alongside the Bolt URL. The Neo4j server image's `NEO4J_AUTH`
+  is composed at pod-start from these two; don't ship it as a separate
+  Vault key. **Don't include `/` in the password** — the Neo4j image
+  splits `NEO4J_AUTH` on the first `/`, so a slash mis-parses server-side
+  and the Bolt port comes up unauthenticated. URL-safe base64 (or any
+  alphabet without `/`) avoids it.
 
-**Database URLs** (only when `internal: false`):
-- `DATABASE_URL`, `VECTOR_DB_URL`, `MONGODB_URL`, `CITATION_DB_URL`
+For external-mode databases (`internal: false`), the host/port/db come
+from `databases.<which>.externalHost/externalPort/externalDb` in values;
+only the credentials live in Vault.
 
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
@@ -238,10 +256,10 @@ A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-
 APP_ENCRYPTION_KEY=<base64-encoded 32-byte key>
 POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
-POSTGRES_DB=srw
 VECTOR_POSTGRES_USER=srw
 VECTOR_POSTGRES_PASSWORD=changeme
-VECTOR_POSTGRES_DB=srw_vector
+CITATION_POSTGRES_USER=srw_citations
+CITATION_POSTGRES_PASSWORD=changeme
 KC_REALM_ADMIN_PASSWORD=changeme
 OPENAI_API_KEY=sk-...
 CLOUD_SERVICE_USER=agent
