@@ -2,7 +2,7 @@ import {computed, effect, inject, Injectable, PLATFORM_ID, signal} from '@angula
 import {isPlatformBrowser} from '@angular/common';
 
 /** Concrete theme keys — each maps to a body class `theme-<key>`. */
-export type ConcreteTheme = 'travertine' | 'senate' | 'praetorian';
+export type ConcreteTheme = 'travertine' | 'senate';
 
 /** What the user picked. `system` follows OS dark/light preference. */
 export type ThemePreference = ConcreteTheme | 'system';
@@ -12,14 +12,17 @@ export type ResolvedTheme = ConcreteTheme;
 
 const STORAGE_KEY = 'cockpit:theme';
 const VALID_PREFERENCES: ReadonlySet<ThemePreference> = new Set<ThemePreference>([
-  'travertine', 'senate', 'praetorian', 'system',
+  'travertine', 'senate', 'system',
 ]);
 
-// Legacy keys (Catppuccin era) → Roman replacements. Old localStorage values
-// are silently rewritten on first read so users keep a sensible look.
+// Legacy keys → Roman replacements. Old localStorage values are silently
+// rewritten on first read so users keep a sensible look.
+//   dark/light: Catppuccin-era keys.
+//   praetorian: retired high-contrast theme; lifted Senate took its place.
 const LEGACY_MIGRATIONS: Record<string, ThemePreference> = {
   dark: 'senate',
   light: 'travertine',
+  praetorian: 'senate',
 };
 
 /**

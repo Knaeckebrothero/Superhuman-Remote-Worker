@@ -12,8 +12,7 @@ import {ChatPageComponent} from './views/chat/chat-page.component';
 import {SessionsPageComponent} from './views/sessions/sessions-page.component';
 import {SessionCreateComponent} from './views/session-create/session-create.component';
 import {DatasourcesPageComponent} from './views/datasources/datasources-page.component';
-import {AdminProvidersComponent} from './views/admin/providers/admin-providers.component';
-import {AdminModelsComponent} from './views/admin/models/admin-models.component';
+import {AdminLlmComponent} from './views/admin/llm/admin-llm.component';
 import {AdminUsersComponent} from './views/admin/users/admin-users.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
@@ -31,8 +30,9 @@ export const routes: Routes = [
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard] },
   { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
-  { path: 'admin/providers', component: AdminProvidersComponent, canActivate: [authGuard, adminGuard] },
-  { path: 'admin/models', component: AdminModelsComponent, canActivate: [authGuard, adminGuard] },
+  { path: 'admin/llm', component: AdminLlmComponent, canActivate: [authGuard, adminGuard] },
+  { path: 'admin/providers', redirectTo: 'admin/llm' },
+  { path: 'admin/models', redirectTo: 'admin/llm' },
   { path: 'admin/users', component: AdminUsersComponent, canActivate: [authGuard, adminGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
 

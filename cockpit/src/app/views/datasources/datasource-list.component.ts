@@ -791,9 +791,16 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       /* Action Buttons */
       .actions-cell {
         white-space: nowrap;
-        display: flex;
-        gap: 2px;
-        align-items: center;
+        text-align: right;
+      }
+
+      .actions-cell app-icon-button,
+      .actions-cell .inline-test {
+        vertical-align: middle;
+      }
+
+      .actions-cell app-icon-button + app-icon-button {
+        margin-left: 2px;
       }
 
       .inline-test {
