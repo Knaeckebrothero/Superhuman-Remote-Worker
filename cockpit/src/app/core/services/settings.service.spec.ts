@@ -3,6 +3,8 @@ import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {SettingsService} from './settings.service';
+import {ReadinessService} from './readiness.service';
+import {AdminProvidersService} from './admin-providers.service';
 import {LlmEndpoint} from '../models/api.model';
 
 function makeEndpoint(overrides: Partial<LlmEndpoint> = {}): LlmEndpoint {
@@ -27,7 +29,11 @@ function createService(mockHttp?: any) {
     put: vi.fn().mockReturnValue(of({})),
   };
   const injector = Injector.create({
-    providers: [{provide: HttpClient, useValue: http}],
+    providers: [
+      {provide: HttpClient, useValue: http},
+      {provide: ReadinessService, useValue: {load: vi.fn()}},
+      {provide: AdminProvidersService, useValue: {loadCodexAvailability: vi.fn()}},
+    ],
   });
   const service = runInInjectionContext(injector, () => new SettingsService());
   return {service, http};
