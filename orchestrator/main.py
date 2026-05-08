@@ -9307,6 +9307,26 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/agents/threads/{thread_id}/lifecycle")
+async def agent_get_thread_lifecycle(thread_id: str) -> dict[str, Any]:
+    """Return lifecycle fields the agent needs for self-cleanup polling.
+
+    Minimal projection so the agent's thread-status watchdog (PR 2) can
+    decide whether to exit without dragging in the full thread payload.
+    Agent-facing — no user auth.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return {
+        "status": thread.get("status"),
+        "agent_id": str(thread.get("agent_id")) if thread.get("agent_id") else None,
+        "ended_at": thread.get("ended_at").isoformat()
+        if thread.get("ended_at")
+        else None,
+    }
+
+
 class AgentThreadStatusRequest(BaseModel):
     status: str
 

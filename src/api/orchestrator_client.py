@@ -287,6 +287,26 @@ class OrchestratorClient:
             logger.debug(f"Failed to get thread workspace: {e}")
             return None
 
+    async def get_thread_lifecycle(self, thread_id: str) -> dict | None:
+        """Fetch minimal lifecycle fields for the agent's status watchdog.
+
+        Returns:
+            ``{status, agent_id, ended_at}`` on success; ``None`` on any
+            failure (caller treats that as "skip this poll cycle").
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/agents/threads/{thread_id}/lifecycle"
+        try:
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logger.debug(f"Failed to get thread lifecycle: {e}")
+            return None
+
     async def deregister(self) -> bool:
         """Deregister this agent from the orchestrator.
 
