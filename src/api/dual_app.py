@@ -265,42 +265,66 @@ def _should_loop() -> bool:
 
 
 async def _reset_to_idle(source: str, *, skip_session_cleanup: bool = False) -> None:
-    """Clean up current task state and return to IDLE for next task."""
+    """Clean up current task state and return to IDLE for next task.
+
+    The state flip to IDLE and the ready-heartbeat are in a try/finally so
+    they run even if the inline cleanup (session detach, file-handler tear-
+    down) raises. Without that guarantee a partial failure leaves the agent
+    reporting 'working'/'session' forever — exactly the zombie pattern we
+    saw in dev (PR 1's orchestrator-side sweep is the safety net for this).
+
+    The ready-heartbeat retries 3x with backoff. If all attempts fail the
+    orchestrator's stuck-working/session sweep catches it within 60s.
+    """
     global _pod_state, _current_job_id, _current_job_task
 
     logger.info(f"Resetting to IDLE after: {source}")
 
-    _current_job_id = None
-    _current_job_task = None
-    _clear_stop()
+    try:
+        _current_job_id = None
+        _current_job_task = None
+        _clear_stop()
 
-    if _pod_state == PodState.SESSION and not skip_session_cleanup:
+        if _pod_state == PodState.SESSION and not skip_session_cleanup:
+            try:
+                from .persistent_app import _detach_session
+
+                await _detach_session()
+            except Exception as e:
+                logger.warning(f"Session cleanup during reset failed: {e}")
+
+        # Remove per-job file handlers from root logger
         try:
-            from .persistent_app import _detach_session
-
-            await _detach_session()
+            root_logger = logging.getLogger()
+            for handler in root_logger.handlers[:]:
+                if isinstance(handler, logging.FileHandler) and "job_" in getattr(
+                    handler, "baseFilename", ""
+                ):
+                    handler.close()
+                    root_logger.removeHandler(handler)
         except Exception as e:
-            logger.warning(f"Session cleanup during reset failed: {e}")
+            logger.warning(f"File handler cleanup during reset failed: {e}")
+    finally:
+        async with _state_lock:
+            _pod_state = PodState.IDLE
 
-    # Remove per-job file handlers from root logger
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        if isinstance(handler, logging.FileHandler) and "job_" in getattr(
-            handler, "baseFilename", ""
-        ):
-            handler.close()
-            root_logger.removeHandler(handler)
-
-    async with _state_lock:
-        _pod_state = PodState.IDLE
-
-    if _orchestrator_client and _orchestrator_client.agent_id:
-        try:
-            await _orchestrator_client.heartbeat(
-                status="ready", job_id=None, metrics=_get_agent_metrics()
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send ready heartbeat after reset: {e}")
+        if _orchestrator_client and _orchestrator_client.agent_id:
+            last_err: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    await _orchestrator_client.heartbeat(
+                        status="ready", job_id=None, metrics=_get_agent_metrics()
+                    )
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            if last_err is not None:
+                logger.warning(
+                    f"Failed to send ready heartbeat after 3 attempts: {last_err}"
+                )
 
     logger.info("Agent returned to IDLE — ready for next task")
 
@@ -433,9 +457,11 @@ async def _process_orchestrator_job(
             except Exception as e:
                 logger.error(f"Failed to report completion for job {job_id}: {e}")
 
-        if _should_loop():
-            await _reset_to_idle("job completion")
-        else:
+        # Always reset state — _reset_to_idle pushes a final 'ready' heartbeat
+        # so the DB matches reality even in non-loop mode where _schedule_exit
+        # would otherwise os._exit(0) before lifespan cleanup runs.
+        await _reset_to_idle("job completion")
+        if not _should_loop():
             _schedule_exit(delay=2.0)
 
     except asyncio.CancelledError:
@@ -450,9 +476,8 @@ async def _process_orchestrator_job(
                 )
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
-        if _should_loop():
-            await _reset_to_idle("job error")
-        else:
+        await _reset_to_idle("job error")
+        if not _should_loop():
             _schedule_exit(delay=2.0)
     finally:
         if _current_job_id == job_id:
@@ -818,9 +843,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     except Exception as e:
                         logger.error(f"Failed to report completion: {e}")
 
-                if _should_loop():
-                    await _reset_to_idle("job resume completion")
-                else:
+                await _reset_to_idle("job resume completion")
+                if not _should_loop():
                     _schedule_exit(delay=2.0)
 
             except asyncio.CancelledError:
@@ -834,9 +858,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                         )
                     except Exception:
                         pass
-                if _should_loop():
-                    await _reset_to_idle("job resume error")
-                else:
+                await _reset_to_idle("job resume error")
+                if not _should_loop():
                     _schedule_exit(delay=2.0)
             finally:
                 if _current_job_id == request.job_id:

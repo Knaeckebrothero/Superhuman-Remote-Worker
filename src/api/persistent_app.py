@@ -53,6 +53,17 @@ _max_sessions_per_process: int = int(
 # Pod exit scheduling
 _pending_exit_task: Optional[asyncio.Task] = None
 
+# Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
+# that the orchestrator reconciler can only catch with a 60s+ delay):
+#   _ws_connected_event  → set when /ws/chat first accepts a connection.
+#   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
+_ws_connected_event: Optional[asyncio.Event] = None
+_watchdog_tasks: list[asyncio.Task] = []
+_session_boot_ws_timeout_s: int = int(
+    os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
+)
+_thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
 
 def _schedule_exit(delay: float = 1.0) -> None:
     """Schedule process exit after a short delay (allows final I/O to flush)."""
@@ -67,6 +78,118 @@ def _schedule_exit(delay: float = 1.0) -> None:
         os._exit(0)
 
     _pending_exit_task = asyncio.create_task(_exit())
+
+
+# ---------------------------------------------------------------------------
+# Self-cleanup watchdogs (PR 2)
+# ---------------------------------------------------------------------------
+
+
+async def _boot_ws_watchdog(timeout_s: int) -> None:
+    """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
+
+    A persistent agent that boots, attaches to a thread, then never receives
+    a WebSocket has no other way to know it's been abandoned (e.g. user
+    navigated away during creation). Without this watchdog the pod sits
+    forever heartbeating and holding a slot. The orchestrator reconciler
+    catches this too, but only after a 60s+ delay; this watchdog kills
+    locally on the configured cadence.
+    """
+    if _ws_connected_event is None:
+        return
+    try:
+        await asyncio.wait_for(_ws_connected_event.wait(), timeout=timeout_s)
+        return  # WS arrived — normal lifecycle takes over
+    except asyncio.TimeoutError:
+        logger.warning(
+            "No WebSocket connection within %ds for thread %s — "
+            "exiting (likely abandoned during creation).",
+            timeout_s,
+            _thread_id,
+        )
+    try:
+        await _detach_session()
+    except Exception as e:
+        logger.warning(f"Detach during boot-WS timeout failed: {e}")
+    _schedule_exit(delay=1.0)
+
+
+async def _thread_status_watchdog(poll_s: int) -> None:
+    """Exit if the bound thread transitions to 'ended' out-of-band.
+
+    The orchestrator's stale_agent_detector can flip a thread to 'ended'
+    via ``mark_orphaned_threads_ended`` or release the binding via
+    ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
+    is orphaned — no work to do, holding a slot. Poll the thread row and
+    exit if it's no longer in ('created', 'active').
+    """
+    while True:
+        try:
+            await asyncio.sleep(poll_s)
+        except asyncio.CancelledError:
+            raise
+        if not _orchestrator_client or not _thread_id:
+            continue
+        try:
+            lifecycle = await _orchestrator_client.get_thread_lifecycle(_thread_id)
+        except Exception as e:
+            logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
+            continue
+        if not lifecycle:
+            continue
+        status = lifecycle.get("status")
+        if status not in ("created", "active"):
+            logger.info(
+                "Thread %s status is '%s' — exiting (orphaned by orchestrator).",
+                _thread_id,
+                status,
+            )
+            try:
+                await _detach_session()
+            except Exception as e:
+                logger.warning(f"Detach during status-watchdog exit failed: {e}")
+            _schedule_exit(delay=1.0)
+            return
+
+
+def _start_watchdogs() -> None:
+    """Start watchdog tasks for the active session. Safe to call repeatedly."""
+    global _ws_connected_event, _watchdog_tasks
+
+    # Stop any prior watchdogs (defensive — should already be cleared).
+    for task in _watchdog_tasks:
+        if not task.done():
+            task.cancel()
+    _watchdog_tasks = []
+
+    _ws_connected_event = asyncio.Event()
+    _watchdog_tasks = [
+        asyncio.create_task(
+            _boot_ws_watchdog(_session_boot_ws_timeout_s),
+            name="boot-ws-watchdog",
+        ),
+        asyncio.create_task(
+            _thread_status_watchdog(_thread_status_poll_s),
+            name="thread-status-watchdog",
+        ),
+    ]
+
+
+def _stop_watchdogs() -> None:
+    """Cancel all active watchdogs. Skips the current task to avoid self-cancel."""
+    global _watchdog_tasks
+    current = asyncio.current_task()
+    for task in _watchdog_tasks:
+        if task is current or task.done():
+            continue
+        task.cancel()
+    _watchdog_tasks = []
+
+
+def _signal_ws_connected() -> None:
+    """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
+    if _ws_connected_event is not None:
+        _ws_connected_event.set()
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
@@ -669,6 +792,10 @@ async def _attach_session(
     # Mark thread as active
     await _update_thread_status("active")
 
+    # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
+    # out-of-band thread.status='ended'. Cancelled by _detach_session.
+    _start_watchdogs()
+
     logger.info(f"Session attached: thread={_thread_id}")
 
 
@@ -688,6 +815,10 @@ async def _detach_session() -> None:
 
     thread_id = _thread_id
     logger.info(f"Detaching session: thread={thread_id}")
+
+    # Cancel self-cleanup watchdogs first — we're about to do the cleanup
+    # they would have triggered, no point letting them race the detach.
+    _stop_watchdogs()
 
     # Mark thread as ended (still resumable — `ended` is the only inactive state).
     await _update_thread_status("ended")
@@ -869,6 +1000,11 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
         await ws.accept()
+
+        # Signal the boot-WS watchdog that a connection arrived. Done before
+        # the readiness check so even a failed-to-be-ready connection counts:
+        # the user clearly came back, and a different error path applies.
+        _signal_ws_connected()
 
         if not _session or not _session.llm_with_tools:
             await _ws_send(ws, "error", {"message": "Agent not ready"})
