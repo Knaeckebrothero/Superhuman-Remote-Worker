@@ -119,8 +119,14 @@ spec:
               value: "apoc.*"
             - name: NEO4J_dbms_security_procedures_allowlist
               value: "apoc.*"
+            # Bind to all IPv4 interfaces. Without this Jetty ends up on
+            # IPv6-only `[::]` on dual-stack nodes, so the IPv4-only cluster
+            # CNI can't reach either port (Traefik → 502, orchestrator/agents
+            # → connection refused on the ClusterIP).
+            - name: NEO4J_server_default__listen__address
+              value: "0.0.0.0"
             - name: NEO4J_server_bolt_listen__address
-              value: ":7688"
+              value: "0.0.0.0:7688"
             - name: NEO4J_server_bolt_advertised__address
               value: "{{ include "srw.neo4jBoltHost" . }}:7688"
             {{- if .Values.databases.neo4j.boltTls.enabled }}

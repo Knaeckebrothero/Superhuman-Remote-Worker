@@ -724,13 +724,14 @@
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
     },
     "startup": {
-      "creating": "Creating session...",
-      "provisioning": "Provisioning agent...",
-      "booting": "Agent starting...",
-      "connecting": "Connecting to agent...",
-      "starting": "Session starting...",
-      "reconnecting": "Reconnecting agent...",
-      "connectingFallback": "Connecting..."
+      "title": "Starting session",
+      "titleResume": "Resuming session",
+      "steps": {
+        "creating": "Creating thread",
+        "provisioning": "Provisioning agent",
+        "booting": "Booting agent runtime",
+        "connecting": "Establishing connection"
+      }
     },
     "thinking": {
       "past": "Thought for a moment",

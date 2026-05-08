@@ -961,6 +961,208 @@ both J and K returned empty `reasoning_content`, falsifying the #38855
 hypothesis as our cluster's cause and pivoting the working theory back
 to the model-or-template-emission question.
 
+## 2026-05-08 — HF chat template Jinja read directly: it's wired correctly
+
+After J/K disconfirmed the vLLM #38855 workaround, the cheapest
+remaining probe was to read the model's actual chat template Jinja
+from HuggingFace and confirm whether the thinking branch exists. It
+does — in detail. Pivots the diagnosis again.
+
+### Files pulled
+
+| Source | Bytes | Path |
+|---|---|---|
+| `tokenizer_config.json` | 2095 | `/tmp/gemma4_tokenizer_config.json` |
+| `chat_template.jinja` | 16934 | `/tmp/gemma4_chat_template.jinja` |
+| `README.md` (model card) | 26731 | `/tmp/gemma4_readme.md` |
+
+The chat template ships as a **separate file**, not embedded in
+`tokenizer_config.json`. This is unusual. HF tokenizers ≥0.21 auto-load
+it from `chat_template.jinja`; older versions only check the JSON
+`chat_template` field and silently fall back to a generic template if
+absent.
+
+### Confirmed: full machinery for channel emission
+
+`tokenizer_config.json` declares first-class tokens for the entire
+thinking-channel apparatus:
+
+- `"think_token": "<|think|>"` (line 71)
+- `"soc_token": "<|channel>"` (start-of-channel, line 66)
+- `"eoc_token": "<channel|>"` (end-of-channel, line 8)
+- A formal `response_schema` (lines 25-65) with the parse regex
+  `<\|channel\>thought\n(?P<thinking>.*?)\<channel\|\>` and a typed
+  `thinking: string` field
+
+The model variant therefore CAN emit channels — disconfirms
+"cause #1" (model variant doesn't emit) from the 2026-05-06
+analysis.
+
+### Confirmed: README states the activation mechanism
+
+From `README.md` line 368-372 (verbatim):
+
+> **Trigger Thinking:** Thinking is enabled by including the
+> `<|think|>` token at the start of the system prompt. To disable
+> thinking, remove the token.
+>
+> **Standard Generation:** When thinking is enabled, the model will
+> output its internal reasoning followed by the final answer using
+> this structure:
+> `<|channel>thought\n`**[Internal reasoning]**`<channel|>`
+>
+> **Disabled Thinking Behavior:** For all models except for the E2B
+> and E4B variants, if thinking is disabled, the model will still
+> generate the tags but with an empty thought block:
+> `<|channel>thought\n<channel|>`**[Final answer]**
+
+So the activation knob is "literal `<|think|>` token at start of
+system prompt." `enable_thinking=True` is the chat-template
+convenience for that.
+
+### Confirmed: chat template is correctly wired
+
+`chat_template.jinja` lines 178-205 (system block):
+
+```jinja
+{%- if (enable_thinking is defined and enable_thinking) or tools or messages[0]['role'] in ['system', 'developer'] -%}
+    {{- '<|turn>system\n' -}}
+    {%- if enable_thinking is defined and enable_thinking -%}
+        {{- '<|think|>\n' -}}
+    {%- endif -%}
+    ...
+    {%- if tools -%}
+        {%- for tool in tools %}
+            {{- '<|tool>' -}}
+            {{- format_function_declaration(tool) | trim -}}
+            {{- '<tool|>' -}}
+        {%- endfor %}
+    {%- endif -%}
+    {{- '<turn|>\n' -}}
+{%- endif %}
+```
+
+Lines 347-353 (generation prompt — the suppression mechanism):
+
+```jinja
+{%- if add_generation_prompt -%}
+    {%- if ns.prev_message_type != 'tool_response' and ns.prev_message_type != 'tool_call' -%}
+        {{- '<|turn>model\n' -}}
+        {%- if not enable_thinking | default(false) -%}
+            {{- '<|channel>thought\n<channel|>' -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endif -%}
+```
+
+So:
+
+- **With `enable_thinking=True`**: `<|think|>` is in system; generation
+  prompt is just `<|turn>model\n` (no empty channel block). Model is
+  free to emit `<|channel>thought\n[reasoning]<channel|>[answer]` or
+  `<|channel>thought\n<channel|>[answer]` (immediate empty thought).
+- **Without the kwarg**: `<|think|>` is NOT in system; generation
+  prompt is `<|turn>model\n<|channel>thought\n<channel|>` — the empty
+  thought block is **pre-inserted**, forcing the model to start the
+  answer phase. Effectively "you've already finished thinking, now
+  give the answer."
+
+Lines 237-241 (multi-turn thinking handling):
+
+```jinja
+{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
+{%- if thinking_text and loop.index0 > ns_turn.last_user_idx and message.get('tool_calls') -%}
+    {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
+{%- endif -%}
+```
+
+Combined with README line 379:
+
+> **No Thinking Content in History**: In multi-turn conversations, the
+> historical model output should only include the final response.
+> Thoughts from previous model turns must *not be added* before the
+> next user turn begins.
+
+So the template correctly drops historical reasoning unless the
+assistant message both (a) follows the last user message, AND (b)
+contains tool_calls. The `strip_thinking` macro at lines 148-158
+sanitizes any leaked channel blocks from prior assistant content.
+
+### Pivoted hypothesis: vLLM is not loading this chat template
+
+Everything model-side is wired correctly. So why did D, J, K all return
+empty `reasoning_content`?
+
+Strongest remaining hypothesis: **vLLM 0.19.1 in the cluster image is
+not loading `chat_template.jinja` as the active template.** Three
+possible mechanisms:
+
+1. **Tokenizers version pre-0.21**: vLLM 0.19.1's bundled
+   `transformers` / `tokenizers` may not auto-discover separate
+   `chat_template.jinja` files. The auto-loading was added in
+   tokenizers 0.21. If vLLM 0.19.1 ships an older version, it falls
+   back to a generic template (Gemma 3 family or a vLLM-internal
+   default) that has no thinking branch.
+2. **No `--chat-template` flag passed**: cluster `entrypoint.sh`
+   doesn't pass `--chat-template` explicitly (confirmed in 2026-05-06
+   doc). If auto-discovery fails per (1), vLLM has nothing else to
+   load.
+3. **`chat_template_kwargs` filtering broken in 0.19.1**: vLLM
+   may accept the kwarg in the request but not forward it to the
+   Jinja namespace. Known issue in some vLLM minor versions.
+
+The kwarg is reaching vLLM in *some* form — D's `completion_tokens=
+524` vs A's `=220`, J's `=738` — so it's not being silently dropped.
+But the structural channel emission isn't happening. Compatible with
+(1) or (2): a fallback template exists that responds to the kwarg by
+generating differently (e.g. inserting "think step by step" prose)
+without the channel structure.
+
+### Cheap next probes
+
+In ascending order of effort:
+
+1. **Run vLLM Python API introspection on the cluster.** `engine.
+   tokenizer.chat_template` reveals what template is actually loaded.
+   Could be a one-line check via `kubectl exec` or SSH to the host.
+   Definitive answer in 30 seconds.
+2. **Pass `--chat-template /path/to/gemma4_chat_template.jinja`
+   explicitly** in the cluster `entrypoint.sh` and rebuild the image.
+   If reasoning_content populates after, hypothesis (1) or (2)
+   confirmed. If not, hypothesis (3) is implicated.
+3. **Try a more complex prompt** that the model would obviously want
+   to think on (e.g. multi-step word problem rather than `17 × 23`).
+   If a complex prompt populates `reasoning_content` while a simple
+   one doesn't, the issue isn't activation but training-distribution
+   sensitivity — the model emits channels selectively.
+4. **Bump vLLM image to 0.20+ or current main** in the cluster
+   container. The recipes page is dated April 2026 and references
+   current vLLM; 0.19.1 (current cluster) is months behind.
+
+### Action items, revised again
+
+1. Probe (1) — query the running vLLM for its loaded chat template.
+   Need workstation SSH access or a kubectl-exec on the cluster pod.
+2. If the loaded template differs from the official one, fix at the
+   container level (add `--chat-template` flag, or upgrade vLLM,
+   whichever is simpler).
+3. Independently, run probe (3) — extend the diagnostic with a
+   complex thinking prompt to see if simpler-prompt-no-channels is
+   actually a model behavior rather than an activation gap.
+4. Cockpit screenshot remains an open question — but with the model's
+   channel machinery now confirmed, the most likely source is "Strix
+   `gemma-4-moe-strix` (llama-server) which natively surfaces
+   channel-delimited content" rather than the cluster vLLM.
+
+### Files Touched 2026-05-08
+
+```
+M  docs/issues/gemma_session_findings.md             (this section: HF artifact reads + revised hypothesis)
+   /tmp/gemma4_chat_template.jinja                   (downloaded for inspection, not committed)
+   /tmp/gemma4_tokenizer_config.json                 (downloaded for inspection, not committed)
+   /tmp/gemma4_readme.md                             (downloaded for inspection, not committed)
+```
+
 ### Web sources
 
 - vLLM gemma4_reasoning_parser API docs — https://docs.vllm.ai/en/latest/api/vllm/reasoning/gemma4_reasoning_parser/
