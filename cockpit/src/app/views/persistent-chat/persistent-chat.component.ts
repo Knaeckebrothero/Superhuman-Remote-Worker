@@ -10,6 +10,7 @@ import {
     ViewChild,
 } from '@angular/core';
 import {TitleCasePipe} from '@angular/common';
+import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
@@ -28,6 +29,17 @@ import {AppIconComponent} from '../../ui/icon';
 interface SlashCommand {
     command: string;
     descriptionKey: string;
+}
+
+interface Suggestion {
+    icon: string;
+    en: string;
+    de: string;
+}
+
+interface DisplayedSuggestion {
+    icon: string;
+    text: string;
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
@@ -422,7 +434,22 @@ const CATEGORY_LABELS: Record<string, string> = {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
               @if (chat.sessionReady()) {
-                <span class="empty-state-text">{{ 'chat.system.emptyPrompt' | transloco }}</span>
+                <div class="empty-inner">
+                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
+                  <h2 class="empty-title">{{ 'chat.empty.title' | transloco }}</h2>
+                  <p class="empty-subtitle">{{ 'chat.empty.subtitle' | transloco }}</p>
+                  @if (displayedSuggestions().length > 0) {
+                    <div class="suggestion-grid">
+                      @for (s of displayedSuggestions(); track $index) {
+                        <button type="button" class="suggestion-chip"
+                                (click)="pickSuggestion(s)">
+                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
+                          <span class="suggestion-text">{{ s.text }}</span>
+                        </button>
+                      }
+                    </div>
+                  }
+                </div>
               } @else {
                 <div class="startup-spinner-container">
                   <div class="startup-spinner"></div>
@@ -880,10 +907,85 @@ const CATEGORY_LABELS: Record<string, string> = {
         justify-content: center;
       }
 
-      .empty-state-text {
+      .empty-inner {
+        text-align: center;
+        max-width: 850px;
+        padding: 72px 48px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .empty-mark {
+        width: 144px;
+        height: 144px;
+        margin-bottom: 30px;
+        opacity: 0.95;
+      }
+
+      .empty-title {
+        font-family: var(--font-display, inherit);
+        font-size: 32px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-primary, var(--text-primary));
+        margin: 0 0 16px;
+        line-height: 1.15;
+      }
+
+      .empty-subtitle {
+        font-size: 17px;
+        line-height: 1.55;
         color: var(--text-muted, var(--text-muted));
-        font-size: 14px;
-        scrollbar-color: var(--border-color, var(--surface-0)) transparent;
+        margin: 0 0 38px;
+        max-width: 620px;
+      }
+
+      .suggestion-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        width: 100%;
+        max-width: 760px;
+      }
+
+      .suggestion-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 16px 22px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-secondary, var(--text-secondary));
+        font-family: inherit;
+        font-size: 16px;
+        font-weight: 500;
+        text-align: left;
+        cursor: pointer;
+        border-radius: 0;
+        transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+      }
+
+      .suggestion-chip:hover {
+        border-color: var(--accent-color, var(--accent-color));
+        color: var(--text-primary, var(--text-primary));
+        background: var(--hover, rgba(255, 255, 255, 0.04));
+      }
+
+      .suggestion-icon {
+        color: var(--accent-color, var(--accent-color));
+        flex-shrink: 0;
+      }
+
+      .suggestion-text {
+        flex: 1;
+      }
+
+      @media (max-width: 600px) {
+        .suggestion-grid {
+          grid-template-columns: 1fr;
+        }
       }
 
       .startup-spinner-container {
@@ -1775,6 +1877,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     readonly modelService = inject(ModelService);
     private readonly transloco = inject(TranslocoService);
     private readonly i18n = inject(I18nService);
+    private readonly http = inject(HttpClient);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
@@ -1794,6 +1897,16 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
     readonly filteredCommands = signal<SlashCommand[]>([]);
+
+    // Empty-state suggestions (loaded once, picked once per mount)
+    private readonly pickedSuggestions = signal<Suggestion[]>([]);
+    readonly displayedSuggestions = computed<DisplayedSuggestion[]>(() => {
+        const lang = this.i18n.activeLang();
+        return this.pickedSuggestions().map(s => ({
+            icon: s.icon,
+            text: lang === 'de-DE' ? (s.de || s.en) : s.en,
+        }));
+    });
 
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
@@ -1816,6 +1929,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
         // Load available models eagerly so the dropdown is ready
         this.modelService.load();
+
+        // Load empty-state suggestions and pick 4 at random for this mount
+        this.http.get<Suggestion[]>('assets/suggestions.json').subscribe({
+            next: (data) => {
+                const shuffled = [...data].sort(() => Math.random() - 0.5);
+                this.pickedSuggestions.set(shuffled.slice(0, Math.min(4, shuffled.length)));
+            },
+            error: () => this.pickedSuggestions.set([]),
+        });
 
         // Auto-scroll when messages, streaming, or tool calls change
         effect(() => {
@@ -1938,6 +2060,14 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         this.inputText = cmd.command + ' ';
         this.showSlashMenu.set(false);
         this.inputEl?.nativeElement?.focus();
+    }
+
+    pickSuggestion(s: DisplayedSuggestion): void {
+        this.inputText = s.text;
+        setTimeout(() => {
+            this.inputEl?.nativeElement?.focus();
+            this.autoResizeInput();
+        });
     }
 
     onKeydown(event: KeyboardEvent): void {

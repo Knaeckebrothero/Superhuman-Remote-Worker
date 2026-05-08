@@ -715,10 +715,13 @@
     },
     "system": {
       "sessionResumed": "Sitzung fortgesetzt",
-      "emptyPrompt": "Beginnen Sie eine Unterhaltung...",
       "resumeSession": "Sitzung fortsetzen",
       "resuming": "Wird fortgesetzt...",
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
+    },
+    "empty": {
+      "title": "Was wollen wir heute erobern?",
+      "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
     },
     "startup": {
       "creating": "Sitzung wird erstellt...",

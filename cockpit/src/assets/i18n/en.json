@@ -715,10 +715,13 @@
     },
     "system": {
       "sessionResumed": "Session resumed",
-      "emptyPrompt": "Start a conversation...",
       "resumeSession": "Resume Session",
       "resuming": "Resuming...",
       "resumeFailed": "Failed to resume session"
+    },
+    "empty": {
+      "title": "What shall we conquer today?",
+      "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
     },
     "startup": {
       "creating": "Creating session...",
