@@ -724,13 +724,14 @@
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
     },
     "startup": {
-      "creating": "Sitzung wird erstellt...",
-      "provisioning": "Agent wird bereitgestellt...",
-      "booting": "Agent startet...",
-      "connecting": "Verbinde mit Agent...",
-      "starting": "Sitzung startet...",
-      "reconnecting": "Agent wird erneut verbunden...",
-      "connectingFallback": "Verbinde..."
+      "title": "Sitzung wird gestartet",
+      "titleResume": "Sitzung wird fortgesetzt",
+      "steps": {
+        "creating": "Thread wird erstellt",
+        "provisioning": "Agent wird bereitgestellt",
+        "booting": "Agent-Laufzeit startet",
+        "connecting": "Verbindung wird hergestellt"
+      }
     },
     "thinking": {
       "past": "Hat einen Moment nachgedacht",
