@@ -69,6 +69,12 @@ spec:
           port: 80
         - protocol: TCP
           port: 443
+    # SSH for git clone of SSH-auth repository datasources (GitHub, GitLab,
+    # self-hosted Gitea-over-SSH, etc.). Already-permissive TCP/443 egress
+    # means this doesn't meaningfully expand the exfil surface.
+    - ports:
+        - protocol: TCP
+          port: 22
     # Tailscale mesh — direct WireGuard peer (UDP/41641) and STUN (UDP/3478).
     # If UDP is blocked end-to-end, Tailscale falls back to DERP-over-443
     # transparently (still works, just relayed). Applies equally to container
