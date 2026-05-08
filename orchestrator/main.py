@@ -394,10 +394,10 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
-            # Mark threads bound to stale/deleted agents as idle
-            idle_count = await postgres_db.mark_orphaned_threads_idle()
-            if idle_count > 0:
-                logger.info(f"Marked {idle_count} thread(s) as idle (orphaned)")
+            # Mark threads bound to stale/deleted agents as ended
+            ended_count = await postgres_db.mark_orphaned_threads_ended()
+            if ended_count > 0:
+                logger.info(f"Marked {ended_count} thread(s) as ended (orphaned)")
             # Recover orphaned jobs from offline or deleted agents
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
@@ -9288,17 +9288,22 @@ async def agent_update_thread_status(
 ) -> dict[str, str]:
     """Update thread status (no auth, agent-facing).
 
-    Used for lifecycle transitions: created → active, active → idle.
-    The 'ended' transition is handled by DELETE /api/persistent/threads/{id}.
+    Used for lifecycle transitions: created → active, active → ended.
+    'ended' is also reachable via DELETE /api/persistent/threads/{id} (manual
+    end is removed from the UI but the endpoint remains for permanent delete).
     """
-    valid_statuses = {"active", "idle"}
+    valid_statuses = {"active", "ended"}
     if request.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
     try:
-        await postgres_db.update_thread_status(thread_id, request.status)
+        if request.status == "ended":
+            # Route through end_thread so ended_at gets stamped.
+            await postgres_db.end_thread(thread_id)
+        else:
+            await postgres_db.update_thread_status(thread_id, request.status)
         return {"status": request.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -10218,7 +10223,7 @@ async def resume_thread(
     thread_id: str,
     request: Request,
 ) -> dict[str, Any]:
-    """Resume an ended or idle thread (auth: owner only).
+    """Resume an ended thread (auth: owner only).
 
     Resets thread status to 'created' and clears the stale agent_id so that
     a new agent can pick it up. The frontend navigates to the chat page after
@@ -10230,7 +10235,7 @@ async def resume_thread(
         raise HTTPException(status_code=404, detail="Thread not found")
     if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
-    if thread.get("status") not in ("ended", "idle"):
+    if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
         )

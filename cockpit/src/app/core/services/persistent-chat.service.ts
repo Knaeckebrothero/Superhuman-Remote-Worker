@@ -2,6 +2,7 @@ import {computed, inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
+import {ThreadStatus} from '../models/api.model';
 
 /** A chat message in the persistent session. */
 export interface ChatMessage {
@@ -98,6 +99,10 @@ export class PersistentChatService {
     readonly ncSessionFolder = signal<string | null>(null);
     readonly cloudSessionUrl = signal<string | null>(null);
 
+    // --- Lifecycle state from the row (drives the resume card) ---
+    readonly threadStatus = signal<ThreadStatus | null>(null);
+    readonly endedAt = signal<string | null>(null);
+
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
 
@@ -152,6 +157,13 @@ export class PersistentChatService {
         this.threadId.set(threadId);
         await this.loadHistory(threadId);
         await this.loadThreadMeta(threadId);
+
+        // Don't auto-connect to ended sessions — render the read-only resume
+        // card instead. The user explicitly clicks "Resume" to come back online.
+        if (this.threadStatus() === 'ended') {
+            this.connectionState.set('disconnected');
+            return;
+        }
 
         const apiUrl = environment.apiUrl;
         const wsBase = apiUrl
@@ -237,6 +249,8 @@ export class PersistentChatService {
             this.turnCount.set(thread.total_turns || 0);
             this.ncSessionFolder.set(thread.nc_session_folder || null);
             this.cloudSessionUrl.set(thread.cloud_session_url || null);
+            this.threadStatus.set((thread.status as ThreadStatus) || null);
+            this.endedAt.set(thread.ended_at || thread.last_activity || null);
         } catch {
             // Non-fatal — UI will show fallback values
         }
@@ -299,6 +313,8 @@ export class PersistentChatService {
         this.turnCount.set(0);
         this.ncSessionFolder.set(null);
         this.cloudSessionUrl.set(null);
+        this.threadStatus.set(null);
+        this.endedAt.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
         this.isSessionPaused.set(false);
@@ -616,16 +632,21 @@ export class PersistentChatService {
                     role: 'system', content: 'Session ended.', timestamp: new Date(),
                 }]);
                 this.isWaitingForInput.set(false);
+                this.threadStatus.set('ended');
+                this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'session.idle_timeout':
-                this.isSessionPaused.set(true);
                 this.messages.update(msgs => [...msgs, {
                     role: 'system',
                     content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
                     timestamp: new Date(),
                 }]);
                 this.isWaitingForInput.set(false);
+                // The agent's idle archive flips the row to 'ended'. Reflect
+                // that locally so the UI swaps to the read-only resume card.
+                this.threadStatus.set('ended');
+                this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'vm_upgrade.needed':

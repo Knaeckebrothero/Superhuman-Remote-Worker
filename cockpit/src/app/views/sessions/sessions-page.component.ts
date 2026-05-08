@@ -192,15 +192,6 @@ interface Project {
                 >
                   <app-icon size="sm">play_arrow</app-icon>
                 </app-icon-button>
-                @if (thread.status !== 'ended') {
-                  <app-icon-button
-                    [ariaLabel]="'sessions.tooltip.end' | transloco"
-                    [tooltip]="'sessions.tooltip.end' | transloco"
-                    (clicked)="endSession(thread)"
-                  >
-                    <app-icon size="sm">stop</app-icon>
-                  </app-icon-button>
-                }
                 <app-icon-button
                   variant="danger"
                   [ariaLabel]="'sessions.tooltip.delete' | transloco"
@@ -376,7 +367,6 @@ interface Project {
     }
 
     .session-status-dot.active, .session-status-dot.created { background: var(--success); }
-    .session-status-dot.idle { background: var(--warning); }
     .session-status-dot.ended { background: var(--surface-2, #585b70); }
 
     .session-title {
@@ -580,7 +570,7 @@ export class SessionsPageComponent implements OnInit {
     }
 
     async resumeSession(thread: Thread): Promise<void> {
-        if (thread.status === 'ended' || thread.status === 'idle') {
+        if (thread.status === 'ended') {
             try {
                 await firstValueFrom(
                     this.http.post(`${environment.apiUrl}/persistent/threads/${thread.id}/resume`, {})
@@ -604,18 +594,6 @@ export class SessionsPageComponent implements OnInit {
         if (!thread.nc_session_folder || !environment.cloudUrl) return;
         const folderName = thread.nc_session_folder.split('/').pop();
         window.open(`${environment.cloudUrl}/apps/files/?dir=/${folderName}`, '_blank');
-    }
-
-    async endSession(thread: Thread): Promise<void> {
-        if (!confirm(this.transloco.translate('sessions.confirmEnd'))) return;
-        try {
-            await firstValueFrom(
-                this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}`)
-            );
-            this.loadThreads();
-        } catch (e: any) {
-            this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
-        }
     }
 
     async deleteSession(thread: Thread): Promise<void> {

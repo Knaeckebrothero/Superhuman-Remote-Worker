@@ -675,7 +675,7 @@ async def _attach_session(
 async def _detach_session() -> None:
     """Tear down the current session and return to idle.
 
-    1. Mark thread as idle
+    1. Mark thread as ended (still resumable)
     2. Git commit + push
     3. Clean up session resources
     4. Clear session globals
@@ -689,8 +689,8 @@ async def _detach_session() -> None:
     thread_id = _thread_id
     logger.info(f"Detaching session: thread={thread_id}")
 
-    # Mark thread as idle (NOT ended — resumable)
-    await _update_thread_status("idle")
+    # Mark thread as ended (still resumable — `ended` is the only inactive state).
+    await _update_thread_status("ended")
 
     # Final cloud sync + stop polling + drop secrets
     if _session.workspace_sync:
@@ -1254,10 +1254,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     pass
 
             if idle_timed_out:
-                await _handle_idle_archive()
+                await _handle_idle_archive(ws)
 
             # Always detach session on disconnect (idle timeout or not).
-            # Sets thread status to 'idle' and cleans up session state.
+            # Sets thread status to 'ended' and cleans up session state.
             await _detach_session()
 
             logger.info(f"WebSocket session ended: thread={_thread_id}")
@@ -1772,11 +1772,17 @@ async def _update_thread_status(status: str) -> None:
             logger.warning(f"Failed to update thread status to {status}: {e}")
 
 
-async def _handle_idle_archive() -> None:
-    """Handle idle timeout — archive session state, set thread to idle."""
+async def _handle_idle_archive(ws: WebSocket) -> None:
+    """Handle idle timeout — archive session state, set thread to ended."""
     try:
         if not _session:
             return
+
+        # 0. Tell any still-connected client that the session is ending so the
+        # UI can flip to the resume card without waiting for a refresh.
+        await _ws_send(
+            ws, "session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"}
+        )
 
         # 1. Extract memories
         recall_store = (
@@ -1822,8 +1828,8 @@ async def _handle_idle_archive() -> None:
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 3. Set thread to 'idle' (NOT 'ended' — resumable)
-        await _update_thread_status("idle")
+        # 3. Set thread to 'ended' (still resumable — `ended` is the only inactive state).
+        await _update_thread_status("ended")
 
         # 4. Git commit + push
         if _session.workspace_manager:

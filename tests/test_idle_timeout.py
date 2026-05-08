@@ -5,8 +5,8 @@ Covers:
   - Idle timeout in get_user_input (asyncio.wait_for)
   - _handle_idle_archive (memory extraction, title, status, git)
   - _update_thread_status helper (REST-first, DB fallback)
-  - Thread status transitions (active on startup, idle on shutdown)
-  - mark_orphaned_threads_idle (postgres.py)
+  - Thread status transitions (active on startup, ended on shutdown)
+  - mark_orphaned_threads_ended (postgres.py)
   - update_thread_status REST client (orchestrator_client.py)
   - PUT /api/agents/threads/{id}/status endpoint
   - Stale detector orphaned thread sweep
@@ -149,11 +149,11 @@ async def _handle_idle_archive(
                             title,
                         )
 
-    # 3. Set thread to 'idle'
+    # 3. Set thread to 'ended' (resumable; idle status was collapsed into ended).
     if orchestrator_client and thread_id:
-        await orchestrator_client.update_thread_status(thread_id, "idle")
+        await orchestrator_client.update_thread_status(thread_id, "ended")
     elif session.postgres_conn and thread_id:
-        await session.postgres_conn.update_thread_status(thread_id, "idle")
+        await session.postgres_conn.update_thread_status(thread_id, "ended")
 
     # 4. Git commit + push
     if session.workspace_manager:
@@ -210,18 +210,18 @@ def _mock_session(
 
 class TestHandleIdleArchive:
     @pytest.mark.asyncio
-    async def test_sets_thread_to_idle_via_orchestrator(self):
+    async def test_sets_thread_to_ended_via_orchestrator(self):
         session = _mock_session()
         orch = AsyncMock()
         await _handle_idle_archive(session, orch, "tid-1")
-        orch.update_thread_status.assert_awaited_once_with("tid-1", "idle")
+        orch.update_thread_status.assert_awaited_once_with("tid-1", "ended")
 
     @pytest.mark.asyncio
     async def test_falls_back_to_direct_db(self):
         session = _mock_session()
         await _handle_idle_archive(session, None, "tid-1")
         session.postgres_conn.update_thread_status.assert_awaited_once_with(
-            "tid-1", "idle"
+            "tid-1", "ended"
         )
 
     @pytest.mark.asyncio
@@ -305,17 +305,17 @@ class TestUpdateThreadStatus:
         orch = AsyncMock()
         orch.update_thread_status.side_effect = Exception("connection refused")
         session = _mock_session()
-        await _update_thread_status(orch, session, "tid-1", "idle")
+        await _update_thread_status(orch, session, "tid-1", "ended")
         session.postgres_conn.update_thread_status.assert_awaited_once_with(
-            "tid-1", "idle"
+            "tid-1", "ended"
         )
 
     @pytest.mark.asyncio
     async def test_uses_db_when_no_orchestrator(self):
         session = _mock_session()
-        await _update_thread_status(None, session, "tid-1", "idle")
+        await _update_thread_status(None, session, "tid-1", "ended")
         session.postgres_conn.update_thread_status.assert_awaited_once_with(
-            "tid-1", "idle"
+            "tid-1", "ended"
         )
 
     @pytest.mark.asyncio
@@ -328,17 +328,18 @@ class TestUpdateThreadStatus:
 
 
 # =============================================================================
-# mark_orphaned_threads_idle (replicated SQL logic)
+# mark_orphaned_threads_ended (replicated SQL logic)
 # =============================================================================
 
 
-async def mark_orphaned_threads_idle(db):
+async def mark_orphaned_threads_ended(db):
     """Replicated from postgres.py."""
     async with db.acquire() as conn:
         result = await conn.execute(
             """
             UPDATE threads
-            SET status        = 'idle',
+            SET status        = 'ended',
+                ended_at      = CURRENT_TIMESTAMP,
                 last_activity = CURRENT_TIMESTAMP
             WHERE status IN ('created', 'active')
               AND (
@@ -354,7 +355,7 @@ async def mark_orphaned_threads_idle(db):
     return 0
 
 
-class TestMarkOrphanedThreadsIdle:
+class TestMarkOrphanedThreadsEnded:
     @pytest.mark.asyncio
     async def test_returns_count_from_update(self):
         conn = AsyncMock()
@@ -365,7 +366,7 @@ class TestMarkOrphanedThreadsIdle:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire.return_value = ctx
 
-        count = await mark_orphaned_threads_idle(db)
+        count = await mark_orphaned_threads_ended(db)
         assert count == 3
 
     @pytest.mark.asyncio
@@ -378,7 +379,7 @@ class TestMarkOrphanedThreadsIdle:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire.return_value = ctx
 
-        count = await mark_orphaned_threads_idle(db)
+        count = await mark_orphaned_threads_ended(db)
         assert count == 0
 
     @pytest.mark.asyncio
@@ -391,10 +392,12 @@ class TestMarkOrphanedThreadsIdle:
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire.return_value = ctx
 
-        await mark_orphaned_threads_idle(db)
+        await mark_orphaned_threads_ended(db)
         sql = conn.execute.call_args[0][0]
         assert "'created'" in sql
         assert "'active'" in sql
+        assert "'ended'" in sql
+        assert "ended_at" in sql
         assert "agent_id IS NULL" in sql
         assert "'offline'" in sql
 
@@ -406,10 +409,13 @@ class TestMarkOrphanedThreadsIdle:
 
 async def agent_update_thread_status(db, thread_id, status):
     """Replicated from orchestrator/main.py."""
-    valid = {"active", "idle"}
+    valid = {"active", "ended"}
     if status not in valid:
         return {"error": 400, "detail": f"Status must be one of: {valid}"}
-    await db.update_thread_status(thread_id, status)
+    if status == "ended":
+        await db.end_thread(thread_id)
+    else:
+        await db.update_thread_status(thread_id, status)
     return {"status": status}
 
 
@@ -420,20 +426,24 @@ class TestAgentUpdateThreadStatus:
         result = await agent_update_thread_status(db, "tid-1", "active")
         assert result == {"status": "active"}
         db.update_thread_status.assert_awaited_once_with("tid-1", "active")
+        db.end_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_accepts_idle(self):
-        db = AsyncMock()
-        result = await agent_update_thread_status(db, "tid-1", "idle")
-        assert result == {"status": "idle"}
-        db.update_thread_status.assert_awaited_once_with("tid-1", "idle")
-
-    @pytest.mark.asyncio
-    async def test_rejects_ended(self):
+    async def test_accepts_ended_routes_through_end_thread(self):
         db = AsyncMock()
         result = await agent_update_thread_status(db, "tid-1", "ended")
+        assert result == {"status": "ended"}
+        # end_thread is invoked so ended_at gets stamped.
+        db.end_thread.assert_awaited_once_with("tid-1")
+        db.update_thread_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejects_idle(self):
+        db = AsyncMock()
+        result = await agent_update_thread_status(db, "tid-1", "idle")
         assert result["error"] == 400
         db.update_thread_status.assert_not_awaited()
+        db.end_thread.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_rejects_created(self):
@@ -456,26 +466,26 @@ class TestAgentUpdateThreadStatus:
 async def stale_detector_sweep(db):
     """Replicated stale agent detector logic (thread-related portion)."""
     count = await db.mark_stale_agents_offline(timeout_minutes=3)
-    idle_count = await db.mark_orphaned_threads_idle()
+    ended_count = await db.mark_orphaned_threads_ended()
     recovered = await db.recover_orphaned_jobs()
     return {
         "stale_agents": count,
-        "idle_threads": idle_count,
+        "ended_threads": ended_count,
         "recovered_jobs": recovered,
     }
 
 
 class TestStaleDetectorSweep:
     @pytest.mark.asyncio
-    async def test_marks_threads_idle_after_agents_offline(self):
+    async def test_marks_threads_ended_after_agents_offline(self):
         db = AsyncMock()
         db.mark_stale_agents_offline.return_value = 2
-        db.mark_orphaned_threads_idle.return_value = 1
+        db.mark_orphaned_threads_ended.return_value = 1
         db.recover_orphaned_jobs.return_value = 0
 
         result = await stale_detector_sweep(db)
         assert result["stale_agents"] == 2
-        assert result["idle_threads"] == 1
+        assert result["ended_threads"] == 1
 
         # Ensure thread sweep is called AFTER agent marking
         calls = db.method_calls
@@ -483,19 +493,19 @@ class TestStaleDetectorSweep:
             i for i, c in enumerate(calls) if c[0] == "mark_stale_agents_offline"
         )
         thread_idx = next(
-            i for i, c in enumerate(calls) if c[0] == "mark_orphaned_threads_idle"
+            i for i, c in enumerate(calls) if c[0] == "mark_orphaned_threads_ended"
         )
         assert agent_idx < thread_idx
 
     @pytest.mark.asyncio
-    async def test_zero_idle_when_no_orphans(self):
+    async def test_zero_ended_when_no_orphans(self):
         db = AsyncMock()
         db.mark_stale_agents_offline.return_value = 0
-        db.mark_orphaned_threads_idle.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = 0
         db.recover_orphaned_jobs.return_value = 0
 
         result = await stale_detector_sweep(db)
-        assert result["idle_threads"] == 0
+        assert result["ended_threads"] == 0
 
 
 # =============================================================================
