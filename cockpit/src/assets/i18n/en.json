@@ -1603,7 +1603,7 @@
       "cta": "Install"
     },
     "update": {
-      "title": "A new standard is ready",
+      "title": "A new update is ready",
       "body": "Reload to deploy the latest version.",
       "cta": "Reload"
     },
