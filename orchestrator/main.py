@@ -379,32 +379,61 @@ _pause_pending_job_ids: set[str] = set()
 
 
 async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
-    """Background task that marks agents as offline if no heartbeat received.
+    """Background task that reconciles agent state every 60 seconds.
 
-    Runs every 60 seconds and marks agents as offline if they haven't sent
-    a heartbeat in the last 3 minutes.  After marking agents offline, recovers
-    any orphaned jobs (still in 'processing' but assigned to offline/deleted
-    agents) by pausing them so the dispatcher can reassign.
+    Two dimensions of reconciliation:
+
+    1. Heartbeat freshness — agents that stopped reporting get marked offline,
+       which in turn flips their threads to 'ended' and pauses their jobs.
+    2. Self-reported consistency — agents that *are* heartbeating but report
+       internally inconsistent state (working with no job, session bound to
+       an ended thread) get flipped back to 'ready' so the dispatcher can
+       reuse the slot. These zombies pass the heartbeat check and would
+       otherwise hold pool slots indefinitely.
+
+    Finally, offline agents older than 24h are GC'd to keep the table small.
     """
     logger.info("Stale agent detector started")
     while not shutdown_event.is_set():
         try:
+            # 1. Heartbeat-based: mark non-responsive agents offline
             count = await postgres_db.mark_stale_agents_offline(timeout_minutes=3)
             if count > 0:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
-            # Mark threads bound to stale/deleted agents as ended
+
+            # 2. Consistency-based: release slots held by zombie agents
+            stuck_working = await postgres_db.mark_stuck_working_agents_ready()
+            if stuck_working > 0:
+                logger.info(
+                    f"Released {stuck_working} agent(s) stuck in 'working' with no job"
+                )
+                _trigger_dispatch()
+            stuck_session = await postgres_db.mark_stuck_session_agents_ready()
+            if stuck_session > 0:
+                logger.info(
+                    f"Released {stuck_session} agent(s) stuck in 'session' "
+                    f"on ended thread"
+                )
+
+            # 3. Propagate: threads bound to offline agents → 'ended'
             ended_count = await postgres_db.mark_orphaned_threads_ended()
             if ended_count > 0:
                 logger.info(f"Marked {ended_count} thread(s) as ended (orphaned)")
-            # Recover orphaned jobs from offline or deleted agents
+
+            # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
                 logger.info(
                     f"Recovered {recovered} orphaned job(s) from offline agents"
                 )
                 _trigger_dispatch()
+
+            # 5. GC: drop offline agent rows older than 24h
+            gc_count = await postgres_db.gc_offline_agents(retention_hours=24)
+            if gc_count > 0:
+                logger.info(f"GC'd {gc_count} offline agent record(s) > 24h old")
         except Exception as e:
             logger.error(f"Error in stale agent detector: {e}")
 

@@ -342,12 +342,10 @@ async def mark_orphaned_threads_ended(db):
                 ended_at      = CURRENT_TIMESTAMP,
                 last_activity = CURRENT_TIMESTAMP
             WHERE status IN ('created', 'active')
-              AND (
-                agent_id IS NULL
-                    OR agent_id IN (SELECT id
-                                    FROM agents
-                                    WHERE status = 'offline')
-                )
+              AND agent_id IS NOT NULL
+              AND agent_id IN (SELECT id
+                               FROM agents
+                               WHERE status = 'offline')
             """
         )
     if result.startswith("UPDATE "):
@@ -398,7 +396,10 @@ class TestMarkOrphanedThreadsEnded:
         assert "'active'" in sql
         assert "'ended'" in sql
         assert "ended_at" in sql
-        assert "agent_id IS NULL" in sql
+        # Fresh threads (agent_id IS NULL) are intentionally skipped — they
+        # cover legitimate transient states the dispatcher / WS proxy own.
+        assert "agent_id IS NOT NULL" in sql
+        assert "agent_id IS NULL" not in sql
         assert "'offline'" in sql
 
 
@@ -464,14 +465,20 @@ class TestAgentUpdateThreadStatus:
 
 
 async def stale_detector_sweep(db):
-    """Replicated stale agent detector logic (thread-related portion)."""
+    """Replicated stale agent detector logic, full sequence."""
     count = await db.mark_stale_agents_offline(timeout_minutes=3)
+    stuck_working = await db.mark_stuck_working_agents_ready()
+    stuck_session = await db.mark_stuck_session_agents_ready()
     ended_count = await db.mark_orphaned_threads_ended()
     recovered = await db.recover_orphaned_jobs()
+    gc_count = await db.gc_offline_agents(retention_hours=24)
     return {
         "stale_agents": count,
+        "stuck_working": stuck_working,
+        "stuck_session": stuck_session,
         "ended_threads": ended_count,
         "recovered_jobs": recovered,
+        "gc_offline": gc_count,
     }
 
 
@@ -480,8 +487,11 @@ class TestStaleDetectorSweep:
     async def test_marks_threads_ended_after_agents_offline(self):
         db = AsyncMock()
         db.mark_stale_agents_offline.return_value = 2
+        db.mark_stuck_working_agents_ready.return_value = 0
+        db.mark_stuck_session_agents_ready.return_value = 0
         db.mark_orphaned_threads_ended.return_value = 1
         db.recover_orphaned_jobs.return_value = 0
+        db.gc_offline_agents.return_value = 0
 
         result = await stale_detector_sweep(db)
         assert result["stale_agents"] == 2
@@ -501,11 +511,241 @@ class TestStaleDetectorSweep:
     async def test_zero_ended_when_no_orphans(self):
         db = AsyncMock()
         db.mark_stale_agents_offline.return_value = 0
+        db.mark_stuck_working_agents_ready.return_value = 0
+        db.mark_stuck_session_agents_ready.return_value = 0
         db.mark_orphaned_threads_ended.return_value = 0
         db.recover_orphaned_jobs.return_value = 0
+        db.gc_offline_agents.return_value = 0
 
         result = await stale_detector_sweep(db)
         assert result["ended_threads"] == 0
+
+    @pytest.mark.asyncio
+    async def test_consistency_sweeps_run_before_propagation(self):
+        # The zombie sweeps (working/session → ready) need to land BEFORE the
+        # thread/job propagation sweeps so freshly-released slots are visible
+        # to the dispatcher within the same tick.
+        db = AsyncMock()
+        db.mark_stale_agents_offline.return_value = 0
+        db.mark_stuck_working_agents_ready.return_value = 1
+        db.mark_stuck_session_agents_ready.return_value = 1
+        db.mark_orphaned_threads_ended.return_value = 0
+        db.recover_orphaned_jobs.return_value = 0
+        db.gc_offline_agents.return_value = 0
+
+        await stale_detector_sweep(db)
+        names = [c[0] for c in db.method_calls]
+        assert names.index("mark_stuck_working_agents_ready") < names.index(
+            "mark_orphaned_threads_ended"
+        )
+        assert names.index("mark_stuck_session_agents_ready") < names.index(
+            "recover_orphaned_jobs"
+        )
+
+    @pytest.mark.asyncio
+    async def test_gc_runs_last(self):
+        # GC must run after every other sweep — the earlier ones may still
+        # need to read offline agent rows that GC would delete.
+        db = AsyncMock()
+        db.mark_stale_agents_offline.return_value = 0
+        db.mark_stuck_working_agents_ready.return_value = 0
+        db.mark_stuck_session_agents_ready.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = 0
+        db.recover_orphaned_jobs.return_value = 0
+        db.gc_offline_agents.return_value = 3
+
+        await stale_detector_sweep(db)
+        names = [c[0] for c in db.method_calls]
+        assert names[-1] == "gc_offline_agents"
+
+
+# =============================================================================
+# mark_stuck_working_agents_ready (replicated SQL logic)
+# =============================================================================
+
+
+async def mark_stuck_working_agents_ready(db):
+    """Replicated from postgres.py."""
+    async with db.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE agents
+            SET status = 'ready'
+            WHERE status = 'working'
+              AND current_job_id IS NULL
+            """
+        )
+    if result.startswith("UPDATE "):
+        return int(result.split()[1])
+    return 0
+
+
+class TestMarkStuckWorkingAgentsReady:
+    @pytest.mark.asyncio
+    async def test_returns_count(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 4"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        assert await mark_stuck_working_agents_ready(db) == 4
+
+    @pytest.mark.asyncio
+    async def test_sql_filters_working_with_no_job(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 0"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await mark_stuck_working_agents_ready(db)
+        sql = conn.execute.call_args[0][0]
+        assert "status = 'ready'" in sql
+        assert "status = 'working'" in sql
+        assert "current_job_id IS NULL" in sql
+
+
+# =============================================================================
+# mark_stuck_session_agents_ready (replicated SQL logic)
+# =============================================================================
+
+
+async def mark_stuck_session_agents_ready(db):
+    """Replicated from postgres.py."""
+    async with db.acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE agents
+            SET status    = 'ready',
+                thread_id = NULL
+            WHERE status = 'session'
+              AND thread_id IS NOT NULL
+              AND thread_id IN (SELECT id
+                                FROM threads
+                                WHERE status = 'ended')
+              AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+            """
+        )
+    if result.startswith("UPDATE "):
+        return int(result.split()[1])
+    return 0
+
+
+class TestMarkStuckSessionAgentsReady:
+    @pytest.mark.asyncio
+    async def test_returns_count(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 6"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        assert await mark_stuck_session_agents_ready(db) == 6
+
+    @pytest.mark.asyncio
+    async def test_sql_filters_session_on_ended_thread_with_grace(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "UPDATE 0"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await mark_stuck_session_agents_ready(db)
+        sql = conn.execute.call_args[0][0]
+        assert "status    = 'ready'" in sql
+        assert "thread_id = NULL" in sql
+        assert "status = 'session'" in sql
+        assert "status = 'ended'" in sql
+        # 2-minute heartbeat grace covers normal detach-heartbeat latency
+        assert "INTERVAL '2 minutes'" in sql
+
+
+# =============================================================================
+# gc_offline_agents (replicated SQL logic)
+# =============================================================================
+
+
+async def gc_offline_agents(db, retention_hours=24):
+    """Replicated from postgres.py."""
+    async with db.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM agents
+            WHERE status = 'offline'
+              AND last_heartbeat < NOW() - ($1 || ' hours')::INTERVAL
+            """,
+            str(retention_hours),
+        )
+    if result.startswith("DELETE "):
+        return int(result.split()[1])
+    return 0
+
+
+class TestGcOfflineAgents:
+    @pytest.mark.asyncio
+    async def test_returns_count(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "DELETE 12"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        assert await gc_offline_agents(db) == 12
+
+    @pytest.mark.asyncio
+    async def test_default_retention_24h(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "DELETE 0"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await gc_offline_agents(db)
+        # Retention is parameterised — passed as a string for the
+        # `($1 || ' hours')::INTERVAL` cast.
+        assert conn.execute.call_args[0][1] == "24"
+
+    @pytest.mark.asyncio
+    async def test_custom_retention(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "DELETE 0"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await gc_offline_agents(db, retention_hours=72)
+        assert conn.execute.call_args[0][1] == "72"
+
+    @pytest.mark.asyncio
+    async def test_sql_targets_only_offline_agents(self):
+        conn = AsyncMock()
+        conn.execute.return_value = "DELETE 0"
+        db = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        db.acquire.return_value = ctx
+
+        await gc_offline_agents(db)
+        sql = conn.execute.call_args[0][0]
+        assert "DELETE FROM agents" in sql
+        assert "status = 'offline'" in sql
+        assert "last_heartbeat" in sql
 
 
 # =============================================================================
