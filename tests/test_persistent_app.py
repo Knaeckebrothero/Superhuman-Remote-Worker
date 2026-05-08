@@ -1353,3 +1353,207 @@ class TestAttachSessionRebinds:
             "EMBEDDING_API_KEY",
         ):
             assert key in src
+
+
+# ---------------------------------------------------------------------------
+# Self-cleanup watchdogs (PR 2)
+# ---------------------------------------------------------------------------
+
+
+class TestSignalWsConnected:
+    def test_sets_event_when_present(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        event = asyncio.Event()
+        with patch.object(pa, "_ws_connected_event", event):
+            pa._signal_ws_connected()
+        assert event.is_set()
+
+    def test_no_op_when_event_is_none(self):
+        from src.api import persistent_app as pa
+
+        with patch.object(pa, "_ws_connected_event", None):
+            pa._signal_ws_connected()  # Should not raise
+
+
+class TestBootWsWatchdog:
+    @pytest.mark.asyncio
+    async def test_returns_early_when_ws_connects(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        event = asyncio.Event()
+        event.set()  # Pre-set so wait_for returns immediately
+        with patch.object(pa, "_ws_connected_event", event):
+            with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                with patch.object(pa, "_schedule_exit") as exit_fn:
+                    await pa._boot_ws_watchdog(timeout_s=10)
+        detach.assert_not_called()
+        exit_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_triggers_detach_and_exit_on_timeout(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        event = asyncio.Event()  # Never set
+        with patch.object(pa, "_ws_connected_event", event):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        # Tiny timeout so the test doesn't actually wait 10 min
+                        await pa._boot_ws_watchdog(timeout_s=0)
+        detach.assert_awaited_once()
+        exit_fn.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_swallows_detach_failure_and_still_exits(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        event = asyncio.Event()  # Never set
+        with patch.object(pa, "_ws_connected_event", event):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(
+                    pa,
+                    "_detach_session",
+                    new=AsyncMock(side_effect=RuntimeError("detach failed")),
+                ):
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        await pa._boot_ws_watchdog(timeout_s=0)
+        # Exit must still be scheduled even if detach raised
+        exit_fn.assert_called_once()
+
+
+class TestThreadStatusWatchdog:
+    @pytest.mark.asyncio
+    async def test_exits_when_thread_status_is_ended(self):
+        from src.api import persistent_app as pa
+
+        client = AsyncMock()
+        client.get_thread_lifecycle = AsyncMock(
+            return_value={"status": "ended", "agent_id": None, "ended_at": "now"}
+        )
+        with patch.object(pa, "_orchestrator_client", client):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        # Tiny poll interval so test runs quickly
+                        await pa._thread_status_watchdog(poll_s=0)
+        detach.assert_awaited_once()
+        exit_fn.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_does_not_exit_when_thread_active(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        client = AsyncMock()
+        client.get_thread_lifecycle = AsyncMock(
+            return_value={"status": "active", "agent_id": "a-1", "ended_at": None}
+        )
+        with patch.object(pa, "_orchestrator_client", client):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        # Run the watchdog briefly then cancel — it must not
+                        # have triggered exit while status was active.
+                        task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
+                        await asyncio.sleep(0.05)
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+        detach.assert_not_called()
+        exit_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_continues_when_lifecycle_fetch_fails(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        client = AsyncMock()
+        client.get_thread_lifecycle = AsyncMock(side_effect=RuntimeError("network"))
+        with patch.object(pa, "_orchestrator_client", client):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
+                        await asyncio.sleep(0.05)
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+        # Transient failure must not trigger exit — we'd kill ourselves on
+        # any orchestrator hiccup otherwise.
+        detach.assert_not_called()
+        exit_fn.assert_not_called()
+
+
+class TestStartStopWatchdogs:
+    @pytest.mark.asyncio
+    async def test_start_creates_two_named_tasks(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        with patch.object(pa, "_watchdog_tasks", []):
+            pa._start_watchdogs()
+            try:
+                assert len(pa._watchdog_tasks) == 2
+                names = {t.get_name() for t in pa._watchdog_tasks}
+                assert names == {"boot-ws-watchdog", "thread-status-watchdog"}
+            finally:
+                pa._stop_watchdogs()
+                await asyncio.gather(
+                    *[t for t in pa._watchdog_tasks if not t.done()],
+                    return_exceptions=True,
+                )
+
+    @pytest.mark.asyncio
+    async def test_start_cancels_prior_tasks(self):
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        async def _forever():
+            await asyncio.sleep(60)
+
+        prior = asyncio.create_task(_forever(), name="prior")
+        with patch.object(pa, "_watchdog_tasks", [prior]):
+            pa._start_watchdogs()
+            try:
+                await asyncio.sleep(0.01)
+                assert prior.cancelled() or prior.done()
+            finally:
+                pa._stop_watchdogs()
+                await asyncio.gather(
+                    *[t for t in pa._watchdog_tasks if not t.done()],
+                    return_exceptions=True,
+                )
+
+    @pytest.mark.asyncio
+    async def test_stop_skips_current_task(self):
+        # _stop_watchdogs should not cancel the calling task — that would
+        # raise CancelledError in the very watchdog that triggered detach.
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        async def fake_watchdog():
+            pa._stop_watchdogs()
+            return "completed-normally"
+
+        task = asyncio.create_task(fake_watchdog(), name="self")
+        with patch.object(pa, "_watchdog_tasks", [task]):
+            result = await task
+        assert result == "completed-normally"
