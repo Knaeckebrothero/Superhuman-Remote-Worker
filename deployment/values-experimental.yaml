@@ -25,13 +25,13 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-89cad78
+    tag: sha-95edbd4
   agent:
-    tag: sha-9ee4ecc
+    tag: sha-95edbd4
   cockpit:
-    tag: sha-ca3d3ff
+    tag: sha-95edbd4
   mcp:
-    tag: sha-2dd8e7f
+    tag: sha-95edbd4
   workspace:
     tag: sha-f50eade
 # -----------------------------------------------------------------------------
