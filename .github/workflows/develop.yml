@@ -272,11 +272,6 @@ jobs:
               | grep -oP 'tag:\s*sha-\K[0-9a-f]{7}' | head -1 || echo ""
           }
 
-          extract_sha_raw() {
-            local file="$1" component="$2"
-            grep -oP "superhuman-remote-worker-${component}:sha-\K[0-9a-f]{7}" "$file" 2>/dev/null | head -1 || echo ""
-          }
-
           has_changes() {
             local sha="$1"
             shift
@@ -303,8 +298,13 @@ jobs:
           SHA_COCKPIT=$(extract_sha cockpit)
           SHA_MCP=$(extract_sha mcp)
           SHA_WORKSPACE=$(extract_sha workspace)
-          SHA_VM_CONTROLLER=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
-          SHA_VM_BASE=$(extract_sha_raw deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
+          # VM image SHAs live in fleet.yaml — vmController as a bare tag
+          # (image.vmController.tag), agent-vm-base embedded in the
+          # defaultVmImage URL (vmController.defaultVmImage). yq is preinstalled
+          # on ubuntu-latest. Empty result → has_changes treats as "rebuild",
+          # which is the safe default.
+          SHA_VM_CONTROLLER=$(yq '.helm.values.image.vmController.tag' deployment-vms/srw-vm-controller/fleet.yaml 2>/dev/null | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
+          SHA_VM_BASE=$(yq '.helm.values.vmController.defaultVmImage' deployment-vms/srw-vm-controller/fleet.yaml 2>/dev/null | grep -oP 'sha-\K[0-9a-f]{7}' | head -1)
 
           echo "Deployed SHAs:"
           echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"

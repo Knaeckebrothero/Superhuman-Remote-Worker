@@ -694,7 +694,7 @@ export interface PromoteRequest {
 // Persistent Thread (Session) Models
 // =============================================================================
 
-export type ThreadStatus = 'created' | 'active' | 'idle' | 'ended';
+export type ThreadStatus = 'created' | 'active' | 'ended';
 
 /**
  * Persistent agent session thread.

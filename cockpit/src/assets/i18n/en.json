@@ -68,7 +68,6 @@
     "emptyFilterActive": "No active sessions.",
     "emptyFilterEnded": "No ended sessions.",
     "untitledSession": "Untitled Session",
-    "confirmEnd": "End this session? Work will be saved but the agent will stop.",
     "confirmDelete": "Delete this session permanently?",
     "turnsOne": "turn",
     "turnsMany": "turns",
@@ -80,7 +79,6 @@
     "tooltip": {
       "sessionFiles": "Session Files",
       "resume": "Resume",
-      "end": "End",
       "delete": "Delete"
     },
     "create": {
@@ -722,6 +720,13 @@
     "empty": {
       "title": "What shall we conquer today?",
       "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
+    },
+    "ended": {
+      "eyebrow": "Resumable",
+      "title": "Resume this session?",
+      "body": "This session is currently ended. Resume to bring the agent back online and continue where you left off.",
+      "endedAt": "Session ended {{ date }}",
+      "resume": "Resume"
     },
     "startup": {
       "title": "Starting session",

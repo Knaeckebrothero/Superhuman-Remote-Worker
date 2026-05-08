@@ -2716,7 +2716,7 @@ async def create_persistent_thread(
 @mcp.tool
 async def list_persistent_threads(
     project_id: str | None = None,
-    status: Literal["created", "active", "idle", "ended"] | None = None,
+    status: Literal["created", "active", "ended"] | None = None,
 ) -> str:
     """List persistent threads for the authenticated user.
 
@@ -2725,7 +2725,7 @@ async def list_persistent_threads(
 
     Args:
         project_id: Filter by project UUID
-        status: Filter by thread status (created, active, idle, ended)
+        status: Filter by thread status (created, active, ended)
 
     Returns:
         Formatted list of persistent threads
@@ -2781,11 +2781,11 @@ async def end_persistent_thread(thread_id: str, permanent: bool = False) -> str:
 
 @mcp.tool
 async def resume_persistent_thread(thread_id: str) -> str:
-    """Resume an ended or idle persistent thread.
+    """Resume an ended persistent thread.
 
     MUTATION: Resets the thread status to 'created', clears the stale
     agent binding, and re-provisions the agent pod. The thread must be
-    in 'ended' or 'idle' status.
+    in 'ended' status.
 
     Args:
         thread_id: Thread UUID to resume

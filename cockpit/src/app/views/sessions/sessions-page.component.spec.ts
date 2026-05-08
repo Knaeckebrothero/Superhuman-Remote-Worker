@@ -340,31 +340,7 @@ describe('SessionsPageComponent', () => {
     });
 
     // =========================================================================
-    // 9.2.6: endSession()
-    // =========================================================================
-
-    describe('endSession()', () => {
-        it('should call DELETE endpoint', async () => {
-            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
-            const thread = makeThread({id: 'thread-xyz'});
-            await component.endSession(thread);
-
-            expect(mockHttp.delete).toHaveBeenCalled();
-            const url = mockHttp.delete.mock.calls[0][0];
-            expect(url).toContain('thread-xyz');
-        });
-
-        it('should reload threads after ending', async () => {
-            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
-            const loadSpy = vi.spyOn(component, 'loadThreads');
-            await component.endSession(makeThread());
-
-            expect(loadSpy).toHaveBeenCalled();
-        });
-    });
-
-    // =========================================================================
-    // 9.2.7: toggleProject() / isProjectSelected()
+    // 9.2.6: toggleProject() / isProjectSelected()
     // =========================================================================
 
     describe('project selection', () => {

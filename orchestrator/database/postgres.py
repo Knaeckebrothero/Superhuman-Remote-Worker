@@ -2113,7 +2113,7 @@ class PostgresDB:
             )
 
     async def resume_thread(self, thread_id: str) -> None:
-        """Resume an ended/idle thread — reset to 'created', clear stale agent."""
+        """Resume an ended thread — reset to 'created', clear stale agent."""
         async with self.acquire() as conn:
             await conn.execute(
                 """
@@ -2195,20 +2195,22 @@ class PostgresDB:
                 legacy_share_id,
             )
 
-    async def mark_orphaned_threads_idle(self) -> int:
-        """Mark threads as idle if their bound agent is offline or deleted.
+    async def mark_orphaned_threads_ended(self) -> int:
+        """Mark threads as ended if their bound agent is offline or deleted.
 
         Threads in 'created' or 'active' status whose agent_id is NULL
-        (deleted) or bound to an offline agent are set to 'idle'.
+        (deleted) or bound to an offline agent are set to 'ended', stamping
+        ended_at so the resume card can show the transition time.
 
         Returns:
-            Number of threads marked idle.
+            Number of threads marked ended.
         """
         async with self.acquire() as conn:
             result = await conn.execute(
                 """
                 UPDATE threads
-                SET status        = 'idle',
+                SET status        = 'ended',
+                    ended_at      = CURRENT_TIMESTAMP,
                     last_activity = CURRENT_TIMESTAMP
                 WHERE status IN ('created', 'active')
                   AND (

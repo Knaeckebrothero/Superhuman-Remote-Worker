@@ -1055,11 +1055,12 @@ describe('PersistentChatService', () => {
     // =========================================================================
 
     describe('session.idle_timeout', () => {
-        it('should set isSessionPaused and add system message', async () => {
+        it('should flip threadStatus to ended and add system message', async () => {
             const {ws} = await connectService(service);
             fireWsMessage(ws, {method: 'session.idle_timeout', params: {timeout_minutes: 15}});
 
-            expect(service.isSessionPaused()).toBe(true);
+            expect(service.threadStatus()).toBe('ended');
+            expect(service.endedAt()).not.toBeNull();
             const msgs = service.messages();
             const last = msgs[msgs.length - 1];
             expect(last.role).toBe('system');
