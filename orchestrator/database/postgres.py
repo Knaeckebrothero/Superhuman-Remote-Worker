@@ -2196,11 +2196,14 @@ class PostgresDB:
             )
 
     async def mark_orphaned_threads_ended(self) -> int:
-        """Mark threads as ended if their bound agent is offline or deleted.
+        """Mark threads as ended when their bound agent is offline.
 
-        Threads in 'created' or 'active' status whose agent_id is NULL
-        (deleted) or bound to an offline agent are set to 'ended', stamping
-        ended_at so the resume card can show the transition time.
+        Only flags threads that have an ``agent_id`` pointing at an offline
+        agent. ``agent_id IS NULL`` is intentionally excluded — it covers
+        legitimate transient states (fresh thread awaiting first dispatch,
+        thread post-Resume awaiting re-binding) that the dispatcher / WS
+        proxy own. Catching those here would race the dispatcher and flip
+        brand-new threads to 'ended' within a second of creation.
 
         Returns:
             Number of threads marked ended.
@@ -2213,15 +2216,108 @@ class PostgresDB:
                     ended_at      = CURRENT_TIMESTAMP,
                     last_activity = CURRENT_TIMESTAMP
                 WHERE status IN ('created', 'active')
-                  AND (
-                    agent_id IS NULL
-                        OR agent_id IN (SELECT id
-                                        FROM agents
-                                        WHERE status = 'offline')
-                    )
+                  AND agent_id IS NOT NULL
+                  AND agent_id IN (SELECT id
+                                   FROM agents
+                                   WHERE status = 'offline')
                 """
             )
         if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
+    async def mark_stuck_working_agents_ready(self) -> int:
+        """Reset agents whose self-reported status is internally inconsistent.
+
+        An agent reporting ``status='working'`` while ``current_job_id IS NULL``
+        is in a state that no normal lifecycle transition can produce — the
+        heartbeat handler updates status and current_job_id atomically, so an
+        agent without a job should be 'ready', not 'working'. Flip the row to
+        'ready' so the dispatcher can use the slot.
+
+        Defense in depth for ``_reset_to_idle()`` failures (heartbeat that
+        never landed, exception during cleanup, agent process crash mid-
+        transition). The ``mark_stale_agents_offline`` sweep doesn't catch
+        these because the agents continue to heartbeat.
+
+        Returns:
+            Number of agents flipped to 'ready'.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agents
+                SET status = 'ready'
+                WHERE status = 'working'
+                  AND current_job_id IS NULL
+                """
+            )
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
+    async def mark_stuck_session_agents_ready(self) -> int:
+        """Release agents still marked 'session' for threads that already ended.
+
+        When a persistent thread transitions to 'ended' (idle timeout, manual
+        end, orphan sweep) the agent is supposed to detach and either exit or
+        loop back to 'ready'. If the detach didn't reach the orchestrator
+        (heartbeat dropped, agent process died before sending the ready
+        heartbeat) the agent row stays 'session' and the slot stays
+        unavailable. This sweep flips it to 'ready' and clears thread_id.
+
+        Heartbeat grace of 2 minutes covers the legitimate window between a
+        thread flipping to 'ended' and the agent sending its post-detach
+        heartbeat.
+
+        Returns:
+            Number of agents released.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE agents
+                SET status    = 'ready',
+                    thread_id = NULL
+                WHERE status = 'session'
+                  AND thread_id IS NOT NULL
+                  AND thread_id IN (SELECT id
+                                    FROM threads
+                                    WHERE status = 'ended')
+                  AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+                """
+            )
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
+    async def gc_offline_agents(self, retention_hours: int = 24) -> int:
+        """Delete agent rows that have been offline longer than the retention.
+
+        Offline agents accumulate forever otherwise — `mark_stale_agents_offline`
+        flips status but never removes the row. After ``retention_hours`` of
+        no heartbeat the pod is definitely gone (k8s would have GC'd it long
+        before), and keeping the row only bloats ``list_agents`` queries.
+
+        FK behavior: ``threads.agent_id`` and ``jobs.assigned_agent_id`` are
+        both ``ON DELETE SET NULL``, so deletion is safe.
+
+        Args:
+            retention_hours: How long offline agents are kept before deletion.
+
+        Returns:
+            Number of agent rows deleted.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM agents
+                WHERE status = 'offline'
+                  AND last_heartbeat < NOW() - ($1 || ' hours')::INTERVAL
+                """,
+                str(retention_hours),
+            )
+        if result.startswith("DELETE "):
             return int(result.split()[1])
         return 0
 
