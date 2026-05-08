@@ -627,8 +627,8 @@ async def mark_stuck_session_agents_ready(db):
               AND thread_id IS NOT NULL
               AND thread_id IN (SELECT id
                                 FROM threads
-                                WHERE status = 'ended')
-              AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+                                WHERE status = 'ended'
+                                  AND ended_at < NOW() - INTERVAL '2 minutes')
             """
         )
     if result.startswith("UPDATE "):
@@ -665,8 +665,10 @@ class TestMarkStuckSessionAgentsReady:
         assert "thread_id = NULL" in sql
         assert "status = 'session'" in sql
         assert "status = 'ended'" in sql
-        # 2-minute heartbeat grace covers normal detach-heartbeat latency
-        assert "INTERVAL '2 minutes'" in sql
+        # Grace is on thread.ended_at — heartbeat freshness is the wrong
+        # signal here because zombies heartbeat normally.
+        assert "ended_at < NOW() - INTERVAL '2 minutes'" in sql
+        assert "last_heartbeat" not in sql
 
 
 # =============================================================================

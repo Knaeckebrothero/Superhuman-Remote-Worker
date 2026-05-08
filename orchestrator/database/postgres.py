@@ -2262,13 +2262,14 @@ class PostgresDB:
         When a persistent thread transitions to 'ended' (idle timeout, manual
         end, orphan sweep) the agent is supposed to detach and either exit or
         loop back to 'ready'. If the detach didn't reach the orchestrator
-        (heartbeat dropped, agent process died before sending the ready
-        heartbeat) the agent row stays 'session' and the slot stays
+        (agent process died before sending the post-detach heartbeat, agent
+        bug, etc.) the agent row stays 'session' and the slot stays
         unavailable. This sweep flips it to 'ready' and clears thread_id.
 
-        Heartbeat grace of 2 minutes covers the legitimate window between a
-        thread flipping to 'ended' and the agent sending its post-detach
-        heartbeat.
+        Grace of 2 minutes is on ``thread.ended_at`` — the *thread* must have
+        been ended for at least that long before we intervene. Heartbeat
+        freshness is intentionally NOT used because zombie agents heartbeat
+        normally; gating on heartbeat would never let the sweep fire.
 
         Returns:
             Number of agents released.
@@ -2283,8 +2284,8 @@ class PostgresDB:
                   AND thread_id IS NOT NULL
                   AND thread_id IN (SELECT id
                                     FROM threads
-                                    WHERE status = 'ended')
-                  AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+                                    WHERE status = 'ended'
+                                      AND ended_at < NOW() - INTERVAL '2 minutes')
                 """
             )
         if result.startswith("UPDATE "):
