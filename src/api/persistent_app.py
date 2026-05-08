@@ -574,9 +574,12 @@ async def _attach_session(
                                 f"  StrictHostKeyChecking accept-new\n"
                             )
 
-                    # Convert HTTPS URL to SSH URL so git uses the key
+                    # Convert HTTPS URL to SSH URL so git uses the key.
+                    # strip("/") handles trailing slashes too — datasource URLs
+                    # entered as `.../repo/` would otherwise become `repo/.git`,
+                    # which GitHub's SSH server rejects.
                     if parsed.scheme in ("http", "https"):
-                        path = parsed.path.lstrip("/")
+                        path = parsed.path.strip("/")
                         if not path.endswith(".git"):
                             path += ".git"
                         repo_url = f"git@{host}:{path}"
