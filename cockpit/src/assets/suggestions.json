@@ -1,0 +1,42 @@
+[
+  {
+    "icon": "route",
+    "en": "Plan and execute a multi-step research task",
+    "de": "Plane und führe eine mehrstufige Recherche durch"
+  },
+  {
+    "icon": "terminal",
+    "en": "Inspect a repository with the developer config",
+    "de": "Untersuche ein Repository mit dem Developer-Config"
+  },
+  {
+    "icon": "folder_shared",
+    "en": "Continue from a project I've shared",
+    "de": "Mache mit einem von mir geteilten Projekt weiter"
+  },
+  {
+    "icon": "lightbulb",
+    "en": "Surprise me — propose three useful jobs",
+    "de": "Überrasche mich — schlage drei nützliche Jobs vor"
+  },
+  {
+    "icon": "summarize",
+    "en": "Summarize recent changes in a codebase",
+    "de": "Fasse die letzten Änderungen in einem Codebestand zusammen"
+  },
+  {
+    "icon": "bug_report",
+    "en": "Investigate a failing job and propose a fix",
+    "de": "Untersuche einen fehlgeschlagenen Job und schlage eine Lösung vor"
+  },
+  {
+    "icon": "description",
+    "en": "Draft a documentation page from existing code",
+    "de": "Entwirf eine Dokumentationsseite aus bestehendem Code"
+  },
+  {
+    "icon": "compare_arrows",
+    "en": "Compare two implementations and recommend one",
+    "de": "Vergleiche zwei Implementierungen und empfehle eine"
+  }
+]
