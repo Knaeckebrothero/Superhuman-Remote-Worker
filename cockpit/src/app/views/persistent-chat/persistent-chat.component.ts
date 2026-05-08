@@ -9,7 +9,7 @@ import {
     signal,
     ViewChild,
 } from '@angular/core';
-import {TitleCasePipe} from '@angular/common';
+import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
@@ -163,6 +163,7 @@ const CATEGORY_LABELS: Record<string, string> = {
     standalone: true,
     imports: [
         FormsModule,
+        NgTemplateOutlet,
         TitleCasePipe,
         RouterLink,
         MarkdownComponent,
@@ -451,48 +452,44 @@ const CATEGORY_LABELS: Record<string, string> = {
                   }
                 </div>
               } @else {
-                <div class="startup-spinner-container">
-                  <div class="startup-spinner"></div>
-                  <span class="startup-label">
-                    @if (chat.isCreating()) {
-                      {{ 'chat.startup.creating' | transloco }}
-                    } @else if (chat.isConnected()) {
-                      @switch (chat.startupPhase()) {
-                        @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
-                        @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
-                        @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
-                        @default { {{ 'chat.startup.starting' | transloco }} }
-                      }
-                    } @else {
-                      {{ 'chat.startup.connectingFallback' | transloco }}
-                    }
-                  </span>
+                <div class="startup-wrapper">
+                  <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
                 </div>
               }
             </div>
           }
         }
 
-        <!-- Resume spinner: shown when history exists but session not yet ready -->
+        <!-- Startup/resume card: shown when history exists but session not yet ready -->
         @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming()) {
-          <div class="startup-spinner-container resume-spinner">
-            <div class="startup-spinner"></div>
-            <span class="startup-label">
-              @if (chat.isCreating()) {
-                {{ 'chat.startup.creating' | transloco }}
-              } @else if (chat.isConnected()) {
-                @switch (chat.startupPhase()) {
-                  @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
-                  @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
-                  @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
-                  @default { {{ 'chat.startup.reconnecting' | transloco }} }
-                }
-              } @else {
-                {{ 'chat.startup.connectingFallback' | transloco }}
-              }
-            </span>
+          <div class="startup-wrapper resume">
+            <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
         }
+
+        <ng-template #startupCardTpl>
+          <div class="startup-card">
+            <div class="startup-card-head">
+              <span class="startup-card-spinner"></span>
+              <span class="startup-card-title">
+                {{ (chat.messages().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
+              </span>
+            </div>
+            <div class="startup-steps">
+              @for (step of startupSteps(); track step.key) {
+                <div class="startup-step" [class]="'state-' + step.state">
+                  @if (step.state === 'active') {
+                    <span class="step-spinner" aria-hidden="true"></span>
+                  } @else {
+                    <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
+                  }
+                  <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+                  <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+                </div>
+              }
+            </div>
+          </div>
+        </ng-template>
 
         <!-- Streaming response -->
         @if (chat.isStreaming()) {
@@ -988,25 +985,116 @@ const CATEGORY_LABELS: Record<string, string> = {
         }
       }
 
-      .startup-spinner-container {
+      .startup-wrapper {
         display: flex;
-        flex-direction: column;
+        justify-content: center;
+        width: 100%;
+        padding: 48px 0 24px;
+      }
+
+      .startup-wrapper.resume {
+        padding: 24px 0;
+      }
+
+      .startup-card {
+        width: min(560px, 100%);
+        background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 4px solid var(--accent-color, var(--accent-color));
+      }
+
+      .startup-card-head {
+        display: flex;
         align-items: center;
         gap: 16px;
+        padding: 20px 22px;
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
       }
 
-      .startup-spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--border-color, var(--surface-0));
+      .startup-card-spinner {
+        width: 22px;
+        height: 22px;
+        border: 3px solid var(--surface-2, var(--surface-1));
         border-top-color: var(--accent-color, var(--accent-color));
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
+        animation: spin 0.7s linear infinite;
+        flex-shrink: 0;
       }
 
-      .startup-label {
-        color: var(--text-muted, var(--text-muted));
+      .startup-card-title {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 15px;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .startup-steps {
+        padding: 14px 22px 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+      }
+
+      .startup-step {
+        display: grid;
+        grid-template-columns: 24px 1fr auto;
+        align-items: center;
+        column-gap: 14px;
+        font-size: 18px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .startup-step .step-spinner {
+        width: 18px;
+        height: 18px;
+        border: 2px solid var(--surface-2, var(--surface-1));
+        border-top-color: var(--accent-color, var(--accent-color));
+        animation: spin 0.7s linear infinite;
+        display: inline-block;
+        flex-shrink: 0;
+        justify-self: center;
+      }
+
+      .startup-step .step-time {
+        font-family: var(--font-mono, monospace);
         font-size: 13px;
+        color: var(--text-muted, var(--text-muted));
+        font-variant-numeric: tabular-nums;
+      }
+
+      .startup-step.state-active .step-time {
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .startup-step .step-icon {
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .startup-step.state-done {
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .startup-step.state-done .step-icon {
+        color: var(--success);
+      }
+
+      .startup-step.state-active {
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .startup-step.state-active .step-icon {
+        color: var(--accent-color, var(--accent-color));
+        animation: pulseSoft 1.4s ease-in-out infinite;
+      }
+
+      .startup-step.state-todo .step-icon {
+        color: var(--surface-2, var(--surface-1));
+      }
+
+      @keyframes pulseSoft {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
       }
 
       .message {
@@ -1101,10 +1189,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       .resume-icon {
         margin-right: 4px;
         vertical-align: middle;
-      }
-
-      .resume-spinner {
-        padding: 24px 0;
       }
 
       /* Tool-only messages: compact inline indicators (no avatar/bubble) */
@@ -1908,6 +1992,65 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         }));
     });
 
+    // Startup step list — drives the provisioning card.
+    // Order maps to the phases the orchestrator emits via the `status` WS message.
+    private readonly STARTUP_PHASE_ORDER = ['creating', 'provisioning', 'booting', 'connecting'] as const;
+
+    // Per-phase timing. Plain mutable maps + a revision signal so the computed
+    // re-runs on transitions without forming a self-referential signal loop.
+    private phaseStarts: Record<string, number> = {};
+    private phaseDurations: Record<string, number> = {};
+    private readonly phaseRevision = signal(0);
+    private readonly nowTick = signal<number>(Date.now());
+    private startupTickInterval: ReturnType<typeof setInterval> | null = null;
+    private prevActivePhase: string | null = null;
+    private prevReadyForTiming = false;
+    private prevThreadIdForTiming: string | null = null;
+
+    readonly startupSteps = computed(() => {
+        const order = this.STARTUP_PHASE_ORDER;
+        const phase = this.chat.startupPhase();
+        const isResuming = this.chat.messages().length > 0;
+        // Subscribe to phase tracking changes and to the live tick.
+        this.phaseRevision();
+        const now = this.nowTick();
+        let activeIdx: number;
+        if (this.chat.isCreating()) {
+            activeIdx = 0;
+        } else if (phase && (order as readonly string[]).includes(phase)) {
+            activeIdx = (order as readonly string[]).indexOf(phase);
+        } else {
+            activeIdx = isResuming ? 1 : 0;
+        }
+        return order.map((key, idx) => {
+            const state: 'done' | 'active' | 'todo' =
+                idx < activeIdx ? 'done' : (idx === activeIdx ? 'active' : 'todo');
+            let elapsedMs: number | null = null;
+            if (state === 'done') {
+                elapsedMs = this.phaseDurations[key] ?? null;
+            } else if (state === 'active' && this.phaseStarts[key] != null) {
+                elapsedMs = Math.max(0, now - this.phaseStarts[key]);
+            }
+            return { key, state, elapsedMs };
+        });
+    });
+
+    stepIcon(state: 'done' | 'active' | 'todo'): string {
+        if (state === 'done') return 'check_circle';
+        if (state === 'active') return 'progress_activity';
+        return 'radio_button_unchecked';
+    }
+
+    formatElapsed(ms: number | null): string {
+        if (ms == null) return '—';
+        const s = Math.max(0, ms) / 1000;
+        if (s < 10) return `${s.toFixed(1)}s`;
+        if (s < 60) return `${Math.round(s)}s`;
+        const m = Math.floor(s / 60);
+        const rs = Math.round(s % 60);
+        return `${m}m${rs.toString().padStart(2, '0')}s`;
+    }
+
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
@@ -1948,6 +2091,59 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
             if (this.autoScroll) {
                 setTimeout(() => this.scrollToBottom(), 0);
+            }
+        });
+
+        // Track startup phase transitions to record per-step durations.
+        effect(() => {
+            const phase = this.chat.startupPhase();
+            const isCreating = this.chat.isCreating();
+            const ready = this.chat.sessionReady();
+            const tid = this.chat.threadId();
+            const order = this.STARTUP_PHASE_ORDER as readonly string[];
+
+            // Reset on a new thread, or when sessionReady drops back to false.
+            if (tid !== this.prevThreadIdForTiming || (this.prevReadyForTiming && !ready)) {
+                this.phaseStarts = {};
+                this.phaseDurations = {};
+                this.prevActivePhase = null;
+                this.phaseRevision.update(v => v + 1);
+            }
+            this.prevThreadIdForTiming = tid;
+            this.prevReadyForTiming = ready;
+
+            // Determine effective active phase (mirrors startupSteps logic, but
+            // we only record timing once we have a real signal — not during the
+            // brief null gap on resume).
+            let active: string | null = null;
+            if (!ready) {
+                if (isCreating) active = 'creating';
+                else if (phase && order.includes(phase)) active = phase;
+            }
+
+            if (active !== this.prevActivePhase) {
+                const now = Date.now();
+                if (this.prevActivePhase != null) {
+                    const start = this.phaseStarts[this.prevActivePhase];
+                    if (start != null) {
+                        this.phaseDurations[this.prevActivePhase] = now - start;
+                    }
+                }
+                if (active && this.phaseStarts[active] == null) {
+                    this.phaseStarts[active] = now;
+                }
+                this.prevActivePhase = active;
+                this.phaseRevision.update(v => v + 1);
+            }
+
+            // Tick every second while a phase is active so the live elapsed
+            // time on the active row updates without manual refresh.
+            if (active && !this.startupTickInterval) {
+                this.nowTick.set(Date.now());
+                this.startupTickInterval = setInterval(() => this.nowTick.set(Date.now()), 1000);
+            } else if (!active && this.startupTickInterval) {
+                clearInterval(this.startupTickInterval);
+                this.startupTickInterval = null;
             }
         });
     }
@@ -2010,6 +2206,10 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
         this.stopIdePolling();
+        if (this.startupTickInterval) {
+            clearInterval(this.startupTickInterval);
+            this.startupTickInterval = null;
+        }
     }
 
     autoResizeInput(): void {
