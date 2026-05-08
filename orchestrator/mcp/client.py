@@ -2376,7 +2376,7 @@ class AsyncCockpitClient:
 
     @_create_retry_decorator()
     async def resume_persistent_thread(self, thread_id: str) -> dict[str, Any]:
-        """Resume an ended or idle persistent thread.
+        """Resume an ended persistent thread.
 
         Returns:
             Dict with ``status`` and ``thread_id``.

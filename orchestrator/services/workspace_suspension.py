@@ -678,7 +678,7 @@ class WorkspaceSuspensionService:
         """Sweep idle thread workspaces (containers + VMs) and suspend them.
 
         A thread workspace is idle if:
-        - Thread status is 'idle' (no active WebSocket)
+        - Thread status is 'ended' (no active WebSocket; agent detached or orphaned)
         - Workspace or VM status is 'ready'
         - last_activity is older than idle_timeout_minutes
 
@@ -697,7 +697,7 @@ class WorkspaceSuspensionService:
                     """
                     SELECT id, metadata, last_activity
                     FROM threads
-                    WHERE status = 'idle'
+                    WHERE status = 'ended'
                       AND (
                           metadata->'workspace_container'->>'status' = 'ready'
                           OR metadata->'vm'->>'status' = 'ready'
@@ -705,7 +705,7 @@ class WorkspaceSuspensionService:
                     """,
                 )
         except Exception:
-            logger.exception("Failed to query idle thread workspace containers")
+            logger.exception("Failed to query ended thread workspace containers")
             return 0
 
         for row in rows:

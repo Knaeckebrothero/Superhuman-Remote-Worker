@@ -327,7 +327,8 @@ class OrchestratorClient:
 
         Args:
             thread_id: Thread UUID
-            status: New status ('active' or 'idle')
+            status: New status ('active' or 'ended'). When 'ended', the
+                orchestrator routes through end_thread() so ended_at is stamped.
 
         Returns:
             True if update succeeded, False otherwise

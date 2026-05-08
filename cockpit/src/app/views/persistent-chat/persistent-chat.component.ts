@@ -343,20 +343,6 @@ const CATEGORY_LABELS: Record<string, string> = {
                 <app-icon size="sm" class="system-icon">info</app-icon>
                 {{ msg.content }}
               </div>
-              @if (chat.isSessionPaused() && $last) {
-                <div class="resume-btn-wrapper">
-                  <app-button variant="primary" size="sm"
-                              [loading]="isResuming()"
-                              (clicked)="resumeSession()">
-                    @if (isResuming()) {
-                      {{ 'chat.system.resuming' | transloco }}
-                    } @else {
-                      <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
-                      {{ 'chat.system.resumeSession' | transloco }}
-                    }
-                  </app-button>
-                </div>
-              }
             } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
               <!-- Tool-only message: compact inline indicator -->
               <div class="tool-only-row">
@@ -581,6 +567,38 @@ const CATEGORY_LABELS: Record<string, string> = {
             </div>
           </div>
         }
+
+        <!-- Ended-session end-marker + resume card — replaces the composer
+             when the thread is in 'ended' status. -->
+        @if (chat.threadStatus() === 'ended') {
+          <div class="end-marker">
+            <span class="end-line"></span>
+            <div class="end-tag">
+              <app-icon size="sm" class="end-icon">flag</app-icon>
+              <span>{{ 'chat.ended.endedAt' | transloco:{ date: formatEndedAt(chat.endedAt()) } }}</span>
+            </div>
+            <span class="end-line"></span>
+          </div>
+          <div class="resume-card">
+            <div class="resume-body">
+              <div class="resume-eyebrow">{{ 'chat.ended.eyebrow' | transloco }}</div>
+              <h3 class="resume-title">{{ 'chat.ended.title' | transloco }}</h3>
+              <p class="resume-text">{{ 'chat.ended.body' | transloco }}</p>
+            </div>
+            <div class="resume-actions">
+              <app-button variant="primary"
+                          [loading]="isResuming()"
+                          (clicked)="resumeSession()">
+                @if (isResuming()) {
+                  {{ 'chat.system.resuming' | transloco }}
+                } @else {
+                  <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
+                  {{ 'chat.ended.resume' | transloco }}
+                }
+              </app-button>
+            </div>
+          </div>
+        }
       </div>
 
       <!-- Error banner -->
@@ -593,6 +611,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       <!-- Input -->
+      @if (chat.threadStatus() !== 'ended') {
       <div class="input-area">
         <div class="input-card" [class.focused]="inputFocused()">
           <!-- Slash command autocomplete -->
@@ -642,6 +661,7 @@ const CATEGORY_LABELS: Record<string, string> = {
           </button>
         </div>
       </div>
+      }
     </div>
   `,
     styles: [
@@ -1180,12 +1200,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
 
-      .resume-btn-wrapper {
-        display: flex;
-        justify-content: center;
-        margin-top: 8px;
-      }
-
       .resume-icon {
         margin-right: 4px;
         vertical-align: middle;
@@ -1580,6 +1594,88 @@ const CATEGORY_LABELS: Record<string, string> = {
         cursor: pointer;
         font-family: inherit;
         text-decoration: underline;
+      }
+
+      /* Ended-session end-marker + resume card */
+
+      .end-marker {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin: 24px 0 8px;
+      }
+
+      .end-line {
+        flex: 1;
+        height: 1px;
+        background: var(--border-color, var(--surface-0));
+      }
+
+      .end-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.20em;
+        font-weight: 600;
+        font-size: 10px;
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .end-icon {
+        color: var(--accent-color, var(--accent-color));
+      }
+
+      .resume-card {
+        margin-top: 8px;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 16px;
+        padding: 18px 20px;
+        background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color, var(--accent-color));
+      }
+
+      .resume-eyebrow {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.28em;
+        font-weight: 600;
+        font-size: 9.5px;
+        color: var(--accent-color, var(--accent-color));
+        margin-bottom: 4px;
+      }
+
+      .resume-title {
+        margin: 0 0 4px;
+        font-family: var(--font-base, inherit);
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .resume-text {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-secondary, var(--text-secondary));
+        line-height: 1.5;
+      }
+
+      .resume-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      @media (max-width: 600px) {
+        .resume-card {
+          grid-template-columns: 1fr;
+        }
       }
 
       /* Input area */
@@ -1991,6 +2087,19 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             text: lang === 'de-DE' ? (s.de || s.en) : s.en,
         }));
     });
+
+    formatEndedAt(value: string | null): string {
+        if (!value) return '';
+        const lang = this.i18n.activeLang();
+        try {
+            return new Intl.DateTimeFormat(lang, {
+                dateStyle: 'long',
+                timeStyle: 'short',
+            }).format(new Date(value));
+        } catch {
+            return value;
+        }
+    }
 
     // Startup step list — drives the provisioning card.
     // Order maps to the phases the orchestrator emits via the `status` WS message.

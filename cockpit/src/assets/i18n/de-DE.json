@@ -68,7 +68,6 @@
     "emptyFilterActive": "Keine aktiven Sitzungen.",
     "emptyFilterEnded": "Keine beendeten Sitzungen.",
     "untitledSession": "Unbenannte Sitzung",
-    "confirmEnd": "Diese Sitzung beenden? Die Arbeit wird gespeichert, aber der Agent stoppt.",
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
@@ -80,7 +79,6 @@
     "tooltip": {
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
-      "end": "Beenden",
       "delete": "Löschen"
     },
     "create": {
@@ -722,6 +720,13 @@
     "empty": {
       "title": "Was wollen wir heute erobern?",
       "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
+    },
+    "ended": {
+      "eyebrow": "Wiederaufnehmbar",
+      "title": "Sitzung fortsetzen?",
+      "body": "Diese Sitzung ist beendet. Setze sie fort, um den Agenten wieder zu aktivieren und an der Stelle weiterzumachen, an der du aufgehört hast.",
+      "endedAt": "Sitzung beendet {{ date }}",
+      "resume": "Fortsetzen"
     },
     "startup": {
       "title": "Sitzung wird gestartet",
