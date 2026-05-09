@@ -885,6 +885,13 @@ class AgentProvisioner:
             labels["app.kubernetes.io/component"] = "agent"
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
+        # Build SHA label — lets the lifecycle reconciler enumerate stale
+        # pods by selector without joining to the agents table. Set when
+        # the image tag follows the `:sha-XXXXXXX` convention; absent for
+        # `:latest` or semver-style tags (local dev — drift detection
+        # is a no-op there anyway).
+        if ":sha-" in self._agent_image:
+            labels["srw/build-sha"] = self._agent_image.rsplit(":sha-", 1)[-1]
 
         containers: list[dict] = [
             {

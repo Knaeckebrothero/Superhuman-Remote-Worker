@@ -1,0 +1,33 @@
+"""Unified instance lifecycle management.
+
+See ``docs/features/unified_instance_lifecycle.md`` for the design.
+
+Phase 1a ships the type / Protocol surface and a reconciler skeleton.
+The actual cutover (AgentInstanceManager replacing _drain_stale_image_agents,
+list_pods startup reconciliation, finalizer-based cleanup) lands in
+Phase 1b.
+"""
+
+from orchestrator.services.lifecycle.agent_manager import (
+    AgentInstanceManager,
+    expected_agent_shas,
+)
+from orchestrator.services.lifecycle.reconciler import (
+    DisruptionBudget,
+    InstanceLifecycleReconciler,
+)
+from orchestrator.services.lifecycle.types import (
+    Instance,
+    InstanceLifecycleManager,
+    StatefulInstanceManager,
+)
+
+__all__ = [
+    "AgentInstanceManager",
+    "DisruptionBudget",
+    "Instance",
+    "InstanceLifecycleManager",
+    "InstanceLifecycleReconciler",
+    "StatefulInstanceManager",
+    "expected_agent_shas",
+]

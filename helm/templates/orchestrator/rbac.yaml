@@ -12,10 +12,18 @@ metadata:
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
 rules:
-  # Workspace container + agent pod lifecycle (create, delete, get status)
+  # Workspace container + agent pod lifecycle (create, delete, get status,
+  # patch labels/annotations from the lifecycle reconciler).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["create", "delete", "get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # Finalizer manipulation for the lifecycle reconciler — guarantees
+  # cleanup hooks run before a pod disappears from etcd. Adopted in
+  # Phase 1 of the unified instance lifecycle redesign; Phase 1c is the
+  # first consumer.
+  - apiGroups: [""]
+    resources: ["pods/finalizers"]
+    verbs: ["update", "patch"]
   # PVC lifecycle for workspace persistence
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]

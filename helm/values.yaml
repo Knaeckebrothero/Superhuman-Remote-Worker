@@ -115,8 +115,11 @@ orchestrator:
 # Agent
 # =============================================================================
 agent:
-  # -- Static replica count (0 = dynamic provisioning via AgentProvisioner)
-  replicas: 0
+  # All agent pods are now provisioned dynamically by AgentProvisioner.
+  # The static Deployment was removed in Phase 1a of the unified instance
+  # lifecycle redesign — `agent.replicas` is no longer honored. The
+  # PodDisruptionBudget and Service stay; they target the dynamic pods
+  # via shared chart selector labels.
   config: "defaults"
   port: "8001"
   persistentConfig: "interactive"
