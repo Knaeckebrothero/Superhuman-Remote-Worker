@@ -156,11 +156,15 @@ jobs:
         #   arxiv pins requests<2.33.0 so we can't upgrade until arxiv releases a fix
         # CVE-2026-3219: pip treats concatenated tar+ZIP files as ZIP — no fix released;
         #   requires a maliciously crafted package, not exposed via our install flow
+        # CVE-2026-44405: paramiko rsakey.py allows SHA-1 — no released fix yet (only on
+        #   master at commit a448945). Exploitation requires MITM on the SSH channel; our
+        #   connections are cluster-internal to controlled workspace pods/VMs.
         run: >-
           pip-audit --desc
           --ignore-vuln CVE-2026-4539
           --ignore-vuln CVE-2026-25645
           --ignore-vuln CVE-2026-3219
+          --ignore-vuln CVE-2026-44405
       - name: Audit npm dependencies
         working-directory: cockpit
         # lodash-es 4.17.23 is the latest release; no fix available.
