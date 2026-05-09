@@ -150,6 +150,7 @@ from services.agent_provisioner import agent_provisioner  # noqa: E402
 from services.lifecycle import (  # noqa: E402
     AgentInstanceManager,
     InstanceLifecycleReconciler,
+    VMInstanceManager,
     WorkspaceInstanceManager,
 )
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
@@ -3039,6 +3040,14 @@ async def lifespan(app: FastAPI):
     lifecycle_reconciler.register(
         WorkspaceInstanceManager(
             container_provisioner=container_provisioner,
+            suspension_service=workspace_suspension_service,
+            snapshot_service=snapshot_service,
+            db=postgres_db,
+        )
+    )
+    lifecycle_reconciler.register(
+        VMInstanceManager(
+            vm_provisioner=vm_provisioner,
             suspension_service=workspace_suspension_service,
             snapshot_service=snapshot_service,
             db=postgres_db,
