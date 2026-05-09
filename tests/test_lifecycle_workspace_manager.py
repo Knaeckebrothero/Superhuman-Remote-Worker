@@ -64,9 +64,7 @@ def _make_manager(
     db.get_job = AsyncMock(side_effect=lambda jid: (job_rows or {}).get(jid))
     db.acquire = MagicMock()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(
-        side_effect=lambda sql, tid: (thread_rows or {}).get(tid)
-    )
+    conn.fetchrow = AsyncMock(side_effect=lambda sql, tid: (thread_rows or {}).get(tid))
     ctx = AsyncMock()
     ctx.__aenter__ = AsyncMock(return_value=conn)
     ctx.__aexit__ = AsyncMock(return_value=False)
@@ -222,9 +220,7 @@ class TestIsIdle:
     @pytest.mark.asyncio
     async def test_paused_job_is_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"job_status": "paused"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "paused"})
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
@@ -238,25 +234,19 @@ class TestIsIdle:
     @pytest.mark.asyncio
     async def test_processing_is_not_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"job_status": "processing"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"job_status": "processing"})
         assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_ended_thread_is_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"thread_status": "ended"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "ended"})
         assert await mgr.is_idle(inst) is True
 
     @pytest.mark.asyncio
     async def test_active_thread_is_not_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"thread_status": "active"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"thread_status": "active"})
         assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
@@ -270,18 +260,14 @@ class TestIsHealthy:
     @pytest.mark.asyncio
     async def test_running_pod_is_healthy(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"pod_phase": "Running"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"pod_phase": "Running"})
         assert await mgr.is_healthy(inst) is True
 
     @pytest.mark.asyncio
     async def test_failed_pod_is_unhealthy(self):
         # Phase 2b will use this signal to trigger the crash detector.
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", metadata={"pod_phase": "Failed"}
-        )
+        inst = Instance(kind="workspace", id="x", metadata={"pod_phase": "Failed"})
         assert await mgr.is_healthy(inst) is False
 
 
@@ -307,9 +293,7 @@ class TestSnapshot:
     @pytest.mark.asyncio
     async def test_returns_none_without_pod_ip(self):
         mgr, _, _, snapshot, _ = _make_manager()
-        inst = Instance(
-            kind="workspace", id="x", bound_to="job1", metadata={}
-        )
+        inst = Instance(kind="workspace", id="x", bound_to="job1", metadata={})
         assert await mgr.snapshot(inst) is None
         snapshot.capture_vm_snapshot.assert_not_called()
 

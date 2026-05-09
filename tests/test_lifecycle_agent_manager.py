@@ -145,11 +145,7 @@ class TestListInstances:
         # A pod that registered too recently for its agents row to exist
         # yet — version comes from the srw/build-sha pod label set by
         # _build_pod_manifest (Phase 1a addition).
-        pods = [
-            _make_pod(
-                "srw-agent-j-fresh", labels={"srw/build-sha": "from-label"}
-            )
-        ]
+        pods = [_make_pod("srw-agent-j-fresh", labels={"srw/build-sha": "from-label"})]
         mgr, _, _, _ = _make_manager(pods=pods, agent_rows=[])
         with patch(
             "orchestrator.services.lifecycle.agent_manager.asyncio.to_thread",

@@ -31,9 +31,7 @@ from orchestrator.services.lifecycle.types import Instance
 logger = logging.getLogger(__name__)
 
 
-_IDLE_JOB_STATUSES = frozenset(
-    {"paused", "pending_review", "waiting_for_reply"}
-)
+_IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
 
 
@@ -126,9 +124,7 @@ class VMInstanceManager:
         return False
 
     async def snapshot(self, inst: Instance) -> str | None:
-        if self._snapshot is None or not getattr(
-            self._snapshot, "is_available", False
-        ):
+        if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
         ssh_host = inst.metadata.get("ssh_host")
         ssh_port = inst.metadata.get("ssh_port") or 22
@@ -146,9 +142,7 @@ class VMInstanceManager:
             )
             return bound if ok else None
         except Exception:
-            logger.exception(
-                "Snapshot failed for VM %s (bound=%s)", inst.id, bound
-            )
+            logger.exception("Snapshot failed for VM %s (bound=%s)", inst.id, bound)
             return None
 
     async def restore(self, inst: Instance, snapshot_ref: str) -> None:
@@ -259,9 +253,7 @@ class VMInstanceManager:
         # synthesize one from scope+bound_id so the reconciler can
         # log/distinguish even before the backend assigns one.
         vm_native_id = (
-            vm_ctx.get("vm_name")
-            or vm_ctx.get("name")
-            or vm_ctx.get("ssh_host")
+            vm_ctx.get("vm_name") or vm_ctx.get("name") or vm_ctx.get("ssh_host")
         )
         inst_id = vm_native_id or f"vm-{scope}-{bound_id[:12]}"
         version = _extract_sha(vm_ctx.get("vm_image"))

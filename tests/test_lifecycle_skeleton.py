@@ -185,21 +185,15 @@ class TestReconciler:
 
     def test_is_drift_skips_when_version_unset(self):
         inst = Instance(kind="agent", id="x", version=None)
-        assert (
-            InstanceLifecycleReconciler.is_drift(inst, expected={"abc"}) is False
-        )
+        assert InstanceLifecycleReconciler.is_drift(inst, expected={"abc"}) is False
 
     def test_is_drift_true_on_mismatch(self):
         inst = Instance(kind="agent", id="x", version="old")
-        assert (
-            InstanceLifecycleReconciler.is_drift(inst, expected={"new"}) is True
-        )
+        assert InstanceLifecycleReconciler.is_drift(inst, expected={"new"}) is True
 
     def test_is_drift_false_on_match(self):
         inst = Instance(kind="agent", id="x", version="abc")
-        assert (
-            InstanceLifecycleReconciler.is_drift(inst, expected={"abc"}) is False
-        )
+        assert InstanceLifecycleReconciler.is_drift(inst, expected={"abc"}) is False
 
     def test_is_drift_false_when_version_in_multi_set(self):
         # Two valid SHAs (worker + persistent images differ briefly during
