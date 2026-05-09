@@ -8,7 +8,7 @@ import pytest
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
@@ -971,6 +971,88 @@ class TestHandleTransitionNode:
         # TodoManager should have predefined strategic todos
         todos = managers["todo"].list_all()
         assert len(todos) == 4  # Transition strategic todos
+
+    @pytest.mark.asyncio
+    async def test_drain_intent_freezes_with_version_upgrade(
+        self, managers, mock_config
+    ):
+        """Phase 1d: at the phase boundary, drain intent freezes with
+        ``version_upgrade`` so the orchestrator pauses + re-dispatches."""
+        # Stage tactical todos so the regular transition itself succeeds —
+        # we want to assert that drain reaction overrides freeze_data
+        # even on a successful transition.
+        managers["todo"].stage_tactical_todos(
+            [f"Task {i} with enough detail" for i in range(1, 6)],
+            phase_name="Phase 1",
+        )
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-drain-1",
+            "is_strategic_phase": True,
+            "phase_number": 0,
+            "iteration": 10,
+        }
+        with patch("src.graph._is_drain_requested", return_value=True):
+            result = await node(state)
+
+        assert result.get("should_stop") is True
+        freeze = result.get("freeze_data")
+        assert freeze is not None
+        assert freeze["freeze_type"] == "version_upgrade"
+        assert freeze["phase_number"] == 0
+        assert "drain intent" in freeze["reason"].lower()
+
+        # Marker file written for parity with other freeze types.
+        marker = managers["workspace"].read_file("output/job_frozen.json")
+        assert marker is not None
+        import json
+
+        assert json.loads(marker)["freeze_type"] == "version_upgrade"
+
+    @pytest.mark.asyncio
+    async def test_no_drain_intent_no_version_upgrade(self, managers, mock_config):
+        """Default path: drain flag false → regular transition, no freeze."""
+        managers["todo"].stage_tactical_todos(
+            [f"Task {i} with enough detail" for i in range(1, 6)],
+            phase_name="Phase 1",
+        )
+        phase_settings = MagicMock()
+        phase_settings.min_todos = 5
+        phase_settings.max_todos = 20
+        mock_config.phase_settings = phase_settings
+
+        node = create_handle_transition_node(
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
+        )
+        state = {
+            "job_id": "test-no-drain",
+            "is_strategic_phase": True,
+            "phase_number": 0,
+            "iteration": 10,
+        }
+        with patch("src.graph._is_drain_requested", return_value=False):
+            result = await node(state)
+
+        # Successful transition without any version_upgrade freeze.
+        assert result.get("should_stop") is not True
+        freeze = result.get("freeze_data")
+        if freeze:
+            assert freeze.get("freeze_type") != "version_upgrade"
 
 
 # =============================================================================

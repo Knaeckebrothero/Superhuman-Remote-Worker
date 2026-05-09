@@ -21,6 +21,10 @@ from orchestrator.services.lifecycle.types import (
     InstanceLifecycleManager,
     StatefulInstanceManager,
 )
+from orchestrator.services.lifecycle.workspace_manager import (
+    WorkspaceInstanceManager,
+    expected_workspace_shas,
+)
 
 __all__ = [
     "AgentInstanceManager",
@@ -29,5 +33,7 @@ __all__ = [
     "InstanceLifecycleManager",
     "InstanceLifecycleReconciler",
     "StatefulInstanceManager",
+    "WorkspaceInstanceManager",
     "expected_agent_shas",
+    "expected_workspace_shas",
 ]
