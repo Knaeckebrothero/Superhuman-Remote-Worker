@@ -161,13 +161,14 @@ class TestReconciler:
 
     @pytest.mark.asyncio
     async def test_tick_returns_per_kind_stats(self):
-        # Phase 1b: tick reports per-kind stats. With a FakeStateless that
-        # returns no instances and no expected versions, every counter is 0.
+        # Tick reports per-kind stats. With a FakeStateless that returns
+        # no instances and no expected versions, every counter is 0.
         reconciler = InstanceLifecycleReconciler(managers=[_FakeStateless()])
         result = await reconciler.tick()
         assert result == {
             "agent": {
                 "listed": 0,
+                "unhealthy": 0,
                 "drift": 0,
                 "drained": 0,
                 "skipped_busy": 0,

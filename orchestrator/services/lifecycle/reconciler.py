@@ -94,24 +94,33 @@ class InstanceLifecycleReconciler:
         For each registered manager:
           1. Compute the set of acceptable versions.
           2. Enumerate live instances.
-          3. For each drifted instance that is currently idle, call
-             ``drain``. Drift on a busy instance is recorded in the
-             stats dict but not actuated — Phase 1c wires the
-             ``should_drain`` intent through the in-pod watchdog so
-             busy agents react at their next safe boundary.
-          4. Respect the disruption budget: skip drains for a kind once
-             the per-tick cap is hit.
+          3. For each instance failing ``is_healthy``, call ``delete``
+             with grace=0 — the crash-recovery path. Closes the gap
+             where ``Unknown``/``Failed`` workspace pods sat forever
+             (``docs/issues/stuck_thread_workspace_pods.md``).
+          4. For each drifted instance that is currently idle, call
+             ``drain``. Drift on a busy instance is recorded in stats
+             but not actuated — the in-pod drain-intent path (Phase 1c)
+             handles busy agents at their next safe boundary.
+          5. Respect the disruption budget: skip drains for a kind once
+             the per-tick cap is hit (only applies to drift drains;
+             unhealthy deletes always proceed since they free capacity
+             rather than consume it).
 
         Returns a per-kind stats dict for observability/tests:
-        ``{"agent": {"listed": N, "drift": N, "drained": N, "skipped_busy": N}}``.
-
-        Phase 1b: no health-based deletion here — ``reap_pods`` still
-        owns crash detection. Phase 1c may consolidate.
+        ``{"agent": {"listed": N, "unhealthy": N, "drift": N,
+                     "drained": N, "skipped_busy": N}}``.
         """
         report: dict[str, dict[str, int]] = {}
         for manager in self._managers:
             kind = manager.kind
-            stats = {"listed": 0, "drift": 0, "drained": 0, "skipped_busy": 0}
+            stats = {
+                "listed": 0,
+                "unhealthy": 0,
+                "drift": 0,
+                "drained": 0,
+                "skipped_busy": 0,
+            }
             try:
                 expected = await manager.expected_versions()
                 instances = await manager.list_instances()
@@ -123,6 +132,33 @@ class InstanceLifecycleReconciler:
             cap = self._budget.cap_for(kind, len(instances))
             drained = 0
             for inst in instances:
+                # Crash recovery: unhealthy instances get force-deleted
+                # before drift consideration. The manager decides what
+                # 'unhealthy' means (pod phase, heartbeat freshness,
+                # backend ping). Idempotent — delete on a missing pod
+                # is a no-op.
+                try:
+                    healthy = await manager.is_healthy(inst)
+                except Exception:
+                    logger.exception(
+                        "is_healthy raised for kind=%s id=%s — "
+                        "treating as healthy to avoid mass-delete",
+                        kind,
+                        inst.id,
+                    )
+                    healthy = True
+                if not healthy:
+                    stats["unhealthy"] += 1
+                    try:
+                        await manager.delete(inst, grace_s=0)
+                    except Exception:
+                        logger.exception(
+                            "Unhealthy-delete failed for kind=%s id=%s",
+                            kind,
+                            inst.id,
+                        )
+                    continue
+
                 if not self.is_drift(inst, expected):
                     continue
                 stats["drift"] += 1
@@ -142,7 +178,7 @@ class InstanceLifecycleReconciler:
                         inst.id,
                     )
             report[kind] = stats
-            if stats["drained"] or stats["drift"]:
+            if any(v for k, v in stats.items() if k != "listed"):
                 logger.info(
                     "Lifecycle tick kind=%s %s",
                     kind,
