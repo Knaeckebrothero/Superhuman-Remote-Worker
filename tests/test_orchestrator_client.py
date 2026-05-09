@@ -143,9 +143,7 @@ class TestOrchestratorClient:
 
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.json = MagicMock(
-            return_value={"status": "ok", "intents": {}}
-        )
+        mock_response.json = MagicMock(return_value={"status": "ok", "intents": {}})
 
         with patch.object(client, "_client", AsyncMock()) as mock_client:
             mock_client.post = AsyncMock(return_value=mock_response)

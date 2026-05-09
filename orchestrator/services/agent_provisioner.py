@@ -625,10 +625,7 @@ class AgentProvisioner:
         agent kept heartbeating until something else terminated it. Now
         ``draining`` triggers a force delete on the next reconciler tick.
         """
-        return (
-            pod.status.phase == "Running"
-            and pod.metadata.name in draining_hostnames
-        )
+        return pod.status.phase == "Running" and pod.metadata.name in draining_hostnames
 
     @staticmethod
     def _is_unstartable(pod, grace_seconds: int) -> bool:
