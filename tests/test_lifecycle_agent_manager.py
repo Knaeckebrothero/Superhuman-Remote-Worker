@@ -306,12 +306,15 @@ class _ScriptedManager:
         expected: set[str] | None = None,
         instances: list[Instance] | None = None,
         idle_ids: set[str] | None = None,
+        unhealthy_ids: set[str] | None = None,
     ):
         self.kind = kind
         self._expected = expected or set()
         self._instances = instances or []
         self._idle_ids = idle_ids or set()
+        self._unhealthy_ids = unhealthy_ids or set()
         self.drain_calls: list[str] = []
+        self.delete_calls: list[str] = []
 
     async def expected_versions(self):
         return self._expected
@@ -320,7 +323,7 @@ class _ScriptedManager:
         return list(self._instances)
 
     async def is_healthy(self, inst):
-        return True
+        return inst.id not in self._unhealthy_ids
 
     async def is_idle(self, inst):
         return inst.id in self._idle_ids
@@ -329,7 +332,7 @@ class _ScriptedManager:
         self.drain_calls.append(inst.id)
 
     async def delete(self, inst, grace_s):
-        return None
+        self.delete_calls.append(inst.id)
 
 
 class TestReconcilerTick:
@@ -345,6 +348,7 @@ class TestReconcilerTick:
         assert mgr.drain_calls == ["a"]
         assert report["agent"] == {
             "listed": 1,
+            "unhealthy": 0,
             "drift": 1,
             "drained": 1,
             "skipped_busy": 0,
@@ -422,6 +426,86 @@ class TestReconcilerTick:
         reconciler = InstanceLifecycleReconciler(managers=[mgr], budget=budget)
         report = await reconciler.tick()
         assert report["agent"]["drained"] == 1
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_instance_is_deleted(self):
+        # Phase 2b: unhealthy instances get force-deleted before drift
+        # consideration. Closes the workspace crash-recovery gap.
+        mgr = _ScriptedManager(
+            expected={"v1"},
+            instances=[Instance(kind="agent", id="dead", version="v1")],
+            idle_ids=set(),
+            unhealthy_ids={"dead"},
+        )
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        report = await reconciler.tick()
+        assert mgr.delete_calls == ["dead"]
+        assert report["agent"]["unhealthy"] == 1
+        # Unhealthy instance is deleted, not drained — drift stats untouched.
+        assert report["agent"]["drift"] == 0
+        assert report["agent"]["drained"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_supersedes_drift(self):
+        # If both unhealthy AND drifted, only the unhealthy delete fires.
+        mgr = _ScriptedManager(
+            expected={"new"},
+            instances=[Instance(kind="agent", id="d", version="old")],
+            idle_ids={"d"},
+            unhealthy_ids={"d"},
+        )
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        report = await reconciler.tick()
+        assert mgr.delete_calls == ["d"]
+        assert mgr.drain_calls == []
+        assert report["agent"]["unhealthy"] == 1
+        assert report["agent"]["drift"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_delete_failure_does_not_break_tick(self):
+        instances = [
+            Instance(kind="agent", id="boom", version="v1"),
+            Instance(kind="agent", id="ok", version="v1"),
+        ]
+        mgr = _ScriptedManager(
+            expected={"v1"},
+            instances=instances,
+            unhealthy_ids={"boom"},
+        )
+
+        async def explode(inst, grace_s):
+            mgr.delete_calls.append(inst.id)
+            raise RuntimeError("k8s on fire")
+
+        mgr.delete = explode  # type: ignore[assignment]
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        report = await reconciler.tick()
+        # The exception didn't bring down the tick; both instances were
+        # observed (one delete attempted, the other healthy).
+        assert mgr.delete_calls == ["boom"]
+        assert report["agent"]["unhealthy"] == 1
+        assert report["agent"]["listed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_is_healthy_exception_treats_as_healthy(self):
+        # Defense in depth: if is_healthy raises, the reconciler must not
+        # mass-delete by treating the failure as 'unhealthy'. Conservative.
+        mgr = _ScriptedManager(
+            expected={"new"},
+            instances=[Instance(kind="agent", id="x", version="old")],
+            idle_ids={"x"},
+        )
+
+        async def boom(inst):
+            raise RuntimeError("flaky check")
+
+        mgr.is_healthy = boom  # type: ignore[assignment]
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        report = await reconciler.tick()
+        # Treated as healthy → falls through to drift, drains normally.
+        assert mgr.delete_calls == []
+        assert mgr.drain_calls == ["x"]
+        assert report["agent"]["unhealthy"] == 0
 
     @pytest.mark.asyncio
     async def test_manager_exception_is_isolated(self):

@@ -573,6 +573,22 @@ class ContainerProvisioner:
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
             return False
 
+    def _build_workspace_labels(self, job_id: str) -> dict[str, str]:
+        labels = {
+            "app": "srw-workspace",
+            "srw/job-id": job_id,
+            "srw/component": "workspace",
+            # Fleet-wide selector shared with KubeVirt VM workspaces.
+            # See docs/features/workspace_network_policy_unification.md
+            "srw.io/component": "agent-workspace",
+        }
+        # Phase 2a: build SHA label parity with agent pods. Lets the
+        # lifecycle reconciler enumerate stale workspaces by selector
+        # without joining to the jobs table.
+        if ":sha-" in self._workspace_image:
+            labels["srw/build-sha"] = self._workspace_image.rsplit(":sha-", 1)[-1]
+        return labels
+
     def _build_pod_manifest(
         self,
         pod_name: str,
@@ -591,14 +607,7 @@ class ContainerProvisioner:
             "metadata": {
                 "name": pod_name,
                 "namespace": self._namespace,
-                "labels": {
-                    "app": "srw-workspace",
-                    "srw/job-id": job_id,
-                    "srw/component": "workspace",
-                    # Fleet-wide selector shared with KubeVirt VM workspaces.
-                    # See docs/features/workspace_network_policy_unification.md
-                    "srw.io/component": "agent-workspace",
-                },
+                "labels": self._build_workspace_labels(job_id),
             },
             "spec": {
                 "restartPolicy": "Never",
