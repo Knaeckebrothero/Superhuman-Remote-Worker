@@ -538,7 +538,13 @@ class AgentProvisioner:
 
         Returns a per-category count dict.
         """
-        stats = {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
+        stats = {
+            "completed": 0,
+            "crashed": 0,
+            "stale": 0,
+            "drained": 0,
+            "unstartable": 0,
+        }
         if not self._k8s_available:
             return stats
 
@@ -555,6 +561,7 @@ class AgentProvisioner:
         offline_hostnames = await self._fetch_offline_hostnames(
             offline_threshold_minutes
         )
+        draining_hostnames = await self._fetch_draining_hostnames()
 
         for pod in pods.items:
             if self._is_completed(pod):
@@ -563,6 +570,8 @@ class AgentProvisioner:
                 category = "crashed"
             elif self._is_stale_running(pod, offline_hostnames):
                 category = "stale"
+            elif self._is_drained_running(pod, draining_hostnames):
+                category = "drained"
             elif self._is_unstartable(pod, unstartable_grace_seconds):
                 category = "unstartable"
             else:
@@ -608,6 +617,20 @@ class AgentProvisioner:
         return pod.status.phase == "Running" and pod.metadata.name in offline_hostnames
 
     @staticmethod
+    def _is_drained_running(pod, draining_hostnames: set[str]) -> bool:
+        """Pod is Running and the orchestrator marked the agent as draining.
+
+        Closes the actuation gap in `_drain_stale_image_agents`: that path
+        flips the DB row to ``draining`` but never deletes the pod, so the
+        agent kept heartbeating until something else terminated it. Now
+        ``draining`` triggers a force delete on the next reconciler tick.
+        """
+        return (
+            pod.status.phase == "Running"
+            and pod.metadata.name in draining_hostnames
+        )
+
+    @staticmethod
     def _is_unstartable(pod, grace_seconds: int) -> bool:
         if pod.status.phase != "Pending":
             return False
@@ -644,6 +667,24 @@ class AgentProvisioner:
             return {r["hostname"] for r in rows}
         except Exception:
             logger.exception("Failed to query offline agents for reaping")
+            return set()
+
+    async def _fetch_draining_hostnames(self) -> set[str]:
+        """Return hostnames of agents the orchestrator has marked draining."""
+        if not self._db:
+            return set()
+        try:
+            async with self._db.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT hostname FROM agents
+                    WHERE status = 'draining'
+                      AND hostname IS NOT NULL
+                    """
+                )
+            return {r["hostname"] for r in rows}
+        except Exception:
+            logger.exception("Failed to query draining agents for reaping")
             return set()
 
     async def scale_down_idle(self, max_terminate: int = 2) -> int:
