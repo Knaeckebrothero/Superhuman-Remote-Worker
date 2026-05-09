@@ -126,6 +126,63 @@ def _get_current_job_id() -> Optional[str]:
     return _current_job_id
 
 
+# Drain intent flag — set the first time the orchestrator's heartbeat
+# response carries ``intents.should_drain=true``. Idle workers exit
+# immediately; busy workers expose the flag to the graph so it can
+# freeze with ``freeze_data.type="version_upgrade"`` at the next phase
+# boundary (Continue-as-New).
+_drain_intent_received: bool = False
+_drain_intent_handled: bool = False
+
+
+def is_drain_requested() -> bool:
+    """Public helper for the worker graph to check drain intent.
+
+    The graph uses this at phase boundaries to decide whether to freeze
+    with ``version_upgrade`` instead of continuing into the next phase.
+    """
+    return _drain_intent_received
+
+
+async def _handle_heartbeat_intents(response: Dict[str, Any]) -> None:
+    """Heartbeat-response callback: react to orchestrator-set intents.
+
+    Idle workers (``ready`` status, no job) exit immediately to free
+    the slot for a fresh-version pod. Busy workers just record the
+    intent — the graph reacts at its next safe boundary.
+    """
+    global _drain_intent_received, _drain_intent_handled
+    intents = response.get("intents") or {}
+    if not isinstance(intents, dict) or not intents.get("should_drain"):
+        return
+    _drain_intent_received = True
+    if _drain_intent_handled:
+        return
+    if _current_job_id is None and _pod_state == PodState.IDLE:
+        _drain_intent_handled = True
+        logger.info(
+            "Drain intent received (reason=%s) — idle worker exiting",
+            intents.get("drain_reason", "unspecified"),
+        )
+        # Best-effort drain heartbeat so the orchestrator sees us go.
+        try:
+            await _orchestrator_client.heartbeat(
+                status="draining",
+                job_id=None,
+                metrics=_get_agent_metrics(),
+            )
+        except Exception:
+            pass
+        os._exit(0)
+    elif not _drain_intent_handled:
+        # Busy — log once. The graph picks this up via is_drain_requested().
+        _drain_intent_handled = True
+        logger.info(
+            "Drain intent received (reason=%s) — will freeze at next phase boundary",
+            intents.get("drain_reason", "unspecified"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -165,6 +222,7 @@ async def lifespan(app: FastAPI):
             get_status=_get_heartbeat_status,
             get_job_id=_get_current_job_id,
             get_metrics=_get_agent_metrics,
+            on_response=_handle_heartbeat_intents,
         )
     )
 

@@ -7,7 +7,7 @@ import asyncio
 import logging
 import os
 import socket
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -415,7 +415,7 @@ class OrchestratorClient:
         status: str,
         job_id: Optional[str] = None,
         metrics: Optional[dict[str, Any]] = None,
-    ) -> bool:
+    ) -> Optional[dict[str, Any]]:
         """Send a heartbeat to the orchestrator.
 
         Args:
@@ -424,11 +424,15 @@ class OrchestratorClient:
             metrics: Optional metrics dict (memory_mb, cpu_percent, tokens_processed)
 
         Returns:
-            True if heartbeat succeeded, False otherwise
+            The orchestrator's JSON response body on success (truthy);
+            ``None`` on failure. The response carries any pending
+            ``intents`` (drain, version-upgrade hints) the agent should
+            react to. Callers that only care about success can still
+            check the return value as truthy/falsy.
         """
         if not self.agent_id:
             logger.warning("Cannot send heartbeat: agent_id not set")
-            return False
+            return None
 
         if not self._client:
             await self.connect()
@@ -446,7 +450,10 @@ class OrchestratorClient:
 
             if response.status_code == 200:
                 logger.debug(f"Heartbeat sent: status={status}, job_id={job_id}")
-                return True
+                try:
+                    return response.json() or {}
+                except Exception:
+                    return {}
             elif response.status_code == 404:
                 # Agent not found - might have been cleaned up, try to re-register
                 logger.warning(
@@ -455,25 +462,28 @@ class OrchestratorClient:
                 if await self.register():
                     # Retry heartbeat after re-registration
                     return await self.heartbeat(status, job_id, metrics)
-                return False
+                return None
             else:
                 logger.error(
                     f"Failed to send heartbeat: {response.status_code} - {response.text}"
                 )
-                return False
+                return None
 
         except httpx.RequestError as e:
             logger.error(f"Failed to connect to orchestrator for heartbeat: {e}")
-            return False
+            return None
         except Exception as e:
             logger.error(f"Unexpected error during heartbeat: {e}")
-            return False
+            return None
 
     async def run_heartbeat_loop(
         self,
         get_status: Callable[[], str],
         get_job_id: Callable[[], Optional[str]],
         get_metrics: Callable[[], Optional[dict[str, Any]]],
+        on_response: Optional[
+            Callable[[dict[str, Any]], Optional[Awaitable[None]]]
+        ] = None,
     ) -> None:
         """Run the heartbeat loop.
 
@@ -486,6 +496,10 @@ class OrchestratorClient:
             get_status: Callback that returns current agent status
             get_job_id: Callback that returns current job ID or None
             get_metrics: Callback that returns metrics dict or None
+            on_response: Optional callback invoked with each successful
+                heartbeat response body (carries ``intents``). Used by
+                callers that need to react to drain / version-upgrade
+                hints. Sync or async.
         """
         logger.info(f"Starting heartbeat loop (interval: {self.heartbeat_interval}s)")
         self._stop_heartbeat.clear()
@@ -507,7 +521,14 @@ class OrchestratorClient:
                     job_id = get_job_id()
                     metrics = get_metrics()
 
-                    await self.heartbeat(status, job_id, metrics)
+                    response = await self.heartbeat(status, job_id, metrics)
+                    if response is not None and on_response is not None:
+                        try:
+                            ret = on_response(response)
+                            if asyncio.iscoroutine(ret):
+                                await ret
+                        except Exception:
+                            logger.exception("on_response callback raised")
 
             except Exception as e:
                 logger.error(f"Error in heartbeat loop: {e}")

@@ -53,6 +53,11 @@ _max_sessions_per_process: int = int(
 # Pod exit scheduling
 _pending_exit_task: Optional[asyncio.Task] = None
 
+# Drain intent — set the first time the orchestrator's heartbeat response
+# carries ``intents.should_drain=true``. Drives a one-shot detach + exit so
+# the agent doesn't keep reacting on every subsequent heartbeat.
+_drain_intent_handled: bool = False
+
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
 #   _ws_connected_event  → set when /ws/chat first accepts a connection.
@@ -63,6 +68,35 @@ _session_boot_ws_timeout_s: int = int(
     os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
 )
 _thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
+
+async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
+    """Heartbeat-response callback: react to orchestrator-set intents.
+
+    Currently only ``should_drain`` triggers anything — when set, the
+    persistent agent detaches its session (which marks the thread
+    ``ended`` so any active WS gets a normal close) and exits the pod.
+    Idempotent: only fires once per process; later heartbeats observing
+    the same intent are no-ops.
+    """
+    global _drain_intent_handled
+    if _drain_intent_handled:
+        return
+    intents = response.get("intents") or {}
+    if not isinstance(intents, dict):
+        return
+    if not intents.get("should_drain"):
+        return
+    _drain_intent_handled = True
+    logger.info(
+        "Drain intent received from orchestrator (reason=%s) — detaching and exiting",
+        intents.get("drain_reason", "unspecified"),
+    )
+    try:
+        await _detach_session()
+    except Exception as e:
+        logger.warning(f"Detach during drain-intent handling failed: {e}")
+    _schedule_exit(delay=1.0)
 
 
 def _schedule_exit(delay: float = 1.0) -> None:
@@ -279,6 +313,7 @@ async def lifespan(app: FastAPI):
                     get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
+                    on_response=_handle_heartbeat_intents,
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
