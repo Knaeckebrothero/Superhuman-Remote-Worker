@@ -233,17 +233,13 @@ class TestIsIdle:
     @pytest.mark.asyncio
     async def test_processing_job_is_not_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="vm", id="x", metadata={"job_status": "processing"}
-        )
+        inst = Instance(kind="vm", id="x", metadata={"job_status": "processing"})
         assert await mgr.is_idle(inst) is False
 
     @pytest.mark.asyncio
     async def test_ended_thread_is_idle(self):
         mgr, *_ = _make_manager()
-        inst = Instance(
-            kind="vm", id="x", metadata={"thread_status": "ended"}
-        )
+        inst = Instance(kind="vm", id="x", metadata={"thread_status": "ended"})
         assert await mgr.is_idle(inst) is True
 
 
@@ -298,9 +294,7 @@ class TestDelete:
     @pytest.mark.asyncio
     async def test_job_vm_calls_delete_vm(self):
         mgr, provisioner, *_ = _make_manager()
-        inst = Instance(
-            kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"}
-        )
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.delete(inst, grace_s=0)
         provisioner.delete_vm.assert_awaited_once_with("job-1")
         provisioner.delete_thread_vm.assert_not_called()
@@ -321,18 +315,14 @@ class TestDelete:
     @pytest.mark.asyncio
     async def test_drain_dispatches_through_delete(self):
         mgr, provisioner, *_ = _make_manager()
-        inst = Instance(
-            kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"}
-        )
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.drain(inst, grace_s=0)
         provisioner.delete_vm.assert_awaited_once_with("job-1")
 
     @pytest.mark.asyncio
     async def test_noop_when_provisioner_unavailable(self):
         mgr, provisioner, *_ = _make_manager(is_available=False)
-        inst = Instance(
-            kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"}
-        )
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.delete(inst, grace_s=0)
         provisioner.delete_vm.assert_not_called()
 

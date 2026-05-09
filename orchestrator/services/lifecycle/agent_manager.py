@@ -54,9 +54,7 @@ class AgentInstanceManager:
         # through the actual module-init paths.
         self._provisioner = provisioner
         self._db = db
-        self._label_selector = (
-            label_selector or "srw/managed-by=agent-provisioner"
-        )
+        self._label_selector = label_selector or "srw/managed-by=agent-provisioner"
 
     # -------------------------------------------------------------------------
     # Protocol implementation
@@ -79,7 +77,9 @@ class AgentInstanceManager:
             self._list_pods(),
             self._fetch_agent_rows(),
         )
-        agents_by_hostname = {row["hostname"]: row for row in agent_rows if row.get("hostname")}
+        agents_by_hostname = {
+            row["hostname"]: row for row in agent_rows if row.get("hostname")
+        }
 
         instances: list[Instance] = []
         for pod in pods:
@@ -107,9 +107,7 @@ class AgentInstanceManager:
                 metadata["thread_id"] = (
                     str(row["thread_id"]) if row.get("thread_id") else None
                 )
-                bound_to = (
-                    metadata["thread_id"] or metadata["current_job_id"]
-                )
+                bound_to = metadata["thread_id"] or metadata["current_job_id"]
             else:
                 # Pod without DB row — likely registered too recently or
                 # heartbeat hasn't landed. Read SHA from the pod label

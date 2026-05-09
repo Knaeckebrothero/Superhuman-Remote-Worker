@@ -28,9 +28,7 @@ logger = logging.getLogger(__name__)
 
 _LABEL_SELECTOR = "srw.io/component=agent-workspace"
 
-_IDLE_JOB_STATUSES = frozenset(
-    {"paused", "pending_review", "waiting_for_reply"}
-)
+_IDLE_JOB_STATUSES = frozenset({"paused", "pending_review", "waiting_for_reply"})
 _IDLE_THREAD_STATUSES = frozenset({"ended"})
 
 
@@ -155,9 +153,7 @@ class WorkspaceInstanceManager:
         SnapshotService keys by job/thread id), or ``None`` if the
         snapshot path isn't usable for this instance.
         """
-        if self._snapshot is None or not getattr(
-            self._snapshot, "is_available", False
-        ):
+        if self._snapshot is None or not getattr(self._snapshot, "is_available", False):
             return None
         ssh_host = inst.metadata.get("pod_ip")
         if not ssh_host:
@@ -257,8 +253,7 @@ class WorkspaceInstanceManager:
         try:
             async with self._db.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT id, status, ended_at, agent_id "
-                    "FROM threads WHERE id = $1",
+                    "SELECT id, status, ended_at, agent_id FROM threads WHERE id = $1",
                     thread_id,
                 )
             return dict(row) if row else None
