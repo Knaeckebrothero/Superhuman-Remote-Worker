@@ -21,6 +21,10 @@ from orchestrator.services.lifecycle.types import (
     InstanceLifecycleManager,
     StatefulInstanceManager,
 )
+from orchestrator.services.lifecycle.vm_manager import (
+    VMInstanceManager,
+    expected_vm_shas,
+)
 from orchestrator.services.lifecycle.workspace_manager import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
@@ -33,7 +37,9 @@ __all__ = [
     "InstanceLifecycleManager",
     "InstanceLifecycleReconciler",
     "StatefulInstanceManager",
+    "VMInstanceManager",
     "WorkspaceInstanceManager",
     "expected_agent_shas",
+    "expected_vm_shas",
     "expected_workspace_shas",
 ]
