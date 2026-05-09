@@ -147,6 +147,10 @@ from services.container_provisioner import container_provisioner  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.lifecycle import (  # noqa: E402
+    AgentInstanceManager,
+    InstanceLifecycleReconciler,
+)
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
@@ -453,6 +457,9 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
     Runs every 60 seconds:
     - Ensures MIN_AGENTS warm pods exist (instant dispatch)
     - Reaps completed / stale / unstartable agent pods (single dispatcher)
+
+    Drift-based draining lives in ``lifecycle_reconciler_loop`` now —
+    this loop only owns capacity (warm pool + scale-down) and crash GC.
     """
     logger.info("Agent pool reconciler started")
     while not shutdown_event.is_set():
@@ -461,9 +468,6 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
                 await agent_provisioner.ensure_warm_pool()
                 await agent_provisioner.reap_pods()
                 await agent_provisioner.scale_down_idle()
-                # Drain idle agents running stale images so new pods
-                # with the current image can be provisioned.
-                await _drain_stale_image_agents()
         except Exception as e:
             logger.error("Error in agent pool reconciler: %s", e)
 
@@ -476,48 +480,32 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
     logger.info("Agent pool reconciler stopped")
 
 
-async def _drain_stale_image_agents() -> None:
-    """Mark idle agents with outdated build SHAs as draining.
+async def lifecycle_reconciler_loop(
+    shutdown_event: asyncio.Event,
+    reconciler: InstanceLifecycleReconciler,
+) -> None:
+    """Background task driving the unified instance lifecycle reconciler.
 
-    Called by the reconciler every 60s.  Only touches agents that are
-    idle (ready, no job, no thread) so active work is never interrupted.
-    The existing ``reap_stale_pods`` pass will clean up draining pods.
+    Runs every 60 seconds. The reconciler delegates to per-kind
+    managers (``AgentInstanceManager`` etc.) for drift detection and
+    drain. Crash detection still flows through ``reap_pods`` in the
+    sibling ``agent_pool_reconciler`` for now; consolidation is a
+    follow-up.
     """
-    expected = _expected_agent_shas()
-    if not expected:
-        return  # No SHA-tagged images — nothing to compare
+    logger.info("Lifecycle reconciler loop started")
+    while not shutdown_event.is_set():
+        try:
+            await reconciler.tick()
+        except Exception:
+            logger.exception("Lifecycle reconciler tick failed")
 
-    try:
-        rows = await postgres_db.fetch(
-            """
-            SELECT id, metadata
-            FROM agents
-            WHERE status = 'ready'
-              AND current_job_id IS NULL
-              AND thread_id IS NULL
-            """,
-        )
-        for row in rows:
-            meta = row["metadata"] or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, ValueError):
-                    meta = {}
-            build_sha = meta.get("build_sha", "")
-            if build_sha and build_sha not in expected:
-                logger.info(
-                    "Draining stale idle agent %s (build_sha=%s, expected=%s)",
-                    row["id"],
-                    build_sha,
-                    expected,
-                )
-                await postgres_db.execute(
-                    "UPDATE agents SET status = 'draining' WHERE id = $1",
-                    row["id"],
-                )
-    except Exception:
-        logger.exception("Error draining stale image agents")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Lifecycle reconciler loop stopped")
 
 
 async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -1356,7 +1344,8 @@ async def _find_idle_persistent_agent() -> Optional[dict]:
     status in ('ready'), and no thread currently attached.
 
     Agents whose build SHA doesn't match the current expected images
-    are skipped and marked as draining so they get cleaned up.
+    are skipped here; the lifecycle reconciler is responsible for
+    actually draining them.
     """
     try:
         rows = await postgres_db.fetch(
@@ -1381,20 +1370,12 @@ async def _find_idle_persistent_agent() -> Optional[dict]:
                     meta = {}
             if _agent_sha_is_current(meta):
                 return agent
-            # Stale agent — mark as draining so reconciler cleans it up
-            logger.info(
+            logger.debug(
                 "Skipping stale agent %s (build_sha=%s, expected=%s)",
                 agent["id"],
                 meta.get("build_sha", ""),
                 _expected_agent_shas(),
             )
-            try:
-                await postgres_db.execute(
-                    "UPDATE agents SET status = 'draining' WHERE id = $1",
-                    agent["id"],
-                )
-            except Exception:
-                pass
         return None
     except Exception:
         logger.exception("Failed to find idle persistent agent")
@@ -2070,18 +2051,13 @@ async def _try_dispatch_pending_jobs() -> None:
                 if _agent_sha_is_current(meta):
                     available_agents.append(ag)
                 else:
-                    logger.info(
+                    # Stale-SHA agents are skipped here; the lifecycle
+                    # reconciler is responsible for draining them.
+                    logger.debug(
                         "Skipping stale worker agent %s (build_sha=%s)",
                         ag["id"],
                         meta.get("build_sha", ""),
                     )
-                    try:
-                        await postgres_db.execute(
-                            "UPDATE agents SET status = 'draining' WHERE id = $1",
-                            ag["id"],
-                        )
-                    except Exception:
-                        pass
 
             # Phase 1: Direct assignment
             matched_job_ids = set()
@@ -3051,6 +3027,30 @@ async def lifespan(app: FastAPI):
     )
     pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
 
+    # Unified instance lifecycle reconciler (drift-based draining and,
+    # in future phases, crash recovery + cross-kind primitives). Runs
+    # peer to agent_pool_reconciler — pool owns capacity, lifecycle
+    # owns version/health.
+    lifecycle_reconciler = InstanceLifecycleReconciler()
+    lifecycle_reconciler.register(
+        AgentInstanceManager(provisioner=agent_provisioner, db=postgres_db)
+    )
+    # Startup reconciliation: rebuild the in-memory view from K8s
+    # before the heartbeat endpoint starts accepting traffic. Phase 1b
+    # logs the discovered pod set; future phases may also flag DB-row
+    # divergence and reap pods that lack a registration.
+    try:
+        startup_pods = await lifecycle_reconciler.managers[0].list_pods()
+        logger.info(
+            "Lifecycle startup: discovered %d agent pod(s) from K8s",
+            len(startup_pods),
+        )
+    except Exception:
+        logger.exception("Lifecycle startup reconciliation failed (non-fatal)")
+    lifecycle_reconciler_task = asyncio.create_task(
+        lifecycle_reconciler_loop(_shutdown_event, lifecycle_reconciler)
+    )
+
     # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
     # an admin PUTs a new config via /api/admin/system-settings/main_cloud.
     async def _main_cloud_reload_callback() -> None:
@@ -3075,6 +3075,7 @@ async def lifespan(app: FastAPI):
     await digest_task
     await delegation_timeout_task
     await pool_reconciler_task
+    await lifecycle_reconciler_task
     await main_cloud_listen_task
 
     # Cleanup clients
@@ -9553,7 +9554,11 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
             except Exception:
                 pass  # Non-critical — don't fail heartbeat
 
-        return {"status": "ok"}
+        # Surface orchestrator-set intents (drain, version-upgrade hints)
+        # so the agent can react on the next heartbeat tick. Keeping the
+        # legacy {"status": "ok"} key for back-compat with older agent
+        # builds that don't read intents.
+        return {"status": "ok", "intents": result.get("intents") or {}}
     except HTTPException:
         raise
     except Exception as e:

@@ -15,7 +15,11 @@ import pytest
 from orchestrator.database.postgres import PostgresDB
 
 
-def _make_db_with_mocked_acquire(prev_status: str, update_result: str = "UPDATE 1"):
+def _make_db_with_mocked_acquire(
+    prev_status: str,
+    update_result: str = "UPDATE 1",
+    intents: dict | None = None,
+):
     """Build a real PostgresDB with acquire() replaced by a mocked conn.
 
     The replacement uses an `asynccontextmanager` so the production
@@ -24,7 +28,8 @@ def _make_db_with_mocked_acquire(prev_status: str, update_result: str = "UPDATE 
     with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
         db = PostgresDB()
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value={"status": prev_status})
+    row = {"status": prev_status, "intents": intents if intents is not None else {}}
+    conn.fetchrow = AsyncMock(return_value=row)
     conn.execute = AsyncMock(return_value=update_result)
 
     @asynccontextmanager
@@ -93,3 +98,59 @@ class TestHeartbeatPreservesDraining:
             status="ready",
         )
         assert result is None
+
+
+class TestHeartbeatReturnsIntents:
+    """Phase 1c: heartbeat result includes orchestrator-set intents so
+    the FastAPI handler can surface them to the agent in the response."""
+
+    @pytest.mark.asyncio
+    async def test_intents_propagate_when_present(self):
+        db, _ = _make_db_with_mocked_acquire(
+            prev_status="ready",
+            intents={"should_drain": True, "drain_reason": "stale_image"},
+        )
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["intents"] == {
+            "should_drain": True,
+            "drain_reason": "stale_image",
+        }
+
+    @pytest.mark.asyncio
+    async def test_intents_empty_when_unset(self):
+        db, _ = _make_db_with_mocked_acquire(prev_status="ready", intents={})
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["intents"] == {}
+
+    @pytest.mark.asyncio
+    async def test_intents_parsed_when_db_returns_jsonb_string(self):
+        # Some asyncpg paths surface JSONB columns as raw strings.
+        db, _ = _make_db_with_mocked_acquire(prev_status="ready")
+        # Override the fetchrow to return the string-encoded variant.
+        import json
+
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(
+            return_value={
+                "status": "ready",
+                "intents": json.dumps({"should_drain": True}),
+            }
+        )
+        conn.execute = AsyncMock(return_value="UPDATE 1")
+
+        @asynccontextmanager
+        async def fake_acquire():
+            yield conn
+
+        db.acquire = fake_acquire
+        result = await db.heartbeat(
+            agent_id="00000000-0000-0000-0000-000000000001",
+            status="ready",
+        )
+        assert result["intents"] == {"should_drain": True}

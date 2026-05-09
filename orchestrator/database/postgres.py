@@ -1700,15 +1700,27 @@ class PostgresDB:
         job_uuid = UUID(current_job_id) if current_job_id else None
 
         async with self.acquire() as conn:
-            # Fetch previous status for transition detection
+            # Fetch previous status (transition detection) + intents
+            # (orchestrator-set drain/upgrade hints that the agent reads
+            # from the heartbeat response and reacts to).
             prev = await conn.fetchrow(
-                "SELECT status FROM agents WHERE id = $1",
+                "SELECT status, intents FROM agents WHERE id = $1",
                 uuid_val,
             )
             if not prev:
                 return None
 
             prev_status = prev["status"]
+            intents_raw = prev["intents"] if "intents" in prev else None
+            if isinstance(intents_raw, str):
+                try:
+                    intents = json.loads(intents_raw)
+                except (json.JSONDecodeError, ValueError):
+                    intents = {}
+            elif isinstance(intents_raw, dict):
+                intents = intents_raw
+            else:
+                intents = {}
 
             # Set last_completed_at when transitioning from working → ready/completed
             # This enables the dispatch cooldown (30s before next job assignment)
@@ -1759,6 +1771,7 @@ class PostgresDB:
             return {
                 "previous_status": prev_status,
                 "effective_status": effective_status,
+                "intents": intents,
             }
 
     async def list_agents(
