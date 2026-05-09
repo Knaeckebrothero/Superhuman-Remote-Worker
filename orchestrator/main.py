@@ -9530,12 +9530,15 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
         # If agent transitioned to ready, trigger the dispatcher
-        # (will be wired up in the dispatcher task)
+        # (will be wired up in the dispatcher task). Use effective_status —
+        # the orchestrator may preserve 'draining' against an agent-reported
+        # 'ready', and we must not dispatch in that case.
         prev_status = result.get("previous_status")
+        effective_status = result.get("effective_status", heartbeat.status)
         if (
             prev_status
-            and prev_status != heartbeat.status
-            and heartbeat.status == "ready"
+            and prev_status != effective_status
+            and effective_status == "ready"
         ):
             logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
             _trigger_dispatch()
