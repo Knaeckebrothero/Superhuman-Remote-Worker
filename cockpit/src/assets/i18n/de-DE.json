@@ -688,6 +688,7 @@
       "retryNow": "Jetzt erneut versuchen",
       "reconnect": "Erneut verbinden"
     },
+    "jumpToLatest": "Zum Aktuellen · {{count}} neu",
     "header": {
       "settingsTooltip": "Sitzungseinstellungen",
       "filesButton": "Dateien",
