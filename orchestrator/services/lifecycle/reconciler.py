@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from orchestrator.services.lifecycle.types import (
+from .types import (
     Instance,
     InstanceLifecycleManager,
     StatefulInstanceManager,
