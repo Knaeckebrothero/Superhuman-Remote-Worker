@@ -290,6 +290,21 @@ class TestRestore:
         suspension.restore_thread_workspace.assert_awaited_once_with("thread-1")
 
 
+class TestSignalDrainPending:
+    @pytest.mark.asyncio
+    async def test_is_noop(self):
+        # No in-pod drain hook for VMs (the management daemon doesn't
+        # poll intents). Drift drain fires only when bound work pauses.
+        mgr, provisioner, suspension, snapshot, db = _make_manager()
+        inst = Instance(
+            kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"}
+        )
+        await mgr.signal_drain_pending(inst)
+        provisioner.delete_vm.assert_not_called()
+        provisioner.delete_thread_vm.assert_not_called()
+        snapshot.capture_vm_snapshot.assert_not_called()
+
+
 class TestDelete:
     @pytest.mark.asyncio
     async def test_job_vm_calls_delete_vm(self):
