@@ -29,7 +29,7 @@ image:
   agent:
     tag: sha-04a2e5d
   cockpit:
-    tag: sha-998d052
+    tag: sha-3ce776d
   mcp:
     tag: sha-95edbd4
   workspace:
