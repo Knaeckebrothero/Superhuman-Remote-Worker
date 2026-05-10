@@ -281,6 +281,18 @@ export class PersistentChatService {
             if (event.code !== 1000 && event.code !== 4408) {
                 this.error.set(`Connection closed: ${event.reason || `code ${event.code}`}`);
             }
+            // The agent's _detach_session() writes the row to 'ended' AFTER the
+            // WS dies (idle timeout, agent crash, network drop). Re-fetch meta
+            // so the UI picks up the flip and renders the resume card without
+            // requiring a manual reload.
+            const threadIdAtClose = this.threadId();
+            if (threadIdAtClose) {
+                setTimeout(() => {
+                    if (this.threadId() !== threadIdAtClose) return;
+                    if (this.connectionState() === 'connected') return;
+                    this.loadThreadMeta(threadIdAtClose);
+                }, 1500);
+            }
         };
 
         this.ws.onerror = () => {

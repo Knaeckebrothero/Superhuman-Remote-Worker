@@ -331,11 +331,36 @@ describe('SessionsPageComponent', () => {
     // =========================================================================
 
     describe('resumeSession()', () => {
-        it('should navigate to session page', () => {
+        it('should navigate to session page for active thread', () => {
             const thread = makeThread({id: 'thread-abc'});
             component.resumeSession(thread);
 
             expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-abc']);
+        });
+
+        it('should POST to resume endpoint when thread is ended', async () => {
+            mockHttp.post.mockReturnValue(of({}));
+            const thread = makeThread({id: 'thread-end', status: 'ended'});
+            await component.resumeSession(thread);
+
+            const resumeCall = mockHttp.post.mock.calls.find(
+                (c: any[]) => c[0]?.includes(`/persistent/threads/thread-end/resume`),
+            );
+            expect(resumeCall).toBeTruthy();
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-end']);
+        });
+    });
+
+    describe('openSession()', () => {
+        it('should navigate without POSTing /resume even for ended threads', () => {
+            const thread = makeThread({id: 'thread-end', status: 'ended'});
+            component.openSession(thread);
+
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-end']);
+            const resumeCall = mockHttp.post.mock.calls.find(
+                (c: any[]) => c[0]?.includes('/resume'),
+            );
+            expect(resumeCall).toBeUndefined();
         });
     });
 
