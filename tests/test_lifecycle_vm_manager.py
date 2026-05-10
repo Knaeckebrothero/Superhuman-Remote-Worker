@@ -296,9 +296,7 @@ class TestSignalDrainPending:
         # No in-pod drain hook for VMs (the management daemon doesn't
         # poll intents). Drift drain fires only when bound work pauses.
         mgr, provisioner, suspension, snapshot, db = _make_manager()
-        inst = Instance(
-            kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"}
-        )
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
         await mgr.signal_drain_pending(inst)
         provisioner.delete_vm.assert_not_called()
         provisioner.delete_thread_vm.assert_not_called()
