@@ -26,7 +26,7 @@ import logging
 import os
 from typing import Any
 
-from orchestrator.services.lifecycle.types import Instance
+from .types import Instance
 
 logger = logging.getLogger(__name__)
 
