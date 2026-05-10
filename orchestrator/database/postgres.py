@@ -1836,7 +1836,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
-                       status, current_job_id, registered_at, last_heartbeat, metadata
+                       status, current_job_id, thread_id,
+                       registered_at, last_heartbeat, metadata
                 FROM agents
                 WHERE id = $1
                 """,
