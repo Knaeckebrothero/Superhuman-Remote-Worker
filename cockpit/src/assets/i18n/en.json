@@ -688,6 +688,7 @@
       "retryNow": "Retry now",
       "reconnect": "Reconnect"
     },
+    "jumpToLatest": "Jump to latest · {{count}} new",
     "header": {
       "settingsTooltip": "Session settings",
       "filesButton": "Files",

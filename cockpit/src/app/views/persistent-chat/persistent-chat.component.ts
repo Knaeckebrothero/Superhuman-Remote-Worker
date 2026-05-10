@@ -624,6 +624,16 @@ const CATEGORY_LABELS: Record<string, string> = {
             </app-button>
           </div>
         }
+
+        <!-- Jump-to-latest pill: appears when the user has scrolled up while
+             new messages arrive. Sticky-positioned so it floats over the stream
+             without needing a wrapper element. -->
+        @if (showJumpToLatest()) {
+          <button class="jump-latest" type="button" (click)="jumpToLatest()">
+            <app-icon size="sm">arrow_downward</app-icon>
+            <span>{{ 'chat.jumpToLatest' | transloco: { count: newMessageCount() } }}</span>
+          </button>
+        }
       </div>
 
       <!-- Error banner -->
@@ -1670,6 +1680,45 @@ const CATEGORY_LABELS: Record<string, string> = {
         filter: saturate(0.6);
       }
 
+      /* Jump-to-latest pill (F5) — sticks to the bottom of the messages
+         scroll container when the user has scrolled up while new messages
+         arrive. Sharp corners + uppercase display font match the rest of
+         the visual refresh. */
+
+      .jump-latest {
+        position: sticky;
+        bottom: 16px;
+        align-self: center;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 14px;
+        background: var(--accent-color);
+        color: #fff;
+        border: 0;
+        cursor: pointer;
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 10.5px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        transition: filter 0.15s ease, transform 0.15s ease;
+        z-index: 5;
+      }
+
+      .jump-latest:hover {
+        filter: brightness(1.1);
+      }
+
+      .jump-latest:active {
+        transform: translateY(1px);
+      }
+
+      .jump-latest app-icon {
+        color: inherit;
+      }
+
       /* Ended-session end-marker + resume card */
 
       .end-marker {
@@ -2240,6 +2289,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     private idePollingAttempts = 0;
 
     private autoScroll = true;
+    private lastSeenMessageCount = 0;
 
     constructor() {
         // Start/stop IDE polling when connection state changes
@@ -2275,6 +2325,23 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             if (this.autoScroll) {
                 setTimeout(() => this.scrollToBottom(), 0);
             }
+        });
+
+        // Track new messages that arrive while the user has scrolled up.
+        // Drives the "Jump to latest · N new" pill (F5).
+        effect(() => {
+            const len = this.chat.messages().length;
+            const away = this.scrolledAway();
+            if (len < this.lastSeenMessageCount) {
+                // Thread switch or messages cleared — start fresh.
+                this.newMessageCount.set(0);
+            } else if (away && len > this.lastSeenMessageCount) {
+                const delta = len - this.lastSeenMessageCount;
+                this.newMessageCount.update(n => n + delta);
+            } else if (!away) {
+                this.newMessageCount.set(0);
+            }
+            this.lastSeenMessageCount = len;
         });
 
         // Track startup phase transitions to record per-step durations.
@@ -2370,6 +2437,12 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         && this.chat.messages().length > 0,
     );
 
+    readonly scrolledAway = signal(false);
+    readonly newMessageCount = signal(0);
+    readonly showJumpToLatest = computed(
+        () => this.scrolledAway() && this.newMessageCount() > 0,
+    );
+
     readonly inputPlaceholder = computed(() => {
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
@@ -2448,7 +2521,20 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         const el = this.messagesContainer?.nativeElement;
         if (!el) return;
         // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
-        this.autoScroll = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        this.autoScroll = nearBottom;
+        this.scrolledAway.set(!nearBottom);
+        if (nearBottom) {
+            this.newMessageCount.set(0);
+        }
+    }
+
+    jumpToLatest(): void {
+        this.autoScroll = true;
+        this.scrolledAway.set(false);
+        this.newMessageCount.set(0);
+        this.lastSeenMessageCount = this.chat.messages().length;
+        this.scrollToBottom();
     }
 
     selectSlashCommand(cmd: SlashCommand): void {
