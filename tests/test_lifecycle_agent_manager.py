@@ -244,6 +244,34 @@ class TestIsIdle:
 # =============================================================================
 
 
+class TestSignalDrainPending:
+    """Phase 1e: soft drain signal — intent only, no status flip."""
+
+    @pytest.mark.asyncio
+    async def test_writes_intent_only(self):
+        mgr, _, _, conn = _make_manager()
+        inst = Instance(
+            kind="agent",
+            id="srw-agent-j-x",
+            version="old",
+            metadata={"agent_id": "11111111-1111-1111-1111-111111111111"},
+        )
+        await mgr.signal_drain_pending(inst)
+        assert conn.execute.call_count == 1
+        sql = conn.execute.call_args[0][0]
+        assert "intents = intents" in sql
+        # Distinguishes from drain(): no status CASE expression.
+        assert "CASE" not in sql
+        assert "should_drain" in conn.execute.call_args[0][1]
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_no_agent_id(self):
+        mgr, _, _, conn = _make_manager()
+        inst = Instance(kind="agent", id="x", metadata={})
+        await mgr.signal_drain_pending(inst)
+        assert conn.execute.call_count == 0
+
+
 class TestDrain:
     @pytest.mark.asyncio
     async def test_writes_intent_and_status_for_idle(self):
@@ -311,6 +339,7 @@ class _ScriptedManager:
         self._unhealthy_ids = unhealthy_ids or set()
         self.drain_calls: list[str] = []
         self.delete_calls: list[str] = []
+        self.signal_calls: list[str] = []
 
     async def expected_versions(self):
         return self._expected
@@ -323,6 +352,9 @@ class _ScriptedManager:
 
     async def is_idle(self, inst):
         return inst.id in self._idle_ids
+
+    async def signal_drain_pending(self, inst):
+        self.signal_calls.append(inst.id)
 
     async def drain(self, inst, grace_s):
         self.drain_calls.append(inst.id)
@@ -360,8 +392,58 @@ class TestReconcilerTick:
         reconciler = InstanceLifecycleReconciler(managers=[mgr])
         report = await reconciler.tick()
         assert mgr.drain_calls == []
+        # Phase 1e: busy drifted instances still get the soft signal
+        # so the in-pod handler can react at the next safe boundary.
+        assert mgr.signal_calls == ["busy"]
         assert report["agent"]["drift"] == 1
         assert report["agent"]["skipped_busy"] == 1
+
+    @pytest.mark.asyncio
+    async def test_signal_fires_on_idle_drift_too(self):
+        # Both signal AND drain on idle drift — drain calls
+        # signal_drain_pending implicitly via the agent manager's own
+        # implementation, but the reconciler also fires the explicit
+        # signal beforehand. Two writes in production; the second is a
+        # no-op due to JSONB merge idempotency.
+        mgr = _ScriptedManager(
+            expected={"new"},
+            instances=[Instance(kind="agent", id="x", version="old")],
+            idle_ids={"x"},
+        )
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        await reconciler.tick()
+        assert mgr.signal_calls == ["x"]
+        assert mgr.drain_calls == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_signal_does_not_fire_without_drift(self):
+        mgr = _ScriptedManager(
+            expected={"v1"},
+            instances=[Instance(kind="agent", id="ok", version="v1")],
+            idle_ids={"ok"},
+        )
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        await reconciler.tick()
+        assert mgr.signal_calls == []
+        assert mgr.drain_calls == []
+
+    @pytest.mark.asyncio
+    async def test_signal_exception_does_not_break_tick(self):
+        mgr = _ScriptedManager(
+            expected={"new"},
+            instances=[Instance(kind="agent", id="boom", version="old")],
+            idle_ids={"boom"},
+        )
+
+        async def explode(inst):
+            raise RuntimeError("intent write blew up")
+
+        mgr.signal_drain_pending = explode  # type: ignore[assignment]
+        reconciler = InstanceLifecycleReconciler(managers=[mgr])
+        report = await reconciler.tick()
+        # Tick continued past the failure; drain still attempted on idle.
+        assert mgr.drain_calls == ["boom"]
+        assert report["agent"]["drained"] == 1
 
     @pytest.mark.asyncio
     async def test_no_drift_when_version_matches(self):

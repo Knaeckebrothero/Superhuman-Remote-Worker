@@ -162,10 +162,26 @@ class InstanceLifecycleReconciler:
                 if not self.is_drift(inst, expected):
                     continue
                 stats["drift"] += 1
-                if drained >= cap or not self._budget.allow(kind):
-                    continue
+
+                # Soft signal: write the drain-pending hint on every
+                # drift, idle or busy. Cheap and idempotent. For agents
+                # this is the trigger that lets a busy worker react at
+                # its next phase boundary (Continue-as-New). For
+                # workspaces and VMs this is a no-op — they get drained
+                # the natural way once the bound work pauses.
+                try:
+                    await manager.signal_drain_pending(inst)
+                except Exception:
+                    logger.exception(
+                        "signal_drain_pending failed for kind=%s id=%s",
+                        kind,
+                        inst.id,
+                    )
+
                 if not await manager.is_idle(inst):
                     stats["skipped_busy"] += 1
+                    continue
+                if drained >= cap or not self._budget.allow(kind):
                     continue
                 try:
                     await manager.drain(inst, grace_s=0)

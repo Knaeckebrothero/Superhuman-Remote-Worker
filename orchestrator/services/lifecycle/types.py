@@ -90,12 +90,25 @@ class InstanceLifecycleManager(Protocol):
         """
         ...
 
-    async def drain(self, inst: Instance, grace_s: int) -> None:
-        """Initiate graceful shutdown.
+    async def signal_drain_pending(self, inst: Instance) -> None:
+        """Soft drain signal — fired on every drifted instance regardless
+        of idle/busy state.
 
-        For idle instances, this is typically immediate. For busy ones,
-        the implementation may set an intent flag and return; actuation
-        happens when the instance hits its next safe boundary.
+        Cheap, idempotent. For agents this writes ``intents.should_drain``
+        so the in-pod heartbeat callback (Phase 1c) can react at the
+        next safe phase boundary (version_upgrade Continue-as-New).
+        For kinds without an in-pod drain hook (workspaces, VMs) this
+        is a no-op — the reconciler picks them up on a future tick once
+        the bound work becomes idle, and ``drain`` actuates immediately.
+        """
+        ...
+
+    async def drain(self, inst: Instance, grace_s: int) -> None:
+        """Hard drain — actuates immediately on an idle instance.
+
+        Distinct from ``signal_drain_pending``: drain is the
+        delete/snapshot path, called only for instances the reconciler
+        has determined are safe to terminate now.
         """
         ...
 
