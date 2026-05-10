@@ -15,7 +15,7 @@ import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
@@ -385,8 +385,8 @@ const CATEGORY_LABELS: Record<string, string> = {
                       </summary>
                       <div class="tool-detail-list">
                         @for (tc of msg.toolCalls; track tc.id) {
-                          <details class="tool-detail-item" [class.has-decision]="!!tc.decision" [attr.open]="tc.status === 'denied' ? '' : null">
-                            <summary class="tool-detail-header">
+                          <details class="tool-card" [class.has-decision]="!!tc.decision" [attr.open]="tc.status === 'denied' ? '' : null">
+                            <summary class="tool-head">
                               <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
                               @if (tc.decision; as d) {
                                 <span class="approval-badge" [class]="'approval-' + d">
@@ -394,18 +394,32 @@ const CATEGORY_LABELS: Record<string, string> = {
                                   {{ ('chat.approval.badge.' + d) | transloco }}
                                 </span>
                               }
-                              <span class="tool-detail-name">{{ tc.tool }}</span>
-                              <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                              <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
+                              <span class="tool-name">{{ tc.tool }}</span>
+                              @if (formatToolArgs(tc.args); as a) {
+                                <span class="tool-args">({{ a }})</span>
+                              }
+                              <span class="tool-status" [class]="'status-' + tc.status">
+                                <app-icon size="sm" class="tool-status-icon">{{ statusIcon(tc.status) }}</app-icon>
+                                {{ translateStatus(tc.status) }}
+                              </span>
                             </summary>
                             @if (tc.result) {
-                              <div class="tool-preview">{{ previewResult(tc.result) }}</div>
-                              <pre class="tool-detail-result">{{ tc.result }}</pre>
+                              <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
                             }
                           </details>
                         }
                       </div>
                     </details>
+                    @for (tc of msg.toolCalls; track tc.id) {
+                      @if (tc.decision; as d) {
+                        <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                          <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                          <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                          <span class="resolved-title">{{ tc.tool }}</span>
+                          <time class="resolved-time">{{ formatTime(msg.timestamp) }}</time>
+                        </div>
+                      }
+                    }
                   }
                 }
               </div>
@@ -518,25 +532,40 @@ const CATEGORY_LABELS: Record<string, string> = {
                     </summary>
                     <div class="tool-detail-list">
                       @for (tc of completedOnly(chat.currentToolCalls()); track tc.id) {
-                        <details class="tool-detail-item" [class.has-decision]="!!tc.decision">
-                          <summary class="tool-detail-header">
+                        <details class="tool-card" [class.has-decision]="!!tc.decision">
+                          <summary class="tool-head">
+                            <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
                             @if (tc.decision; as d) {
                               <span class="approval-badge" [class]="'approval-' + d">
                                 <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
                                 {{ ('chat.approval.badge.' + d) | transloco }}
                               </span>
                             }
-                            <span class="tool-detail-name">{{ tc.tool }}</span>
-                            <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                            <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
+                            <span class="tool-name">{{ tc.tool }}</span>
+                            @if (formatToolArgs(tc.args); as a) {
+                              <span class="tool-args">({{ a }})</span>
+                            }
+                            <span class="tool-status" [class]="'status-' + tc.status">
+                              <app-icon size="sm" class="tool-status-icon">{{ statusIcon(tc.status) }}</app-icon>
+                              {{ translateStatus(tc.status) }}
+                            </span>
                           </summary>
                           @if (tc.result) {
-                            <pre class="tool-detail-result">{{ tc.result }}</pre>
+                            <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
                           }
                         </details>
                       }
                     </div>
                   </details>
+                }
+                @for (tc of chat.currentToolCalls(); track tc.id) {
+                  @if (tc.decision; as d) {
+                    <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                      <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                      <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                      <span class="resolved-title">{{ tc.tool }}</span>
+                    </div>
+                  }
                 }
               }
               @if (!chat.streamingText() && !chat.currentToolCalls().length && !chat.pendingPermission()) {
@@ -550,20 +579,20 @@ const CATEGORY_LABELS: Record<string, string> = {
           </div>
         }
 
-        <!-- Inline approval card — anchored to the live turn, not gated on
-             streaming state so it stays visible across edge cases. -->
+        <!-- Inline approval card (mile marker) — anchored to the live turn,
+             not gated on streaming state so it stays visible across edge cases. -->
         @if (chat.pendingPermission(); as perm) {
-          <div class="approval-card">
-            <div class="approval-card-head">
-              <app-icon size="sm" class="approval-card-icon">shield</app-icon>
-              <span class="approval-card-label">{{ 'chat.approval.pendingTitle' | transloco }}</span>
+          <div class="mile">
+            <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
+            <div class="mile-title">{{ permissionTitle(perm) }}</div>
+            <div class="mile-detail">
+              <app-icon size="sm" class="mile-detail-icon">{{ toolIcon(perm.tool) }}</app-icon>
+              <code class="mile-tool">{{ perm.tool }}</code>
+              @if (formatToolArgs(perm.args); as a) {
+                <code class="mile-args">({{ a }})</code>
+              }
             </div>
-            <div class="approval-card-tool">
-              <app-icon size="sm" class="tool-icon">{{ toolIcon(perm.tool) }}</app-icon>
-              <span class="approval-card-tool-name">{{ perm.tool }}</span>
-              <span class="approval-card-tool-args">{{ formatToolArgs(perm.args) }}</span>
-            </div>
-            <div class="approval-card-actions">
+            <div class="mile-actions">
               <app-button variant="success" size="sm" (clicked)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
               <app-button variant="danger" size="sm" (clicked)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</app-button>
@@ -649,8 +678,12 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       <!-- Input -->
       @if (chat.threadStatus() !== 'ended') {
-      <div class="input-area">
-        <div class="input-card" [class.focused]="inputFocused()">
+      <div class="composer-wrap">
+        <div
+          class="composer"
+          [class.focused]="inputFocused()"
+          [class.disabled]="!chat.isConnected()"
+        >
           <!-- Slash command autocomplete -->
           @if (showSlashMenu()) {
             <div class="slash-menu">
@@ -680,22 +713,47 @@ const CATEGORY_LABELS: Record<string, string> = {
             [disabled]="!chat.isConnected()"
             rows="1"
           ></textarea>
-          <button
-            class="action-btn"
-            [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
-            [class.interrupting]="chat.isInterrupting()"
-            [class.pending]="isPendingSend()"
-            (click)="chat.isStreaming() ? chat.interrupt() : send()"
-            [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
-          >
-            @if (isPendingSend() || chat.isInterrupting()) {
-              <span class="action-spinner"></span>
-            } @else if (chat.isStreaming()) {
-              <app-icon size="sm" class="action-icon">stop</app-icon>
-            } @else {
-              <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
-            }
-          </button>
+          <div class="composer-row">
+            <button
+              type="button"
+              class="ctrl"
+              [disabled]="!chat.isConnected()"
+              [title]="'chat.composer.attachComing' | transloco"
+              aria-disabled="true"
+            >
+              <app-icon size="sm" class="ctrl-icon">attach_file</app-icon>
+              <span class="ctrl-label">{{ 'chat.composer.attach' | transloco }}</span>
+            </button>
+            <button
+              type="button"
+              class="ctrl"
+              [disabled]="!chat.isConnected()"
+              [title]="'chat.composer.mentionComing' | transloco"
+              aria-disabled="true"
+            >
+              <app-icon size="sm" class="ctrl-icon">alternate_email</app-icon>
+              <span class="ctrl-label">{{ 'chat.composer.mention' | transloco }}</span>
+            </button>
+            <span class="spacer"></span>
+            <button
+              type="button"
+              class="send"
+              [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
+              [class.interrupting]="chat.isInterrupting()"
+              [class.pending]="isPendingSend()"
+              [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+              (click)="chat.isStreaming() ? chat.interrupt() : send()"
+              [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
+            >
+              @if (isPendingSend() || chat.isInterrupting()) {
+                <span class="action-spinner"></span>
+              } @else if (chat.isStreaming()) {
+                <app-icon size="sm" class="action-icon">stop</app-icon>
+              } @else {
+                <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
+              }
+            </button>
+          </div>
         </div>
       </div>
       }
@@ -744,7 +802,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .back-link:hover { color: var(--text-primary, var(--text-primary)); }
 
-      .header-icon, .approval-card-icon, .error-icon {
+      .header-icon, .error-icon {
         color: var(--accent-color, var(--accent-color));
       }
 
@@ -1310,40 +1368,57 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-summary-dot.denied { background: var(--danger); }
       .tool-summary-dot.mixed { background: var(--warning); }
 
-      /* Tool detail list (level 2) */
+      /* Tool detail list (level 2) — F6 card visual */
 
       .tool-detail-list {
-        padding: 4px 0 4px 20px;
+        padding: 6px 0 4px 20px;
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 6px;
       }
 
-      .tool-detail-item { font-size: 11px; }
+      .tool-card {
+        font-size: 11px;
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 0;
+        background: var(--surface-0);
+        overflow: hidden;
+      }
 
-      .tool-detail-header {
+      .tool-head {
         display: flex;
         align-items: center;
-        gap: 6px;
-        padding: 3px 8px;
+        gap: 8px;
+        padding: 6px 10px;
         cursor: pointer;
-        border-radius: 4px;
-        color: var(--text-muted, var(--text-muted));
         list-style: none;
+        background: var(--panel-bg, var(--panel-bg));
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        color: var(--text-muted, var(--text-muted));
       }
 
-      .tool-detail-header::-webkit-details-marker { display: none; }
-      .tool-detail-header:hover { background: rgba(255, 255, 255, 0.03); }
+      .tool-card[open] > .tool-head {
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+      }
 
-      .tool-detail-name {
-        font-family: 'JetBrains Mono', monospace;
+      .tool-head::-webkit-details-marker { display: none; }
+      .tool-head:hover { background: var(--surface-1, rgba(255, 255, 255, 0.04)); }
+
+      .tool-icon {
         color: var(--accent-color, var(--accent-color));
-        font-weight: 500;
+        width: 16px;
+        text-align: center;
+        flex-shrink: 0;
       }
 
-      .tool-detail-args {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 10px;
+      .tool-name {
+        color: var(--accent-color, var(--accent-color));
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .tool-args {
         color: var(--text-muted, var(--text-muted));
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1352,43 +1427,42 @@ const CATEGORY_LABELS: Record<string, string> = {
         min-width: 0;
       }
 
-      .tool-detail-status {
-        font-size: 10px;
+      .tool-status {
         margin-left: auto;
-      }
-
-      .tool-detail-status.status-completed { color: var(--success); }
-      .tool-detail-status.status-running { color: var(--warning); }
-      .tool-detail-status.status-denied { color: var(--danger); }
-      .tool-detail-status.status-pending { color: var(--text-muted, var(--text-muted)); }
-
-      .tool-icon {
-        color: var(--text-muted, var(--text-muted));
-        width: 16px;
-        text-align: center;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 9.5px;
+        font-weight: 600;
         flex-shrink: 0;
       }
 
-      .tool-preview {
-        padding: 2px 8px 2px 28px;
-        font-size: 10px;
-        color: var(--text-muted, var(--text-muted));
-        opacity: 0.6;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-family: 'JetBrains Mono', monospace;
+      .tool-status .tool-status-icon { font-size: 13px; }
+
+      .tool-status.status-completed,
+      .tool-status.status-completed .tool-status-icon { color: var(--success); }
+      .tool-status.status-running,
+      .tool-status.status-running .tool-status-icon { color: var(--warning); }
+      .tool-status.status-running .tool-status-icon { animation: spin 0.7s linear infinite; }
+      .tool-status.status-denied,
+      .tool-status.status-denied .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
+      .tool-status.status-pending,
+      .tool-status.status-pending .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
+
+      .tool-body {
+        padding: 10px 12px;
+        background: var(--surface-0);
       }
 
-      .tool-detail-item[open] > .tool-preview { display: none; }
-
-      .tool-detail-result {
-        margin: 4px 0 4px 8px;
-        padding: 8px 10px;
-        background: var(--panel-bg, var(--panel-bg));
-        border-radius: 6px;
+      .tool-result {
+        margin: 0;
+        padding: 0;
+        background: transparent;
         font-size: 11px;
-        max-height: 200px;
+        max-height: 240px;
         overflow: auto;
         white-space: pre-wrap;
         word-break: break-word;
@@ -1522,66 +1596,124 @@ const CATEGORY_LABELS: Record<string, string> = {
         40% { transform: translateY(-6px); }
       }
 
-      /* Approval — pending card and resolved badges.
-         Pending: warning-toned card anchored to the live turn.
-         Resolved: small inline badge prefixed onto the tool-detail row. */
+      /* Approval — pending mile marker and resolved trail strips.
+         Pending: sharp-cornered card with accent-color left border.
+         Resolved: single-line trail strip in the message stream
+         (in addition to the small badge inside the tool-card head). */
 
-      .approval-card {
-        margin: 8px auto;
-        width: 80%;
-        border: 1px solid var(--warning);
-        border-radius: 8px;
-        padding: 12px;
-        background: var(--warning-tint);
+      .mile {
+        align-self: flex-start;
+        margin: 10px 0 10px 40px;
+        width: min(720px, calc(100% - 40px));
+        padding: 14px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color);
+        border-radius: 0;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 6px;
       }
 
-      .approval-card-head {
+      .mile-label {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.20em;
+        font-weight: 600;
+        font-size: 10px;
+        color: var(--accent-color);
+      }
+
+      .mile-title {
+        font-weight: 600;
+        font-size: 14px;
+        color: var(--text-primary);
+      }
+
+      .mile-detail {
         display: flex;
         align-items: center;
         gap: 6px;
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--warning);
-      }
-
-      .approval-card-head .approval-card-icon { color: var(--warning); }
-
-      .approval-card-tool {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 10px;
-        background: var(--surface-0);
-        border-radius: 6px;
+        font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
+        color: var(--text-muted);
+        margin-bottom: 6px;
         min-width: 0;
       }
 
-      .approval-card-tool .tool-icon { color: var(--text-muted); flex-shrink: 0; }
+      .mile-detail-icon { color: var(--text-muted); flex-shrink: 0; }
 
-      .approval-card-tool-name {
-        font-family: var(--font-mono);
+      .mile-tool {
+        background: transparent;
+        color: var(--accent-color);
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .mile-args {
+        background: transparent;
+        color: var(--text-muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+      }
+
+      .mile-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .mile-resolved {
+        align-self: flex-start;
+        margin: 6px 0 6px 40px;
+        width: min(720px, calc(100% - 40px));
+        padding: 8px 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--text-muted);
+        border-radius: 0;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .mile-resolved.approved { border-left-color: var(--success); }
+      .mile-resolved.rejected { border-left-color: var(--text-muted); opacity: 0.85; }
+
+      .mile-resolved-icon { font-size: 16px; flex-shrink: 0; color: var(--text-muted); }
+      .mile-resolved.approved .mile-resolved-icon { color: var(--success); }
+      .mile-resolved.rejected .mile-resolved-icon { color: var(--text-muted); }
+
+      .mile-resolved .resolved-label {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 10px;
         font-weight: 600;
         color: var(--text-primary);
         flex-shrink: 0;
       }
 
-      .approval-card-tool-args {
-        font-family: var(--font-mono);
-        font-size: 11px;
-        color: var(--text-muted);
-        white-space: nowrap;
+      .mile-resolved.approved .resolved-label { color: var(--success); }
+
+      .mile-resolved .resolved-title {
+        color: var(--text-primary);
         overflow: hidden;
         text-overflow: ellipsis;
+        white-space: nowrap;
         min-width: 0;
+        flex: 1;
       }
 
-      .approval-card-actions {
-        display: flex;
-        gap: 8px;
+      .mile-resolved .resolved-time {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--text-muted);
+        flex-shrink: 0;
       }
 
       .approval-badge {
@@ -1801,44 +1933,48 @@ const CATEGORY_LABELS: Record<string, string> = {
         }
       }
 
-      /* Input area */
+      /* Composer */
 
-      .input-area {
-        padding: 12px 16px 16px;
-        background: var(--panel-bg, var(--panel-bg));
+      .composer-wrap {
+        padding: 14px 36px 18px;
+        background: transparent;
         flex-shrink: 0;
       }
 
-      .input-card {
+      .composer {
         position: relative;
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-        padding: 8px 8px 8px 16px;
-        border-radius: 20px;
+        max-width: 880px;
+        margin: 0 auto;
+        background: var(--panel-bg, var(--panel-bg));
         border: 1px solid var(--border-color, var(--surface-0));
-        background: var(--surface-0, var(--surface-0));
-        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        border-radius: 0;
+        transition: outline-color 0.15s ease, border-color 0.15s ease;
       }
 
-      .input-card.focused {
+      .composer.focused {
+        outline: 2px solid var(--accent-color, var(--accent-color));
+        outline-offset: 1px;
         border-color: var(--accent-color, var(--accent-color));
-        box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 20%, transparent);
+      }
+
+      .composer.disabled {
+        opacity: 0.6;
       }
 
       .chat-input {
-        flex: 1;
-        padding: 6px 0;
-        border: none;
-        background: transparent;
-        color: var(--text-primary, var(--text-primary));
-        font-size: 14px;
-        font-family: inherit;
-        resize: none;
-        min-height: 24px;
+        width: 100%;
+        min-height: 56px;
         max-height: 180px;
-        line-height: 1.5;
-        overflow-y: auto;
+        padding: 12px 14px;
+        background: transparent;
+        border: 0;
+        outline: 0;
+        color: var(--text-primary, var(--text-primary));
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.55;
+        resize: none;
+        display: block;
       }
 
       .chat-input:focus,
@@ -1849,7 +1985,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .chat-input:disabled {
-        opacity: 0.5;
         cursor: not-allowed;
       }
 
@@ -1857,47 +1992,94 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-muted, var(--text-muted));
       }
 
-      /* Action button — send / stop / spinner in one spot */
-
-      .action-btn {
+      .composer-row {
         display: flex;
         align-items: center;
-        justify-content: center;
-        width: 36px;
-        height: 36px;
-        border-radius: 50%;
-        border: none;
+        gap: 6px;
+        padding: 6px 8px 8px;
+        border-top: 1px solid var(--border-color, var(--surface-0));
+        background: var(--surface-0, var(--surface-0));
+      }
+
+      .composer-row .spacer {
+        flex: 1;
+      }
+
+      .ctrl {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 26px;
+        padding: 0 10px;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 0;
+        color: var(--text-muted, var(--text-muted));
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      }
+
+      .ctrl:hover:not(:disabled) {
+        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .ctrl:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      .ctrl-icon {
+        font-size: 14px;
+      }
+
+      /* Send button — round, morphs to stop/spinner during streaming */
+
+      .send {
+        width: 30px;
+        height: 30px;
+        display: grid;
+        place-items: center;
         background: var(--accent-color, var(--accent-color));
         color: var(--timeline-bg, var(--timeline-bg));
+        border: 0;
+        border-radius: 50%;
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.15s ease, opacity 0.15s ease;
       }
 
-      .action-btn:disabled {
-        opacity: 0.3;
+      .send:disabled {
+        background: var(--surface-1, var(--surface-0));
+        color: var(--text-muted, var(--text-muted));
         cursor: not-allowed;
       }
 
-      .action-btn.stop {
+      .send:not(:disabled):hover {
+        background: var(--accent-hover, var(--accent-color));
+      }
+
+      .send.stop {
         background: var(--danger);
         opacity: 1;
       }
 
-      .action-btn.pending,
-      .action-btn.interrupting {
+      .send.pending,
+      .send.interrupting {
         opacity: 0.7;
         cursor: wait;
       }
 
-      .action-btn.interrupting {
+      .send.interrupting {
         background: var(--danger);
       }
 
-
       .action-spinner {
-        width: 16px;
-        height: 16px;
+        width: 14px;
+        height: 14px;
         border: 2px solid var(--timeline-bg, var(--timeline-bg));
         border-top-color: transparent;
         border-radius: 50%;
@@ -2158,17 +2340,21 @@ const CATEGORY_LABELS: Record<string, string> = {
           max-width: 98%;
         }
 
-        .approval-card {
-          width: 95%;
-        }
-
         .chat-input {
           font-size: 16px;
         }
 
-        .input-area {
-          padding: 8px;
-          padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+        .composer-wrap {
+          padding: 10px 12px 14px;
+          padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+        }
+
+        .composer-row {
+          padding: 4px 6px 6px;
+        }
+
+        .ctrl-label {
+          display: none;
         }
       }
     `,
@@ -2747,6 +2933,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         return this.fallbackToolLabel(tc.tool);
     }
 
+    permissionTitle(perm: PermissionRequest): string {
+        return this.toolLabel({...perm, status: 'pending'} as ToolCallInfo);
+    }
+
+    formatTime(d: Date | string | number): string {
+        const date = d instanceof Date ? d : new Date(d);
+        return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    }
+
     private toolLabelContext(tool: string, args: Record<string, unknown>): string {
         if (!args) return '';
         const t = tool.toLowerCase();
@@ -2843,6 +3038,16 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         const key = `chat.tools.status${status.charAt(0).toUpperCase()}${status.slice(1)}`;
         const translated = this.transloco.translate(key);
         return translated !== key ? translated : status;
+    }
+
+    statusIcon(status: string): string {
+        switch (status) {
+            case 'completed': return 'check_circle';
+            case 'running': return 'progress_activity';
+            case 'denied': return 'block';
+            case 'pending': return 'radio_button_unchecked';
+            default: return 'help';
+        }
     }
 
     toolSummaryLabel(calls: ToolCallInfo[]): string {
