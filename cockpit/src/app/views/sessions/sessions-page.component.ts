@@ -163,7 +163,7 @@ interface Project {
 
           @for (thread of filteredThreads(); track thread.id) {
             <div class="session-card" [class.ended]="thread.status === 'ended'">
-              <div class="session-main" (click)="resumeSession(thread)">
+              <div class="session-main" (click)="openSession(thread)">
                 <div class="session-info">
                   <span class="session-status-dot" [class]="thread.status"></span>
                   <span class="session-title">{{ thread.title || ('sessions.untitledSession' | transloco) }}</span>
@@ -567,6 +567,16 @@ export class SessionsPageComponent implements OnInit {
         // Navigate immediately to chat view with spinner, create thread in background
         this.router.navigate(['/sessions', '_creating'], {state: {createBody: body}});
         this.creating.set(false);
+    }
+
+    /**
+     * Open a session in the chat view without resuming. For ended threads this
+     * gives a read-only history view + the in-chat resume card; for active
+     * threads it just navigates. No POST to /resume — the user opts in to
+     * spinning the agent back up via the resume card or the dedicated icon.
+     */
+    openSession(thread: Thread): void {
+        this.router.navigate(['/sessions', thread.id]);
     }
 
     async resumeSession(thread: Thread): Promise<void> {

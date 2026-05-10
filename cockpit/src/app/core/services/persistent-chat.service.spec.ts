@@ -960,6 +960,50 @@ describe('PersistentChatService', () => {
 
             expect(service.error()).toBeNull();
         });
+
+        it('should re-fetch thread meta after WS close to catch server-side ended flip', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                // Track a meta GET separately from history GET.
+                mockHttp.get.mockImplementation((url: string) => {
+                    if (url.endsWith('/test-thread-123')) {
+                        return of({status: 'ended', ended_at: '2026-05-10T10:00:00Z'});
+                    }
+                    return of({messages: [], total: 0});
+                });
+
+                if (ws.onclose) ws.onclose({code: 1006, reason: 'abnormal'});
+                // Pre-delay: still on whatever status the initial meta load set.
+                expect(service.threadStatus()).not.toBe('ended');
+
+                await vi.advanceTimersByTimeAsync(1500);
+
+                expect(service.threadStatus()).toBe('ended');
+                expect(service.endedAt()).toBe('2026-05-10T10:00:00Z');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('should not re-fetch if the thread changed before the delay elapsed', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                if (ws.onclose) ws.onclose({code: 1006, reason: 'abnormal'});
+                // Simulate navigation away (different thread) before timer fires.
+                service.threadId.set('different-thread');
+                mockHttp.get.mockClear();
+                await vi.advanceTimersByTimeAsync(1500);
+
+                const metaCalls = mockHttp.get.mock.calls.filter(
+                    (c: any[]) => c[0]?.endsWith('/test-thread-123'),
+                );
+                expect(metaCalls.length).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
     });
 
     // =========================================================================
