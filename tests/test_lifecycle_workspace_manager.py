@@ -340,6 +340,20 @@ class TestRestore:
 # =============================================================================
 
 
+class TestSignalDrainPending:
+    @pytest.mark.asyncio
+    async def test_is_noop(self):
+        # Workspaces have no in-pod drain hook. The soft signal is a
+        # no-op; drift drain happens once the bound work goes idle.
+        mgr, container, suspension, snapshot, db = _make_manager()
+        inst = Instance(kind="workspace", id="x", bound_to="job1", metadata={})
+        await mgr.signal_drain_pending(inst)
+        container.delete_workspace.assert_not_called()
+        suspension.restore_workspace.assert_not_called()
+        snapshot.capture_vm_snapshot.assert_not_called()
+        db.acquire.assert_not_called()
+
+
 class TestDrain:
     @pytest.mark.asyncio
     async def test_job_drain_calls_delete_workspace(self):

@@ -192,6 +192,13 @@ class WorkspaceInstanceManager:
         else:
             await self._suspension.restore_workspace(snapshot_ref)
 
+    async def signal_drain_pending(self, inst: Instance) -> None:
+        """No-op: workspaces have no in-pod drain hook to react to a
+        soft signal. The reconciler picks them up on a future tick
+        when the bound job/thread becomes idle (paused/ended), and
+        ``drain`` actuates immediately at that point."""
+        return None
+
     async def drain(self, inst: Instance, grace_s: int) -> None:
         """Delete the pod (snapshot has already run when reached via tick).
 

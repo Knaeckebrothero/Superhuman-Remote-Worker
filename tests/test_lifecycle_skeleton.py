@@ -80,6 +80,9 @@ class _FakeStateless:
     async def is_idle(self, inst):
         return True
 
+    async def signal_drain_pending(self, inst):
+        return None
+
     async def drain(self, inst, grace_s):
         return None
 

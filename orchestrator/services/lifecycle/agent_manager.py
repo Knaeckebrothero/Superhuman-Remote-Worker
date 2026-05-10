@@ -143,17 +143,46 @@ class AgentInstanceManager:
             and inst.metadata.get("thread_id") is None
         )
 
+    async def signal_drain_pending(self, inst: Instance) -> None:
+        """Write ``intents.should_drain=true`` without changing status.
+
+        Fired on every drift detection (idle and busy). The Phase 1c
+        in-pod heartbeat callback reads this on the next 5s tick and
+        either self-exits (idle worker, persistent session) or sets a
+        flag the graph picks up at the next phase boundary
+        (version_upgrade Continue-as-New for busy worker).
+
+        Idempotent and cheap — JSONB merge produces the same result on
+        repeat ticks. Logged at debug to avoid spam every 60s while
+        a stale agent waits for its phase boundary.
+        """
+        agent_id = inst.metadata.get("agent_id")
+        if not agent_id:
+            return
+        intent_payload = json.dumps(
+            {"should_drain": True, "drain_reason": "stale_image"}
+        )
+        async with self._db.acquire() as conn:
+            await conn.execute(
+                "UPDATE agents SET intents = intents || $1::jsonb WHERE id = $2",
+                intent_payload,
+                agent_id,
+            )
+        logger.debug(
+            "Drain intent set for agent %s (build_sha=%s)",
+            agent_id,
+            inst.version,
+        )
+
     async def drain(self, inst: Instance, grace_s: int) -> None:
-        """Mark an agent for drain.
+        """Hard drain for an idle stale-SHA agent.
 
-        Writes both ``intents.should_drain=true`` (Phase 1c will wire
-        this to the in-pod watchdog so the agent self-exits) and
-        ``status='draining'`` (Phase 0 stopgap path — keeps the existing
-        ``reap_pods`` ``drained`` category effective for idle agents
-        until 1c lands).
-
-        Idempotent: re-drains are no-ops at the DB level (CASE on
-        existing draining status preserves it; jsonb merge is set-like).
+        Sets the intent (idempotent with ``signal_drain_pending``) and
+        flips ``status`` to ``draining`` only when currently ``ready``,
+        so the existing ``reap_pods`` ``drained`` category force-deletes
+        the pod on the next agent_pool_reconciler pass. CASE preserves
+        the status for agents that aren't actually idle in the DB
+        (defense in depth — the reconciler already gates on is_idle).
         """
         agent_id = inst.metadata.get("agent_id")
         if not agent_id:
@@ -174,7 +203,7 @@ class AgentInstanceManager:
                 agent_id,
             )
         logger.info(
-            "Marked agent %s draining (build_sha=%s, expected mismatch)",
+            "Drained agent %s (build_sha=%s, expected mismatch)",
             agent_id,
             inst.version,
         )

@@ -159,6 +159,12 @@ class VMInstanceManager:
         else:
             await self._suspension.restore_workspace(snapshot_ref)
 
+    async def signal_drain_pending(self, inst: Instance) -> None:
+        """No-op: VMs have no in-pod drain hook (the management daemon
+        listens on NATS but doesn't read intents from the orchestrator).
+        Drift drain happens once the bound work becomes idle."""
+        return None
+
     async def drain(self, inst: Instance, grace_s: int) -> None:
         await self.delete(inst, grace_s)
 
