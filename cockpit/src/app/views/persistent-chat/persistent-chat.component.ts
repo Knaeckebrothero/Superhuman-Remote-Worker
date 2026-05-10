@@ -437,7 +437,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                     </div>
                   }
                 </div>
-              } @else {
+              } @else if (chat.threadStatus() !== 'ended') {
                 <div class="startup-wrapper">
                   <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
                 </div>
@@ -446,8 +446,10 @@ const CATEGORY_LABELS: Record<string, string> = {
           }
         }
 
-        <!-- Startup/resume card: shown when history exists but session not yet ready -->
-        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming()) {
+        <!-- Startup/resume card: shown when history exists but session not yet ready.
+             Suppressed for ended threads — the F3 resume card below is the call-to-action
+             there, and there's no actual provisioning in flight until the user opts in. -->
+        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
           <div class="startup-wrapper resume">
             <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
