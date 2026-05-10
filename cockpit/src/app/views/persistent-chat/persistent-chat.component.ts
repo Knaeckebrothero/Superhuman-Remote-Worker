@@ -2211,8 +2211,12 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
             const tid = this.chat.threadId();
             const order = this.STARTUP_PHASE_ORDER as readonly string[];
 
-            // Reset on a new thread, or when sessionReady drops back to false.
-            if (tid !== this.prevThreadIdForTiming || (this.prevReadyForTiming && !ready)) {
+            // Reset when switching to a different thread, or when sessionReady
+            // drops back to false. The null → realId transition during new-thread
+            // creation must NOT reset — that would wipe the 'creating' phase
+            // timing recorded while threadId was still null.
+            const threadChanged = this.prevThreadIdForTiming != null && tid !== this.prevThreadIdForTiming;
+            if (threadChanged || (this.prevReadyForTiming && !ready)) {
                 this.phaseStarts = {};
                 this.phaseDurations = {};
                 this.prevActivePhase = null;
