@@ -8,24 +8,24 @@ list_pods startup reconciliation, finalizer-based cleanup) lands in
 Phase 1b.
 """
 
-from orchestrator.services.lifecycle.agent_manager import (
+from .agent_manager import (
     AgentInstanceManager,
     expected_agent_shas,
 )
-from orchestrator.services.lifecycle.reconciler import (
+from .reconciler import (
     DisruptionBudget,
     InstanceLifecycleReconciler,
 )
-from orchestrator.services.lifecycle.types import (
+from .types import (
     Instance,
     InstanceLifecycleManager,
     StatefulInstanceManager,
 )
-from orchestrator.services.lifecycle.vm_manager import (
+from .vm_manager import (
     VMInstanceManager,
     expected_vm_shas,
 )
-from orchestrator.services.lifecycle.workspace_manager import (
+from .workspace_manager import (
     WorkspaceInstanceManager,
     expected_workspace_shas,
 )
