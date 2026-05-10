@@ -783,6 +783,14 @@
       "reconnecting": "Disconnected — reconnecting…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)"
     },
+    "composer": {
+      "attach": "Attach",
+      "attachComing": "Attachments coming soon",
+      "mention": "Mention",
+      "mentionComing": "Mentions coming soon",
+      "send": "Send",
+      "stop": "Stop"
+    },
     "code": {
       "expandHint": "Click to expand",
       "copyTooltip": "Copy to clipboard"
