@@ -783,6 +783,14 @@
       "reconnecting": "Getrennt — verbinde erneut…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
     },
+    "composer": {
+      "attach": "Anhängen",
+      "attachComing": "Anhänge folgen in Kürze",
+      "mention": "Erwähnen",
+      "mentionComing": "Erwähnungen folgen in Kürze",
+      "send": "Senden",
+      "stop": "Stoppen"
+    },
     "code": {
       "expandHint": "Klicken zum Ausklappen",
       "copyTooltip": "In die Zwischenablage kopieren"
