@@ -9532,7 +9532,7 @@ async def agent_save_message(
 
 
 @app.post("/api/agents/{agent_id}/heartbeat")
-async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str, str]:
+async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str, Any]:
     """Update agent heartbeat and status.
 
     Agents call this every 60 seconds to report their status.
