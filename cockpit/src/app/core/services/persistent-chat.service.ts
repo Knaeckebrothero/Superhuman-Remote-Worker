@@ -4,6 +4,12 @@ import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import {ThreadStatus} from '../models/api.model';
 
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+const RECONNECT_CAP_MS = 30000;
+const RECONNECT_JITTER = 0.1;
+const RECONNECT_MAX_ATTEMPTS = 12;
+const RECONNECT_TERMINAL_CODES = new Set([1000, 4404, 4408, 4503]);
+
 /** A chat message in the persistent session. */
 export interface ChatMessage {
     role: 'user' | 'assistant' | 'system';
@@ -71,6 +77,11 @@ export class PersistentChatService {
     readonly isConnected = computed(() => this.connectionState() === 'connected');
     readonly threadId = signal<string | null>(null);
 
+    // --- Reconnect engine ---
+    readonly reconnectAttempt = signal<number>(0);
+    readonly reconnectGaveUp = signal<boolean>(false);
+    readonly reconnectMaxAttempts = RECONNECT_MAX_ATTEMPTS;
+
     // --- Chat state ---
     readonly messages = signal<ChatMessage[]>([]);
     readonly streamingText = signal('');
@@ -129,6 +140,8 @@ export class PersistentChatService {
 
     private ws: WebSocket | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private intentionalClose = false;
+    private lastConnectUrl: string | null = null;
 
     /**
      * Connect to a persistent agent session.
@@ -258,11 +271,15 @@ export class PersistentChatService {
 
     /** Open the WebSocket connection. */
     private _connectWs(url: string): void {
+        this.intentionalClose = false;
+        this.lastConnectUrl = url;
         this.ws = new WebSocket(url);
 
         this.ws.onopen = () => {
             this.connectionState.set('connected');
             this.error.set(null);
+            this.reconnectAttempt.set(0);
+            this.reconnectGaveUp.set(false);
         };
 
         this.ws.onmessage = (event) => {
@@ -278,35 +295,121 @@ export class PersistentChatService {
             this.connectionState.set('disconnected');
             this.isStreaming.set(false);
             this.isWaitingForInput.set(false);
-            if (event.code !== 1000 && event.code !== 4408) {
+
+            if (this.intentionalClose) return;
+
+            const willReconnect = this.shouldReconnect(event.code);
+
+            // Don't surface a generic error string when the reconnect banner
+            // is about to take over — it's the better signal for the user.
+            if (!willReconnect && event.code !== 1000 && event.code !== 4408) {
                 this.error.set(`Connection closed: ${event.reason || `code ${event.code}`}`);
             }
+
             // The agent's _detach_session() writes the row to 'ended' AFTER the
             // WS dies (idle timeout, agent crash, network drop). Re-fetch meta
             // so the UI picks up the flip and renders the resume card without
             // requiring a manual reload.
             const threadIdAtClose = this.threadId();
             if (threadIdAtClose) {
-                setTimeout(() => {
+                setTimeout(async () => {
                     if (this.threadId() !== threadIdAtClose) return;
                     if (this.connectionState() === 'connected') return;
-                    this.loadThreadMeta(threadIdAtClose);
+                    await this.loadThreadMeta(threadIdAtClose);
+                    if (this.threadStatus() === 'ended') {
+                        this._cancelReconnect();
+                    }
                 }, 1500);
+            }
+
+            if (willReconnect) {
+                this._scheduleReconnect();
             }
         };
 
         this.ws.onerror = () => {
+            // Mid-reconnect, the close handler drives the loop — don't surface
+            // a redundant error state that would mask the reconnect banner.
+            if (this.reconnectAttempt() > 0) return;
             this.connectionState.set('error');
             this.error.set('WebSocket connection failed');
         };
     }
 
-    /** Disconnect from the session. */
-    disconnect(): void {
+    private shouldReconnect(code: number): boolean {
+        if (RECONNECT_TERMINAL_CODES.has(code)) return false;
+        if (this.threadStatus() === 'ended') return false;
+        return true;
+    }
+
+    private _scheduleReconnect(): void {
+        if (this.intentionalClose) return;
+        if (this.threadStatus() === 'ended') return;
+
+        if (this.reconnectAttempt() >= RECONNECT_MAX_ATTEMPTS) {
+            this.reconnectGaveUp.set(true);
+            return;
+        }
+
+        const idx = this.reconnectAttempt();
+        const baseDelay = RECONNECT_DELAYS_MS[idx] ?? RECONNECT_CAP_MS;
+        const jitter = baseDelay * RECONNECT_JITTER * (Math.random() * 2 - 1);
+        const delay = Math.max(0, Math.round(baseDelay + jitter));
+
+        this.reconnectAttempt.set(idx + 1);
+
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.intentionalClose) return;
+            if (this.threadStatus() === 'ended') return;
+            const url = this.lastConnectUrl;
+            if (!url) return;
+            this.connectionState.set('connecting');
+            this._connectWs(url);
+        }, delay);
+    }
+
+    private _cancelReconnect(): void {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.reconnectAttempt.set(0);
+        this.reconnectGaveUp.set(false);
+    }
+
+    /** Cancel the current backoff wait and immediately fire a reconnect attempt.
+     *  From the gave-up state, also resets the attempt counter. */
+    reconnectNow(): void {
+        if (this.intentionalClose) return;
+        if (!this.lastConnectUrl) return;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.reconnectGaveUp()) {
+            this.reconnectAttempt.set(0);
+            this.reconnectGaveUp.set(false);
+        }
+
+        this.reconnectAttempt.set(this.reconnectAttempt() + 1);
+        this.connectionState.set('connecting');
+        this._connectWs(this.lastConnectUrl);
+    }
+
+    /** Disconnect from the session. */
+    disconnect(): void {
+        this.intentionalClose = true;
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.reconnectAttempt.set(0);
+        this.reconnectGaveUp.set(false);
+        this.lastConnectUrl = null;
         if (this.ws) {
             this.ws.onclose = null; // Prevent error handling on intentional close
             this.ws.close(1000);

@@ -337,7 +337,8 @@ const CATEGORY_LABELS: Record<string, string> = {
         @for (msg of chat.messages(); track $index) {
           <div class="message" [class]="'message-' + msg.role"
                [class.historical]="msg.historical"
-               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length">
+               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length"
+               [class.dimmed]="isShowingReconnectBanner() && $index === chat.messages().length - 1">
             @if (msg.role === 'system') {
               <div class="system-message">
                 <app-icon size="sm" class="system-icon">info</app-icon>
@@ -601,15 +602,39 @@ const CATEGORY_LABELS: Record<string, string> = {
             </div>
           </div>
         }
+
+        <!-- Reconnect banner: WS dropped on a still-active thread.
+             Mutually exclusive with the F3 resume card (threadStatus !== 'ended')
+             and the F2 startup card (sessionReady === true). -->
+        @if (isShowingReconnectBanner()) {
+          <div class="reconnect-banner">
+            <app-icon size="sm" class="rb-icon">cloud_off</app-icon>
+            <div class="rb-body">
+              <strong>{{ 'chat.disconnected.title' | transloco }}</strong>
+              @if (chat.reconnectGaveUp()) {
+                <span>{{ 'chat.disconnected.gaveUp' | transloco }}</span>
+              } @else if (chat.reconnectAttempt() > 0) {
+                <span>{{ 'chat.disconnected.retrying' | transloco:{ attempt: chat.reconnectAttempt(), max: chat.reconnectMaxAttempts } }}</span>
+              } @else {
+                <span>{{ 'chat.disconnected.dropped' | transloco }}</span>
+              }
+            </div>
+            <app-button variant="secondary" size="sm" (clicked)="chat.reconnectNow()">
+              {{ (chat.reconnectGaveUp() ? 'chat.disconnected.reconnect' : 'chat.disconnected.retryNow') | transloco }}
+            </app-button>
+          </div>
+        }
       </div>
 
       <!-- Error banner -->
       @if (chat.error(); as err) {
-        <div class="error-banner">
-          <app-icon size="sm" class="error-icon">error</app-icon>
-          {{ err }}
-          <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
-        </div>
+        @if (!isShowingReconnectBanner()) {
+          <div class="error-banner">
+            <app-icon size="sm" class="error-icon">error</app-icon>
+            {{ err }}
+            <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
+          </div>
+        }
       }
 
       <!-- Input -->
@@ -1598,6 +1623,53 @@ const CATEGORY_LABELS: Record<string, string> = {
         text-decoration: underline;
       }
 
+      /* Reconnect banner (F4) — shown inline at the bottom of the message
+         stream when the WS dropped on a still-active thread. */
+
+      .reconnect-banner {
+        margin: 14px 0 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 14px;
+        background: var(--danger-tint);
+        border: 1px solid var(--danger);
+        border-left: 3px solid var(--danger);
+      }
+
+      .reconnect-banner .rb-icon {
+        color: var(--danger);
+        animation: pulseSoft 1.4s ease-in-out infinite;
+      }
+
+      .reconnect-banner .rb-body {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+        flex: 1;
+      }
+
+      .reconnect-banner .rb-body strong {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 11px;
+        color: var(--danger);
+      }
+
+      .reconnect-banner .rb-body span {
+        font-family: var(--font-mono, inherit);
+        font-size: 11.5px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .message.dimmed {
+        opacity: 0.5;
+        filter: saturate(0.6);
+      }
+
       /* Ended-session end-marker + resume card */
 
       .end-marker {
@@ -2291,9 +2363,17 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         return this.transloco.translate(key);
     });
 
+    readonly isShowingReconnectBanner = computed(() =>
+        this.chat.connectionState() === 'disconnected'
+        && this.chat.threadStatus() === 'active'
+        && this.chat.sessionReady()
+        && this.chat.messages().length > 0,
+    );
+
     readonly inputPlaceholder = computed(() => {
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
+        if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isConnected() && !this.chat.sessionReady()) return this.transloco.translate('chat.input.sessionStarting');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
