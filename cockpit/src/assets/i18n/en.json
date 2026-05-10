@@ -680,6 +680,14 @@
       "error": "Error",
       "disconnected": "Disconnected"
     },
+    "disconnected": {
+      "title": "Lost contact",
+      "dropped": "Connection dropped. Reconnecting…",
+      "retrying": "Retrying… (attempt {{attempt}} of {{max}})",
+      "gaveUp": "Couldn't reconnect after several attempts.",
+      "retryNow": "Retry now",
+      "reconnect": "Reconnect"
+    },
     "header": {
       "settingsTooltip": "Session settings",
       "filesButton": "Files",
@@ -771,6 +779,7 @@
       "sessionStarting": "Type your message while the session starts...",
       "stopping": "Stopping...",
       "working": "Agent is working...",
+      "reconnecting": "Disconnected — reconnecting…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)"
     },
     "code": {

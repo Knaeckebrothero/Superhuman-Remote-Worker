@@ -680,6 +680,14 @@
       "error": "Fehler",
       "disconnected": "Getrennt"
     },
+    "disconnected": {
+      "title": "Verbindung verloren",
+      "dropped": "Verbindung unterbrochen. Verbinde erneut…",
+      "retrying": "Erneuter Versuch… (Versuch {{attempt}} von {{max}})",
+      "gaveUp": "Erneuter Verbindungsaufbau nach mehreren Versuchen fehlgeschlagen.",
+      "retryNow": "Jetzt erneut versuchen",
+      "reconnect": "Erneut verbinden"
+    },
     "header": {
       "settingsTooltip": "Sitzungseinstellungen",
       "filesButton": "Dateien",
@@ -771,6 +779,7 @@
       "sessionStarting": "Schreiben Sie Ihre Nachricht, während die Sitzung startet...",
       "stopping": "Wird gestoppt...",
       "working": "Agent arbeitet...",
+      "reconnecting": "Getrennt — verbinde erneut…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
     },
     "code": {

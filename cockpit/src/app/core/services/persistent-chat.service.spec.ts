@@ -939,11 +939,11 @@ describe('PersistentChatService', () => {
             expect(service.isStreaming()).toBe(false);
         });
 
-        it('should set error message on abnormal close', async () => {
+        it('should set error message on terminal close (no reconnect)', async () => {
             const {ws} = await connectService(service);
-            if (ws.onclose) ws.onclose({code: 1006, reason: 'server went away'});
+            if (ws.onclose) ws.onclose({code: 4503, reason: 'agent unavailable'});
 
-            expect(service.error()).toContain('server went away');
+            expect(service.error()).toContain('agent unavailable');
         });
 
         it('should NOT set error on normal close (code 1000)', async () => {
@@ -951,6 +951,21 @@ describe('PersistentChatService', () => {
             if (ws.onclose) ws.onclose({code: 1000, reason: ''});
 
             expect(service.error()).toBeNull();
+        });
+
+        it('should suppress error when reconnect is scheduled (abnormal close)', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                if (ws.onclose) ws.onclose({code: 1006, reason: 'connection lost'});
+
+                expect(service.error()).toBeNull();
+                expect(service.reconnectAttempt()).toBe(1);
+            } finally {
+                vi.useRealTimers();
+            }
         });
 
         it('should ignore malformed WS messages', async () => {
@@ -1000,6 +1015,244 @@ describe('PersistentChatService', () => {
                     (c: any[]) => c[0]?.endsWith('/test-thread-123'),
                 );
                 expect(metaCalls.length).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+    });
+
+    // =========================================================================
+    // F4: Reconnect engine
+    // =========================================================================
+
+    describe('reconnect engine (F4)', () => {
+        let randomSpy: any;
+
+        beforeEach(() => {
+            // Math.random=0.5 → jitter contributes 0 → predictable backoff delays.
+            randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0.5);
+        });
+
+        afterEach(() => {
+            randomSpy.mockRestore();
+        });
+
+        it('does not reconnect on clean close (1000)', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                if (ws.onclose) ws.onclose({code: 1000, reason: ''});
+
+                expect(service.reconnectAttempt()).toBe(0);
+                expect((service as any).reconnectTimer).toBeNull();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('does not reconnect on idle-timeout close (4408)', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                if (ws.onclose) ws.onclose({code: 4408, reason: 'idle timeout'});
+
+                expect(service.reconnectAttempt()).toBe(0);
+                expect((service as any).reconnectTimer).toBeNull();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('does not reconnect on terminal server close (4503)', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                if (ws.onclose) ws.onclose({code: 4503, reason: 'agent unavailable'});
+
+                expect(service.reconnectAttempt()).toBe(0);
+                expect((service as any).reconnectTimer).toBeNull();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('cancels backoff if re-fetch reveals thread ended', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                mockHttp.get.mockImplementation((url: string) => {
+                    if (url.endsWith('/test-thread-123')) {
+                        return of({status: 'ended', ended_at: '2026-05-10T10:00:00Z'});
+                    }
+                    return of({messages: [], total: 0});
+                });
+
+                if (ws.onclose) ws.onclose({code: 1006, reason: 'abnormal'});
+                expect(service.reconnectAttempt()).toBe(1);
+
+                await vi.advanceTimersByTimeAsync(1500);
+
+                expect(service.threadStatus()).toBe('ended');
+                expect(service.reconnectAttempt()).toBe(0);
+                expect(service.reconnectGaveUp()).toBe(false);
+                expect((service as any).reconnectTimer).toBeNull();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('reconnectNow() cancels backoff and fires immediate connect', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws, WsSpy} = await connectService(service);
+                service.threadStatus.set('active');
+                WsSpy.mockClear();
+
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(1);
+                expect(WsSpy).not.toHaveBeenCalled();
+
+                service.reconnectNow();
+
+                expect(WsSpy).toHaveBeenCalledTimes(1);
+                expect(service.connectionState()).toBe('connecting');
+                expect(service.reconnectAttempt()).toBe(2);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('follows backoff schedule across attempts (1s, 2s, 4s, …)', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws, WsSpy} = await connectService(service);
+                service.threadStatus.set('active');
+                WsSpy.mockClear();
+
+                // Attempt 1: 1000ms
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(1);
+                await vi.advanceTimersByTimeAsync(999);
+                expect(WsSpy).toHaveBeenCalledTimes(0);
+                await vi.advanceTimersByTimeAsync(2);
+                expect(WsSpy).toHaveBeenCalledTimes(1);
+
+                // Attempt 2: 2000ms
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(2);
+                await vi.advanceTimersByTimeAsync(1999);
+                expect(WsSpy).toHaveBeenCalledTimes(1);
+                await vi.advanceTimersByTimeAsync(2);
+                expect(WsSpy).toHaveBeenCalledTimes(2);
+
+                // Attempt 3: 4000ms
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(3);
+                await vi.advanceTimersByTimeAsync(3999);
+                expect(WsSpy).toHaveBeenCalledTimes(2);
+                await vi.advanceTimersByTimeAsync(2);
+                expect(WsSpy).toHaveBeenCalledTimes(3);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('successful reconnect resets the attempt counter', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(1);
+
+                await vi.advanceTimersByTimeAsync(1000);
+                // _connectWs ran; mock ws was reused with new handlers. Fire onopen
+                // to simulate the WS coming back online.
+                if (ws.onopen) ws.onopen({});
+
+                expect(service.reconnectAttempt()).toBe(0);
+                expect(service.reconnectGaveUp()).toBe(false);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('flips reconnectGaveUp after MAX_ATTEMPTS exhausted', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws} = await connectService(service);
+                service.threadStatus.set('active');
+
+                // Drive the loop synchronously: each onclose increments the
+                // attempt counter; advance timers between iterations so the
+                // scheduled callback runs and reassigns ws.onclose.
+                for (let i = 1; i <= service.reconnectMaxAttempts; i++) {
+                    if (ws.onclose) ws.onclose({code: 1006});
+                    expect(service.reconnectAttempt()).toBe(i);
+                    expect(service.reconnectGaveUp()).toBe(false);
+                    // Advance enough to fire any backoff (capped at 30s).
+                    await vi.advanceTimersByTimeAsync(30000);
+                }
+
+                // One more close attempt — already at MAX, should flip gave-up.
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectGaveUp()).toBe(true);
+                expect((service as any).reconnectTimer).toBeNull();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('reconnectNow() from gave-up state resets and resumes the cycle', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws, WsSpy} = await connectService(service);
+                service.threadStatus.set('active');
+                WsSpy.mockClear();
+
+                // Force the gave-up state.
+                service.reconnectAttempt.set(service.reconnectMaxAttempts);
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectGaveUp()).toBe(true);
+
+                service.reconnectNow();
+
+                expect(service.reconnectGaveUp()).toBe(false);
+                expect(service.reconnectAttempt()).toBe(1);
+                expect(WsSpy).toHaveBeenCalledTimes(1);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('disconnect() mid-backoff cancels reconnect loop', async () => {
+            vi.useFakeTimers();
+            try {
+                const {ws, WsSpy} = await connectService(service);
+                service.threadStatus.set('active');
+                WsSpy.mockClear();
+
+                if (ws.onclose) ws.onclose({code: 1006});
+                expect(service.reconnectAttempt()).toBe(1);
+
+                service.disconnect();
+                expect(service.reconnectAttempt()).toBe(0);
+                expect(service.reconnectGaveUp()).toBe(false);
+                expect((service as any).reconnectTimer).toBeNull();
+
+                // Advance past the would-be reconnect delay; no new WS should
+                // be constructed.
+                await vi.advanceTimersByTimeAsync(60000);
+                expect(WsSpy).toHaveBeenCalledTimes(0);
             } finally {
                 vi.useRealTimers();
             }
