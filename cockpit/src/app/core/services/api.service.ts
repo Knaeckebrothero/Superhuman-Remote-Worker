@@ -1,6 +1,6 @@
 import {inject, Injectable} from '@angular/core';
-import {HttpClient, HttpParams} from '@angular/common/http';
-import {catchError, map, Observable, of, tap} from 'rxjs';
+import {HttpClient, HttpErrorResponse, HttpParams} from '@angular/common/http';
+import {catchError, map, Observable, of, tap, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
@@ -747,8 +747,15 @@ export class ApiService {
    * Push files into the persistent thread's live workspace uploads/ directory.
    * Used by the persistent-chat composer for attachment, camera capture, and
    * voice-message uploads.
+   *
+   * Errors are RE-THROWN (not swallowed to ``null``) so the caller can read
+   * the server-side ``detail`` field — typical messages include
+   * ``"Workspace is not ready — try again in a moment"`` (409) or
+   * ``"Could not reach workspace (host:port)"`` (502). Use
+   * ``humanizeUploadError()`` to map an arbitrary HttpErrorResponse to a
+   * user-facing string.
    */
-  uploadToThread(threadId: string, files: File[]): Observable<ThreadUploadResponse | null> {
+  uploadToThread(threadId: string, files: File[]): Observable<ThreadUploadResponse> {
     const formData = new FormData();
     files.forEach((file) => formData.append('files', file, file.name));
     return this.http
@@ -757,11 +764,25 @@ export class ApiService {
         formData,
       )
       .pipe(
-        catchError((error) => {
+        catchError((error: HttpErrorResponse) => {
           console.error(`Failed to upload files to thread ${threadId}:`, error);
-          return of(null);
+          return throwError(() => error);
         }),
       );
+  }
+
+  /** Map an upload HttpErrorResponse to a user-facing message. */
+  humanizeUploadError(error: unknown): string {
+    if (error instanceof HttpErrorResponse) {
+      const detail = (error.error && (error.error as {detail?: unknown}).detail) as
+        | string
+        | undefined;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+      if (error.status === 0) return 'Network error — check your connection';
+      if (error.status === 413) return 'File too large';
+      return `Upload failed (HTTP ${error.status}) — try again`;
+    }
+    return 'Upload failed — try again';
   }
 
   /**

@@ -36,6 +36,16 @@ spec:
           port: 22
         - protocol: TCP
           port: 9222
+    # SFTP from orchestrator: thread workspace uploads (camera capture, voice
+    # messages, attachments) land in <workspace>/uploads/ via paramiko SFTP.
+    # See orchestrator/services/thread_uploads.py.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 22
     # code-server from orchestrator (IDE session proxying)
     - from:
         - podSelector:
