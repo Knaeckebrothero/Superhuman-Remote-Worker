@@ -21,8 +21,12 @@ from typing import Any, Iterable
 
 try:
     import paramiko
-except ImportError:  # pragma: no cover - paramiko is a hard dep elsewhere
+except ImportError:  # pragma: no cover - import-time guard
     paramiko = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "paramiko is not installed — thread workspace uploads "
+        "(POST /api/persistent/threads/{id}/uploads) will fail with HTTP 503"
+    )
 
 from . import resolve_ssh_key_path
 
