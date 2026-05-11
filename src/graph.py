@@ -88,6 +88,7 @@ from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
+from .services.image_content import extract_image_tags, make_multimodal_user_message
 from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -3080,6 +3081,31 @@ def create_audited_tool_node(
                             f"VM workspace connection lost during tool execution: "
                             f"{msg.content[:300]}"
                         )
+
+        # Multimodal image delivery: image-bearing tools embed base64 in a
+        # `<image_data>` / `<page_image>` tag inside the result string.
+        # Strip the tag, replace it with a short marker, and append a
+        # synthesized HumanMessage carrying the image as a real provider
+        # content block so multimodal primary models can actually see it.
+        # State only ever sees the cleaned ToolMessage + clean HumanMessage;
+        # the base64 lives transiently in this local `result`.
+        if "messages" in result:
+            image_followups: list[HumanMessage] = []
+            for msg in result["messages"]:
+                if not isinstance(msg, ToolMessage) or not msg.content:
+                    continue
+                cleaned, extracted = extract_image_tags(msg.content)
+                if not extracted:
+                    continue
+                msg.content = cleaned
+                image_followups.append(
+                    make_multimodal_user_message(
+                        text=(f"Image content from tool call {msg.tool_call_id}:"),
+                        images=extracted,
+                    )
+                )
+            if image_followups:
+                result["messages"].extend(image_followups)
 
         # Enrich tool-not-found errors with actionable guidance
         if "messages" in result:

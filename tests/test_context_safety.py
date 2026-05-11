@@ -679,3 +679,117 @@ class TestContextSafetyIntegration:
         assert config.summarization_safe_limit < config.model_max_context_tokens
         # Chunk size should be less than safe limit
         assert config.summarization_chunk_size < config.summarization_safe_limit
+
+
+# =============================================================================
+# Tests for oversized-message backstop in summarize_and_compact
+# =============================================================================
+
+
+class TestOversizedMessageCompaction:
+    """Backstop that catches runaway-generation poisoning.
+
+    When a single AIMessage exceeds half the context window, it's almost
+    certainly a repetition-loop artifact (the loader-side max_tokens
+    fallback prevents new ones, but a session resumed from a poisoned
+    state needs this rule to recover). Verify the substitution shape.
+    """
+
+    @pytest.mark.asyncio
+    async def test_oversized_aimessage_replaced_with_stub(
+        self, context_manager, mock_llm
+    ):
+        """A single oversized AIMessage should be substituted by a stub."""
+        # context_manager has model_max_context_tokens=2000, threshold=1000.
+        # Build an AIMessage exceeding the threshold (~6000 chars => ~1500 tokens).
+        oversized_content = "loop " * 1500
+        messages = [
+            HumanMessage(content="hi", id="h1"),
+            AIMessage(content=oversized_content, id="a1"),  # poisonous
+            HumanMessage(content="still there?", id="h2"),
+            AIMessage(content="yes", id="a2"),
+            HumanMessage(content="ok", id="h3"),
+            AIMessage(content="done", id="a3"),
+        ]
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        # The original oversized content must not survive into the new history.
+        assert not any(
+            isinstance(m, AIMessage) and oversized_content in (m.content or "")
+            for m in result
+        )
+        # A stub describing the elided message must be present.
+        stubs = [
+            m
+            for m in result
+            if isinstance(m, AIMessage) and "elided by compaction" in (m.content or "")
+        ]
+        assert len(stubs) == 1, "expected exactly one elision stub"
+        # The original ID must be present in removal markers so state reducer
+        # actually evicts it from LangGraph state.
+        from langchain_core.messages import RemoveMessage
+
+        removed_ids = {m.id for m in result if isinstance(m, RemoveMessage)}
+        assert "a1" in removed_ids
+
+    @pytest.mark.asyncio
+    async def test_aimessage_with_tool_calls_not_substituted(
+        self, context_manager, mock_llm
+    ):
+        """AIMessages with tool_calls must NOT be substituted — would orphan ToolMessages."""
+        oversized = "loop " * 1500  # over 1000-token threshold
+        messages = [
+            HumanMessage(content="hi", id="h1"),
+            AIMessage(
+                content=oversized,
+                id="a1",
+                tool_calls=[{"id": "t1", "name": "tool", "args": {}}],
+            ),
+            ToolMessage(content="result", tool_call_id="t1", id="t1"),
+            HumanMessage(content="next", id="h2"),
+            AIMessage(content="ok", id="a2"),
+            HumanMessage(content="ok2", id="h3"),
+        ]
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        # No elision stub for the tool-bearing AIMessage.
+        stubs = [
+            m
+            for m in result
+            if isinstance(m, AIMessage) and "elided by compaction" in (m.content or "")
+        ]
+        assert stubs == [], "tool-call AIMessages must not be substituted"
+
+    @pytest.mark.asyncio
+    async def test_normal_messages_pass_through_unchanged(
+        self, context_manager, mock_llm
+    ):
+        """Normal-sized messages should not trigger substitution."""
+        messages = [
+            HumanMessage(content="short", id="h1"),
+            AIMessage(content="short reply", id="a1"),
+            HumanMessage(content="another", id="h2"),
+            AIMessage(content="another reply", id="a2"),
+            HumanMessage(content="third", id="h3"),
+            AIMessage(content="third reply", id="a3"),
+        ]
+
+        result = await context_manager.summarize_and_compact(
+            messages=messages,
+            auxiliary=mock_llm,
+        )
+
+        stubs = [
+            m
+            for m in result
+            if isinstance(m, AIMessage) and "elided by compaction" in (m.content or "")
+        ]
+        assert stubs == [], "no substitution should occur for normal-sized messages"

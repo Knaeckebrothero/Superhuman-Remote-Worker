@@ -3,6 +3,8 @@ import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import {ThreadStatus} from '../models/api.model';
+import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
+import {ApiService} from './api.service';
 
 const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 const RECONNECT_CAP_MS = 30000;
@@ -20,6 +22,17 @@ export interface ChatMessage {
     timestamp: Date;
     /** True for messages loaded from DB history (not live). */
     historical?: boolean;
+    /** Files uploaded to the workspace alongside this user message. */
+    attachments?: ChatAttachment[];
+}
+
+/** Attachment chip shown alongside a user message. */
+export interface ChatAttachment {
+    name: string;
+    size: number;
+    mimeType: string;
+    /** Workspace-relative path, e.g. "uploads/photo.jpg". */
+    path: string;
 }
 
 /** Info about a tool call within an assistant message. */
@@ -28,7 +41,7 @@ export interface ToolCallInfo {
     tool: string;
     args: Record<string, unknown>;
     result?: string;
-    status: 'pending' | 'running' | 'completed' | 'denied';
+    status: 'pending' | 'running' | 'completed' | 'denied' | 'error';
     /** Tool category from the registry (e.g. workspace, git, research). */
     category?: string;
     /**
@@ -71,6 +84,7 @@ export type NarrationMode = 'silent' | 'verbose' | 'auto';
 @Injectable({providedIn: 'root'})
 export class PersistentChatService {
     private readonly http = inject(HttpClient);
+    private readonly api = inject(ApiService);
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
@@ -122,6 +136,15 @@ export class PersistentChatService {
 
     // --- Pending message (submitted before session was ready) ---
     readonly pendingMessage = signal<string | null>(null);
+
+    // --- Pending attachments (queued in composer before send) ---
+    readonly pendingAttachments = signal<FilePreview[]>([]);
+
+    // --- Upload state (true while the next send is busy uploading files) ---
+    readonly isUploadingAttachments = signal(false);
+
+    // --- Last upload error (cleared on next successful send) ---
+    readonly attachmentError = signal<string | null>(null);
 
     // --- Session tasks ---
     readonly tasks = signal<SessionTask[]>([]);
@@ -448,34 +471,109 @@ export class PersistentChatService {
         await this.connect(threadId);
     }
 
+    /** Add files queued in the composer to be uploaded on next send. */
+    addAttachments(previews: FilePreview[]): void {
+        if (!previews.length) return;
+        this.pendingAttachments.update((existing) => [...existing, ...previews]);
+        this.attachmentError.set(null);
+    }
+
+    /** Drop one queued attachment by id. */
+    removeAttachment(id: string): void {
+        this.pendingAttachments.update((list) => list.filter((p) => p.id !== id));
+    }
+
+    /** Drop all queued attachments. */
+    clearAttachments(): void {
+        this.pendingAttachments.set([]);
+    }
+
     /** Send a user message (with slash command parsing).
      *  If the session isn't ready yet, queues the message and sends it
      *  automatically once the agent signals readiness.
+     *
+     *  When ``pendingAttachments`` is non-empty, files are uploaded to the
+     *  thread workspace's ``uploads/`` directory first, then a hint listing
+     *  the uploaded filenames is appended to the message text the agent
+     *  receives over the WS. The displayed user message keeps the original
+     *  text and shows uploaded files as separate attachment chips.
      */
-    sendMessage(content: string): void {
-        if (!content.trim()) return;
-
-        // Slash command parsing
+    async sendMessage(content: string): Promise<void> {
         const trimmed = content.trim();
+
+        // Slash commands bypass attachment logic.
         if (trimmed.startsWith('/')) {
-            const handled = this.handleSlashCommand(trimmed);
-            if (handled) return;
+            if (this.handleSlashCommand(trimmed)) return;
         }
 
-        // Add to local messages immediately so the user sees their input
+        const queued = this.pendingAttachments();
+        if (!trimmed && queued.length === 0) return;
+
+        let uploaded: ThreadUploadedFile[] = [];
+        if (queued.length > 0) {
+            const threadId = this.threadId();
+            if (!threadId) {
+                this.attachmentError.set('Cannot upload: no active thread');
+                return;
+            }
+            const files = queued.filter((p) => p.file).map((p) => p.file);
+            this.isUploadingAttachments.set(true);
+            this.attachmentError.set(null);
+            queued.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
+            try {
+                const result = await firstValueFrom(this.api.uploadToThread(threadId, files));
+                if (result === null) {
+                    queued.forEach((p) => {
+                        p.uploadStatus = UploadStatus.FAILED;
+                        p.error = 'Upload failed';
+                    });
+                    this.attachmentError.set('Upload failed — try again');
+                    return;
+                }
+                uploaded = result.files;
+                queued.forEach((p) => (p.uploadStatus = UploadStatus.COMPLETED));
+            } finally {
+                this.isUploadingAttachments.set(false);
+            }
+            // Successful upload — drop the previews so the composer clears
+            this.clearAttachments();
+        }
+
+        const attachments: ChatAttachment[] = uploaded.map((f) => ({
+            name: f.name,
+            size: f.size,
+            mimeType: f.mime_type,
+            path: f.path,
+        }));
+
+        // What the agent sees: text + a plain-language hint about the files.
+        let wsContent = trimmed;
+        if (attachments.length > 0) {
+            const list = attachments.map((a) => a.name).join(', ');
+            const hint = `[Attached files in uploads/: ${list}]`;
+            wsContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
+        }
+
+        // Add to local messages — content is the user's typed text only;
+        // uploaded files render as separate attachment chips in the UI.
         this.messages.update((msgs) => [
             ...msgs,
-            {role: 'user', content, timestamp: new Date()},
+            {
+                role: 'user',
+                content: trimmed,
+                timestamp: new Date(),
+                attachments: attachments.length > 0 ? attachments : undefined,
+            },
         ]);
 
-        // If session isn't ready yet, queue and send when ready
+        // If session isn't ready yet, queue and send when ready.
         if (!this.sessionReady() || !this.ws) {
-            this.pendingMessage.set(content);
+            this.pendingMessage.set(wsContent);
             return;
         }
 
         this.isWaitingForInput.set(false);
-        this.send({method: 'message', content});
+        this.send({method: 'message', content: wsContent});
     }
 
     /** Parse and dispatch slash commands. Returns true if handled. */
@@ -565,6 +663,16 @@ export class PersistentChatService {
         if (this.isInterrupting()) return; // Already interrupting
         this.isInterrupting.set(true);
         this.send({method: 'interrupt'});
+    }
+
+    /** Stop a pending permission prompt + halt the turn so the user can
+     *  type a follow-up. Denies the call so the backend isn't stranded
+     *  awaiting a decision (the loop would otherwise block on the
+     *  `permission_check` await forever), then sends interrupt so the
+     *  next loop iteration bails out instead of acting on the denial. */
+    stop(): void {
+        this.deny();
+        this.interrupt();
     }
 
     /** Change permission mode. */
@@ -675,10 +783,11 @@ export class PersistentChatService {
 
             case 'tool.completed': {
                 const id = params['id'] as string;
+                const nextStatus: 'completed' | 'error' = params['is_error'] ? 'error' : 'completed';
                 this.currentToolCalls.update((calls) =>
                     calls.map((tc) =>
                         tc.id === id
-                            ? {...tc, status: 'completed' as const, result: (params['result'] as string) || ''}
+                            ? {...tc, status: nextStatus, result: (params['result'] as string) || ''}
                             : tc,
                     ),
                 );

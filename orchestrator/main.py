@@ -70,9 +70,11 @@ import yaml  # noqa: E402
 from fastapi import (  # noqa: E402
     Body,
     FastAPI,
+    File,
     HTTPException,
     Query,
     Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -10549,6 +10551,111 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
         return {"status": "restoring", "code_server_url": None, "gitea_url": gitea_url}
 
     return {"status": "unavailable", "code_server_url": None, "gitea_url": gitea_url}
+
+
+@app.post("/api/persistent/threads/{thread_id}/uploads")
+async def upload_files_to_thread(
+    thread_id: str,
+    request: Request,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Push files into a persistent thread workspace's ``uploads/`` directory.
+
+    Files are SFTP'd into ``<workspace_path>/uploads/`` on the live
+    workspace container (or VM). The cockpit then appends an
+    ``Attached files: …`` hint to the user's next message so the agent
+    can find them. See ``services/thread_uploads.py`` for SSH details.
+
+    Returns:
+        ``{"thread_id": "...", "files": [{name, size, mime_type, path}, ...]}``
+    """
+    from services.thread_uploads import (
+        ThreadUploadError,
+        upload_files_to_thread_workspace,
+    )
+
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    payloads: list[tuple[str, bytes, str]] = []
+    for f in files:
+        contents = await f.read()
+        payloads.append(
+            (
+                f.filename or "unnamed",
+                contents,
+                f.content_type or "application/octet-stream",
+            )
+        )
+
+    try:
+        results = await upload_files_to_thread_workspace(thread, payloads)
+    except ThreadUploadError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+    return {
+        "thread_id": thread_id,
+        "files": [
+            {"name": r.name, "size": r.size, "mime_type": r.mime_type, "path": r.path}
+            for r in results
+        ],
+    }
+
+
+@app.post("/api/persistent/threads/{thread_id}/tts")
+async def synthesize_thread_message_tts(
+    thread_id: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> Response:
+    """Generate speech audio for a chat message.
+
+    Body:
+        ``content`` (str, required) — text to speak (typically an assistant
+        message).
+        ``reformulate`` (bool, default ``True``) — when true, runs an
+        auxiliary LLM pass to rewrite the text for natural narration
+        (strips markdown, summarizes code blocks, etc.).
+        ``language`` (str, default ``"en"``) — selects the TTS voice.
+
+    Returns:
+        ``audio/mpeg`` MP3 bytes. ``204 No Content`` when no TTS model is
+        configured for the user. ``502`` when the synthesis call fails.
+    """
+    from services.tts import generate_message_tts
+
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+    reformulate = bool(body.get("reformulate", True))
+    language = (body.get("language") or "en").strip() or "en"
+
+    audio = await generate_message_tts(
+        content=content,
+        language=language,
+        reformulate=reformulate,
+        user_id=str(user["id"]),
+        postgres_db=postgres_db,
+    )
+    if audio is None:
+        # 204: TTS disabled / not configured. The cockpit treats this as a
+        # disabled-feature signal rather than an error.
+        return Response(status_code=204)
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 # --- Session notification helpers (used by WS proxy) ---

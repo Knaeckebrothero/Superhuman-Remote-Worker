@@ -1205,7 +1205,12 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
             },
         )
 
-    async def on_tool_result(tool_name: str, result: str, tool_call_id: str) -> None:
+    async def on_tool_result(
+        tool_name: str,
+        result: str,
+        tool_call_id: str,
+        is_error: bool = False,
+    ) -> None:
         display_result = result[:2000] + "..." if len(result) > 2000 else result
         await _ws_send(
             ws,
@@ -1214,6 +1219,7 @@ async def _run_persistent_websocket(ws: WebSocket, pa) -> None:
                 "tool": tool_name,
                 "result": display_result,
                 "id": tool_call_id,
+                "is_error": is_error,
             },
         )
         if tool_name in ("write_file", "edit_file"):

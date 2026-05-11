@@ -149,6 +149,68 @@ class TestSaveMessage:
 
 
 # ---------------------------------------------------------------------------
+# 3.3b _restore_session_messages() — IDs must be set so RemoveMessage works
+# ---------------------------------------------------------------------------
+
+
+class TestRestoreSessionMessageIds:
+    """Restored messages must carry IDs so compaction's RemoveMessage works.
+
+    Without this, a session resumed from a poisoned state can never compact
+    (RemoveMessage(id=None) is a no-op) — see issue
+    persistent_session_restored_messages_no_ids.md.
+    """
+
+    @pytest.mark.asyncio
+    async def test_all_restored_messages_have_ids(self):
+        from src.api import persistent_app as pa
+
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_agent = MagicMock()
+        mock_agent.postgres_conn = MagicMock()
+        mock_agent.postgres_conn.get_thread_messages_history = AsyncMock(
+            return_value=[
+                {"role": "user", "content": "hi", "tool_calls": None, "turn_number": 1},
+                {
+                    "role": "assistant",
+                    "content": "calling tool",
+                    "tool_calls": [{"id": "t1", "name": "f", "args": {}}],
+                    "turn_number": 1,
+                },
+                {
+                    "role": "tool",
+                    "content": "result",
+                    "tool_calls": None,
+                    "turn_number": 1,
+                },
+                {
+                    "role": "assistant",
+                    "content": "done",
+                    "tool_calls": None,
+                    "turn_number": 1,
+                },
+            ]
+        )
+
+        with (
+            patch.object(pa, "_session", mock_session),
+            patch.object(pa, "_agent", mock_agent),
+            patch.object(pa, "_thread_id", "thread-abc"),
+        ):
+            await pa._restore_session_messages()
+
+        # All four messages must have IDs set.
+        assert len(mock_session.messages) == 4
+        ids = [m.id for m in mock_session.messages]
+        assert all(i is not None and i for i in ids), (
+            f"every restored message needs an id, got {ids}"
+        )
+        # IDs must be unique (UUIDs).
+        assert len(set(ids)) == len(ids), "restored message IDs must be unique"
+
+
+# ---------------------------------------------------------------------------
 # 3.4 _save_turn_ai_messages()
 # ---------------------------------------------------------------------------
 

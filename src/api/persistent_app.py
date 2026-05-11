@@ -1135,7 +1135,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             )
 
         async def on_tool_result(
-            tool_name: str, result: str, tool_call_id: str
+            tool_name: str,
+            result: str,
+            tool_call_id: str,
+            is_error: bool = False,
         ) -> None:
             # Truncate large results for WS (full result is in message history)
             display_result = result[:2000] + "..." if len(result) > 2000 else result
@@ -1146,6 +1149,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "tool": tool_name,
                     "result": display_result,
                     "id": tool_call_id,
+                    "is_error": is_error,
                 },
             )
 
@@ -1472,6 +1476,7 @@ async def _restore_session_messages() -> None:
         return
 
     try:
+        import uuid as _uuid
         from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
@@ -1491,8 +1496,14 @@ async def _restore_session_messages() -> None:
             content = db_msg["content"] or ""
             tool_calls = db_msg.get("tool_calls")
 
+            # Generate a fresh UUID per restored message. Without an `id`,
+            # `RemoveMessage(id=...)` in compaction is a no-op — meaning a
+            # resumed session that needs compaction can never shrink. The
+            # ID is a LangGraph state key, not user-facing or persisted.
+            msg_id = str(_uuid.uuid4())
+
             if role in ("human", "user"):
-                restored.append(HumanMessage(content=content))
+                restored.append(HumanMessage(content=content, id=msg_id))
 
             elif role in ("ai", "assistant"):
                 lc_tool_calls = []
@@ -1508,14 +1519,22 @@ async def _restore_session_messages() -> None:
                     pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
                 else:
                     pending_tool_call_ids = []
-                restored.append(AIMessage(content=content, tool_calls=lc_tool_calls))
+                restored.append(
+                    AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+                )
 
             elif role == "tool":
                 # Pair with the next pending tool_call_id from the last AIMessage
                 tool_call_id = (
                     pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
                 )
-                restored.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+                restored.append(
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=tool_call_id,
+                        id=msg_id,
+                    )
+                )
 
             # Skip system messages — the loop adds a fresh one from current config
 
