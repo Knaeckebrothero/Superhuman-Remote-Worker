@@ -18,6 +18,8 @@ from typing import Optional, Union
 
 from openai import AsyncOpenAI
 
+from src.services.image_content import make_image_content_block_from_b64
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,16 +153,8 @@ class VisionHelper:
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": prompt_text,
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{image_data}"
-                                },
-                            },
+                            {"type": "text", "text": prompt_text},
+                            make_image_content_block_from_b64(image_data, mime_type),
                         ],
                     }
                 ],
@@ -243,16 +237,8 @@ class VisionHelper:
                     {
                         "role": "user",
                         "content": [
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{mime_type};base64,{page_image}"
-                                },
-                            },
+                            {"type": "text", "text": prompt},
+                            make_image_content_block_from_b64(page_image, mime_type),
                         ],
                     }
                 ],

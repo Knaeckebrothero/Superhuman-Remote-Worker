@@ -757,13 +757,14 @@
       "statusCompleted": "completed",
       "statusRunning": "running",
       "statusDenied": "denied",
-      "statusPending": "pending"
+      "statusPending": "pending",
+      "statusError": "error"
     },
     "permission": {
       "title": "Permission required",
       "approve": "Approve",
       "autoAccept": "Auto-accept",
-      "deny": "Deny"
+      "stop": "Stop"
     },
     "approval": {
       "pendingTitle": "Approval needed to run this tool",
@@ -781,15 +782,31 @@
       "stopping": "Stopping...",
       "working": "Agent is working...",
       "reconnecting": "Disconnected — reconnecting…",
+      "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)"
     },
     "composer": {
       "attach": "Attach",
-      "attachComing": "Attachments coming soon",
-      "mention": "Mention",
-      "mentionComing": "Mentions coming soon",
+      "chooseFile": "Choose file",
+      "takePhoto": "Take photo",
+      "capturePhoto": "Capture photo",
+      "recordVoice": "Hold to record voice message",
+      "recordingStop": "Stop recording",
+      "recordingCancel": "Cancel recording",
+      "remove": "Remove",
       "send": "Send",
-      "stop": "Stop"
+      "stop": "Stop",
+      "dropHint": "Drop files to attach",
+      "cameraDenied": "Camera permission denied",
+      "cameraError": "Could not access camera",
+      "micDenied": "Microphone permission denied",
+      "micError": "Could not start recording"
+    },
+    "tts": {
+      "play": "Read aloud",
+      "stop": "Stop reading",
+      "generating": "Generating speech…",
+      "error": "Speech failed — click to retry"
     },
     "code": {
       "expandHint": "Click to expand",

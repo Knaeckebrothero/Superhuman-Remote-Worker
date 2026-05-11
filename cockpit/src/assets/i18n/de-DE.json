@@ -757,13 +757,14 @@
       "statusCompleted": "abgeschlossen",
       "statusRunning": "läuft",
       "statusDenied": "abgelehnt",
-      "statusPending": "ausstehend"
+      "statusPending": "ausstehend",
+      "statusError": "Fehler"
     },
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
       "autoAccept": "Auto-akzeptieren",
-      "deny": "Ablehnen"
+      "stop": "Stoppen"
     },
     "approval": {
       "pendingTitle": "Bestätigung erforderlich, um dieses Tool auszuführen",
@@ -781,15 +782,31 @@
       "stopping": "Wird gestoppt...",
       "working": "Agent arbeitet...",
       "reconnecting": "Getrennt — verbinde erneut…",
+      "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
     },
     "composer": {
       "attach": "Anhängen",
-      "attachComing": "Anhänge folgen in Kürze",
-      "mention": "Erwähnen",
-      "mentionComing": "Erwähnungen folgen in Kürze",
+      "chooseFile": "Datei wählen",
+      "takePhoto": "Foto aufnehmen",
+      "capturePhoto": "Foto aufnehmen",
+      "recordVoice": "Halten zum Aufnehmen",
+      "recordingStop": "Aufnahme stoppen",
+      "recordingCancel": "Aufnahme abbrechen",
+      "remove": "Entfernen",
       "send": "Senden",
-      "stop": "Stoppen"
+      "stop": "Stoppen",
+      "dropHint": "Dateien hier ablegen, um sie anzuhängen",
+      "cameraDenied": "Kamerazugriff verweigert",
+      "cameraError": "Kamera nicht verfügbar",
+      "micDenied": "Mikrofonzugriff verweigert",
+      "micError": "Aufnahme konnte nicht gestartet werden"
+    },
+    "tts": {
+      "play": "Vorlesen",
+      "stop": "Vorlesen stoppen",
+      "generating": "Sprache wird erzeugt…",
+      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",

@@ -3,6 +3,7 @@ import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
+import {ApiService} from './api.service';
 
 /**
  * Create a mock WebSocket that captures handlers and allows triggering events.
@@ -30,12 +31,22 @@ function createService() {
         delete: vi.fn().mockReturnValue(of({})),
     };
 
+    // Minimal ApiService stub — the only methods PersistentChatService calls
+    // on it from this test surface are upload-related. uploadToThread is
+    // exercised in dedicated tests; reconnect tests don't trip it.
+    const mockApi: any = {
+        uploadToThread: vi.fn().mockReturnValue(of({thread_id: 't', files: []})),
+    };
+
     const injector = Injector.create({
-        providers: [{provide: HttpClient, useValue: mockHttp}],
+        providers: [
+            {provide: HttpClient, useValue: mockHttp},
+            {provide: ApiService, useValue: mockApi},
+        ],
     });
 
     const service = runInInjectionContext(injector, () => new PersistentChatService());
-    return {service, mockHttp};
+    return {service, mockHttp, mockApi};
 }
 
 /**
@@ -726,6 +737,36 @@ describe('PersistentChatService', () => {
                 const calls = service.currentToolCalls();
                 expect(calls[0].status).toBe('completed');
                 expect(calls[1].status).toBe('running');
+            });
+
+            it('should set status to error when is_error is true', async () => {
+                const {ws} = await connectService(service);
+                fireWsMessage(ws, {
+                    method: 'tool.started',
+                    params: {id: 'tc1', tool: 'read_file', args: {}},
+                });
+                fireWsMessage(ws, {
+                    method: 'tool.completed',
+                    params: {id: 'tc1', result: 'Tool execution error: ENOENT', is_error: true},
+                });
+
+                const calls = service.currentToolCalls();
+                expect(calls[0].status).toBe('error');
+                expect(calls[0].result).toBe('Tool execution error: ENOENT');
+            });
+
+            it('should keep status as completed when is_error is missing', async () => {
+                const {ws} = await connectService(service);
+                fireWsMessage(ws, {
+                    method: 'tool.started',
+                    params: {id: 'tc1', tool: 'web_search', args: {}},
+                });
+                fireWsMessage(ws, {
+                    method: 'tool.completed',
+                    params: {id: 'tc1', result: 'ok'},
+                });
+
+                expect(service.currentToolCalls()[0].status).toBe('completed');
             });
         });
 
