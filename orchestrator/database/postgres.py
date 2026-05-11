@@ -2217,7 +2217,7 @@ class PostgresDB:
                 legacy_share_id,
             )
 
-    async def mark_orphaned_threads_ended(self) -> int:
+    async def mark_orphaned_threads_ended(self) -> list[str]:
         """Mark threads as ended when their bound agent is offline.
 
         Only flags threads that have an ``agent_id`` pointing at an offline
@@ -2228,10 +2228,12 @@ class PostgresDB:
         brand-new threads to 'ended' within a second of creation.
 
         Returns:
-            Number of threads marked ended.
+            List of thread IDs that were marked ended. The caller is
+            responsible for tearing down the associated workspace + agent
+            pods; this method only owns the DB state transition.
         """
         async with self.acquire() as conn:
-            result = await conn.execute(
+            rows = await conn.fetch(
                 """
                 UPDATE threads
                 SET status        = 'ended',
@@ -2242,11 +2244,10 @@ class PostgresDB:
                   AND agent_id IN (SELECT id
                                    FROM agents
                                    WHERE status = 'offline')
+                RETURNING id
                 """
             )
-        if result.startswith("UPDATE "):
-            return int(result.split()[1])
-        return 0
+        return [str(row["id"]) for row in rows]
 
     async def mark_stuck_working_agents_ready(self) -> int:
         """Reset agents whose self-reported status is internally inconsistent.
