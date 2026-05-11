@@ -50,6 +50,8 @@ export interface FilePreview {
   uploadStatus: UploadStatus;
   /** Error message if upload failed */
   error?: string;
+  /** Server-assigned filename after upload (for the agent hint) */
+  remoteName?: string;
 }
 
 /**
@@ -84,4 +86,22 @@ export interface UploadInfo {
   files: UploadedFile[];
   /** ISO timestamp when upload was created */
   created_at: string;
+}
+
+/**
+ * One file pushed into a thread workspace's uploads/ directory.
+ */
+export interface ThreadUploadedFile {
+  name: string;
+  size: number;
+  mime_type: string;
+  path: string;
+}
+
+/**
+ * Response from POST /api/persistent/threads/{thread_id}/uploads.
+ */
+export interface ThreadUploadResponse {
+  thread_id: string;
+  files: ThreadUploadedFile[];
 }

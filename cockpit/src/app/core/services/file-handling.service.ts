@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import { FilePreview, FileType, UploadStatus } from '../models/file.model';
+import { RecordingResult } from '../models/recording.model';
 
 /**
  * Service for handling file-related operations such as validation,
@@ -174,5 +175,46 @@ export class FileHandlingService {
       reader.onerror = reject;
       reader.readAsDataURL(file);
     });
+  }
+
+  /**
+   * Build a FilePreview for a voice recording. The file name encodes the
+   * timestamp and duration so it's distinguishable in the workspace.
+   */
+  async createAudioFilePreview(result: RecordingResult): Promise<FilePreview> {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const extension = this.getAudioExtension(result.mimeType);
+    const filename = `voice-message-${timestamp}.${extension}`;
+    const audioFile = new File([result.blob], filename, {
+      type: result.mimeType,
+      lastModified: Date.now(),
+    });
+    return {
+      id: this.generateId(),
+      file: audioFile,
+      name: `Voice message (${this.formatDuration(result.duration)})`,
+      size: audioFile.size,
+      sizeFormatted: this.formatFileSize(audioFile.size),
+      type: FileType.AUDIO,
+      mimeType: audioFile.type,
+      uploadStatus: UploadStatus.PENDING,
+    };
+  }
+
+  private getAudioExtension(mimeType: string): string {
+    const map: Record<string, string> = {
+      'audio/webm': 'webm',
+      'audio/ogg': 'ogg',
+      'audio/mp4': 'm4a',
+      'audio/mpeg': 'mp3',
+      'audio/wav': 'wav',
+    };
+    return map[mimeType.split(';')[0]] || 'webm';
+  }
+
+  private formatDuration(seconds: number): string {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 }

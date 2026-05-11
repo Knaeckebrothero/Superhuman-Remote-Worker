@@ -1885,6 +1885,35 @@ def create_llm(
         return _create_openai_llm(config, limits)
 
 
+def _resolve_max_output_tokens(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> int:
+    """Resolve the output token cap for non-Anthropic providers.
+
+    Mirrors the safety pattern in `_create_anthropic_llm`: when the user
+    hasn't set `max_output_tokens` explicitly, derive a sensible cap from
+    the model's declared context window. Without this, vLLM/llama.cpp
+    style endpoints fall back to their server-side default (effectively
+    unbounded for most local servers), and a single runaway generation
+    (e.g. the known gemma4 + xgrammar repetition loop, vllm#40080) can
+    emit millions of tokens of repeated content and poison the next turn.
+
+    Resolution order:
+      1. Explicit ``config.max_output_tokens`` (user / per-job override)
+      2. ``min(16384, ctx // 4)`` when the context window is known
+      3. ``8192`` as last resort
+    """
+    if config.max_output_tokens is not None:
+        return config.max_output_tokens
+    ctx = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
+    if ctx:
+        return min(16384, ctx // 4)
+    return 8192
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -1972,8 +2001,8 @@ def _create_openai_llm(
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
-    if config.max_output_tokens is not None:
-        llm_kwargs["max_tokens"] = config.max_output_tokens
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
@@ -1993,7 +2022,7 @@ def _create_openai_llm(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm
@@ -2092,11 +2121,15 @@ def _create_google_llm(
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
 
+    # ChatGoogleGenerativeAI uses ``max_output_tokens`` (not ``max_tokens``)
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_output_tokens"] = max_tokens
+
     llm = ChatGoogleGenerativeAI(**llm_kwargs)
 
     logger.info(
         f"Created Google LLM: model={config.model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s"
+        f"timeout={config.timeout}s, max_output_tokens={max_tokens}"
     )
 
     return llm
@@ -2148,11 +2181,15 @@ def _create_groq_llm(
     if config.base_url:
         llm_kwargs["groq_api_base"] = config.base_url
 
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
+
     llm = ChatGroq(**llm_kwargs)
 
     logger.info(
         f"Created Groq LLM: model={model}, temp={config.temperature}, "
-        f"timeout={config.timeout}s, max_retries={config.max_retries}"
+        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"max_tokens={max_tokens}"
     )
 
     return llm
@@ -2259,8 +2296,8 @@ def _create_openrouter_llm(
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
-    if config.max_output_tokens is not None:
-        llm_kwargs["max_tokens"] = config.max_output_tokens
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
@@ -2285,7 +2322,7 @@ def _create_openrouter_llm(
         f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={config.timeout}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm
@@ -2384,8 +2421,8 @@ def _create_codex_llm(
     if extra_body:
         llm_kwargs["extra_body"] = extra_body
 
-    if config.max_output_tokens is not None:
-        llm_kwargs["max_tokens"] = config.max_output_tokens
+    max_tokens = _resolve_max_output_tokens(config, limits)
+    llm_kwargs["max_tokens"] = max_tokens
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
@@ -2405,7 +2442,7 @@ def _create_codex_llm(
         f"Created Codex LLM: model={model}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={config.timeout}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
-        f"reasoning={reasoning_mode}, keys={key_info}"
+        f"max_tokens={max_tokens}, reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm

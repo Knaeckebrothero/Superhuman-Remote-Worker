@@ -29,6 +29,7 @@ def _make_config(**overrides):
     config.reasoning_level = overrides.get("reasoning_level", None)
     config.streaming = overrides.get("streaming", False)
     config.max_output_tokens = overrides.get("max_output_tokens", None)
+    config.model_max_context_tokens = overrides.get("model_max_context_tokens", None)
     return config
 
 
