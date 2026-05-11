@@ -522,16 +522,16 @@ export class PersistentChatService {
             queued.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
             try {
                 const result = await firstValueFrom(this.api.uploadToThread(threadId, files));
-                if (result === null) {
-                    queued.forEach((p) => {
-                        p.uploadStatus = UploadStatus.FAILED;
-                        p.error = 'Upload failed';
-                    });
-                    this.attachmentError.set('Upload failed — try again');
-                    return;
-                }
                 uploaded = result.files;
                 queued.forEach((p) => (p.uploadStatus = UploadStatus.COMPLETED));
+            } catch (err) {
+                const msg = this.api.humanizeUploadError(err);
+                queued.forEach((p) => {
+                    p.uploadStatus = UploadStatus.FAILED;
+                    p.error = msg;
+                });
+                this.attachmentError.set(msg);
+                return;
             } finally {
                 this.isUploadingAttachments.set(false);
             }
