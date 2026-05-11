@@ -2,6 +2,15 @@ import {computed, inject, Injectable, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
+import {ThreadStatus} from '../models/api.model';
+import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
+import {ApiService} from './api.service';
+
+const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
+const RECONNECT_CAP_MS = 30000;
+const RECONNECT_JITTER = 0.1;
+const RECONNECT_MAX_ATTEMPTS = 12;
+const RECONNECT_TERMINAL_CODES = new Set([1000, 4404, 4408, 4503]);
 
 /** A chat message in the persistent session. */
 export interface ChatMessage {
@@ -13,6 +22,17 @@ export interface ChatMessage {
     timestamp: Date;
     /** True for messages loaded from DB history (not live). */
     historical?: boolean;
+    /** Files uploaded to the workspace alongside this user message. */
+    attachments?: ChatAttachment[];
+}
+
+/** Attachment chip shown alongside a user message. */
+export interface ChatAttachment {
+    name: string;
+    size: number;
+    mimeType: string;
+    /** Workspace-relative path, e.g. "uploads/photo.jpg". */
+    path: string;
 }
 
 /** Info about a tool call within an assistant message. */
@@ -21,7 +41,7 @@ export interface ToolCallInfo {
     tool: string;
     args: Record<string, unknown>;
     result?: string;
-    status: 'pending' | 'running' | 'completed' | 'denied';
+    status: 'pending' | 'running' | 'completed' | 'denied' | 'error';
     /** Tool category from the registry (e.g. workspace, git, research). */
     category?: string;
     /**
@@ -64,11 +84,17 @@ export type NarrationMode = 'silent' | 'verbose' | 'auto';
 @Injectable({providedIn: 'root'})
 export class PersistentChatService {
     private readonly http = inject(HttpClient);
+    private readonly api = inject(ApiService);
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
     readonly isConnected = computed(() => this.connectionState() === 'connected');
     readonly threadId = signal<string | null>(null);
+
+    // --- Reconnect engine ---
+    readonly reconnectAttempt = signal<number>(0);
+    readonly reconnectGaveUp = signal<boolean>(false);
+    readonly reconnectMaxAttempts = RECONNECT_MAX_ATTEMPTS;
 
     // --- Chat state ---
     readonly messages = signal<ChatMessage[]>([]);
@@ -98,6 +124,10 @@ export class PersistentChatService {
     readonly ncSessionFolder = signal<string | null>(null);
     readonly cloudSessionUrl = signal<string | null>(null);
 
+    // --- Lifecycle state from the row (drives the resume card) ---
+    readonly threadStatus = signal<ThreadStatus | null>(null);
+    readonly endedAt = signal<string | null>(null);
+
     // --- Session readiness (agent has finished init and is ready for messages) ---
     readonly sessionReady = signal(false);
 
@@ -106,6 +136,15 @@ export class PersistentChatService {
 
     // --- Pending message (submitted before session was ready) ---
     readonly pendingMessage = signal<string | null>(null);
+
+    // --- Pending attachments (queued in composer before send) ---
+    readonly pendingAttachments = signal<FilePreview[]>([]);
+
+    // --- Upload state (true while the next send is busy uploading files) ---
+    readonly isUploadingAttachments = signal(false);
+
+    // --- Last upload error (cleared on next successful send) ---
+    readonly attachmentError = signal<string | null>(null);
 
     // --- Session tasks ---
     readonly tasks = signal<SessionTask[]>([]);
@@ -124,6 +163,8 @@ export class PersistentChatService {
 
     private ws: WebSocket | null = null;
     private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private intentionalClose = false;
+    private lastConnectUrl: string | null = null;
 
     /**
      * Connect to a persistent agent session.
@@ -152,6 +193,13 @@ export class PersistentChatService {
         this.threadId.set(threadId);
         await this.loadHistory(threadId);
         await this.loadThreadMeta(threadId);
+
+        // Don't auto-connect to ended sessions — render the read-only resume
+        // card instead. The user explicitly clicks "Resume" to come back online.
+        if (this.threadStatus() === 'ended') {
+            this.connectionState.set('disconnected');
+            return;
+        }
 
         const apiUrl = environment.apiUrl;
         const wsBase = apiUrl
@@ -237,6 +285,8 @@ export class PersistentChatService {
             this.turnCount.set(thread.total_turns || 0);
             this.ncSessionFolder.set(thread.nc_session_folder || null);
             this.cloudSessionUrl.set(thread.cloud_session_url || null);
+            this.threadStatus.set((thread.status as ThreadStatus) || null);
+            this.endedAt.set(thread.ended_at || thread.last_activity || null);
         } catch {
             // Non-fatal — UI will show fallback values
         }
@@ -244,11 +294,15 @@ export class PersistentChatService {
 
     /** Open the WebSocket connection. */
     private _connectWs(url: string): void {
+        this.intentionalClose = false;
+        this.lastConnectUrl = url;
         this.ws = new WebSocket(url);
 
         this.ws.onopen = () => {
             this.connectionState.set('connected');
             this.error.set(null);
+            this.reconnectAttempt.set(0);
+            this.reconnectGaveUp.set(false);
         };
 
         this.ws.onmessage = (event) => {
@@ -264,23 +318,121 @@ export class PersistentChatService {
             this.connectionState.set('disconnected');
             this.isStreaming.set(false);
             this.isWaitingForInput.set(false);
-            if (event.code !== 1000 && event.code !== 4408) {
+
+            if (this.intentionalClose) return;
+
+            const willReconnect = this.shouldReconnect(event.code);
+
+            // Don't surface a generic error string when the reconnect banner
+            // is about to take over — it's the better signal for the user.
+            if (!willReconnect && event.code !== 1000 && event.code !== 4408) {
                 this.error.set(`Connection closed: ${event.reason || `code ${event.code}`}`);
+            }
+
+            // The agent's _detach_session() writes the row to 'ended' AFTER the
+            // WS dies (idle timeout, agent crash, network drop). Re-fetch meta
+            // so the UI picks up the flip and renders the resume card without
+            // requiring a manual reload.
+            const threadIdAtClose = this.threadId();
+            if (threadIdAtClose) {
+                setTimeout(async () => {
+                    if (this.threadId() !== threadIdAtClose) return;
+                    if (this.connectionState() === 'connected') return;
+                    await this.loadThreadMeta(threadIdAtClose);
+                    if (this.threadStatus() === 'ended') {
+                        this._cancelReconnect();
+                    }
+                }, 1500);
+            }
+
+            if (willReconnect) {
+                this._scheduleReconnect();
             }
         };
 
         this.ws.onerror = () => {
+            // Mid-reconnect, the close handler drives the loop — don't surface
+            // a redundant error state that would mask the reconnect banner.
+            if (this.reconnectAttempt() > 0) return;
             this.connectionState.set('error');
             this.error.set('WebSocket connection failed');
         };
     }
 
-    /** Disconnect from the session. */
-    disconnect(): void {
+    private shouldReconnect(code: number): boolean {
+        if (RECONNECT_TERMINAL_CODES.has(code)) return false;
+        if (this.threadStatus() === 'ended') return false;
+        return true;
+    }
+
+    private _scheduleReconnect(): void {
+        if (this.intentionalClose) return;
+        if (this.threadStatus() === 'ended') return;
+
+        if (this.reconnectAttempt() >= RECONNECT_MAX_ATTEMPTS) {
+            this.reconnectGaveUp.set(true);
+            return;
+        }
+
+        const idx = this.reconnectAttempt();
+        const baseDelay = RECONNECT_DELAYS_MS[idx] ?? RECONNECT_CAP_MS;
+        const jitter = baseDelay * RECONNECT_JITTER * (Math.random() * 2 - 1);
+        const delay = Math.max(0, Math.round(baseDelay + jitter));
+
+        this.reconnectAttempt.set(idx + 1);
+
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.intentionalClose) return;
+            if (this.threadStatus() === 'ended') return;
+            const url = this.lastConnectUrl;
+            if (!url) return;
+            this.connectionState.set('connecting');
+            this._connectWs(url);
+        }, delay);
+    }
+
+    private _cancelReconnect(): void {
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = null;
         }
+        this.reconnectAttempt.set(0);
+        this.reconnectGaveUp.set(false);
+    }
+
+    /** Cancel the current backoff wait and immediately fire a reconnect attempt.
+     *  From the gave-up state, also resets the attempt counter. */
+    reconnectNow(): void {
+        if (this.intentionalClose) return;
+        if (!this.lastConnectUrl) return;
+
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
+        if (this.reconnectGaveUp()) {
+            this.reconnectAttempt.set(0);
+            this.reconnectGaveUp.set(false);
+        }
+
+        this.reconnectAttempt.set(this.reconnectAttempt() + 1);
+        this.connectionState.set('connecting');
+        this._connectWs(this.lastConnectUrl);
+    }
+
+    /** Disconnect from the session. */
+    disconnect(): void {
+        this.intentionalClose = true;
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        this.reconnectAttempt.set(0);
+        this.reconnectGaveUp.set(false);
+        this.lastConnectUrl = null;
         if (this.ws) {
             this.ws.onclose = null; // Prevent error handling on intentional close
             this.ws.close(1000);
@@ -299,6 +451,8 @@ export class PersistentChatService {
         this.turnCount.set(0);
         this.ncSessionFolder.set(null);
         this.cloudSessionUrl.set(null);
+        this.threadStatus.set(null);
+        this.endedAt.set(null);
         this.tasks.set([]);
         this.undoAvailable.set(false);
         this.isSessionPaused.set(false);
@@ -317,34 +471,109 @@ export class PersistentChatService {
         await this.connect(threadId);
     }
 
+    /** Add files queued in the composer to be uploaded on next send. */
+    addAttachments(previews: FilePreview[]): void {
+        if (!previews.length) return;
+        this.pendingAttachments.update((existing) => [...existing, ...previews]);
+        this.attachmentError.set(null);
+    }
+
+    /** Drop one queued attachment by id. */
+    removeAttachment(id: string): void {
+        this.pendingAttachments.update((list) => list.filter((p) => p.id !== id));
+    }
+
+    /** Drop all queued attachments. */
+    clearAttachments(): void {
+        this.pendingAttachments.set([]);
+    }
+
     /** Send a user message (with slash command parsing).
      *  If the session isn't ready yet, queues the message and sends it
      *  automatically once the agent signals readiness.
+     *
+     *  When ``pendingAttachments`` is non-empty, files are uploaded to the
+     *  thread workspace's ``uploads/`` directory first, then a hint listing
+     *  the uploaded filenames is appended to the message text the agent
+     *  receives over the WS. The displayed user message keeps the original
+     *  text and shows uploaded files as separate attachment chips.
      */
-    sendMessage(content: string): void {
-        if (!content.trim()) return;
-
-        // Slash command parsing
+    async sendMessage(content: string): Promise<void> {
         const trimmed = content.trim();
+
+        // Slash commands bypass attachment logic.
         if (trimmed.startsWith('/')) {
-            const handled = this.handleSlashCommand(trimmed);
-            if (handled) return;
+            if (this.handleSlashCommand(trimmed)) return;
         }
 
-        // Add to local messages immediately so the user sees their input
+        const queued = this.pendingAttachments();
+        if (!trimmed && queued.length === 0) return;
+
+        let uploaded: ThreadUploadedFile[] = [];
+        if (queued.length > 0) {
+            const threadId = this.threadId();
+            if (!threadId) {
+                this.attachmentError.set('Cannot upload: no active thread');
+                return;
+            }
+            const files = queued.filter((p) => p.file).map((p) => p.file);
+            this.isUploadingAttachments.set(true);
+            this.attachmentError.set(null);
+            queued.forEach((p) => (p.uploadStatus = UploadStatus.UPLOADING));
+            try {
+                const result = await firstValueFrom(this.api.uploadToThread(threadId, files));
+                uploaded = result.files;
+                queued.forEach((p) => (p.uploadStatus = UploadStatus.COMPLETED));
+            } catch (err) {
+                const msg = this.api.humanizeUploadError(err);
+                queued.forEach((p) => {
+                    p.uploadStatus = UploadStatus.FAILED;
+                    p.error = msg;
+                });
+                this.attachmentError.set(msg);
+                return;
+            } finally {
+                this.isUploadingAttachments.set(false);
+            }
+            // Successful upload — drop the previews so the composer clears
+            this.clearAttachments();
+        }
+
+        const attachments: ChatAttachment[] = uploaded.map((f) => ({
+            name: f.name,
+            size: f.size,
+            mimeType: f.mime_type,
+            path: f.path,
+        }));
+
+        // What the agent sees: text + a plain-language hint about the files.
+        let wsContent = trimmed;
+        if (attachments.length > 0) {
+            const list = attachments.map((a) => a.name).join(', ');
+            const hint = `[Attached files in uploads/: ${list}]`;
+            wsContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
+        }
+
+        // Add to local messages — content is the user's typed text only;
+        // uploaded files render as separate attachment chips in the UI.
         this.messages.update((msgs) => [
             ...msgs,
-            {role: 'user', content, timestamp: new Date()},
+            {
+                role: 'user',
+                content: trimmed,
+                timestamp: new Date(),
+                attachments: attachments.length > 0 ? attachments : undefined,
+            },
         ]);
 
-        // If session isn't ready yet, queue and send when ready
+        // If session isn't ready yet, queue and send when ready.
         if (!this.sessionReady() || !this.ws) {
-            this.pendingMessage.set(content);
+            this.pendingMessage.set(wsContent);
             return;
         }
 
         this.isWaitingForInput.set(false);
-        this.send({method: 'message', content});
+        this.send({method: 'message', content: wsContent});
     }
 
     /** Parse and dispatch slash commands. Returns true if handled. */
@@ -434,6 +663,16 @@ export class PersistentChatService {
         if (this.isInterrupting()) return; // Already interrupting
         this.isInterrupting.set(true);
         this.send({method: 'interrupt'});
+    }
+
+    /** Stop a pending permission prompt + halt the turn so the user can
+     *  type a follow-up. Denies the call so the backend isn't stranded
+     *  awaiting a decision (the loop would otherwise block on the
+     *  `permission_check` await forever), then sends interrupt so the
+     *  next loop iteration bails out instead of acting on the denial. */
+    stop(): void {
+        this.deny();
+        this.interrupt();
     }
 
     /** Change permission mode. */
@@ -544,10 +783,11 @@ export class PersistentChatService {
 
             case 'tool.completed': {
                 const id = params['id'] as string;
+                const nextStatus: 'completed' | 'error' = params['is_error'] ? 'error' : 'completed';
                 this.currentToolCalls.update((calls) =>
                     calls.map((tc) =>
                         tc.id === id
-                            ? {...tc, status: 'completed' as const, result: (params['result'] as string) || ''}
+                            ? {...tc, status: nextStatus, result: (params['result'] as string) || ''}
                             : tc,
                     ),
                 );
@@ -616,16 +856,21 @@ export class PersistentChatService {
                     role: 'system', content: 'Session ended.', timestamp: new Date(),
                 }]);
                 this.isWaitingForInput.set(false);
+                this.threadStatus.set('ended');
+                this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'session.idle_timeout':
-                this.isSessionPaused.set(true);
                 this.messages.update(msgs => [...msgs, {
                     role: 'system',
                     content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
                     timestamp: new Date(),
                 }]);
                 this.isWaitingForInput.set(false);
+                // The agent's idle archive flips the row to 'ended'. Reflect
+                // that locally so the UI swaps to the read-only resume card.
+                this.threadStatus.set('ended');
+                this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'vm_upgrade.needed':

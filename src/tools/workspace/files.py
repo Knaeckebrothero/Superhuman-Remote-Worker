@@ -17,6 +17,10 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
+from src.services.image_content import (
+    IMAGE_DATA_TAG_TEMPLATE,
+    PAGE_IMAGE_TAG_TEMPLATE,
+)
 from src.utils.pdf import PDFReader, format_read_info
 from ..context import ToolContext
 
@@ -189,15 +193,17 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 base64_image = base64.b64encode(image_data).decode()
                 mime_type = _get_mime_type(local_path)
 
-                # Return in a format that can be parsed by the agent
-                # The LLM will receive this as text, but we format it clearly
+                # The tag is stripped + replaced with a marker by the
+                # graph-side post-processor (`extract_image_tags` in
+                # `src/services/image_content.py`), which also appends a
+                # synthesized HumanMessage carrying the image as a real
+                # provider content block. Multimodal primary models see
+                # the actual image; the cleaned ToolMessage stays small.
                 return (
                     f"[IMAGE: {name}]\n"
                     f"Type: {mime_type}\n"
                     f"Size: {len(image_data):,} bytes\n\n"
-                    f'<image_data mime_type="{mime_type}">\n'
-                    f"{base64_image}\n"
-                    f"</image_data>"
+                    + IMAGE_DATA_TAG_TEMPLATE.format(mime=mime_type, b64=base64_image)
                 )
             except Exception as e:
                 logger.error(f"Error reading image {local_path}: {e}")
@@ -384,12 +390,12 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 return ""  # No visual content available
 
             if context.get_phase_multimodal():
-                # Return base64 image for multimodal model
+                # Tag is stripped + delivered as a real image content block
+                # by the graph-side post-processor; see
+                # `src/services/image_content.py`.
                 base64_image = base64.b64encode(page_image).decode()
-                return (
-                    f'\n<page_image page="{page_num}" mime_type="image/png">\n'
-                    f"{base64_image}\n"
-                    f"</page_image>"
+                return "\n" + PAGE_IMAGE_TAG_TEMPLATE.format(
+                    page=page_num, mime="image/png", b64=base64_image
                 )
             else:
                 # Get AI description for text-only model

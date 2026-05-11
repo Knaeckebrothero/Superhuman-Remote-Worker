@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, Component, computed, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
+import {ChangeDetectionStrategy, Component, computed, DestroyRef, effect, ElementRef, inject, OnInit, signal, viewChild} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {AdminModelsService} from '../../../core/services/admin-models.service';
 import {AdminProvidersService} from '../../../core/services/admin-providers.service';
@@ -486,6 +486,7 @@ export class AdminModelsComponent implements OnInit {
   readonly models = inject(AdminModelsService);
   readonly providers = inject(AdminProvidersService);
   private readonly coordinator = inject(AdminLlmCoordinatorService);
+  private readonly destroyRef = inject(DestroyRef);
 
   private readonly discoverPaneRef = viewChild<ElementRef<HTMLElement>>('discoverPane');
 
@@ -584,6 +585,22 @@ export class AdminModelsComponent implements OnInit {
     return Array.from(groups.values()).sort((a, b) => a.label.localeCompare(b.label));
   });
 
+  constructor() {
+    // Native <select> displays the first option when no value matches, which
+    // misleads the operator into thinking a provider is selected when the
+    // signal is still empty — leaving the discover pane hidden and the Add
+    // button disabled. When exactly one available provider exists, lock the
+    // form to it.
+    effect(() => {
+      const options = this.providerOptions();
+      if (this.formProviderKey()) return;
+      const available = options.filter((o) => o.available);
+      if (available.length !== 1) return;
+      const only = available[0];
+      this.onProviderKeyChange(`${only.kind}:${only.ref}`);
+    });
+  }
+
   ngOnInit(): void {
     this.models.loadModels();
     this.models.loadFamilies();
@@ -592,7 +609,7 @@ export class AdminModelsComponent implements OnInit {
     this.providers.loadCodexAvailability();
 
     this.coordinator.discoverEndpoint$
-      .pipe(takeUntilDestroyed())
+      .pipe(takeUntilDestroyed(this.destroyRef))
       .subscribe((endpointId) => this.preselectAndDiscover(endpointId));
   }
 

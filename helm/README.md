@@ -328,8 +328,9 @@ The unified policy enforces:
 
 - **Ingress**: SSH/CDP only from the agent, IDE only from the orchestrator
   / Traefik.
-- **Egress**: DNS, TCP 80/443, Tailscale (UDP/41641 + UDP/3478), in-cluster
-  database services. No general internet beyond HTTP/S.
+- **Egress**: DNS, TCP 22/80/443, Tailscale (UDP/41641 + UDP/3478), in-cluster
+  database services. No general internet beyond HTTP/S + SSH (SSH is needed
+  for git clone of SSH-auth repository datasources).
 - **VM↔VM and container↔container lateral isolation**: the policy does not
   list the workspace label as an allowed source.
 

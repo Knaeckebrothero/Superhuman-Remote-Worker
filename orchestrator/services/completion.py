@@ -322,6 +322,12 @@ def determine_job_status(
         return ("waiting", None)
     if freeze_type == "vm_upgrade_required":
         return ("paused", None)
+    if freeze_type == "version_upgrade":
+        # Continue-as-New: agent observed orchestrator-set drain intent,
+        # froze cleanly at a phase boundary, and the same job context
+        # gets re-dispatched to a fresh-version agent by the auto-assign
+        # dispatcher. State preserved through ``freeze_data`` + workspace.
+        return ("paused", None)
     return ("pending_review", None)
 
 

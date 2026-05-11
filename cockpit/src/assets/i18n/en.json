@@ -68,7 +68,6 @@
     "emptyFilterActive": "No active sessions.",
     "emptyFilterEnded": "No ended sessions.",
     "untitledSession": "Untitled Session",
-    "confirmEnd": "End this session? Work will be saved but the agent will stop.",
     "confirmDelete": "Delete this session permanently?",
     "turnsOne": "turn",
     "turnsMany": "turns",
@@ -80,7 +79,6 @@
     "tooltip": {
       "sessionFiles": "Session Files",
       "resume": "Resume",
-      "end": "End",
       "delete": "Delete"
     },
     "create": {
@@ -682,6 +680,15 @@
       "error": "Error",
       "disconnected": "Disconnected"
     },
+    "disconnected": {
+      "title": "Lost contact",
+      "dropped": "Connection dropped. Reconnecting…",
+      "retrying": "Retrying… (attempt {{attempt}} of {{max}})",
+      "gaveUp": "Couldn't reconnect after several attempts.",
+      "retryNow": "Retry now",
+      "reconnect": "Reconnect"
+    },
+    "jumpToLatest": "Jump to latest · {{count}} new",
     "header": {
       "settingsTooltip": "Session settings",
       "filesButton": "Files",
@@ -715,19 +722,30 @@
     },
     "system": {
       "sessionResumed": "Session resumed",
-      "emptyPrompt": "Start a conversation...",
       "resumeSession": "Resume Session",
       "resuming": "Resuming...",
       "resumeFailed": "Failed to resume session"
     },
+    "empty": {
+      "title": "What shall we conquer today?",
+      "subtitle": "The agent is connected and listening. Issue a brief, or pick a starting point below."
+    },
+    "ended": {
+      "eyebrow": "Resumable",
+      "title": "Resume this session?",
+      "body": "This session is currently ended. Resume to bring the agent back online and continue where you left off.",
+      "endedAt": "Session ended {{ date }}",
+      "resume": "Resume"
+    },
     "startup": {
-      "creating": "Creating session...",
-      "provisioning": "Provisioning agent...",
-      "booting": "Agent starting...",
-      "connecting": "Connecting to agent...",
-      "starting": "Session starting...",
-      "reconnecting": "Reconnecting agent...",
-      "connectingFallback": "Connecting..."
+      "title": "Starting session",
+      "titleResume": "Resuming session",
+      "steps": {
+        "creating": "Creating thread",
+        "provisioning": "Provisioning agent",
+        "booting": "Booting agent runtime",
+        "connecting": "Establishing connection"
+      }
     },
     "thinking": {
       "past": "Thought for a moment",
@@ -739,13 +757,14 @@
       "statusCompleted": "completed",
       "statusRunning": "running",
       "statusDenied": "denied",
-      "statusPending": "pending"
+      "statusPending": "pending",
+      "statusError": "error"
     },
     "permission": {
       "title": "Permission required",
       "approve": "Approve",
       "autoAccept": "Auto-accept",
-      "deny": "Deny"
+      "stop": "Stop"
     },
     "approval": {
       "pendingTitle": "Approval needed to run this tool",
@@ -762,7 +781,32 @@
       "sessionStarting": "Type your message while the session starts...",
       "stopping": "Stopping...",
       "working": "Agent is working...",
+      "reconnecting": "Disconnected — reconnecting…",
+      "uploading": "Uploading attachments…",
       "default": "Type a message... (Enter to send, Shift+Enter for newline)"
+    },
+    "composer": {
+      "attach": "Attach",
+      "chooseFile": "Choose file",
+      "takePhoto": "Take photo",
+      "capturePhoto": "Capture photo",
+      "recordVoice": "Hold to record voice message",
+      "recordingStop": "Stop recording",
+      "recordingCancel": "Cancel recording",
+      "remove": "Remove",
+      "send": "Send",
+      "stop": "Stop",
+      "dropHint": "Drop files to attach",
+      "cameraDenied": "Camera permission denied",
+      "cameraError": "Could not access camera",
+      "micDenied": "Microphone permission denied",
+      "micError": "Could not start recording"
+    },
+    "tts": {
+      "play": "Read aloud",
+      "stop": "Stop reading",
+      "generating": "Generating speech…",
+      "error": "Speech failed — click to retry"
     },
     "code": {
       "expandHint": "Click to expand",
@@ -1603,7 +1647,7 @@
       "cta": "Install"
     },
     "update": {
-      "title": "A new standard is ready",
+      "title": "A new update is ready",
       "body": "Reload to deploy the latest version.",
       "cta": "Reload"
     },

@@ -68,7 +68,6 @@
     "emptyFilterActive": "Keine aktiven Sitzungen.",
     "emptyFilterEnded": "Keine beendeten Sitzungen.",
     "untitledSession": "Unbenannte Sitzung",
-    "confirmEnd": "Diese Sitzung beenden? Die Arbeit wird gespeichert, aber der Agent stoppt.",
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
@@ -80,7 +79,6 @@
     "tooltip": {
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
-      "end": "Beenden",
       "delete": "Löschen"
     },
     "create": {
@@ -682,6 +680,15 @@
       "error": "Fehler",
       "disconnected": "Getrennt"
     },
+    "disconnected": {
+      "title": "Verbindung verloren",
+      "dropped": "Verbindung unterbrochen. Verbinde erneut…",
+      "retrying": "Erneuter Versuch… (Versuch {{attempt}} von {{max}})",
+      "gaveUp": "Erneuter Verbindungsaufbau nach mehreren Versuchen fehlgeschlagen.",
+      "retryNow": "Jetzt erneut versuchen",
+      "reconnect": "Erneut verbinden"
+    },
+    "jumpToLatest": "Zum Aktuellen · {{count}} neu",
     "header": {
       "settingsTooltip": "Sitzungseinstellungen",
       "filesButton": "Dateien",
@@ -715,19 +722,30 @@
     },
     "system": {
       "sessionResumed": "Sitzung fortgesetzt",
-      "emptyPrompt": "Beginnen Sie eine Unterhaltung...",
       "resumeSession": "Sitzung fortsetzen",
       "resuming": "Wird fortgesetzt...",
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden"
     },
+    "empty": {
+      "title": "Was wollen wir heute erobern?",
+      "subtitle": "Der Agent ist verbunden und bereit. Stelle eine Aufgabe oder wähle unten einen Startpunkt."
+    },
+    "ended": {
+      "eyebrow": "Wiederaufnehmbar",
+      "title": "Sitzung fortsetzen?",
+      "body": "Diese Sitzung ist beendet. Setze sie fort, um den Agenten wieder zu aktivieren und an der Stelle weiterzumachen, an der du aufgehört hast.",
+      "endedAt": "Sitzung beendet {{ date }}",
+      "resume": "Fortsetzen"
+    },
     "startup": {
-      "creating": "Sitzung wird erstellt...",
-      "provisioning": "Agent wird bereitgestellt...",
-      "booting": "Agent startet...",
-      "connecting": "Verbinde mit Agent...",
-      "starting": "Sitzung startet...",
-      "reconnecting": "Agent wird erneut verbunden...",
-      "connectingFallback": "Verbinde..."
+      "title": "Sitzung wird gestartet",
+      "titleResume": "Sitzung wird fortgesetzt",
+      "steps": {
+        "creating": "Thread wird erstellt",
+        "provisioning": "Agent wird bereitgestellt",
+        "booting": "Agent-Laufzeit startet",
+        "connecting": "Verbindung wird hergestellt"
+      }
     },
     "thinking": {
       "past": "Hat einen Moment nachgedacht",
@@ -739,13 +757,14 @@
       "statusCompleted": "abgeschlossen",
       "statusRunning": "läuft",
       "statusDenied": "abgelehnt",
-      "statusPending": "ausstehend"
+      "statusPending": "ausstehend",
+      "statusError": "Fehler"
     },
     "permission": {
       "title": "Berechtigung erforderlich",
       "approve": "Genehmigen",
       "autoAccept": "Auto-akzeptieren",
-      "deny": "Ablehnen"
+      "stop": "Stoppen"
     },
     "approval": {
       "pendingTitle": "Bestätigung erforderlich, um dieses Tool auszuführen",
@@ -762,7 +781,32 @@
       "sessionStarting": "Schreiben Sie Ihre Nachricht, während die Sitzung startet...",
       "stopping": "Wird gestoppt...",
       "working": "Agent arbeitet...",
+      "reconnecting": "Getrennt — verbinde erneut…",
+      "uploading": "Anhänge werden hochgeladen…",
       "default": "Nachricht eingeben... (Eingabe zum Senden, Umschalt+Eingabe für neue Zeile)"
+    },
+    "composer": {
+      "attach": "Anhängen",
+      "chooseFile": "Datei wählen",
+      "takePhoto": "Foto aufnehmen",
+      "capturePhoto": "Foto aufnehmen",
+      "recordVoice": "Halten zum Aufnehmen",
+      "recordingStop": "Aufnahme stoppen",
+      "recordingCancel": "Aufnahme abbrechen",
+      "remove": "Entfernen",
+      "send": "Senden",
+      "stop": "Stoppen",
+      "dropHint": "Dateien hier ablegen, um sie anzuhängen",
+      "cameraDenied": "Kamerazugriff verweigert",
+      "cameraError": "Kamera nicht verfügbar",
+      "micDenied": "Mikrofonzugriff verweigert",
+      "micError": "Aufnahme konnte nicht gestartet werden"
+    },
+    "tts": {
+      "play": "Vorlesen",
+      "stop": "Vorlesen stoppen",
+      "generating": "Sprache wird erzeugt…",
+      "error": "Sprache fehlgeschlagen — zum Wiederholen klicken"
     },
     "code": {
       "expandHint": "Klicken zum Ausklappen",
@@ -1603,7 +1647,7 @@
       "cta": "Installieren"
     },
     "update": {
-      "title": "Ein neuer Standard ist bereit",
+      "title": "Eine neue Version ist verfügbar",
       "body": "Neu laden, um die aktuelle Version zu beziehen.",
       "cta": "Neu laden"
     },

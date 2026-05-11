@@ -29,6 +29,7 @@ from langchain_core.messages import (
 )
 
 from .core.context import ContextManager
+from .services.image_content import extract_image_tags, make_multimodal_user_message
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,12 @@ class PersistentLoopCallbacks:
     # Notify client that a tool is about to execute
     on_tool_start: Callable[[str, Dict[str, Any], str], Awaitable[None]]
 
-    # Notify client with tool result
-    on_tool_result: Callable[[str, str, str], Awaitable[None]]
+    # Notify client with tool result. The trailing ``is_error`` kwarg signals
+    # tool-execution failures (tool not found, exception during ainvoke). The
+    # transport may use it to render the call with an error treatment instead
+    # of the success styling. Defaults to False for backwards compatibility
+    # with older callers.
+    on_tool_result: Callable[..., Awaitable[None]]
 
     # Ask client for permission to run a tool (returns True if approved).
     # tool_call_id lets the transport correlate the decision back to a
@@ -360,7 +365,15 @@ async def _execute_turn(
         except asyncio.TimeoutError:
             logger.warning("Memory retrieval timed out — skipping injection")
         except Exception as e:
-            logger.warning(f"Memory retrieval failed (non-fatal): {e}")
+            # Log the exception type so this stops being guesswork — bare
+            # `e` for openai.APIConnectionError formats as "Connection error."
+            # with no detail. See
+            # docs/issues/persistent_graph_misleading_embedding_connection_error.md
+            logger.warning(
+                "Memory retrieval failed (non-fatal): %s: %s",
+                type(e).__name__,
+                e,
+            )
 
     effective_pids = project_ids or ([project_id] if project_id else [])
     if knowledge_store and effective_pids:
@@ -395,7 +408,12 @@ async def _execute_turn(
         except asyncio.TimeoutError:
             logger.warning("Knowledge retrieval timed out — skipping injection")
         except Exception as e:
-            logger.warning(f"Knowledge retrieval failed (non-fatal): {e}")
+            # See sibling memory-retrieval handler above for rationale.
+            logger.warning(
+                "Knowledge retrieval failed (non-fatal): %s: %s",
+                type(e).__name__,
+                e,
+            )
 
     while True:
         # Check for interrupt before LLM call
@@ -814,22 +832,43 @@ async def _execute_turn(
                 messages.append(
                     ToolMessage(content=error_result, tool_call_id=tool_call_id)
                 )
-                await callbacks.on_tool_result(tool_name, error_result, tool_call_id)
+                await callbacks.on_tool_result(
+                    tool_name, error_result, tool_call_id, is_error=True
+                )
                 messages_added += 1
                 continue
 
+            is_error = False
             try:
                 result = await tool.ainvoke(tool_args)
                 result_str = str(result) if result is not None else ""
             except Exception as e:
                 logger.warning(f"Tool {tool_name} failed: {e}")
                 result_str = f"Tool execution error: {e}"
+                is_error = True
 
-            messages.append(ToolMessage(content=result_str, tool_call_id=tool_call_id))
+            # Multimodal image delivery: if the tool result embedded a
+            # `<image_data>` / `<page_image>` tag, strip it and attach the
+            # image as a real provider content block on a follow-up
+            # HumanMessage so multimodal primary models actually see it.
+            cleaned_str, extracted_images = extract_image_tags(result_str)
+
+            messages.append(ToolMessage(content=cleaned_str, tool_call_id=tool_call_id))
             messages_added += 1
             tool_calls_made += 1
 
-            await callbacks.on_tool_result(tool_name, result_str, tool_call_id)
+            if extracted_images:
+                messages.append(
+                    make_multimodal_user_message(
+                        text=(f"Image content from tool call {tool_call_id}:"),
+                        images=extracted_images,
+                    )
+                )
+                messages_added += 1
+
+            await callbacks.on_tool_result(
+                tool_name, cleaned_str, tool_call_id, is_error=is_error
+            )
 
             # Check for freeze request (e.g. sudo intercept → VM upgrade)
             if tool_context and callbacks.on_vm_upgrade_needed:

@@ -115,8 +115,11 @@ orchestrator:
 # Agent
 # =============================================================================
 agent:
-  # -- Static replica count (0 = dynamic provisioning via AgentProvisioner)
-  replicas: 0
+  # All agent pods are now provisioned dynamically by AgentProvisioner.
+  # The static Deployment was removed in Phase 1a of the unified instance
+  # lifecycle redesign — `agent.replicas` is no longer honored. The
+  # PodDisruptionBudget and Service stay; they target the dynamic pods
+  # via shared chart selector labels.
   config: "defaults"
   port: "8001"
   persistentConfig: "interactive"
@@ -591,7 +594,12 @@ opencloud:
   enabled: true
   image: docker.io/opencloudeu/opencloud:latest
   storageClass: ""
-  dataStorageSize: "10Gi"
+  # OpenCloud's decomposeds3 driver buffers TUS uploads on the local PVC
+  # before promoting them to S3 on finalize. Sized for multi-GB uploads
+  # at moderate concurrency — bumping below this risks a disk-full
+  # cascade where postprocessing can't drain via NATS jetstream and the
+  # entire UI returns "Resource not found" until staging is cleared.
+  dataStorageSize: "64Gi"
   configStorageSize: "1Gi"
   resources:
     requests:

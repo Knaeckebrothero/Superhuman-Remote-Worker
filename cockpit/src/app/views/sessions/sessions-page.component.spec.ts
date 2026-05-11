@@ -331,40 +331,41 @@ describe('SessionsPageComponent', () => {
     // =========================================================================
 
     describe('resumeSession()', () => {
-        it('should navigate to session page', () => {
+        it('should navigate to session page for active thread', () => {
             const thread = makeThread({id: 'thread-abc'});
             component.resumeSession(thread);
 
             expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-abc']);
         });
-    });
 
-    // =========================================================================
-    // 9.2.6: endSession()
-    // =========================================================================
+        it('should POST to resume endpoint when thread is ended', async () => {
+            mockHttp.post.mockReturnValue(of({}));
+            const thread = makeThread({id: 'thread-end', status: 'ended'});
+            await component.resumeSession(thread);
 
-    describe('endSession()', () => {
-        it('should call DELETE endpoint', async () => {
-            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
-            const thread = makeThread({id: 'thread-xyz'});
-            await component.endSession(thread);
-
-            expect(mockHttp.delete).toHaveBeenCalled();
-            const url = mockHttp.delete.mock.calls[0][0];
-            expect(url).toContain('thread-xyz');
-        });
-
-        it('should reload threads after ending', async () => {
-            vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
-            const loadSpy = vi.spyOn(component, 'loadThreads');
-            await component.endSession(makeThread());
-
-            expect(loadSpy).toHaveBeenCalled();
+            const resumeCall = mockHttp.post.mock.calls.find(
+                (c: any[]) => c[0]?.includes(`/persistent/threads/thread-end/resume`),
+            );
+            expect(resumeCall).toBeTruthy();
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-end']);
         });
     });
 
+    describe('openSession()', () => {
+        it('should navigate without POSTing /resume even for ended threads', () => {
+            const thread = makeThread({id: 'thread-end', status: 'ended'});
+            component.openSession(thread);
+
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 'thread-end']);
+            const resumeCall = mockHttp.post.mock.calls.find(
+                (c: any[]) => c[0]?.includes('/resume'),
+            );
+            expect(resumeCall).toBeUndefined();
+        });
+    });
+
     // =========================================================================
-    // 9.2.7: toggleProject() / isProjectSelected()
+    // 9.2.6: toggleProject() / isProjectSelected()
     // =========================================================================
 
     describe('project selection', () => {

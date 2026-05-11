@@ -1,6 +1,6 @@
 import {inject, Injectable} from '@angular/core';
-import {HttpClient, HttpParams} from '@angular/common/http';
-import {catchError, Observable, of, tap} from 'rxjs';
+import {HttpClient, HttpErrorResponse, HttpParams} from '@angular/common/http';
+import {catchError, map, Observable, of, tap, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from './error-message.service';
@@ -42,7 +42,7 @@ import {
     User,
     WorkspaceOverview,
 } from '../models/api.model';
-import {UploadInfo, UploadResponse} from '../models/file.model';
+import {ThreadUploadResponse, UploadInfo, UploadResponse} from '../models/file.model';
 import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
 import {LLMRequest} from '../../debug/request.model';
 import {GraphChangeResponse, GraphDelta} from '../../debug/graph.model';
@@ -741,6 +741,84 @@ export class ApiService {
         throw error;
       }),
     );
+  }
+
+  /**
+   * Push files into the persistent thread's live workspace uploads/ directory.
+   * Used by the persistent-chat composer for attachment, camera capture, and
+   * voice-message uploads.
+   *
+   * Errors are RE-THROWN (not swallowed to ``null``) so the caller can read
+   * the server-side ``detail`` field — typical messages include
+   * ``"Workspace is not ready — try again in a moment"`` (409) or
+   * ``"Could not reach workspace (host:port)"`` (502). Use
+   * ``humanizeUploadError()`` to map an arbitrary HttpErrorResponse to a
+   * user-facing string.
+   */
+  uploadToThread(threadId: string, files: File[]): Observable<ThreadUploadResponse> {
+    const formData = new FormData();
+    files.forEach((file) => formData.append('files', file, file.name));
+    return this.http
+      .post<ThreadUploadResponse>(
+        `${this.baseUrl}/persistent/threads/${threadId}/uploads`,
+        formData,
+      )
+      .pipe(
+        catchError((error: HttpErrorResponse) => {
+          console.error(`Failed to upload files to thread ${threadId}:`, error);
+          return throwError(() => error);
+        }),
+      );
+  }
+
+  /** Map an upload HttpErrorResponse to a user-facing message. */
+  humanizeUploadError(error: unknown): string {
+    if (error instanceof HttpErrorResponse) {
+      const detail = (error.error && (error.error as {detail?: unknown}).detail) as
+        | string
+        | undefined;
+      if (typeof detail === 'string' && detail.trim()) return detail;
+      if (error.status === 0) return 'Network error — check your connection';
+      if (error.status === 413) return 'File too large';
+      return `Upload failed (HTTP ${error.status}) — try again`;
+    }
+    return 'Upload failed — try again';
+  }
+
+  /**
+   * Generate TTS audio for a chat message in a persistent thread.
+   *
+   * Returns:
+   *   - the MP3 blob on success,
+   *   - `null` on transport error,
+   *   - `'unavailable'` when the server returns 204 (no TTS model
+   *     configured) — distinguishes the "feature disabled" case from a
+   *     real failure so the UI can hide rather than show an error.
+   */
+  generateTTS(
+    threadId: string,
+    content: string,
+    options: {reformulate?: boolean; language?: string} = {},
+  ): Observable<Blob | 'unavailable' | null> {
+    return this.http
+      .post(
+        `${this.baseUrl}/persistent/threads/${threadId}/tts`,
+        {
+          content,
+          reformulate: options.reformulate ?? true,
+          language: options.language ?? 'en',
+        },
+        {responseType: 'blob', observe: 'response'},
+      )
+      .pipe(
+        map((resp) =>
+          resp.status === 204 ? ('unavailable' as const) : (resp.body as Blob),
+        ),
+        catchError((error) => {
+          console.error(`Failed to generate TTS for thread ${threadId}:`, error);
+          return of(null);
+        }),
+      );
   }
 
   // ===== Job Management Endpoints =====

@@ -132,11 +132,18 @@ class TestOrchestratorClient:
 
     @pytest.mark.asyncio
     async def test_heartbeat_success(self, client):
-        """Test successful heartbeat."""
+        """Test successful heartbeat returns the response body.
+
+        Phase 1c: heartbeat returns the JSON response (carries
+        ``intents``) so callers can react to drain/upgrade hints; the
+        old ``bool`` API is gone. Truthy semantics still work for code
+        that only cares about success.
+        """
         client.agent_id = "agent-123"
 
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.json = MagicMock(return_value={"status": "ok", "intents": {}})
 
         with patch.object(client, "_client", AsyncMock()) as mock_client:
             mock_client.post = AsyncMock(return_value=mock_response)
@@ -147,17 +154,39 @@ class TestOrchestratorClient:
                 metrics={"memory_mb": 512, "cpu_percent": 25.5},
             )
 
-            assert result is True
+            assert result == {"status": "ok", "intents": {}}
             mock_client.post.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_heartbeat_returns_intents(self, client):
+        """When orchestrator surfaces drain intent, the agent receives it."""
+        client.agent_id = "agent-123"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json = MagicMock(
+            return_value={
+                "status": "ok",
+                "intents": {"should_drain": True, "drain_reason": "stale_image"},
+            }
+        )
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await client.heartbeat(status="ready")
+
+            assert result["intents"]["should_drain"] is True
+            assert result["intents"]["drain_reason"] == "stale_image"
+
+    @pytest.mark.asyncio
     async def test_heartbeat_without_agent_id(self, client):
-        """Test heartbeat fails when agent_id not set."""
+        """Heartbeat returns None when agent_id not set."""
         client.agent_id = None
 
         result = await client.heartbeat(status="ready")
 
-        assert result is False
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_deregister_success(self, client):

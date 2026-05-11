@@ -70,9 +70,11 @@ import yaml  # noqa: E402
 from fastapi import (  # noqa: E402
     Body,
     FastAPI,
+    File,
     HTTPException,
     Query,
     Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -147,6 +149,12 @@ from services.container_provisioner import container_provisioner  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.lifecycle import (  # noqa: E402
+    AgentInstanceManager,
+    InstanceLifecycleReconciler,
+    VMInstanceManager,
+    WorkspaceInstanceManager,
+)
 from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
@@ -379,32 +387,61 @@ _pause_pending_job_ids: set[str] = set()
 
 
 async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
-    """Background task that marks agents as offline if no heartbeat received.
+    """Background task that reconciles agent state every 60 seconds.
 
-    Runs every 60 seconds and marks agents as offline if they haven't sent
-    a heartbeat in the last 3 minutes.  After marking agents offline, recovers
-    any orphaned jobs (still in 'processing' but assigned to offline/deleted
-    agents) by pausing them so the dispatcher can reassign.
+    Two dimensions of reconciliation:
+
+    1. Heartbeat freshness — agents that stopped reporting get marked offline,
+       which in turn flips their threads to 'ended' and pauses their jobs.
+    2. Self-reported consistency — agents that *are* heartbeating but report
+       internally inconsistent state (working with no job, session bound to
+       an ended thread) get flipped back to 'ready' so the dispatcher can
+       reuse the slot. These zombies pass the heartbeat check and would
+       otherwise hold pool slots indefinitely.
+
+    Finally, offline agents older than 24h are GC'd to keep the table small.
     """
     logger.info("Stale agent detector started")
     while not shutdown_event.is_set():
         try:
+            # 1. Heartbeat-based: mark non-responsive agents offline
             count = await postgres_db.mark_stale_agents_offline(timeout_minutes=3)
             if count > 0:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
-            # Mark threads bound to stale/deleted agents as idle
-            idle_count = await postgres_db.mark_orphaned_threads_idle()
-            if idle_count > 0:
-                logger.info(f"Marked {idle_count} thread(s) as idle (orphaned)")
-            # Recover orphaned jobs from offline or deleted agents
+
+            # 2. Consistency-based: release slots held by zombie agents
+            stuck_working = await postgres_db.mark_stuck_working_agents_ready()
+            if stuck_working > 0:
+                logger.info(
+                    f"Released {stuck_working} agent(s) stuck in 'working' with no job"
+                )
+                _trigger_dispatch()
+            stuck_session = await postgres_db.mark_stuck_session_agents_ready()
+            if stuck_session > 0:
+                logger.info(
+                    f"Released {stuck_session} agent(s) stuck in 'session' "
+                    f"on ended thread"
+                )
+
+            # 3. Propagate: threads bound to offline agents → 'ended'
+            ended_count = await postgres_db.mark_orphaned_threads_ended()
+            if ended_count > 0:
+                logger.info(f"Marked {ended_count} thread(s) as ended (orphaned)")
+
+            # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await postgres_db.recover_orphaned_jobs()
             if recovered > 0:
                 logger.info(
                     f"Recovered {recovered} orphaned job(s) from offline agents"
                 )
                 _trigger_dispatch()
+
+            # 5. GC: drop offline agent rows older than 24h
+            gc_count = await postgres_db.gc_offline_agents(retention_hours=24)
+            if gc_count > 0:
+                logger.info(f"GC'd {gc_count} offline agent record(s) > 24h old")
         except Exception as e:
             logger.error(f"Error in stale agent detector: {e}")
 
@@ -424,6 +461,9 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
     Runs every 60 seconds:
     - Ensures MIN_AGENTS warm pods exist (instant dispatch)
     - Reaps completed / stale / unstartable agent pods (single dispatcher)
+
+    Drift-based draining lives in ``lifecycle_reconciler_loop`` now —
+    this loop only owns capacity (warm pool + scale-down) and crash GC.
     """
     logger.info("Agent pool reconciler started")
     while not shutdown_event.is_set():
@@ -432,9 +472,6 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
                 await agent_provisioner.ensure_warm_pool()
                 await agent_provisioner.reap_pods()
                 await agent_provisioner.scale_down_idle()
-                # Drain idle agents running stale images so new pods
-                # with the current image can be provisioned.
-                await _drain_stale_image_agents()
         except Exception as e:
             logger.error("Error in agent pool reconciler: %s", e)
 
@@ -447,48 +484,32 @@ async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
     logger.info("Agent pool reconciler stopped")
 
 
-async def _drain_stale_image_agents() -> None:
-    """Mark idle agents with outdated build SHAs as draining.
+async def lifecycle_reconciler_loop(
+    shutdown_event: asyncio.Event,
+    reconciler: InstanceLifecycleReconciler,
+) -> None:
+    """Background task driving the unified instance lifecycle reconciler.
 
-    Called by the reconciler every 60s.  Only touches agents that are
-    idle (ready, no job, no thread) so active work is never interrupted.
-    The existing ``reap_stale_pods`` pass will clean up draining pods.
+    Runs every 60 seconds. The reconciler delegates to per-kind
+    managers (``AgentInstanceManager`` etc.) for drift detection and
+    drain. Crash detection still flows through ``reap_pods`` in the
+    sibling ``agent_pool_reconciler`` for now; consolidation is a
+    follow-up.
     """
-    expected = _expected_agent_shas()
-    if not expected:
-        return  # No SHA-tagged images — nothing to compare
+    logger.info("Lifecycle reconciler loop started")
+    while not shutdown_event.is_set():
+        try:
+            await reconciler.tick()
+        except Exception:
+            logger.exception("Lifecycle reconciler tick failed")
 
-    try:
-        rows = await postgres_db.fetch(
-            """
-            SELECT id, metadata
-            FROM agents
-            WHERE status = 'ready'
-              AND current_job_id IS NULL
-              AND thread_id IS NULL
-            """,
-        )
-        for row in rows:
-            meta = row["metadata"] or {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, ValueError):
-                    meta = {}
-            build_sha = meta.get("build_sha", "")
-            if build_sha and build_sha not in expected:
-                logger.info(
-                    "Draining stale idle agent %s (build_sha=%s, expected=%s)",
-                    row["id"],
-                    build_sha,
-                    expected,
-                )
-                await postgres_db.execute(
-                    "UPDATE agents SET status = 'draining' WHERE id = $1",
-                    row["id"],
-                )
-    except Exception:
-        logger.exception("Error draining stale image agents")
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Lifecycle reconciler loop stopped")
 
 
 async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
@@ -1327,7 +1348,8 @@ async def _find_idle_persistent_agent() -> Optional[dict]:
     status in ('ready'), and no thread currently attached.
 
     Agents whose build SHA doesn't match the current expected images
-    are skipped and marked as draining so they get cleaned up.
+    are skipped here; the lifecycle reconciler is responsible for
+    actually draining them.
     """
     try:
         rows = await postgres_db.fetch(
@@ -1352,20 +1374,12 @@ async def _find_idle_persistent_agent() -> Optional[dict]:
                     meta = {}
             if _agent_sha_is_current(meta):
                 return agent
-            # Stale agent — mark as draining so reconciler cleans it up
-            logger.info(
+            logger.debug(
                 "Skipping stale agent %s (build_sha=%s, expected=%s)",
                 agent["id"],
                 meta.get("build_sha", ""),
                 _expected_agent_shas(),
             )
-            try:
-                await postgres_db.execute(
-                    "UPDATE agents SET status = 'draining' WHERE id = $1",
-                    agent["id"],
-                )
-            except Exception:
-                pass
         return None
     except Exception:
         logger.exception("Failed to find idle persistent agent")
@@ -2041,18 +2055,13 @@ async def _try_dispatch_pending_jobs() -> None:
                 if _agent_sha_is_current(meta):
                     available_agents.append(ag)
                 else:
-                    logger.info(
+                    # Stale-SHA agents are skipped here; the lifecycle
+                    # reconciler is responsible for draining them.
+                    logger.debug(
                         "Skipping stale worker agent %s (build_sha=%s)",
                         ag["id"],
                         meta.get("build_sha", ""),
                     )
-                    try:
-                        await postgres_db.execute(
-                            "UPDATE agents SET status = 'draining' WHERE id = $1",
-                            ag["id"],
-                        )
-                    except Exception:
-                        pass
 
             # Phase 1: Direct assignment
             matched_job_ids = set()
@@ -3022,6 +3031,46 @@ async def lifespan(app: FastAPI):
     )
     pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
 
+    # Unified instance lifecycle reconciler (drift-based draining and,
+    # in future phases, crash recovery + cross-kind primitives). Runs
+    # peer to agent_pool_reconciler — pool owns capacity, lifecycle
+    # owns version/health.
+    lifecycle_reconciler = InstanceLifecycleReconciler()
+    lifecycle_reconciler.register(
+        AgentInstanceManager(provisioner=agent_provisioner, db=postgres_db)
+    )
+    lifecycle_reconciler.register(
+        WorkspaceInstanceManager(
+            container_provisioner=container_provisioner,
+            suspension_service=workspace_suspension_service,
+            snapshot_service=snapshot_service,
+            db=postgres_db,
+        )
+    )
+    lifecycle_reconciler.register(
+        VMInstanceManager(
+            vm_provisioner=vm_provisioner,
+            suspension_service=workspace_suspension_service,
+            snapshot_service=snapshot_service,
+            db=postgres_db,
+        )
+    )
+    # Startup reconciliation: rebuild the in-memory view from K8s
+    # before the heartbeat endpoint starts accepting traffic. Phase 1b
+    # logs the discovered pod set; future phases may also flag DB-row
+    # divergence and reap pods that lack a registration.
+    try:
+        startup_pods = await lifecycle_reconciler.managers[0].list_pods()
+        logger.info(
+            "Lifecycle startup: discovered %d agent pod(s) from K8s",
+            len(startup_pods),
+        )
+    except Exception:
+        logger.exception("Lifecycle startup reconciliation failed (non-fatal)")
+    lifecycle_reconciler_task = asyncio.create_task(
+        lifecycle_reconciler_loop(_shutdown_event, lifecycle_reconciler)
+    )
+
     # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
     # an admin PUTs a new config via /api/admin/system-settings/main_cloud.
     async def _main_cloud_reload_callback() -> None:
@@ -3046,6 +3095,7 @@ async def lifespan(app: FastAPI):
     await digest_task
     await delegation_timeout_task
     await pool_reconciler_task
+    await lifecycle_reconciler_task
     await main_cloud_listen_task
 
     # Cleanup clients
@@ -9278,6 +9328,26 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
     }
 
 
+@app.get("/api/agents/threads/{thread_id}/lifecycle")
+async def agent_get_thread_lifecycle(thread_id: str) -> dict[str, Any]:
+    """Return lifecycle fields the agent needs for self-cleanup polling.
+
+    Minimal projection so the agent's thread-status watchdog (PR 2) can
+    decide whether to exit without dragging in the full thread payload.
+    Agent-facing — no user auth.
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return {
+        "status": thread.get("status"),
+        "agent_id": str(thread.get("agent_id")) if thread.get("agent_id") else None,
+        "ended_at": thread.get("ended_at").isoformat()
+        if thread.get("ended_at")
+        else None,
+    }
+
+
 class AgentThreadStatusRequest(BaseModel):
     status: str
 
@@ -9288,17 +9358,22 @@ async def agent_update_thread_status(
 ) -> dict[str, str]:
     """Update thread status (no auth, agent-facing).
 
-    Used for lifecycle transitions: created → active, active → idle.
-    The 'ended' transition is handled by DELETE /api/persistent/threads/{id}.
+    Used for lifecycle transitions: created → active, active → ended.
+    'ended' is also reachable via DELETE /api/persistent/threads/{id} (manual
+    end is removed from the UI but the endpoint remains for permanent delete).
     """
-    valid_statuses = {"active", "idle"}
+    valid_statuses = {"active", "ended"}
     if request.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
     try:
-        await postgres_db.update_thread_status(thread_id, request.status)
+        if request.status == "ended":
+            # Route through end_thread so ended_at gets stamped.
+            await postgres_db.end_thread(thread_id)
+        else:
+            await postgres_db.update_thread_status(thread_id, request.status)
         return {"status": request.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -9459,7 +9534,7 @@ async def agent_save_message(
 
 
 @app.post("/api/agents/{agent_id}/heartbeat")
-async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str, str]:
+async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str, Any]:
     """Update agent heartbeat and status.
 
     Agents call this every 60 seconds to report their status.
@@ -9476,12 +9551,15 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
 
         # If agent transitioned to ready, trigger the dispatcher
-        # (will be wired up in the dispatcher task)
+        # (will be wired up in the dispatcher task). Use effective_status —
+        # the orchestrator may preserve 'draining' against an agent-reported
+        # 'ready', and we must not dispatch in that case.
         prev_status = result.get("previous_status")
+        effective_status = result.get("effective_status", heartbeat.status)
         if (
             prev_status
-            and prev_status != heartbeat.status
-            and heartbeat.status == "ready"
+            and prev_status != effective_status
+            and effective_status == "ready"
         ):
             logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
             _trigger_dispatch()
@@ -9496,7 +9574,11 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
             except Exception:
                 pass  # Non-critical — don't fail heartbeat
 
-        return {"status": "ok"}
+        # Surface orchestrator-set intents (drain, version-upgrade hints)
+        # so the agent can react on the next heartbeat tick. Keeping the
+        # legacy {"status": "ok"} key for back-compat with older agent
+        # builds that don't read intents.
+        return {"status": "ok", "intents": result.get("intents") or {}}
     except HTTPException:
         raise
     except Exception as e:
@@ -10218,7 +10300,7 @@ async def resume_thread(
     thread_id: str,
     request: Request,
 ) -> dict[str, Any]:
-    """Resume an ended or idle thread (auth: owner only).
+    """Resume an ended thread (auth: owner only).
 
     Resets thread status to 'created' and clears the stale agent_id so that
     a new agent can pick it up. The frontend navigates to the chat page after
@@ -10230,7 +10312,7 @@ async def resume_thread(
         raise HTTPException(status_code=404, detail="Thread not found")
     if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
-    if thread.get("status") not in ("ended", "idle"):
+    if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
         )
@@ -10469,6 +10551,114 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
         return {"status": "restoring", "code_server_url": None, "gitea_url": gitea_url}
 
     return {"status": "unavailable", "code_server_url": None, "gitea_url": gitea_url}
+
+
+@app.post("/api/persistent/threads/{thread_id}/uploads")
+async def upload_files_to_thread(
+    thread_id: str,
+    request: Request,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    """Push files into a persistent thread workspace's ``uploads/`` directory.
+
+    Files are SFTP'd into ``<workspace_path>/uploads/`` on the live
+    workspace container (or VM). The cockpit then appends an
+    ``Attached files: …`` hint to the user's next message so the agent
+    can find them. See ``services/thread_uploads.py`` for SSH details.
+
+    Returns:
+        ``{"thread_id": "...", "files": [{name, size, mime_type, path}, ...]}``
+    """
+    from services.thread_uploads import (
+        ThreadUploadError,
+        upload_files_to_thread_workspace,
+    )
+
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    payloads: list[tuple[str, bytes, str]] = []
+    for f in files:
+        contents = await f.read()
+        payloads.append(
+            (
+                f.filename or "unnamed",
+                contents,
+                f.content_type or "application/octet-stream",
+            )
+        )
+
+    try:
+        results = await upload_files_to_thread_workspace(thread, payloads)
+    except ThreadUploadError as e:
+        logger.warning(
+            "Thread upload failed for %s: %d %s", thread_id, e.status_code, e.detail
+        )
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+    return {
+        "thread_id": thread_id,
+        "files": [
+            {"name": r.name, "size": r.size, "mime_type": r.mime_type, "path": r.path}
+            for r in results
+        ],
+    }
+
+
+@app.post("/api/persistent/threads/{thread_id}/tts")
+async def synthesize_thread_message_tts(
+    thread_id: str,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> Response:
+    """Generate speech audio for a chat message.
+
+    Body:
+        ``content`` (str, required) — text to speak (typically an assistant
+        message).
+        ``reformulate`` (bool, default ``True``) — when true, runs an
+        auxiliary LLM pass to rewrite the text for natural narration
+        (strips markdown, summarizes code blocks, etc.).
+        ``language`` (str, default ``"en"``) — selects the TTS voice.
+
+    Returns:
+        ``audio/mpeg`` MP3 bytes. ``204 No Content`` when no TTS model is
+        configured for the user. ``502`` when the synthesis call fails.
+    """
+    from services.tts import generate_message_tts
+
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+    reformulate = bool(body.get("reformulate", True))
+    language = (body.get("language") or "en").strip() or "en"
+
+    audio = await generate_message_tts(
+        content=content,
+        language=language,
+        reformulate=reformulate,
+        user_id=str(user["id"]),
+        postgres_db=postgres_db,
+    )
+    if audio is None:
+        # 204: TTS disabled / not configured. The cockpit treats this as a
+        # disabled-feature signal rather than an error.
+        return Response(status_code=204)
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 # --- Session notification helpers (used by WS proxy) ---

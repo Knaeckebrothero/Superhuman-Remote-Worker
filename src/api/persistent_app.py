@@ -53,6 +53,51 @@ _max_sessions_per_process: int = int(
 # Pod exit scheduling
 _pending_exit_task: Optional[asyncio.Task] = None
 
+# Drain intent — set the first time the orchestrator's heartbeat response
+# carries ``intents.should_drain=true``. Drives a one-shot detach + exit so
+# the agent doesn't keep reacting on every subsequent heartbeat.
+_drain_intent_handled: bool = False
+
+# Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
+# that the orchestrator reconciler can only catch with a 60s+ delay):
+#   _ws_connected_event  → set when /ws/chat first accepts a connection.
+#   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
+_ws_connected_event: Optional[asyncio.Event] = None
+_watchdog_tasks: list[asyncio.Task] = []
+_session_boot_ws_timeout_s: int = int(
+    os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
+)
+_thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
+
+async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
+    """Heartbeat-response callback: react to orchestrator-set intents.
+
+    Currently only ``should_drain`` triggers anything — when set, the
+    persistent agent detaches its session (which marks the thread
+    ``ended`` so any active WS gets a normal close) and exits the pod.
+    Idempotent: only fires once per process; later heartbeats observing
+    the same intent are no-ops.
+    """
+    global _drain_intent_handled
+    if _drain_intent_handled:
+        return
+    intents = response.get("intents") or {}
+    if not isinstance(intents, dict):
+        return
+    if not intents.get("should_drain"):
+        return
+    _drain_intent_handled = True
+    logger.info(
+        "Drain intent received from orchestrator (reason=%s) — detaching and exiting",
+        intents.get("drain_reason", "unspecified"),
+    )
+    try:
+        await _detach_session()
+    except Exception as e:
+        logger.warning(f"Detach during drain-intent handling failed: {e}")
+    _schedule_exit(delay=1.0)
+
 
 def _schedule_exit(delay: float = 1.0) -> None:
     """Schedule process exit after a short delay (allows final I/O to flush)."""
@@ -67,6 +112,118 @@ def _schedule_exit(delay: float = 1.0) -> None:
         os._exit(0)
 
     _pending_exit_task = asyncio.create_task(_exit())
+
+
+# ---------------------------------------------------------------------------
+# Self-cleanup watchdogs (PR 2)
+# ---------------------------------------------------------------------------
+
+
+async def _boot_ws_watchdog(timeout_s: int) -> None:
+    """Exit if no /ws/chat connection arrives within ``timeout_s`` of attach.
+
+    A persistent agent that boots, attaches to a thread, then never receives
+    a WebSocket has no other way to know it's been abandoned (e.g. user
+    navigated away during creation). Without this watchdog the pod sits
+    forever heartbeating and holding a slot. The orchestrator reconciler
+    catches this too, but only after a 60s+ delay; this watchdog kills
+    locally on the configured cadence.
+    """
+    if _ws_connected_event is None:
+        return
+    try:
+        await asyncio.wait_for(_ws_connected_event.wait(), timeout=timeout_s)
+        return  # WS arrived — normal lifecycle takes over
+    except asyncio.TimeoutError:
+        logger.warning(
+            "No WebSocket connection within %ds for thread %s — "
+            "exiting (likely abandoned during creation).",
+            timeout_s,
+            _thread_id,
+        )
+    try:
+        await _detach_session()
+    except Exception as e:
+        logger.warning(f"Detach during boot-WS timeout failed: {e}")
+    _schedule_exit(delay=1.0)
+
+
+async def _thread_status_watchdog(poll_s: int) -> None:
+    """Exit if the bound thread transitions to 'ended' out-of-band.
+
+    The orchestrator's stale_agent_detector can flip a thread to 'ended'
+    via ``mark_orphaned_threads_ended`` or release the binding via
+    ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
+    is orphaned — no work to do, holding a slot. Poll the thread row and
+    exit if it's no longer in ('created', 'active').
+    """
+    while True:
+        try:
+            await asyncio.sleep(poll_s)
+        except asyncio.CancelledError:
+            raise
+        if not _orchestrator_client or not _thread_id:
+            continue
+        try:
+            lifecycle = await _orchestrator_client.get_thread_lifecycle(_thread_id)
+        except Exception as e:
+            logger.debug(f"Thread lifecycle poll failed (non-fatal): {e}")
+            continue
+        if not lifecycle:
+            continue
+        status = lifecycle.get("status")
+        if status not in ("created", "active"):
+            logger.info(
+                "Thread %s status is '%s' — exiting (orphaned by orchestrator).",
+                _thread_id,
+                status,
+            )
+            try:
+                await _detach_session()
+            except Exception as e:
+                logger.warning(f"Detach during status-watchdog exit failed: {e}")
+            _schedule_exit(delay=1.0)
+            return
+
+
+def _start_watchdogs() -> None:
+    """Start watchdog tasks for the active session. Safe to call repeatedly."""
+    global _ws_connected_event, _watchdog_tasks
+
+    # Stop any prior watchdogs (defensive — should already be cleared).
+    for task in _watchdog_tasks:
+        if not task.done():
+            task.cancel()
+    _watchdog_tasks = []
+
+    _ws_connected_event = asyncio.Event()
+    _watchdog_tasks = [
+        asyncio.create_task(
+            _boot_ws_watchdog(_session_boot_ws_timeout_s),
+            name="boot-ws-watchdog",
+        ),
+        asyncio.create_task(
+            _thread_status_watchdog(_thread_status_poll_s),
+            name="thread-status-watchdog",
+        ),
+    ]
+
+
+def _stop_watchdogs() -> None:
+    """Cancel all active watchdogs. Skips the current task to avoid self-cancel."""
+    global _watchdog_tasks
+    current = asyncio.current_task()
+    for task in _watchdog_tasks:
+        if task is current or task.done():
+            continue
+        task.cancel()
+    _watchdog_tasks = []
+
+
+def _signal_ws_connected() -> None:
+    """Signal that a WebSocket has connected. Cancels the boot-WS watchdog."""
+    if _ws_connected_event is not None:
+        _ws_connected_event.set()
 
 
 def _get_agent_metrics() -> Optional[Dict[str, Any]]:
@@ -156,6 +313,7 @@ async def lifespan(app: FastAPI):
                     get_status=_heartbeat_status,
                     get_job_id=lambda: None,
                     get_metrics=_get_agent_metrics,
+                    on_response=_handle_heartbeat_intents,
                 )
             )
             logger.info("Registered with orchestrator as persistent agent")
@@ -574,9 +732,12 @@ async def _attach_session(
                                 f"  StrictHostKeyChecking accept-new\n"
                             )
 
-                    # Convert HTTPS URL to SSH URL so git uses the key
+                    # Convert HTTPS URL to SSH URL so git uses the key.
+                    # strip("/") handles trailing slashes too — datasource URLs
+                    # entered as `.../repo/` would otherwise become `repo/.git`,
+                    # which GitHub's SSH server rejects.
                     if parsed.scheme in ("http", "https"):
-                        path = parsed.path.lstrip("/")
+                        path = parsed.path.strip("/")
                         if not path.endswith(".git"):
                             path += ".git"
                         repo_url = f"git@{host}:{path}"
@@ -666,13 +827,17 @@ async def _attach_session(
     # Mark thread as active
     await _update_thread_status("active")
 
+    # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
+    # out-of-band thread.status='ended'. Cancelled by _detach_session.
+    _start_watchdogs()
+
     logger.info(f"Session attached: thread={_thread_id}")
 
 
 async def _detach_session() -> None:
     """Tear down the current session and return to idle.
 
-    1. Mark thread as idle
+    1. Mark thread as ended (still resumable)
     2. Git commit + push
     3. Clean up session resources
     4. Clear session globals
@@ -686,8 +851,12 @@ async def _detach_session() -> None:
     thread_id = _thread_id
     logger.info(f"Detaching session: thread={thread_id}")
 
-    # Mark thread as idle (NOT ended — resumable)
-    await _update_thread_status("idle")
+    # Cancel self-cleanup watchdogs first — we're about to do the cleanup
+    # they would have triggered, no point letting them race the detach.
+    _stop_watchdogs()
+
+    # Mark thread as ended (still resumable — `ended` is the only inactive state).
+    await _update_thread_status("ended")
 
     # Final cloud sync + stop polling + drop secrets
     if _session.workspace_sync:
@@ -867,6 +1036,11 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     async def ws_chat(ws: WebSocket):
         await ws.accept()
 
+        # Signal the boot-WS watchdog that a connection arrived. Done before
+        # the readiness check so even a failed-to-be-ready connection counts:
+        # the user clearly came back, and a different error path applies.
+        _signal_ws_connected()
+
         if not _session or not _session.llm_with_tools:
             await _ws_send(ws, "error", {"message": "Agent not ready"})
             await ws.close(code=4503, reason="Agent not ready")
@@ -961,7 +1135,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             )
 
         async def on_tool_result(
-            tool_name: str, result: str, tool_call_id: str
+            tool_name: str,
+            result: str,
+            tool_call_id: str,
+            is_error: bool = False,
         ) -> None:
             # Truncate large results for WS (full result is in message history)
             display_result = result[:2000] + "..." if len(result) > 2000 else result
@@ -972,6 +1149,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     "tool": tool_name,
                     "result": display_result,
                     "id": tool_call_id,
+                    "is_error": is_error,
                 },
             )
 
@@ -1251,10 +1429,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     pass
 
             if idle_timed_out:
-                await _handle_idle_archive()
+                await _handle_idle_archive(ws)
 
             # Always detach session on disconnect (idle timeout or not).
-            # Sets thread status to 'idle' and cleans up session state.
+            # Sets thread status to 'ended' and cleans up session state.
             await _detach_session()
 
             logger.info(f"WebSocket session ended: thread={_thread_id}")
@@ -1298,6 +1476,7 @@ async def _restore_session_messages() -> None:
         return
 
     try:
+        import uuid as _uuid
         from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
         db_messages = await _agent.postgres_conn.get_thread_messages_history(
@@ -1317,8 +1496,14 @@ async def _restore_session_messages() -> None:
             content = db_msg["content"] or ""
             tool_calls = db_msg.get("tool_calls")
 
+            # Generate a fresh UUID per restored message. Without an `id`,
+            # `RemoveMessage(id=...)` in compaction is a no-op — meaning a
+            # resumed session that needs compaction can never shrink. The
+            # ID is a LangGraph state key, not user-facing or persisted.
+            msg_id = str(_uuid.uuid4())
+
             if role in ("human", "user"):
-                restored.append(HumanMessage(content=content))
+                restored.append(HumanMessage(content=content, id=msg_id))
 
             elif role in ("ai", "assistant"):
                 lc_tool_calls = []
@@ -1334,14 +1519,22 @@ async def _restore_session_messages() -> None:
                     pending_tool_call_ids = [tc["id"] for tc in lc_tool_calls]
                 else:
                     pending_tool_call_ids = []
-                restored.append(AIMessage(content=content, tool_calls=lc_tool_calls))
+                restored.append(
+                    AIMessage(content=content, tool_calls=lc_tool_calls, id=msg_id)
+                )
 
             elif role == "tool":
                 # Pair with the next pending tool_call_id from the last AIMessage
                 tool_call_id = (
                     pending_tool_call_ids.pop(0) if pending_tool_call_ids else ""
                 )
-                restored.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+                restored.append(
+                    ToolMessage(
+                        content=content,
+                        tool_call_id=tool_call_id,
+                        id=msg_id,
+                    )
+                )
 
             # Skip system messages — the loop adds a fresh one from current config
 
@@ -1769,11 +1962,17 @@ async def _update_thread_status(status: str) -> None:
             logger.warning(f"Failed to update thread status to {status}: {e}")
 
 
-async def _handle_idle_archive() -> None:
-    """Handle idle timeout — archive session state, set thread to idle."""
+async def _handle_idle_archive(ws: WebSocket) -> None:
+    """Handle idle timeout — archive session state, set thread to ended."""
     try:
         if not _session:
             return
+
+        # 0. Tell any still-connected client that the session is ending so the
+        # UI can flip to the resume card without waiting for a refresh.
+        await _ws_send(
+            ws, "session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"}
+        )
 
         # 1. Extract memories
         recall_store = (
@@ -1819,8 +2018,8 @@ async def _handle_idle_archive() -> None:
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 3. Set thread to 'idle' (NOT 'ended' — resumable)
-        await _update_thread_status("idle")
+        # 3. Set thread to 'ended' (still resumable — `ended` is the only inactive state).
+        await _update_thread_status("ended")
 
         # 4. Git commit + push
         if _session.workspace_manager:

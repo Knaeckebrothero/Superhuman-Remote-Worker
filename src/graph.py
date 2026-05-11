@@ -88,6 +88,7 @@ from .core.workspace import WorkspaceManager
 from .llm.exceptions import ContextOverflowError
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .services.guardrails import format_nudge
+from .services.image_content import extract_image_tags, make_multimodal_user_message
 from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
@@ -2091,6 +2092,23 @@ async def _process_queued_replies(
     return len(queued)
 
 
+def _is_drain_requested() -> bool:
+    """Worker-side drain intent set by the dual-mode heartbeat callback.
+
+    Lazy-imported so the graph stays decoupled from the dual_app module
+    (avoids cycles, lets the persistent and standalone run paths import
+    the graph cleanly even when ``src.api.dual_app`` isn't initialized).
+    Returns False if the import fails or the dual-mode state is unset
+    — in either case there's no drain intent to react to.
+    """
+    try:
+        from src.api.dual_app import is_drain_requested
+
+        return is_drain_requested()
+    except Exception:
+        return False
+
+
 def create_handle_transition_node(
     workspace: WorkspaceManager,
     todo_manager: TodoManager,
@@ -2197,6 +2215,38 @@ def create_handle_transition_node(
         # report_completion() → orchestrator for status determination.
         if result.freeze_data:
             updates["freeze_data"] = result.freeze_data
+
+        # Phase 1d — Continue-as-New on orchestrator drain intent.
+        # The lifecycle reconciler marks workers on a stale image with
+        # ``intents.should_drain``; the dual_app heartbeat callback
+        # records that on a process-local flag. At a phase boundary the
+        # workspace + todos are in a clean state, so we freeze with
+        # ``version_upgrade`` and let the orchestrator pause and
+        # re-dispatch the same job context onto a fresh-version pod.
+        # The check fires regardless of transition success — even a
+        # rejected transition is a fine point to hand off.
+        if _is_drain_requested():
+            upgrade_freeze = {
+                "freeze_type": "version_upgrade",
+                "phase": phase_str,
+                "phase_number": phase_number,
+                "reason": "orchestrator drain intent at phase boundary",
+            }
+            try:
+                workspace.write_file(
+                    "output/job_frozen.json",
+                    json.dumps(upgrade_freeze, indent=2, ensure_ascii=False),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{job_id}] Failed to write version_upgrade freeze marker: {e}"
+                )
+            updates["freeze_data"] = upgrade_freeze
+            updates["should_stop"] = True
+            logger.info(
+                f"[{job_id}] Drain intent at phase boundary — "
+                f"freezing for version_upgrade re-dispatch"
+            )
         return updates
 
     return handle_transition
@@ -3031,6 +3081,31 @@ def create_audited_tool_node(
                             f"VM workspace connection lost during tool execution: "
                             f"{msg.content[:300]}"
                         )
+
+        # Multimodal image delivery: image-bearing tools embed base64 in a
+        # `<image_data>` / `<page_image>` tag inside the result string.
+        # Strip the tag, replace it with a short marker, and append a
+        # synthesized HumanMessage carrying the image as a real provider
+        # content block so multimodal primary models can actually see it.
+        # State only ever sees the cleaned ToolMessage + clean HumanMessage;
+        # the base64 lives transiently in this local `result`.
+        if "messages" in result:
+            image_followups: list[HumanMessage] = []
+            for msg in result["messages"]:
+                if not isinstance(msg, ToolMessage) or not msg.content:
+                    continue
+                cleaned, extracted = extract_image_tags(msg.content)
+                if not extracted:
+                    continue
+                msg.content = cleaned
+                image_followups.append(
+                    make_multimodal_user_message(
+                        text=(f"Image content from tool call {msg.tool_call_id}:"),
+                        images=extracted,
+                    )
+                )
+            if image_followups:
+                result["messages"].extend(image_followups)
 
         # Enrich tool-not-found errors with actionable guidance
         if "messages" in result:

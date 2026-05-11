@@ -1451,9 +1451,75 @@ class ContextManager:
             for m in messages
             if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
         ]
-        conversation = [m for m in messages if not isinstance(m, SystemMessage)]
+        original_conversation = [
+            m for m in messages if not isinstance(m, SystemMessage)
+        ]
+
+        # Backstop for runaway-generation poisoning: any single AIMessage
+        # that exceeds half the context window is almost certainly a
+        # repetition-loop artifact (the loader-side max_tokens fallback
+        # prevents new ones, but a session resumed from a poisoned state
+        # — or one that hit an endpoint ignoring max_tokens — needs this
+        # to recover). Replace with a stub before slicing; the original
+        # is removed via the existing removal_markers loop. We skip
+        # AIMessages with tool_calls (substituting one orphans the
+        # paired ToolMessages and breaks the turn) and ToolMessages
+        # (legitimate large reads should be handled by `truncate_long_tool_results`).
+        oversized_threshold = self.config.model_max_context_tokens // 2
+        sanitized_conversation: List[BaseMessage] = []
+        oversized_count = 0
+        oversized_total = 0
+        for msg in original_conversation:
+            msg_tokens = self.token_counter([msg])
+            replaceable = (
+                msg_tokens > oversized_threshold
+                and isinstance(msg, AIMessage)
+                and not getattr(msg, "tool_calls", None)
+            )
+            if replaceable:
+                oversized_count += 1
+                oversized_total += msg_tokens
+                sanitized_conversation.append(
+                    AIMessage(
+                        content=(
+                            f"[Previous response of ~{msg_tokens:,} tokens elided "
+                            f"by compaction — likely runaway generation. "
+                            f"See workspace logs for details.]"
+                        )
+                    )
+                )
+            else:
+                sanitized_conversation.append(msg)
+
+        if oversized_count > 0:
+            logger.warning(
+                f"Compaction: replaced {oversized_count} oversized AIMessage(s) "
+                f"({oversized_total:,} tokens total, threshold {oversized_threshold:,}) "
+                f"with stubs"
+            )
+
+        # `conversation` (sanitized) drives slicing and recent-message
+        # reconstruction; `original_conversation` is retained for the
+        # removal_markers loop so the originals' IDs are evicted from state.
+        conversation = sanitized_conversation
+
+        # Helper: when normal compaction can't proceed (too few messages,
+        # summary larger than original, etc.) but we *did* substitute
+        # oversized messages, return the substitution as a standalone
+        # result so the backstop still wins. Without this, the runaway
+        # AIMessage would survive the early returns and re-poison the
+        # next turn.
+        def _substitution_only_result() -> List[BaseMessage]:
+            markers = [
+                RemoveMessage(id=m.id)
+                for m in original_conversation
+                if hasattr(m, "id") and m.id
+            ]
+            return markers + system_msgs + sanitized_conversation
 
         if len(conversation) <= effective_keep_recent:
+            if oversized_count > 0:
+                return _substitution_only_result()
             return messages
 
         # Find safe slice point that doesn't orphan ToolMessages
@@ -1483,6 +1549,8 @@ class ContextManager:
             logger.error(
                 f"Summary ({summary_tokens} tokens) larger than original ({original_tokens} tokens) — skipping compaction"
             )
+            if oversized_count > 0:
+                return _substitution_only_result()
             return messages
 
         # Create summary as SystemMessage (best practice per OpenAI/LangChain)
@@ -1502,8 +1570,10 @@ class ContextManager:
             else:
                 messages_without_ids += 1
 
-        # Remove conversation messages (recent ones will be re-added as fresh copies)
-        for msg in conversation:
+        # Remove conversation messages (recent ones will be re-added as fresh copies).
+        # Iterate the ORIGINAL conversation so we evict the right state IDs even
+        # when oversized messages were substituted with stubs above.
+        for msg in original_conversation:
             if hasattr(msg, "id") and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
             else:

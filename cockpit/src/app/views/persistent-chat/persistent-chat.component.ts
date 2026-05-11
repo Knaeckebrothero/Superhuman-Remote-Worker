@@ -4,30 +4,58 @@ import {
     computed,
     effect,
     ElementRef,
+    HostListener,
     inject,
     OnDestroy,
+    OnInit,
     signal,
     ViewChild,
 } from '@angular/core';
-import {TitleCasePipe} from '@angular/common';
+import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
+import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
 import {RouterLink} from '@angular/router';
+import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
+import {FileHandlingService} from '../../core/services/file-handling.service';
+import {DeviceCapabilitiesService} from '../../core/services/device-capabilities.service';
+import {VoiceRecordingService} from '../../core/services/voice-recording.service';
+import {FilePreview, FileType} from '../../core/models/file.model';
+import {RecordingConfig} from '../../core/models/recording.model';
 import {environment} from '../../core/environment';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {AppButtonComponent} from '../../ui/button';
 import {AppBadgeComponent} from '../../ui/badge';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
+import {AppDialogComponent} from '../../ui/dialog';
 
 interface SlashCommand {
     command: string;
     descriptionKey: string;
+}
+
+interface TtsMessageState {
+    audioUrl?: string;
+    isGenerating: boolean;
+    isPlaying: boolean;
+    error: boolean;
+}
+
+interface Suggestion {
+    icon: string;
+    en: string;
+    de: string;
+}
+
+interface DisplayedSuggestion {
+    icon: string;
+    text: string;
 }
 
 const SLASH_COMMANDS: SlashCommand[] = [
@@ -151,6 +179,7 @@ const CATEGORY_LABELS: Record<string, string> = {
     standalone: true,
     imports: [
         FormsModule,
+        NgTemplateOutlet,
         TitleCasePipe,
         RouterLink,
         MarkdownComponent,
@@ -160,9 +189,20 @@ const CATEGORY_LABELS: Record<string, string> = {
         AppBadgeComponent,
         AppSelectComponent,
         AppIconComponent,
+        AppDialogComponent,
     ],
     template: `
     <div class="chat-container">
+      <!-- Drag-and-drop overlay (covers the chat area while files are being dragged) -->
+      @if (isDragOver()) {
+        <div class="drop-overlay" aria-hidden="true">
+          <div class="drop-overlay-card">
+            <app-icon size="lg" class="drop-overlay-icon">cloud_upload</app-icon>
+            <span class="drop-overlay-text">{{ 'chat.composer.dropHint' | transloco }}</span>
+          </div>
+        </div>
+      }
+
       <!-- Header -->
       <div class="chat-header">
         <div class="header-left">
@@ -319,47 +359,93 @@ const CATEGORY_LABELS: Record<string, string> = {
         </div>
       }
 
+      <!--
+        Shared template for the per-tool-call expandable card list. Used by
+        three sites: the streaming "completed tools" block, the finalized
+        message-with-content branch, and the tool-only-message branch. Keep
+        the template the single source of truth — adding/changing args
+        formatting, status icons, decision badges, etc. should only happen
+        here.
+      -->
+      <ng-template #toolDetails let-tools>
+        <div class="tool-detail-list">
+          @for (tc of tools; track tc.id) {
+            <details class="tool-card" [class.has-decision]="!!tc.decision" [class.tool-error]="tc.status === 'error'" [attr.open]="(tc.status === 'denied' || tc.status === 'error') ? '' : null">
+              <summary class="tool-head">
+                <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
+                @if (tc.decision; as d) {
+                  <span class="approval-badge" [class]="'approval-' + d">
+                    <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                    {{ ('chat.approval.badge.' + d) | transloco }}
+                  </span>
+                }
+                <span class="tool-name">{{ tc.tool }}</span>
+                @if (formatToolArgs(tc.args); as a) {
+                  <span class="tool-args">({{ a }})</span>
+                }
+                <span class="tool-status" [class]="'status-' + tc.status">
+                  <app-icon size="sm" class="tool-status-icon">{{ statusIcon(tc.status) }}</app-icon>
+                  {{ translateStatus(tc.status) }}
+                </span>
+              </summary>
+              @if (tc.result) {
+                <div class="tool-body"><pre class="tool-result">{{ tc.result }}</pre></div>
+              }
+            </details>
+          }
+        </div>
+      </ng-template>
+
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
         @for (msg of chat.messages(); track $index) {
           <div class="message" [class]="'message-' + msg.role"
                [class.historical]="msg.historical"
-               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length">
+               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length"
+               [class.dimmed]="isShowingReconnectBanner() && $index === chat.messages().length - 1">
             @if (msg.role === 'system') {
               <div class="system-message">
                 <app-icon size="sm" class="system-icon">info</app-icon>
                 {{ msg.content }}
               </div>
-              @if (chat.isSessionPaused() && $last) {
-                <div class="resume-btn-wrapper">
-                  <app-button variant="primary" size="sm"
-                              [loading]="isResuming()"
-                              (clicked)="resumeSession()">
-                    @if (isResuming()) {
-                      {{ 'chat.system.resuming' | transloco }}
-                    } @else {
-                      <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
-                      {{ 'chat.system.resumeSession' | transloco }}
-                    }
-                  </app-button>
-                </div>
-              }
             } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
-              <!-- Tool-only message: compact inline indicator -->
-              <div class="tool-only-row">
-                <app-icon size="sm" class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</app-icon>
-                <span class="tool-only-label">
-                  {{ toolSummaryLabel(msg.toolCalls!) }}
-                </span>
-                <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
-              </div>
+              <!-- Tool-only message: compact inline indicator, expandable to show args/results -->
+              <details
+                class="tool-summary tool-only-summary"
+                [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null"
+              >
+                <summary class="tool-only-row">
+                  <app-icon size="sm" class="tool-summary-chevron tool-only-chevron">chevron_right</app-icon>
+                  <app-icon size="sm" class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</app-icon>
+                  <span class="tool-only-label">{{ toolSummaryLabel(msg.toolCalls!) }}</span>
+                  <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
+                </summary>
+                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
+              </details>
             } @else {
               <div class="avatar">
                 <app-icon size="sm" class="avatar-icon">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</app-icon>
               </div>
               <div class="message-body">
                 @if (msg.role === 'user') {
-                  <div class="user-text">{{ msg.content }}</div>
+                  @if (msg.content) {
+                    <div class="user-text">{{ msg.content }}</div>
+                  }
+                  @if (msg.attachments?.length) {
+                    <div class="user-attachments">
+                      @for (att of msg.attachments; track att.path) {
+                        <span class="user-attachment-chip" [title]="att.path">
+                          <app-icon size="sm">{{
+                            att.mimeType.startsWith('image/') ? 'image' :
+                            att.mimeType.startsWith('video/') ? 'videocam' :
+                            att.mimeType.startsWith('audio/') ? 'audiotrack' :
+                            'description'
+                          }}</app-icon>
+                          <span class="user-attachment-name">{{ att.name }}</span>
+                        </span>
+                      }
+                    </div>
+                  }
                 } @else {
                   @if (msg.thinking && chat.narrationMode() !== 'silent') {
                     <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
@@ -373,6 +459,35 @@ const CATEGORY_LABELS: Record<string, string> = {
                   @if (msg.content) {
                     <markdown [data]="msg.content"></markdown>
                   }
+                  @if (msg.content) {
+                    @let ttsS = ttsStateFor($index);
+                    <div class="message-actions">
+                      <button
+                        type="button"
+                        class="msg-action-btn tts-btn"
+                        [class.is-playing]="ttsS.isPlaying"
+                        [class.is-error]="ttsS.error"
+                        [disabled]="ttsS.isGenerating"
+                        [title]="(
+                          ttsS.isPlaying ? 'chat.tts.stop' :
+                          ttsS.isGenerating ? 'chat.tts.generating' :
+                          ttsS.error ? 'chat.tts.error' :
+                          'chat.tts.play'
+                        ) | transloco"
+                        (click)="toggleTts($index, msg.content)"
+                      >
+                        @if (ttsS.isGenerating) {
+                          <span class="action-spinner-sm"></span>
+                        } @else if (ttsS.isPlaying) {
+                          <app-icon size="sm">stop</app-icon>
+                        } @else if (ttsS.error) {
+                          <app-icon size="sm">error_outline</app-icon>
+                        } @else {
+                          <app-icon size="sm">volume_up</app-icon>
+                        }
+                      </button>
+                    </div>
+                  }
                   @if (msg.toolCalls?.length) {
                     <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null">
                       <summary class="tool-summary-line">
@@ -383,29 +498,18 @@ const CATEGORY_LABELS: Record<string, string> = {
                         </span>
                         <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
                       </summary>
-                      <div class="tool-detail-list">
-                        @for (tc of msg.toolCalls; track tc.id) {
-                          <details class="tool-detail-item" [class.has-decision]="!!tc.decision" [attr.open]="tc.status === 'denied' ? '' : null">
-                            <summary class="tool-detail-header">
-                              <app-icon size="sm" class="tool-icon">{{ toolIcon(tc.tool) }}</app-icon>
-                              @if (tc.decision; as d) {
-                                <span class="approval-badge" [class]="'approval-' + d">
-                                  <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                                  {{ ('chat.approval.badge.' + d) | transloco }}
-                                </span>
-                              }
-                              <span class="tool-detail-name">{{ tc.tool }}</span>
-                              <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                              <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
-                            </summary>
-                            @if (tc.result) {
-                              <div class="tool-preview">{{ previewResult(tc.result) }}</div>
-                              <pre class="tool-detail-result">{{ tc.result }}</pre>
-                            }
-                          </details>
-                        }
-                      </div>
+                      <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
                     </details>
+                    @for (tc of msg.toolCalls; track tc.id) {
+                      @if (tc.decision; as d) {
+                        <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                          <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                          <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                          <span class="resolved-title">{{ tc.tool }}</span>
+                          <time class="resolved-time">{{ formatTime(msg.timestamp) }}</time>
+                        </div>
+                      }
+                    }
                   }
                 }
               </div>
@@ -422,50 +526,63 @@ const CATEGORY_LABELS: Record<string, string> = {
           @if (!chat.isStreaming()) {
             <div class="empty-state">
               @if (chat.sessionReady()) {
-                <span class="empty-state-text">{{ 'chat.system.emptyPrompt' | transloco }}</span>
-              } @else {
-                <div class="startup-spinner-container">
-                  <div class="startup-spinner"></div>
-                  <span class="startup-label">
-                    @if (chat.isCreating()) {
-                      {{ 'chat.startup.creating' | transloco }}
-                    } @else if (chat.isConnected()) {
-                      @switch (chat.startupPhase()) {
-                        @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
-                        @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
-                        @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
-                        @default { {{ 'chat.startup.starting' | transloco }} }
+                <div class="empty-inner">
+                  <img class="empty-mark" src="assets/icons/icon-mark.svg" alt="" />
+                  <h2 class="empty-title">{{ 'chat.empty.title' | transloco }}</h2>
+                  <p class="empty-subtitle">{{ 'chat.empty.subtitle' | transloco }}</p>
+                  @if (displayedSuggestions().length > 0) {
+                    <div class="suggestion-grid">
+                      @for (s of displayedSuggestions(); track $index) {
+                        <button type="button" class="suggestion-chip"
+                                (click)="pickSuggestion(s)">
+                          <app-icon size="lg" class="suggestion-icon">{{ s.icon }}</app-icon>
+                          <span class="suggestion-text">{{ s.text }}</span>
+                        </button>
                       }
-                    } @else {
-                      {{ 'chat.startup.connectingFallback' | transloco }}
-                    }
-                  </span>
+                    </div>
+                  }
+                </div>
+              } @else if (chat.threadStatus() !== 'ended') {
+                <div class="startup-wrapper">
+                  <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
                 </div>
               }
             </div>
           }
         }
 
-        <!-- Resume spinner: shown when history exists but session not yet ready -->
-        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming()) {
-          <div class="startup-spinner-container resume-spinner">
-            <div class="startup-spinner"></div>
-            <span class="startup-label">
-              @if (chat.isCreating()) {
-                {{ 'chat.startup.creating' | transloco }}
-              } @else if (chat.isConnected()) {
-                @switch (chat.startupPhase()) {
-                  @case ('provisioning') { {{ 'chat.startup.provisioning' | transloco }} }
-                  @case ('booting') { {{ 'chat.startup.booting' | transloco }} }
-                  @case ('connecting') { {{ 'chat.startup.connecting' | transloco }} }
-                  @default { {{ 'chat.startup.reconnecting' | transloco }} }
-                }
-              } @else {
-                {{ 'chat.startup.connectingFallback' | transloco }}
-              }
-            </span>
+        <!-- Startup/resume card: shown when history exists but session not yet ready.
+             Suppressed for ended threads — the F3 resume card below is the call-to-action
+             there, and there's no actual provisioning in flight until the user opts in. -->
+        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
+          <div class="startup-wrapper resume">
+            <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
         }
+
+        <ng-template #startupCardTpl>
+          <div class="startup-card">
+            <div class="startup-card-head">
+              <span class="startup-card-spinner"></span>
+              <span class="startup-card-title">
+                {{ (chat.messages().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
+              </span>
+            </div>
+            <div class="startup-steps">
+              @for (step of startupSteps(); track step.key) {
+                <div class="startup-step" [class]="'state-' + step.state">
+                  @if (step.state === 'active') {
+                    <span class="step-spinner" aria-hidden="true"></span>
+                  } @else {
+                    <app-icon size="lg" class="step-icon">{{ stepIcon(step.state) }}</app-icon>
+                  }
+                  <span class="step-label">{{ ('chat.startup.steps.' + step.key) | transloco }}</span>
+                  <time class="step-time">{{ formatElapsed(step.elapsedMs) }}</time>
+                </div>
+              }
+            </div>
+          </div>
+        </ng-template>
 
         <!-- Streaming response -->
         @if (chat.isStreaming()) {
@@ -503,27 +620,17 @@ const CATEGORY_LABELS: Record<string, string> = {
                       </span>
                       <span class="tool-summary-dot completed"></span>
                     </summary>
-                    <div class="tool-detail-list">
-                      @for (tc of completedOnly(chat.currentToolCalls()); track tc.id) {
-                        <details class="tool-detail-item" [class.has-decision]="!!tc.decision">
-                          <summary class="tool-detail-header">
-                            @if (tc.decision; as d) {
-                              <span class="approval-badge" [class]="'approval-' + d">
-                                <app-icon size="sm" class="approval-badge-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                                {{ ('chat.approval.badge.' + d) | transloco }}
-                              </span>
-                            }
-                            <span class="tool-detail-name">{{ tc.tool }}</span>
-                            <span class="tool-detail-args">{{ formatToolArgs(tc.args) }}</span>
-                            <span class="tool-detail-status" [class]="'status-' + tc.status">{{ translateStatus(tc.status) }}</span>
-                          </summary>
-                          @if (tc.result) {
-                            <pre class="tool-detail-result">{{ tc.result }}</pre>
-                          }
-                        </details>
-                      }
-                    </div>
+                    <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: completedOnly(chat.currentToolCalls()) }"></ng-container>
                   </details>
+                }
+                @for (tc of chat.currentToolCalls(); track tc.id) {
+                  @if (tc.decision; as d) {
+                    <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                      <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                      <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                      <span class="resolved-title">{{ tc.tool }}</span>
+                    </div>
+                  }
                 }
               }
               @if (!chat.streamingText() && !chat.currentToolCalls().length && !chat.pendingPermission()) {
@@ -537,40 +644,112 @@ const CATEGORY_LABELS: Record<string, string> = {
           </div>
         }
 
-        <!-- Inline approval card — anchored to the live turn, not gated on
-             streaming state so it stays visible across edge cases. -->
+        <!-- Inline approval card (mile marker) — anchored to the live turn,
+             not gated on streaming state so it stays visible across edge cases. -->
         @if (chat.pendingPermission(); as perm) {
-          <div class="approval-card">
-            <div class="approval-card-head">
-              <app-icon size="sm" class="approval-card-icon">shield</app-icon>
-              <span class="approval-card-label">{{ 'chat.approval.pendingTitle' | transloco }}</span>
+          <div class="mile">
+            <div class="mile-label">{{ 'chat.permission.title' | transloco }}</div>
+            <div class="mile-title">{{ permissionTitle(perm) }}</div>
+            <div class="mile-detail">
+              <app-icon size="sm" class="mile-detail-icon">{{ toolIcon(perm.tool) }}</app-icon>
+              <code class="mile-tool">{{ perm.tool }}</code>
+              @if (formatToolArgs(perm.args); as a) {
+                <code class="mile-args">({{ a }})</code>
+              }
             </div>
-            <div class="approval-card-tool">
-              <app-icon size="sm" class="tool-icon">{{ toolIcon(perm.tool) }}</app-icon>
-              <span class="approval-card-tool-name">{{ perm.tool }}</span>
-              <span class="approval-card-tool-args">{{ formatToolArgs(perm.args) }}</span>
-            </div>
-            <div class="approval-card-actions">
+            <div class="mile-actions">
               <app-button variant="success" size="sm" (clicked)="chat.approve()">{{ 'chat.permission.approve' | transloco }}</app-button>
               <app-button variant="info" size="sm" (clicked)="approveAndAutoAccept()">{{ 'chat.permission.autoAccept' | transloco }}</app-button>
-              <app-button variant="danger" size="sm" (clicked)="chat.deny()">{{ 'chat.permission.deny' | transloco }}</app-button>
+              <app-button variant="danger" size="sm" (clicked)="chat.stop()">{{ 'chat.permission.stop' | transloco }}</app-button>
             </div>
           </div>
+        }
+
+        <!-- Ended-session end-marker + resume card — replaces the composer
+             when the thread is in 'ended' status. -->
+        @if (chat.threadStatus() === 'ended') {
+          <div class="end-marker">
+            <span class="end-line"></span>
+            <div class="end-tag">
+              <app-icon size="sm" class="end-icon">flag</app-icon>
+              <span>{{ 'chat.ended.endedAt' | transloco:{ date: formatEndedAt(chat.endedAt()) } }}</span>
+            </div>
+            <span class="end-line"></span>
+          </div>
+          <div class="resume-card">
+            <div class="resume-body">
+              <div class="resume-eyebrow">{{ 'chat.ended.eyebrow' | transloco }}</div>
+              <h3 class="resume-title">{{ 'chat.ended.title' | transloco }}</h3>
+              <p class="resume-text">{{ 'chat.ended.body' | transloco }}</p>
+            </div>
+            <div class="resume-actions">
+              <app-button variant="primary"
+                          [loading]="isResuming()"
+                          (clicked)="resumeSession()">
+                @if (isResuming()) {
+                  {{ 'chat.system.resuming' | transloco }}
+                } @else {
+                  <app-icon size="sm" class="resume-icon">play_arrow</app-icon>
+                  {{ 'chat.ended.resume' | transloco }}
+                }
+              </app-button>
+            </div>
+          </div>
+        }
+
+        <!-- Reconnect banner: WS dropped on a still-active thread.
+             Mutually exclusive with the F3 resume card (threadStatus !== 'ended')
+             and the F2 startup card (sessionReady === true). -->
+        @if (isShowingReconnectBanner()) {
+          <div class="reconnect-banner">
+            <app-icon size="sm" class="rb-icon">cloud_off</app-icon>
+            <div class="rb-body">
+              <strong>{{ 'chat.disconnected.title' | transloco }}</strong>
+              @if (chat.reconnectGaveUp()) {
+                <span>{{ 'chat.disconnected.gaveUp' | transloco }}</span>
+              } @else if (chat.reconnectAttempt() > 0) {
+                <span>{{ 'chat.disconnected.retrying' | transloco:{ attempt: chat.reconnectAttempt(), max: chat.reconnectMaxAttempts } }}</span>
+              } @else {
+                <span>{{ 'chat.disconnected.dropped' | transloco }}</span>
+              }
+            </div>
+            <app-button variant="secondary" size="sm" (clicked)="chat.reconnectNow()">
+              {{ (chat.reconnectGaveUp() ? 'chat.disconnected.reconnect' : 'chat.disconnected.retryNow') | transloco }}
+            </app-button>
+          </div>
+        }
+
+        <!-- Jump-to-latest pill: appears when the user has scrolled up while
+             new messages arrive. Sticky-positioned so it floats over the stream
+             without needing a wrapper element. -->
+        @if (showJumpToLatest()) {
+          <button class="jump-latest" type="button" (click)="jumpToLatest()">
+            <app-icon size="sm">arrow_downward</app-icon>
+            <span>{{ 'chat.jumpToLatest' | transloco: { count: newMessageCount() } }}</span>
+          </button>
         }
       </div>
 
       <!-- Error banner -->
       @if (chat.error(); as err) {
-        <div class="error-banner">
-          <app-icon size="sm" class="error-icon">error</app-icon>
-          {{ err }}
-          <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
-        </div>
+        @if (!isShowingReconnectBanner()) {
+          <div class="error-banner">
+            <app-icon size="sm" class="error-icon">error</app-icon>
+            {{ err }}
+            <button class="error-dismiss" (click)="chat.error.set(null)">{{ 'chat.error.dismiss' | transloco }}</button>
+          </div>
+        }
       }
 
       <!-- Input -->
-      <div class="input-area">
-        <div class="input-card" [class.focused]="inputFocused()">
+      @if (chat.threadStatus() !== 'ended') {
+      <div class="composer-wrap">
+        <div
+          class="composer"
+          [class.focused]="inputFocused()"
+          [class.disabled]="!chat.isConnected()"
+          [class.recording]="isRecording()"
+        >
           <!-- Slash command autocomplete -->
           @if (showSlashMenu()) {
             <div class="slash-menu">
@@ -587,37 +766,218 @@ const CATEGORY_LABELS: Record<string, string> = {
               }
             </div>
           }
-          <textarea
-            #inputEl
-            class="chat-input"
-            [(ngModel)]="inputText"
-            (ngModelChange)="onInputChange($event)"
-            (input)="autoResizeInput()"
-            (keydown)="onKeydown($event)"
-            (focus)="inputFocused.set(true)"
-            (blur)="inputFocused.set(false)"
-            [placeholder]="inputPlaceholder()"
-            [disabled]="!chat.isConnected()"
-            rows="1"
-          ></textarea>
-          <button
-            class="action-btn"
-            [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
-            [class.interrupting]="chat.isInterrupting()"
-            [class.pending]="isPendingSend()"
-            (click)="chat.isStreaming() ? chat.interrupt() : send()"
-            [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
-          >
-            @if (isPendingSend() || chat.isInterrupting()) {
-              <span class="action-spinner"></span>
-            } @else if (chat.isStreaming()) {
-              <app-icon size="sm" class="action-icon">stop</app-icon>
-            } @else {
-              <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
+
+          <!-- Attachment preview chips -->
+          @if (chat.pendingAttachments().length > 0 && !isRecording()) {
+            <div class="attachment-row">
+              @for (preview of chat.pendingAttachments(); track preview.id) {
+                <div class="attachment-chip" [class.is-image]="preview.type === 'image'">
+                  @if (preview.type === 'image' && preview.preview) {
+                    <button
+                      type="button"
+                      class="attachment-thumb"
+                      (click)="openImagePreview(preview)"
+                      [attr.aria-label]="preview.name"
+                    >
+                      <img [src]="preview.preview" [alt]="preview.name" />
+                    </button>
+                  } @else {
+                    <span class="attachment-icon">
+                      <app-icon size="sm">{{
+                        preview.type === 'audio' ? 'audiotrack' :
+                        preview.type === 'video' ? 'videocam' :
+                        preview.type === 'document' ? 'description' : 'insert_drive_file'
+                      }}</app-icon>
+                    </span>
+                  }
+                  <span class="attachment-meta">
+                    <span class="attachment-name">{{ preview.name }}</span>
+                    <span class="attachment-size">{{ preview.sizeFormatted }}</span>
+                  </span>
+                  <button
+                    type="button"
+                    class="attachment-remove"
+                    (click)="removeAttachment(preview.id)"
+                    [attr.aria-label]="'chat.composer.remove' | transloco"
+                    [title]="'chat.composer.remove' | transloco"
+                  >
+                    <app-icon size="sm">close</app-icon>
+                  </button>
+                </div>
+              }
+            </div>
+          }
+
+          <!-- Upload error banner -->
+          @if (chat.attachmentError(); as err) {
+            <div class="attachment-error">
+              <app-icon size="sm">error_outline</app-icon>
+              <span>{{ err }}</span>
+            </div>
+          }
+
+          <!-- Recording mode: waveform + duration + controls -->
+          @if (isRecording()) {
+            <div class="recording-strip">
+              <button
+                type="button"
+                class="recording-btn cancel"
+                (click)="cancelRecording()"
+                [attr.aria-label]="'chat.composer.recordingCancel' | transloco"
+                [title]="'chat.composer.recordingCancel' | transloco"
+              >
+                <app-icon size="sm">close</app-icon>
+              </button>
+              <canvas #waveformCanvas class="recording-canvas" width="600" height="56"></canvas>
+              <span class="recording-time">
+                <span class="recording-dot"></span>
+                {{ recordingDuration() }}s
+              </span>
+              <button
+                type="button"
+                class="recording-btn confirm"
+                (click)="stopRecording()"
+                [attr.aria-label]="'chat.composer.recordingStop' | transloco"
+                [title]="'chat.composer.recordingStop' | transloco"
+              >
+                <app-icon size="sm">check</app-icon>
+              </button>
+            </div>
+          } @else {
+            <textarea
+              #inputEl
+              class="chat-input"
+              [(ngModel)]="inputText"
+              (ngModelChange)="onInputChange($event)"
+              (input)="autoResizeInput()"
+              (keydown)="onKeydown($event)"
+              (focus)="inputFocused.set(true)"
+              (blur)="inputFocused.set(false)"
+              [placeholder]="inputPlaceholder()"
+              [disabled]="!chat.isConnected()"
+              rows="1"
+            ></textarea>
+          }
+
+          @if (!isRecording()) {
+          <div class="composer-row">
+            <!-- Attach button + popover menu -->
+            <div class="attach-wrap">
+              <button
+                type="button"
+                class="ctrl"
+                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [title]="'chat.composer.attach' | transloco"
+                [class.active]="attachmentMenuOpen()"
+                (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
+              >
+                <app-icon size="sm" class="ctrl-icon">attach_file</app-icon>
+                <span class="ctrl-label">{{ 'chat.composer.attach' | transloco }}</span>
+              </button>
+              @if (attachmentMenuOpen()) {
+                <div class="attach-menu" (click)="$event.stopPropagation()">
+                  <button type="button" class="attach-menu-item" (click)="pickFile()">
+                    <app-icon size="sm">folder_open</app-icon>
+                    <span>{{ 'chat.composer.chooseFile' | transloco }}</span>
+                  </button>
+                  @if (hasCamera()) {
+                    <button type="button" class="attach-menu-item" (click)="pickCamera()">
+                      <app-icon size="sm">photo_camera</app-icon>
+                      <span>{{ 'chat.composer.takePhoto' | transloco }}</span>
+                    </button>
+                  }
+                </div>
+                <div class="attach-menu-backdrop" (click)="closeAttachmentMenu()"></div>
+              }
+            </div>
+
+            <!-- Direct camera shortcut on mobile devices -->
+            @if (hasCamera() && isMobileDevice()) {
+              <button
+                type="button"
+                class="ctrl"
+                [disabled]="!chat.isConnected() || chat.isUploadingAttachments()"
+                [title]="'chat.composer.takePhoto' | transloco"
+                (click)="pickCamera()"
+              >
+                <app-icon size="sm" class="ctrl-icon">photo_camera</app-icon>
+              </button>
             }
-          </button>
+
+            <span class="spacer"></span>
+
+            <!-- Mic button: shown only when no text/attachments queued and not streaming -->
+            @if (
+              hasAudioInput()
+              && inputText.trim().length === 0
+              && chat.pendingAttachments().length === 0
+              && !chat.isStreaming()
+              && !isPendingSend()
+            ) {
+              <button
+                type="button"
+                class="ctrl mic"
+                [disabled]="!chat.isConnected()"
+                [title]="'chat.composer.recordVoice' | transloco"
+                (click)="startRecording()"
+              >
+                <app-icon size="sm" class="ctrl-icon">mic</app-icon>
+              </button>
+            }
+
+            <button
+              type="button"
+              class="send"
+              [class.stop]="chat.isStreaming() && !chat.isInterrupting()"
+              [class.interrupting]="chat.isInterrupting()"
+              [class.pending]="isPendingSend()"
+              [title]="(chat.isStreaming() ? 'chat.composer.stop' : 'chat.composer.send') | transloco"
+              (click)="chat.isStreaming() ? chat.interrupt() : send()"
+              [disabled]="chat.isInterrupting() || (!chat.isStreaming() && !canSend())"
+            >
+              @if (isPendingSend() || chat.isInterrupting()) {
+                <span class="action-spinner"></span>
+              } @else if (chat.isStreaming()) {
+                <app-icon size="sm" class="action-icon">stop</app-icon>
+              } @else {
+                <app-icon size="sm" class="action-icon">arrow_upward</app-icon>
+              }
+            </button>
+          </div>
+          }
         </div>
+
+        <!-- Hidden file inputs -->
+        <input
+          #fileInput
+          type="file"
+          multiple
+          accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.txt,.md,.csv,.xls,.xlsx,.zip"
+          (change)="onFilesSelected($event)"
+          style="display: none;"
+        />
+        <input
+          #cameraInput
+          type="file"
+          accept="image/*"
+          capture="environment"
+          (change)="onFilesSelected($event)"
+          style="display: none;"
+        />
       </div>
+      }
+
+      <!-- Image preview dialog -->
+      <app-dialog
+        [open]="imagePreviewUrl() !== null"
+        [title]="imagePreviewName()"
+        size="lg"
+        (closed)="closeImagePreview()"
+      >
+        @if (imagePreviewUrl(); as url) {
+          <img [src]="url" [alt]="imagePreviewName()" class="image-preview-img" />
+        }
+      </app-dialog>
     </div>
   `,
     styles: [
@@ -633,6 +993,49 @@ const CATEGORY_LABELS: Record<string, string> = {
         display: flex;
         flex-direction: column;
         height: 100%;
+        position: relative;
+      }
+
+      /* Drag-and-drop overlay shown while files are dragged over the chat */
+      .drop-overlay {
+        position: absolute;
+        inset: 0;
+        z-index: 50;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: color-mix(in srgb, var(--accent-color, #3399D6) 18%, transparent);
+        backdrop-filter: blur(2px);
+        pointer-events: none;
+        animation: drop-overlay-fade 0.12s ease-out;
+      }
+
+      @keyframes drop-overlay-fade {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+      }
+
+      .drop-overlay-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        padding: 28px 36px;
+        background: var(--panel-bg, var(--panel-bg));
+        border: 2px dashed var(--accent-color, #3399D6);
+        border-radius: 8px;
+        color: var(--text-primary, var(--text-primary));
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+      }
+
+      .drop-overlay-icon {
+        font-size: 36px;
+        color: var(--accent-color, #3399D6);
+      }
+
+      .drop-overlay-text {
+        font-size: 14px;
+        font-weight: 500;
       }
 
       /* Header */
@@ -663,7 +1066,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .back-link:hover { color: var(--text-primary, var(--text-primary)); }
 
-      .header-icon, .approval-card-icon, .error-icon {
+      .header-icon, .error-icon {
         color: var(--accent-color, var(--accent-color));
       }
 
@@ -880,31 +1283,197 @@ const CATEGORY_LABELS: Record<string, string> = {
         justify-content: center;
       }
 
-      .empty-state-text {
-        color: var(--text-muted, var(--text-muted));
-        font-size: 14px;
-        scrollbar-color: var(--border-color, var(--surface-0)) transparent;
-      }
-
-      .startup-spinner-container {
+      .empty-inner {
+        text-align: center;
+        max-width: 850px;
+        padding: 72px 48px;
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 16px;
       }
 
-      .startup-spinner {
-        width: 32px;
-        height: 32px;
-        border: 3px solid var(--border-color, var(--surface-0));
-        border-top-color: var(--accent-color, var(--accent-color));
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
+      .empty-mark {
+        width: 144px;
+        height: 144px;
+        margin-bottom: 30px;
+        opacity: 0.95;
       }
 
-      .startup-label {
+      .empty-title {
+        font-family: var(--font-display, inherit);
+        font-size: 32px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-primary, var(--text-primary));
+        margin: 0 0 16px;
+        line-height: 1.15;
+      }
+
+      .empty-subtitle {
+        font-size: 17px;
+        line-height: 1.55;
         color: var(--text-muted, var(--text-muted));
+        margin: 0 0 38px;
+        max-width: 620px;
+      }
+
+      .suggestion-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        width: 100%;
+        max-width: 760px;
+      }
+
+      .suggestion-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 16px 22px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        color: var(--text-secondary, var(--text-secondary));
+        font-family: inherit;
+        font-size: 16px;
+        font-weight: 500;
+        text-align: left;
+        cursor: pointer;
+        border-radius: 0;
+        transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+      }
+
+      .suggestion-chip:hover {
+        border-color: var(--accent-color, var(--accent-color));
+        color: var(--text-primary, var(--text-primary));
+        background: var(--hover, rgba(255, 255, 255, 0.04));
+      }
+
+      .suggestion-icon {
+        color: var(--accent-color, var(--accent-color));
+        flex-shrink: 0;
+      }
+
+      .suggestion-text {
+        flex: 1;
+      }
+
+      @media (max-width: 600px) {
+        .suggestion-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .startup-wrapper {
+        display: flex;
+        justify-content: center;
+        width: 100%;
+        padding: 48px 0 24px;
+      }
+
+      .startup-wrapper.resume {
+        padding: 24px 0;
+      }
+
+      .startup-card {
+        width: min(560px, 100%);
+        background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 4px solid var(--accent-color, var(--accent-color));
+      }
+
+      .startup-card-head {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 20px 22px;
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+      }
+
+      .startup-card-spinner {
+        width: 22px;
+        height: 22px;
+        border: 3px solid var(--surface-2, var(--surface-1));
+        border-top-color: var(--accent-color, var(--accent-color));
+        animation: spin 0.7s linear infinite;
+        flex-shrink: 0;
+      }
+
+      .startup-card-title {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 15px;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .startup-steps {
+        padding: 14px 22px 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+      }
+
+      .startup-step {
+        display: grid;
+        grid-template-columns: 24px 1fr auto;
+        align-items: center;
+        column-gap: 14px;
+        font-size: 18px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .startup-step .step-spinner {
+        width: 18px;
+        height: 18px;
+        border: 2px solid var(--surface-2, var(--surface-1));
+        border-top-color: var(--accent-color, var(--accent-color));
+        animation: spin 0.7s linear infinite;
+        display: inline-block;
+        flex-shrink: 0;
+        justify-self: center;
+      }
+
+      .startup-step .step-time {
+        font-family: var(--font-mono, monospace);
         font-size: 13px;
+        color: var(--text-muted, var(--text-muted));
+        font-variant-numeric: tabular-nums;
+      }
+
+      .startup-step.state-active .step-time {
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .startup-step .step-icon {
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .startup-step.state-done {
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .startup-step.state-done .step-icon {
+        color: var(--success);
+      }
+
+      .startup-step.state-active {
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .startup-step.state-active .step-icon {
+        color: var(--accent-color, var(--accent-color));
+        animation: pulseSoft 1.4s ease-in-out infinite;
+      }
+
+      .startup-step.state-todo .step-icon {
+        color: var(--surface-2, var(--surface-1));
+      }
+
+      @keyframes pulseSoft {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
       }
 
       .message {
@@ -990,19 +1559,9 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
 
-      .resume-btn-wrapper {
-        display: flex;
-        justify-content: center;
-        margin-top: 8px;
-      }
-
       .resume-icon {
         margin-right: 4px;
         vertical-align: middle;
-      }
-
-      .resume-spinner {
-        padding: 24px 0;
       }
 
       /* Tool-only messages: compact inline indicators (no avatar/bubble) */
@@ -1019,6 +1578,22 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 2px 8px 2px 40px;  /* indent to align with message body (avatar 30px + gap 10px) */
         font-size: 11px;
         color: var(--text-muted, var(--text-muted));
+        cursor: pointer;
+        list-style: none;
+        border-radius: 4px;
+        transition: background 0.15s;
+      }
+
+      .tool-only-row::-webkit-details-marker { display: none; }
+      .tool-only-row:hover { background: rgba(255, 255, 255, 0.04); }
+
+      .tool-only-chevron {
+        font-size: 14px;
+        transition: transform 0.15s;
+      }
+
+      details[open] > .tool-only-row .tool-only-chevron {
+        transform: rotate(90deg);
       }
 
       .tool-only-icon {
@@ -1027,6 +1602,11 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .tool-only-label {
         white-space: nowrap;
+      }
+
+      /* Tool-only details body: align with the row, give the cards a bit of breathing room */
+      .tool-only-summary > .tool-detail-list {
+        padding: 4px 8px 4px 60px;
       }
 
       /* Tool summary (collapsed by default) */
@@ -1073,40 +1653,57 @@ const CATEGORY_LABELS: Record<string, string> = {
       .tool-summary-dot.denied { background: var(--danger); }
       .tool-summary-dot.mixed { background: var(--warning); }
 
-      /* Tool detail list (level 2) */
+      /* Tool detail list (level 2) — F6 card visual */
 
       .tool-detail-list {
-        padding: 4px 0 4px 20px;
+        padding: 6px 0 4px 20px;
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 6px;
       }
 
-      .tool-detail-item { font-size: 11px; }
+      .tool-card {
+        font-size: 11px;
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 0;
+        background: var(--surface-0);
+        overflow: hidden;
+      }
 
-      .tool-detail-header {
+      .tool-head {
         display: flex;
         align-items: center;
-        gap: 6px;
-        padding: 3px 8px;
+        gap: 8px;
+        padding: 6px 10px;
         cursor: pointer;
-        border-radius: 4px;
-        color: var(--text-muted, var(--text-muted));
         list-style: none;
+        background: var(--panel-bg, var(--panel-bg));
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        color: var(--text-muted, var(--text-muted));
       }
 
-      .tool-detail-header::-webkit-details-marker { display: none; }
-      .tool-detail-header:hover { background: rgba(255, 255, 255, 0.03); }
+      .tool-card[open] > .tool-head {
+        border-bottom: 1px solid var(--border-color, var(--surface-0));
+      }
 
-      .tool-detail-name {
-        font-family: 'JetBrains Mono', monospace;
+      .tool-head::-webkit-details-marker { display: none; }
+      .tool-head:hover { background: var(--surface-1, rgba(255, 255, 255, 0.04)); }
+
+      .tool-icon {
         color: var(--accent-color, var(--accent-color));
-        font-weight: 500;
+        width: 16px;
+        text-align: center;
+        flex-shrink: 0;
       }
 
-      .tool-detail-args {
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 10px;
+      .tool-name {
+        color: var(--accent-color, var(--accent-color));
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .tool-args {
         color: var(--text-muted, var(--text-muted));
         overflow: hidden;
         text-overflow: ellipsis;
@@ -1115,43 +1712,50 @@ const CATEGORY_LABELS: Record<string, string> = {
         min-width: 0;
       }
 
-      .tool-detail-status {
-        font-size: 10px;
+      .tool-status {
         margin-left: auto;
-      }
-
-      .tool-detail-status.status-completed { color: var(--success); }
-      .tool-detail-status.status-running { color: var(--warning); }
-      .tool-detail-status.status-denied { color: var(--danger); }
-      .tool-detail-status.status-pending { color: var(--text-muted, var(--text-muted)); }
-
-      .tool-icon {
-        color: var(--text-muted, var(--text-muted));
-        width: 16px;
-        text-align: center;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 9.5px;
+        font-weight: 600;
         flex-shrink: 0;
       }
 
-      .tool-preview {
-        padding: 2px 8px 2px 28px;
-        font-size: 10px;
-        color: var(--text-muted, var(--text-muted));
-        opacity: 0.6;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-family: 'JetBrains Mono', monospace;
+      .tool-status .tool-status-icon { font-size: 13px; }
+
+      .tool-status.status-completed,
+      .tool-status.status-completed .tool-status-icon { color: var(--success); }
+      .tool-status.status-running,
+      .tool-status.status-running .tool-status-icon { color: var(--warning); }
+      .tool-status.status-running .tool-status-icon { animation: spin 0.7s linear infinite; }
+      .tool-status.status-denied,
+      .tool-status.status-denied .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
+      .tool-status.status-pending,
+      .tool-status.status-pending .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
+      .tool-status.status-error,
+      .tool-status.status-error .tool-status-icon { color: var(--danger); }
+
+      /* Error tool card — danger left accent + tinted body so errored calls
+         are visible at a glance, even when the card is collapsed. */
+      .tool-card.tool-error { border-left: 3px solid var(--danger); }
+      .tool-card.tool-error > .tool-head .tool-name { color: var(--danger); }
+      .tool-card.tool-error > .tool-body { background: color-mix(in srgb, var(--danger) 6%, var(--surface-0)); }
+
+      .tool-body {
+        padding: 10px 12px;
+        background: var(--surface-0);
       }
 
-      .tool-detail-item[open] > .tool-preview { display: none; }
-
-      .tool-detail-result {
-        margin: 4px 0 4px 8px;
-        padding: 8px 10px;
-        background: var(--panel-bg, var(--panel-bg));
-        border-radius: 6px;
+      .tool-result {
+        margin: 0;
+        padding: 0;
+        background: transparent;
         font-size: 11px;
-        max-height: 200px;
+        max-height: 240px;
         overflow: auto;
         white-space: pre-wrap;
         word-break: break-word;
@@ -1285,66 +1889,124 @@ const CATEGORY_LABELS: Record<string, string> = {
         40% { transform: translateY(-6px); }
       }
 
-      /* Approval — pending card and resolved badges.
-         Pending: warning-toned card anchored to the live turn.
-         Resolved: small inline badge prefixed onto the tool-detail row. */
+      /* Approval — pending mile marker and resolved trail strips.
+         Pending: sharp-cornered card with accent-color left border.
+         Resolved: single-line trail strip in the message stream
+         (in addition to the small badge inside the tool-card head). */
 
-      .approval-card {
-        margin: 8px auto;
-        width: 80%;
-        border: 1px solid var(--warning);
-        border-radius: 8px;
-        padding: 12px;
-        background: var(--warning-tint);
+      .mile {
+        align-self: flex-start;
+        margin: 10px 0 10px 40px;
+        width: min(720px, calc(100% - 40px));
+        padding: 14px 16px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color);
+        border-radius: 0;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 6px;
       }
 
-      .approval-card-head {
+      .mile-label {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.20em;
+        font-weight: 600;
+        font-size: 10px;
+        color: var(--accent-color);
+      }
+
+      .mile-title {
+        font-weight: 600;
+        font-size: 14px;
+        color: var(--text-primary);
+      }
+
+      .mile-detail {
         display: flex;
         align-items: center;
         gap: 6px;
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--warning);
-      }
-
-      .approval-card-head .approval-card-icon { color: var(--warning); }
-
-      .approval-card-tool {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 10px;
-        background: var(--surface-0);
-        border-radius: 6px;
+        font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
+        color: var(--text-muted);
+        margin-bottom: 6px;
         min-width: 0;
       }
 
-      .approval-card-tool .tool-icon { color: var(--text-muted); flex-shrink: 0; }
+      .mile-detail-icon { color: var(--text-muted); flex-shrink: 0; }
 
-      .approval-card-tool-name {
-        font-family: var(--font-mono);
+      .mile-tool {
+        background: transparent;
+        color: var(--accent-color);
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .mile-args {
+        background: transparent;
+        color: var(--text-muted);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+      }
+
+      .mile-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      .mile-resolved {
+        align-self: flex-start;
+        margin: 6px 0 6px 40px;
+        width: min(720px, calc(100% - 40px));
+        padding: 8px 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        background: var(--surface-0);
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--text-muted);
+        border-radius: 0;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .mile-resolved.approved { border-left-color: var(--success); }
+      .mile-resolved.rejected { border-left-color: var(--text-muted); opacity: 0.85; }
+
+      .mile-resolved-icon { font-size: 16px; flex-shrink: 0; color: var(--text-muted); }
+      .mile-resolved.approved .mile-resolved-icon { color: var(--success); }
+      .mile-resolved.rejected .mile-resolved-icon { color: var(--text-muted); }
+
+      .mile-resolved .resolved-label {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 10px;
         font-weight: 600;
         color: var(--text-primary);
         flex-shrink: 0;
       }
 
-      .approval-card-tool-args {
-        font-family: var(--font-mono);
-        font-size: 11px;
-        color: var(--text-muted);
-        white-space: nowrap;
+      .mile-resolved.approved .resolved-label { color: var(--success); }
+
+      .mile-resolved .resolved-title {
+        color: var(--text-primary);
         overflow: hidden;
         text-overflow: ellipsis;
+        white-space: nowrap;
         min-width: 0;
+        flex: 1;
       }
 
-      .approval-card-actions {
-        display: flex;
-        gap: 8px;
+      .mile-resolved .resolved-time {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--text-muted);
+        flex-shrink: 0;
       }
 
       .approval-badge {
@@ -1396,44 +2058,216 @@ const CATEGORY_LABELS: Record<string, string> = {
         text-decoration: underline;
       }
 
-      /* Input area */
+      /* Reconnect banner (F4) — shown inline at the bottom of the message
+         stream when the WS dropped on a still-active thread. */
 
-      .input-area {
-        padding: 12px 16px 16px;
+      .reconnect-banner {
+        margin: 14px 0 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 14px;
+        background: var(--danger-tint);
+        border: 1px solid var(--danger);
+        border-left: 3px solid var(--danger);
+      }
+
+      .reconnect-banner .rb-icon {
+        color: var(--danger);
+        animation: pulseSoft 1.4s ease-in-out infinite;
+      }
+
+      .reconnect-banner .rb-body {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+        flex: 1;
+      }
+
+      .reconnect-banner .rb-body strong {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 11px;
+        color: var(--danger);
+      }
+
+      .reconnect-banner .rb-body span {
+        font-family: var(--font-mono, inherit);
+        font-size: 11.5px;
+        color: var(--text-secondary, var(--text-secondary));
+      }
+
+      .message.dimmed {
+        opacity: 0.5;
+        filter: saturate(0.6);
+      }
+
+      /* Jump-to-latest pill (F5) — sticks to the bottom of the messages
+         scroll container when the user has scrolled up while new messages
+         arrive. Sharp corners + uppercase display font match the rest of
+         the visual refresh. */
+
+      .jump-latest {
+        position: sticky;
+        bottom: 16px;
+        align-self: center;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 14px;
+        background: var(--accent-color);
+        color: #fff;
+        border: 0;
+        cursor: pointer;
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-weight: 600;
+        font-size: 10.5px;
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+        transition: filter 0.15s ease, transform 0.15s ease;
+        z-index: 5;
+      }
+
+      .jump-latest:hover {
+        filter: brightness(1.1);
+      }
+
+      .jump-latest:active {
+        transform: translateY(1px);
+      }
+
+      .jump-latest app-icon {
+        color: inherit;
+      }
+
+      /* Ended-session end-marker + resume card */
+
+      .end-marker {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin: 24px 0 8px;
+      }
+
+      .end-line {
+        flex: 1;
+        height: 1px;
+        background: var(--border-color, var(--surface-0));
+      }
+
+      .end-tag {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.20em;
+        font-weight: 600;
+        font-size: 10px;
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .end-icon {
+        color: var(--accent-color, var(--accent-color));
+      }
+
+      .resume-card {
+        margin-top: 8px;
+        display: grid;
+        grid-template-columns: 1fr auto;
+        align-items: center;
+        gap: 16px;
+        padding: 18px 20px;
         background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-left: 3px solid var(--accent-color, var(--accent-color));
+      }
+
+      .resume-eyebrow {
+        font-family: var(--font-display, inherit);
+        text-transform: uppercase;
+        letter-spacing: 0.28em;
+        font-weight: 600;
+        font-size: 9.5px;
+        color: var(--accent-color, var(--accent-color));
+        margin-bottom: 4px;
+      }
+
+      .resume-title {
+        margin: 0 0 4px;
+        font-family: var(--font-base, inherit);
+        font-size: 16px;
+        font-weight: 600;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .resume-text {
+        margin: 0;
+        font-size: 13px;
+        color: var(--text-secondary, var(--text-secondary));
+        line-height: 1.5;
+      }
+
+      .resume-actions {
+        display: flex;
+        gap: 8px;
+      }
+
+      @media (max-width: 600px) {
+        .resume-card {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      /* Composer */
+
+      .composer-wrap {
+        padding: 14px 36px 18px;
+        background: transparent;
         flex-shrink: 0;
       }
 
-      .input-card {
+      .composer {
         position: relative;
-        display: flex;
-        align-items: flex-end;
-        gap: 8px;
-        padding: 8px 8px 8px 16px;
-        border-radius: 20px;
+        max-width: 880px;
+        margin: 0 auto;
+        background: var(--panel-bg, var(--panel-bg));
         border: 1px solid var(--border-color, var(--surface-0));
-        background: var(--surface-0, var(--surface-0));
-        transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        border-radius: 0;
+        transition: outline-color 0.15s ease, border-color 0.15s ease;
       }
 
-      .input-card.focused {
+      .composer.focused {
+        outline: 2px solid var(--accent-color, var(--accent-color));
+        outline-offset: 1px;
         border-color: var(--accent-color, var(--accent-color));
-        box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 20%, transparent);
+      }
+
+      .composer.disabled {
+        opacity: 0.6;
       }
 
       .chat-input {
-        flex: 1;
-        padding: 6px 0;
-        border: none;
-        background: transparent;
-        color: var(--text-primary, var(--text-primary));
-        font-size: 14px;
-        font-family: inherit;
-        resize: none;
-        min-height: 24px;
+        width: 100%;
+        min-height: 56px;
         max-height: 180px;
-        line-height: 1.5;
-        overflow-y: auto;
+        padding: 12px 14px;
+        background: transparent;
+        border: 0;
+        outline: 0;
+        color: var(--text-primary, var(--text-primary));
+        font-family: inherit;
+        font-size: 14px;
+        line-height: 1.55;
+        resize: none;
+        display: block;
       }
 
       .chat-input:focus,
@@ -1444,7 +2278,6 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .chat-input:disabled {
-        opacity: 0.5;
         cursor: not-allowed;
       }
 
@@ -1452,47 +2285,94 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-muted, var(--text-muted));
       }
 
-      /* Action button — send / stop / spinner in one spot */
-
-      .action-btn {
+      .composer-row {
         display: flex;
         align-items: center;
-        justify-content: center;
-        width: 36px;
-        height: 36px;
-        border-radius: 50%;
-        border: none;
+        gap: 6px;
+        padding: 6px 8px 8px;
+        border-top: 1px solid var(--border-color, var(--surface-0));
+        background: var(--surface-0, var(--surface-0));
+      }
+
+      .composer-row .spacer {
+        flex: 1;
+      }
+
+      .ctrl {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 26px;
+        padding: 0 10px;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 0;
+        color: var(--text-muted, var(--text-muted));
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      }
+
+      .ctrl:hover:not(:disabled) {
+        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .ctrl:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      .ctrl-icon {
+        font-size: 14px;
+      }
+
+      /* Send button — round, morphs to stop/spinner during streaming */
+
+      .send {
+        width: 30px;
+        height: 30px;
+        display: grid;
+        place-items: center;
         background: var(--accent-color, var(--accent-color));
         color: var(--timeline-bg, var(--timeline-bg));
+        border: 0;
+        border-radius: 50%;
         cursor: pointer;
         flex-shrink: 0;
         transition: background 0.15s ease, opacity 0.15s ease;
       }
 
-      .action-btn:disabled {
-        opacity: 0.3;
+      .send:disabled {
+        background: var(--surface-1, var(--surface-0));
+        color: var(--text-muted, var(--text-muted));
         cursor: not-allowed;
       }
 
-      .action-btn.stop {
+      .send:not(:disabled):hover {
+        background: var(--accent-hover, var(--accent-color));
+      }
+
+      .send.stop {
         background: var(--danger);
         opacity: 1;
       }
 
-      .action-btn.pending,
-      .action-btn.interrupting {
+      .send.pending,
+      .send.interrupting {
         opacity: 0.7;
         cursor: wait;
       }
 
-      .action-btn.interrupting {
+      .send.interrupting {
         background: var(--danger);
       }
 
-
       .action-spinner {
-        width: 16px;
-        height: 16px;
+        width: 14px;
+        height: 14px;
         border: 2px solid var(--timeline-bg, var(--timeline-bg));
         border-top-color: transparent;
         border-radius: 50%;
@@ -1501,6 +2381,316 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       @keyframes spin {
         to { transform: rotate(360deg); }
+      }
+
+      /* Composer attachments — chips, error banner, recording strip, attach menu */
+
+      .attachment-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 10px 10px 0;
+      }
+
+      .attachment-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 4px 4px 8px;
+        max-width: 240px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 6px;
+        position: relative;
+      }
+
+      .attachment-chip.is-image {
+        padding: 4px;
+      }
+
+      .attachment-thumb {
+        display: block;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        cursor: pointer;
+        line-height: 0;
+      }
+
+      .attachment-thumb img {
+        width: 56px;
+        height: 56px;
+        object-fit: cover;
+        border-radius: 4px;
+      }
+
+      .attachment-icon {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .attachment-meta {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        flex: 1;
+      }
+
+      .attachment-name {
+        font-size: 12px;
+        color: var(--text-primary, var(--text-primary));
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .attachment-size {
+        font-size: 10px;
+        color: var(--text-muted, var(--text-muted));
+      }
+
+      .attachment-remove {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        background: transparent;
+        border: 0;
+        border-radius: 4px;
+        color: var(--text-muted, var(--text-muted));
+        cursor: pointer;
+      }
+
+      .attachment-remove:hover {
+        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .attachment-error {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 12px;
+        margin: 8px 10px 0;
+        background: color-mix(in srgb, var(--danger, #c44) 12%, transparent);
+        color: var(--danger, #c44);
+        font-size: 12px;
+        border-radius: 4px;
+      }
+
+      /* Recording strip — replaces the textarea while recording. */
+      .recording-strip {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 12px;
+        min-height: 64px;
+      }
+
+      .recording-canvas {
+        flex: 1;
+        height: 56px;
+        border-radius: 4px;
+        background: transparent;
+      }
+
+      .recording-time {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-variant-numeric: tabular-nums;
+        font-size: 13px;
+        color: var(--text-primary, var(--text-primary));
+        min-width: 50px;
+      }
+
+      .recording-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--danger, #c44);
+        animation: chat-recording-pulse 1.2s ease-in-out infinite;
+      }
+
+      @keyframes chat-recording-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.35; }
+      }
+
+      .recording-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        background: transparent;
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 50%;
+        color: var(--text-muted, var(--text-muted));
+        cursor: pointer;
+      }
+
+      .recording-btn.cancel:hover {
+        color: var(--danger, #c44);
+        border-color: var(--danger, #c44);
+      }
+
+      .recording-btn.confirm {
+        background: var(--accent-color, var(--accent-color));
+        color: var(--timeline-bg, var(--timeline-bg));
+        border-color: transparent;
+      }
+
+      /* Attach menu */
+      .attach-wrap {
+        position: relative;
+      }
+
+      .ctrl.active {
+        background: var(--surface-0, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .attach-menu {
+        position: absolute;
+        bottom: 100%;
+        left: 0;
+        margin-bottom: 6px;
+        min-width: 180px;
+        background: var(--panel-bg, var(--panel-bg));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 8px;
+        padding: 4px;
+        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
+        z-index: 11;
+      }
+
+      .attach-menu-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+      }
+
+      .attach-menu-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 100%;
+        padding: 8px 10px;
+        background: transparent;
+        border: 0;
+        border-radius: 6px;
+        color: var(--text-primary, var(--text-primary));
+        font-family: inherit;
+        font-size: 13px;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .attach-menu-item:hover {
+        background: var(--surface-0, var(--surface-0));
+      }
+
+      /* Mic button styled the same as other ctrl buttons */
+      .ctrl.mic .ctrl-icon {
+        font-size: 16px;
+      }
+
+      /* Image preview dialog body */
+      .image-preview-img {
+        display: block;
+        max-width: 100%;
+        max-height: 70vh;
+        margin: 0 auto;
+        object-fit: contain;
+      }
+
+      /* Per-message action row (TTS button etc.) */
+      .message-actions {
+        display: flex;
+        gap: 4px;
+        margin-top: 6px;
+        opacity: 0.55;
+        transition: opacity 0.15s ease;
+      }
+
+      .message-actions:hover,
+      .message-actions:focus-within {
+        opacity: 1;
+      }
+
+      .msg-action-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 26px;
+        height: 26px;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 4px;
+        color: var(--text-muted, var(--text-muted));
+        cursor: pointer;
+        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+      }
+
+      .msg-action-btn:hover:not(:disabled) {
+        background: var(--surface-0, var(--surface-0));
+        color: var(--text-primary, var(--text-primary));
+        border-color: var(--border-color, var(--surface-0));
+      }
+
+      .msg-action-btn:disabled {
+        cursor: wait;
+      }
+
+      .tts-btn.is-playing {
+        color: var(--accent-color, var(--accent-color));
+        border-color: var(--accent-color, var(--accent-color));
+      }
+
+      .tts-btn.is-error {
+        color: var(--danger, #c44);
+      }
+
+      .action-spinner-sm {
+        width: 12px;
+        height: 12px;
+        border: 2px solid currentColor;
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      /* User-message attachment chips (rendered alongside their text) */
+      .user-attachments {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .user-attachment-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 3px 8px;
+        background: var(--surface-0, var(--surface-0));
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: 4px;
+        font-size: 12px;
+        color: var(--text-muted, var(--text-muted));
+        max-width: 240px;
+      }
+
+      .user-attachment-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       /* Slash command autocomplete */
@@ -1753,31 +2943,42 @@ const CATEGORY_LABELS: Record<string, string> = {
           max-width: 98%;
         }
 
-        .approval-card {
-          width: 95%;
-        }
-
         .chat-input {
           font-size: 16px;
         }
 
-        .input-area {
-          padding: 8px;
-          padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+        .composer-wrap {
+          padding: 10px 12px 14px;
+          padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+        }
+
+        .composer-row {
+          padding: 4px 6px 6px;
+        }
+
+        .ctrl-label {
+          display: none;
         }
       }
     `,
     ],
 })
-export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
+export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly chat = inject(PersistentChatService);
     private readonly api = inject(ApiService);
     readonly modelService = inject(ModelService);
     private readonly transloco = inject(TranslocoService);
     private readonly i18n = inject(I18nService);
+    private readonly http = inject(HttpClient);
+    private readonly fileHandling = inject(FileHandlingService);
+    private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
+    private readonly voiceRecording = inject(VoiceRecordingService);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
+    @ViewChild('fileInput') fileInput?: ElementRef<HTMLInputElement>;
+    @ViewChild('cameraInput') cameraInput?: ElementRef<HTMLInputElement>;
+    @ViewChild('waveformCanvas') waveformCanvas?: ElementRef<HTMLCanvasElement>;
 
     inputText = '';
 
@@ -1790,10 +2991,120 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     // Input state
     readonly inputFocused = signal(false);
 
+    // Composer attachments — device capabilities, recording, image preview.
+    readonly hasCamera = signal(false);
+    readonly hasAudioInput = signal(false);
+    readonly isMobileDevice = signal(false);
+    readonly attachmentMenuOpen = signal(false);
+    readonly isRecording = signal(false);
+    readonly recordingDuration = signal(0);
+    readonly imagePreviewUrl = signal<string | null>(null);
+    readonly imagePreviewName = signal<string>('');
+    // Drag-and-drop overlay state. dragEnterCount handles the
+    // dragenter/dragleave-on-child-element quirk: the leave fires every
+    // time the cursor crosses any nested element border, so we only hide
+    // the overlay when the counter returns to zero.
+    readonly isDragOver = signal(false);
+    private dragEnterCount = 0;
+
+    private capabilitiesSub?: Subscription;
+    private recordingStateSub?: Subscription;
+
+    // Per-assistant-message TTS state. Keyed by the message index in
+    // chat.messages(). Indices are stable in practice — the messages
+    // array only ever appends.
+    readonly ttsState = signal<Record<number, TtsMessageState>>({});
+    private currentTtsAudio: HTMLAudioElement | null = null;
+    private currentTtsIndex: number | null = null;
+    // Tracks blob URLs we've created so we can revoke them on destroy.
+    private readonly ttsBlobUrls = new Set<string>();
+
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
     readonly filteredCommands = signal<SlashCommand[]>([]);
+
+    // Empty-state suggestions (loaded once, picked once per mount)
+    private readonly pickedSuggestions = signal<Suggestion[]>([]);
+    readonly displayedSuggestions = computed<DisplayedSuggestion[]>(() => {
+        const lang = this.i18n.activeLang();
+        return this.pickedSuggestions().map(s => ({
+            icon: s.icon,
+            text: lang === 'de-DE' ? (s.de || s.en) : s.en,
+        }));
+    });
+
+    formatEndedAt(value: string | null): string {
+        if (!value) return '';
+        const lang = this.i18n.activeLang();
+        try {
+            return new Intl.DateTimeFormat(lang, {
+                dateStyle: 'long',
+                timeStyle: 'short',
+            }).format(new Date(value));
+        } catch {
+            return value;
+        }
+    }
+
+    // Startup step list — drives the provisioning card.
+    // Order maps to the phases the orchestrator emits via the `status` WS message.
+    private readonly STARTUP_PHASE_ORDER = ['creating', 'provisioning', 'booting', 'connecting'] as const;
+
+    // Per-phase timing. Plain mutable maps + a revision signal so the computed
+    // re-runs on transitions without forming a self-referential signal loop.
+    private phaseStarts: Record<string, number> = {};
+    private phaseDurations: Record<string, number> = {};
+    private readonly phaseRevision = signal(0);
+    private readonly nowTick = signal<number>(Date.now());
+    private startupTickInterval: ReturnType<typeof setInterval> | null = null;
+    private prevActivePhase: string | null = null;
+    private prevReadyForTiming = false;
+    private prevThreadIdForTiming: string | null = null;
+
+    readonly startupSteps = computed(() => {
+        const order = this.STARTUP_PHASE_ORDER;
+        const phase = this.chat.startupPhase();
+        const isResuming = this.chat.messages().length > 0;
+        // Subscribe to phase tracking changes and to the live tick.
+        this.phaseRevision();
+        const now = this.nowTick();
+        let activeIdx: number;
+        if (this.chat.isCreating()) {
+            activeIdx = 0;
+        } else if (phase && (order as readonly string[]).includes(phase)) {
+            activeIdx = (order as readonly string[]).indexOf(phase);
+        } else {
+            activeIdx = isResuming ? 1 : 0;
+        }
+        return order.map((key, idx) => {
+            const state: 'done' | 'active' | 'todo' =
+                idx < activeIdx ? 'done' : (idx === activeIdx ? 'active' : 'todo');
+            let elapsedMs: number | null = null;
+            if (state === 'done') {
+                elapsedMs = this.phaseDurations[key] ?? null;
+            } else if (state === 'active' && this.phaseStarts[key] != null) {
+                elapsedMs = Math.max(0, now - this.phaseStarts[key]);
+            }
+            return { key, state, elapsedMs };
+        });
+    });
+
+    stepIcon(state: 'done' | 'active' | 'todo'): string {
+        if (state === 'done') return 'check_circle';
+        if (state === 'active') return 'progress_activity';
+        return 'radio_button_unchecked';
+    }
+
+    formatElapsed(ms: number | null): string {
+        if (ms == null) return '—';
+        const s = Math.max(0, ms) / 1000;
+        if (s < 10) return `${s.toFixed(1)}s`;
+        if (s < 60) return `${Math.round(s)}s`;
+        const m = Math.floor(s / 60);
+        const rs = Math.round(s % 60);
+        return `${m}m${rs.toString().padStart(2, '0')}s`;
+    }
 
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
@@ -1801,6 +3112,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     private idePollingAttempts = 0;
 
     private autoScroll = true;
+    private lastSeenMessageCount = 0;
 
     constructor() {
         // Start/stop IDE polling when connection state changes
@@ -1817,6 +3129,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         // Load available models eagerly so the dropdown is ready
         this.modelService.load();
 
+        // Load empty-state suggestions and pick 4 at random for this mount
+        this.http.get<Suggestion[]>('assets/suggestions.json').subscribe({
+            next: (data) => {
+                const shuffled = [...data].sort(() => Math.random() - 0.5);
+                this.pickedSuggestions.set(shuffled.slice(0, Math.min(4, shuffled.length)));
+            },
+            error: () => this.pickedSuggestions.set([]),
+        });
+
         // Auto-scroll when messages, streaming, or tool calls change
         effect(() => {
             this.chat.messages();
@@ -1826,6 +3147,80 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
             if (this.autoScroll) {
                 setTimeout(() => this.scrollToBottom(), 0);
+            }
+        });
+
+        // Track new messages that arrive while the user has scrolled up.
+        // Drives the "Jump to latest · N new" pill (F5).
+        effect(() => {
+            const len = this.chat.messages().length;
+            const away = this.scrolledAway();
+            if (len < this.lastSeenMessageCount) {
+                // Thread switch or messages cleared — start fresh.
+                this.newMessageCount.set(0);
+            } else if (away && len > this.lastSeenMessageCount) {
+                const delta = len - this.lastSeenMessageCount;
+                this.newMessageCount.update(n => n + delta);
+            } else if (!away) {
+                this.newMessageCount.set(0);
+            }
+            this.lastSeenMessageCount = len;
+        });
+
+        // Track startup phase transitions to record per-step durations.
+        effect(() => {
+            const phase = this.chat.startupPhase();
+            const isCreating = this.chat.isCreating();
+            const ready = this.chat.sessionReady();
+            const tid = this.chat.threadId();
+            const order = this.STARTUP_PHASE_ORDER as readonly string[];
+
+            // Reset when switching to a different thread, or when sessionReady
+            // drops back to false. The null → realId transition during new-thread
+            // creation must NOT reset — that would wipe the 'creating' phase
+            // timing recorded while threadId was still null.
+            const threadChanged = this.prevThreadIdForTiming != null && tid !== this.prevThreadIdForTiming;
+            if (threadChanged || (this.prevReadyForTiming && !ready)) {
+                this.phaseStarts = {};
+                this.phaseDurations = {};
+                this.prevActivePhase = null;
+                this.phaseRevision.update(v => v + 1);
+            }
+            this.prevThreadIdForTiming = tid;
+            this.prevReadyForTiming = ready;
+
+            // Determine effective active phase (mirrors startupSteps logic, but
+            // we only record timing once we have a real signal — not during the
+            // brief null gap on resume).
+            let active: string | null = null;
+            if (!ready) {
+                if (isCreating) active = 'creating';
+                else if (phase && order.includes(phase)) active = phase;
+            }
+
+            if (active !== this.prevActivePhase) {
+                const now = Date.now();
+                if (this.prevActivePhase != null) {
+                    const start = this.phaseStarts[this.prevActivePhase];
+                    if (start != null) {
+                        this.phaseDurations[this.prevActivePhase] = now - start;
+                    }
+                }
+                if (active && this.phaseStarts[active] == null) {
+                    this.phaseStarts[active] = now;
+                }
+                this.prevActivePhase = active;
+                this.phaseRevision.update(v => v + 1);
+            }
+
+            // Tick every second while a phase is active so the live elapsed
+            // time on the active row updates without manual refresh.
+            if (active && !this.startupTickInterval) {
+                this.nowTick.set(Date.now());
+                this.startupTickInterval = setInterval(() => this.nowTick.set(Date.now()), 1000);
+            } else if (!active && this.startupTickInterval) {
+                clearInterval(this.startupTickInterval);
+                this.startupTickInterval = null;
             }
         });
     }
@@ -1858,27 +3253,56 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         return this.transloco.translate(key);
     });
 
+    readonly isShowingReconnectBanner = computed(() =>
+        this.chat.connectionState() === 'disconnected'
+        && this.chat.threadStatus() === 'active'
+        && this.chat.sessionReady()
+        && this.chat.messages().length > 0,
+    );
+
+    readonly scrolledAway = signal(false);
+    readonly newMessageCount = signal(0);
+    readonly showJumpToLatest = computed(
+        () => this.scrolledAway() && this.newMessageCount() > 0,
+    );
+
     readonly inputPlaceholder = computed(() => {
         // Track language changes so placeholder re-translates when i18n switches.
         this.i18n.activeLang();
+        if (this.isShowingReconnectBanner()) return this.transloco.translate('chat.input.reconnecting');
         if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
         if (this.chat.isConnected() && !this.chat.sessionReady()) return this.transloco.translate('chat.input.sessionStarting');
         if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
         if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
+        if (this.chat.isUploadingAttachments()) return this.transloco.translate('chat.input.uploading');
         return this.transloco.translate('chat.input.default');
     });
 
     /** True when there is a pending message waiting for the session to become ready. */
     readonly isPendingSend = computed(
-        () => this.chat.pendingMessage() !== null,
+        () =>
+            this.chat.pendingMessage() !== null ||
+            this.chat.isUploadingAttachments(),
     );
 
     readonly canSend = computed(
         () =>
             this.chat.isConnected() &&
-            this.inputText.trim().length > 0 &&
+            (this.inputText.trim().length > 0 || this.chat.pendingAttachments().length > 0) &&
             !this.isPendingSend(),
     );
+
+    ngOnInit(): void {
+        this.capabilitiesSub = this.deviceCapabilities.getCapabilities().subscribe((caps) => {
+            this.hasCamera.set(caps.hasCamera);
+            this.hasAudioInput.set(caps.hasAudioInput);
+            this.isMobileDevice.set(caps.isMobile);
+        });
+        this.recordingStateSub = this.voiceRecording.getRecordingState().subscribe((state) => {
+            this.isRecording.set(state.isRecording);
+            this.recordingDuration.set(state.duration);
+        });
+    }
 
     ngAfterViewChecked(): void {
         this.collapseCodeBlocks();
@@ -1888,6 +3312,28 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
         this.stopIdePolling();
+        if (this.startupTickInterval) {
+            clearInterval(this.startupTickInterval);
+            this.startupTickInterval = null;
+        }
+        this.capabilitiesSub?.unsubscribe();
+        this.recordingStateSub?.unsubscribe();
+        if (this.isRecording()) {
+            this.voiceRecording.cancelRecording();
+        }
+        // Tear down TTS playback + free blob URLs.
+        if (this.currentTtsAudio) {
+            try {
+                this.currentTtsAudio.pause();
+                this.currentTtsAudio.src = '';
+            } catch {
+                // ignore
+            }
+            this.currentTtsAudio = null;
+            this.currentTtsIndex = null;
+        }
+        this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
+        this.ttsBlobUrls.clear();
     }
 
     autoResizeInput(): void {
@@ -1899,12 +3345,14 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
 
     send(): void {
         const text = this.inputText.trim();
-        if (!text) return;
+        if (!text && this.chat.pendingAttachments().length === 0) return;
 
         this.showSlashMenu.set(false);
-        this.chat.sendMessage(text);
+        // Clear textarea immediately — sendMessage is async because of uploads.
         this.inputText = '';
         this.autoScroll = true;
+        // Fire-and-forget. Errors are surfaced via chat.attachmentError().
+        void this.chat.sendMessage(text);
 
         // Resize textarea back
         setTimeout(() => {
@@ -1912,6 +3360,367 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
                 this.inputEl.nativeElement.style.height = 'auto';
             }
         });
+    }
+
+    // ===== Composer attachment / camera / voice handlers =====
+
+    /** Open the attachment menu. */
+    openAttachmentMenu(): void {
+        this.attachmentMenuOpen.set(true);
+    }
+
+    /** Close the attachment menu. */
+    closeAttachmentMenu(): void {
+        this.attachmentMenuOpen.set(false);
+    }
+
+    /** Open the OS file picker. */
+    pickFile(): void {
+        this.closeAttachmentMenu();
+        this.fileInput?.nativeElement.click();
+    }
+
+    /** Capture a photo: hidden camera input on mobile, getUserMedia overlay on desktop. */
+    pickCamera(): void {
+        this.closeAttachmentMenu();
+        if (this.isMobileDevice()) {
+            this.cameraInput?.nativeElement.click();
+        } else {
+            void this.openDesktopCamera();
+        }
+    }
+
+    /** Handler for both `<input type=file>` (file picker and mobile camera). */
+    async onFilesSelected(event: Event): Promise<void> {
+        const input = event.target as HTMLInputElement;
+        if (!input.files || input.files.length === 0) return;
+        const previews = await this.fileHandling.createFilePreviews(Array.from(input.files));
+        this.chat.addAttachments(previews);
+        // Allow re-selecting the same file later.
+        input.value = '';
+    }
+
+    /** Drop one queued attachment. */
+    removeAttachment(id: string): void {
+        this.chat.removeAttachment(id);
+    }
+
+    /** Open the image preview dialog. */
+    openImagePreview(preview: FilePreview): void {
+        if (preview.type !== FileType.IMAGE || !preview.preview) return;
+        this.imagePreviewName.set(preview.name);
+        this.imagePreviewUrl.set(preview.preview);
+    }
+
+    closeImagePreview(): void {
+        this.imagePreviewUrl.set(null);
+        this.imagePreviewName.set('');
+    }
+
+    /** Begin a hold-to-record voice message session. */
+    async startRecording(): Promise<void> {
+        if (this.isRecording()) return;
+        const config: RecordingConfig = {
+            isHoldToRecord: true,
+            maxDuration: 600,
+            audioConstraints: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+            },
+        };
+        try {
+            await this.voiceRecording.startRecording(config, this.waveformCanvas?.nativeElement);
+        } catch (e: any) {
+            // Surface a permission/hardware error in the same banner used by uploads.
+            const msg = e?.name === 'NotAllowedError'
+                ? this.transloco.translate('chat.composer.micDenied')
+                : this.transloco.translate('chat.composer.micError');
+            this.chat.attachmentError.set(msg);
+        }
+    }
+
+    /** Stop recording and queue the resulting blob as an attachment. */
+    async stopRecording(): Promise<void> {
+        if (!this.isRecording()) return;
+        const result = await this.voiceRecording.stopRecording();
+        if (!result || result.duration < 1) return;
+        const preview = await this.fileHandling.createAudioFilePreview(result);
+        this.chat.addAttachments([preview]);
+    }
+
+    cancelRecording(): void {
+        this.voiceRecording.cancelRecording();
+    }
+
+    /** Desktop camera path: live MediaStream in a fullscreen overlay; capture to JPEG. */
+    private async openDesktopCamera(): Promise<void> {
+        let stream: MediaStream | null = null;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({video: true});
+        } catch (e: any) {
+            const msg = e?.name === 'NotAllowedError'
+                ? this.transloco.translate('chat.composer.cameraDenied')
+                : this.transloco.translate('chat.composer.cameraError');
+            this.chat.attachmentError.set(msg);
+            return;
+        }
+
+        // The overlay is appended to document.body so it sits above the
+        // app shell and isn't constrained by any scoped scroll containers.
+        // That also means scoped component styles don't reach it — inline
+        // styles below.
+        const overlay = document.createElement('div');
+        overlay.style.cssText =
+            'position:fixed;inset:0;background:rgba(0,0,0,0.92);' +
+            'z-index:9999;display:flex;flex-direction:column;align-items:center;' +
+            'justify-content:center;gap:20px;';
+        const video = document.createElement('video');
+        video.srcObject = stream;
+        video.autoplay = true;
+        video.playsInline = true;
+        video.style.cssText = 'max-width:90vw;max-height:70vh;border-radius:8px;background:#000;';
+        const buttons = document.createElement('div');
+        buttons.style.cssText = 'display:flex;gap:12px;';
+        const captureBtn = document.createElement('button');
+        captureBtn.type = 'button';
+        captureBtn.textContent = this.transloco.translate('chat.composer.capturePhoto');
+        captureBtn.style.cssText =
+            'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
+            'border-radius:6px;background:#3399D6;color:#fff;cursor:pointer;';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.textContent = this.transloco.translate('common.cancel');
+        cancelBtn.style.cssText =
+            'padding:10px 20px;font-size:14px;font-weight:500;border:none;' +
+            'border-radius:6px;background:#444;color:#fff;cursor:pointer;';
+        buttons.appendChild(captureBtn);
+        buttons.appendChild(cancelBtn);
+        overlay.appendChild(video);
+        overlay.appendChild(buttons);
+        document.body.appendChild(overlay);
+
+        const cleanup = () => {
+            stream?.getTracks().forEach((t) => t.stop());
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        };
+
+        await new Promise<void>((resolve) => (video.onloadedmetadata = () => resolve()));
+
+        captureBtn.onclick = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) {
+                cleanup();
+                return;
+            }
+            ctx.drawImage(video, 0, 0);
+            canvas.toBlob(
+                async (blob) => {
+                    if (blob) {
+                        const file = new File([blob], `photo-${Date.now()}.jpg`, {
+                            type: 'image/jpeg',
+                            lastModified: Date.now(),
+                        });
+                        const previews = await this.fileHandling.createFilePreviews([file]);
+                        this.chat.addAttachments(previews);
+                    }
+                    cleanup();
+                },
+                'image/jpeg',
+                0.9,
+            );
+        };
+        cancelBtn.onclick = cleanup;
+        overlay.onclick = (e) => {
+            if (e.target === overlay) cleanup();
+        };
+    }
+
+    // ===== TTS playback =====
+
+    /** Read state for a given message index (always returns a defaulted object). */
+    ttsStateFor(index: number): TtsMessageState {
+        return (
+            this.ttsState()[index] ?? {isGenerating: false, isPlaying: false, error: false}
+        );
+    }
+
+    /** Mutate state for one message index. */
+    private setTtsState(index: number, patch: Partial<TtsMessageState>): void {
+        this.ttsState.update((cur) => ({
+            ...cur,
+            [index]: {...this.ttsStateFor(index), ...patch},
+        }));
+    }
+
+    /**
+     * Play, pause, or generate-then-play TTS for an assistant message.
+     *
+     * - First click: fetch the audio (formulation + synthesis on the server),
+     *   then start playback.
+     * - Subsequent clicks: toggle play/pause on the cached blob.
+     */
+    async toggleTts(index: number, content: string): Promise<void> {
+        const state = this.ttsStateFor(index);
+        const threadId = this.chat.threadId();
+        if (!threadId || !content.trim()) return;
+
+        // Stop any other message that's playing.
+        if (this.currentTtsIndex !== null && this.currentTtsIndex !== index) {
+            this.stopCurrentTts();
+        }
+
+        if (state.isPlaying) {
+            this.stopCurrentTts();
+            return;
+        }
+
+        if (state.audioUrl) {
+            this.playCachedTts(index, state.audioUrl);
+            return;
+        }
+
+        // Need to fetch the audio first.
+        this.setTtsState(index, {isGenerating: true, error: false});
+        const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
+        let result;
+        try {
+            result = await firstValueFrom(
+                this.api.generateTTS(threadId, content, {language: lang, reformulate: true}),
+            );
+        } catch (e) {
+            console.error('TTS generate threw', e);
+            this.setTtsState(index, {isGenerating: false, error: true});
+            return;
+        }
+        if (result === null || result === 'unavailable') {
+            this.setTtsState(index, {
+                isGenerating: false,
+                error: result === null,
+            });
+            // 'unavailable' (204) is silent — server told us TTS isn't
+            // configured; the button stays in idle, the user can click
+            // again but nothing more useful will happen.
+            return;
+        }
+        const url = URL.createObjectURL(result);
+        this.ttsBlobUrls.add(url);
+        this.setTtsState(index, {isGenerating: false, audioUrl: url, error: false});
+        this.playCachedTts(index, url);
+    }
+
+    private playCachedTts(index: number, url: string): void {
+        // Reuse a single Audio instance so memory stays bounded across
+        // many messages.
+        if (!this.currentTtsAudio) {
+            this.currentTtsAudio = new Audio();
+            this.currentTtsAudio.addEventListener('ended', () => this.onTtsEnded());
+            this.currentTtsAudio.addEventListener('pause', () => this.onTtsPaused());
+            this.currentTtsAudio.addEventListener('error', () => this.onTtsError());
+        }
+        this.currentTtsAudio.src = url;
+        this.currentTtsIndex = index;
+        this.setTtsState(index, {isPlaying: true});
+        this.currentTtsAudio.play().catch((e) => {
+            console.error('TTS playback failed', e);
+            this.setTtsState(index, {isPlaying: false, error: true});
+            this.currentTtsIndex = null;
+        });
+    }
+
+    private stopCurrentTts(): void {
+        if (!this.currentTtsAudio || this.currentTtsIndex === null) return;
+        try {
+            this.currentTtsAudio.pause();
+            this.currentTtsAudio.currentTime = 0;
+        } catch {
+            // ignore
+        }
+        const idx = this.currentTtsIndex;
+        this.currentTtsIndex = null;
+        this.setTtsState(idx, {isPlaying: false});
+    }
+
+    private onTtsEnded(): void {
+        if (this.currentTtsIndex === null) return;
+        const idx = this.currentTtsIndex;
+        this.currentTtsIndex = null;
+        this.setTtsState(idx, {isPlaying: false});
+    }
+
+    private onTtsPaused(): void {
+        // The 'pause' event also fires when src changes or when stop()
+        // pauses the element. Only react when the audio is *user-paused*
+        // mid-track (currentTime > 0 and not at end).
+        if (this.currentTtsIndex === null || !this.currentTtsAudio) return;
+        const a = this.currentTtsAudio;
+        if (a.ended || a.currentTime === 0) return;
+        const idx = this.currentTtsIndex;
+        this.setTtsState(idx, {isPlaying: false});
+    }
+
+    private onTtsError(): void {
+        if (this.currentTtsIndex === null) return;
+        const idx = this.currentTtsIndex;
+        this.currentTtsIndex = null;
+        this.setTtsState(idx, {isPlaying: false, error: true});
+    }
+
+    // ===== Drag-and-drop file handling =====
+
+    /** True when the dragged payload includes files (not text or HTML). */
+    private hasFilePayload(event: DragEvent): boolean {
+        const types = event.dataTransfer?.types;
+        if (!types) return false;
+        // Spec says types is DOMStringList; browsers expose Array-like.
+        for (let i = 0; i < types.length; i++) {
+            if (types[i] === 'Files') return true;
+        }
+        return false;
+    }
+
+    @HostListener('dragenter', ['$event'])
+    onDragEnter(event: DragEvent): void {
+        if (!this.hasFilePayload(event)) return;
+        event.preventDefault();
+        this.dragEnterCount++;
+        if (this.dragEnterCount === 1) this.isDragOver.set(true);
+    }
+
+    @HostListener('dragover', ['$event'])
+    onDragOver(event: DragEvent): void {
+        if (!this.hasFilePayload(event)) return;
+        // preventDefault on dragover is what tells the browser this is a
+        // valid drop target. Without it, the drop event never fires.
+        event.preventDefault();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy';
+    }
+
+    @HostListener('dragleave', ['$event'])
+    onDragLeave(event: DragEvent): void {
+        if (!this.hasFilePayload(event)) return;
+        this.dragEnterCount = Math.max(0, this.dragEnterCount - 1);
+        if (this.dragEnterCount === 0) this.isDragOver.set(false);
+    }
+
+    @HostListener('drop', ['$event'])
+    async onDrop(event: DragEvent): Promise<void> {
+        if (!this.hasFilePayload(event)) return;
+        event.preventDefault();
+        this.dragEnterCount = 0;
+        this.isDragOver.set(false);
+
+        const files = event.dataTransfer?.files;
+        if (!files || files.length === 0) return;
+        // Honour the same gating as the file picker — if the session is
+        // disconnected, the upload would fail anyway.
+        if (!this.chat.isConnected()) return;
+
+        const previews = await this.fileHandling.createFilePreviews(Array.from(files));
+        if (previews.length > 0) this.chat.addAttachments(previews);
     }
 
     onInputChange(value: string): void {
@@ -1931,13 +3740,34 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         const el = this.messagesContainer?.nativeElement;
         if (!el) return;
         // If user is within 80px of the bottom, re-enable auto-scroll; otherwise pause it.
-        this.autoScroll = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        this.autoScroll = nearBottom;
+        this.scrolledAway.set(!nearBottom);
+        if (nearBottom) {
+            this.newMessageCount.set(0);
+        }
+    }
+
+    jumpToLatest(): void {
+        this.autoScroll = true;
+        this.scrolledAway.set(false);
+        this.newMessageCount.set(0);
+        this.lastSeenMessageCount = this.chat.messages().length;
+        this.scrollToBottom();
     }
 
     selectSlashCommand(cmd: SlashCommand): void {
         this.inputText = cmd.command + ' ';
         this.showSlashMenu.set(false);
         this.inputEl?.nativeElement?.focus();
+    }
+
+    pickSuggestion(s: DisplayedSuggestion): void {
+        this.inputText = s.text;
+        setTimeout(() => {
+            this.inputEl?.nativeElement?.focus();
+            this.autoResizeInput();
+        });
     }
 
     onKeydown(event: KeyboardEvent): void {
@@ -2136,6 +3966,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         return this.fallbackToolLabel(tc.tool);
     }
 
+    permissionTitle(perm: PermissionRequest): string {
+        return this.toolLabel({...perm, status: 'pending'} as ToolCallInfo);
+    }
+
+    formatTime(d: Date | string | number): string {
+        const date = d instanceof Date ? d : new Date(d);
+        return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    }
+
     private toolLabelContext(tool: string, args: Record<string, unknown>): string {
         if (!args) return '';
         const t = tool.toLowerCase();
@@ -2234,6 +4073,17 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
         return translated !== key ? translated : status;
     }
 
+    statusIcon(status: string): string {
+        switch (status) {
+            case 'completed': return 'check_circle';
+            case 'running': return 'progress_activity';
+            case 'denied': return 'block';
+            case 'pending': return 'radio_button_unchecked';
+            case 'error': return 'error';
+            default: return 'help';
+        }
+    }
+
     toolSummaryLabel(calls: ToolCallInfo[]): string {
         // Use intent grouping when categories are available, else human labels
         const hasCategories = calls.some(tc => tc.category);
@@ -2251,6 +4101,7 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     toolSummaryStatus(calls: ToolCallInfo[]): string {
+        if (calls.some(tc => tc.status === 'error')) return 'error';
         if (calls.some(tc => tc.status === 'denied')) return 'denied';
         if (calls.some(tc => tc.status === 'running')) return 'running';
         if (calls.every(tc => tc.status === 'completed')) return 'completed';
@@ -2274,15 +4125,15 @@ export class PersistentChatComponent implements AfterViewChecked, OnDestroy {
     }
 
     hasCompletedTools(calls: ToolCallInfo[]): boolean {
-        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied');
+        return calls.some(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
     }
 
     completedOnly(calls: ToolCallInfo[]): ToolCallInfo[] {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied');
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error');
     }
 
     completedToolCount(calls: ToolCallInfo[]): number {
-        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied').length;
+        return calls.filter(tc => tc.status === 'completed' || tc.status === 'denied' || tc.status === 'error').length;
     }
 
     currentToolLabel(calls: ToolCallInfo[]): string {

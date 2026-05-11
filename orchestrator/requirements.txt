@@ -23,3 +23,7 @@ argon2-cffi>=23.1.0
 aiosmtplib>=3.0.0
 email-reply-parser>=0.5.0
 boto3>=1.35.0
+# SFTP client for pushing files into a live thread workspace's uploads/ dir
+# (services/thread_uploads.py). Without it, POST /api/persistent/threads/{id}/uploads
+# fails with HTTP 503 "paramiko is not installed on the orchestrator".
+paramiko>=3.4.0

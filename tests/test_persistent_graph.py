@@ -1133,9 +1133,9 @@ class TestExecuteTurnInterrupt:
         # After first tool execution, set interrupt
         original_on_tool_result = callbacks.on_tool_result
 
-        async def _on_tool_result(name, result, tcid):
+        async def _on_tool_result(name, result, tcid, is_error=False):
             interrupt_after_tool[0] = True
-            await original_on_tool_result(name, result, tcid)
+            await original_on_tool_result(name, result, tcid, is_error=is_error)
 
         callbacks.on_tool_result = _on_tool_result
 
@@ -2177,7 +2177,7 @@ class TestToolExecutionLoop:
         tool.ainvoke.assert_called_once_with({"q": "test"})
         callbacks.on_tool_start.assert_called_once_with("search", {"q": "test"}, "tc1")
         callbacks.on_tool_result.assert_called_once_with(
-            "search", "search results", "tc1"
+            "search", "search results", "tc1", is_error=False
         )
 
     @pytest.mark.asyncio
@@ -2369,7 +2369,9 @@ class TestToolExecutionLoop:
             tool_context=tool_ctx,
         )
 
-        callbacks.on_tool_result.assert_called_once_with("noop", "", "tc1")
+        callbacks.on_tool_result.assert_called_once_with(
+            "noop", "", "tc1", is_error=False
+        )
 
     @pytest.mark.asyncio
     async def test_tool_args_default_to_empty_dict(self):

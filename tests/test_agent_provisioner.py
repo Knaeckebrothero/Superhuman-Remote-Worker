@@ -122,7 +122,13 @@ class TestReapPods:
     async def test_noop_when_k8s_not_available(self):
         p, _ = _make_provisioner(k8s_available=False)
         result = await p.reap_pods()
-        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
+        assert result == {
+            "completed": 0,
+            "crashed": 0,
+            "stale": 0,
+            "drained": 0,
+            "unstartable": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_noop_when_no_reapable_pods(self):
@@ -136,7 +142,13 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
+        assert result == {
+            "completed": 0,
+            "crashed": 0,
+            "stale": 0,
+            "drained": 0,
+            "unstartable": 0,
+        }
         assert p._core_api.delete_namespaced_pod.call_count == 0
 
     @pytest.mark.asyncio
@@ -179,6 +191,83 @@ class TestReapPods:
         assert result["stale"] == 1
         assert result["completed"] == 0
         assert result["unstartable"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_reaps_drained_running_pods(self):
+        # Phase 0 stopgap: when _drain_stale_image_agents marks an agent
+        # 'draining', reap_pods must force-delete the pod. Without this the
+        # status flicker has no actuation.
+        p, conn = _make_provisioner()
+        # Two queries fire: offline (returns empty) and draining (returns
+        # the target hostname). Use side_effect to differentiate.
+        conn.fetch.side_effect = [
+            [],
+            [{"hostname": "srw-agent-j-drained"}],
+        ]
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-drained"),
+            _make_pod("srw-agent-j-healthy"),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["drained"] == 1
+        assert result["stale"] == 0
+        assert result["completed"] == 0
+        assert result["unstartable"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drained_skipped_for_pending_pods(self):
+        # A pod marked draining but stuck in Pending isn't a Running pod
+        # and shouldn't get the drained categorization (would shadow
+        # _is_unstartable). Pending stale-image pods are caught by the
+        # unstartable path if they hit a terminal waiting reason; otherwise
+        # they're left to start up.
+        p, conn = _make_provisioner()
+        conn.fetch.side_effect = [
+            [],
+            [{"hostname": "srw-agent-j-pending-drained"}],
+        ]
+        pods_result = MagicMock()
+        pods_result.items = [
+            _make_pod("srw-agent-j-pending-drained", phase="Pending", age_seconds=10),
+        ]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["drained"] == 0
+        assert p._core_api.delete_namespaced_pod.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_takes_precedence_over_drained(self):
+        # Defensive ordering: if an agent somehow appears in both the
+        # offline and draining hostname sets (mock conflation, race
+        # condition), the stale category wins. The pod gets deleted
+        # either way; the category just needs to be deterministic.
+        p, conn = _make_provisioner()
+        conn.fetch.side_effect = [
+            [{"hostname": "srw-agent-j-both"}],
+            [{"hostname": "srw-agent-j-both"}],
+        ]
+        pods_result = MagicMock()
+        pods_result.items = [_make_pod("srw-agent-j-both")]
+        p._core_api.list_namespaced_pod.return_value = pods_result
+        with patch(
+            "orchestrator.services.agent_provisioner.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            result = await p.reap_pods()
+        assert result["stale"] == 1
+        assert result["drained"] == 0
         assert p._core_api.delete_namespaced_pod.call_count == 1
 
     @pytest.mark.asyncio
@@ -244,7 +333,13 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 0, "crashed": 0, "stale": 0, "unstartable": 0}
+        assert result == {
+            "completed": 0,
+            "crashed": 0,
+            "stale": 0,
+            "drained": 0,
+            "unstartable": 0,
+        }
         assert p._core_api.delete_namespaced_pod.call_count == 0
 
     @pytest.mark.asyncio
@@ -313,7 +408,13 @@ class TestReapPods:
             side_effect=_fake_to_thread,
         ):
             result = await p.reap_pods()
-        assert result == {"completed": 1, "crashed": 0, "stale": 1, "unstartable": 1}
+        assert result == {
+            "completed": 1,
+            "crashed": 0,
+            "stale": 1,
+            "drained": 0,
+            "unstartable": 1,
+        }
         assert p._core_api.delete_namespaced_pod.call_count == 3
 
 
