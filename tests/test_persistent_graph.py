@@ -2369,7 +2369,9 @@ class TestToolExecutionLoop:
             tool_context=tool_ctx,
         )
 
-        callbacks.on_tool_result.assert_called_once_with("noop", "", "tc1", is_error=False)
+        callbacks.on_tool_result.assert_called_once_with(
+            "noop", "", "tc1", is_error=False
+        )
 
     @pytest.mark.asyncio
     async def test_tool_args_default_to_empty_dict(self):
