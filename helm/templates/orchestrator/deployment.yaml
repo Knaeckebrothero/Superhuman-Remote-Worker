@@ -731,4 +731,16 @@ spec:
         - name: vm-ssh-key
           secret:
             secretName: {{ include "srw.vmSshKeySecretName" . }}
-            defaultMode: 0400
+            # 0444 (read for owner/group/other) so the orchestrator container,
+            # which runs as the non-root `srw` user (uid 999) baked into
+            # docker/Dockerfile.orchestrator, can read the key. The secret is
+            # owned root:root and the orchestrator pod is single-purpose, so
+            # world-readable inside this container is acceptable. Required by
+            # services/thread_uploads.py (paramiko SFTP for live thread
+            # workspace uploads). NOTE: OpenSSH's CLI rejects group/world-
+            # readable keys — services/{ide_session,snapshot_service}.py shell
+            # out to `ssh -i` and would need `-o StrictModes=no` (or an
+            # initContainer-staged copy) before they can use this key. They
+            # don't today, so this change unblocks paramiko but does not by
+            # itself fix the system-`ssh` paths.
+            defaultMode: 0444
