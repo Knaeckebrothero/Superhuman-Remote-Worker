@@ -10598,6 +10598,9 @@ async def upload_files_to_thread(
     try:
         results = await upload_files_to_thread_workspace(thread, payloads)
     except ThreadUploadError as e:
+        logger.warning(
+            "Thread upload failed for %s: %d %s", thread_id, e.status_code, e.detail
+        )
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
     return {
