@@ -426,9 +426,14 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 )
 
             # 3. Propagate: threads bound to offline agents → 'ended'
-            ended_count = await postgres_db.mark_orphaned_threads_ended()
-            if ended_count > 0:
-                logger.info(f"Marked {ended_count} thread(s) as ended (orphaned)")
+            ended_ids = await postgres_db.mark_orphaned_threads_ended()
+            if ended_ids:
+                logger.info(f"Marked {len(ended_ids)} thread(s) as ended (orphaned)")
+                # The DB transition leaves workspace + agent pods alive — release
+                # them here so we don't depend on the idle sweeper as the only
+                # backstop (it's disabled whenever S3 snapshots are unavailable).
+                for thread_id in ended_ids:
+                    await _release_thread_resources(thread_id)
 
             # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await postgres_db.recover_orphaned_jobs()
@@ -1640,6 +1645,29 @@ async def _archive_and_cleanup_workspace(
                 actions.append("k8s workspace released")
 
     return actions
+
+
+async def _release_thread_resources(thread_id: str) -> None:
+    """Release a thread's workspace container/VM and agent pod.
+
+    Centralized so the user-facing DELETE, the agent-facing status flip,
+    and the orphan reaper share one teardown sequence. Each step swallows
+    its own exception — a failure in snapshotting must not block the
+    agent-pod delete and vice versa, otherwise resources leak.
+    """
+    try:
+        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
+    except Exception:
+        logger.exception("Workspace cleanup failed for thread %s", thread_id)
+
+    try:
+        if agent_provisioner.is_available:
+            await agent_provisioner.delete_agent_pod_by_thread(thread_id)
+        elif persistent_provisioner.is_available:
+            await persistent_provisioner.delete_agent_pod(thread_id)
+            await persistent_provisioner.delete_agent_pvc(thread_id)
+    except Exception:
+        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
 
 
 def _provider_of_model(model: str) -> str | None:
@@ -9372,6 +9400,11 @@ async def agent_update_thread_status(
         if request.status == "ended":
             # Route through end_thread so ended_at gets stamped.
             await postgres_db.end_thread(thread_id)
+            # Tear down workspace + agent pods so they don't leak. Mirrors
+            # the user-facing DELETE handler. Scheduled as a background task
+            # because the caller is the agent itself — synchronously deleting
+            # its own pod would cut the response off mid-flight.
+            asyncio.create_task(_release_thread_resources(thread_id))
         else:
             await postgres_db.update_thread_status(thread_id, request.status)
         return {"status": request.status}
@@ -10248,18 +10281,8 @@ async def end_thread(
             metadata = {}
     ws_ctx = metadata.get("workspace_container") or {}
 
-    # Archive workspace (snapshot to S3) and clean up workspace container + VM
-    try:
-        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
-    except Exception as e:
-        logger.warning("Workspace cleanup failed for thread %s: %s", thread_id, e)
-
-    # Clean up agent pod (unified provisioner, then legacy fallback)
-    if agent_provisioner.is_available:
-        await agent_provisioner.delete_agent_pod_by_thread(thread_id)
-    elif persistent_provisioner.is_available:
-        await persistent_provisioner.delete_agent_pod(thread_id)
-        await persistent_provisioner.delete_agent_pvc(thread_id)
+    # Snapshot + tear down workspace container/VM and agent pod
+    await _release_thread_resources(thread_id)
 
     # Destructive cleanup of user-visible resources runs ONLY on permanent
     # delete. A soft "end" keeps the Gitea repo and the cloud session folder
