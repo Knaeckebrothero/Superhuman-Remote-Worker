@@ -1522,7 +1522,6 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
             # Clear loop_task before _detach_session so it doesn't try to
             # cancel an already-finished task we just awaited.
-            global _loop_task
             _loop_task = None
 
             # Always detach session on disconnect (idle timeout or not).
