@@ -2957,6 +2957,13 @@ async def lifespan(app: FastAPI):
     await vector_db.connect()
     await mongodb.connect()
 
+    # Reassert MongoDB index declarations on every startup. Idempotent —
+    # existing identical indexes are a silent no-op. Closes the gap that
+    # produced the 2026-05-12 outage where the standalone init.py CLI was
+    # never actually invoked by the deploy pipeline. See
+    # docs/issues/agent_audit_collection_missing_indexes.md.
+    await mongodb.ensure_indexes()
+
     # Apply pending migrations on each DB. Each PostgresDB instance is
     # bound to its migrations directory at construction time; the runner
     # serializes via pg_advisory_xact_lock and refuses to proceed on
