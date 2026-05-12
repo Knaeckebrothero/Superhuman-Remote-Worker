@@ -13,6 +13,7 @@ import {
     DatasourceCreateRequest,
     DatasourceTestResult,
     DatasourceUpdateRequest,
+    SSHKeyGenerateResponse,
     Expert,
     ExpertDetail,
     Job,
@@ -592,6 +593,24 @@ export class ApiService {
         return of(null);
       }),
     );
+  }
+
+  /**
+   * Generate a fresh ed25519 SSH keypair for a repository datasource. The
+   * caller drops the private key into the form's SSH key textarea and shows
+   * the public key to the user so they can register it as a deploy key.
+   */
+  generateSshKey(comment?: string): Observable<SSHKeyGenerateResponse | null> {
+    return this.http
+      .post<SSHKeyGenerateResponse>(`${this.baseUrl}/datasources/ssh-keys/generate`, {
+        comment: comment ?? null,
+      })
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to generate SSH key:', error);
+          return of(null);
+        }),
+      );
   }
 
   /**
