@@ -3161,6 +3161,9 @@ async def lifespan(app: FastAPI):
     )
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
+    thread_events_prune_task = asyncio.create_task(
+        thread_events_prune_sweeper(_shutdown_event)
+    )
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
@@ -3228,6 +3231,7 @@ async def lifespan(app: FastAPI):
     await token_cleanup_task
     await dispatcher_task
     await sudo_sweeper_task
+    await thread_events_prune_task
     await ide_sweeper_task
     await ws_sweeper_task
     await gc_sweeper_task
@@ -10672,6 +10676,440 @@ async def get_thread_messages_history(
         "total": total,
         "thread_id": thread_id,
     }
+
+
+# =============================================================================
+# Headless persistent sessions — Phase 2 SSE + REST transport
+# =============================================================================
+#
+# SSE replaces the WebSocket as the primary server→client path; the existing
+# /ws/persistent/{thread_id} stays as a fallback. Per
+# docs/features/headless_persistent_sessions.md.
+#
+# The per-turn input lock guards against duplicate POSTs from concurrent
+# cockpit tabs racing on the same turn. Single-instance orchestrator, so a
+# module-level dict is enough; entries auto-clean 5 min after release.
+
+_thread_turn_locks: dict[tuple[str, int], asyncio.Lock] = {}
+_thread_turn_inflight: dict[str, int] = {}
+
+
+def _ensure_thread_turn_lock(thread_id: str, turn_id: int) -> asyncio.Lock:
+    """Get or create the lock for (thread_id, turn_id). Concurrent callers
+    landing on the same tuple share the same Lock object."""
+    key = (thread_id, turn_id)
+    lock = _thread_turn_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_turn_locks[key] = lock
+    return lock
+
+
+def _schedule_turn_lock_cleanup(thread_id: str, turn_id: int) -> None:
+    """Remove the lock entry 5 minutes after release. Memory-leak guard
+    for long-lived sessions accumulating per-turn locks."""
+
+    async def _later() -> None:
+        await asyncio.sleep(300)
+        _thread_turn_locks.pop((thread_id, turn_id), None)
+        if _thread_turn_inflight.get(thread_id) == turn_id:
+            _thread_turn_inflight.pop(thread_id, None)
+
+    asyncio.create_task(_later(), name=f"turn-lock-cleanup-{thread_id[:8]}")
+
+
+async def _resolve_thread_for_forwarding(
+    thread_id: str, user: dict
+) -> tuple[dict, dict]:
+    """Look up thread + bound agent for orchestrator → agent forwarding.
+
+    Returns (thread, agent). Raises HTTPException on auth or routing failures.
+    Restores a suspended workspace if needed (same pattern as the WS proxy).
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws_ctx = metadata.get("workspace_container") or {}
+    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
+        logger.info("Restoring suspended workspace for thread %s", thread_id)
+        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to restore suspended workspace",
+            )
+        thread = await postgres_db.get_thread(thread_id)
+
+    agent_id = thread.get("agent_id") if thread else None
+    if not agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="No agent bound to thread — open the SSE stream first",
+        )
+    agent = await postgres_db.get_agent(str(agent_id))
+    if not agent or not agent.get("pod_ip"):
+        raise HTTPException(
+            status_code=503,
+            detail="Agent unreachable (no pod_ip)",
+        )
+    return thread, agent
+
+
+async def _forward_to_agent(
+    agent: dict, path: str, payload: dict, timeout: float = 30.0
+) -> dict[str, Any]:
+    """POST `payload` to the agent pod's REST endpoint at `path`. Returns
+    parsed JSON body. Raises HTTPException on transport/status errors."""
+    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(agent_url, json=payload)
+    except Exception as e:
+        logger.warning("Agent forward failed: %s %s -> %s", path, agent.get("id"), e)
+        raise HTTPException(status_code=503, detail=f"Agent unreachable: {e}") from e
+    if response.status_code >= 500:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Agent error: {response.status_code} {response.text[:200]}",
+        )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text[:200],
+        )
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text[:500]}
+
+
+@app.get("/api/persistent/threads/{thread_id}/stream")
+async def thread_event_stream(thread_id: str, request: Request) -> StreamingResponse:
+    """SSE: stream this thread's event log with replay-from-cursor.
+
+    The client sends `Last-Event-ID: <epoch>:<seq>` to resume from a known
+    point. If the cursor's epoch doesn't match the server, or its seq is
+    older than retention, the server emits a single `gone_beyond_horizon`
+    event and closes — the client must drop its cursor and re-sync.
+
+    Otherwise: replay everything since the cursor, then switch to live
+    mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    server_epoch = int(thread.get("events_epoch") or 0)
+
+    # Parse Last-Event-ID. Format: "<epoch>:<seq>". Missing/malformed → no
+    # replay, start from current tail.
+    last_event_id = request.headers.get("Last-Event-ID") or request.headers.get(
+        "last-event-id"
+    )
+    cursor_epoch: Optional[int] = None
+    cursor_seq: Optional[int] = None
+    if last_event_id:
+        try:
+            e_str, s_str = last_event_id.split(":", 1)
+            cursor_epoch = int(e_str)
+            cursor_seq = int(s_str)
+        except (ValueError, AttributeError):
+            cursor_epoch = None
+            cursor_seq = None
+
+    async def event_stream():
+        # Mismatched epoch → force re-sync.
+        if cursor_epoch is not None and cursor_epoch != server_epoch:
+            async with postgres_db.acquire() as conn:
+                tail = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    thread_id,
+                    server_epoch,
+                )
+            payload = json.dumps(
+                {
+                    "method": "gone_beyond_horizon",
+                    "params": {
+                        "epoch": server_epoch,
+                        "server_seq": int(tail or 0),
+                        "reason": "epoch_mismatch",
+                    },
+                }
+            )
+            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
+            return
+
+        # Retention floor for the current epoch.
+        async with postgres_db.acquire() as conn:
+            min_seq = await conn.fetchval(
+                "SELECT MIN(seq) FROM thread_events "
+                "WHERE thread_id = $1 AND epoch = $2",
+                thread_id,
+                server_epoch,
+            )
+        min_seq = int(min_seq) if min_seq is not None else 0
+
+        # Cursor older than retention → also force re-sync.
+        if cursor_seq is not None and min_seq > 0 and cursor_seq < min_seq - 1:
+            async with postgres_db.acquire() as conn:
+                tail = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    thread_id,
+                    server_epoch,
+                )
+            payload = json.dumps(
+                {
+                    "method": "gone_beyond_horizon",
+                    "params": {
+                        "epoch": server_epoch,
+                        "server_seq": int(tail or 0),
+                        "retention_min_seq": min_seq,
+                        "reason": "cursor_older_than_retention",
+                    },
+                }
+            )
+            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
+            return
+
+        last_sent_seq = cursor_seq if cursor_seq is not None else 0
+        empty_polls = 0
+        idle_keepalive_at = 0.0
+        cancelled = False
+        try:
+            while not cancelled:
+                if await request.is_disconnected():
+                    break
+                async with postgres_db.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT seq, kind, payload "
+                        "FROM thread_events "
+                        "WHERE thread_id = $1 AND epoch = $2 AND seq > $3 "
+                        "ORDER BY seq ASC "
+                        "LIMIT 500",
+                        thread_id,
+                        server_epoch,
+                        last_sent_seq,
+                    )
+                if rows:
+                    empty_polls = 0
+                    for row in rows:
+                        seq = int(row["seq"])
+                        # row["payload"] is a JSONB column — asyncpg may
+                        # return it as str or already-parsed dict depending
+                        # on codec registration.
+                        raw_payload = row["payload"]
+                        if isinstance(raw_payload, str):
+                            payload_obj = json.loads(raw_payload)
+                        else:
+                            payload_obj = raw_payload
+                        frame = {
+                            "method": row["kind"],
+                            "params": payload_obj,
+                        }
+                        body = json.dumps(frame)
+                        yield f"id: {server_epoch}:{seq}\ndata: {body}\n\n"
+                        last_sent_seq = seq
+                    idle_keepalive_at = 0.0
+                else:
+                    # Adaptive backoff: 200ms × 5 empty polls, then 1s.
+                    empty_polls += 1
+                    wait = 1.0 if empty_polls >= 5 else 0.2
+                    # Keepalive comment every ~30s of idle.
+                    idle_keepalive_at += wait
+                    if idle_keepalive_at >= 30.0:
+                        yield ": keepalive\n\n"
+                        idle_keepalive_at = 0.0
+                    try:
+                        await asyncio.sleep(wait)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        break
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("thread_event_stream error (thread=%s): %s", thread_id, e)
+            return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+class ThreadInputRequest(BaseModel):
+    """Body for POST /api/persistent/threads/{thread_id}/input."""
+
+    content: str
+    turn_id: Optional[int] = None
+
+
+@app.post("/api/persistent/threads/{thread_id}/input")
+async def thread_input(
+    thread_id: str, body: ThreadInputRequest, request: Request
+) -> dict[str, Any]:
+    """Submit user input to a thread. Per-turn lock returns 409 on dupes."""
+    user = await require_approved_user(request, postgres_db)
+    thread, agent = await _resolve_thread_for_forwarding(thread_id, user)
+
+    if not body.content or not isinstance(body.content, str):
+        raise HTTPException(
+            status_code=400, detail="content must be a non-empty string"
+        )
+
+    # Turn id defaults to the thread's current total_turns + 1. Reject
+    # arbitrarily-large values to bound the lock dict.
+    total_turns = int(thread.get("total_turns") or 0)
+    if body.turn_id is None:
+        turn_id = total_turns + 1
+    else:
+        turn_id = body.turn_id
+        if turn_id < 0 or turn_id > total_turns + 5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"turn_id out of range "
+                f"(thread at turn {total_turns}, max accepted "
+                f"{total_turns + 5})",
+            )
+
+    lock = _ensure_thread_turn_lock(thread_id, turn_id)
+    if lock.locked():
+        in_flight = _thread_turn_inflight.get(thread_id, turn_id)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "turn_in_flight",
+                "turn_id": in_flight,
+                "thread_id": thread_id,
+            },
+        )
+    async with lock:
+        _thread_turn_inflight[thread_id] = turn_id
+        try:
+            result = await _forward_to_agent(
+                agent,
+                "/api/input",
+                {"content": body.content, "turn_id": turn_id},
+            )
+        finally:
+            _schedule_turn_lock_cleanup(thread_id, turn_id)
+    return {
+        "accepted": True,
+        "turn_id": turn_id,
+        "agent": result,
+    }
+
+
+@app.post("/api/persistent/threads/{thread_id}/interrupt")
+async def thread_interrupt(thread_id: str, request: Request) -> dict[str, Any]:
+    """Interrupt the in-flight turn. Mode (hard/graceful) is decided by
+    the agent based on whether a tool is currently mid-`ainvoke`."""
+    user = await require_approved_user(request, postgres_db)
+    _, agent = await _resolve_thread_for_forwarding(thread_id, user)
+    result = await _forward_to_agent(agent, "/api/interrupt", {})
+    return {"accepted": True, "agent": result}
+
+
+class ThreadApproveRequest(BaseModel):
+    """Body for POST /api/persistent/threads/{id}/approve/{approval_id}."""
+
+    decision: str  # "approve" or "deny"
+
+
+@app.post("/api/persistent/threads/{thread_id}/approve/{approval_id}")
+async def thread_approve(
+    thread_id: str,
+    approval_id: str,
+    body: ThreadApproveRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Resolve a pending permission gate (sudo or tool-permission). The
+    approval_id is forwarded for the agent to validate against its current
+    in-flight request."""
+    user = await require_approved_user(request, postgres_db)
+    _, agent = await _resolve_thread_for_forwarding(thread_id, user)
+    if body.decision not in ("approve", "deny"):
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be 'approve' or 'deny'",
+        )
+    result = await _forward_to_agent(
+        agent,
+        "/api/approve",
+        {"decision": body.decision, "approval_id": approval_id},
+    )
+    return {"accepted": True, "decision": body.decision, "agent": result}
+
+
+async def thread_events_prune_sweeper(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Background task that prunes the thread_events log on retention.
+
+    Runs every THREAD_EVENTS_PRUNE_INTERVAL_S (default 300s). Two queries:
+      - DELETE rows for threads in 'ended' status older than 24h.
+      - DELETE rows for threads NOT in 'ended' older than 7 days.
+
+    Best-effort. Survives transient DB errors by logging and continuing.
+    """
+    interval_s = int(os.environ.get("THREAD_EVENTS_PRUNE_INTERVAL_S", "300"))
+    logger.info("Thread-events prune sweeper started (interval=%ds)", interval_s)
+    while not shutdown_event.is_set():
+        try:
+            async with postgres_db.acquire() as conn:
+                ended_deleted = await conn.fetchval(
+                    "WITH deleted AS ("
+                    "  DELETE FROM thread_events "
+                    "  WHERE thread_id IN ("
+                    "    SELECT id FROM threads WHERE status = 'ended'"
+                    "  ) "
+                    "  AND created_at < now() - interval '24 hours' "
+                    "  RETURNING 1"
+                    ") SELECT COUNT(*) FROM deleted"
+                )
+                active_deleted = await conn.fetchval(
+                    "WITH deleted AS ("
+                    "  DELETE FROM thread_events "
+                    "  WHERE thread_id IN ("
+                    "    SELECT id FROM threads WHERE status <> 'ended'"
+                    "  ) "
+                    "  AND created_at < now() - interval '7 days' "
+                    "  RETURNING 1"
+                    ") SELECT COUNT(*) FROM deleted"
+                )
+            if (ended_deleted or 0) + (active_deleted or 0) > 0:
+                logger.info(
+                    "thread_events prune: ended=%d active=%d",
+                    int(ended_deleted or 0),
+                    int(active_deleted or 0),
+                )
+        except Exception as e:
+            logger.warning("thread_events prune error (non-fatal): %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Thread-events prune sweeper stopped")
 
 
 @app.get("/api/persistent/threads/{thread_id}/ide")

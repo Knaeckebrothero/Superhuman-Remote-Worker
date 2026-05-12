@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
@@ -99,8 +99,26 @@ _subscribers: Dict[str, asyncio.Queue] = {}
 # hoisted to module level so they survive WS reconnect. All three are reset
 # on session attach / cleared on _terminate_session.
 _loop_user_queue: Optional[asyncio.Queue] = None
-_loop_interrupt_flag: bool = False
+# Tri-state interrupt flag (phase 2): None = no interrupt pending,
+# "graceful" = stop after current tool call completes, "hard" = cancel the
+# in-flight LLM stream immediately and drop the partial AIMessage. Set by
+# the agent's POST /api/interrupt handler based on current _tool_inflight
+# state. Consumed by persistent_graph's check_interrupt callback at three
+# sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
+# path uses the same flag — sets "hard" when no tool is inflight.
+_loop_interrupt_flag: Optional[str] = None
 _loop_last_user_content: List[str] = [""]
+
+# True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
+# pick hard vs graceful mode. Set in _loop_on_tool_start, cleared in
+# _loop_on_tool_result.
+_tool_inflight: bool = False
+
+# Phase 2 event-log cursor. Allocated synchronously by _broadcast; the DB
+# write is scheduled via asyncio.create_task (fire-and-forget). Initialized
+# in _attach_session with epoch bump on cold restart; cleared on terminate.
+_events_epoch: int = 0
+_next_seq: int = 0
 
 
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
@@ -907,14 +925,65 @@ async def _attach_session(
     # transport churn. Cleared in _terminate_session.
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
     _loop_user_queue = asyncio.Queue()
-    _loop_interrupt_flag = False
+    _loop_interrupt_flag = None
     _loop_last_user_content = [""]
+
+    # Phase 2 event-log cursor init. The current epoch lives on the threads
+    # row; we bump it iff the previous epoch has events (i.e. this is a
+    # cold-checkpoint restart that lost the in-memory seq counter). A fresh
+    # epoch with no rows is reused as-is. _next_seq always starts at 0
+    # locally — _broadcast pre-increments before writing the first event.
+    global _events_epoch, _next_seq, _tool_inflight
+    _tool_inflight = False
+    _events_epoch = 0
+    _next_seq = 0
+    if _session is not None and _session.postgres_conn is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                current_epoch = await conn.fetchval(
+                    "SELECT events_epoch FROM threads WHERE id = $1",
+                    _thread_id,
+                )
+                if current_epoch is None:
+                    current_epoch = 0
+                max_seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    _thread_id,
+                    current_epoch,
+                )
+                if max_seq and max_seq > 0:
+                    # Cold-checkpoint restart: previous epoch has events
+                    # but we lost the in-memory counter. Bump to a fresh
+                    # epoch so cursors from the previous run trigger
+                    # GONE_BEYOND_HORIZON on reconnect.
+                    new_epoch = await conn.fetchval(
+                        "UPDATE threads SET events_epoch = events_epoch + 1 "
+                        "WHERE id = $1 RETURNING events_epoch",
+                        _thread_id,
+                    )
+                    _events_epoch = int(new_epoch)
+                    logger.info(
+                        "Bumped events_epoch to %d for thread %s "
+                        "(previous epoch had %d events)",
+                        _events_epoch,
+                        _thread_id,
+                        max_seq,
+                    )
+                else:
+                    _events_epoch = int(current_epoch)
+        except Exception as e:
+            logger.warning(
+                "events_epoch init failed for thread %s (non-fatal): %s",
+                _thread_id,
+                e,
+            )
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
     _start_watchdogs()
 
-    logger.info(f"Session attached: thread={_thread_id}")
+    logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
 async def _terminate_session(reason: str) -> None:
@@ -944,6 +1013,7 @@ async def _terminate_session(reason: str) -> None:
     """
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _events_epoch, _next_seq, _tool_inflight
 
     if not _session:
         return
@@ -1006,9 +1076,15 @@ async def _terminate_session(reason: str) -> None:
     # when those handlers notice the WS close; dropping the registry here
     # ensures stale entries don't accumulate across sessions.
     _loop_user_queue = None
-    _loop_interrupt_flag = False
+    _loop_interrupt_flag = None
     _loop_last_user_content = [""]
     _subscribers.clear()
+
+    # Phase 2 event-log cursor reset. The next session attach reads the
+    # epoch fresh from the threads table.
+    _events_epoch = 0
+    _next_seq = 0
+    _tool_inflight = False
 
     # Safety valve: restart after N sessions to guard against state leakage
     _sessions_served += 1
@@ -1167,6 +1243,77 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             logger.exception(f"Failed to detach session for thread {thread_id}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    # --- Headless REST input endpoints (phase 2) ---
+    #
+    # Counterparts to the WS-receive-loop methods, exposed so the orchestrator's
+    # SSE-based clients (cockpit chunk 3, MCP, curl) can drive the session
+    # without a WebSocket. The orchestrator forwards from
+    # POST /api/threads/{id}/{input,interrupt,approve/{approval_id}}.
+
+    @app.post("/api/input")
+    async def api_input(request: Request):
+        """Push user input onto the loop's queue. Body: {content, turn_id?}."""
+        if _session is None or _loop_user_queue is None:
+            return JSONResponse({"error": "Session not active"}, status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        content = body.get("content", "")
+        if not isinstance(content, str) or not content:
+            return JSONResponse(
+                {"error": "content must be a non-empty string"},
+                status_code=400,
+            )
+        _loop_last_user_content[0] = content
+        await _loop_user_queue.put(content)
+        return JSONResponse(
+            {
+                "accepted": True,
+                "turn_id": _session.turn_count,
+                "queue_depth": _loop_user_queue.qsize(),
+            }
+        )
+
+    @app.post("/api/interrupt")
+    async def api_interrupt():
+        """Signal the loop to stop. Mode is hard vs graceful based on
+        whether a tool call is currently in flight."""
+        global _loop_interrupt_flag
+        if _session is None:
+            return JSONResponse({"error": "Session not active"}, status_code=503)
+        mode = "graceful" if _tool_inflight else "hard"
+        _loop_interrupt_flag = mode
+        logger.info(
+            "Interrupt received via REST (mode=%s, tool_inflight=%s)",
+            mode,
+            _tool_inflight,
+        )
+        return JSONResponse({"ack": True, "mode": mode})
+
+    @app.post("/api/approve")
+    async def api_approve(request: Request):
+        """Resolve a pending permission gate. Body: {decision: approve|deny,
+        approval_id?}. approval_id is verified by the orchestrator before
+        forwarding; we just push the sentinel onto the queue here."""
+        if _session is None or _loop_user_queue is None:
+            return JSONResponse({"error": "Session not active"}, status_code=503)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+        decision = body.get("decision")
+        if decision == "approve":
+            await _loop_user_queue.put(APPROVE_SENTINEL)
+        elif decision == "deny":
+            await _loop_user_queue.put(DENY_SENTINEL)
+        else:
+            return JSONResponse(
+                {"error": "decision must be 'approve' or 'deny'"},
+                status_code=400,
+            )
+        return JSONResponse({"accepted": True, "decision": decision})
+
     # --- WebSocket endpoint ---
 
     @app.websocket("/ws/chat")
@@ -1306,9 +1453,14 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                         await _loop_user_queue.put(DENY_SENTINEL)
 
                 elif method == "interrupt":
-                    _loop_interrupt_flag = True
-                    await _ws_send(ws, "interrupt.ack", {})
-                    logger.info("Interrupt acknowledged")
+                    # Mode picked from current _tool_inflight: graceful when
+                    # a tool is mid-invoke (let it finish, don't leak state);
+                    # hard otherwise (cancel the LLM stream now, drop the
+                    # partial AIMessage). See persistent_graph check sites.
+                    mode = "graceful" if _tool_inflight else "hard"
+                    _loop_interrupt_flag = mode
+                    await _ws_send(ws, "interrupt.ack", {"mode": mode})
+                    logger.info("Interrupt acknowledged (mode=%s)", mode)
 
                 elif method == "mode.set":
                     new_mode = data.get("mode", "supervised")
@@ -1462,13 +1614,29 @@ def _unsubscribe(client_id: str) -> None:
 
 
 def _broadcast(method: str, params: Dict[str, Any]) -> None:
-    """Enqueue a frame onto every subscriber queue.
+    """Enqueue a frame onto every subscriber queue, persist to event log.
 
-    Non-blocking. On a full queue, drops the oldest frame to make room for the
-    new one — token-stream pacing semantics. We'd rather lose an old chunk than
-    block the loop on a stuck consumer.
+    Non-blocking. On a full subscriber queue, drops the oldest frame to make
+    room for the new one — token-stream pacing semantics. We'd rather lose an
+    old chunk than block the loop on a stuck consumer.
+
+    Phase 2 (event log): allocates the next seq synchronously and stamps
+    `(_events_epoch, seq)` into the frame's params under `_seq`. The actual
+    DB write is scheduled via asyncio.create_task and is best-effort — a
+    failed DB write doesn't block the loop or cancel the in-pod broadcast.
+    Reconnecting SSE clients replay from this log; failed writes produce a
+    cursor gap that GONE_BEYOND_HORIZON catches on the next mismatch.
     """
-    frame = {"method": method, "params": params}
+    global _next_seq
+    _next_seq += 1
+    seq = _next_seq
+    epoch = _events_epoch
+    # Stamp the cursor onto the frame so existing WS subscribers see the
+    # same (epoch, seq) the event log records — keeps WS and SSE paths
+    # consistent under reconnect.
+    params_with_cursor = {**params, "_seq": [epoch, seq]}
+    frame = {"method": method, "params": params_with_cursor}
+
     for client_id, queue in list(_subscribers.items()):
         try:
             queue.put_nowait(frame)
@@ -1484,6 +1652,56 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
                     client_id,
                     method,
                 )
+
+    # Fire-and-forget DB write. Doesn't block the broadcast — if persistence
+    # fails the live subscribers still received the frame; only the SSE
+    # replay path loses a row.
+    if _session is not None and _session.postgres_conn is not None:
+        asyncio.create_task(
+            _persist_event(epoch, seq, method, params),
+            name=f"persist-event-{seq}",
+        )
+
+
+async def _persist_event(
+    epoch: int, seq: int, kind: str, payload: Dict[str, Any]
+) -> None:
+    """Insert one row into thread_events. Best-effort; failures are logged.
+
+    Called fire-and-forget from _broadcast. Captures the postgres_conn at
+    task start so a concurrent _terminate_session can null _session
+    without blowing up this in-flight write.
+    """
+    if _session is None or _thread_id is None:
+        return
+    postgres_conn = _session.postgres_conn
+    if postgres_conn is None:
+        return
+    try:
+        # Serialize payload defensively — frames carry tool args, etc.
+        safe_payload = _safe_serialize(payload)
+        async with postgres_conn.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO thread_events "
+                "(thread_id, epoch, seq, kind, payload) "
+                "VALUES ($1, $2, $3, $4, $5::jsonb)",
+                _thread_id,
+                epoch,
+                seq,
+                kind,
+                json.dumps(safe_payload),
+            )
+    except Exception as e:
+        # Best-effort: log and drop. The frame already reached live
+        # subscribers; only SSE replay for this seq is lost.
+        logger.warning(
+            "thread_events write failed (thread=%s epoch=%d seq=%d kind=%s): %s",
+            _thread_id,
+            epoch,
+            seq,
+            kind,
+            e,
+        )
 
 
 async def _run_subscriber_pump(
@@ -1561,13 +1779,26 @@ async def _loop_get_user_input() -> str:
     return await queue.get()
 
 
-def _loop_check_interrupt() -> bool:
-    """One-shot read of the interrupt flag. Resets to False after read."""
+def _loop_check_interrupt() -> Optional[str]:
+    """One-shot read of the interrupt flag. Returns the mode or None.
+
+    Returns:
+        None when no interrupt is pending.
+        "hard" to cancel the in-flight LLM stream immediately and drop the
+            partial AIMessage (set when interrupt fires with no tool active).
+        "graceful" to stop after the current tool call completes (set when
+            interrupt fires with a tool mid-`ainvoke`).
+
+    Consumed by persistent_graph at three checkpoints. A `bool(result)`
+    check preserves the legacy "any interrupt → stop" semantics for sites
+    that don't yet branch on the mode.
+    """
     global _loop_interrupt_flag
-    if _loop_interrupt_flag:
-        _loop_interrupt_flag = False
-        return True
-    return False
+    mode = _loop_interrupt_flag
+    if mode is not None:
+        _loop_interrupt_flag = None
+        return mode
+    return None
 
 
 async def _loop_on_token(token: str) -> None:
@@ -1581,6 +1812,8 @@ async def _loop_on_thinking(content: str) -> None:
 async def _loop_on_tool_start(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
 ) -> None:
+    global _tool_inflight
+    _tool_inflight = True
     meta = TOOL_REGISTRY.get(tool_name, {})
     _broadcast(
         "tool.started",
@@ -1599,6 +1832,8 @@ async def _loop_on_tool_result(
     tool_call_id: str,
     is_error: bool = False,
 ) -> None:
+    global _tool_inflight
+    _tool_inflight = False
     # Truncate large results for transport (full result is in message history)
     display_result = result[:2000] + "..." if len(result) > 2000 else result
     _broadcast(
