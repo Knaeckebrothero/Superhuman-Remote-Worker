@@ -518,7 +518,12 @@ class TestClassifyLlmError:
         err = _make_sdk_error(
             "NotFoundError",
             404,
-            body={"error": {"message": "Model 'x' not found", "type": "invalid_request_error"}},
+            body={
+                "error": {
+                    "message": "Model 'x' not found",
+                    "type": "invalid_request_error",
+                }
+            },
         )
         assert _classify_llm_error(err) == "permanent"
 
@@ -544,7 +549,9 @@ class TestClassifyLlmError:
         err = _make_sdk_error(
             "BadRequestError",
             400,
-            body={"error": {"type": "invalid_request_error", "code": "tool_use_failed"}},
+            body={
+                "error": {"type": "invalid_request_error", "code": "tool_use_failed"}
+            },
         )
         assert _classify_llm_error(err) == "transient"
 
@@ -554,7 +561,12 @@ class TestClassifyLlmError:
         err = _make_sdk_error(
             "BadRequestError",
             400,
-            body={"error": {"type": "invalid_request_error", "code": "rate_limit_exceeded"}},
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "rate_limit_exceeded",
+                }
+            },
         )
         assert _classify_llm_error(err) == "rate_limit"
 
