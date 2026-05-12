@@ -672,9 +672,10 @@ async def _attach_session(
             # We keep using it as the SSH key filename and SSH config alias
             # so that two datasources with different keys for the same repo
             # don't clobber each other's auth material.
-            ds_name = _re.sub(
-                r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()
-            ).strip("-") or "repo"
+            ds_name = (
+                _re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+                or "repo"
+            )
             try:
                 repo_url = ds.get("connection_url", "")
                 branch = ds.get("default_branch")
