@@ -1519,9 +1519,7 @@ def _create_mongodb_indexes(db) -> None:
             except Exception as e:
                 qualified = f"{collection_name}.{index_name}"
                 failed.append(qualified)
-                logger.error(
-                    f"    FAILED to create {qualified} ({keys!r}): {e}"
-                )
+                logger.error(f"    FAILED to create {qualified} ({keys!r}): {e}")
     if failed:
         raise RuntimeError(
             f"MongoDB index creation failed for {len(failed)} index(es): "
