@@ -1715,6 +1715,47 @@ async def _release_thread_resources(thread_id: str) -> None:
         logger.exception("Agent pod cleanup failed for thread %s", thread_id)
 
 
+async def _suspend_thread_resources(thread_id: str) -> None:
+    """Suspend a thread's workspace to S3 and release the agent pod.
+
+    Used for agent-initiated `ended` transitions where the user has not
+    asked to destroy data — idle timeout, drain, watchdog, WS disconnect.
+    Preserves the workspace via S3 snapshot so /resume can restore it
+    later (resume already routes through restore_thread_workspace when
+    it sees workspace_container.status == 'suspended').
+
+    Falls back gracefully if the suspension service is disabled or the
+    snapshot fails: the workspace stays alive (reconciler will reap it
+    eventually) but we still delete the agent pod so the slot frees.
+    """
+    suspended = False
+    try:
+        if workspace_suspension_service.is_enabled:
+            suspended = await workspace_suspension_service.suspend_thread_workspace(
+                thread_id
+            )
+    except Exception:
+        logger.exception("Workspace suspend failed for thread %s", thread_id)
+
+    if suspended:
+        # suspend_thread_workspace already deletes the agent pod.
+        return
+
+    logger.warning(
+        "Workspace suspend unavailable or failed for thread %s — keeping "
+        "workspace alive (reconciler will reap) but deleting the agent pod",
+        thread_id,
+    )
+    try:
+        if agent_provisioner.is_available:
+            await agent_provisioner.delete_agent_pod_by_thread(thread_id)
+        elif persistent_provisioner.is_available:
+            await persistent_provisioner.delete_agent_pod(thread_id)
+            await persistent_provisioner.delete_agent_pvc(thread_id)
+    except Exception:
+        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+
+
 def _provider_of_model(model: str) -> str | None:
     """Sync prefix-based provider heuristic for legacy dispatch paths.
 
@@ -9524,11 +9565,13 @@ async def agent_update_thread_status(
         if request.status == "ended":
             # Route through end_thread so ended_at gets stamped.
             await postgres_db.end_thread(thread_id)
-            # Tear down workspace + agent pods so they don't leak. Mirrors
-            # the user-facing DELETE handler. Scheduled as a background task
-            # because the caller is the agent itself — synchronously deleting
-            # its own pod would cut the response off mid-flight.
-            asyncio.create_task(_release_thread_resources(thread_id))
+            # Agent-initiated `ended` (idle timeout, drain, watchdog, WS
+            # disconnect) is almost always recoverable, not a user-intent
+            # delete — preserve the workspace via S3 snapshot so /resume
+            # can restore it. The user-facing DELETE handler still uses
+            # _release_thread_resources for true destruction.
+            # See docs/issues/persistent_session_permission_check_race.md.
+            asyncio.create_task(_suspend_thread_resources(thread_id))
         else:
             await postgres_db.update_thread_status(thread_id, request.status)
         return {"status": request.status}
