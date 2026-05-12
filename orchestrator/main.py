@@ -14350,9 +14350,7 @@ async def get_project(project_id: str) -> dict[str, Any]:
             # deployments is intentionally ignored here.
             try:
                 members = await postgres_db.get_project_members(project_id)
-                owner = next(
-                    (m for m in members if m.get("role") == "owner"), None
-                )
+                owner = next((m for m in members if m.get("role") == "owner"), None)
                 owner_email = (owner or {}).get("email")
                 owner_display = (owner or {}).get("display_name") or ""
                 if owner_email:
