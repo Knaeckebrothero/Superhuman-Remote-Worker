@@ -185,21 +185,29 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: KEYCLOAK_REALM
-            {{- if .Values.keycloak.internal }}
-            # KEYCLOAK_ADMIN_* — only when SRW manages the Keycloak instance.
-            # External Keycloak deployments use the bootstrap Job (with its
-            # own KC_ADMIN_USER/PASSWORD Secret) instead.
+            # KEYCLOAK_ADMIN_* — required for runtime project-group sync
+            # (KeycloakGroupSync). Without these the orchestrator can't add
+            # users to project groups, and OpenCloud's reconciler then strips
+            # any direct LibreGraph group membership on the user's next login
+            # — leaving them locked out of their project Space.
+            #
+            # Internal Keycloak: the chart-rendered Secret uses key
+            # KEYCLOAK_ADMIN_USER/PASSWORD. External Keycloak: the runtime
+            # Vault bundle uses KC_ADMIN_USER/PASSWORD (the bootstrap-Job
+            # convention). Same credential either way; just different secret
+            # keys depending on who owns the Keycloak instance.
             - name: KEYCLOAK_ADMIN_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: KEYCLOAK_ADMIN_USER
+                  key: {{ if .Values.keycloak.internal }}KEYCLOAK_ADMIN_USER{{ else }}KC_ADMIN_USER{{ end }}
+                  optional: true
             - name: KEYCLOAK_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
-                  key: KEYCLOAK_ADMIN_PASSWORD
-            {{- end }}
+                  key: {{ if .Values.keycloak.internal }}KEYCLOAK_ADMIN_PASSWORD{{ else }}KC_ADMIN_PASSWORD{{ end }}
+                  optional: true
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:
