@@ -1285,6 +1285,233 @@ class TestWsSend:
 
 
 # ---------------------------------------------------------------------------
+# 3.17.1 Headless: subscriber fan-out (_subscribe / _unsubscribe / _broadcast)
+# ---------------------------------------------------------------------------
+
+
+class TestSubscriberFanout:
+    """Tests for the subscriber-list broadcast hub that decouples the loop
+    from any single WebSocket. See docs/features/headless_persistent_sessions.md."""
+
+    def setup_method(self):
+        import src.api.persistent_app as mod
+
+        mod._subscribers.clear()
+
+    def teardown_method(self):
+        import src.api.persistent_app as mod
+
+        mod._subscribers.clear()
+
+    def test_subscribe_returns_fresh_queue(self):
+        import src.api.persistent_app as mod
+
+        queue = mod._subscribe("client-A")
+        assert "client-A" in mod._subscribers
+        assert mod._subscribers["client-A"] is queue
+        assert queue.empty()
+
+    def test_unsubscribe_removes_entry(self):
+        import src.api.persistent_app as mod
+
+        mod._subscribe("client-A")
+        mod._unsubscribe("client-A")
+        assert "client-A" not in mod._subscribers
+
+    def test_unsubscribe_unknown_id_is_a_noop(self):
+        import src.api.persistent_app as mod
+
+        # Should not raise.
+        mod._unsubscribe("never-subscribed")
+
+    def test_broadcast_enqueues_to_all_subscribers(self):
+        import src.api.persistent_app as mod
+
+        q1 = mod._subscribe("c1")
+        q2 = mod._subscribe("c2")
+
+        mod._broadcast("token", {"content": "hi"})
+
+        frame = {"method": "token", "params": {"content": "hi"}}
+        assert q1.get_nowait() == frame
+        assert q2.get_nowait() == frame
+
+    def test_broadcast_no_subscribers_does_nothing(self):
+        """Loop running with zero subscribers — the whole point of headless."""
+        import src.api.persistent_app as mod
+
+        # Should not raise.
+        mod._broadcast("token", {"content": "into the void"})
+        assert mod._subscribers == {}
+
+    def test_broadcast_drops_oldest_on_full_queue(self):
+        """Slow consumer must not block the loop. Oldest frame is dropped."""
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        small = _asyncio.Queue(maxsize=2)
+        mod._subscribers["slow"] = small
+
+        # Fill the queue so the next broadcast must drop.
+        small.put_nowait({"method": "old1", "params": {}})
+        small.put_nowait({"method": "old2", "params": {}})
+
+        mod._broadcast("new", {"content": "x"})
+
+        # old1 should have been dropped; queue holds old2 + new.
+        first = small.get_nowait()
+        second = small.get_nowait()
+        assert first["method"] == "old2"
+        assert second["method"] == "new"
+
+    def test_unsubscribe_does_not_touch_loop_task(self):
+        """The keystone invariant — WS close must not cancel the loop."""
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        async def _runit():
+            async def _forever():
+                await _asyncio.sleep(60)
+
+            task = _asyncio.create_task(_forever())
+            mod._loop_task = task
+            try:
+                mod._subscribe("clientX")
+                mod._unsubscribe("clientX")
+                # Loop is untouched: still running, still the same task.
+                assert mod._loop_task is task
+                assert not task.done()
+                assert not task.cancelled()
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except _asyncio.CancelledError:
+                    pass
+                mod._loop_task = None
+
+        _asyncio.run(_runit())
+
+
+# ---------------------------------------------------------------------------
+# 3.17.2 Headless: _terminate_session preserves the race-fix invariants
+# ---------------------------------------------------------------------------
+
+
+class TestTerminateSession:
+    """Tests for _terminate_session(reason) — the renamed body of the
+    pre-headless _detach_session. Verifies cancel-before-null ordering and
+    cleanup of the new headless-era input primitives."""
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_session_already_none(self):
+        import src.api.persistent_app as mod
+
+        mod._session = None
+        # Should not raise.
+        await mod._terminate_session("test")
+
+    @pytest.mark.asyncio
+    async def test_cancels_loop_task_before_nulling_session(self):
+        """The race-fix from commit 3a1d265 must survive the rename."""
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        # Track when the loop was cancelled vs when cleanup ran.
+        order = []
+        loop_started = _asyncio.Event()
+
+        async def _loop_body():
+            loop_started.set()
+            try:
+                await _asyncio.sleep(60)
+            except _asyncio.CancelledError:
+                order.append("loop_cancelled")
+                raise
+
+        loop_task = _asyncio.create_task(_loop_body())
+        # Wait until the body actually enters its try block — otherwise
+        # cancel() would fire before the body had a chance to register an
+        # except handler, and our ordering assertion would be vacuous.
+        await loop_started.wait()
+        mod._loop_task = loop_task
+        mod._thread_id = "t1"
+
+        # Minimal _session double that records when it's torn down.
+        fake_session = MagicMock()
+        fake_session.workspace_sync = None
+        fake_session.workspace_manager = None
+        fake_session.cleanup = AsyncMock(side_effect=lambda: order.append("cleanup"))
+        mod._session = fake_session
+
+        with patch.object(mod, "_update_thread_status", new=AsyncMock()):
+            await mod._terminate_session("test")
+
+        # Cancel happens before cleanup which happens before nulling.
+        assert order == ["loop_cancelled", "cleanup"]
+        assert mod._session is None
+        assert mod._loop_task is None
+
+    @pytest.mark.asyncio
+    async def test_clears_headless_input_primitives(self):
+        """Subscriber registry and loop input queues must reset."""
+        import asyncio as _asyncio
+
+        import src.api.persistent_app as mod
+
+        mod._loop_task = None  # nothing to cancel
+        mod._thread_id = "t2"
+        mod._subscribers["ghost"] = _asyncio.Queue()
+        mod._loop_user_queue = _asyncio.Queue()
+        mod._loop_interrupt_flag = True
+        mod._loop_last_user_content = ["something"]
+
+        fake_session = MagicMock()
+        fake_session.workspace_sync = None
+        fake_session.workspace_manager = None
+        fake_session.cleanup = AsyncMock()
+        mod._session = fake_session
+
+        with patch.object(mod, "_update_thread_status", new=AsyncMock()):
+            await mod._terminate_session("test")
+
+        assert mod._subscribers == {}
+        assert mod._loop_user_queue is None
+        assert mod._loop_interrupt_flag is False
+        assert mod._loop_last_user_content == [""]
+
+
+# ---------------------------------------------------------------------------
+# 3.17.3 Headless: module-level loop callbacks behave as the old closures did
+# ---------------------------------------------------------------------------
+
+
+class TestLoopCheckInterrupt:
+    """_loop_check_interrupt is the hoisted check_interrupt — must be one-shot."""
+
+    def setup_method(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_interrupt_flag = False
+
+    def test_returns_false_when_flag_not_set(self):
+        import src.api.persistent_app as mod
+
+        assert mod._loop_check_interrupt() is False
+
+    def test_returns_true_once_then_resets(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_interrupt_flag = True
+        assert mod._loop_check_interrupt() is True
+        # Subsequent reads see the reset.
+        assert mod._loop_check_interrupt() is False
+
+
+# ---------------------------------------------------------------------------
 # 3.18 create_persistent_app()
 # ---------------------------------------------------------------------------
 
@@ -1450,7 +1677,7 @@ class TestBootWsWatchdog:
         event = asyncio.Event()
         event.set()  # Pre-set so wait_for returns immediately
         with patch.object(pa, "_ws_connected_event", event):
-            with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+            with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                 with patch.object(pa, "_schedule_exit") as exit_fn:
                     await pa._boot_ws_watchdog(timeout_s=10)
         detach.assert_not_called()
@@ -1465,7 +1692,7 @@ class TestBootWsWatchdog:
         event = asyncio.Event()  # Never set
         with patch.object(pa, "_ws_connected_event", event):
             with patch.object(pa, "_thread_id", "thread-xyz"):
-                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Tiny timeout so the test doesn't actually wait 10 min
                         await pa._boot_ws_watchdog(timeout_s=0)
@@ -1483,7 +1710,7 @@ class TestBootWsWatchdog:
             with patch.object(pa, "_thread_id", "thread-xyz"):
                 with patch.object(
                     pa,
-                    "_detach_session",
+                    "_terminate_session",
                     new=AsyncMock(side_effect=RuntimeError("detach failed")),
                 ):
                     with patch.object(pa, "_schedule_exit") as exit_fn:
@@ -1503,7 +1730,7 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa, "_thread_id", "thread-xyz"):
-                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Tiny poll interval so test runs quickly
                         await pa._thread_status_watchdog(poll_s=0)
@@ -1522,7 +1749,7 @@ class TestThreadStatusWatchdog:
         )
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa, "_thread_id", "thread-xyz"):
-                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         # Run the watchdog briefly then cancel — it must not
                         # have triggered exit while status was active.
@@ -1546,7 +1773,7 @@ class TestThreadStatusWatchdog:
         client.get_thread_lifecycle = AsyncMock(side_effect=RuntimeError("network"))
         with patch.object(pa, "_orchestrator_client", client):
             with patch.object(pa, "_thread_id", "thread-xyz"):
-                with patch.object(pa, "_detach_session", new=AsyncMock()) as detach:
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
                     with patch.object(pa, "_schedule_exit") as exit_fn:
                         task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
                         await asyncio.sleep(0.05)
