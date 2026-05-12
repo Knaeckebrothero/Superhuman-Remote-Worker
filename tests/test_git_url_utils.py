@@ -16,8 +16,10 @@ from src.utils.git_url import repo_name_from_url
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("https://github.com/Knaeckebrothero/Superhuman-Remote-Worker.git",
-         "Superhuman-Remote-Worker"),
+        (
+            "https://github.com/Knaeckebrothero/Superhuman-Remote-Worker.git",
+            "Superhuman-Remote-Worker",
+        ),
         ("https://github.com/foo/bar.git", "bar"),
         ("https://github.com/foo/bar", "bar"),
         ("https://github.com/foo/bar/", "bar"),
@@ -61,7 +63,10 @@ class TestFallback:
 class TestSanitization:
     def test_disallowed_chars_replaced(self):
         # Spaces and other filesystem-hostile chars collapse to a single dash.
-        assert repo_name_from_url("https://example.com/u/weird repo name") == "weird-repo-name"
+        assert (
+            repo_name_from_url("https://example.com/u/weird repo name")
+            == "weird-repo-name"
+        )
 
     def test_unicode_replaced(self):
         # Non-ASCII isn't in the allowed set — gets dashed out.
