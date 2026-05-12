@@ -1327,12 +1327,22 @@ class TestSubscriberFanout:
     def test_broadcast_enqueues_to_all_subscribers(self):
         import src.api.persistent_app as mod
 
+        # Reset event-log cursor so this test is deterministic.
+        mod._next_seq = 0
+        mod._events_epoch = 0
+        mod._session = None  # skip the DB write task
+
         q1 = mod._subscribe("c1")
         q2 = mod._subscribe("c2")
 
         mod._broadcast("token", {"content": "hi"})
 
-        frame = {"method": "token", "params": {"content": "hi"}}
+        # Phase 2 stamps (_seq) on every frame so both broadcast subscribers
+        # and event-log replay share the same cursor.
+        frame = {
+            "method": "token",
+            "params": {"content": "hi", "_seq": [0, 1]},
+        }
         assert q1.get_nowait() == frame
         assert q2.get_nowait() == frame
 
@@ -1466,8 +1476,11 @@ class TestTerminateSession:
         mod._thread_id = "t2"
         mod._subscribers["ghost"] = _asyncio.Queue()
         mod._loop_user_queue = _asyncio.Queue()
-        mod._loop_interrupt_flag = True
+        mod._loop_interrupt_flag = "hard"
         mod._loop_last_user_content = ["something"]
+        mod._tool_inflight = True
+        mod._events_epoch = 7
+        mod._next_seq = 42
 
         fake_session = MagicMock()
         fake_session.workspace_sync = None
@@ -1480,8 +1493,11 @@ class TestTerminateSession:
 
         assert mod._subscribers == {}
         assert mod._loop_user_queue is None
-        assert mod._loop_interrupt_flag is False
+        assert mod._loop_interrupt_flag is None
         assert mod._loop_last_user_content == [""]
+        assert mod._tool_inflight is False
+        assert mod._events_epoch == 0
+        assert mod._next_seq == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1490,25 +1506,33 @@ class TestTerminateSession:
 
 
 class TestLoopCheckInterrupt:
-    """_loop_check_interrupt is the hoisted check_interrupt — must be one-shot."""
+    """_loop_check_interrupt returns the tri-state mode and resets in one shot."""
 
     def setup_method(self):
         import src.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = False
+        mod._loop_interrupt_flag = None
+        mod._tool_inflight = False
 
-    def test_returns_false_when_flag_not_set(self):
+    def test_returns_none_when_flag_not_set(self):
         import src.api.persistent_app as mod
 
-        assert mod._loop_check_interrupt() is False
+        assert mod._loop_check_interrupt() is None
 
-    def test_returns_true_once_then_resets(self):
+    def test_returns_hard_mode_once_then_resets(self):
         import src.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = True
-        assert mod._loop_check_interrupt() is True
+        mod._loop_interrupt_flag = "hard"
+        assert mod._loop_check_interrupt() == "hard"
         # Subsequent reads see the reset.
-        assert mod._loop_check_interrupt() is False
+        assert mod._loop_check_interrupt() is None
+
+    def test_returns_graceful_mode_once_then_resets(self):
+        import src.api.persistent_app as mod
+
+        mod._loop_interrupt_flag = "graceful"
+        assert mod._loop_check_interrupt() == "graceful"
+        assert mod._loop_check_interrupt() is None
 
 
 # ---------------------------------------------------------------------------

@@ -124,8 +124,21 @@ class PersistentLoopCallbacks:
     # Notify client of errors
     on_error: Callable[[str], Awaitable[None]]
 
-    # Check if an interrupt was requested (non-blocking)
-    check_interrupt: Callable[[], bool]
+    # Check if an interrupt was requested (non-blocking). Returns the
+    # interrupt mode ("hard" | "graceful") or None if no interrupt is
+    # pending. One-shot: reading consumes the flag.
+    #
+    # - "hard": cancel the in-flight LLM stream immediately, drop the
+    #   partial AIMessage (don't append to messages). Set when the
+    #   interrupt POST lands while no tool is mid-`ainvoke`.
+    # - "graceful": let the current tool / stream finish, then exit at
+    #   the next turn boundary. Set when the interrupt POST lands while
+    #   a tool is mid-`ainvoke`. The accumulated partial AIMessage is
+    #   preserved in messages.
+    #
+    # Legacy callers returning bool are accepted: any truthy non-None
+    # value behaves like "graceful" (preserves partial response).
+    check_interrupt: Callable[[], Optional[str]]
 
     # Notify client that a VM upgrade is needed (sudo detected, optional)
     on_vm_upgrade_needed: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
@@ -511,7 +524,10 @@ async def _execute_turn(
             try:
                 # Try astream for token-by-token streaming
                 chunks = []
-                streaming_interrupted = False
+                # Holds the interrupt mode ("hard"|"graceful") if the loop
+                # below broke early; None otherwise. Legacy bool callbacks
+                # land as True here and are treated as "graceful".
+                streaming_interrupted: Any = None
                 async for chunk in llm_with_tools.astream(prepared):
                     chunks.append(chunk)
                     # Extract and stream text content
@@ -542,10 +558,18 @@ async def _execute_turn(
                             response_content += content
                             await callbacks.on_token(content)
 
-                    # Check for mid-stream interrupt
-                    if callbacks.check_interrupt():
-                        logger.info("Interrupt received during LLM streaming")
-                        streaming_interrupted = True
+                    # Check for mid-stream interrupt. Capture the mode so
+                    # the partial-response handler below can drop (hard)
+                    # vs keep (graceful) the AIMessage. Use truthy check —
+                    # legacy callers returning bool False count as "no
+                    # interrupt" alongside the new-API None.
+                    interrupt_mode = callbacks.check_interrupt()
+                    if interrupt_mode:
+                        logger.info(
+                            "Interrupt received during LLM streaming (mode=%s)",
+                            interrupt_mode,
+                        )
+                        streaming_interrupted = interrupt_mode
                         break
 
                 # Concatenate all chunks into final response
@@ -624,10 +648,21 @@ async def _execute_turn(
                             )
                             await callbacks.on_token(response_content)
 
-                # Handle mid-stream interruption
+                # Handle mid-stream interruption. "hard" drops the partial
+                # AIMessage entirely (user said cancel-immediately, the
+                # half-typed assistant text shouldn't live in history).
+                # Any other truthy mode (graceful, or a legacy bool True)
+                # preserves the partial response so the work is visible.
                 if streaming_interrupted:
-                    if response:
-                        # Strip incomplete tool calls from partial response
+                    if streaming_interrupted == "hard":
+                        logger.info(
+                            "Hard interrupt: dropping partial AIMessage "
+                            "(%d chars accumulated)",
+                            len(response_content),
+                        )
+                    elif response:
+                        # graceful (or legacy bool True): strip incomplete
+                        # tool calls from partial response and keep it.
                         if hasattr(response, "tool_calls"):
                             response.tool_calls = []
                         if hasattr(response, "invalid_tool_calls"):
