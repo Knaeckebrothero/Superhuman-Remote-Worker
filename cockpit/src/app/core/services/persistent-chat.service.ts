@@ -924,9 +924,52 @@ export class PersistentChatService {
                 break;
 
             case 'error':
-                this.error.set((params['message'] as string) || 'Unknown error');
+                this.error.set(this.sanitizeError(params['message'] as string));
                 break;
         }
+    }
+
+    /**
+     * Convert backend exception strings into friendly user-facing messages.
+     * Raw Python tracebacks and library-internal error strings (e.g. LangChain
+     * "Got unknown type ...", "'NoneType' object has no attribute ...") leak
+     * implementation details and confuse users. Log the original to console
+     * for debugging; surface a generic message instead.
+     */
+    private sanitizeError(raw: string | undefined | null): string {
+        if (!raw) return 'Unknown error';
+        const msg = String(raw);
+
+        // Always preserve the original for devs.
+        console.warn('[persistent-chat] backend error:', msg);
+
+        // Race-condition fallout: session detached mid-turn.
+        if (/'NoneType' object has no attribute/i.test(msg)) {
+            return 'Session was interrupted. Try sending your message again or refresh the page.';
+        }
+
+        // LangChain provider couldn't classify a message — usually fires
+        // after a streaming response gets corrupted (e.g. WS reconnect).
+        if (/Got unknown type/i.test(msg)) {
+            return 'The assistant returned a malformed response. Try sending your message again.';
+        }
+
+        // LLM upstream timeout (10 min) — actionable, but the raw string
+        // already says it cleanly.
+        if (/LLM call timed out/i.test(msg)) {
+            return msg;
+        }
+
+        // Python traceback leaked through.
+        if (/Traceback \(most recent call last\)/i.test(msg)) {
+            return 'Something went wrong on the server. Check the console for details.';
+        }
+
+        // Cap length so a long error doesn't blow out the banner.
+        if (msg.length > 240) {
+            return msg.slice(0, 240) + '…';
+        }
+        return msg;
     }
 
     /** Mark the session as ready and flush any pending message. */

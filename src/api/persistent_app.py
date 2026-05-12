@@ -64,6 +64,13 @@ _drain_intent_handled: bool = False
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
+
+# Reference to the currently running persistent-loop task. Set by ws_chat when
+# it spawns the loop, cleared when ws_chat exits. _detach_session() cancels and
+# awaits it before nulling _session, so out-of-band callers (heartbeat intents,
+# thread-status watchdog, drain) can't race the in-flight turn into a
+# NoneType.permission_mode crash. See docs/issues/persistent_session_permission_check_race.md.
+_loop_task: Optional[asyncio.Task] = None
 _session_boot_ws_timeout_s: int = int(
     os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
 )
@@ -879,19 +886,35 @@ async def _attach_session(
 async def _detach_session() -> None:
     """Tear down the current session and return to idle.
 
-    1. Mark thread as ended (still resumable)
-    2. Git commit + push
-    3. Clean up session resources
-    4. Clear session globals
-    5. Increment session counter, exit if max reached
+    1. Cancel in-flight persistent-loop task (prevents permission_check race)
+    2. Mark thread as ended (still resumable)
+    3. Git commit + push
+    4. Clean up session resources
+    5. Clear session globals
+    6. Increment session counter, exit if max reached
     """
-    global _session, _thread_id, _sessions_served
+    global _session, _thread_id, _sessions_served, _loop_task
 
     if not _session:
         return
 
     thread_id = _thread_id
     logger.info(f"Detaching session: thread={thread_id}")
+
+    # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
+    # drain, thread-status watchdog) reach this without going through the
+    # ws_chat finally block that normally cancels the loop, so without this
+    # the loop's next _session.permission_mode access AttributeErrors when we
+    # null _session below. Skipped when invoked from inside the loop itself
+    # (would deadlock awaiting self).
+    loop_task = _loop_task
+    if loop_task is not None and loop_task is not asyncio.current_task():
+        if not loop_task.done():
+            loop_task.cancel()
+            try:
+                await loop_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # Cancel self-cleanup watchdogs first — we're about to do the cleanup
     # they would have triggered, no point letting them race the detach.
@@ -1221,6 +1244,17 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         async def permission_check(
             tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
         ) -> bool:
+            # Belt-and-suspenders for the detach race: Fix 2 cancels loop_task
+            # before nulling _session, so this should be unreachable. If it is
+            # reached, deny the call — the session is gone, the tool result
+            # has nowhere to land.
+            if _session is None:
+                logger.warning(
+                    "permission_check fired with _session=None for tool %s — "
+                    "denying (session was detached mid-turn)",
+                    tool_name,
+                )
+                return False
             mode = _session.permission_mode
 
             if mode == "autonomous":
@@ -1249,7 +1283,10 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 approved = response == APPROVE_SENTINEL
             except asyncio.TimeoutError:
                 approved = False
-            _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
+            if _session is not None:
+                _session.tool_decisions[tool_call_id] = (
+                    "approved" if approved else "denied"
+                )
             return approved
 
         async def on_turn_start(turn_id: int) -> None:
@@ -1329,7 +1366,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             on_vm_upgrade_needed=on_vm_upgrade_needed,
         )
 
-        # Start persistent loop as background task
+        # Start persistent loop as background task. Publish on the module
+        # global so _detach_session() can cancel us before nulling _session.
+        global _loop_task
         loop_task = asyncio.create_task(
             run_persistent_loop(
                 llm_with_tools=_session.llm_with_tools,
@@ -1350,6 +1389,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 get_current_tools=lambda: (_session.llm_with_tools, _session.tools),
             )
         )
+        _loop_task = loop_task
 
         # --- WebSocket receive loop ---
         try:
@@ -1383,6 +1423,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 elif method == "mode.set":
                     new_mode = data.get("mode", "supervised")
                     if new_mode in ("supervised", "auto_accept", "autonomous"):
+                        if _session is None:
+                            await _ws_send(
+                                ws,
+                                "error",
+                                {"message": "Session no longer active"},
+                            )
+                            continue
                         _session.permission_mode = new_mode
                         await _ws_send(ws, "mode.changed", {"mode": new_mode})
                         logger.info(f"Permission mode changed to: {new_mode}")
@@ -1472,6 +1519,11 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
             if idle_timed_out:
                 await _handle_idle_archive(ws)
+
+            # Clear loop_task before _detach_session so it doesn't try to
+            # cancel an already-finished task we just awaited.
+            global _loop_task
+            _loop_task = None
 
             # Always detach session on disconnect (idle timeout or not).
             # Sets thread status to 'ended' and cleans up session state.
@@ -1880,7 +1932,12 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 ),
             )
 
-        # Update permission mode if included
+        # Update permission mode if included.
+        # _session may have been detached concurrently — bail out cleanly
+        # instead of AttributeError'ing on assignment.
+        if _session is None:
+            await _ws_send(ws, "error", {"message": "Session no longer active"})
+            return
         pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             _session.permission_mode = pm
@@ -1900,6 +1957,8 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 logger.warning("Config persistence to orchestrator failed (non-fatal)")
 
         # Acknowledge with resolved values
+        if _session is None:
+            return
         await _ws_send(
             ws,
             "config.changed",
