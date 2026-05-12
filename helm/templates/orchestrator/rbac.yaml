@@ -17,6 +17,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["create", "delete", "get", "list", "watch", "patch"]
+  # Read pod logs before reap — supports the diagnostic log capture added
+  # in commit 8e92c81 (Capture agent logs before pod deletion). Without
+  # this, AgentProvisioner._capture_agent_logs_before_reap fails with 403
+  # and the very logs we need to debug agent-side incidents are lost.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   # Finalizer manipulation for the lifecycle reconciler — guarantees
   # cleanup hooks run before a pod disappears from etcd. Adopted in
   # Phase 1 of the unified instance lifecycle redesign; Phase 1c is the
