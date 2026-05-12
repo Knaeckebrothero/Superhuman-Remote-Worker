@@ -14143,8 +14143,17 @@ async def _ensure_project_cloud_resources(
       exists but the user was never added to the groups — e.g. project created
       while Keycloak admin auth was broken, or a Space adopted out-of-band.
 
+    Default projects skip both: they piggyback on the owner's personal home
+    Space (already attached as a datasource by the user-creation flow), so a
+    separate project Space + `project-<id>` group would be dead state. The
+    cloud_storage_url branch in `get_project` resolves to the user's home
+    browser URL for default projects.
+
     Returns the (possibly updated) project dict.
     """
+    if project.get("is_default"):
+        return project
+
     project_id_str = str(project["id"])
     project_name = project["name"]
     group_name = f"project-{project_id_str}"
@@ -14333,27 +14342,57 @@ async def get_project(project_id: str) -> dict[str, Any]:
     project["cloud_storage_url"] = None
     backend = main_cloud_router.for_project(project)
     if backend.is_initialized:
-        handle_str = project.get("main_cloud_folder_handle")
-        legacy_folder_id = project.get("nextcloud_folder_id")
-        if handle_str or legacy_folder_id:
-            handle = ProjectFolderHandle.from_db(
-                handle_str or str(legacy_folder_id),
-                backend=project.get("main_cloud_backend") or backend.backend_id,
-            )
-            # Legacy Nextcloud handles were backfilled without vendor_meta;
-            # re-attach the mountpoint from the project name so the URL
-            # builder has what it needs.
-            if not handle.vendor_meta.get("mountpoint"):
-                handle = ProjectFolderHandle(
-                    backend=handle.backend,
-                    native_id=handle.native_id,
-                    vendor_meta={**handle.vendor_meta, "mountpoint": project["name"]},
+        if project.get("is_default"):
+            # Default projects piggyback on the owner's personal home Space —
+            # the deep-link must resolve to that home, not to a project Space
+            # (which we no longer provision for defaults — see
+            # `_ensure_project_cloud_resources`). A stale handle from older
+            # deployments is intentionally ignored here.
+            try:
+                members = await postgres_db.get_project_members(project_id)
+                owner = next(
+                    (m for m in members if m.get("role") == "owner"), None
                 )
-            project["cloud_storage_url"] = backend.get_project_folder_browser_url(
-                handle
-            )
-        elif project.get("is_default"):
-            project["cloud_storage_url"] = backend.get_default_home_browser_url()
+                owner_email = (owner or {}).get("email")
+                owner_display = (owner or {}).get("display_name") or ""
+                if owner_email:
+                    resolved = await backend.resolve_user_identity(
+                        owner_email, owner_display.lower()
+                    )
+                    if resolved:
+                        home = await backend.get_user_home(resolved)
+                        if home and home.browser_url:
+                            project["cloud_storage_url"] = home.browser_url
+            except Exception as e:
+                logger.warning(
+                    f"Failed to resolve user-home URL for default project "
+                    f"{project_id}: {e}"
+                )
+            if not project["cloud_storage_url"]:
+                project["cloud_storage_url"] = backend.get_default_home_browser_url()
+        else:
+            handle_str = project.get("main_cloud_folder_handle")
+            legacy_folder_id = project.get("nextcloud_folder_id")
+            if handle_str or legacy_folder_id:
+                handle = ProjectFolderHandle.from_db(
+                    handle_str or str(legacy_folder_id),
+                    backend=project.get("main_cloud_backend") or backend.backend_id,
+                )
+                # Legacy Nextcloud handles were backfilled without vendor_meta;
+                # re-attach the mountpoint from the project name so the URL
+                # builder has what it needs.
+                if not handle.vendor_meta.get("mountpoint"):
+                    handle = ProjectFolderHandle(
+                        backend=handle.backend,
+                        native_id=handle.native_id,
+                        vendor_meta={
+                            **handle.vendor_meta,
+                            "mountpoint": project["name"],
+                        },
+                    )
+                project["cloud_storage_url"] = backend.get_project_folder_browser_url(
+                    handle
+                )
 
     return project
 
