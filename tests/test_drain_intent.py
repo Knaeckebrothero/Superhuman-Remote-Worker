@@ -27,7 +27,9 @@ class TestPersistentDrainHandler:
         persistent_app._drain_intent_handled = False
 
         with (
-            patch.object(persistent_app, "_detach_session", new=AsyncMock()) as detach,
+            patch.object(
+                persistent_app, "_terminate_session", new=AsyncMock()
+            ) as detach,
             patch.object(persistent_app, "_schedule_exit") as exit_,
         ):
             await persistent_app._handle_heartbeat_intents(
@@ -44,7 +46,9 @@ class TestPersistentDrainHandler:
         persistent_app._drain_intent_handled = False
 
         with (
-            patch.object(persistent_app, "_detach_session", new=AsyncMock()) as detach,
+            patch.object(
+                persistent_app, "_terminate_session", new=AsyncMock()
+            ) as detach,
             patch.object(persistent_app, "_schedule_exit") as exit_,
         ):
             await persistent_app._handle_heartbeat_intents(
@@ -64,7 +68,9 @@ class TestPersistentDrainHandler:
         persistent_app._drain_intent_handled = False
 
         with (
-            patch.object(persistent_app, "_detach_session", new=AsyncMock()) as detach,
+            patch.object(
+                persistent_app, "_terminate_session", new=AsyncMock()
+            ) as detach,
             patch.object(persistent_app, "_schedule_exit") as exit_,
         ):
             # Empty / missing / explicit-false should all be no-ops.

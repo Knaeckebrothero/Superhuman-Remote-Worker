@@ -66,15 +66,41 @@ _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
-# it spawns the loop, cleared when ws_chat exits. _detach_session() cancels and
-# awaits it before nulling _session, so out-of-band callers (heartbeat intents,
-# thread-status watchdog, drain) can't race the in-flight turn into a
-# NoneType.permission_mode crash. See docs/issues/persistent_session_permission_check_race.md.
+# it spawns the loop, cleared when _terminate_session runs. _terminate_session()
+# cancels and awaits it before nulling _session, so out-of-band callers
+# (heartbeat intents, thread-status watchdog, drain) can't race the in-flight
+# turn into a NoneType.permission_mode crash. See
+# docs/issues/persistent_session_permission_check_race.md.
+#
+# Headless sessions (chunk 1): the loop now outlives any single WebSocket. It is
+# only cancelled by _terminate_session, never by WS close.
 _loop_task: Optional[asyncio.Task] = None
 _session_boot_ws_timeout_s: int = int(
     os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
 )
 _thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
+# Subscriber registry for headless persistent sessions.
+#
+# Loop-driven output (token chunks, tool events, turn lifecycle, etc.) used to
+# be sent directly to a single WebSocket scoped to ws_chat. Under headless
+# semantics the loop must outlive any single WS attach, so the loop instead
+# broadcasts via _broadcast() and each WebSocket connection registers its own
+# queue via _subscribe(). A _run_subscriber_pump task drains each queue into
+# its WS. Closing a WS just calls _unsubscribe() — the loop keeps running.
+#
+# Keyed by client_id (generated server-side per WS connection). Bounded queue
+# protects the loop from a slow consumer: on overflow the oldest frame is
+# dropped (token-stream pacing semantics).
+_SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
+_subscribers: Dict[str, asyncio.Queue] = {}
+
+# Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
+# hoisted to module level so they survive WS reconnect. All three are reset
+# on session attach / cleared on _terminate_session.
+_loop_user_queue: Optional[asyncio.Queue] = None
+_loop_interrupt_flag: bool = False
+_loop_last_user_content: List[str] = [""]
 
 
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
@@ -100,7 +126,7 @@ async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
         intents.get("drain_reason", "unspecified"),
     )
     try:
-        await _detach_session()
+        await _terminate_session("drain")
     except Exception as e:
         logger.warning(f"Detach during drain-intent handling failed: {e}")
     _schedule_exit(delay=1.0)
@@ -149,7 +175,7 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
             _thread_id,
         )
     try:
-        await _detach_session()
+        await _terminate_session("boot_ws_timeout")
     except Exception as e:
         logger.warning(f"Detach during boot-WS timeout failed: {e}")
     _schedule_exit(delay=1.0)
@@ -186,7 +212,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
                 status,
             )
             try:
-                await _detach_session()
+                await _terminate_session("thread_ended_oob")
             except Exception as e:
                 logger.warning(f"Detach during status-watchdog exit failed: {e}")
             _schedule_exit(delay=1.0)
@@ -351,7 +377,7 @@ async def lifespan(app: FastAPI):
 
     # Detach any active session
     if _session:
-        await _detach_session()
+        await _terminate_session("shutdown")
 
     if _orchestrator_client:
         try:
@@ -876,37 +902,61 @@ async def _attach_session(
     # Mark thread as active
     await _update_thread_status("active")
 
+    # Initialize headless loop primitives. These survive WS reconnect so that
+    # the loop can keep reading input / responding to interrupts across
+    # transport churn. Cleared in _terminate_session.
+    global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    _loop_user_queue = asyncio.Queue()
+    _loop_interrupt_flag = False
+    _loop_last_user_content = [""]
+
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
-    # out-of-band thread.status='ended'. Cancelled by _detach_session.
+    # out-of-band thread.status='ended'. Cancelled by _terminate_session.
     _start_watchdogs()
 
     logger.info(f"Session attached: thread={_thread_id}")
 
 
-async def _detach_session() -> None:
+async def _terminate_session(reason: str) -> None:
     """Tear down the current session and return to idle.
 
-    1. Cancel in-flight persistent-loop task (prevents permission_check race)
-    2. Mark thread as ended (still resumable)
-    3. Git commit + push
-    4. Clean up session resources
-    5. Clear session globals
-    6. Increment session counter, exit if max reached
+    Called by:
+      - WS-handler finally block? NO — under headless semantics WS close only
+        unsubscribes; the loop survives. WS close never calls this.
+      - Out-of-band lifecycle: drain intent, boot-WS timeout, thread-status
+        watchdog, REST /session/detach, process shutdown, MAX_SESSIONS sweep.
+      - The persistent loop's own completion handler (idle timeout, crash,
+        clean /done exit) routes here via _loop_completion_handler.
+
+    Steps:
+      1. Cancel in-flight persistent-loop task (prevents permission_check race
+         that the commit 3a1d265 race-fix protects against).
+      2. Mark thread as ended (still resumable — `ended` is the only inactive
+         state).
+      3. Git commit + push.
+      4. Clean up session resources.
+      5. Clear session globals AND headless input primitives + subscribers.
+      6. Increment session counter, exit if max reached.
+
+    `reason` is logged and stored for observability — e.g. "drain",
+    "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
+    "thread_ended_oob", "boot_ws_timeout", "legacy".
     """
     global _session, _thread_id, _sessions_served, _loop_task
+    global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
 
     if not _session:
         return
 
     thread_id = _thread_id
-    logger.info(f"Detaching session: thread={thread_id}")
+    logger.info(f"Terminating session: thread={thread_id} reason={reason}")
 
     # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
     # drain, thread-status watchdog) reach this without going through the
-    # ws_chat finally block that normally cancels the loop, so without this
-    # the loop's next _session.permission_mode access AttributeErrors when we
-    # null _session below. Skipped when invoked from inside the loop itself
-    # (would deadlock awaiting self).
+    # loop's normal exit path, so without this the loop's next
+    # _session.permission_mode access AttributeErrors when we null _session
+    # below. Skipped when invoked from inside the loop itself (e.g. via
+    # _loop_completion_handler's cleanup, which would deadlock awaiting self).
     loop_task = _loop_task
     if loop_task is not None and loop_task is not asyncio.current_task():
         if not loop_task.done():
@@ -915,6 +965,7 @@ async def _detach_session() -> None:
                 await loop_task
             except (asyncio.CancelledError, Exception):
                 pass
+    _loop_task = None
 
     # Cancel self-cleanup watchdogs first — we're about to do the cleanup
     # they would have triggered, no point letting them race the detach.
@@ -950,6 +1001,15 @@ async def _detach_session() -> None:
     _session = None
     _thread_id = None
 
+    # Clear headless input primitives + subscriber registry. The pump tasks
+    # owned by each subscriber are cancelled by their ws_chat finally blocks
+    # when those handlers notice the WS close; dropping the registry here
+    # ensures stale entries don't accumulate across sessions.
+    _loop_user_queue = None
+    _loop_interrupt_flag = False
+    _loop_last_user_content = [""]
+    _subscribers.clear()
+
     # Safety valve: restart after N sessions to guard against state leakage
     _sessions_served += 1
     if _max_sessions_per_process > 0 and _sessions_served >= _max_sessions_per_process:
@@ -962,8 +1022,20 @@ async def _detach_session() -> None:
         sys.exit(0)
 
     logger.info(
-        f"Session detached: thread={thread_id} (sessions served: {_sessions_served})"
+        f"Session terminated: thread={thread_id} "
+        f"reason={reason} (sessions served: {_sessions_served})"
     )
+
+
+async def _detach_session() -> None:
+    """Back-compat shim. Prefer _terminate_session(reason) at new call sites.
+
+    Kept so existing tests patching `_detach_session` continue to work and so
+    code paths not yet updated don't break. Logs at DEBUG so each invocation
+    is traceable.
+    """
+    logger.debug("_detach_session() called via back-compat shim")
+    await _terminate_session("legacy")
 
 
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
@@ -1083,7 +1155,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
         thread_id = _thread_id
         try:
-            await _detach_session()
+            await _terminate_session("rest_detach")
             return JSONResponse(
                 {
                     "status": "detached",
@@ -1099,6 +1171,22 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
+        """WebSocket consumer for an already-running persistent session.
+
+        Headless lifecycle (chunk 1):
+          - First WS attach spawns the persistent loop with module-level
+            callbacks. Subsequent attaches just register a subscriber and
+            tap into the existing loop's broadcast stream.
+          - WS close calls _unsubscribe() and cancels this connection's pump
+            task. The loop keeps running. It only stops via
+            _loop_completion_handler (idle timeout, /done, crash) or via
+            out-of-band _terminate_session (drain, watchdog, REST detach).
+          - The pod no longer exits when the WS closes — that was the
+            WS-bound era. _schedule_exit is now driven only by drain intent
+            and shutdown paths.
+        """
+        import uuid
+
         await ws.accept()
 
         # Signal the boot-WS watchdog that a connection arrived. Done before
@@ -1111,9 +1199,18 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             await ws.close(code=4503, reason="Agent not ready")
             return
 
-        logger.info(f"WebSocket connected: thread={_thread_id}")
+        # Register this WS as a subscriber on the broadcast hub.
+        client_id = uuid.uuid4().hex
+        queue = _subscribe(client_id)
+        pump_task = asyncio.create_task(
+            _run_subscriber_pump(ws, client_id, queue),
+            name=f"subscriber-pump-{client_id[:8]}",
+        )
 
-        # Send current session state so the client can sync
+        logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
+
+        # Send current session state so this client can sync. Direct send —
+        # this is the welcome frame, only the connecting client cares.
         await _ws_send(
             ws,
             "session.state",
@@ -1128,270 +1225,61 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             },
         )
 
-        # Queue for user input (bridges WS receive loop → persistent loop)
-        user_queue: asyncio.Queue[str] = asyncio.Queue()
-        interrupt_flag = False
-        # Track last user message for persistence
-        _last_user_content: List[str] = [""]
-
-        def check_interrupt() -> bool:
-            nonlocal interrupt_flag
-            if interrupt_flag:
-                interrupt_flag = False
-                return True
-            return False
-
-        # Compute idle timeout from config
-        idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
-        idle_timeout_seconds = (
-            idle_timeout_minutes * 60 if idle_timeout_minutes > 0 else None
-        )
-
-        async def get_user_input() -> str:
-            await _ws_send(ws, "ready", {})
-            if idle_timeout_seconds:
-                try:
-                    return await asyncio.wait_for(
-                        user_queue.get(), timeout=idle_timeout_seconds
-                    )
-                except asyncio.TimeoutError:
-                    logger.info(
-                        f"Idle timeout ({idle_timeout_minutes}min) "
-                        f"for thread {_thread_id}"
-                    )
-                    await _ws_send(
-                        ws,
-                        "session.idle_timeout",
-                        {
-                            "thread_id": _thread_id,
-                            "message": "Session paused due to inactivity. "
-                            "Your work has been saved.",
-                            "timeout_minutes": idle_timeout_minutes,
-                        },
-                    )
-                    try:
-                        await ws.close(code=4408, reason="Idle timeout")
-                    except Exception:
-                        pass
-                    raise IdleTimeoutError(
-                        f"Idle timeout after {idle_timeout_seconds}s"
-                    )
-            return await user_queue.get()
-
-        async def on_token(token: str) -> None:
-            await _ws_send(ws, "token", {"content": token})
-
-        async def on_thinking(content: str) -> None:
-            await _ws_send(ws, "thinking", {"content": content})
-
-        async def on_tool_start(
-            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
-        ) -> None:
-            meta = TOOL_REGISTRY.get(tool_name, {})
-            await _ws_send(
-                ws,
-                "tool.started",
-                {
-                    "tool": tool_name,
-                    "args": _safe_serialize(tool_args),
-                    "id": tool_call_id,
-                    "category": meta.get("category", ""),
-                },
-            )
-
-        async def on_tool_result(
-            tool_name: str,
-            result: str,
-            tool_call_id: str,
-            is_error: bool = False,
-        ) -> None:
-            # Truncate large results for WS (full result is in message history)
-            display_result = result[:2000] + "..." if len(result) > 2000 else result
-            await _ws_send(
-                ws,
-                "tool.completed",
-                {
-                    "tool": tool_name,
-                    "result": display_result,
-                    "id": tool_call_id,
-                    "is_error": is_error,
-                },
-            )
-
-            # Notify frontend of file checkpoint availability after writes
-            if tool_name in ("write_file", "edit_file"):
-                await _ws_send(
-                    ws,
-                    "file.checkpoint",
-                    {
-                        "turn_id": _session.turn_count,
-                    },
-                )
-
-            # Broadcast task state after task tool calls
-            if (
-                tool_name in ("task_add", "task_complete", "task_list")
-                and _session.session_task_manager
-            ):
-                await _ws_send(
-                    ws,
-                    "tasks.updated",
-                    {
-                        "tasks": _session.session_task_manager.to_dict_list(),
-                    },
-                )
-
-        async def permission_check(
-            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
-        ) -> bool:
-            # Belt-and-suspenders for the detach race: Fix 2 cancels loop_task
-            # before nulling _session, so this should be unreachable. If it is
-            # reached, deny the call — the session is gone, the tool result
-            # has nowhere to land.
-            if _session is None:
-                logger.warning(
-                    "permission_check fired with _session=None for tool %s — "
-                    "denying (session was detached mid-turn)",
-                    tool_name,
-                )
-                return False
-            mode = _session.permission_mode
-
-            if mode == "autonomous":
-                return True
-
-            if mode == "auto_accept":
-                # Auto-accept reads and writes; still ask for shell commands
-                shell_tools = {"run_command", "shell_execute", "shell_read"}
-                if tool_name not in shell_tools:
-                    return True
-
-            # Supervised mode (or shell in auto_accept): ask user
-            await _ws_send(
-                ws,
-                "permission.request",
-                {
-                    "id": tool_call_id,
-                    "tool": tool_name,
-                    "args": _safe_serialize(tool_args),
-                },
-            )
-
-            # Wait for approval (with timeout)
-            try:
-                response = await asyncio.wait_for(user_queue.get(), timeout=300)
-                approved = response == APPROVE_SENTINEL
-            except asyncio.TimeoutError:
-                approved = False
-            if _session is not None:
-                _session.tool_decisions[tool_call_id] = (
-                    "approved" if approved else "denied"
-                )
-            return approved
-
-        async def on_turn_start(turn_id: int) -> None:
-            _session.turn_count = turn_id
-            await _ws_send(ws, "turn.started", {"turn_id": turn_id})
-            # Save user message to DB (bounded await — no messages lost on crash)
-            if _orchestrator_client and _last_user_content[0]:
-                try:
-                    await asyncio.wait_for(
-                        _save_message(
-                            _orchestrator_client,
-                            _thread_id,
-                            "user",
-                            _last_user_content[0],
-                            None,
-                            turn_id,
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("User message save timed out (5s) — proceeding")
-
-        async def on_turn_complete(turn_id: int, metrics: dict | None = None) -> None:
-            await _ws_send(ws, "turn.completed", {"turn_id": turn_id})
-            # Save AI messages from this turn to DB (bounded await)
-            if _orchestrator_client:
-                try:
-                    await asyncio.wait_for(
-                        _save_turn_ai_messages(
-                            _orchestrator_client,
-                            _thread_id,
-                            _session.messages,
-                            turn_id,
-                            metrics=metrics,
-                            tool_decisions=dict(_session.tool_decisions),
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("AI message save timed out (5s) — proceeding")
-            _session.tool_decisions.clear()
-
-            # Auto-generate title after first few turns (fire-and-forget).
-            # Retry on turns 1-3 in case the LLM is transiently unreachable.
-            if turn_id <= 3 and _session.postgres_conn:
-                asyncio.create_task(_auto_title_after_first_turn(ws))
-
-            # Push workspace changes to Nextcloud (fire-and-forget)
-            if _session.workspace_sync:
-                asyncio.create_task(_session.workspace_sync.push())
-
-        async def on_error(message: str) -> None:
-            await _ws_send(ws, "error", {"message": message})
-
-        async def on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
-            """Notify client that sudo was detected and VM upgrade is available."""
-            await _ws_send(
-                ws,
-                "vm_upgrade.needed",
-                {
-                    "reason": freeze_data.get("reason", "sudo detected"),
-                    "command": freeze_data.get("command"),
-                },
-            )
-
-        callbacks = PersistentLoopCallbacks(
-            get_user_input=get_user_input,
-            on_token=on_token,
-            on_thinking=on_thinking,
-            on_tool_start=on_tool_start,
-            on_tool_result=on_tool_result,
-            permission_check=permission_check,
-            on_turn_start=on_turn_start,
-            on_turn_complete=on_turn_complete,
-            on_error=on_error,
-            check_interrupt=check_interrupt,
-            on_vm_upgrade_needed=on_vm_upgrade_needed,
-        )
-
-        # Start persistent loop as background task. Publish on the module
-        # global so _detach_session() can cancel us before nulling _session.
+        # Spawn the persistent loop if it isn't already running. Reconnecting
+        # to a session whose loop is mid-turn just joins the broadcast — no
+        # restart, no replay (replay arrives in chunk 2 via the event log).
         global _loop_task
-        loop_task = asyncio.create_task(
-            run_persistent_loop(
-                llm_with_tools=_session.llm_with_tools,
-                tools=_session.tools,
-                context_manager=_session.context_manager,
-                config=_session.config,
-                system_prompt=_session.system_prompt,
-                callbacks=callbacks,
-                messages=_session.messages,
-                auxiliary_llm=_session.auxiliary_llm,
-                workspace_content=_session.get_workspace_content,
-                recall_store=_session.recall_store,
-                knowledge_store=_session.knowledge_store,
-                project_id=_session.project_id,
-                project_ids=_session.project_ids,
-                tool_context=_session.tool_context,
-                initial_turn_count=_session.turn_count,
-                get_current_tools=lambda: (_session.llm_with_tools, _session.tools),
+        if _loop_task is None or _loop_task.done():
+            callbacks = PersistentLoopCallbacks(
+                get_user_input=_loop_get_user_input,
+                on_token=_loop_on_token,
+                on_thinking=_loop_on_thinking,
+                on_tool_start=_loop_on_tool_start,
+                on_tool_result=_loop_on_tool_result,
+                permission_check=_loop_permission_check,
+                on_turn_start=_loop_on_turn_start,
+                on_turn_complete=_loop_on_turn_complete,
+                on_error=_loop_on_error,
+                check_interrupt=_loop_check_interrupt,
+                on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
             )
-        )
-        _loop_task = loop_task
+            _loop_task = asyncio.create_task(
+                run_persistent_loop(
+                    llm_with_tools=_session.llm_with_tools,
+                    tools=_session.tools,
+                    context_manager=_session.context_manager,
+                    config=_session.config,
+                    system_prompt=_session.system_prompt,
+                    callbacks=callbacks,
+                    messages=_session.messages,
+                    auxiliary_llm=_session.auxiliary_llm,
+                    workspace_content=_session.get_workspace_content,
+                    recall_store=_session.recall_store,
+                    knowledge_store=_session.knowledge_store,
+                    project_id=_session.project_id,
+                    project_ids=_session.project_ids,
+                    tool_context=_session.tool_context,
+                    initial_turn_count=_session.turn_count,
+                    get_current_tools=lambda: (
+                        _session.llm_with_tools,
+                        _session.tools,
+                    ),
+                ),
+                name="persistent-loop",
+            )
+            asyncio.create_task(
+                _loop_completion_handler(_loop_task),
+                name="persistent-loop-completion",
+            )
+            logger.info(f"Persistent loop started: thread={_thread_id}")
+        else:
+            logger.info(
+                f"Persistent loop already running, attached as subscriber "
+                f"client={client_id[:8]}"
+            )
 
         # --- WebSocket receive loop ---
+        global _loop_interrupt_flag
         try:
             while True:
                 raw = await ws.receive_text()
@@ -1405,18 +1293,20 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
                 if method == "message":
                     content = data.get("content", "")
-                    if content:
-                        _last_user_content[0] = content
-                        await user_queue.put(content)
+                    if content and _loop_user_queue is not None:
+                        _loop_last_user_content[0] = content
+                        await _loop_user_queue.put(content)
 
                 elif method == "approve":
-                    await user_queue.put(APPROVE_SENTINEL)
+                    if _loop_user_queue is not None:
+                        await _loop_user_queue.put(APPROVE_SENTINEL)
 
                 elif method == "deny":
-                    await user_queue.put(DENY_SENTINEL)
+                    if _loop_user_queue is not None:
+                        await _loop_user_queue.put(DENY_SENTINEL)
 
                 elif method == "interrupt":
-                    interrupt_flag = True
+                    _loop_interrupt_flag = True
                     await _ws_send(ws, "interrupt.ack", {})
                     logger.info("Interrupt acknowledged")
 
@@ -1443,6 +1333,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 elif method == "narration.set":
                     new_mode = data.get("mode", "auto")
                     if new_mode in ("silent", "verbose", "auto"):
+                        if _session is None:
+                            await _ws_send(
+                                ws,
+                                "error",
+                                {"message": "Session no longer active"},
+                            )
+                            continue
                         _session.narration_mode = new_mode
                         await _ws_send(ws, "narration.changed", {"mode": new_mode})
                         logger.info(f"Narration mode changed to: {new_mode}")
@@ -1472,6 +1369,13 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     asyncio.create_task(_handle_vm_upgrade(ws))
 
                 elif method == "undo":
+                    if _session is None:
+                        await _ws_send(
+                            ws,
+                            "error",
+                            {"message": "Session no longer active"},
+                        )
+                        continue
                     turn_id = data.get("turn_id")
                     restored = _session.undo_turn(turn_id)
                     if restored:
@@ -1496,44 +1400,27 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                     )
 
         except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected: thread={_thread_id}")
+            logger.info(
+                f"WebSocket disconnected: thread={_thread_id} "
+                f"client={client_id[:8]} (loop continues)"
+            )
         except Exception as e:
             logger.exception(f"WebSocket error: {e}")
         finally:
-            # Check if loop exited due to idle timeout
-            idle_timed_out = False
-            if loop_task.done() and not loop_task.cancelled():
+            # Headless keystone: WS close only unsubscribes. The loop keeps
+            # running until _loop_completion_handler routes its natural exit,
+            # or out-of-band _terminate_session intervenes. We do NOT cancel
+            # _loop_task here, and we do NOT schedule pod exit.
+            _unsubscribe(client_id)
+            if not pump_task.done():
+                pump_task.cancel()
                 try:
-                    loop_task.result()
-                except IdleTimeoutError:
-                    idle_timed_out = True
-                except Exception:
-                    pass
-
-            if not loop_task.done():
-                loop_task.cancel()
-                try:
-                    await loop_task
+                    await pump_task
                 except asyncio.CancelledError:
                     pass
-
-            if idle_timed_out:
-                await _handle_idle_archive(ws)
-
-            # Clear loop_task before _detach_session so it doesn't try to
-            # cancel an already-finished task we just awaited.
-            _loop_task = None
-
-            # Always detach session on disconnect (idle timeout or not).
-            # Sets thread status to 'ended' and cleans up session state.
-            await _detach_session()
-
-            logger.info(f"WebSocket session ended: thread={_thread_id}")
-
-            # Exit process so the pod terminates cleanly.
-            # In K8s (restartPolicy: Never) this lets the stale agent
-            # detector mark the agent offline as a safety net.
-            _schedule_exit(delay=2.0)
+            logger.info(
+                f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
+            )
 
     return app
 
@@ -1542,11 +1429,359 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
 
 async def _ws_send(ws: WebSocket, method: str, params: Dict[str, Any]) -> None:
-    """Send a JSON message over WebSocket. Silently drops if connection is closed."""
+    """Send a JSON message over WebSocket. Silently drops if connection is closed.
+
+    Used by WS-handler-direct sends (the receive-loop's acks, the welcome frame,
+    fire-and-forget handler tasks that hold a ws reference). Loop-driven sends
+    use _broadcast() instead, so a closed WS doesn't kill the loop's output.
+    """
     try:
         await ws.send_json({"method": method, "params": params})
     except Exception:
         pass  # Connection already closed
+
+
+def _subscribe(client_id: str) -> asyncio.Queue:
+    """Register a new subscriber and return its outbound queue.
+
+    Each WebSocket connection (and later, each SSE consumer) gets its own
+    bounded queue. _broadcast() enqueues onto every registered queue;
+    _run_subscriber_pump drains one queue into one WS.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
+    _subscribers[client_id] = queue
+    return queue
+
+
+def _unsubscribe(client_id: str) -> None:
+    """Remove a subscriber. Cheap — does not touch the loop or session state.
+
+    This is what WS close calls. The loop keeps running with one fewer audience.
+    """
+    _subscribers.pop(client_id, None)
+
+
+def _broadcast(method: str, params: Dict[str, Any]) -> None:
+    """Enqueue a frame onto every subscriber queue.
+
+    Non-blocking. On a full queue, drops the oldest frame to make room for the
+    new one — token-stream pacing semantics. We'd rather lose an old chunk than
+    block the loop on a stuck consumer.
+    """
+    frame = {"method": method, "params": params}
+    for client_id, queue in list(_subscribers.items()):
+        try:
+            queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            # Drop oldest, retry. If the retry still fails (shouldn't — we just
+            # made room), drop the new frame and move on.
+            try:
+                queue.get_nowait()
+                queue.put_nowait(frame)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                logger.warning(
+                    "Subscriber %s queue overflow — dropping frame %s",
+                    client_id,
+                    method,
+                )
+
+
+async def _run_subscriber_pump(
+    ws: WebSocket, client_id: str, queue: asyncio.Queue
+) -> None:
+    """Drain a subscriber's queue into its WebSocket. Exits on send failure.
+
+    One pump task per connected WebSocket. Cancelled by the ws_chat finally
+    block when the WS closes; the queue is then garbage-collected after
+    _unsubscribe removes the dict entry.
+    """
+    try:
+        while True:
+            frame = await queue.get()
+            try:
+                await ws.send_json(frame)
+            except Exception:
+                # WS is dead — let the receive loop's exception path clean up.
+                return
+    except asyncio.CancelledError:
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Persistent-loop callbacks (module-level under headless semantics).
+#
+# These used to be closures inside ws_chat. They've been hoisted so the loop
+# can outlive any single WebSocket connection: callbacks reference module
+# globals (_session, _loop_user_queue, _loop_interrupt_flag,
+# _loop_last_user_content, _orchestrator_client, _thread_id) and emit via
+# _broadcast() rather than writing to one ws.
+# ---------------------------------------------------------------------------
+
+
+async def _loop_get_user_input() -> str:
+    """Wait for the next user input. Honors session idle timeout.
+
+    On idle timeout, broadcasts session.idle_timeout to every subscriber and
+    raises IdleTimeoutError — the loop unwinds, _loop_completion_handler
+    routes it to _handle_idle_archive() + _terminate_session("idle_timeout").
+    """
+    queue = _loop_user_queue
+    if queue is None:
+        # _attach_session always initializes this. If we hit None here the
+        # session is being torn down — fail loudly so the loop unwinds.
+        raise RuntimeError("_loop_user_queue not initialized — session torn down?")
+
+    _broadcast("ready", {})
+
+    if _session is None:
+        return await queue.get()
+
+    idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
+    if idle_timeout_minutes and idle_timeout_minutes > 0:
+        idle_timeout_seconds = idle_timeout_minutes * 60
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.info(
+                "Idle timeout (%dmin) for thread %s",
+                idle_timeout_minutes,
+                _thread_id,
+            )
+            _broadcast(
+                "session.idle_timeout",
+                {
+                    "thread_id": _thread_id,
+                    "message": (
+                        "Session paused due to inactivity. Your work has been saved."
+                    ),
+                    "timeout_minutes": idle_timeout_minutes,
+                },
+            )
+            raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
+    return await queue.get()
+
+
+def _loop_check_interrupt() -> bool:
+    """One-shot read of the interrupt flag. Resets to False after read."""
+    global _loop_interrupt_flag
+    if _loop_interrupt_flag:
+        _loop_interrupt_flag = False
+        return True
+    return False
+
+
+async def _loop_on_token(token: str) -> None:
+    _broadcast("token", {"content": token})
+
+
+async def _loop_on_thinking(content: str) -> None:
+    _broadcast("thinking", {"content": content})
+
+
+async def _loop_on_tool_start(
+    tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+) -> None:
+    meta = TOOL_REGISTRY.get(tool_name, {})
+    _broadcast(
+        "tool.started",
+        {
+            "tool": tool_name,
+            "args": _safe_serialize(tool_args),
+            "id": tool_call_id,
+            "category": meta.get("category", ""),
+        },
+    )
+
+
+async def _loop_on_tool_result(
+    tool_name: str,
+    result: str,
+    tool_call_id: str,
+    is_error: bool = False,
+) -> None:
+    # Truncate large results for transport (full result is in message history)
+    display_result = result[:2000] + "..." if len(result) > 2000 else result
+    _broadcast(
+        "tool.completed",
+        {
+            "tool": tool_name,
+            "result": display_result,
+            "id": tool_call_id,
+            "is_error": is_error,
+        },
+    )
+
+    # Notify frontend of file checkpoint availability after writes
+    if tool_name in ("write_file", "edit_file") and _session is not None:
+        _broadcast(
+            "file.checkpoint",
+            {"turn_id": _session.turn_count},
+        )
+
+    # Broadcast task state after task tool calls
+    if (
+        tool_name in ("task_add", "task_complete", "task_list")
+        and _session is not None
+        and _session.session_task_manager
+    ):
+        _broadcast(
+            "tasks.updated",
+            {"tasks": _session.session_task_manager.to_dict_list()},
+        )
+
+
+async def _loop_permission_check(
+    tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+) -> bool:
+    """Check whether a tool call is approved. Waits on _loop_user_queue."""
+    # Belt-and-suspenders for the detach race: _terminate_session cancels
+    # _loop_task before nulling _session, so this should be unreachable.
+    # If it is reached, deny the call — the session is gone.
+    if _session is None:
+        logger.warning(
+            "permission_check fired with _session=None for tool %s — denying",
+            tool_name,
+        )
+        return False
+    mode = _session.permission_mode
+
+    if mode == "autonomous":
+        return True
+
+    if mode == "auto_accept":
+        # Auto-accept reads and writes; still ask for shell commands
+        shell_tools = {"run_command", "shell_execute", "shell_read"}
+        if tool_name not in shell_tools:
+            return True
+
+    # Supervised mode (or shell in auto_accept): ask user
+    _broadcast(
+        "permission.request",
+        {
+            "id": tool_call_id,
+            "tool": tool_name,
+            "args": _safe_serialize(tool_args),
+        },
+    )
+
+    queue = _loop_user_queue
+    if queue is None:
+        return False
+
+    # Wait for approval (with timeout). Under headless semantics this can
+    # legitimately wait for the user to come back from email — the 300s cap
+    # matches today's behavior; later phases extend this via magic-link.
+    try:
+        response = await asyncio.wait_for(queue.get(), timeout=300)
+        approved = response == APPROVE_SENTINEL
+    except asyncio.TimeoutError:
+        approved = False
+    if _session is not None:
+        _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
+    return approved
+
+
+async def _loop_on_turn_start(turn_id: int) -> None:
+    if _session is None:
+        return
+    _session.turn_count = turn_id
+    _broadcast("turn.started", {"turn_id": turn_id})
+    # Save user message to DB (bounded await — no messages lost on crash)
+    if _orchestrator_client and _loop_last_user_content[0]:
+        try:
+            await asyncio.wait_for(
+                _save_message(
+                    _orchestrator_client,
+                    _thread_id,
+                    "user",
+                    _loop_last_user_content[0],
+                    None,
+                    turn_id,
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("User message save timed out (5s) — proceeding")
+
+
+async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
+    if _session is None:
+        return
+    _broadcast("turn.completed", {"turn_id": turn_id})
+    # Save AI messages from this turn to DB (bounded await)
+    if _orchestrator_client:
+        try:
+            await asyncio.wait_for(
+                _save_turn_ai_messages(
+                    _orchestrator_client,
+                    _thread_id,
+                    _session.messages,
+                    turn_id,
+                    metrics=metrics,
+                    tool_decisions=dict(_session.tool_decisions),
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("AI message save timed out (5s) — proceeding")
+    _session.tool_decisions.clear()
+
+    # Auto-generate title after first few turns (fire-and-forget).
+    # Retry on turns 1-3 in case the LLM is transiently unreachable.
+    if turn_id <= 3 and _session.postgres_conn:
+        asyncio.create_task(_auto_title_after_first_turn())
+
+    # Push workspace changes to Nextcloud (fire-and-forget)
+    if _session.workspace_sync:
+        asyncio.create_task(_session.workspace_sync.push())
+
+
+async def _loop_on_error(message: str) -> None:
+    _broadcast("error", {"message": message})
+
+
+async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
+    """Notify subscribers that sudo was detected and VM upgrade is available."""
+    _broadcast(
+        "vm_upgrade.needed",
+        {
+            "reason": freeze_data.get("reason", "sudo detected"),
+            "command": freeze_data.get("command"),
+        },
+    )
+
+
+async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
+    """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
+
+    Under headless semantics the WS handler no longer cleans up after the loop
+    in its finally block — the loop outlives the WS. So we attach this
+    completion handler when the loop is spawned, and it routes the exit path:
+
+    - IdleTimeoutError → archive + terminate as "idle_timeout"
+    - Other exceptions → terminate as "loop_crash"
+    - Clean exit → terminate as "loop_complete"
+    - CancelledError → already inside _terminate_session, do nothing
+    """
+    try:
+        await loop_task
+    except IdleTimeoutError:
+        logger.info("Persistent loop exited via idle timeout")
+        try:
+            await _handle_idle_archive()
+        except Exception as e:
+            logger.warning(f"Idle archive failed: {e}")
+        await _terminate_session("idle_timeout")
+    except asyncio.CancelledError:
+        # Cancellation came from _terminate_session itself — don't re-enter.
+        # Re-raise so the wrapper task surfaces as cancelled.
+        raise
+    except Exception as e:
+        logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
+        await _terminate_session("loop_crash")
+    else:
+        logger.info("Persistent loop completed cleanly")
+        await _terminate_session("loop_complete")
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -2062,17 +2297,21 @@ async def _update_thread_status(status: str) -> None:
             logger.warning(f"Failed to update thread status to {status}: {e}")
 
 
-async def _handle_idle_archive(ws: WebSocket) -> None:
-    """Handle idle timeout — archive session state, set thread to ended."""
+async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
+    """Handle idle timeout — archive session state, set thread to ended.
+
+    `ws` is optional under headless semantics — when called from the loop's
+    completion handler there's no single WS in scope; we broadcast to every
+    subscriber instead. The argument is kept for back-compat with any callers
+    still holding a ws reference; the broadcast reaches them too.
+    """
     try:
         if not _session:
             return
 
-        # 0. Tell any still-connected client that the session is ending so the
-        # UI can flip to the resume card without waiting for a refresh.
-        await _ws_send(
-            ws, "session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"}
-        )
+        # 0. Tell every still-connected client that the session is ending so
+        # the UI can flip to the resume card without waiting for a refresh.
+        _broadcast("session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"})
 
         # 1. Extract memories
         recall_store = (
@@ -2373,8 +2612,12 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         return None
 
 
-async def _auto_title_after_first_turn(ws: WebSocket) -> None:
-    """Generate and push a title after the first assistant turn (fire-and-forget)."""
+async def _auto_title_after_first_turn() -> None:
+    """Generate and push a title after the first assistant turn (fire-and-forget).
+
+    Loop-driven (fired from _loop_on_turn_complete), broadcasts to every
+    subscriber so each attached client sees the new title.
+    """
     try:
         if not _session or not _session.postgres_conn or not _thread_id:
             return
@@ -2396,7 +2639,7 @@ async def _auto_title_after_first_turn(ws: WebSocket) -> None:
                 _thread_id,
                 title,
             )
-        await _ws_send(ws, "title.updated", {"title": title})
+        _broadcast("title.updated", {"title": title})
         logger.info(f"Auto-titled thread {_thread_id}: {title}")
     except Exception as e:
         logger.warning(f"Auto-title generation failed (non-fatal): {e}")
