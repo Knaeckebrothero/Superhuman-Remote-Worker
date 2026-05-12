@@ -11042,22 +11042,80 @@ async def thread_approve(
     body: ThreadApproveRequest,
     request: Request,
 ) -> dict[str, Any]:
-    """Resolve a pending permission gate (sudo or tool-permission). The
-    approval_id is forwarded for the agent to validate against its current
-    in-flight request."""
+    """Resolve a pending permission gate by updating thread_permission_requests
+    directly. The DB trigger fires NOTIFY → the agent's LISTEN wakes its
+    permission_check. No agent forwarding hop — this endpoint is the
+    canonical resolution path for magic-link approvals and MCP clients
+    alike. The cockpit WS approve method does the same UPDATE inside the
+    agent for back-compat.
+
+    Returns:
+        200 — request resolved (status flipped)
+        400 — invalid decision
+        403 — not thread owner
+        404 — approval_id not found, or wrong thread, or no pending request
+        409 — request already decided (idempotent re-clicks land here)
+    """
     user = await require_approved_user(request, postgres_db)
-    _, agent = await _resolve_thread_for_forwarding(thread_id, user)
-    if body.decision not in ("approve", "deny"):
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    if body.decision == "approve":
+        new_status = "approved"
+    elif body.decision == "deny":
+        new_status = "denied"
+    else:
         raise HTTPException(
             status_code=400,
             detail="decision must be 'approve' or 'deny'",
         )
-    result = await _forward_to_agent(
-        agent,
-        "/api/approve",
-        {"decision": body.decision, "approval_id": approval_id},
-    )
-    return {"accepted": True, "decision": body.decision, "agent": result}
+
+    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
+
+    async with postgres_db.acquire() as conn:
+        # Lookup-then-update so we can distinguish 404 (wrong id/thread)
+        # from 409 (already decided).
+        existing = await conn.fetchrow(
+            "SELECT id, status, tool_call_id FROM thread_permission_requests "
+            "WHERE id = $1 AND thread_id = $2",
+            approval_id,
+            thread_id,
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Permission request not found for this thread",
+            )
+        if existing["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Already {existing['status']}",
+            )
+        row = await conn.fetchrow(
+            "UPDATE thread_permission_requests "
+            "SET status = $2, decided_at = now(), decided_by = $3 "
+            "WHERE id = $1 AND status = 'pending' "
+            "RETURNING id, status, tool_call_id",
+            approval_id,
+            new_status,
+            decided_by,
+        )
+    if row is None:
+        # Lost the race — somebody else just decided this. Idempotency.
+        raise HTTPException(
+            status_code=409,
+            detail="Already decided (race lost)",
+        )
+    return {
+        "accepted": True,
+        "decision": body.decision,
+        "approval_id": str(row["id"]),
+        "status": row["status"],
+        "tool_call_id": row["tool_call_id"],
+    }
 
 
 async def thread_events_prune_sweeper(
