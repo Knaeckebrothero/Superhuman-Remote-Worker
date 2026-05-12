@@ -164,8 +164,7 @@ class TestPhaseOverrideCredentialInjection:
         result = await main._inject_dispatch_credentials(_job(), override)
 
         assert (
-            result["llm"]["tactical"]["base_url"]
-            == "https://caller-pinned.example/v1"
+            result["llm"]["tactical"]["base_url"] == "https://caller-pinned.example/v1"
         )
         # The guard skips injection entirely when base_url is already set,
         # so api_key from the endpoint is NOT injected either — matching

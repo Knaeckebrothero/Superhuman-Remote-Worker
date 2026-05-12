@@ -238,7 +238,9 @@ def _classify_llm_error(error: Exception) -> str:
         current = nxt if nxt is not current else None
 
     error_str = str(error).lower()
-    if "model" in error_str and ("not found" in error_str or "does not exist" in error_str):
+    if "model" in error_str and (
+        "not found" in error_str or "does not exist" in error_str
+    ):
         return "permanent"
     if "404" in error_str and "model" in error_str:
         return "permanent"
