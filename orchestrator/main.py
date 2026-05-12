@@ -17,6 +17,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+import urllib.parse
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import find_dotenv, load_dotenv
@@ -79,7 +80,12 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
+from fastapi.responses import (  # noqa: E402
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 
 from pydantic import BaseModel, Field  # noqa: E402
 
@@ -165,6 +171,7 @@ from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
 from services.email import email_service  # noqa: E402
+from services import headless_notifications  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
 from services.notification_service import notification_service  # noqa: E402
 import httpx  # noqa: E402
@@ -3164,6 +3171,9 @@ async def lifespan(app: FastAPI):
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
     )
+    headless_notify_task = asyncio.create_task(
+        thread_permission_notify_sweeper(_shutdown_event)
+    )
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
@@ -3232,6 +3242,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     await sudo_sweeper_task
     await thread_events_prune_task
+    await headless_notify_task
     await ide_sweeper_task
     await ws_sweeper_task
     await gc_sweeper_task
@@ -11168,6 +11179,319 @@ async def thread_events_prune_sweeper(
         except asyncio.TimeoutError:
             pass
     logger.info("Thread-events prune sweeper stopped")
+
+
+# =============================================================================
+# Headless persistent sessions — Phase 4 magic-link routes + watcher
+# =============================================================================
+#
+# Email magic-links land at /magic/approve/{token}. GET renders a
+# confirmation page (read-only, prefetch-safe). POST consumes the token
+# and UPDATEs thread_permission_requests via the same trigger path as
+# the cockpit WS approve handler.
+#
+# Background watcher (thread_permission_notify_sweeper) detects pending
+# requests older than 30s with no notification on record and dispatches
+# the email via services.headless_notifications.
+
+
+def _magic_link_confirmation_page(
+    *,
+    tool_name: str,
+    tool_args_preview: str,
+    intended_decision: Optional[str],
+    token: str,
+) -> str:
+    """Render the GET landing page. Single button POSTs back to the same
+    URL with the actual decision; this is what prevents email-link
+    prefetchers (Outlook Safe Links, Gmail) from auto-consuming tokens.
+    """
+    safe_args = (
+        tool_args_preview.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    safe_tool = tool_name.replace("&", "&amp;").replace("<", "&lt;")
+    if intended_decision == "approved":
+        button_label = "Confirm: Approve"
+        button_color = "#a6e3a1"
+    elif intended_decision == "denied":
+        button_label = "Confirm: Deny"
+        button_color = "#f38ba8"
+    else:
+        button_label = "Confirm decision"
+        button_color = "#cba6f7"
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
+    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
+      <h2 style="margin: 0; color: #cba6f7; font-size: 16px;">Confirm tool decision</h2>
+    </div>
+    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
+      <p>The agent wants to call <code style="background: #181825; padding: 2px 6px; border-radius: 4px;">{safe_tool}</code> with these arguments:</p>
+      <pre style="background: #181825; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #a6e3a1;">{safe_args}</pre>
+    </div>
+    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
+      <form method="POST" action="/magic/approve/{urllib.parse.quote(token, safe="")}" style="display: inline;">
+        <button type="submit" style="background: {button_color}; color: #1e1e2e; padding: 10px 28px; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
+      </form>
+      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">This link is single-use and expires in 30 minutes.</p>
+    </div>
+  </div>
+</body></html>"""
+
+
+def _magic_link_result_page(
+    *,
+    title: str,
+    body: str,
+    cockpit_url: str,
+    is_error: bool = False,
+) -> str:
+    accent = "#f38ba8" if is_error else "#a6e3a1"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SRW — {title}</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
+    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
+      <h2 style="margin: 0; color: {accent}; font-size: 16px;">{title}</h2>
+    </div>
+    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
+      <p>{body}</p>
+      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: #cba6f7;">Open the cockpit</a></p>
+    </div>
+  </div>
+</body></html>"""
+
+
+@app.get("/magic/approve/{token}")
+async def magic_link_get(token: str) -> HTMLResponse:
+    """Show a confirmation page for the magic-link token.
+
+    Does NOT consume the token (POST does). This separation is critical:
+    email link previewers (Outlook Safe Links, Gmail) auto-fetch URLs
+    server-side; a GET-executes link would be consumed by a bot before
+    the human ever clicks.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This approval link is no longer valid. It may have "
+                    "expired, been used already, or been invalidated by a "
+                    "newer approval. Open the cockpit to see the current "
+                    "state."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    # Fetch tool details for the confirmation page.
+    async with postgres_db.acquire() as conn:
+        permission_row = await conn.fetchrow(
+            "SELECT id, tool_name, tool_args, status "
+            "FROM thread_permission_requests WHERE id = $1",
+            row["approval_id"],
+        )
+
+    if permission_row is None or permission_row["status"] != "pending":
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request has already been resolved. No "
+                    "further action is needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    tool_args = permission_row["tool_args"]
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except Exception:
+            tool_args = {}
+    elif tool_args is None:
+        tool_args = {}
+    args_preview = json.dumps(tool_args, indent=2, default=str)
+    if len(args_preview) > 600:
+        args_preview = args_preview[:600] + "\n… (truncated)"
+
+    page = _magic_link_confirmation_page(
+        tool_name=permission_row["tool_name"],
+        tool_args_preview=args_preview,
+        intended_decision=row.get("intended_decision"),
+        token=token,
+    )
+    return HTMLResponse(page)
+
+
+@app.post("/magic/approve/{token}")
+async def magic_link_post(token: str) -> HTMLResponse:
+    """Consume the token and resolve the permission request.
+
+    CAS UPDATE on magic_link_tokens (single-use) + a second UPDATE on
+    thread_permission_requests (which the agent's LISTEN picks up via
+    the existing trigger). Distinguishes 404 (invalid) from 409 (token
+    already used or request already decided) for clean UX on double-clicks.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This approval link is no longer valid. It may have "
+                    "expired or been used already."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    decision = row.get("intended_decision") or "approved"
+
+    consumed = await headless_notifications.consume_magic_link(
+        postgres_db, str(row["id"]), decision
+    )
+    if consumed is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already used",
+                body=(
+                    "This link has already been used. The agent's request "
+                    "is being processed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    # Resolve the permission request. CAS-style UPDATE so we don't race
+    # with the cockpit having already decided it.
+    decided_by_label = "magic_link"
+    if consumed.get("user_id"):
+        decided_by_label = f"user:{consumed['user_id']}"
+    async with postgres_db.acquire() as conn:
+        permission_row = await conn.fetchrow(
+            "UPDATE thread_permission_requests "
+            "SET status = $2, decided_at = now(), decided_by = $3 "
+            "WHERE id = $1 AND status = 'pending' "
+            "RETURNING id, status, tool_call_id, tool_name",
+            consumed["approval_id"],
+            decision,
+            decided_by_label,
+        )
+
+    if permission_row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request was already resolved by another "
+                    "approval path (cockpit click, REST, or expired). "
+                    "Your action was not needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    pretty = "approved" if decision == "approved" else "denied"
+    return HTMLResponse(
+        _magic_link_result_page(
+            title=f"Tool {pretty}",
+            body=(
+                f"The agent's request to call "
+                f"<code>{permission_row['tool_name']}</code> has been "
+                f"{pretty}. The agent will resume shortly."
+            ),
+            cockpit_url=cockpit_external_url,
+        )
+    )
+
+
+async def thread_permission_notify_sweeper(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Background task: scan for permission requests waiting >N seconds and
+    dispatch the magic-link email if not yet notified.
+
+    Runs every HEADLESS_NOTIFY_INTERVAL_S (default 30s). Idempotent: the
+    send function dedup-skips rows already in thread_notifications.
+
+    Best-effort. Survives transient errors by logging and continuing.
+    """
+    interval_s = int(os.environ.get("HEADLESS_NOTIFY_INTERVAL_S", "30"))
+    age_threshold_s = int(os.environ.get("HEADLESS_NOTIFY_AGE_S", "30"))
+    logger.info(
+        "Headless permission-notify sweeper started (interval=%ds, age_threshold=%ds)",
+        interval_s,
+        age_threshold_s,
+    )
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    while not shutdown_event.is_set():
+        try:
+            async with postgres_db.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT id, thread_id "
+                    "FROM thread_permission_requests "
+                    "WHERE status = 'pending' "
+                    "  AND requested_at < now() - "
+                    "      ($1 || ' seconds')::interval "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_notifications tn "
+                    "    WHERE tn.request_id = thread_permission_requests.id "
+                    "      AND tn.kind = 'permission_pending' "
+                    "      AND tn.delivery_status IN ('sent', 'failed')"
+                    "  ) "
+                    "ORDER BY requested_at ASC "
+                    "LIMIT 50",
+                    str(age_threshold_s),
+                )
+            for row in rows:
+                try:
+                    result = await headless_notifications.send_permission_pending_email(
+                        postgres_db,
+                        email_service,
+                        thread_id=str(row["thread_id"]),
+                        approval_id=str(row["id"]),
+                        cockpit_external_url=cockpit_external_url,
+                    )
+                    if result.get("status") == "sent":
+                        logger.info(
+                            "Sent permission-pending email (thread=%s req=%s)",
+                            str(row["thread_id"])[:8],
+                            str(row["id"])[:8],
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Permission-pending email failed (req=%s): %s",
+                        str(row["id"])[:8],
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("headless permission-notify sweep error: %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Headless permission-notify sweeper stopped")
 
 
 @app.get("/api/persistent/threads/{thread_id}/ide")
