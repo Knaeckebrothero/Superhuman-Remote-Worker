@@ -23,8 +23,6 @@ from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..agent import UniversalAgent
 from ..persistent_graph import (
-    APPROVE_SENTINEL,
-    DENY_SENTINEL,
     IdleTimeoutError,
     PersistentLoopCallbacks,
     run_persistent_loop,
@@ -1293,26 +1291,50 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.post("/api/approve")
     async def api_approve(request: Request):
-        """Resolve a pending permission gate. Body: {decision: approve|deny,
-        approval_id?}. approval_id is verified by the orchestrator before
-        forwarding; we just push the sentinel onto the queue here."""
-        if _session is None or _loop_user_queue is None:
+        """Resolve a pending permission gate by UPDATEing the
+        thread_permission_requests row. Body: {decision: approve|deny,
+        approval_id?}. If approval_id is omitted, the most-recent-pending
+        row for this thread is resolved (legacy single-pending-at-a-time
+        contract). The DB trigger emits NOTIFY → agent's permission_check
+        wakes up."""
+        if _session is None:
             return JSONResponse({"error": "Session not active"}, status_code=503)
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        decision = body.get("decision")
-        if decision == "approve":
-            await _loop_user_queue.put(APPROVE_SENTINEL)
-        elif decision == "deny":
-            await _loop_user_queue.put(DENY_SENTINEL)
+        decision_raw = body.get("decision")
+        if decision_raw == "approve":
+            decision = "approved"
+        elif decision_raw == "deny":
+            decision = "denied"
         else:
             return JSONResponse(
                 {"error": "decision must be 'approve' or 'deny'"},
                 status_code=400,
             )
-        return JSONResponse({"accepted": True, "decision": decision})
+        approval_id = body.get("approval_id")
+        resolved = await _resolve_pending_permission(
+            decision,
+            approval_id=approval_id,
+            decided_by="rest_client",
+        )
+        if resolved is None:
+            return JSONResponse(
+                {
+                    "error": "No matching pending request",
+                    "approval_id": approval_id,
+                },
+                status_code=404,
+            )
+        return JSONResponse(
+            {
+                "accepted": True,
+                "decision": decision_raw,
+                "approval_id": str(resolved["id"]),
+                "tool_call_id": resolved["tool_call_id"],
+            }
+        )
 
     # --- WebSocket endpoint ---
 
@@ -1445,12 +1467,30 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                         await _loop_user_queue.put(content)
 
                 elif method == "approve":
-                    if _loop_user_queue is not None:
-                        await _loop_user_queue.put(APPROVE_SENTINEL)
+                    # Phase 3: resolve the most-recent-pending permission
+                    # request in the DB. Cockpit can pass an explicit
+                    # approval_id to disambiguate when multiple are
+                    # pending (rare — agent's loop serializes most flows).
+                    approval_id = data.get("approval_id")
+                    asyncio.create_task(
+                        _resolve_pending_permission(
+                            "approved",
+                            approval_id=approval_id,
+                            decided_by="ws_client",
+                        ),
+                        name="resolve-approve",
+                    )
 
                 elif method == "deny":
-                    if _loop_user_queue is not None:
-                        await _loop_user_queue.put(DENY_SENTINEL)
+                    approval_id = data.get("approval_id")
+                    asyncio.create_task(
+                        _resolve_pending_permission(
+                            "denied",
+                            approval_id=approval_id,
+                            decided_by="ws_client",
+                        ),
+                        name="resolve-deny",
+                    )
 
                 elif method == "interrupt":
                     # Mode picked from current _tool_inflight: graceful when
@@ -1865,54 +1905,215 @@ async def _loop_on_tool_result(
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: DB-backed permission gates (LISTEN/NOTIFY on thread_permission_requests)
+# ---------------------------------------------------------------------------
+#
+# The agent INSERTs a pending row when permission_check fires, then waits for
+# UPDATE → trigger → NOTIFY. Approval can arrive from any path (WS-attached
+# cockpit, REST POST from MCP/cockpit, future email magic-link) — all converge
+# on the same UPDATE statement. The agent never blocks on an in-memory queue
+# anymore; the queue path is still in place for non-permission user input.
+#
+# Channel: thread_permission_updates (global). Payload carries the request id;
+# the listener filters by it to match its own pending wait.
+
+_PERMISSION_TIMEOUT_S: float = 300.0
+_PERMISSION_NOTIFY_CHANNEL: str = "thread_permission_updates"
+
+
+async def _insert_permission_request(
+    tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
+) -> Optional[str]:
+    """INSERT a pending row and return its UUID. None on failure."""
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return None
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            row_id = await conn.fetchval(
+                "INSERT INTO thread_permission_requests "
+                "(thread_id, tool_call_id, tool_name, tool_args) "
+                "VALUES ($1, $2, $3, $4::jsonb) "
+                "RETURNING id",
+                _thread_id,
+                tool_call_id,
+                tool_name,
+                json.dumps(_safe_serialize(tool_args)),
+            )
+        return str(row_id) if row_id is not None else None
+    except Exception as e:
+        logger.warning(
+            "thread_permission_requests INSERT failed (tool=%s): %s",
+            tool_name,
+            e,
+        )
+        return None
+
+
+async def _wait_for_permission_resolution(
+    request_id: str, timeout: float = _PERMISSION_TIMEOUT_S
+) -> str:
+    """Block until the row's status flips from pending. Returns the final
+    status string ('approved'/'denied'/'expired'). On any failure, returns
+    'denied' as the conservative default.
+
+    Uses asyncpg's connection-scoped add_listener on the global NOTIFY
+    channel; filters by row id. After registering the listener, re-SELECTs
+    the row's status to close the race window between INSERT and listen
+    setup. On timeout, atomically marks the row 'expired' (only if it's
+    still 'pending') before reading the canonical final status back.
+    """
+    if _session is None or _session.postgres_conn is None:
+        return "denied"
+
+    resolved = asyncio.Event()
+
+    def _on_notify(_conn, _pid, _channel, payload):
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return
+        if str(data.get("id")) == request_id:
+            resolved.set()
+
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            await conn.add_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
+            try:
+                # Race-safe: an UPDATE between INSERT and add_listener
+                # would have fired NOTIFY into the void; check the row's
+                # current status before settling in to wait.
+                current = await conn.fetchval(
+                    "SELECT status FROM thread_permission_requests WHERE id = $1",
+                    request_id,
+                )
+                if current in ("approved", "denied", "expired"):
+                    return str(current)
+
+                try:
+                    await asyncio.wait_for(resolved.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # CAS-style expire: only if nobody beat us to it.
+                    await conn.execute(
+                        "UPDATE thread_permission_requests "
+                        "SET status = 'expired', decided_at = now(), "
+                        "    decided_by = 'system' "
+                        "WHERE id = $1 AND status = 'pending'",
+                        request_id,
+                    )
+
+                final = await conn.fetchval(
+                    "SELECT status FROM thread_permission_requests WHERE id = $1",
+                    request_id,
+                )
+                return str(final) if final is not None else "denied"
+            finally:
+                try:
+                    await conn.remove_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("Permission resolution wait failed (id=%s): %s", request_id, e)
+        return "denied"
+
+
+async def _resolve_pending_permission(
+    decision: str,
+    approval_id: Optional[str] = None,
+    decided_by: str = "ws_client",
+) -> Optional[Dict[str, Any]]:
+    """UPDATE a pending permission row by id, or the most-recent-pending if
+    no id given. Returns the resolved row dict or None if not found / no
+    pending request matched."""
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return None
+    if decision not in ("approved", "denied"):
+        return None
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            if approval_id is not None:
+                row = await conn.fetchrow(
+                    "UPDATE thread_permission_requests "
+                    "SET status = $2, decided_at = now(), decided_by = $3 "
+                    "WHERE id = $1 AND status = 'pending' "
+                    "RETURNING id, status, tool_call_id, thread_id",
+                    approval_id,
+                    decision,
+                    decided_by,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE thread_permission_requests "
+                    "SET status = $2, decided_at = now(), decided_by = $3 "
+                    "WHERE id = ("
+                    "  SELECT id FROM thread_permission_requests "
+                    "  WHERE thread_id = $1 AND status = 'pending' "
+                    "  ORDER BY requested_at DESC LIMIT 1"
+                    ") "
+                    "RETURNING id, status, tool_call_id, thread_id",
+                    _thread_id,
+                    decision,
+                    decided_by,
+                )
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning("Resolve pending permission failed: %s", e)
+        return None
+
+
 async def _loop_permission_check(
     tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
 ) -> bool:
-    """Check whether a tool call is approved. Waits on _loop_user_queue."""
-    # Belt-and-suspenders for the detach race: _terminate_session cancels
-    # _loop_task before nulling _session, so this should be unreachable.
-    # If it is reached, deny the call — the session is gone.
+    """Check whether a tool call is approved. INSERTs a pending row, waits
+    for the DB to flip via LISTEN/NOTIFY, returns True iff approved.
+
+    The race-fix from commit 3a1d265: if _terminate_session nulled _session
+    while permission_check was being scheduled, this returns False — the
+    session is gone, the tool result has nowhere to land.
+    """
     if _session is None:
         logger.warning(
             "permission_check fired with _session=None for tool %s — denying",
             tool_name,
         )
         return False
+
     mode = _session.permission_mode
 
     if mode == "autonomous":
         return True
 
     if mode == "auto_accept":
-        # Auto-accept reads and writes; still ask for shell commands
+        # Auto-accept reads and writes; still ask for shell commands.
         shell_tools = {"run_command", "shell_execute", "shell_read"}
         if tool_name not in shell_tools:
             return True
 
-    # Supervised mode (or shell in auto_accept): ask user
+    # Supervised mode (or shell under auto_accept): ask user via the
+    # durable permission table, then wait on LISTEN/NOTIFY.
+    request_id = await _insert_permission_request(tool_call_id, tool_name, tool_args)
+    if request_id is None:
+        # DB unavailable — conservative deny rather than risk silent
+        # auto-approval. Logged at WARNING by the insert helper.
+        if _session is not None:
+            _session.tool_decisions[tool_call_id] = "denied"
+        return False
+
+    # Broadcast carries both ids so clients can refer back via either.
     _broadcast(
         "permission.request",
         {
             "id": tool_call_id,
+            "approval_id": request_id,
             "tool": tool_name,
             "args": _safe_serialize(tool_args),
         },
     )
 
-    queue = _loop_user_queue
-    if queue is None:
-        return False
-
-    # Wait for approval (with timeout). Under headless semantics this can
-    # legitimately wait for the user to come back from email — the 300s cap
-    # matches today's behavior; later phases extend this via magic-link.
-    try:
-        response = await asyncio.wait_for(queue.get(), timeout=300)
-        approved = response == APPROVE_SENTINEL
-    except asyncio.TimeoutError:
-        approved = False
+    final_status = await _wait_for_permission_resolution(request_id)
+    approved = final_status == "approved"
     if _session is not None:
-        _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
+        _session.tool_decisions[tool_call_id] = final_status
     return approved
 
 
