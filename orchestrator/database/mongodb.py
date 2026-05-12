@@ -62,6 +62,63 @@ FILTER_MAPPINGS: Dict[str, List[str]] = {
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 
 
+# Index declarations consumed by both the runtime `MongoDB.ensure_indexes()`
+# helper (idempotent assert on every orchestrator startup) and the one-shot
+# `init.py` CLI. Single source of truth: amend here, both paths pick it up.
+#
+# Why runtime ensure exists: the 2026-05-12 outage was rooted in six of seven
+# `agent_audit` indexes never having been created on the live DB because no
+# part of the deploy flow actually invoked `init.py`. Per-job COLLSCANs on a
+# 117K-row collection then turned a single retrying job into a cluster-wide
+# MongoDB CPU pin. See docs/issues/agent_audit_collection_missing_indexes.md.
+#
+# Each entry is (collection_name, [(keys, index_name), ...]). `keys` follows
+# pymongo's create_index signature: a string for single-field, a list of
+# (field, direction) tuples for compound. Motor and pymongo both treat a
+# create_index call against an existing identical index as a silent no-op;
+# only spec drift raises.
+MONGODB_INDEX_DECLARATIONS: List[tuple] = [
+    (
+        "llm_requests",
+        [
+            ("job_id", "idx_job_id"),
+            ("agent_type", "idx_agent_type"),
+            ("timestamp", "idx_timestamp"),
+            ("model", "idx_model"),
+            (
+                [("job_id", 1), ("agent_type", 1), ("timestamp", -1)],
+                "idx_job_agent_time",
+            ),
+        ],
+    ),
+    (
+        "agent_audit",
+        [
+            ("job_id", "idx_audit_job_id"),
+            ("step_type", "idx_audit_step_type"),
+            ("node_name", "idx_audit_node_name"),
+            ("timestamp", "idx_audit_timestamp"),
+            ([("job_id", 1), ("step_number", 1)], "idx_audit_job_step"),
+            (
+                [("job_id", 1), ("iteration", 1), ("step_number", 1)],
+                "idx_audit_job_iter_step",
+            ),
+            (
+                [("job_id", 1), ("agent_type", 1), ("step_type", 1)],
+                "idx_audit_job_agent_type",
+            ),
+        ],
+    ),
+    (
+        "chat_history",
+        [
+            ("job_id", "idx_chat_job_id"),
+            ([("job_id", 1), ("timestamp", 1)], "idx_chat_job_timestamp"),
+        ],
+    ),
+]
+
+
 class MongoDB:
     """Async MongoDB manager for audit queries using motor.
 
@@ -167,6 +224,54 @@ class MongoDB:
             self._db = None
             self._available = False
             logger.info("MongoDB connection closed")
+
+    async def ensure_indexes(self) -> int:
+        """Idempotently assert every declared index exists on the live DB.
+
+        Called from the orchestrator's FastAPI lifespan after ``connect()``
+        so the index set is reasserted on every pod start — closing the gap
+        that produced the 2026-05-12 outage, where the only DB-init path
+        (the standalone ``init.py`` CLI) wasn't actually invoked by the
+        deploy pipeline and six of seven ``agent_audit`` indexes never
+        materialised. Motor's ``create_index`` is a silent no-op when the
+        same index already exists, so a healthy cluster pays only the
+        existence check.
+
+        Failures are logged at ERROR — a missing index that turns a
+        per-job aggregation into a 117K-row COLLSCAN is exactly the
+        condition that took down the cluster, and silent WARNINGs were
+        what kept it invisible. Returns the number of indexes successfully
+        asserted (for logging / smoke tests).
+        """
+        if not self._available or self._db is None:
+            return 0
+        asserted = 0
+        failed: List[str] = []
+        for collection_name, indexes in MONGODB_INDEX_DECLARATIONS:
+            coll = self._db[collection_name]
+            for keys, index_name in indexes:
+                try:
+                    await coll.create_index(keys, name=index_name)
+                    asserted += 1
+                except Exception as e:
+                    qualified = f"{collection_name}.{index_name}"
+                    failed.append(qualified)
+                    logger.error(
+                        f"MongoDB ensure_indexes: failed to assert "
+                        f"{qualified} ({keys!r}): {e}"
+                    )
+        if failed:
+            logger.error(
+                f"MongoDB ensure_indexes: {len(failed)} index(es) FAILED "
+                f"to assert: {failed}. Per-job queries on these collections "
+                f"will COLLSCAN until this is resolved."
+            )
+        else:
+            logger.info(
+                f"MongoDB ensure_indexes: asserted {asserted} indexes "
+                f"across {len(MONGODB_INDEX_DECLARATIONS)} collections"
+            )
+        return asserted
 
     # Alias for compatibility
     async def close(self) -> None:
