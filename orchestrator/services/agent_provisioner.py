@@ -576,12 +576,69 @@ class AgentProvisioner:
                 category = "unstartable"
             else:
                 continue
+            # Capture agent stderr before delete so unexpected exits don't
+            # vanish with the pod. Diagnostic for the
+            # persistent_session_permission_check_race incident — see
+            # docs/issues/persistent_session_permission_check_race.md.
+            await self._capture_agent_logs_before_reap(pod, category)
             if await self.delete_agent_pod(pod.metadata.name):
                 stats[category] += 1
 
         if sum(stats.values()) > 0:
             logger.info("Reaped agent pod(s): %s", stats)
         return stats
+
+    async def _capture_agent_logs_before_reap(self, pod, category: str) -> None:
+        """Log the agent container's tail before reap deletes the pod.
+
+        Diagnostic for the persistent_session_permission_check_race incident:
+        when an agent exits unexpectedly (or is reaped while a thread is bound),
+        the pod is deleted by ``delete_agent_pod`` and its stderr is gone. We
+        emit the last 500 lines to the orchestrator's stderr at WARNING so they
+        survive in the cluster's log aggregation.
+
+        Always exception-safe: a capture failure must never block the reap.
+        """
+        pod_name = pod.metadata.name
+        exit_code: Any = None
+        for cs in getattr(pod.status, "container_statuses", None) or []:
+            if cs.name != "agent":
+                continue
+            terminated = getattr(getattr(cs, "state", None), "terminated", None)
+            if terminated is not None:
+                exit_code = getattr(terminated, "exit_code", None)
+            break
+
+        try:
+            log_tail = await asyncio.to_thread(
+                self._core_api.read_namespaced_pod_log,
+                name=pod_name,
+                namespace=self._namespace,
+                container="agent",
+                tail_lines=500,
+                timestamps=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "Reap log capture: failed to fetch logs for pod=%s "
+                "(category=%s, exit_code=%s): %s",
+                pod_name,
+                category,
+                exit_code,
+                e,
+            )
+            return
+
+        logger.warning(
+            "Reap log capture: pod=%s category=%s phase=%s exit_code=%s "
+            "logs_below_marker_BEGIN\n%s\nlogs_below_marker_END pod=%s",
+            pod_name,
+            category,
+            pod.status.phase,
+            exit_code,
+            log_tail or "(empty)",
+            pod_name,
+        )
 
     @staticmethod
     def _is_completed(pod) -> bool:
