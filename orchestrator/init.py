@@ -1490,86 +1490,44 @@ async def init_mongodb(force_reset: bool = False) -> bool:
 
 
 def _create_mongodb_indexes(db) -> None:
-    """Create MongoDB collections and indexes."""
-    # llm_requests collection
-    llm_requests = db["llm_requests"]
-    llm_indexes = [
-        ("job_id", {"name": "idx_job_id"}),
-        ("agent_type", {"name": "idx_agent_type"}),
-        ("timestamp", {"name": "idx_timestamp"}),
-        ("model", {"name": "idx_model"}),
-        (
-            [("job_id", 1), ("agent_type", 1), ("timestamp", -1)],
-            {"name": "idx_job_agent_time"},
-        ),
-    ]
+    """Create MongoDB collections and indexes.
 
-    logger.info("  Configuring llm_requests collection...")
-    for index_spec, options in llm_indexes:
-        try:
-            if isinstance(index_spec, list):
-                llm_requests.create_index(index_spec, **options)
-            else:
-                llm_requests.create_index(index_spec, **options)
-            logger.info(f"    Created index: {options['name']}")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"    Index exists: {options['name']}")
-            else:
-                logger.warning(f"    Failed to create index {options['name']}: {e}")
+    Iterates the same declarations the runtime ``MongoDB.ensure_indexes()``
+    consumes — single source of truth lives in
+    ``orchestrator/database/mongodb.py:MONGODB_INDEX_DECLARATIONS``. Two
+    paths exist because this function runs with sync ``pymongo`` from the
+    one-shot init CLI while the runtime path uses async ``motor``; the
+    declarations themselves are plain data.
 
-    # agent_audit collection
-    agent_audit = db["agent_audit"]
-    audit_indexes = [
-        ("job_id", {"name": "idx_audit_job_id"}),
-        ("step_type", {"name": "idx_audit_step_type"}),
-        ("node_name", {"name": "idx_audit_node_name"}),
-        ("timestamp", {"name": "idx_audit_timestamp"}),
-        ([("job_id", 1), ("step_number", 1)], {"name": "idx_audit_job_step"}),
-        (
-            [("job_id", 1), ("iteration", 1), ("step_number", 1)],
-            {"name": "idx_audit_job_iter_step"},
-        ),
-        (
-            [("job_id", 1), ("agent_type", 1), ("step_type", 1)],
-            {"name": "idx_audit_job_agent_type"},
-        ),
-    ]
+    Index creation failures are raised — silent WARNINGs were the
+    proximate cause of the 2026-05-12 outage (six of seven ``agent_audit``
+    indexes had quietly never materialised). If init runs at all, it must
+    leave behind a fully-indexed DB or fail visibly. The runtime helper
+    in ``mongodb.py`` provides the belt-and-braces idempotent reassert on
+    every orchestrator startup.
+    """
+    from database.mongodb import MONGODB_INDEX_DECLARATIONS
 
-    logger.info("  Configuring agent_audit collection...")
-    for index_spec, options in audit_indexes:
-        try:
-            if isinstance(index_spec, list):
-                agent_audit.create_index(index_spec, **options)
-            else:
-                agent_audit.create_index(index_spec, **options)
-            logger.info(f"    Created index: {options['name']}")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"    Index exists: {options['name']}")
-            else:
-                logger.warning(f"    Failed to create index {options['name']}: {e}")
-
-    # chat_history collection
-    chat_history = db["chat_history"]
-    chat_indexes = [
-        ("job_id", {"name": "idx_chat_job_id"}),
-        ([("job_id", 1), ("timestamp", 1)], {"name": "idx_chat_job_timestamp"}),
-    ]
-
-    logger.info("  Configuring chat_history collection...")
-    for index_spec, options in chat_indexes:
-        try:
-            if isinstance(index_spec, list):
-                chat_history.create_index(index_spec, **options)
-            else:
-                chat_history.create_index(index_spec, **options)
-            logger.info(f"    Created index: {options['name']}")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"    Index exists: {options['name']}")
-            else:
-                logger.warning(f"    Failed to create index {options['name']}: {e}")
+    failed: list[str] = []
+    for collection_name, indexes in MONGODB_INDEX_DECLARATIONS:
+        logger.info(f"  Configuring {collection_name} collection...")
+        coll = db[collection_name]
+        for keys, index_name in indexes:
+            try:
+                coll.create_index(keys, name=index_name)
+                logger.info(f"    Created index: {index_name}")
+            except Exception as e:
+                qualified = f"{collection_name}.{index_name}"
+                failed.append(qualified)
+                logger.error(
+                    f"    FAILED to create {qualified} ({keys!r}): {e}"
+                )
+    if failed:
+        raise RuntimeError(
+            f"MongoDB index creation failed for {len(failed)} index(es): "
+            f"{failed}. Per-job queries on these collections will COLLSCAN "
+            f"until this is resolved."
+        )
 
 
 async def verify_mongodb() -> dict:
