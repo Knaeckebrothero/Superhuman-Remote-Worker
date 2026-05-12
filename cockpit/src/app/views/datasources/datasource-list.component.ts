@@ -535,7 +535,31 @@ import {AppDialogComponent} from '../../ui/dialog';
       <p class="public-key-intro">
         {{ 'datasources.sshKeyDialog.intro' | transloco }}
       </p>
-      <pre class="public-key-block">{{ generatedPublicKey() }}</pre>
+      <div class="public-key-wrap">
+        <pre class="public-key-block">{{ generatedPublicKey() }}</pre>
+        <app-icon-button
+          class="public-key-copy"
+          size="sm"
+          variant="ghost"
+          [ariaLabel]="
+            (publicKeyCopied()
+              ? 'datasources.sshKeyDialog.copied'
+              : 'datasources.sshKeyDialog.copy'
+            ) | transloco
+          "
+          [tooltip]="
+            (publicKeyCopied()
+              ? 'datasources.sshKeyDialog.copied'
+              : 'datasources.sshKeyDialog.copy'
+            ) | transloco
+          "
+          (clicked)="copyPublicKey()"
+        >
+          <app-icon size="sm">{{
+            publicKeyCopied() ? 'check' : 'content_copy'
+          }}</app-icon>
+        </app-icon-button>
+      </div>
       <p class="public-key-hint">
         {{ 'datasources.sshKeyDialog.privateNote' | transloco }}
       </p>
@@ -776,17 +800,27 @@ import {AppDialogComponent} from '../../ui/dialog';
         color: var(--text-muted, #6c7086);
       }
 
+      .public-key-wrap {
+        position: relative;
+      }
+
       .public-key-block {
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
         line-height: 1.4;
-        padding: 10px 12px;
+        padding: 10px 36px 10px 12px;
         margin: 0;
         background: rgba(0, 0, 0, 0.25);
         border: 1px solid var(--border-color, var(--surface-1));
         border-radius: 6px;
         white-space: pre-wrap;
         word-break: break-all;
+      }
+
+      .public-key-copy {
+        position: absolute;
+        top: 4px;
+        right: 4px;
       }
 
       .test-result {
