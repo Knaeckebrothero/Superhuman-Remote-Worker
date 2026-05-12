@@ -961,6 +961,10 @@
       "tokenLabel": "Access Token",
       "tokenPlaceholder": "ghp_xxxx or personal access token",
       "sshKeyLabel": "SSH Private Key",
+      "sshGenerate": "Generate SSH key",
+      "sshGenerateBusy": "Generating...",
+      "sshGenerateConfirm": "Replace the current SSH key?",
+      "sshGenerateReplace": "Replace",
       "repoHint": "The repository will be cloned into the workspace and git credentials configured automatically. The agent uses standard git commands — no credential setup required.",
       "usernameLabel": "Username",
       "usernamePlaceholder": "neo4j",
@@ -972,6 +976,15 @@
       "saving": "Saving...",
       "update": "Update",
       "create": "Create"
+    },
+    "sshKeyDialog": {
+      "title": "Add this SSH key to your repository",
+      "intro": "Add the following public key as a deploy key on your repository provider (GitHub: Settings → Deploy keys; Gitea: Settings → Deploy keys; GitLab: Settings → Repository → Deploy keys).",
+      "privateNote": "The matching private key has been added to the form. Save the datasource to store it.",
+      "copy": "Copy public key",
+      "copied": "Copied!",
+      "done": "Done",
+      "generateFailed": "Failed to generate SSH key. Please try again."
     },
     "table": {
       "loading": "Loading datasources...",
