@@ -1,0 +1,10 @@
+{
+  "name": "Superhumand-remote-worker",
+  "files": [
+    {
+      "directory": ".",
+      "recursive": 1,
+      "hidden": 1
+    }
+  ]
+}

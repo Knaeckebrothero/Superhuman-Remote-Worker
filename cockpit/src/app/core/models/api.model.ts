@@ -137,6 +137,17 @@ export interface DatasourceTestResult {
   message: string;
 }
 
+/**
+ * Response from POST /api/datasources/ssh-keys/generate.
+ *
+ * `private_key` is dropped into the SSH key textarea, `public_key` is shown
+ * to the user so they can add it as a deploy key on their provider.
+ */
+export interface SSHKeyGenerateResponse {
+  private_key: string;
+  public_key: string;
+}
+
 // =============================================================================
 // User Models
 // =============================================================================

@@ -135,6 +135,11 @@ from src.core.model_registry import (  # noqa: E402
     family_of as _model_family,
     resolve_model as _resolve_model,
 )
+from src.utils.ssh_key import (  # noqa: E402
+    InvalidSSHKeyError,
+    generate_ed25519_keypair as _generate_ed25519_keypair,
+    validate_private_key as _validate_ssh_private_key,
+)
 from langchain_core.messages import (  # noqa: E402
     AIMessage,
     BaseMessage,
@@ -2261,6 +2266,25 @@ class DatasourceUpdate(BaseModel):
     credentials: dict[str, Any] | None = Field(None, description="New auth details")
     cli_hint: str | None = Field(None, description="New CLI hint")
     default_branch: str | None = Field(None, description="New default branch")
+
+
+class SSHKeyGenerateRequest(BaseModel):
+    """Request body for generating an SSH keypair for a repository datasource."""
+
+    comment: str | None = Field(
+        None,
+        description="Optional comment to embed in the public key (e.g. datasource name)",
+        max_length=200,
+    )
+
+
+class SSHKeyGenerateResponse(BaseModel):
+    """Response containing a freshly generated ed25519 SSH keypair."""
+
+    private_key: str = Field(..., description="OpenSSH PEM private key (no passphrase)")
+    public_key: str = Field(
+        ..., description="Single-line OpenSSH public key for the deploy-keys field"
+    )
 
 
 class ProjectDatasourceSettings(BaseModel):
@@ -8276,6 +8300,54 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
 # =============================================================================
 
 
+def _normalize_datasource_credentials(
+    credentials: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate and normalize secret fields in a datasource credentials dict.
+
+    Currently this means: if an ``ssh_key`` is present, run it through
+    :func:`validate_private_key`, which trims surrounding whitespace,
+    normalizes line endings, and ensures the single trailing newline that
+    OpenSSL/libcrypto requires. Raises ``HTTPException(400)`` if the key
+    fails structural validation.
+    """
+    if not credentials:
+        return credentials
+    ssh_key = credentials.get("ssh_key")
+    if ssh_key is None:
+        return credentials
+    try:
+        credentials["ssh_key"] = _validate_ssh_private_key(ssh_key)
+    except InvalidSSHKeyError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {exc}") from exc
+    return credentials
+
+
+@app.post(
+    "/api/datasources/ssh-keys/generate",
+    response_model=SSHKeyGenerateResponse,
+)
+async def generate_datasource_ssh_key(
+    body: SSHKeyGenerateRequest | None = None,
+) -> SSHKeyGenerateResponse:
+    """Generate a fresh ed25519 SSH keypair for the user to paste into the form.
+
+    The private half is returned in OpenSSH PEM format (already normalized
+    with a trailing newline so it round-trips through validation) and the
+    public half is returned in the single-line authorized_keys format the
+    user pastes into their provider's deploy-keys UI. The server does not
+    persist the keypair — storage happens when the user submits the
+    datasource form, which re-validates the private key via the same
+    ssh_key path as a hand-pasted key.
+    """
+    comment = (body.comment if body else None) or ""
+    keypair = _generate_ed25519_keypair(comment=comment)
+    return SSHKeyGenerateResponse(
+        private_key=keypair.private_key,
+        public_key=keypair.public_key,
+    )
+
+
 @app.get("/api/datasources")
 async def list_datasources(
     job_id: str | None = Query(
@@ -8324,19 +8396,23 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     user = await get_current_user(request, postgres_db)
     user_id = str(user["id"]) if user else None
 
+    credentials = _normalize_datasource_credentials(body.credentials)
+
     try:
         return await postgres_db.create_datasource(
             name=body.name,
             ds_type=body.type,
             connection_url=body.connection_url,
             description=body.description,
-            credentials=body.credentials,
+            credentials=credentials,
             job_id=body.job_id,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
             created_by=user_id,
             is_global=body.is_global,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
@@ -8352,13 +8428,14 @@ async def update_datasource(
     datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
     """Update a datasource."""
+    credentials = _normalize_datasource_credentials(body.credentials)
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
             name=body.name,
             description=body.description,
             connection_url=body.connection_url,
-            credentials=body.credentials,
+            credentials=credentials,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
         )

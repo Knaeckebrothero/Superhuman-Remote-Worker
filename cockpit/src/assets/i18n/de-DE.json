@@ -961,6 +961,10 @@
       "tokenLabel": "Access Token",
       "tokenPlaceholder": "ghp_xxxx oder Personal Access Token",
       "sshKeyLabel": "Privater SSH-Schlüssel",
+      "sshGenerate": "SSH-Schlüssel generieren",
+      "sshGenerateBusy": "Wird generiert...",
+      "sshGenerateConfirm": "Aktuellen SSH-Schlüssel ersetzen?",
+      "sshGenerateReplace": "Ersetzen",
       "repoHint": "Das Repository wird in den Arbeitsbereich geklont und Git-Anmeldeinformationen werden automatisch konfiguriert. Der Agent verwendet standardmäßige Git-Befehle — keine Einrichtung der Anmeldeinformationen erforderlich.",
       "usernameLabel": "Benutzername",
       "usernamePlaceholder": "neo4j",
@@ -972,6 +976,15 @@
       "saving": "Wird gespeichert...",
       "update": "Aktualisieren",
       "create": "Erstellen"
+    },
+    "sshKeyDialog": {
+      "title": "Fügen Sie diesen SSH-Schlüssel zu Ihrem Repository hinzu",
+      "intro": "Fügen Sie den folgenden öffentlichen Schlüssel als Deploy-Key bei Ihrem Repository-Anbieter hinzu (GitHub: Einstellungen → Deploy keys; Gitea: Einstellungen → Deploy-Schlüssel; GitLab: Einstellungen → Repository → Deploy keys).",
+      "privateNote": "Der passende private Schlüssel wurde in das Formular eingetragen. Speichern Sie die Datenquelle, um ihn zu hinterlegen.",
+      "copy": "Öffentlichen Schlüssel kopieren",
+      "copied": "Kopiert!",
+      "done": "Fertig",
+      "generateFailed": "SSH-Schlüssel konnte nicht generiert werden. Bitte erneut versuchen."
     },
     "table": {
       "loading": "Datenquellen werden geladen...",
