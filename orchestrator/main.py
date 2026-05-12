@@ -793,6 +793,46 @@ async def _inject_dispatch_credentials(
             f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
         )
 
+    # Resolve credentials for any capability/phase section the job explicitly
+    # pinned a model on. The top-level branch above only inspects `llm.model`;
+    # without this loop, an override like
+    # `{"llm": {"tactical": {"model": "X"}}}` ships the model name with no
+    # `base_url`/`api_key`, the agent's LLM factory falls back to the parent's
+    # base_url, and X's endpoint never gets hit — producing opaque 404s when
+    # X lives behind a non-default endpoint. The user-default phase pin block
+    # further down catches the same hole for unpinned phases, so the two
+    # blocks together cover both shapes: explicit job overrides (here) and
+    # user-default fallback (below).
+    for _section_name, _parent in (
+        ("auxiliary", config_override),
+        ("strategic", llm_over),
+        ("tactical", llm_over),
+    ):
+        _section = _parent.get(_section_name)
+        if not isinstance(_section, dict):
+            continue
+        _section_model = _section.get("model")
+        if not _section_model or _section.get("base_url"):
+            continue
+        await _inject_model_credentials(
+            section=_section,
+            model_id=_section_model,
+            user_id=user_id_str,
+            resolved_keys=resolved_keys,
+        )
+        if "api_key" not in _section and "base_url" not in _section:
+            logger.warning(
+                f"Dispatch: job {job_id} pinned {_section_name} model "
+                f"{_section_model!r} but no endpoint or provider key was "
+                f"resolvable — the agent will fall back to the parent "
+                f"base_url and almost certainly 404."
+            )
+        else:
+            logger.info(
+                f"Dispatch: injected credentials for {_section_name} "
+                f"override: {_section_model}"
+            )
+
     if job.get("user_id"):
         user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
         aux_model = user_settings.get("default_auxiliary_model")
