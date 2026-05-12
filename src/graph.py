@@ -150,6 +150,112 @@ def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
     return 90.0
 
 
+def _classify_llm_error(error: Exception) -> str:
+    """Classify an LLM exception as ``permanent``, ``rate_limit``, or ``transient``.
+
+    Drives the retry decision in ``create_execute_node`` so non-retriable
+    failures (404 model-not-found, 401/403 auth, 400 invalid_request) fail
+    the job fast instead of looping forever — see
+    docs/issues/agent_infinite_retry_on_permanent_llm_errors.md for the
+    incident this prevents.
+
+    Walks the exception's ``__cause__`` chain because LangChain wraps the
+    underlying provider exception. Inspection order:
+
+    1. ``status_code`` attribute (``openai.APIStatusError`` and the
+       ``anthropic`` SDK use the same convention) — most reliable signal.
+    2. Class name match against the well-known SDK error types — avoids
+       a hard dependency on every provider SDK at import time.
+    3. Error-message text fallback for stringified provider errors that
+       made it through without preserving the original class (already
+       observed in production audit logs).
+
+    Returns one of:
+
+    * ``permanent``  — short-circuit retries, mark the job failed.
+    * ``rate_limit`` — transient, but the caller should respect Retry-After
+      via :func:`_extract_rate_limit_delay`.
+    * ``transient``  — retry with the existing backoff schedule.
+    """
+    _PERMANENT_STATUS = {400, 401, 403, 404}
+
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+
+        status_code = getattr(current, "status_code", None)
+        if isinstance(status_code, int):
+            if status_code == 429:
+                return "rate_limit"
+            if status_code in _PERMANENT_STATUS:
+                # 400 needs to be disambiguated — Groq's tool_use_failed and
+                # some rate-limit-disguised-as-400 errors are NOT permanent.
+                if status_code == 400:
+                    body = getattr(current, "body", None)
+                    if isinstance(body, dict):
+                        err_obj = body.get("error") or {}
+                        if isinstance(err_obj, dict):
+                            code = (err_obj.get("code") or "").lower()
+                            etype = (err_obj.get("type") or "").lower()
+                            if "rate" in code or "rate" in etype:
+                                return "rate_limit"
+                            if code == "tool_use_failed":
+                                return "transient"
+                            if etype == "invalid_request_error":
+                                return "permanent"
+                    # 400 without a parseable body — be conservative, retry.
+                    return "transient"
+                return "permanent"
+            if 500 <= status_code < 600:
+                return "transient"
+
+        cls_name = type(current).__name__
+        if cls_name in (
+            "NotFoundError",
+            "AuthenticationError",
+            "PermissionDeniedError",
+        ):
+            return "permanent"
+        if cls_name == "RateLimitError":
+            return "rate_limit"
+        if cls_name == "BadRequestError":
+            # Same disambiguation as the 400 status branch above.
+            body = getattr(current, "body", None)
+            if isinstance(body, dict):
+                err_obj = body.get("error") or {}
+                if isinstance(err_obj, dict):
+                    code = (err_obj.get("code") or "").lower()
+                    etype = (err_obj.get("type") or "").lower()
+                    if "rate" in code or "rate" in etype:
+                        return "rate_limit"
+                    if code == "tool_use_failed":
+                        return "transient"
+                    if etype == "invalid_request_error":
+                        return "permanent"
+
+        nxt = getattr(current, "__cause__", None)
+        current = nxt if nxt is not current else None
+
+    error_str = str(error).lower()
+    if "model" in error_str and ("not found" in error_str or "does not exist" in error_str):
+        return "permanent"
+    if "404" in error_str and "model" in error_str:
+        return "permanent"
+    if "authenticationerror" in error_str or "invalid_api_key" in error_str:
+        return "permanent"
+    if "permissiondenied" in error_str:
+        return "permanent"
+    if (
+        "429" in error_str
+        or "rate limit" in error_str
+        or "too many requests" in error_str
+    ):
+        return "rate_limit"
+
+    return "transient"
+
+
 def _extract_tool_use_failed(error: Exception) -> Optional[str]:
     """Extract failed_generation from Groq's tool_use_failed error.
 
@@ -1652,6 +1758,51 @@ def create_execute_node(
                         f"[{job_id}] Groq tool_use_failed streak exceeded (streak {streak}): "
                         f"model cannot produce output within token limits"
                     )
+
+                # Classify the error before deciding to retry. Permanent
+                # failures (404 model not found, 401/403 auth, 400
+                # invalid_request) will never succeed by retrying — looping
+                # on them is what produced the 2026-05-12 cluster outage
+                # (every iteration wrote an audit row + burned LLM calls).
+                # Permanent errors short-circuit straight to job-failure
+                # via should_stop=True; the existing graph routing
+                # (check_todos → check_goal → END) then surfaces error to
+                # determine_job_status which marks the job 'failed'.
+                classification = _classify_llm_error(e)
+                if classification == "permanent":
+                    logger.error(
+                        f"[{job_id}] LLM error is permanent "
+                        f"({type(e).__name__}) — failing job without retry: {e}"
+                    )
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "llm_error",
+                                    "message": str(e)[:500],
+                                    "recoverable": False,
+                                    "classification": "permanent",
+                                    "attempts": attempt + 1,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                            phase=phase_str,
+                            phase_number=phase_number,
+                        )
+                    return {
+                        "error": {
+                            "message": str(e),
+                            "type": "llm_error",
+                            "recoverable": False,
+                        },
+                        "iteration": iteration + 1,
+                        "should_stop": True,
+                    }
 
                 retry_manager.record_failure("llm_invoke")
 
