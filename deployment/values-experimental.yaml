@@ -27,7 +27,7 @@ image:
   orchestrator:
     tag: sha-6175feb
   agent:
-    tag: sha-7d840e2
+    tag: sha-6175feb
   cockpit:
     tag: sha-6175feb
   mcp:
