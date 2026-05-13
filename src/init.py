@@ -38,6 +38,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
+from src.core.workspace import get_workspace_base_path  # noqa: E402
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -60,31 +62,6 @@ def setup_logging(verbose: bool = False) -> None:
             format="%(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
-
-
-def get_workspace_base_path() -> Path:
-    """Get the base path for workspaces based on environment.
-
-    Priority:
-    1. WORKSPACE_PATH environment variable
-    2. /workspace if running in container (detected by existence)
-    3. ./workspace in project root for development
-
-    Returns:
-        Path to workspace base directory
-    """
-    # Check environment variable first
-    env_path = os.getenv("WORKSPACE_PATH")
-    if env_path:
-        return Path(env_path)
-
-    # Check if running in container (standard container workspace path)
-    container_path = Path("/workspace")
-    if container_path.exists() and container_path.is_dir():
-        return container_path
-
-    # Development mode: use ./workspace relative to project root
-    return PROJECT_ROOT / "workspace"
 
 
 # =============================================================================
