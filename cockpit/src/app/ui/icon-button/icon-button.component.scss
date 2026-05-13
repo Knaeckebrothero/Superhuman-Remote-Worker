@@ -1,10 +1,12 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-block;
 }
 
 .app-icon-button__btn {
+  @include shape.control;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -33,21 +35,18 @@
   &[data-size='sm'] {
     width: 24px;
     height: 24px;
-    border-radius: v.$radius-sm;
     font-size: 14px;
   }
 
   &[data-size='md'] {
     width: 32px;
     height: 32px;
-    border-radius: v.$radius-sm;
     font-size: 16px;
   }
 
   &[data-size='lg'] {
     width: 40px;
     height: 40px;
-    border-radius: v.$radius-md;
     font-size: 20px;
   }
 
@@ -105,7 +104,7 @@
   height: 14px;
   border: 2px solid currentColor;
   border-right-color: transparent;
-  border-radius: 50%;
+  @include shape.circle;
   animation: app-icon-button-spin 0.7s linear infinite;
 }
 

@@ -1,0 +1,99 @@
+// Shape recipes — the consumption API for primitives.
+//
+// Each archetype mixin owns a structural decision: which radius token to
+// consume, plus any compositional extras (shadow stacks, transitions, press
+// behavior). Tokens own values; recipes own decisions.
+//
+// Primitives @include the recipe that matches their archetype. Theme files
+// retheme by flipping the underlying tokens — no primitive changes needed.
+//
+// Usage in a primitive:
+//
+//   @use '../../../styles/shape-recipes' as shape;
+//
+//   .app-button__btn      { @include shape.control; @include shape.stamp; }
+//   .app-card             { @include shape.surface; }
+//   .app-chip[data-pill]  { @include shape.pill; }
+//   .app-switch__knob     { @include shape.circle; }
+
+// =============================================================================
+// Radius archetypes
+// =============================================================================
+
+// Control — buttons, inputs, selects, chips, badges, tabs, icon-buttons (non-circle).
+// Reads --radius-control; component-local override via --<name>-radius if the
+// primitive declares one.
+@mixin control {
+  border-radius: var(--radius-control);
+}
+
+// Surface — cards, dialogs, menus, toasts, panels.
+@mixin surface {
+  border-radius: var(--radius-surface);
+}
+
+// Pill — pill-shaped chips, status pills.
+@mixin pill {
+  border-radius: var(--radius-pill);
+}
+
+// Tag — small inline markers, checkbox tile, code chips.
+@mixin tag {
+  border-radius: var(--radius-tag);
+}
+
+// Circle — radio dots, switch knobs, spinner rings, avatars, round icon-buttons.
+// Theme-invariant: semantic, not decorative. Roman themes do not flatten these.
+@mixin circle {
+  border-radius: 50%;
+}
+
+// =============================================================================
+// Inset Stamp
+// =============================================================================
+//
+// The Roman primary-button treatment. Layers an inner highlight + inner shadow
+// + outer accent drop to read "stamped into stone." Tinted variants (warning,
+// info, success, danger) get a softer set — the dark inner shadow muddies on
+// translucent fills.
+//
+// Token contract — declared by Roman themes in _shape-overrides.scss:
+//   --stamp-highlight     top inner highlight (1px)
+//   --stamp-shadow        bottom inner shadow (1px)
+//   --stamp-drop          bottom outer accent drop (1px)
+//   --stamp-press         translateY on :active
+//   --stamp-press-shadow  inner shadow on :active (replaces drop)
+//
+// Non-Roman themes leave these unset; the var() fallbacks resolve to transparent
+// so the recipe collapses to a flat button without the visual.
+//
+// Variants:
+//   'full' (default) — primary, secondary. Full stack + press translate.
+//   'soft'           — warning, info, success, danger. Highlight only.
+
+@mixin stamp($variant: 'full') {
+  position: relative;
+  transition:
+    transform 60ms ease,
+    box-shadow 120ms ease,
+    background-color 120ms ease;
+
+  @if $variant == 'full' {
+    box-shadow:
+      inset 0  1px 0 0 var(--stamp-highlight, transparent),
+      inset 0 -1px 0 0 var(--stamp-shadow,    transparent),
+      0      1px 0 0 var(--stamp-drop,        transparent);
+
+    &:active:not(:disabled) {
+      transform: translateY(var(--stamp-press, 0));
+      box-shadow:
+        inset 0 1px 2px 0 var(--stamp-press-shadow, transparent),
+        0 0 0 0 transparent;
+    }
+  } @else if $variant == 'soft' {
+    box-shadow:
+      inset 0 1px 0 0 var(--stamp-highlight, transparent);
+  } @else {
+    @error "shape.stamp(): unknown variant '#{$variant}'. Use 'full' or 'soft'.";
+  }
+}

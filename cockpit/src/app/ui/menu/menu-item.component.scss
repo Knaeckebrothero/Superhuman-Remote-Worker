@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: flex;
@@ -11,7 +12,7 @@
   cursor: pointer;
   user-select: none;
   outline: none;
-  border-radius: v.$radius-sm;
+  @include shape.control;
   transition: background-color 0.1s ease, color 0.1s ease;
 
   &:hover:not([data-disabled]),

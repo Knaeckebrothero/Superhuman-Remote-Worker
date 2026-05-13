@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-flex;
@@ -31,8 +32,8 @@
   }
 
   // --- Shape ---
-  &[data-shape='rounded'] { border-radius: v.$radius-sm; }
-  &[data-shape='pill']    { border-radius: v.$radius-xl; }
+  &[data-shape='rounded'] { @include shape.tag; }
+  &[data-shape='pill']    { @include shape.pill; }
 
   // --- Uppercase modifier ---
   &[data-uppercase] {
@@ -62,7 +63,7 @@
     }
     &[data-appearance='solid'] {
       background: var(--accent-color);
-      color: var(--timeline-bg);
+      color: var(--on-accent);
     }
   }
 
@@ -73,7 +74,7 @@
     }
     &[data-appearance='solid'] {
       background: var(--success);
-      color: var(--timeline-bg);
+      color: var(--on-success);
     }
   }
 
@@ -84,7 +85,7 @@
     }
     &[data-appearance='solid'] {
       background: var(--warning);
-      color: var(--timeline-bg);
+      color: var(--on-warning);
     }
   }
 
@@ -106,7 +107,7 @@
     }
     &[data-appearance='solid'] {
       background: var(--info);
-      color: var(--timeline-bg);
+      color: var(--on-info);
     }
   }
 
@@ -117,7 +118,7 @@
     }
     &[data-appearance='solid'] {
       background: var(--danger);
-      color: var(--timeline-bg);
+      color: var(--on-danger);
     }
   }
 }

@@ -1,10 +1,12 @@
+@use '../../../styles/shape-recipes' as shape;
+
 :host {
   display: inline-block;
   flex-shrink: 0;
   border-style: solid;
   border-color: currentColor;
   border-right-color: transparent;
-  border-radius: 50%;
+  @include shape.circle;
   animation: app-spinner-spin 0.7s linear infinite;
 
   // --- Sizes ---
