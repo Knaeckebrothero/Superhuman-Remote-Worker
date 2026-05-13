@@ -53,6 +53,6 @@ Current position (update each strategic phase):
 Approaches and delegations that were tried and did NOT work, with the reason.
 This prevents retrying the same failed strategy after context compaction.
 
-(Example: "Tried async database calls — Claude Code produced code with race conditions. Switched to sync with connection pooling.")
+(Example: "Tried async database calls — produced code with race conditions. Switched to sync with connection pooling.")
 
 (PROTECTED — only remove entries when the underlying issue is confirmed resolved.)
