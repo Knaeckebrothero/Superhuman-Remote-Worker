@@ -1,0 +1,24 @@
+// Semantic role tokens.
+//
+// Primitives consume these — not the raw scale in _root-tokens.scss — so a
+// theme can rebind a role globally without touching components. Example:
+// flipping --radius-control to var(--radius-full) makes every control
+// pill-shaped without editing a single primitive.
+//
+// Each role token defaults to a primitive token. Theme files override the
+// role directly when the change is global; they override the primitive when
+// the change cascades through every role that references it (e.g. Roman
+// themes set --radius-sm: 0, which automatically flattens --radius-tag).
+
+:root {
+  // --- Radii roles ---
+  --radius-control: var(--radius-md);   // buttons, inputs, selects, chips, badges, tabs, icon-buttons
+  --radius-surface: var(--radius-md);   // cards, dialogs, menus, toasts, panels
+  --radius-pill:    var(--radius-full); // pill-shaped chips, status pills
+  --radius-tag:     var(--radius-sm);   // small inline markers, checkbox tile
+
+  // --- Typography roles ---
+  --font-primary: var(--font-family-base); // primary-variant buttons; Roman themes override to display
+  --font-control: var(--font-family-base); // body of buttons, inputs, labels
+  --font-mono:    var(--font-family-mono); // code, tool args, debug surfaces
+}

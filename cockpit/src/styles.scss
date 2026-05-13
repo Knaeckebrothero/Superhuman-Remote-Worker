@@ -1,5 +1,7 @@
 // Cinzel + Cormorant Garamond for Roman themes are loaded via index.html <link>.
 @use 'styles/variables' as v;
+@use 'styles/root-tokens';        // Primitive scale at :root (--radius-*, --font-family-*)
+@use 'styles/semantic-tokens';    // Role tokens at :root (--radius-control, --font-primary, …)
 @use 'styles/themes/themes' as theme;
 @use 'styles/themes/shape-overrides';
 
