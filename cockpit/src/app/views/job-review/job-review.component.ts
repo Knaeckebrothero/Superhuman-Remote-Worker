@@ -401,13 +401,13 @@ interface FrozenJobData {
       .confidence-bar {
         height: 6px;
         background: var(--surface-0, var(--surface-0));
-        border-radius: 3px;
+        border-radius: var(--radius-pill);
         overflow: hidden;
       }
 
       .confidence-fill {
         height: 100%;
-        border-radius: 3px;
+        border-radius: var(--radius-pill);
         transition: width 0.3s ease;
       }
 
@@ -493,7 +493,7 @@ interface FrozenJobData {
       /* Result Message */
       .result-message {
         padding: 8px 12px;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         font-size: 12px;
         background: var(--success-tint);
         color: var(--success);
@@ -534,7 +534,7 @@ interface FrozenJobData {
         padding: 8px 12px;
         background: var(--code-bg, var(--timeline-bg));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: monospace;
         font-size: 0.9em;
         color: var(--text-primary, var(--text-primary));

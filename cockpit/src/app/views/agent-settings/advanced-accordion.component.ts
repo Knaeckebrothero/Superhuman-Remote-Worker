@@ -696,7 +696,7 @@ import {UserService} from '../../core/services/user.service';
     }
     .accordion-section {
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       overflow: hidden;
     }
     .accordion-section.expanded {
@@ -726,7 +726,7 @@ import {UserService} from '../../core/services/user.service';
     .modified-badge {
       margin-left: auto;
       padding: 1px 6px;
-      border-radius: 8px;
+      border-radius: var(--radius-pill);
       background: color-mix(in srgb, var(--accent-color) 20%, transparent);
       color: var(--accent-color, var(--accent-color));
       font-size: 11px;
@@ -789,7 +789,7 @@ import {UserService} from '../../core/services/user.service';
       flex: 1;
       padding: 7px 10px;
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-primary, var(--text-primary));
       font-family: inherit;

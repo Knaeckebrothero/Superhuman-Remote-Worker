@@ -74,7 +74,7 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       align-items: center;
       gap: 10px;
       padding: 8px 10px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       cursor: pointer;
       transition: background 0.15s;
     }
@@ -121,7 +121,7 @@ import {Datasource, DatasourceType} from '../../core/models/api.model';
       text-transform: uppercase;
       letter-spacing: 0.3px;
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       background: rgba(255, 255, 255, 0.06);
       color: var(--text-muted, var(--text-muted));
       flex-shrink: 0;

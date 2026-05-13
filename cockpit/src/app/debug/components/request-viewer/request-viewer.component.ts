@@ -242,7 +242,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         flex: 1;
         padding: 6px 10px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: var(--panel-bg, #181825);
         color: var(--text-primary, #cdd6f4);
         font-size: 12px;
@@ -257,9 +257,9 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .load-btn {
         padding: 6px 16px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
@@ -333,7 +333,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       /* Metadata Card */
       .metadata-card {
         background: var(--surface-0, #313244);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         padding: 12px;
         margin-bottom: 16px;
       }
@@ -413,7 +413,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .message-bubble {
         max-width: 85%;
         padding: 10px 14px;
-        border-radius: 12px;
+        border-radius: var(--radius-lg);
         font-size: 13px;
         line-height: 1.5;
       }
@@ -489,7 +489,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         display: inline-block;
         padding: 2px 8px;
         background: rgba(250, 179, 135, 0.2);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         color: #fab387;
@@ -500,7 +500,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         margin: 4px 0 0 0;
         padding: 8px;
         background: rgba(0, 0, 0, 0.3);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         color: #a6e3a1;
@@ -529,7 +529,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .tools-section {
         margin-top: 8px;
         background: var(--surface-0, #313244);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         overflow: hidden;
       }
 
@@ -576,7 +576,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .reasoning-section {
         margin-top: 16px;
         background: var(--surface-0, #313244);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         overflow: hidden;
       }
 

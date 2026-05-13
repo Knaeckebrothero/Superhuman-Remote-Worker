@@ -777,11 +777,11 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .chip-count {
       background: var(--accent-color, var(--accent-color));
-      color: var(--timeline-bg);
+      color: var(--on-accent, var(--timeline-bg, #11111b));
       font-size: 9px;
       font-weight: 700;
       padding: 0 5px;
-      border-radius: 8px;
+      border-radius: var(--radius-pill);
       min-width: 14px;
       text-align: center;
       line-height: 14px;
@@ -853,7 +853,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .item-urgency-bar {
       width: 3px;
       align-self: stretch;
-      border-radius: 0 2px 2px 0;
+      border-radius: 0 var(--radius-tag) var(--radius-tag) 0;
       flex-shrink: 0;
     }
     .urgency-green { background: var(--success); }
@@ -980,7 +980,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: inline-block;
       padding: 1px 5px;
       background: var(--surface-0, var(--surface-0));
-      border-radius: 3px;
+      border-radius: var(--radius-tag);
       font-size: 10px;
       font-family: inherit;
     }
@@ -1030,7 +1030,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
     .session-detail .args-block {
       background: var(--surface-0, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-tag);
       padding: 8px 12px;
       font-size: 12px;
       overflow-x: auto;
@@ -1054,7 +1054,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .command-block {
       background: var(--panel-bg, var(--panel-bg));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-tag);
       padding: 12px 14px;
     }
     .command-block code {
@@ -1089,7 +1089,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .decision-info {
       background: var(--panel-bg, var(--panel-bg));
-      border-radius: 6px;
+      border-radius: var(--radius-surface);
       padding: 10px 12px;
     }
 
@@ -1105,7 +1105,7 @@ function relativeTime(iso: string, nowLabel: string): string {
 
     .rules-section {
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-surface);
       overflow: hidden;
     }
 
@@ -1187,7 +1187,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     }
 
     .msg-bubble {
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 10px 14px;
       max-width: 85%;
     }
@@ -1234,12 +1234,12 @@ function relativeTime(iso: string, nowLabel: string): string {
       code {
         background: var(--surface-0, var(--surface-0));
         padding: 1px 4px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 12px;
       }
       pre {
         background: var(--surface-0, var(--surface-0));
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         padding: 8px 10px;
         overflow-x: auto;
         margin: 6px 0;
@@ -1265,7 +1265,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: block;
       padding: 6px 10px;
       background: rgba(0, 0, 0, 0.3);
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-family: monospace;
       font-size: 0.85em;
       color: var(--text-primary, var(--text-primary));
@@ -1286,7 +1286,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     .review-job-info {
       background: var(--panel-bg, var(--panel-bg));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-surface);
       padding: 12px;
     }
 
@@ -1343,13 +1343,13 @@ function relativeTime(iso: string, nowLabel: string): string {
       flex: 1;
       height: 6px;
       background: var(--surface-0, var(--surface-0));
-      border-radius: 3px;
+      border-radius: var(--radius-pill);
       overflow: hidden;
     }
 
     .confidence-fill {
       height: 100%;
-      border-radius: 3px;
+      border-radius: var(--radius-pill);
       transition: width 0.3s ease;
     }
     .confidence-fill.low { background: var(--danger); }
@@ -1387,7 +1387,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       padding: 8px 12px;
       background: var(--warning-tint);
       border-left: 2px solid var(--warning);
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       margin-bottom: 8px;
       line-height: 1.5;
     }
@@ -1402,7 +1402,7 @@ function relativeTime(iso: string, nowLabel: string): string {
     app-button kbd {
       font-size: 9px;
       padding: 1px 4px;
-      border-radius: 2px;
+      border-radius: var(--radius-tag);
       background: rgba(0, 0, 0, 0.2);
       font-family: inherit;
       margin-left: 2px;
@@ -1420,7 +1420,7 @@ function relativeTime(iso: string, nowLabel: string): string {
       display: inline-block;
       padding: 2px 7px;
       background: var(--surface-0, var(--surface-0));
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
       font-family: inherit;
       color: var(--accent-color, var(--accent-color));

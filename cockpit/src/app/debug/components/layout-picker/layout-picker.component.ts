@@ -80,7 +80,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
         overflow-y: auto;
         background: var(--panel-bg, #181825);
         border: 1px solid var(--border-color, #313244);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         z-index: 1001;
       }
@@ -117,7 +117,7 @@ import { LayoutPreviewComponent } from './layout-preview.component';
         padding: 8px;
         background: var(--surface-0, #313244);
         border: 1px solid transparent;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         cursor: pointer;
         transition: border-color 0.15s, background 0.15s;
       }

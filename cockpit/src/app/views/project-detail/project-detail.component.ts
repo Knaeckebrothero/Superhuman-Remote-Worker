@@ -897,7 +897,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       display: inline-flex;
       align-items: center;
       padding: 8px 16px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-size: 13px;
       color: var(--text-secondary);
       text-decoration: none;
@@ -926,7 +926,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .detail-card {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 14px;
     }
 
@@ -952,7 +952,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       flex: 1;
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 16px;
       text-align: center;
     }
@@ -1028,7 +1028,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .status-badge {
       display: inline-block;
       padding: 3px 8px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
       font-weight: 500;
       text-transform: capitalize;
@@ -1046,7 +1046,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .merge-badge {
       display: inline-block;
       padding: 3px 8px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
       font-weight: 500;
     }
@@ -1060,7 +1060,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .role-badge {
       display: inline-block;
       padding: 3px 8px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
       font-weight: 500;
       background: var(--surface-0);
@@ -1079,7 +1079,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       padding: 12px;
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       flex-wrap: wrap;
     }
 
@@ -1119,7 +1119,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       gap: 6px;
       padding: 14px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       background: var(--panel-bg);
     }
 
@@ -1146,7 +1146,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .expert-tag {
       font-size: 10px;
       padding: 1px 6px;
-      border-radius: 3px;
+      border-radius: var(--radius-tag);
       background: var(--surface-0);
       color: var(--text-muted);
     }
@@ -1157,7 +1157,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .settings-group {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 16px;
     }
 
@@ -1206,7 +1206,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       gap: 16px;
       padding: 12px;
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
     }
 
     .danger-info { flex: 1; min-width: 0; }
@@ -1236,7 +1236,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
       flex: 1; min-width: 70px;
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 12px;
       text-align: center;
     }
@@ -1263,7 +1263,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-note-card {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 14px;
       cursor: pointer;
       transition: border-color 0.15s ease;
@@ -1283,7 +1283,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .kb-note-status {
-      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      font-size: 10px; padding: 2px 6px; border-radius: var(--radius-tag);
       font-weight: 500; text-transform: capitalize;
     }
 
@@ -1293,7 +1293,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-note-status[data-status="archived"] { background: var(--surface-0); color: var(--text-muted); }
 
     .kb-type-badge {
-      font-size: 10px; padding: 2px 8px; border-radius: 4px;
+      font-size: 10px; padding: 2px 8px; border-radius: var(--radius-tag);
       font-weight: 600; text-transform: capitalize; white-space: nowrap;
       background: var(--surface-0); color: var(--text-secondary);
     }
@@ -1315,12 +1315,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-note-footer .footer-date { margin-left: auto; }
 
     .kb-tag-sm {
-      font-size: 10px; padding: 1px 5px; border-radius: 3px;
+      font-size: 10px; padding: 1px 5px; border-radius: var(--radius-tag);
       background: var(--surface-0); color: var(--text-muted);
     }
 
     .kb-confidence-sm {
-      font-size: 10px; padding: 1px 5px; border-radius: 3px;
+      font-size: 10px; padding: 1px 5px; border-radius: var(--radius-tag);
       background: var(--surface-0); color: var(--accent-color);
       text-transform: capitalize;
     }
@@ -1334,7 +1334,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-detail {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 20px;
     }
 
@@ -1355,12 +1355,12 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     .kb-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 
     .kb-tag {
-      font-size: 11px; padding: 3px 8px; border-radius: 4px;
+      font-size: 11px; padding: 3px 8px; border-radius: var(--radius-tag);
       background: var(--surface-0); color: var(--accent-color);
     }
 
     .kb-confidence {
-      font-size: 12px; padding: 2px 6px; border-radius: 3px;
+      font-size: 12px; padding: 2px 6px; border-radius: var(--radius-tag);
       background: var(--surface-0); color: var(--accent-color);
       text-transform: capitalize;
     }
@@ -1387,7 +1387,7 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
     }
 
     .kb-rel-type {
-      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      font-size: 10px; padding: 2px 6px; border-radius: var(--radius-tag);
       background: var(--surface-0); color: var(--text-secondary);
       font-weight: 500;
     }

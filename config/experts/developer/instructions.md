@@ -26,72 +26,41 @@ These are default instructions for development tasks. Follow them unless the use
 - Identify risks and dependencies between milestones
 - Order milestones so each builds on verified prior work
 
-## 4. Implementation via Claude Code
+## 4. Implementation
 
-Work through milestones by delegating to `claude_code`. Never edit code files directly.
+Work through milestones with the workspace tools (`read_file`, `write_file`, `list_files`, `search_files`) and the shell (`run_command`, `shell_read`). One todo = one focused change.
 
-### claude_code Tool Reference
+### Tool Reference
 
-The `claude_code` tool delegates a coding task to Claude Code. See the tool description for the wire format and exact arguments. Key parameters:
+- **`read_file(path, offset?, limit?)`** — Read a file with line numbers. Always read a file before overwriting it.
+- **`write_file(path, content)`** — Overwrite a file with new content. There is no in-place edit — `content` must be the complete new file. If the file already exists, you MUST `read_file` it first so you understand what you're replacing.
+- **`list_files(path)`** — List directory contents. Use to map an unfamiliar repo.
+- **`search_files(query, path?)`** — Grep across the workspace.
+- **`file_exists(path)`** — Cheap existence check.
+- **`run_command(command, timeout?, tail?)`** — Run a shell command in the workspace root. Stateless: each call starts in a fresh shell, so use `cd repo && ...` or absolute paths for repo-relative work. Only the last `tail` lines of output are returned (default 30); raise `tail` for test runs.
+- **`shell_read(...)`** — Page through earlier scrollback when `run_command`'s tail truncation cut off something you need.
+- **`git_log` / `git_diff` / `git_status` / `git_tags`** — Inspect repo state. Use `git_diff` against the phase-start tag to see what landed since the phase began.
 
-- `prompt` — detailed instructions (or follow-up when resuming)
-- `session_id` — resume a previous session (omit for a new session)
-- `working_dir` — subdirectory within the workspace (defaults to workspace root)
+### Per-todo Loop
 
-The tool returns the result text plus session metadata (session_id, turns, cost, duration).
+For each todo:
 
-- **Multi-turn sessions**: First call returns a `session_id`. Pass it on follow-up calls to resume — Claude Code remembers all prior context.
-- **Output cap**: Response truncated to 50,000 chars (tail preserved). For verbose output, ask Claude Code to write to a file.
-- **Repo access**: `repo/` is a real git clone. Claude Code can run git, tests, linters inside it.
-- **When to resume vs start fresh**: Resume for corrections, follow-up work on the same files, running additional tests. Start fresh for unrelated tasks, different part of the codebase, new todo.
-
-### Prompt Templates
-
-**Implement Feature:**
-```
-GOAL: Implement [feature] in [file path].
-CONTEXT: Codebase uses [framework]. Related: [paths]. Follow pattern from [example file].
-SCOPE: Create/modify [exact file paths].
-CONSTRAINTS: Don't modify [files]. Keep [convention].
-VERIFY: Run [test command]. Fix failures before finishing.
-```
-
-**Fix Bug:**
-```
-GOAL: Fix [bug] in [file path].
-CONTEXT: Current behavior: [what happens]. Expected: [what should happen]. Root cause: [if known].
-SCOPE: Fix in [file path]. Related: [paths].
-CONSTRAINTS: Don't change [files]. Preserve [behavior].
-VERIFY: Run [test command] to confirm fix. Run [broader test] for regressions.
-```
-
-**Run Tests:**
-```
-GOAL: Run test suite and fix any failures.
-CONTEXT: Test framework: [pytest/jest/etc]. Config: [path].
-SCOPE: Fix source code, not tests (unless tests are wrong).
-CONSTRAINTS: Don't skip or delete failing tests.
-VERIFY: All tests pass on final run.
-```
-
-**Git Operations:**
-```
-GOAL: Stage changes, commit with message "[message]", push to origin [branch].
-CONTEXT: Remote URL has credentials embedded.
-SCOPE: All modified/untracked files in repo.
-CONSTRAINTS: No untracked files left behind.
-VERIFY: git status shows clean working tree after push.
-```
+1. **Search prior knowledge** — `kb_search` for relevant context and previously failed approaches.
+2. **Read targets and neighbors** — `read_file` every file you intend to modify, plus at least one neighbor for convention reference.
+3. **Implement** — `write_file` with the complete new file contents. Match imports, naming, error-handling, and log style of the surrounding code.
+4. **Run verification** — Execute the test/lint/check command from the todo via `run_command`. Read the full output.
+5. **Inspect the diff** — `git_diff` to confirm scope. Unexpected file changes are a red flag.
+6. **Mark complete** — `todo_complete` with evidence (files changed, test counts, exit codes).
 
 ### Working Directories
 
 | Path | Purpose |
 |------|---------|
-| `repo/` | Cloned repository — always use as `working_dir` for code work |
+| `repo/` | Cloned repository — use `cd repo && ...` in `run_command`, or pass `repo/...` paths to workspace tools |
 | `repo/[subdir]` | Monorepo subdirectory (e.g., `repo/frontend`, `repo/backend`) |
 | workspace root | Management files (plan.md, todos.yaml) — use workspace tools |
 | `documents/` | Input documents — read with workspace tools |
-| `output/` | Deliverables — write via claude_code or workspace tools |
+| `output/` | Deliverables — write with `write_file` |
 
 ### PR Sizing
 
@@ -103,13 +72,12 @@ Small, focused PRs ship faster and review better:
 
 ### Anti-Patterns
 
-- **Vague prompts** ("fix the tests") — be specific about files, commands, expected behavior
-- **Missing working_dir** — Claude Code defaults to workspace root, not repo
-- **Skipping verification** — always git_diff or read_file before marking complete
-- **Batching unrelated work** — one prompt per focused task
-- **Manual code fixes** via write_file — delegate corrections back to claude_code (resume the session)
-- **Overloading a single delegation** — if > 3 files change, consider splitting
-- **Starting fresh for corrections** — resume the session instead, it's cheaper and has context
+- **Blind overwrites** — never call `write_file` on an existing file without `read_file` first; you may erase content you didn't see
+- **Skipping verification** — always `git_diff` after a write, and read the full test output before `todo_complete`
+- **Trusting exit code 0** — "0 tests collected" exits 0; read the output, not just the status
+- **Batching unrelated work** — one todo per focused change
+- **Stateless-shell mistakes** — `run_command` does not remember `cd` between calls; chain with `&&` or use absolute paths
+- **Adding unrequested changes** — a bug fix doesn't need surrounding cleanup or "while I'm here" refactors
 - **Giant PRs** — if a PR touches > 10 files or > 500 lines, split it
 
 ## 5. Testing
