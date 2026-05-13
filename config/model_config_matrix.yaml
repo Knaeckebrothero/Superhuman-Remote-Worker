@@ -129,6 +129,12 @@ gpt-5:
     strategic: strategic_gpt_5.txt
     tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
+    # Auxiliary task prompts — tuned for the gpt-5 family wire format
+    # (XML-tagged, structured-output aware). Loaded when an aux model in this
+    # family runs background tasks (e.g. gpt-5.4-mini as the auxiliary model).
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
   guardrails:
     file: gpt_5.yaml
   settings:
@@ -154,6 +160,10 @@ codex:
     strategic: strategic_gpt_5.txt
     tactical: tactical_gpt_5.txt
     summarization: summarization_prompt_gpt_5.txt
+    # Shared with the gpt-5 family — codex aliases gpt-5 for prompts.
+    memory_extraction: memory_extraction_prompt_gpt_5.txt
+    memory_assembler: memory_assembler_prompt_gpt_5.txt
+    curation: curation_prompt_gpt_5.txt
   guardrails:
     file: codex.yaml
   settings:
