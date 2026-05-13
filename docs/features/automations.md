@@ -22,7 +22,121 @@ related:
 
 Design document for a native trigger system that creates jobs in response to time-based schedules **or** job-completion events, unified under a single "Automations" tab in the cockpit. The orchestrator API is documented as the escape hatch for the long tail (webhooks, inbound email, Slack, complex branching).
 
-**Status:** Design phase. Supersedes the earlier `routines.md` (cron-only) framing — that scope is now the cron half of this feature.
+**Status:** Updated 2026-05-08 with a research refresh (see next section). Design phase. Supersedes the earlier `routines.md` (cron-only) framing — that scope is now the cron half of this feature.
+
+## Research Refresh (2026-05-08)
+
+A round of competitive and codebase research surfaced enough new signal to warrant a delta section. The original v1 design shape (later sections) remains valid; this section captures factual corrections, additions, and updated decisions. Treat it as authoritative where it conflicts with later sections — surgical fixes have been applied inline below for the most critical items.
+
+### New competitive context (AI agent products with scheduling)
+
+The original Industry Context table cites infrastructure systems (GitHub Actions, Temporal, Argo Events, etc.). Since the doc was written, the AI-product space has moved:
+
+| Product | Triggers | Notable | Limits / Anti-pattern |
+|---|---|---|---|
+| **Anthropic Claude Code Routines** (research preview, 2026-04) | Schedule + GitHub events + per-routine HTTP API with bearer token | Closest direct competitor in shape. Tabbed editor, NL presets, cron via CLI. Deterministic stagger per routine. Min interval 1 hour. Per-routine API token with freeform `text` payload. | Daily run cap + hourly webhook cap |
+| **Claude Cowork tasks** | Schedule (hourly/daily/weekly) | Modal: name, prompt, frequency, model, working folder | "Only runs while computer is awake and app is open" — explicit durability gap |
+| **Claude Code `/loop` + `CronCreate`** | 5-field cron, 1-min granularity | "Let Claude pick the interval" mode — model decides next sleep based on observed state. Novel. | Max 50 per session, **7-day expiry on recurring** (auto-clean for forgotten loops, worth borrowing) |
+| **OpenAI ChatGPT Tasks** (Jan 2025 GA) | Schedule only (one-time + recurring) | NL entry; sidebar via profile menu | **10 active per user**; widely-criticized hard cap; silent-failure complaints on GPT-5.1 |
+| **Google Gemini Scheduled Actions** | Schedule (NL only, no cron exposed) | NL entry only; settings page management | **10 active**; same number as ChatGPT (deliberate copy); reviewer complaints about implicit conversion bugs |
+| **Manus Scheduled Tasks** | Daily/weekly/monthly + custom | Each fire runs the full agent (browse + search + text); matches our model | — |
+| **Lindy.ai** | Time + email + webhook + Calendar + Slack mention + per-integration | Most mature trigger taxonomy; multiple triggers per agent; trigger-level filters; visual flow canvas | **Credit pool, not task count** (400 free/mo) — best alternative to 10-task cap |
+| **Dust.tt Triggers** | Schedule + Webhook only | NL schedule entry → cron-like format displayed back; strong run-history transparency: "every trigger logs what ran, when, and why" | — |
+| **Zapier Agents + Schedule by Zapier** | Bridges existing Zapier triggers to AI agent action | Two-node pattern — cleanest separation-of-concerns | — |
+
+**Patterns appearing across multiple products — borrow these:**
+
+1. **Natural-language-first schedule input, cron as escape hatch.** Replit, Dust, Anthropic, Zapier, ChatGPT, Gemini all do this. Our doc currently leads with raw cron + presets; should flip to NL-first with cron as opt-in.
+2. **Multiple triggers per automation** (Lindy, Anthropic Routines). Our `trigger_type` enum is disjoint in v1 — fine, but the editor should still allow adding a second trigger to an existing automation later.
+3. **Run history with explicit "what ran, when, why."** Critical for trust. Dust, Anthropic Routines, HomeAssistant Traces, Manus all ship it.
+4. **Deterministic jitter / stagger** (Anthropic, Temporal). Server-side, derived from automation ID. Doc currently describes only `:07` presets in the picker — should be elevated to a server-side concept.
+5. **Tiered durability framing.** Cloud (durable, machine-off) / Local (durable, machine-on) / Session (ephemeral). Anthropic ships all three. We're a cloud product so durability falls out for free, but the framing matters in copy.
+
+**Anti-patterns to reject:**
+
+1. **Hard 10-task cap** (ChatGPT, Gemini). Cited as "feels cheap" on a $20/mo plan. Use credit/budget pool or per-frequency caps instead. Our soft cap of 20 per user is fine; just don't pitch it as a hard product limit.
+2. **Silent failures.** ChatGPT 5.1 community thread: "Scheduled tasks do not work at all." Build observability before scaling frequency. Anthropic explicitly disambiguates: "green status means the session exited without an infrastructure error — does not mean the task succeeded." Adopt similar copy.
+3. **Mobile/desktop parity gaps.** ChatGPT tasks invisible in mobile. Don't ship a feature that's only half-present on the surface users live in.
+
+**Differentiation:** **inter-agent / job-completion triggers** are genuinely novel ground in May 2026. Every product surveyed is schedule+webhook only. Anthropic Routines reacts to *external* events (GitHub) but not to its own routines completing. **"When scholar finishes, run critic"** is a real differentiator worth highlighting in copy.
+
+### Codebase reality check
+
+- **`completion.py` is pure logic.** The actual critic/curator subjob spawn lives in `orchestrator/main.py:6629-6643` inside the `POST /api/jobs/{id}/complete` handler. Three other terminal-state paths bypass it: `POST /api/jobs/{id}/approve` (`main.py:5498`), manual cancel, and the timeout sweeper (`main.py:584`). **`emit_lifecycle_event(...)` needs to fire from all four sites**, after the relevant DB writes commit.
+- **Line references shifted ~100-400 lines** due to growth: `auto_assign_dispatcher` at `main.py:2146` (was 1752), background tasks at `:3008-3023` (was 2421-2435), `jobs.priority` at `schema.sql:544`, `idx_jobs_priority` at `:612`, `get_dispatchable_jobs` at `postgres.py:1948`. Concepts all valid; numbers updated inline below.
+- **Migration target: `orchestrator/database/migrations/app/0003_create_automations.sql`.** Last applied is `0002_collapse_thread_status.sql`.
+- **`context.tags` is not yet a real convention** in the codebase (zero hits in search). The doc assumes it; we need to standardize as part of this work — likely a `ContextDict` TypedDict or normalization in `create_job()`.
+- **`autonomy` is not on the `JobCreate` model.** Either add it or bake into `config_override` at fire time.
+- **No pre-existing scheduling/cron/automation code** in the repo (zero hits for `cron|schedul|automation|routine` in orchestrator). No `LifecycleEvent` or pub/sub pattern either — building from scratch.
+
+### Frontend reality check
+
+- **Forms are template-driven signal-based, not Reactive Forms.** `formData = signal({...})` + `onXEdit(value) { update(...) }`. Validation is manual (computed signals). Follow this pattern, don't introduce `FormBuilder`/`FormGroup`.
+- **Closest CRUD analog: Projects** under `cockpit/src/app/views/projects/`. List + detail-as-editor pattern, ~1200 LOC for the detail view.
+- **i18n via `@jsverse/transloco`**, English + German shipped. cronstrue supports both. Estimated ~80-100 keys for the full feature.
+- **Design system:** `radio-group`, `select`, `input`, `textarea`, `chip`, `dialog`, `badge`, `form-field`, `card` are wired. **No code editor, no cron picker, no chip-input** for tag selection — build the cron picker from scratch or evaluate `ngx-cron-editor` (v0.10.2, Nov 2025).
+- **Real-time updates:** the existing pattern for the Jobs list is a Refresh button, not WebSocket subscription. Match that — poll `/api/automations/{id}` for `next_run_at` / `last_fired_at` updates.
+
+### Safety guards elevated due to real-world incidents
+
+The **$47K multi-agent runaway** (Tech Startups, 2025-11-14) — two Claude Haiku agents in a recursive clarification loop for 11 days with no chain-depth cap and no per-chain budget — pushed the cost-cap timeline forward. Other production incidents: **$4.2K in 63 hours** (Apr 2026), **$437 overnight** (Apr 2026).
+
+- **Per-chain cost cap moves from Phase 2 to Phase 1.** `chain_id` is already the join key; marginal implementation cost is small; postmortem consensus is "SDK-level budget enforcement is the only reliable protection."
+- **Add fingerprint-based loop detection at the automation level** — hash of `(automation_id, prompt-template, parent-chain-summary)`, analogous to existing per-job stuck detection in `src/`. Catches A→B→A→B before `max_chain_depth=10` triggers.
+- **Cross-automation overlap warning.** HomeAssistant's most-cited pitfall is two automations cross-triggering each other into a state-flip loop — the user owns both rules but doesn't realize they conflict. Cockpit should warn when a new automation's filter overlaps an existing one's emission profile.
+
+Industry default caps for sanity-check: AI SDK `stepCountIs(20)`, LangChain `max_iterations=15`. Our `max_chain_depth=10` and `max_fires_per_day=100` defaults are well-calibrated.
+
+### Don't promote to LISTEN/NOTIFY (2025 consensus)
+
+The original v2 promotion path lists "NATS / Redis Streams / Postgres LISTEN/NOTIFY." The 2025 consensus has shifted — **LISTEN/NOTIFY does not scale** ([Recall.ai, July 2025](https://www.recall.ai/blog/postgres-listen-notify-does-not-scale)) — global cluster-wide lock blocks all commits while a NOTIFY is pending.
+
+Updated v2 progression: in-process queue → outbox table + dedicated relay (`FOR UPDATE SKIP LOCKED`) → NATS or Redis Streams if pub/sub fan-out grows. LISTEN/NOTIFY at most as a latency-reducer signal *on top of* a polling outbox. **PgQueuer** (Python, async, has built-in scheduler) is the closest existing reference for this pattern in our language; worth name-checking, not a dependency.
+
+### Temporal corrections
+
+- **Overlap policies are six**, not five. Original list was missing `BufferAll`. Use Temporal's CamelCase: `Skip / BufferOne / BufferAll / CancelOther / TerminateOther / AllowAll`.
+- **Drop the Temporal Signals citation for A→B chaining.** Temporal explicitly recommends Child Workflows for that pattern; Signals can only target running executions ("you can only send Signals to Workflow Executions that haven't closed"). Our pub/sub-on-lifecycle-events is closer to **Argo Events** (already cited).
+- **GitHub Actions `workflow_run` filtering** is narrower than the original doc implies — `workflows + branches + types` only; conclusion is checked via job-level `if:`, not as a filter. Our `event_filter` is genuinely richer (`tags_any/all`, `min_priority`, `parent_automation_id`).
+- **Other Temporal Schedules properties worth borrowing**: `pause_on_failure` (auto-pauses on failure/timeout), `note` (human-readable annotation, especially for paused state), `last_completion_result` / `last_failure` (accessible to next run), `backfill` (retroactive execution of missed window).
+
+### UX framing improvements
+
+- **HomeAssistant 2025.12's "target-first" picker copy.** "When the scholar finishes" beats "On `job_complete` of expert `scholar`." Same UX gain HA captured in two years of editor work.
+- **Adopt Anthropic's "green ≠ success" disambiguation copy** in run-history rows.
+- **Timezone disclaimer prominently in the cron editor** — every consumer cron builder shows it; cheap; prevents the most common user error.
+- **HomeAssistant trace view as v2 north star** for chain visualization. Default 5 traces retained per automation matches HA.
+
+### Open questions resolved
+
+- **Q5 (quiet hours)** → **fire-time always proceeds; notify-time is gated.** Severity-stratified routing per PagerDuty/Slack pattern (urgent/blocking_message always notifies; routine completions queue into a morning digest). Lives in `notify_user_tool`, not in automations. Default 22:00–07:00 user-tz.
+- **Q7 (`phase_complete` events in v1)** → **defer.** No external precedent — every system surveyed exposes job-completion or message-event granularity, none expose intra-job phase boundaries. Ship `job_complete` only in v1; revisit in Phase 2 if real users pull.
+
+Q1, Q2, Q3, Q4, Q6 remain open.
+
+### New citations
+
+- [Claude Code Routines docs](https://code.claude.com/docs/en/routines)
+- [Claude Code scheduled tasks (`/loop`, CronCreate)](https://code.claude.com/docs/en/scheduled-tasks)
+- [Claude Cowork scheduled tasks](https://support.claude.com/en/articles/13854387-schedule-recurring-tasks-in-claude-cowork)
+- [ChatGPT Tasks](https://help.openai.com/en/articles/10291617-scheduled-tasks-in-chatgpt)
+- [Google Gemini Scheduled Actions](https://blog.google/products-and-platforms/products/gemini/scheduled-actions-gemini-app/)
+- [Manus Scheduled Tasks](https://manus.im/docs/features/scheduled-tasks)
+- [Lindy.ai pricing](https://www.lindy.ai/pricing)
+- [Replit Scheduled Deployments](https://blog.replit.com/scheduled-deployments)
+- [Replit Agent 4 launch](https://blog.replit.com/introducing-agent-4-built-for-creativity)
+- [Dust.tt scheduled triggers](https://dust.tt/academy/agent-automation/chapter/scheduled-triggers)
+- [Zapier Agents guide](https://zapier.com/blog/zapier-agents-guide/)
+- [Temporal Schedule docs (2026)](https://docs.temporal.io/schedule)
+- [Temporal Python SDK ScheduleOverlapPolicy](https://python.temporal.io/temporalio.client.ScheduleOverlapPolicy.html)
+- [HomeAssistant 2025.12 release post (target-first triggers)](https://www.home-assistant.io/blog/2025/12/03/release-202512/)
+- [HomeAssistant 2025.11 release post (editor redesign)](https://www.home-assistant.io/blog/2025/11/05/release-202511/)
+- [Recall.ai: LISTEN/NOTIFY does not scale](https://www.recall.ai/blog/postgres-listen-notify-does-not-scale)
+- [Tech Startups: $47K AI agent failure](https://techstartups.com/2025/11/14/ai-agents-horror-stories-how-a-47000-ai-agent-failure-exposed-the-hype-and-hidden-risks-of-multi-agent-systems/)
+- [Mohamed Msatfi: $47K loop reproduction](https://medium.com/@mohamedmsatfi1/i-spent-0-20-reproducing-the-multi-agent-loop-that-cost-someone-47k-7f57c51f3c06)
+- [PgQueuer](https://github.com/janbjorge/pgqueuer)
+- [ngx-cron-editor](https://www.npmjs.com/package/ngx-cron-editor)
+- [AI SDK loop control](https://ai-sdk.dev/docs/agents/loop-control)
 
 ## What "Automation" Means Here
 
@@ -86,18 +200,18 @@ This document specifies the native path.
 
 5. **The hard part is not the dispatchers, it's the UI.** A cron tick is twenty lines of code. An event consumer is forty. An "Automations" tab where a non-technical user can create either kind of trigger without reading docs is the whole feature. Skip this and the implementation might as well not exist.
 
-6. **Performance is a non-concern.** A 60-second cron tick + a pub/sub on completion events is rounding error compared to what the orchestrator already does (the auto-assign dispatcher polls every few seconds at `orchestrator/main.py:1802`, every agent heartbeats every 5 seconds, IMAP poll every 30 seconds). One more background task in the existing `asyncio.create_task` lineup at `orchestrator/main.py:2421-2435` adds nothing measurable.
+6. **Performance is a non-concern.** A 60-second cron tick + a pub/sub on completion events is rounding error compared to what the orchestrator already does (the auto-assign dispatcher polls every few seconds at `orchestrator/main.py:2155`, every agent heartbeats every 5 seconds, IMAP poll every 30 seconds). One more background task in the existing `asyncio.create_task` lineup at `orchestrator/main.py:3008-3023` adds nothing measurable.
 
 7. **Specific patterns we're borrowing from named systems** — explicit attribution so the design choices are auditable:
    - **CTE + `FOR UPDATE SKIP LOCKED`** — from river, graphile-worker, PgQueuer. The de facto modern Postgres-as-queue idiom. Used for the cron tick and (for multi-replica safety) the event consumer's candidate selection.
    - **`catchup_window_seconds`** — from Sidekiq-Cron's `reschedule_grace_time` and Temporal Schedules' `CatchupWindow`. Drop fires past the window rather than back-filling a flood.
    - **Fire-each-overdue-once + advance to future** — Sidekiq-Cron's behavior. Avoids Airflow's notorious old `catchup=True` backfill flood.
    - **Compute next from previous scheduled time** — explicit lesson from multiple Rails / Python blog post-mortems on schedule drift.
-   - **Temporal Schedules overlap-policy vocabulary** (`SKIP`, `BUFFER_ONE`, `ALLOW_ALL`, `CANCEL_OTHER`, `TERMINATE_OTHER`) — adopted now (even though v1 only ships `ALLOW_ALL`) so we don't have to rename later.
+   - **Temporal Schedules overlap-policy vocabulary** (`Skip`, `BufferOne`, `BufferAll`, `AllowAll`, `CancelOther`, `TerminateOther`) — adopted now (even though v1 only ships `AllowAll`) so we don't have to rename later. Note: earlier readings of this doc listed only five policies; the current Temporal SDK exposes six, with `BufferAll` (sequential queue, unlimited) included.
    - **`scheduled_for` vs `dispatched_at` as separate columns** — Airflow's `execution_date` → `logical_date` rename war story.
    - **GitHub Actions `workflow_run`** — the event-trigger filter syntax (named source workflow + completion-status filter) and the explicit "only when triggered by my own workflows" semantic.
    - **HomeAssistant "Automations"** — the user-facing naming and the unified time-and-event mental model. Users coming from HA will recognize the shape immediately.
-   - **Argo Events / Temporal Signals** — the lifecycle-event-as-pub/sub backend pattern.
+   - **Argo Events** — the lifecycle-event-as-pub/sub backend pattern. (Temporal Signals were originally cited here, but they target running Workflow Executions only — Temporal recommends Child Workflows for A→B chaining, a parent-stays-alive pattern that is the opposite of what we want.)
    - **`cronstrue` + jittered presets** — from cron-job.org and GitLab Schedules' UI patterns.
 
 ## Design
@@ -260,11 +374,11 @@ The two partial indexes mirror the two dispatchers: the cron index stays small e
 
 **`priority`** — a template field, not a new mechanism. Copied verbatim into the resulting `jobs.priority` at fire time. Same scale, same default (5), same semantics as a manually-created job. See the Priority subsection for how the existing dispatcher uses it.
 
-**`max_chain_depth` and `max_fires_per_day`** — load-bearing safety guards introduced to control event-driven chains. With cron there's no equivalent risk because the trigger is fixed-frequency. With events, scholar→critic→developer→scholar→... can loop forever if a filter is too broad or two automations cross-trigger each other. Both guards are detailed in "What Could Go Wrong."
+**`max_chain_depth` and `max_fires_per_day`** — load-bearing safety guards introduced to control event-driven chains. With cron there's no equivalent risk because the trigger is fixed-frequency. With events, scholar→critic→developer→scholar→... can loop forever if a filter is too broad or two automations cross-trigger each other. The November 2025 **$47K multi-agent runaway** (two Claude Haiku agents in a recursive clarification loop for 11 days) is the canonical incident this exists to prevent. Industry default caps for sanity-check: AI SDK `stepCountIs(20)`, LangChain `max_iterations=15`. Both guards are detailed in "What Could Go Wrong."
 
 ### Priority
 
-Automations reuse the existing `jobs.priority` column (`INTEGER NOT NULL DEFAULT 5`, defined at `orchestrator/database/schema.sql:536` with index `idx_jobs_priority` at line 604) and the existing two-phase auto-assign dispatcher at `orchestrator/main.py:1752`. Phase 1 directly assigns free agents to the highest-priority pending jobs — `get_dispatchable_jobs` in `orchestrator/database/postgres.py:1931` orders by `priority DESC, created_at ASC`. Phase 2 preempts lowest-priority running jobs when higher-priority pending ones can't otherwise be scheduled. Both phases are already shipped; the automations feature does not extend or modify them.
+Automations reuse the existing `jobs.priority` column (`INTEGER NOT NULL DEFAULT 5`, defined at `orchestrator/database/schema.sql:544` with index `idx_jobs_priority` at line 612) and the existing two-phase auto-assign dispatcher at `orchestrator/main.py:2146`. Phase 1 directly assigns free agents to the highest-priority pending jobs — `get_dispatchable_jobs` in `orchestrator/database/postgres.py:1948` orders by `priority DESC, created_at ASC`. Phase 2 preempts lowest-priority running jobs when higher-priority pending ones can't otherwise be scheduled. Both phases are already shipped; the automations feature does not extend or modify them.
 
 `automations.priority` is therefore a **template field**: `create_job_from_automation` copies it verbatim into the new job's `priority` column, and from there the dispatcher takes over with no special handling for automation-spawned jobs. An automation-spawned job looks identical to a manually-created job from the dispatcher's point of view.
 
@@ -276,7 +390,7 @@ This is the original "Routines" feature, preserved verbatim under the new name. 
 
 #### `cron_dispatcher` (60s tick)
 
-A new async loop, mounted alongside the existing background tasks at `orchestrator/main.py:2421-2435`:
+A new async loop, mounted alongside the existing background tasks at `orchestrator/main.py:3008-3023`:
 
 ```python
 # orchestrator/services/cron_dispatcher.py
@@ -372,7 +486,7 @@ async def _tick() -> None:
 - **CTE + `FOR UPDATE SKIP LOCKED`** — selecting due rows and processing them inside a single transaction is the pattern used by river, graphile-worker, and PgQueuer. The locked rows are released on commit; multiple orchestrator replicas can tick in parallel and never collide. The transactional approach gives **exactly-once fire semantics for free**: if the tick crashes between job INSERT and automation UPDATE, the transaction rolls back and the next tick re-tries the same automation with the same `scheduled_for`. No `(automation_id, scheduled_fire_time)` unique constraint required.
 - **`next_run` is computed from the previous `scheduled_for`, not from `now()`.** Anchoring on wall-clock time causes drift on minute-level schedules: a 1.5-second tick on `* * * * *` shifts the schedule forward by 1.5s every minute. Always advance from the cron-canonical previous time.
 - **The `while next_run <= now` loop** collapses long downtime to a single fire. If the orchestrator was down for 6 hours on a `0 * * * *` schedule, we fire once for the most recent due hour (or skip if past the catchup window) and advance `next_run_at` to the next *future* hour — no flood of 6 backfilled jobs.
-- **`create_job_from_automation` calls the existing job-creation service** used by `POST /api/jobs`. The created job carries `context.automation_id = <automation.id>`, `context.trigger = 'cron'`, and `context.scheduled_for = <iso8601>` so it's filterable in the job list and audit-visible. The new job's `priority` is populated from `r["priority"]` — the existing two-phase auto-assign dispatcher (`orchestrator/main.py:1752`) handles ordering and preemption with no scheduler-side changes.
+- **`create_job_from_automation` calls the existing job-creation service** used by `POST /api/jobs`. The created job carries `context.automation_id = <automation.id>`, `context.trigger = 'cron'`, and `context.scheduled_for = <iso8601>` so it's filterable in the job list and audit-visible. The new job's `priority` is populated from `r["priority"]` — the existing two-phase auto-assign dispatcher (`orchestrator/main.py:2146`) handles ordering and preemption with no scheduler-side changes.
 - **`LIMIT 100`** caps per-tick work. Sudden spikes (downtime recovery) are absorbed across multiple ticks. Jitter the `next_run_at` of recovered automations slightly to desynchronize fleets.
 - The 60s sleep is a `wait_for(shutdown_event)` so the task tears down cleanly on orchestrator shutdown.
 
@@ -386,11 +500,11 @@ The new half. Designed to express *"when X agent finishes, run Y"* — the patte
 
 #### Lifecycle Events
 
-The orchestrator already runs every job through `orchestrator/services/completion.py` when an agent reports completion. Today, that service deterministically spawns critic / curator subjobs under fixed conditions. **For event triggers, we generalize the existing hooks into a typed event broadcast:**
+The orchestrator runs every successfully-completed job through `orchestrator/services/completion.py`, which evaluates whether to spawn a critic / curator subjob. **Codebase reality (corrected 2026-05-08):** `completion.py` is pure logic — synchronous condition evaluators with no DB calls or async. The actual subjob spawning lives in the `POST /api/jobs/{id}/complete` handler at `orchestrator/main.py:6629-6643`, and three other terminal-state paths bypass that handler entirely: `POST /api/jobs/{id}/approve` (`main.py:5498`), manual cancellation, and the timeout sweeper (`main.py:584`). **`emit_lifecycle_event(...)` therefore needs to fire from all four sites**, after the relevant DB writes commit. **For event triggers, we generalize these hooks into a typed event broadcast:**
 
 ```python
-# Added at the end of completion processing in orchestrator/services/completion.py,
-# AFTER the DB writes that mark the job complete have committed.
+# Emitted from each terminal-state path in orchestrator/main.py
+# (complete / approve / cancel / timeout-sweep), AFTER the DB writes commit.
 await emit_lifecycle_event(LifecycleEvent(
     type="job_complete",
     job_id=job["id"],
@@ -483,7 +597,7 @@ async def _handle(event: LifecycleEvent) -> None:
 
 **Key properties:**
 
-- **In-process `asyncio.Queue` pub/sub in v1.** Single-replica orchestrator today; one queue is enough. Promote to a durable broker (NATS, Redis Streams, Postgres `LISTEN`/`NOTIFY` with a transactional outbox) if/when we run multiple replicas.
+- **In-process `asyncio.Queue` pub/sub in v1.** Single-replica orchestrator today; one queue is enough. Promote to a durable broker (outbox table + dedicated relay using `FOR UPDATE SKIP LOCKED`, then NATS or Redis Streams for fan-out) if/when we run multiple replicas. **Avoid Postgres `LISTEN`/`NOTIFY` as the primary delivery mechanism** — global cluster-wide lock blocks all commits while a NOTIFY is pending ([Recall.ai, July 2025](https://www.recall.ai/blog/postgres-listen-notify-does-not-scale)). It's fine as a latency-reducer signal *on top of* the polling outbox, never as the only mechanism.
 - **GIN index on `event_filter` (`jsonb_path_ops`)** keeps candidate selection sub-millisecond even with tens of thousands of event-trigger automations. The remaining filter clauses (`tags_any`, `tags_all`, `min_priority`, `parent_automation_id`) are evaluated in Python after candidate narrowing — they can't be expressed as JSONB containment cheaply.
 - **`create_job_from_automation` writes `chain_id` and `chain_depth = parent.chain_depth + 1`** into the new job's `context`. This is what gives `max_chain_depth` something to count. `chain_id` is preserved across all hops descended from the same root fire, so the cockpit can render the full chain as one entity and a Phase-2 per-chain cost cap becomes possible.
 - **`SKIP LOCKED`** matters for future multi-replica deployments: when multiple consumers drain the same logical event stream, the row-level lock prevents double-fires.
@@ -655,7 +769,7 @@ Log lines complement metrics. Every fire logs: `automation_id`, `trigger_type`, 
 | **Event filter too broad — matches on jobs the user didn't intend** | `parent_automation_id` filter for chain-restricted rules; `parent_user_id` default-on; cockpit's "last 5 matching jobs" preview shows what would have fired before save; tags as the recommended way to mark intent on the parent side |
 | **Event-trigger fires before parent job's outputs are durable** | `emit_lifecycle_event` is called *after* the completion service commits its DB writes, never before. v2 promotes this to a Postgres-backed transactional outbox if we go multi-replica |
 | **Cost runaway from a frequent cron automation** | Per-automation daily/monthly LLM cost cap → auto-pause when exceeded. Defer to Phase 2; reuse existing budget infrastructure |
-| **Cost runaway across an event chain** | Per-`chain_id` cost cap (Phase 2). `chain_id` is already the join key. Reuses existing per-job cost tracking |
+| **Cost runaway across an event chain** | Per-`chain_id` cost cap (Phase 1, elevated from Phase 2 after the November 2025 $47K incident). `chain_id` is already the join key. Reuses existing per-job cost tracking |
 | Always-failing automation | Cockpit shows `last_status` prominently. Phase 2: auto-disable after N consecutive failures and notify the owner. Silent auto-disable is worse than no auto-disable |
 | Typo'd `* * * * *` cron | Minimum-interval floor on cron-trigger creation (default 5 minutes for non-admin users). Soft cap of 20 automations per user |
 | Orphaned automations after user deletion | `ON DELETE CASCADE` from `owner_id` |
@@ -695,17 +809,17 @@ Log lines complement metrics. Every fire logs: `automation_id`, `trigger_type`, 
 | `orchestrator/services/completion.py` | Generalize the existing critic / curator spawn hooks into `emit_lifecycle_event` calls. The existing deterministic behavior is preserved either as a code-level fallback OR as a default-installed system automation (decide in implementation order step 2 below) |
 | `orchestrator/main.py` | Mount `/api/automations` routes; start both dispatchers in lifespan startup at lines 2421-2435 |
 | `requirements.txt` | Add `croniter` if not already present |
-| `cockpit/package.json` | Add `cronstrue` and `cron-parser` |
+| `cockpit/package.json` | Add `cronstrue` and `cron-parser`. Evaluate `ngx-cron-editor` (v0.10.2, Nov 2025) as a candidate for the cron picker UI; fall back to hand-built preset picker if friend-test fails |
 | `cockpit/src/app/app.routes.ts` | Add `/automations` route, lazy-loaded |
 | `cockpit/src/app/layout/...` | Add "Automations" item to main navigation |
 
 #### Implementation Order
 
 1. **Schema + helpers** — Add the `automations` table and query helpers. Run `init.py` to apply. Land `LifecycleEvent` types.
-2. **Generalize `completion.py` hooks** — turn the hardcoded critic / curator spawn into `emit_lifecycle_event` calls. Verify existing deterministic behavior is preserved either by a code-level fallback OR by default-installed "system automations" the user can later see/edit. **Decide which here, before downstream work proceeds**: code-level fallback is simpler; default-installed automations make the system more inspectable and align with the "everything is a rule" mental model. Recommend default-installed if migration is tractable.
+2. **Wire `emit_lifecycle_event` into the four terminal paths** — `complete`, `approve`, manual cancel, and timeout sweeper. Each call goes after DB commit. The hardcoded critic/curator spawn at `main.py:6629-6643` becomes either (a) a code-level fallback that fires when no automation matches, or (b) a default-installed system automation. **Decide which here before downstream work proceeds**: (a) is simpler and safer for v1; (b) makes the system inspectable and aligns with the "everything is a rule" mental model. Recommendation: (a) for v1, promote to (b) in Phase 2 once battle-tested.
 3. **API endpoints** — CRUD + `run-now` + `pause`/`resume` + `preview`. Tests for trigger-type-conditional validation.
 4. **Cron dispatcher** — port the loop + tests from the original routines design, mostly verbatim.
-5. **Event dispatcher** — new code. Tests for every filter clause and every safety guard.
+5. **Event dispatcher** — new code. Tests for every filter clause and every safety guard. **Includes per-chain cost cap (elevated from Phase 2 after the November 2025 $47K incident) and fingerprint-based loop detection at the automation layer** (hash of `automation_id` + prompt-template + parent-chain-summary, analogous to the per-job stuck detection in `src/`).
 6. **Cockpit list view** — read-only first. Verify automations created via API appear correctly.
 7. **Cockpit editor** — trigger-type radio + branching form. Friend-test gate before merging.
 8. **Cron preview + event preview widgets** — both must ship before the editor is feature-complete.
@@ -717,7 +831,6 @@ Log lines complement metrics. Every fire logs: `automation_id`, `trigger_type`, 
 - **Auto-disable on repeated failures.** After N consecutive failed runs, auto-disable the automation and notify the owner. Threshold per-automation, default 3. Adds a `consecutive_failures` column.
 - **Per-automation `overlap_policy` (cron).** Borrow Temporal Schedules vocabulary: `ALLOW_ALL`, `SKIP`, `BUFFER_ONE`, `CANCEL_OTHER`, `TERMINATE_OTHER`. UI default `SKIP` for new automations; existing stay on `ALLOW_ALL` for back-compat.
 - **Per-automation cost cap.** `daily_cost_cap_usd` / `monthly_cost_cap_usd`. Auto-pause + notify when exceeded.
-- **Per-chain cost cap (event chains).** Sum job costs by `chain_id`; trip the cap before A11 fires if A1..A10 already burned the budget.
 - **`automation_fires` history table.** Promote when query performance demands it. Include retention policy (default 90 days).
 - **Automation duplication / templates.** "Save as template" so similar automations can be created without retyping.
 - **Project-level sharing.** `project_id` already supports it; needs UI affordances.
@@ -745,11 +858,11 @@ The existence of these future trigger sources is **the reason a clean lifecycle-
 
 4. **MCP exposure.** Should there be `create_automation` / `list_automations` MCP tools so Claude Code can manage automations on the user's behalf? Probably yes, but small.
 
-5. **Quiet hours.** Cron fires obey quiet hours? Probably ignore — user explicitly set the schedule. Event fires during quiet hours? Trickier — a 3am critic fire might be fine, but its email notification shouldn't wake anyone. Decide separately for fire-time vs. notify-time.
+5. ~~**Quiet hours.**~~ **Resolved 2026-05-08:** fire-time always proceeds; notify-time is gated. Severity-stratified routing per PagerDuty/Slack pattern — urgent/blocking_message always notifies; routine completions queue into a morning digest. Lives in `notify_user_tool`, not in automations. Default window 22:00–07:00 user-tz, freeze-on-urgent overrides.
 
 6. **Should `completion.py`'s existing critic / curator spawn become a default-installed system automation, or stay code?** Leaning toward default-installed — it makes the system inspectable and user-tweakable, and there's no second behavior path. But the migration story is delicate (existing users, "system" ownership, rollback if it misbehaves). Decide before step 2 of the implementation order.
 
-7. **Phase-complete events.** The schema and `event_filter` support `on=phase_complete`, but enabling it has a cost (per-phase emit, even if no automation subscribes). The proposed mitigation is ref-counting subscribers per event type; verify this is performant before exposing it in the v1 UI. If not, ship `job_complete` only and add `phase_complete` in Phase 2.
+7. ~~**Phase-complete events.**~~ **Resolved 2026-05-08:** ship `job_complete` only in v1; defer `phase_complete` to Phase 2. No external precedent — every product surveyed (ChatGPT, Gemini, Manus, Lindy, Anthropic Routines, etc.) exposes job-completion or message-event granularity; none expose intra-job phase boundaries. Revisit if real users pull.
 
 ## Future Extensions
 
