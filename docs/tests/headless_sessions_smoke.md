@@ -28,6 +28,7 @@ Applying migration: 0004_thread_events.sql               OK
 Applying migration: 0005_thread_permission_requests.sql  OK
 Applying migration: 0006_headless_notifications.sql      OK
 Applying migration: 0007_thread_pk_identity.sql          OK
+Applying migration: 0008_thread_awaiting_user.sql        OK
 ```
 
 If you see any `ERROR` line in the migration output, **stop here** — the migration syntax is the problem and the rest of the smoke is moot.
@@ -369,15 +370,300 @@ psql_dev -c "
 
 ---
 
+## Phase 5 sections (attention sleep, magic-link wake, extend window)
+
+These verify Phase 5 plumbing without standing up a real LangGraph loop. Run after §1 has confirmed migration 0008 is applied.
+
+### P5.1 — Verify migration 0008 landed
+
+```bash
+psql_dev -c "
+  -- New columns
+  SELECT column_name FROM information_schema.columns
+   WHERE table_name='threads'
+     AND column_name IN ('awaiting_user_since','extend_count');
+  -- Predicate index on awaiting_user_since
+  SELECT indexname FROM pg_indexes
+   WHERE tablename='threads'
+     AND indexname='idx_threads_awaiting_user_since';
+  -- CHECK constraint now allows awaiting_user / suspended
+  SELECT pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class t ON c.conrelid=t.oid
+   WHERE t.relname='threads' AND c.conname='valid_thread_status';
+"
+```
+
+**Pass criteria:** two column rows, one index row, and the constraint string contains `'awaiting_user'` and `'suspended'`.
+
+### P5.2 — Status endpoint accepts awaiting_user, rejects suspended
+
+```bash
+# awaiting_user — should 200 and set awaiting_user_since
+curl -s -X PUT -H "Content-Type: application/json" \
+  -d '{"status":"awaiting_user"}' \
+  "http://localhost:8085/api/agents/threads/$THREAD_ID/status"
+
+psql_dev -c "SELECT status, awaiting_user_since IS NOT NULL AS ts_set,
+                    extend_count FROM threads WHERE id='$THREAD_ID';"
+
+# Second call — awaiting_user_since must NOT change (idempotent)
+TS_BEFORE=$(psql_dev -At -c "SELECT awaiting_user_since FROM threads WHERE id='$THREAD_ID';")
+sleep 1
+curl -s -X PUT -H "Content-Type: application/json" \
+  -d '{"status":"awaiting_user"}' \
+  "http://localhost:8085/api/agents/threads/$THREAD_ID/status"
+TS_AFTER=$(psql_dev -At -c "SELECT awaiting_user_since FROM threads WHERE id='$THREAD_ID';")
+[ "$TS_BEFORE" = "$TS_AFTER" ] && echo "OK: timestamp preserved" || echo "FAIL: timestamp moved"
+
+# Revert to active — clears the timer fields
+curl -s -X PUT -H "Content-Type: application/json" \
+  -d '{"status":"active"}' \
+  "http://localhost:8085/api/agents/threads/$THREAD_ID/status"
+psql_dev -c "SELECT status, awaiting_user_since IS NULL AS cleared,
+                    extend_count FROM threads WHERE id='$THREAD_ID';"
+
+# suspended must be rejected
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X PUT -H "Content-Type: application/json" \
+  -d '{"status":"suspended"}' \
+  "http://localhost:8085/api/agents/threads/$THREAD_ID/status"
+```
+
+**Pass criteria:** awaiting_user transitions set timestamp; second write preserves it; active revert clears both fields and resets extend_count to 0; `suspended` returns `400`.
+
+### P5.3 — Attention-sleep watchdog suspends stale threads
+
+The default TTL is 60 min, too slow to wait for during a smoke. We drop it to 0 so the very next sweeper tick (within 60s) suspends anything currently in `awaiting_user`.
+
+In **terminal C** (the orchestrator window), stop the running process (Ctrl+C) and restart with the env override:
+
+```bash
+HEADLESS_ATTENTION_SLEEP_MINUTES=0 \
+  uvicorn orchestrator.main:app --reload --port 8085
+```
+
+Watch the startup log for `Attention-sleep sweeper started (interval=60s, ttl=0min)` — that confirms the env took effect.
+
+In **terminal D**:
+
+```bash
+# Force a stale awaiting_user state. The watchdog will see it on its
+# next tick (every 60s) and call suspend_thread_workspace.
+psql_dev -c "
+  UPDATE threads
+     SET status='awaiting_user',
+         awaiting_user_since = now() - interval '5 minutes'
+   WHERE id='$THREAD_ID';
+"
+
+echo 'Watching terminal C for the suspend log line (up to 75s)...'
+sleep 75
+
+psql_dev -c "SELECT status FROM threads WHERE id='$THREAD_ID';"
+```
+
+**Pass criteria:** Terminal C log contains *either*:
+
+- `attention-sleep: thread <uuid> suspended (was awaiting_user >0m)` — full success; thread.status is now `suspended`.
+- `attention-sleep: suspend declined for thread <uuid> (workspace not ready or already suspending)` — also a pass for this smoke. The watchdog **did select** the row and call `suspend_thread_workspace()`; the service correctly refused because there's no live workspace pod (no S3 / no provisioner on dev). Thread status stays `awaiting_user` in this case.
+
+**Reset:** Ctrl+C terminal C and restart without the env var before continuing to P5.4.
+
+### P5.4 — Magic-link extend window
+
+Mint a fresh token + pending request (the same Python snippet as §3 — adapted to use a new `REQ_ID` so we don't conflict with earlier-consumed tokens):
+
+```bash
+REQ_ID=$(psql_dev -t -c "
+  INSERT INTO thread_permission_requests
+  (thread_id, tool_call_id, tool_name, tool_args)
+  VALUES ('$THREAD_ID', 'tc-extend', 'run_command',
+          '{\"cmd\": \"sleep 100\"}'::jsonb)
+  RETURNING id;
+" | tr -d ' ')
+
+python -c "
+import asyncio, hashlib, secrets
+from datetime import datetime, timezone, timedelta
+import asyncpg
+THREAD_ID = '$THREAD_ID'
+REQ_ID = '$REQ_ID'
+async def main():
+    pool = await asyncpg.create_pool(
+        'postgresql://srw:srw_password@localhost:5432/srw', min_size=1, max_size=1)
+    raw = secrets.token_urlsafe(32)
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    async with pool.acquire() as conn:
+        await conn.execute('''
+          INSERT INTO magic_link_tokens
+          (token_hash, purpose, approval_id, thread_id,
+           intended_decision, expires_at)
+          VALUES (\$1, 'approve_permission', \$2, \$3, 'approved', \$4)
+        ''', h, REQ_ID, THREAD_ID, expires)
+    print(f'TOKEN={raw}')
+    await pool.close()
+asyncio.run(main())
+" | tee /tmp/smoke-extend-token.txt
+TOKEN=$(grep '^TOKEN=' /tmp/smoke-extend-token.txt | cut -d= -f2)
+```
+
+Now exercise extend:
+
+```bash
+# Set thread to awaiting_user so the extend has something to bump.
+psql_dev -c "
+  UPDATE threads SET status='awaiting_user',
+                     awaiting_user_since = now() - interval '10 minutes',
+                     extend_count=0
+   WHERE id='$THREAD_ID';
+"
+
+# First extend — should bump timestamp + extend_count, render 'extended' banner.
+curl -s -X POST "http://localhost:8085/magic/extend/$TOKEN" | grep -i "extended by 60 minutes" \
+  && echo "OK: extend 1 banner" || echo "FAIL: no banner"
+psql_dev -c "SELECT extend_count,
+                    awaiting_user_since > now() - interval '1 minute' AS bumped
+               FROM threads WHERE id='$THREAD_ID';"
+
+# Click 3 more times — extend_count reaches 4 (cap).
+for i in 2 3 4; do curl -s -X POST "http://localhost:8085/magic/extend/$TOKEN" > /dev/null; done
+psql_dev -c "SELECT extend_count FROM threads WHERE id='$THREAD_ID';"
+
+# Fifth click — UPDATE misses (extend_count >= cap), banner shows 'cap_reached'.
+curl -s -X POST "http://localhost:8085/magic/extend/$TOKEN" | grep -i "Extend limit reached" \
+  && echo "OK: cap banner" || echo "FAIL: no cap banner"
+
+# Confirm extend did NOT consume the approval token.
+psql_dev -c "SELECT used_at IS NULL AS still_unused FROM magic_link_tokens
+              WHERE token_hash = encode(sha256('$TOKEN'::bytea), 'hex');"
+```
+
+**Pass criteria:** first POST shows "Window extended" banner; `extend_count = 1` and `awaiting_user_since` bumped to ~now; after the 4th click `extend_count = 4`; the 5th shows the cap banner; the approve token's `used_at` is still NULL throughout.
+
+### P5.5 — Invalid token on extend returns 404
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -X POST "http://localhost:8085/magic/extend/this-is-not-a-real-token"
+```
+
+**Pass criteria:** `404`.
+
+### P5.6 — Magic-link approve fires wake task on suspended workspace
+
+The wake task is fire-and-forget after the POST returns, so this step is purely log inspection. We simulate a suspended state directly (no S3 / no provisioner needed — `workspace_suspension_service.is_enabled` only requires the S3 client object, which the dev compose initializes even without buckets, so the helper at least reaches the `restore_thread_workspace` call before failing).
+
+> **Dev-cluster heads-up.** On a wired K8s dev cluster (where `persistent_provisioner` is configured), the wake helper goes further than the docker-compose path: after logging `magic-link wake: restoring suspended workspace …` it calls `restore_thread_workspace`, which succeeds structurally even on a snapshot 404, then provisions a real **workspace pod + PVC + agent pod** for the test thread. The DB-revert in the cleanup snippet below does NOT delete those cluster resources — see [`docs/issues/headless_sessions_smoke_leaks_cluster_pods.md`](../issues/headless_sessions_smoke_leaks_cluster_pods.md) and the `kubectl delete` step at the end of this section. The pass criterion is still "log line fired"; everything past the log line is best-effort restore on the cluster and best-effort no-op on docker-compose.
+
+Mint a fresh approve token + pending request:
+
+```bash
+REQ_ID=$(psql_dev -t -c "
+  INSERT INTO thread_permission_requests
+  (thread_id, tool_call_id, tool_name, tool_args)
+  VALUES ('$THREAD_ID', 'tc-wake', 'run_command',
+          '{\"cmd\": \"date\"}'::jsonb)
+  RETURNING id;
+" | tr -d ' ')
+
+python -c "
+import asyncio, hashlib, secrets
+from datetime import datetime, timezone, timedelta
+import asyncpg
+THREAD_ID = '$THREAD_ID'
+REQ_ID = '$REQ_ID'
+async def main():
+    pool = await asyncpg.create_pool(
+        'postgresql://srw:srw_password@localhost:5432/srw', min_size=1, max_size=1)
+    raw = secrets.token_urlsafe(32)
+    h = hashlib.sha256(raw.encode()).hexdigest()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    async with pool.acquire() as conn:
+        await conn.execute('''
+          INSERT INTO magic_link_tokens
+          (token_hash, purpose, approval_id, thread_id,
+           intended_decision, expires_at)
+          VALUES (\$1, 'approve_permission', \$2, \$3, 'approved', \$4)
+        ''', h, REQ_ID, THREAD_ID, expires)
+    print(f'TOKEN={raw}')
+    await pool.close()
+asyncio.run(main())
+" | tee /tmp/smoke-wake-token.txt
+TOKEN=$(grep '^TOKEN=' /tmp/smoke-wake-token.txt | cut -d= -f2)
+```
+
+Mark the thread workspace as suspended in metadata, then POST:
+
+```bash
+psql_dev -c "
+  UPDATE threads
+     SET status='suspended',
+         metadata = jsonb_set(
+           COALESCE(metadata, '{}'::jsonb),
+           '{workspace_container,status}',
+           '\"suspended\"'::jsonb
+         )
+   WHERE id='$THREAD_ID';
+"
+
+curl -s -X POST "http://localhost:8085/magic/approve/$TOKEN" | head -c 200
+echo ""
+echo "Check terminal C for 'magic-link wake: restoring' line (within ~1s)"
+```
+
+**Pass criteria:** Terminal C (orchestrator) log contains *either*:
+
+- `magic-link wake: restoring suspended workspace for thread <uuid>` followed by either success or `workspace restore failed` — confirms the wake helper fired and reached the restore call.
+- Nothing at all → FAIL (wake task didn't fire).
+
+The POST itself returns 200 with "Tool approved" body regardless — the wake is fire-and-forget after the permission UPDATE.
+
+**Cleanup:** revert thread back to a clean state:
+
+```bash
+psql_dev -c "
+  UPDATE threads SET status='active',
+                     awaiting_user_since=NULL,
+                     extend_count=0,
+                     metadata=metadata - 'workspace_container'
+   WHERE id='$THREAD_ID';
+"
+```
+
+**On a wired dev cluster, also delete the orphaned pods + PVC** the wake task spawned. The three resources all carry the first 8 chars of the thread UUID in their names — `grep` them out, then delete:
+
+```bash
+# Adjust namespace if different (production manifests use superhuman-remote-worker).
+NS=superhuman-remote-worker
+
+# List what got created so you can sanity-check before deleting.
+kubectl -n "$NS" get pods,pvc | grep "${THREAD_ID:0:8}" || \
+  echo "Nothing matched — probably running against docker-compose, skip the delete."
+
+# Delete pods + PVC matching the short thread ID. --wait=false so we don't
+# block on PVC finalizers.
+kubectl -n "$NS" get pods,pvc -o name | grep "${THREAD_ID:0:8}" | \
+  xargs -r kubectl -n "$NS" delete --wait=false
+```
+
+If you skip this step, each P5.6 run leaks 1 workspace pod, 1 PVC, and 1 agent pod into the namespace. They will not be picked up by the normal idle/suspension sweepers because the thread row is now `active` with no `workspace_container` metadata.
+
+---
+
 ## Common failure modes
 
 | Symptom | Likely cause |
 |---|---|
 | Migration 0004/5/6 syntax error | SQL dialect issue — likely `BIGSERIAL` vs `BIGINT GENERATED BY DEFAULT AS IDENTITY` or a stray `;` in the trigger function |
+| Migration 0008 fails with constraint conflict | Existing rows have `status='idle'` somehow — backfill to `'ended'` first (migration 0002 already did this, but a manual UPDATE could have re-introduced) |
 | NOTIFY never arrives in §2 | Trigger function not installed, or condition `NEW.status <> OLD.status` failed because OLD is NULL on something other than UPDATE |
 | GET magic-link returns 500 | Likely HTMLResponse import or `urllib.parse.quote` argument |
 | POST magic-link consumes but agent doesn't wake | Agent's add_listener didn't register, OR the agent's connection isn't the same pool that received the NOTIFY |
 | Watcher never emits | The NOT EXISTS subquery on `thread_notifications` is wrong, OR `requested_at < now() - ...` interval cast issue |
 | SSE replay returns empty | `Last-Event-ID` header parsing rejecting the input (we tolerate malformed by treating as "no cursor") |
+| P5.3 watchdog never suspends | Workspace context missing on thread metadata → `suspend_thread_workspace` returns False early. Either provision a workspace for the test thread or accept the "suspend declined" log line as proof the watchdog selected the row. |
+| P5.4 extend POST returns 200 but no banner | The token's `thread_id` may be NULL (mint was missing the bind argument). Check `SELECT thread_id FROM magic_link_tokens WHERE token_hash = …` |
+| P5.6 wake task silent | Either `workspace_suspension_service.is_enabled` is False, or the thread's metadata doesn't carry a `workspace_container` section — both abort the wake helper early. |
 
 When a step fails, capture the orchestrator logs (terminal C) and `psql_dev -c "SELECT * FROM thread_notifications ORDER BY sent_at DESC LIMIT 5;"` for triage.

@@ -1,130 +1,126 @@
-# Todo Crafting Guide — Developer
+# Todo Crafting Guide — Developer (TDD)
 
-**You MUST read this file before calling `next_phase_todos`.** The tool will reject
-your call if you haven't. This guide teaches you how to create effective, execution-ready todos.
+**You MUST read this file before calling `next_phase_todos`.** The tool will reject your call if you haven't. This guide teaches you how to create execution-ready, phase-typed, AC-traced todos.
 
 ---
 
-## Core Principle: One Todo = One Focused Change
+## Core Principle: Spec → Red → Green → Refactor
 
-**Target: 5-10 todos per tactical phase.** Adapt based on task complexity:
-- **Simple, well-defined tasks**: 5-7 todos (straightforward implementations)
-- **Standard tasks**: 7-10 todos (feature implementation with tests)
-- **Complex, multi-step tasks**: 10-15 todos (split into more phases if you need more)
+Every developer phase is one of these types. The strategic phase chooses; the tactical phase honors that choice:
 
-Each tactical phase ends with a strategic review. More frequent reviews mean:
-- Earlier detection of wrong directions
-- Better-adapted todos based on what actually landed in the diff
-- Less wasted work if the approach needs to change
+| `tdd_phase` | Goal | Writes Allowed | Writes Forbidden | Exit Gate |
+|---|---|---|---|---|
+| `spec` | Define `spec.yaml` with EARS acceptance criteria | workspace root (spec.yaml, workspace.md, plan.md) | `src/`, `tests/` | spec.yaml exists, AC have IDs and test_oracle, locked into workspace.md |
+| `red` | Write failing tests | `tests/` | `src/` | Every in-scope AC has a test that fails with AssertionError (not ImportError) |
+| `green` | Minimum implementation to pass tests | `src/` | `tests/` | All in-scope tests pass; no test edits; full suite green |
+| `refactor` | Improve structure while keeping green | `src/` | `tests/` | All previously-green tests stay green |
+| `integration` | PR / commit prep | minimal edits | scope changes | Commit pushed, AC IDs in commit message |
 
-A phase should represent one coherent unit of work — "explore the codebase," "implement
-the auth module," "add tests for the API endpoints" — not an entire feature.
+**Pick exactly one tdd_phase per tactical phase.** Mixing types in one phase is the failure mode that erases the TDD discipline.
+
+**Target: 5-10 todos per tactical phase.** Adapt based on complexity:
+- Spec phase: 3-5 todos (interview, write spec, lock to workspace.md, init matrix)
+- Red phase: 1 todo per behavior under test (target 5-8)
+- Green phase: 1 todo per failing test (target 5-8)
+- Refactor phase: 3-5 focused structural changes
+- Integration phase: 3-5 todos (review diff, commit, push, verify)
+
+---
+
+## Every Todo Must Trace to the Spec
+
+Every red/green/refactor todo names the **AC ID(s) it serves** in its content (e.g., `AC-1`, `AC-2`). After the phase, the traceability matrix in `workspace.md` shows the AC status. Todos that don't trace to any AC are scope creep — either add the AC to the spec (deliberately, recorded), or drop the todo.
 
 ---
 
 ## Todo Specificity Rules
 
-Every todo must be specific enough to act on immediately during the tactical phase.
+Every todo must be specific enough to act on immediately.
 
 ### Vague → Execution-Ready Examples
 
-| Vague (fails) | Execution-ready (works) |
-|---|---|
-| "Fix the tests" | "Fix failing test in repo/tests/test_auth.py::test_login_invalid_token — handle empty session token by returning 401. Follow guard pattern from repo/src/auth/refresh.py:30. Run pytest tests/test_auth.py" |
-| "Add the API endpoint" | "Add GET /api/users/{id} endpoint in repo/src/routes/users.py. Return UserResponse schema from repo/src/schemas/user.py. Follow pattern from repo/src/routes/items.py:get_item. Run pytest tests/test_routes_users.py" |
-| "Refactor the module" | "Extract database connection logic from repo/src/services/user_service.py into repo/src/db/connection.py. Keep the same interface. Run pytest tests/test_user_service.py to confirm no regressions" |
-| "Write unit tests" | "Add tests for UserService.create_user() in repo/tests/test_user_service.py. Cover: valid input, duplicate email, missing fields. Follow test style from repo/tests/test_auth_service.py. Run pytest tests/test_user_service.py -v" |
-| "Update the frontend" | "Add user profile page component in repo/frontend/src/components/UserProfile.tsx. Display name, email, avatar. Follow component pattern from repo/frontend/src/components/ItemDetail.tsx. Run npm test -- --testPathPattern=UserProfile" |
-| "Set up CI" | "Create repo/.github/workflows/ci.yml with: checkout, setup Python 3.11, install requirements.txt, run pytest tests/ -v. Follow structure from existing repo/.github/workflows/lint.yml" |
+| Phase | Vague (fails) | Execution-ready (works) |
+|---|---|---|
+| spec | "Define the requirements" | "Interview user about magic-link TTL extension via kb_search of related decisions. Produce spec.yaml with 2-4 EARS acceptance criteria covering: (1) link click resets deadline, (2) watchdog skips awaiting threads. Each AC has an ID and test_oracle path. Lock spec into workspace.md `## Acceptance Criteria` section." |
+| red | "Write tests for the feature" | "Write failing test for AC-1 in repo/tests/test_persistent_ttl.py::test_magic_link_extends_deadline. Cover: thread in awaiting_user state, magic_link_clicked event arrives, awaiting_user_deadline must equal now + ttl_default. Follow fixture style from repo/tests/test_persistent_chat.py. Run `pytest tests/test_persistent_ttl.py::test_magic_link_extends_deadline -x -v` — confirm AssertionError, NOT ImportError." |
+| red | "Add a test for the bug" | "Write regression test for AC-3 (auth bypass on empty session) in repo/tests/test_auth.py::test_empty_session_rejected. Cover: empty string session token returns 401. Follow style from repo/tests/test_auth.py::test_invalid_token. Run `pytest tests/test_auth.py::test_empty_session_rejected -x -v` — must fail with assertion mismatch on status code." |
+| green | "Implement the endpoint" | "Make AC-1 test pass: in repo/src/persistent/lifecycle.py:handle_event, add MagicLinkClicked branch that sets thread.awaiting_user_deadline = now() + ttl_default. Reference pattern: repo/src/persistent/lifecycle.py:handle_idle. Forbidden: editing tests/. Run `pytest tests/test_persistent_ttl.py -x` — must go red → green; then `pytest tests/ -x` — full suite stays green." |
+| green | "Fix the bug" | "Make AC-3 test pass: in repo/src/auth/login.py:45, add guard `if not session_token: return Response(status=401)` before token validation. Run `pytest tests/test_auth.py::test_empty_session_rejected -x` — must turn green; `pytest tests/test_auth.py -x` — no other tests turn red." |
+| refactor | "Clean up the code" | "Extract MagicLinkClicked handler from repo/src/persistent/lifecycle.py into repo/src/persistent/handlers/magic_link.py. Behavior identical. Update import in lifecycle.py. Run `pytest tests/ -x` — every previously-green test stays green." |
 
 ### What Makes an Execution-Ready Todo
 
-1. **Names target files** — exact paths to read/modify (e.g., `repo/src/auth/login.py`)
-2. **Names the specific change** — what to add, fix, or modify
-3. **Names a reference pattern** — an existing file that shows the convention to follow
-4. **Names the verification command** — the test or check to run after implementation
-5. **Completable in one focused change** — if it needs more than ~3 files touched, split it
+1. **`tdd_phase` is set** — matches the phase's tdd_phase
+2. **AC ID(s) referenced** — every red/green/refactor todo cites the AC it serves
+3. **Target files named** — exact paths, with the directory restriction implied by tdd_phase
+4. **Specific change named** — what to add, fix, or modify (and for green: the minimum needed)
+5. **Reference pattern named** — an existing file/function that shows the convention
+6. **Verification command named** — the test/check to run, AND the expected initial state (must-fail for red, must-pass for green)
 
 ### The Specificity Test
 
-Before finalizing each todo, ask: "Could I open this todo, read the files it names, and start typing the fix immediately?"
-- "Implement the feature" → What feature? Which files? What convention? Too vague.
-- "Add password validation to repo/src/auth/validators.py — min 8 chars, 1 uppercase, 1 digit. Follow pattern from email_validator in same file. Run pytest tests/test_validators.py" → Clear, actionable.
+Before finalizing each todo, ask: "Could I open this todo, read the files it names, and start typing immediately — knowing which AC I'm satisfying, which directory I'm allowed to write to, and what success looks like?"
 
 ---
 
 ## Phase Design Patterns
 
-### 1. Codebase Exploration Phase (first phase for any new repo)
+### 1. Spec Phase (first phase for any non-trivial work)
 
-Purpose: Understand the repository before changing any code.
+Purpose: Lock the acceptance criteria before any code or test exists.
 
 Example todos:
-- "Read repo/README.md and repo/package.json (or requirements.txt) to understand project structure and dependencies"
-{% if has_tool("kb_write") -%}
-- "Use list_files on repo/src/ to map the directory structure. Record key paths via the kb_write tool (type=learning, tag=repository)"
+{% if has_tool("kb_search") -%}
+- "Read task_brief.md and instructions.md in full. Search kb (`kb_search`) for prior decisions related to this feature. Record findings via kb_write (type=learning, tag=prior-context)."
 {% else -%}
-- "Use list_files on repo/src/ to map the directory structure. Record key paths in notes/repository_notes.md"
+- "Read task_brief.md and instructions.md in full. Note all prior context in workspace.md."
 {% endif -%}
-- "Read repo/src/routes/ (or equivalent entry points) to understand the API surface"
-- "Read repo/tests/ to understand the test framework, conventions, and coverage"
-- "Read repo/.github/workflows/ (or CI config) to understand the build/test pipeline"
-{% if has_tool("kb_write") -%}
-- "Record framework, conventions, test command, key entry points, branch strategy via the kb_write tool (type=learning, tag=repository)"
-{% else -%}
-- "Record framework, conventions, test command, key entry points, branch strategy in notes/repository_notes.md"
-{% endif -%}
+- "Explore the existing codebase to identify the test framework, test command, and a 2-3 representative tests that match the style we'll need. Record framework + test command via kb_write (type=learning, tag=repository)."
+- "Write spec.yaml with EARS acceptance criteria covering [describe scope]. Each AC has an ID (AC-1, AC-2, ...), an EARS statement, and a test_oracle path. Include `not_included` (explicit scope boundaries) and `done_when` (exact commands)."
+- "Lock spec into workspace.md `## Acceptance Criteria` section (PROTECTED). Initialize the traceability matrix with each AC at `not_started`."
 
-### 2. Implementation Phase (core development work)
+### 2. Red Phase (write failing tests)
 
-Purpose: Land focused code changes, one per todo.
+Purpose: For each AC, write a test that fails for the right reason (AssertionError, not ImportError).
 
 Example todos:
-- "Add UserService class in repo/src/services/user_service.py with create, read, update, delete methods. Follow pattern from repo/src/services/item_service.py. Run pytest tests/test_user_service.py"
-- "Add user routes in repo/src/routes/users.py — CRUD endpoints using UserService. Follow repo/src/routes/items.py pattern. Run pytest tests/test_routes_users.py"
-- "Verify via git_diff: confirm only expected files changed, no unrelated modifications"
-- "Add migration script in repo/migrations/003_add_users_table.py. Follow pattern from repo/migrations/002_add_items_table.py. Run migration and verify schema"
+- "Write failing test for AC-1 in repo/tests/<area>/test_<feature>.py::test_<behavior>. Cover: <Given> <When> <Then>. Follow fixture style from repo/tests/<neighbor>. Run `pytest tests/<area>/test_<feature>.py::test_<behavior> -x -v` — confirm AssertionError."
+- "Write failing test for AC-2 boundary case in repo/tests/<area>/test_<feature>.py::test_<boundary>. Cover: empty input returns <expected error>. Run `pytest tests/<area>/test_<feature>.py::test_<boundary> -x -v` — confirm AssertionError."
+- "Update traceability matrix: AC-1 and AC-2 status → `red`. Verify all in-scope AC now have an entry."
 
-### 3. Testing Phase (verify and harden)
+### 3. Green Phase (minimum implementation)
 
-Purpose: Add tests, fix failures, ensure coverage.
-
-Example todos:
-- "Add unit tests for UserService in repo/tests/test_user_service.py. Cover: create valid user, duplicate email error, missing required fields, update nonexistent user. Run pytest tests/test_user_service.py -v"
-- "Add integration tests for user API routes in repo/tests/test_routes_users.py. Cover: CRUD operations, auth required, invalid input. Run pytest tests/test_routes_users.py -v"
-- "Run full test suite (pytest tests/ -v), fix any regressions introduced by the user feature"
-- "Verify via git_diff: confirm test files are substantive (not empty stubs or skipped tests)"
-
-### 4. PR/Commit Phase (package and ship)
-
-Purpose: Create clean, focused commits and PRs.
+Purpose: Make the failing tests pass with the minimum implementation. No speculative features.
 
 Example todos:
-- "Review all changes via the git_diff tool against the phase_N_start tag — confirm scope matches the feature"
-- "Clean up any debug prints, commented-out code, or TODO markers. Run linter. Run full test suite"
-- "Stage all changes via run_command, commit with message 'feat: add user CRUD endpoints with tests', push to origin feature/users"
-- "Verify via git_log: confirm commit is clean and push succeeded"
+- "Make AC-1 test pass: in repo/src/<file>:<function>, [minimum change]. Reference pattern: repo/src/<neighbor>. Forbidden: editing tests/. Run `pytest tests/<file>::<test> -x` — confirm red → green; `pytest tests/ -x` — full suite stays green."
+- "Make AC-2 test pass: in repo/src/<file>:<function>, [minimum change]. Run `pytest tests/<file>::<test> -x`."
+- "Update traceability matrix: AC-1 and AC-2 status → `green`. Run full project suite from spec.yaml done_when[0]."
 
-### 5. Bug Fix Phase (diagnose and fix)
+### 4. Refactor Phase (optional — only when green and structure needs work)
 
-Purpose: Investigate a specific bug, implement the fix, add regression tests.
-
-Example todos:
-- "Read the bug report/error log. Identify the affected file and function"
-- "Read repo/src/affected_file.py to understand current behavior"
-- "Fix [specific bug] in repo/src/affected_file.py:line. Root cause: [explanation]. Add guard clause for [condition]. Run pytest tests/test_affected.py"
-- "Add regression test in repo/tests/test_affected.py::test_bug_description that reproduces the original bug and confirms the fix. Run pytest tests/test_affected.py -v"
-- "Verify via git_diff: confirm fix is minimal and targeted, no unrelated changes"
-
-### 6. Refactoring Phase (restructure without changing behavior)
-
-Purpose: Improve code structure while preserving all existing behavior.
+Purpose: Improve code quality while keeping all tests green.
 
 Example todos:
-- "Run full test suite (pytest tests/ -v) and record baseline results — all tests must pass before refactoring"
-- "Extract [logic] from repo/src/module.py into repo/src/new_module.py. Update imports in all consumers. Run pytest tests/ -v"
-- "Verify via git_diff: confirm only structural changes, no behavior changes"
-- "Run full test suite again — same tests must pass with same results"
+- "Run full test suite (`pytest tests/ -x -v`) and record baseline — must be all green before refactoring. Save baseline output to archive/phase_N_baseline.txt."
+- "Extract <logic> from repo/src/<file> into repo/src/<new_file>. Update imports in callers. Run `pytest tests/ -x` — every previously-green test stays green."
+- "Verify via git_diff: only structural changes, no behavior changes, no edits under tests/."
+
+### 5. Integration Phase (PR / commit)
+
+Purpose: Package the work for review.
+
+Example todos:
+- "Review all changes via `git_diff` against the job's base tag. Confirm scope matches spec.yaml feature and respects not_included."
+- "Stage and commit with message `feat: <feature> (AC-1, AC-2, ...)`. Push to origin <branch>."
+- "Verify via `git_log` and `git_status`: commit landed, branch clean."
+
+### 6. Bug Fix Variant (red → green within one feature)
+
+A bug fix is just a TDD cycle with the regression test as the first AC:
+- Spec phase: Add `AC-N: When <bug-trigger>, the system shall <correct-behavior>`. Test oracle: a new regression test.
+- Red phase: Write the regression test that reproduces the bug — it must fail with the bug present.
+- Green phase: Fix the bug. Confirm the regression test turns green; existing tests stay green.
 
 ---
 
@@ -133,28 +129,61 @@ Example todos:
 Every change must be independently verified before `todo_complete`.
 
 **Verification checklist per todo:**
-1. `git_diff` — Are the changes what you expected? No unrelated files?
-2. `read_file` — Spot-check the modified file (write_file overwrites — confirm you preserved everything you meant to).
-3. Test output — Did the specified tests actually pass? Read the output for "0 tests collected", "skipped", or warning lines even if exit code is 0.
-4. Scope check — Did the change stay within the files the todo named?
 
-**Evidence-based completion:** Todo notes should include concrete evidence:
+For RED phase:
+1. `git_diff` — only files under `tests/` changed? Anything in `src/`? STOP.
+2. Pytest output — does the new test ID appear in the failure list?
+3. Failure type — is it `AssertionError`/assertion mismatch? Or is it `ImportError`/`CollectionError`/`SyntaxError`?
+4. Forbidden test pattern check — search the diff for `assert True`, `pytest.skip`, `xfail`, empty bodies, tautologies, etc.
+5. Traceability — is the AC ID updated in `workspace.md`?
+
+For GREEN phase:
+1. `git_diff` — only files under `src/` (or config/migration paths) changed? Anything under `tests/`? STOP.
+2. Pytest output — did the target test go from red to green?
+3. Full suite — did `done_when` commands pass? Any new failures elsewhere?
+4. Traceability — AC ID updated to `green`?
+
+**Evidence-based completion.** Todo notes should include concrete evidence:
 - Bad: "Implemented the feature, tests pass"
-- Good: "Added UserService in repo/src/services/user_service.py (4 methods). pytest tests/test_user_service.py: 8 passed, 0 failed. git_diff shows 2 files changed: user_service.py (+95), test_user_service.py (+120)"
+- Good red: "Added tests/test_persistent_ttl.py::test_extends (35 lines). pytest output: `FAILED tests/test_persistent_ttl.py::test_extends - AssertionError: 0 != 600`. AC-1 → red."
+- Good green: "Modified repo/src/persistent/lifecycle.py:handle_event (+8 lines). pytest output: `tests/test_persistent_ttl.py::test_extends PASSED`. Full suite `pytest tests/ -x`: 142 passed, 0 failed. AC-1 → green."
+
+---
+
+## Anti-Patterns
+
+**Phase-type violations:**
+- Mixing red and green todos in one phase ("write the test and then implement") — collapse the cycle, lose the discipline
+- Editing `tests/` in a green phase ("the test was wrong, I'll just fix it") — STOP, end the phase, surface in strategic
+- Editing `src/` in a red phase ("just enough to make the import work") — the test must fail honestly; if the import is the problem, the test path is wrong
+
+**Test dishonesty:**
+- `assert True`, empty test bodies, `pytest.skip`/`xfail` to "make it pass"
+- Tests that mirror the implementation (`assert f(x) == f(x)`)
+- Mocking the unit under test
+- Catching `Exception` and asserting nothing
+
+**Spec drift:**
+- Rewriting an AC to match what was built — moves the goalposts
+- Adding "implicit" AC mid-stream without recording — scope creep
+- Vague AC ("the system shall be correct") — not testable
+
+**Other:**
+- Blind overwrites — never `write_file` without `read_file` first
+- Trusting exit code 0 — "0 tests collected" exits 0; read the test count
+- Giant PRs — > 10 files or > 500 lines is too big; split
+- Silent abandonment — emit `BLOCKED:` and record, never just "move on"
 
 ---
 
 ## Quick Reference
 
-| Phase type | Typical todos | When to use |
+| `tdd_phase` | Typical todos | When to use |
 |---|---|---|
-| Codebase Exploration | 5-7 | Starting work on a new or unfamiliar repo |
-| Implementation | 5-10 | Building new features or modules |
-| Testing | 5-7 | Adding/improving test coverage |
-| PR/Commit | 3-5 | Packaging work for review |
-| Bug Fix | 4-6 | Investigating and fixing specific bugs |
-| Refactoring | 5-7 | Restructuring code without behavior changes |
+| `spec` | 3-5 | First phase of any new feature; or when AC are revealed to be wrong |
+| `red` | 5-8 | Before any implementation; one test per behavior, one todo per test |
+| `green` | 5-8 | After red is verified; one todo per failing test |
+| `refactor` | 3-5 | After green; only when structure genuinely needs improvement |
+| `integration` | 3-5 | Final phase — PR/commit prep |
 
-**Default to 7 todos.** Go lower (5) for focused phases like bug fixes or PR cleanup.
-Go higher (10) for implementation phases with multiple files. If you need more than 15,
-split into two phases.
+**Default per phase: 7 todos.** Spec/integration phases are smaller (3-5). Red/green phases scale with AC count. If a phase needs > 12 todos, split the spec or split the phase.

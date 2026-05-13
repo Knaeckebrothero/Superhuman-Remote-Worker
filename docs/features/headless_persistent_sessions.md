@@ -27,8 +27,9 @@ related:
 
 > The session is the source of truth, not the WebSocket. Close the browser and the agent keeps working. Reopen and the cockpit catches up like it never left. When attention is needed and nobody is watching, the system reaches out.
 
-**Status:** Design / brainstorm. No implementation yet.
+**Status:** Phases 1-6 shipped 2026-05-12/13. All filed hygiene issues resolved. Cockpit WS→SSE migration (Phase 1+2 client) is the last remaining slice.
 **Filed:** 2026-05-12
+**Last updated:** 2026-05-13
 
 ## Motivation
 
@@ -62,6 +63,40 @@ The existing transport is a single WebSocket (`/ws/persistent/{thread_id}` in `o
 This decision removes a whole class of bugs: there is no client-side reconnect state machine to maintain, since SSE's `EventSource` retries automatically and replays from `Last-Event-ID`. It also gives us symmetric semantics for browser tabs, MCP clients, and curl-based dev tooling — all consume the same stream.
 
 The seq/epoch protocol in [Per-thread event log](#1-per-thread-event-log) is the same regardless of transport — SSE just provides the wire format. If we later need bidirectional duplex, WebSocket is the documented fallback.
+
+## Implementation status (2026-05-13)
+
+Backend for all six implementation phases landed between 2026-05-12 and 2026-05-13. The cockpit-side work is the largest remaining slice — the SSE consumer migration in `persistent-chat.service.ts` is the keystone that makes the new transport actually reach users; the Phase 6 settings panel rides along.
+
+| Phase | Backend | Cockpit | Notes |
+|---|---|---|---|
+| 1 — Loop decoupling + SSE transport | ✅ shipped (`7c8d544`, `37a1692`) | ❌ pending | SSE endpoint + REST input live; Angular still uses WS |
+| 2 — Event log + epoch + horizon | ✅ shipped (`37a1692`, migration `0004_thread_events.sql`) | ❌ pending | Server writes events; cockpit doesn't yet cursor-resume |
+| 3 — Permission gates via DB | ✅ shipped (`128f702`, migration `0005_thread_permission_requests.sql`) | n/a | LISTEN/NOTIFY path live; existing approval UI keeps working |
+| 4 — Notification fan-out + magic links | ✅ shipped (`13f7461`, migration `0006_headless_notifications.sql`) | ✅ settings UI shipped via Phase 6 | Two hygiene gaps resolved 2026-05-13 — see [Resolved issues](#resolved-issues) |
+| 5 — Attention sleep | ✅ shipped (`0e5994e`, migration `0008_thread_awaiting_user.sql`) | n/a | Cluster smoke green 2026-05-13; smoke-leak runbook callout shipped |
+| 6 — Polite mode + per-thread TTL | ✅ shipped (`6203057`) | ✅ shipped 2026-05-13 | `HeadlessConfig` dataclass + sweeper COALESCE + 3 cockpit controls under "Persistent Agent" |
+
+### Resolved issues
+
+Three tech-debt items surfaced during smoke testing — all shipped 2026-05-13 in one PR bundle (sweeper SQL widening + SMTP TLD blocklist + smoke runbook callout). Kept inline as a record of the surfaced-then-fixed cycle.
+
+- ✅ [[headless_notifications_skipped_status_dedup]] (resolved 2026-05-13) — Sweeper SQL widened to include `skipped_no_email` and `skipped_already_resolved` in the permanent-suppression `IN (...)` set, plus a `2 × interval_s` recency floor (`make_interval(secs => $2)`) for transient `skipped_rate_limit` / `skipped_smtp` cases. In-process `already_notified()` probe deleted in favor of the now-authoritative sweeper SQL. See [`docs/issues/headless_notifications_skipped_status_dedup.md`](../issues/headless_notifications_skipped_status_dedup.md).
+- ✅ [[headless_notifications_smtp_recipient_validation]] (resolved 2026-05-13) — Module-level `_is_undeliverable_recipient` helper in `orchestrator/services/email.py` rejects RFC 6761 reserved TLDs (`invalid`/`test`/`example`/`localhost`) plus malformed addresses; `_send` filters before composing. Option B (`email-validator` lib) deliberately deferred. See [`docs/issues/headless_notifications_smtp_recipient_validation.md`](../issues/headless_notifications_smtp_recipient_validation.md).
+- ✅ [[headless_sessions_smoke_leaks_cluster_pods]] (resolved 2026-05-13) — `docs/tests/headless_sessions_smoke.md` §P5.6 now opens with a dev-cluster heads-up and the cleanup snippet ends with a `kubectl get | grep ${THREAD_ID:0:8} | xargs delete` step that catches workspace pod + PVC + agent pod in one shot. Option B (env knob) deferred until broader dev-cluster smoke-mode story. See [`docs/issues/headless_sessions_smoke_leaks_cluster_pods.md`](../issues/headless_sessions_smoke_leaks_cluster_pods.md).
+
+### Remaining work
+
+One outstanding slice — the cockpit transport migration.
+
+1. **Cockpit WS→SSE migration** (`cockpit/src/app/core/services/persistent-chat.service.ts`). Phase 1 + Phase 2 client side. Replace the WS reconnect state machine with an `EventSource` consuming `GET /api/threads/{id}/stream`, plus `POST /api/threads/{id}/input` for turn input and `POST /api/threads/{id}/interrupt`. Persist `(epoch, seq)` cursor in IndexedDB, send via `Last-Event-ID` header on reconnect, handle `GONE_BEYOND_HORIZON` by pulling snapshot via REST. This is the keystone that makes Phases 1-5 actually visible to users. WS handler stays as opt-in fallback per the design decision.
+
+Items that are explicitly **not** queued (deferred / out of scope by decision):
+
+- Headless budgets (per-run / cumulative token + wall-clock caps) — its own future feature doc.
+- Tiered presence-aware attention-sleep defaults — listed in [open questions](#open-questions) #2.
+- Per-project eager defaults — [open questions](#open-questions) #3.
+- Mobile / desktop push channels — wait for a mobile/desktop cockpit to exist.
 
 ## What already exists
 
@@ -338,9 +373,11 @@ Saves cluster cost when nobody actually wants to come back.
 
 ### Phase 6 — Polite mode + settings UI
 
-- [ ] `polite` mode wired in the loop: park at end of each completed turn unless a client is attached OR new input is in the queue.
-- [ ] Cockpit "Persistent Agent" settings section: `headless_mode` toggle, `headless_attention_sleep_minutes` input, `notification_channels` multi-select.
-- [ ] Per-thread overrides via `metadata.config_override.headless.*` with user-settings as the merge base.
+- [x] `polite` mode wired in the loop: park at end of each completed turn unless a client is attached OR new input is in the queue. (`src/api/persistent_app.py:_loop_get_user_input`, 2026-05-13)
+- [x] Cockpit "Persistent Agent" settings section: `headless_mode` select (default / eager / polite), `headless_attention_sleep_minutes` number input, `notification_channels` email-only checkbox. (`cockpit/src/app/views/settings/settings.component.ts`, 2026-05-13)
+- [x] Per-thread overrides via `metadata.config_override.headless.*` with user-settings as the merge base. (`orchestrator/main.py:create_thread` for snapshot at create time; `attention_sleep_sweeper` uses 3-tier COALESCE for runtime resolution, 2026-05-13)
+
+Backend landed 2026-05-13 alongside `HeadlessConfig` in `src/core/loader.py` and `UserSettingsUpdate.persistent_agent` passthrough. Cockpit UI followed the same day: three controls slotted into the existing Persistent Agent section, round-tripping through `/api/settings/preferences` with full transloco coverage (EN + DE) and a clean dev build.
 
 > **Future:** A separate "headless budgets" feature will add per-run / cumulative / org-wide token + wall-clock caps with their own UI and notification triggers. Out of scope for this feature.
 
