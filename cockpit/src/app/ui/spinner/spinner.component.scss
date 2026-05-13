@@ -4,9 +4,11 @@
   display: inline-block;
   flex-shrink: 0;
   border-style: solid;
-  border-color: currentColor;
+  border-color: currentcolor;
   border-right-color: transparent;
+
   @include shape.circle;
+
   animation: app-spinner-spin 0.7s linear infinite;
 
   // --- Sizes ---

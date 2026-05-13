@@ -23,6 +23,7 @@
   --radius-md:   0;
   --radius-lg:   2px;
   --radius-xl:   0;
+
   // --radius-full stays at the primitive default (999px) — functional circles
   // (radio dots, switch knobs, spinners, avatars) keep their semantic shape.
 
@@ -111,15 +112,18 @@
     border: 1px solid var(--border-color);
     background: var(--surface-0);
     color: var(--text-primary);
+
     // Top inner highlight + bottom inner shadow = pressed-into-surface look
     box-shadow:
       inset 0 1px 0 0 color-mix(in srgb, var(--text-primary) 8%, transparent),
       inset 0 -1px 0 0 color-mix(in srgb, #000 18%, transparent),
       0 1px 0 0 color-mix(in srgb, var(--accent-color) 18%, transparent);
   }
+
   .btn:hover {
     background: var(--surface-1);
   }
+
   .btn:active {
     transform: translateY(1px);
     box-shadow:
@@ -141,6 +145,7 @@
       inset 0 -1px 0 0 color-mix(in srgb, #000 28%, transparent),
       0 1px 0 0 color-mix(in srgb, var(--accent-color) 35%, transparent);
   }
+
   .btn-primary:hover {
     background: var(--accent-hover);
   }

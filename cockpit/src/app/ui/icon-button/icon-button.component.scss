@@ -7,17 +7,16 @@
 
 .app-icon-button__btn {
   @include shape.control;
+
   display: inline-flex;
   align-items: center;
   justify-content: center;
   position: relative;
-
   appearance: none;
   border: 1px solid transparent;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-
   transition:
     background-color 0.15s ease,
     color 0.15s ease,
@@ -102,9 +101,11 @@
 .app-icon-button__spinner {
   width: 14px;
   height: 14px;
-  border: 2px solid currentColor;
+  border: 2px solid currentcolor;
   border-right-color: transparent;
+
   @include shape.circle;
+
   animation: app-icon-button-spin 0.7s linear infinite;
 }
 
