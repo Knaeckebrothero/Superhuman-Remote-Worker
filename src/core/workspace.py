@@ -83,31 +83,44 @@ class WorkspaceManagerConfig:
         )
 
 
+_FALLBACK_BASE_WARNED = False
+
+
 def get_workspace_base_path() -> Path:
-    """Get the base path for workspaces based on environment.
+    """Get the base path for the agent's local control-plane state.
+
+    This is the agent process's own state directory (LangGraph checkpoints,
+    per-job log files, phase snapshot tarballs) — NOT the job workspace
+    where the LLM does its work. Job workspaces are always remote
+    (SSH/SFTP into a workspace container/VM); see `WorkspaceManager`.
 
     Priority:
-    1. WORKSPACE_PATH environment variable
-    2. /workspace if running in container (detected by existence)
-    3. ./workspace in project root for development
+    1. WORKSPACE_PATH environment variable (set by container/pod manifests)
+    2. /workspace if it exists (container/pod with PVC mounted there)
+    3. ~/.cache/srw-agent/workspace for bare-metal dev (with a one-time warning)
 
     Returns:
         Path to workspace base directory
     """
-    # Check environment variable first
     env_path = os.getenv("WORKSPACE_PATH")
     if env_path:
         return Path(env_path)
 
-    # Check if running in container (standard container workspace path)
     container_path = Path("/workspace")
     if container_path.exists() and container_path.is_dir():
         return container_path
 
-    # Development mode: use ./workspace relative to project root
-    from src.utils.config import get_project_root
-
-    return get_project_root() / "workspace"
+    global _FALLBACK_BASE_WARNED
+    fallback = Path.home() / ".cache" / "srw-agent" / "workspace"
+    if not _FALLBACK_BASE_WARNED:
+        logger.warning(
+            "WORKSPACE_PATH not set and /workspace not mounted; "
+            "falling back to %s for agent state. "
+            "Set WORKSPACE_PATH explicitly to silence this warning.",
+            fallback,
+        )
+        _FALLBACK_BASE_WARNED = True
+    return fallback
 
 
 def get_checkpoints_path() -> Path:
