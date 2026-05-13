@@ -3174,6 +3174,7 @@ async def lifespan(app: FastAPI):
     headless_notify_task = asyncio.create_task(
         thread_permission_notify_sweeper(_shutdown_event)
     )
+    attention_sleep_task = asyncio.create_task(attention_sleep_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
@@ -3243,6 +3244,7 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await thread_events_prune_task
     await headless_notify_task
+    await attention_sleep_task
     await ide_sweeper_task
     await ws_sweeper_task
     await gc_sweeper_task
@@ -9566,11 +9568,20 @@ async def agent_update_thread_status(
 ) -> dict[str, str]:
     """Update thread status (no auth, agent-facing).
 
-    Used for lifecycle transitions: created → active, active → ended.
-    'ended' is also reachable via DELETE /api/persistent/threads/{id} (manual
-    end is removed from the UI but the endpoint remains for permanent delete).
+    Lifecycle transitions:
+      created → active, active → ended (existing).
+      active → awaiting_user (Phase 5: agent reached natural pause, no WS
+        subscriber). Idempotent — repeated awaiting_user writes preserve
+        the original awaiting_user_since so the attention-sleep watchdog's
+        clock keeps ticking.
+      awaiting_user → active (Phase 5: subscriber reattached). Clears
+        awaiting_user_since and extend_count.
+
+    'suspended' is reserved for the attention-sleep watchdog and is not
+    writable from agent path — would create a race where an agent flips
+    the thread back to active while the orchestrator is mid-suspend.
     """
-    valid_statuses = {"active", "ended"}
+    valid_statuses = {"active", "ended", "awaiting_user"}
     if request.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
@@ -9587,8 +9598,45 @@ async def agent_update_thread_status(
             # _release_thread_resources for true destruction.
             # See docs/issues/persistent_session_permission_check_race.md.
             asyncio.create_task(_suspend_thread_resources(thread_id))
-        else:
-            await postgres_db.update_thread_status(thread_id, request.status)
+        elif request.status == "awaiting_user":
+            # Idempotent: preserve awaiting_user_since on repeated writes
+            # (the agent's loop calls this on every untethered turn-complete
+            # in eager mode; resetting the timestamp would let the
+            # attention-sleep watchdog never fire). extend_count is also
+            # preserved across repeated writes within the same session;
+            # only the active→awaiting_user transition resets it.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = 'awaiting_user', "
+                    "    awaiting_user_since = CASE "
+                    "        WHEN status = 'awaiting_user' "
+                    "             THEN awaiting_user_since "
+                    "        ELSE now() "
+                    "    END, "
+                    "    extend_count = CASE "
+                    "        WHEN status = 'awaiting_user' THEN extend_count "
+                    "        ELSE 0 "
+                    "    END, "
+                    "    last_activity = CURRENT_TIMESTAMP "
+                    "WHERE id = $1",
+                    thread_id,
+                )
+        else:  # active
+            # On revert from awaiting_user (or any other source), clear the
+            # attention-sleep timer fields so the watchdog re-arms cleanly
+            # on the next natural-pause transition.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = $2, "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0, "
+                    "    last_activity = CURRENT_TIMESTAMP "
+                    "WHERE id = $1",
+                    thread_id,
+                    request.status,
+                )
         return {"status": request.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -11195,16 +11243,30 @@ async def thread_events_prune_sweeper(
 # the email via services.headless_notifications.
 
 
+# Phase 5: per-thread cap on /magic/extend clicks. 4 × 60min = 4h total
+# awaiting_user before unconditional suspension. Configurable via env for
+# ops tuning during incident response.
+_MAGIC_EXTEND_CAP: int = int(os.environ.get("HEADLESS_EXTEND_CAP", "4"))
+
+
 def _magic_link_confirmation_page(
     *,
     tool_name: str,
     tool_args_preview: str,
     intended_decision: Optional[str],
     token: str,
+    extend_status: Optional[str] = None,
+    extends_remaining: Optional[int] = None,
 ) -> str:
     """Render the GET landing page. Single button POSTs back to the same
     URL with the actual decision; this is what prevents email-link
     prefetchers (Outlook Safe Links, Gmail) from auto-consuming tokens.
+
+    Phase 5: a second form lets the user POST /magic/extend/{token} to
+    bump the attention-sleep clock by 60 min without consuming the
+    approval token. extend_status (when set) drives an inline toast:
+    'extended' on success, 'cap_reached' when extend_count >= cap,
+    'not_awaiting' when the thread is no longer in awaiting_user.
     """
     safe_args = (
         tool_args_preview.replace("&", "&amp;")
@@ -11222,6 +11284,44 @@ def _magic_link_confirmation_page(
         button_label = "Confirm decision"
         button_color = "#cba6f7"
 
+    quoted_token = urllib.parse.quote(token, safe="")
+
+    # Extend banner copy — friendly, action-specific.
+    extend_banner_html = ""
+    if extend_status == "extended":
+        remaining_str = (
+            f" — {extends_remaining} extends remaining"
+            if extends_remaining is not None
+            else ""
+        )
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #a6e3a1; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            f'color: #a6e3a1; font-size: 13px;">Window extended by 60 minutes'
+            f"{remaining_str}.</div>"
+        )
+    elif extend_status == "cap_reached":
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #f9e2af; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            'color: #f9e2af; font-size: 13px;">Extend limit reached — please '
+            "approve, deny, or open the cockpit.</div>"
+        )
+    elif extend_status == "not_awaiting":
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #89b4fa; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            'color: #89b4fa; font-size: 13px;">No extend needed — the agent '
+            "is already active.</div>"
+        )
+
+    # Disable the extend button if we already know the cap was hit.
+    extend_disabled_attr = (
+        ' disabled style="opacity: 0.5; cursor: not-allowed;"'
+        if extend_status == "cap_reached"
+        else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
 <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 40px 20px;">
@@ -11230,14 +11330,18 @@ def _magic_link_confirmation_page(
       <h2 style="margin: 0; color: #cba6f7; font-size: 16px;">Confirm tool decision</h2>
     </div>
     <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
+      {extend_banner_html}
       <p>The agent wants to call <code style="background: #181825; padding: 2px 6px; border-radius: 4px;">{safe_tool}</code> with these arguments:</p>
       <pre style="background: #181825; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #a6e3a1;">{safe_args}</pre>
     </div>
     <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
-      <form method="POST" action="/magic/approve/{urllib.parse.quote(token, safe="")}" style="display: inline;">
+      <form method="POST" action="/magic/approve/{quoted_token}" style="display: inline;">
         <button type="submit" style="background: {button_color}; color: #1e1e2e; padding: 10px 28px; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
       </form>
-      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">This link is single-use and expires in 30 minutes.</p>
+      <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
+        <button type="submit"{extend_disabled_attr} style="background: transparent; color: #89b4fa; padding: 10px 20px; border: 1px solid #89b4fa; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px;">I'm reviewing — extend 60min</button>
+      </form>
+      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
     </div>
   </div>
 </body></html>"""
@@ -11390,7 +11494,7 @@ async def magic_link_post(token: str) -> HTMLResponse:
             "UPDATE thread_permission_requests "
             "SET status = $2, decided_at = now(), decided_by = $3 "
             "WHERE id = $1 AND status = 'pending' "
-            "RETURNING id, status, tool_call_id, tool_name",
+            "RETURNING id, status, tool_call_id, tool_name, thread_id",
             consumed["approval_id"],
             decision,
             decided_by_label,
@@ -11410,6 +11514,16 @@ async def magic_link_post(token: str) -> HTMLResponse:
             status_code=409,
         )
 
+    # Phase 5: if the thread is suspended (attention-sleep watchdog fired
+    # since the email was sent), kick off restore + agent-pod re-creation.
+    # The agent's wake path (_loop_permission_check select-first guard)
+    # will pick up this UPDATE's decision once the new pod is alive — no
+    # second click required.
+    asyncio.create_task(
+        _phase5_wake_if_suspended(str(permission_row["thread_id"])),
+        name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
+    )
+
     pretty = "approved" if decision == "approved" else "denied"
     return HTMLResponse(
         _magic_link_result_page(
@@ -11422,6 +11536,213 @@ async def magic_link_post(token: str) -> HTMLResponse:
             cockpit_url=cockpit_external_url,
         )
     )
+
+
+@app.post("/magic/extend/{token}")
+async def magic_link_extend(token: str) -> HTMLResponse:
+    """Extend the attention-sleep window for the thread bound to this token.
+
+    Validates the token (same hash + expiry + single-use checks as
+    /magic/approve) but does NOT consume it — the user is signaling
+    "I'm still reviewing" without making the approve decision. Bumps
+    threads.awaiting_user_since forward by 60 minutes per click, capped
+    at HEADLESS_EXTEND_CAP (default 4 = 4h total ceiling).
+
+    Re-renders the confirmation page with a toast so the user can still
+    click approve/deny on the same screen. Status_code 200 throughout —
+    the page itself carries the success/cap/not-awaiting signal.
+
+    Why a separate route and not "extend ↔ approve same POST": the
+    approve handler consumes the token (single-use CAS). If extend
+    shared that path, every extend click would burn the approval token
+    and the user couldn't approve afterward.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This link is no longer valid. Open the cockpit to "
+                    "review the agent's current state."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    thread_id = row.get("thread_id")
+    if thread_id is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Cannot extend",
+                body="This link is not bound to a thread.",
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=400,
+        )
+
+    # Bump awaiting_user_since iff the thread is still in awaiting_user
+    # and extend_count < cap. The CAS UPDATE returns the new row state so
+    # we can show the right banner. status='active' or 'suspended' means
+    # there's nothing to extend — the agent has either woken up already
+    # or moved beyond awaiting_user.
+    async with postgres_db.acquire() as conn:
+        updated = await conn.fetchrow(
+            "UPDATE threads "
+            "SET awaiting_user_since = now(), "
+            "    extend_count = extend_count + 1 "
+            "WHERE id = $1 "
+            "  AND status = 'awaiting_user' "
+            "  AND extend_count < $2 "
+            "RETURNING extend_count",
+            str(thread_id),
+            _MAGIC_EXTEND_CAP,
+        )
+
+    if updated is None:
+        # Distinguish cap_reached from not_awaiting for the banner copy.
+        async with postgres_db.acquire() as conn:
+            row_state = await conn.fetchrow(
+                "SELECT status, extend_count FROM threads WHERE id = $1",
+                str(thread_id),
+            )
+        if row_state is None:
+            extend_status = "not_awaiting"
+        elif row_state["status"] != "awaiting_user":
+            extend_status = "not_awaiting"
+        elif row_state["extend_count"] >= _MAGIC_EXTEND_CAP:
+            extend_status = "cap_reached"
+        else:
+            # Edge case — concurrent change between our UPDATE and SELECT.
+            # Render not_awaiting which is the gentler banner.
+            extend_status = "not_awaiting"
+        extends_remaining = None
+    else:
+        extend_status = "extended"
+        extends_remaining = max(0, _MAGIC_EXTEND_CAP - int(updated["extend_count"]))
+
+    # Re-render the confirmation page with the banner. Load the permission
+    # row again (status may have changed underneath us).
+    approval_id = row.get("approval_id")
+    if approval_id is not None:
+        async with postgres_db.acquire() as conn:
+            permission_row = await conn.fetchrow(
+                "SELECT tool_name, tool_args, status FROM "
+                "thread_permission_requests WHERE id = $1",
+                approval_id,
+            )
+    else:
+        permission_row = None
+
+    if permission_row is None or permission_row["status"] != "pending":
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request has been resolved. No further "
+                    "action is needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=200,
+        )
+
+    tool_args = permission_row["tool_args"]
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except Exception:
+            tool_args = {}
+    elif tool_args is None:
+        tool_args = {}
+    args_preview = json.dumps(tool_args, indent=2, default=str)
+    if len(args_preview) > 600:
+        args_preview = args_preview[:600] + "\n… (truncated)"
+
+    page = _magic_link_confirmation_page(
+        tool_name=permission_row["tool_name"],
+        tool_args_preview=args_preview,
+        intended_decision=row.get("intended_decision"),
+        token=token,
+        extend_status=extend_status,
+        extends_remaining=extends_remaining,
+    )
+    return HTMLResponse(page)
+
+
+async def _phase5_wake_if_suspended(thread_id: str) -> None:
+    """Restore a suspended thread's workspace + agent pod after a magic-link
+    decision. Fire-and-forget — the HTTP response has already returned.
+
+    Pattern mirrors resume_persistent_thread (main.py:10640) — restore the
+    workspace from S3, then spawn the agent pod if the persistent
+    provisioner is wired. Idempotent: status checks short-circuit when the
+    workspace is already alive (e.g. a cockpit tab is open and the click
+    came from email anyway).
+    """
+    try:
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread:
+            return
+        metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        ws_ctx = metadata.get("workspace_container") or {}
+        ws_status = ws_ctx.get("status")
+        if ws_status == "suspended" and workspace_suspension_service.is_enabled:
+            logger.info(
+                "magic-link wake: restoring suspended workspace for thread %s",
+                thread_id,
+            )
+            ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
+            if not ok:
+                logger.warning(
+                    "magic-link wake: workspace restore failed for thread %s",
+                    thread_id,
+                )
+                return
+            # Reflect on the thread row that we're awake again. The agent
+            # pod's _attach_session will set this to 'active' too, but
+            # writing here closes the window where the attention-sleep
+            # watchdog could re-fire before the agent boots.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = 'active', "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0 "
+                    "WHERE id = $1 AND status IN ('suspended', 'awaiting_user')",
+                    thread_id,
+                )
+
+        # Agent pod may also have been deleted on suspension
+        # (workspace_suspension.py:502-504). Re-provision if a persistent
+        # provisioner is configured. fire-and-forget — the agent's boot
+        # will restore the LangGraph checkpoint and re-enter permission_check
+        # for the same tool_call_id, where the select-first guard picks up
+        # the decision we just UPDATEd.
+        if persistent_provisioner is not None and not thread.get("agent_id"):
+            config_name = thread.get("config_name", "persistent_defaults")
+            asyncio.create_task(
+                persistent_provisioner.create_agent_pod(
+                    thread_id, config_name=config_name
+                ),
+                name=f"phase5-create-agent-{thread_id[:8]}",
+            )
+    except Exception as e:
+        logger.warning(
+            "magic-link wake task failed for thread %s: %s",
+            thread_id,
+            e,
+        )
 
 
 async def thread_permission_notify_sweeper(
@@ -11492,6 +11813,134 @@ async def thread_permission_notify_sweeper(
         except asyncio.TimeoutError:
             pass
     logger.info("Headless permission-notify sweeper stopped")
+
+
+# =============================================================================
+# Phase 5 — Attention sleep watchdog
+# =============================================================================
+#
+# Suspends thread workspaces (and the bound agent pod) when the agent has
+# been in `awaiting_user` for longer than HEADLESS_ATTENTION_SLEEP_MINUTES.
+# State machine:
+#   active ─→ awaiting_user (agent: natural pause + no WS subscriber)
+#   awaiting_user ─→ suspended (this watchdog after TTL)
+#   awaiting_user ─→ active (agent: subscriber reattach, clears timer)
+#   suspended ─→ active (magic-link wake or REST reattach restores workspace)
+#
+# Magic-link "extend window" POSTs bump awaiting_user_since forward so the
+# watchdog re-arms; threads.extend_count caps the bumps at 4 (4h total).
+#
+# Today's "tethered" signal is WS-only — Phase 5 v1 ships before the
+# cockpit migrates from WS to SSE. SSE-only consumers (MCP, curl) do not
+# block suspension; they should rely on magic-link wake to bring the
+# session back. When cockpit moves to SSE, this watchdog will need to
+# consult the orchestrator's in-process SSE attach registry too.
+
+
+_ATTENTION_SLEEP_INTERVAL_S: int = int(
+    os.environ.get("HEADLESS_ATTENTION_SLEEP_INTERVAL_S", "60")
+)
+_ATTENTION_SLEEP_MINUTES: int = int(
+    os.environ.get("HEADLESS_ATTENTION_SLEEP_MINUTES", "60")
+)
+
+
+async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task: suspend threads stuck in awaiting_user past their TTL.
+
+    Runs every HEADLESS_ATTENTION_SLEEP_INTERVAL_S (default 60s). For each
+    qualifying thread:
+      1. Call workspace_suspension_service.suspend_thread_workspace() —
+         snapshots filesystem to S3, deletes workspace pod/VM, also deletes
+         the bound agent pod (workspace_suspension.py:502-504).
+      2. CAS UPDATE thread.status from 'awaiting_user' → 'suspended'. The
+         CAS guards against the user re-attaching mid-suspend: if status
+         flipped back to 'active' between the SELECT and the UPDATE, we
+         don't clobber it.
+
+    Best-effort: a transient failure (DB unavailable, suspend service
+    error) is logged and retried on the next tick.
+    """
+    interval_s = _ATTENTION_SLEEP_INTERVAL_S
+    ttl_minutes = _ATTENTION_SLEEP_MINUTES
+    logger.info(
+        "Attention-sleep sweeper started (interval=%ds, ttl=%dmin)",
+        interval_s,
+        ttl_minutes,
+    )
+
+    while not shutdown_event.is_set():
+        try:
+            if workspace_suspension_service.is_enabled:
+                async with postgres_db.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT id "
+                        "FROM threads "
+                        "WHERE status = 'awaiting_user' "
+                        "  AND awaiting_user_since IS NOT NULL "
+                        "  AND awaiting_user_since < "
+                        "      now() - ($1 || ' minutes')::interval "
+                        "ORDER BY awaiting_user_since ASC "
+                        "LIMIT 50",
+                        str(ttl_minutes),
+                    )
+
+                for row in rows:
+                    thread_id = str(row["id"])
+                    try:
+                        ok = (
+                            await workspace_suspension_service.suspend_thread_workspace(
+                                thread_id
+                            )
+                        )
+                        if not ok:
+                            logger.info(
+                                "attention-sleep: suspend declined for thread %s "
+                                "(workspace not ready or already suspending)",
+                                thread_id,
+                            )
+                            continue
+                        async with postgres_db.acquire() as conn:
+                            updated = await conn.fetchval(
+                                "UPDATE threads "
+                                "SET status = 'suspended' "
+                                "WHERE id = $1 AND status = 'awaiting_user' "
+                                "RETURNING id",
+                                thread_id,
+                            )
+                        if updated:
+                            logger.info(
+                                "attention-sleep: thread %s suspended (was "
+                                "awaiting_user >%dm)",
+                                thread_id,
+                                ttl_minutes,
+                            )
+                        else:
+                            # Concurrent reattach won the race — workspace
+                            # is suspended but the restore path will pick it
+                            # up on the next reattach.
+                            logger.info(
+                                "attention-sleep: status flipped during "
+                                "suspend for thread %s; restore path will "
+                                "handle wake",
+                                thread_id,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "attention-sleep: suspend failed for thread %s: %s",
+                            thread_id,
+                            e,
+                        )
+        except Exception as e:
+            logger.warning("attention-sleep sweep error: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Attention-sleep sweeper stopped")
 
 
 @app.get("/api/persistent/threads/{thread_id}/ide")
