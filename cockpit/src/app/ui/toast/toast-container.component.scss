@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: contents;
@@ -24,7 +25,7 @@
   min-width: 240px;
   max-width: 400px;
   padding: 10px 12px;
-  border-radius: v.$radius-md;
+  @include shape.surface;
   background: var(--surface-2, var(--surface-1));
   border: 1px solid var(--border-color);
   box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
@@ -65,7 +66,7 @@
   font-size: 18px;
   line-height: 1;
   padding: 0 4px;
-  border-radius: v.$radius-sm;
+  @include shape.control;
 
   &:hover { color: var(--text-primary); }
   &:focus-visible {

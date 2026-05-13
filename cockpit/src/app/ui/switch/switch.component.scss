@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-block;
@@ -41,7 +42,7 @@
   flex-shrink: 0;
   display: inline-block;
   background: var(--surface-1);
-  border-radius: 999px;
+  @include shape.pill;
   transition:
     background-color 0.15s ease,
     border-color 0.15s ease;
@@ -62,7 +63,7 @@
   top: 2px;
   left: 2px;
   background: var(--text-primary);
-  border-radius: 50%;
+  @include shape.circle;
   transition:
     transform 0.18s cubic-bezier(0.4, 0, 0.2, 1),
     background-color 0.15s ease;
@@ -82,7 +83,7 @@
   background: var(--accent-color);
 
   .app-switch__thumb {
-    background: var(--timeline-bg);
+    background: var(--on-accent);
 
     [data-size='sm'] & {
       transform: translateX(12px);
