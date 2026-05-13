@@ -6,7 +6,9 @@
   align-items: center;
   justify-content: center;
   padding: v.$space-xs v.$space-md;
+
   @include shape.control;
+
   border: 1px solid var(--border-color);
   background: transparent;
   color: var(--text-muted);
@@ -15,7 +17,6 @@
   line-height: v.$line-height-tight;
   cursor: pointer;
   user-select: none;
-
   transition:
     background-color 0.15s ease,
     color 0.15s ease,

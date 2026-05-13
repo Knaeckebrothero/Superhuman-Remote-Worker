@@ -7,10 +7,10 @@
 
 .app-chip__btn {
   @include shape.pill;
+
   display: inline-flex;
   align-items: center;
   gap: v.$space-xs;
-
   appearance: none;
   border: 1px solid var(--border-color);
   background: transparent;
@@ -20,7 +20,6 @@
   line-height: v.$line-height-tight;
   cursor: pointer;
   white-space: nowrap;
-
   transition:
     background-color 0.15s ease,
     color 0.15s ease,
@@ -48,7 +47,7 @@
   }
 
   // --- Hover (only when selectable & enabled) ---
-  &[data-selectable]:hover:not(:disabled):not([data-selected]) {
+  &[data-selectable]:hover:not(:disabled, [data-selected]) {
     border-color: var(--text-primary);
     color: var(--text-primary);
   }
@@ -90,6 +89,7 @@
   .app-chip__btn[data-size='sm'] {
     min-height: 32px;
   }
+
   .app-chip__btn[data-size='md'] {
     min-height: v.$touch-target-min;
   }

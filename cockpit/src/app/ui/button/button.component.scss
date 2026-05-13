@@ -21,6 +21,7 @@
 
   // Shape — component-local override surface, defaults to the control role.
   --btn-radius: var(--radius-control);
+
   border-radius: var(--btn-radius);
 
   // Reset / typography
@@ -86,6 +87,7 @@
   &[data-variant='primary'] {
     @include shape.stamp;
     @include type.display;
+
     background: var(--accent-color);
     color: var(--on-accent);
     border-color: var(--accent-color);
@@ -102,6 +104,7 @@
 
   &[data-variant='secondary'] {
     @include shape.stamp;
+
     background: var(--surface-0);
     color: var(--text-primary);
     border-color: var(--border-color);
@@ -132,6 +135,7 @@
 
   &[data-variant='danger'] {
     @include shape.stamp;
+
     background: var(--danger);
     color: var(--on-danger);
     border-color: var(--danger);
@@ -147,6 +151,7 @@
 
   &[data-variant='success'] {
     @include shape.stamp;
+
     background: var(--success);
     color: var(--on-success);
     border-color: var(--success);
@@ -162,6 +167,7 @@
 
   &[data-variant='warning'] {
     @include shape.stamp('soft');
+
     background: var(--warning-tint);
     color: var(--warning);
     border-color: var(--warning-tint);
@@ -177,6 +183,7 @@
 
   &[data-variant='info'] {
     @include shape.stamp;
+
     background: var(--info);
     color: var(--on-info);
     border-color: var(--info);
@@ -211,9 +218,11 @@
   position: absolute;
   width: 14px;
   height: 14px;
-  border: 2px solid currentColor;
+  border: 2px solid currentcolor;
   border-right-color: transparent;
+
   @include shape.circle;
+
   animation: app-button-spin 0.7s linear infinite;
 }
 

@@ -13,7 +13,7 @@
 @mixin apply-app-theme($theme-name) {
   $theme-map: map.get(config.$themes, $theme-name);
 
-  @if $theme-map == null {
+  @if not $theme-map {
     @error "Unknown theme '#{$theme-name}'. Add it to $themes in _theme-config.scss.";
   }
 

@@ -33,7 +33,9 @@
   height: 16px;
   background: var(--surface-0);
   border: 1px solid var(--border-color);
+
   @include shape.circle;
+
   transition:
     background-color 0.15s ease,
     border-color 0.15s ease;
@@ -45,7 +47,9 @@
   left: 50%;
   width: 8px;
   height: 8px;
+
   @include shape.circle;
+
   background: var(--accent-color);
   transform: translate(-50%, -50%) scale(0);
   transition: transform 0.15s ease;

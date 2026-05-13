@@ -3,8 +3,11 @@
 
 :host {
   display: block;
+
   --card-radius: var(--radius-surface);
+
   @include shape.surface;
+
   border: 1px solid var(--border-color);
   background: var(--surface-0);
   color: var(--text-primary);

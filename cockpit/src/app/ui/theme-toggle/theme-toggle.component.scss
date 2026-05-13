@@ -13,7 +13,9 @@
   height: 32px;
   padding: 0 32px 0 12px;
   border: 1px solid var(--border-color);
+
   @include shape.control;
+
   background: var(--surface-0);
   color: var(--text-primary);
   font-size: v.$font-size-xs;
@@ -39,7 +41,6 @@
   height: 100%;
   padding: 0 32px 0 12px;
   appearance: none;
-  -webkit-appearance: none;
   border: none;
   background: transparent;
   color: inherit;

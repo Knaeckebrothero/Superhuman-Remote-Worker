@@ -42,11 +42,12 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-
   background: var(--surface-0);
   border: 1px solid var(--border-color);
   color: var(--on-accent);
+
   @include shape.tag;
+
   transition:
     background-color 0.15s ease,
     border-color 0.15s ease,

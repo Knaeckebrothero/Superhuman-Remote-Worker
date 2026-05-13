@@ -18,8 +18,10 @@
     padding: v.$space-xs;
     background: var(--surface-2, var(--surface-1));
     border: 1px solid var(--border-color);
+
     @include shape.surface;
-    box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
+
+    box-shadow: var(--shadow-md, 0 8px 24px rgb(0, 0, 0, 0.3));
     animation: app-menu-fade 0.12s ease-out;
   }
 }
