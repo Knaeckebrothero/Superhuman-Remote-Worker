@@ -206,7 +206,7 @@ interface ExpertDetail extends Expert {
       gap: 6px;
       padding: 14px;
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       background: var(--surface-0, var(--surface-0));
       cursor: pointer;
       text-align: left;

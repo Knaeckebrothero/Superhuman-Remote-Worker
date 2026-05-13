@@ -1023,7 +1023,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 28px 36px;
         background: var(--panel-bg, var(--panel-bg));
         border: 2px dashed var(--accent-color, #3399D6);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         color: var(--text-primary, var(--text-primary));
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
       }
@@ -1160,7 +1160,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .task-header-clickable {
         cursor: pointer;
         user-select: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         transition: background 0.15s;
       }
       .task-header-clickable:hover {
@@ -1184,7 +1184,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         display: flex;
         align-items: center;
         padding: 4px 8px;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         border: 1px solid var(--border-color, var(--surface-0));
         background: transparent;
         color: var(--text-muted, var(--text-muted));
@@ -1226,7 +1226,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 4px;
         padding: 4px 12px;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         border: 1px solid var(--info);
         background: transparent;
         color: var(--info);
@@ -1511,7 +1511,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       }
 
       .message-user .avatar-icon {
-        color: var(--timeline-bg, var(--timeline-bg));
+        color: var(--on-accent, var(--timeline-bg, #11111b));
       }
 
       .message-body {
@@ -1524,8 +1524,8 @@ const CATEGORY_LABELS: Record<string, string> = {
          user-bubble token, with an accent-derived hairline border. */
       .message-user .message-body {
         padding: 10px 14px;
-        border-radius: 12px;
-        border-top-right-radius: 4px;
+        border-radius: var(--radius-lg);
+        border-top-right-radius: var(--radius-tag);
         background: var(--user-bubble, var(--surface-0));
         color: var(--user-bubble-text, var(--text-primary));
         border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
@@ -1553,7 +1553,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-muted, var(--text-muted));
         padding: 4px 12px;
         background: var(--surface-0, var(--surface-0));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         width: fit-content;
         margin: 0 auto;
       }
@@ -1580,7 +1580,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         color: var(--text-muted, var(--text-muted));
         cursor: pointer;
         list-style: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         transition: background 0.15s;
       }
 
@@ -1622,7 +1622,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         gap: 6px;
         padding: 4px 8px;
         cursor: pointer;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         color: var(--text-muted, var(--text-muted));
         transition: background 0.15s;
         list-style: none;
@@ -1822,7 +1822,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .thinking-block {
         margin: 4px 0 8px;
         border-left: 2px solid var(--border, var(--surface-1));
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
       }
 
       .thinking-block > .thinking-header {
@@ -2014,7 +2014,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 3px;
         padding: 1px 6px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
         text-transform: uppercase;
@@ -2337,7 +2337,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         display: grid;
         place-items: center;
         background: var(--accent-color, var(--accent-color));
-        color: var(--timeline-bg, var(--timeline-bg));
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         border: 0;
         border-radius: 50%;
         cursor: pointer;
@@ -2400,7 +2400,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         max-width: 240px;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         position: relative;
       }
 
@@ -2421,7 +2421,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         width: 56px;
         height: 56px;
         object-fit: cover;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
       }
 
       .attachment-icon {
@@ -2461,7 +2461,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         height: 22px;
         background: transparent;
         border: 0;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         color: var(--text-muted, var(--text-muted));
         cursor: pointer;
       }
@@ -2480,7 +2480,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         background: color-mix(in srgb, var(--danger, #c44) 12%, transparent);
         color: var(--danger, #c44);
         font-size: 12px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
       }
 
       /* Recording strip — replaces the textarea while recording. */
@@ -2495,7 +2495,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .recording-canvas {
         flex: 1;
         height: 56px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         background: transparent;
       }
 
@@ -2542,7 +2542,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .recording-btn.confirm {
         background: var(--accent-color, var(--accent-color));
-        color: var(--timeline-bg, var(--timeline-bg));
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         border-color: transparent;
       }
 
@@ -2564,7 +2564,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         min-width: 180px;
         background: var(--panel-bg, var(--panel-bg));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         padding: 4px;
         box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
         z-index: 11;
@@ -2584,7 +2584,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 8px 10px;
         background: transparent;
         border: 0;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         color: var(--text-primary, var(--text-primary));
         font-family: inherit;
         font-size: 13px;
@@ -2632,7 +2632,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         height: 26px;
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         color: var(--text-muted, var(--text-muted));
         cursor: pointer;
         transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
@@ -2681,7 +2681,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         padding: 3px 8px;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-size: 12px;
         color: var(--text-muted, var(--text-muted));
         max-width: 240px;
@@ -2703,7 +2703,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         margin-bottom: 8px;
         background: var(--panel-bg, var(--panel-bg));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 12px;
+        border-radius: var(--radius-lg);
         padding: 4px;
         box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
         z-index: 10;
@@ -2714,7 +2714,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         align-items: center;
         gap: 10px;
         padding: 8px 12px;
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         cursor: pointer;
         transition: background 0.1s ease;
       }
@@ -2739,7 +2739,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 
       .message-body ::ng-deep pre {
         background: var(--panel-bg, var(--panel-bg));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         padding: 12px 16px;
         overflow-x: auto;
         font-family: 'JetBrains Mono', monospace;
@@ -2760,7 +2760,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         right: 6px;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         padding: 2px 4px;
         cursor: pointer;
         opacity: 0;
@@ -2783,7 +2783,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       .message-body ::ng-deep code {
         background: color-mix(in srgb, var(--accent-color) 20%, transparent);
         padding: 1px 5px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 0.9em;
       }
@@ -2791,7 +2791,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       /* Collapsible code blocks */
       .message-body ::ng-deep .code-collapse {
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         margin: 8px 0;
         overflow: hidden;
       }

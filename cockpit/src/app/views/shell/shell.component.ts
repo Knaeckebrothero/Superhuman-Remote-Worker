@@ -140,7 +140,7 @@ import {AppIconComponent} from '../../ui/icon';
         gap: 4px;
         padding: 6px 10px;
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-primary, var(--text-primary));
         font-size: 12px;
@@ -175,7 +175,7 @@ import {AppIconComponent} from '../../ui/icon';
         overflow-y: auto;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
         z-index: 100;
       }
@@ -236,7 +236,7 @@ import {AppIconComponent} from '../../ui/icon';
         gap: 4px;
         padding: 6px 10px;
         border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-primary, var(--text-primary));
         font-size: 12px;
@@ -266,7 +266,7 @@ import {AppIconComponent} from '../../ui/icon';
         overflow-y: auto;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
         z-index: 100;
       }
@@ -389,7 +389,7 @@ import {AppIconComponent} from '../../ui/icon';
           min-width: unset;
           width: calc(100vw - 16px);
           max-height: 50vh;
-          border-radius: 10px;
+          border-radius: var(--radius-surface);
         }
       }
     `,

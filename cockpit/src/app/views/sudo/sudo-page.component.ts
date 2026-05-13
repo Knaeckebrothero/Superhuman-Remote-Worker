@@ -329,7 +329,7 @@ function secondsLeft(req: SudoRequest): number {
 
       .request-card {
         background: var(--surface-0, var(--surface-0));
-        border-radius: 6px;
+        border-radius: var(--radius-surface);
         padding: 10px 12px;
         border-left: 3px solid var(--border-color, var(--surface-0));
       }

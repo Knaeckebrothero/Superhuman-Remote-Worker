@@ -147,7 +147,7 @@ const STORAGE_KEYS = {
       flex: 1;
       padding: 7px 10px;
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-primary, var(--text-primary));
       font-family: inherit;

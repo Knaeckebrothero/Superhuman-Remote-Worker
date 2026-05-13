@@ -639,7 +639,7 @@ import {AppDialogComponent} from '../../ui/dialog';
         justify-content: space-between;
         padding: 8px 12px;
         margin: 8px 12px 0;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         font-size: 12px;
         flex-shrink: 0;
       }
@@ -660,7 +660,7 @@ import {AppDialogComponent} from '../../ui/dialog';
       .form-panel {
         margin: 8px 12px 0;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         background: rgba(0, 0, 0, 0.2);
         flex-shrink: 0;
       }
@@ -717,7 +717,7 @@ import {AppDialogComponent} from '../../ui/dialog';
         padding: 8px 10px;
         background: var(--info-tint);
         border: 1px solid var(--info-tint);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-size: 11px;
         color: var(--text-secondary, var(--text-secondary));
         line-height: 1.5;
@@ -812,7 +812,7 @@ import {AppDialogComponent} from '../../ui/dialog';
         margin: 0;
         background: rgba(0, 0, 0, 0.25);
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 6px;
+        border-radius: var(--radius-tag);
         white-space: pre-wrap;
         word-break: break-all;
       }
@@ -829,7 +829,7 @@ import {AppDialogComponent} from '../../ui/dialog';
         gap: 6px;
         padding: 8px 12px;
         margin-top: 8px;
-        border-radius: 5px;
+        border-radius: var(--radius-control);
         font-size: 12px;
       }
 

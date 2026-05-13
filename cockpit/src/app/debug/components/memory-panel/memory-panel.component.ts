@@ -312,7 +312,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .tab-btn {
         padding: 4px 12px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 11px;
@@ -328,7 +328,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .tab-btn.active {
         background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         border-color: var(--accent-color, #cba6f7);
       }
 
@@ -336,7 +336,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         margin-left: auto;
         padding: 4px 8px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         cursor: pointer;
@@ -377,7 +377,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .error-state button {
         padding: 8px 16px;
         border: 1px solid #f38ba8;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: #f38ba8;
         cursor: pointer;
@@ -439,7 +439,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .metric-card {
         background: var(--surface-0, #313244);
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         padding: 12px 10px;
         text-align: center;
       }
@@ -475,7 +475,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .filter-btn {
         padding: 4px 10px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 11px;
@@ -497,7 +497,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .inline-select {
         padding: 4px 8px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: var(--panel-bg, #181825);
         color: var(--text-secondary, #a6adc8);
         font-size: 11px;
@@ -527,7 +527,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .memory-item {
         border-left: 3px solid var(--border-color, #45475a);
         margin-bottom: 4px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         background: var(--surface-0, #313244);
         transition: all 0.15s ease;
       }
@@ -547,7 +547,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .type-badge {
         padding: 2px 6px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
         font-family: 'JetBrains Mono', monospace;
@@ -624,7 +624,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         font-family: 'JetBrains Mono', monospace;
         background: var(--panel-bg, #181825);
         padding: 8px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         max-height: 200px;
         overflow: auto;
         line-height: 1.5;
@@ -638,7 +638,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .keyword-chip {
         padding: 2px 8px;
-        border-radius: 10px;
+        border-radius: var(--radius-pill);
         background: var(--surface-0, #313244);
         color: var(--text-secondary, #a6adc8);
         font-size: 10px;
@@ -683,7 +683,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .page-btn {
         padding: 4px 10px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 11px;

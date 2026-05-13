@@ -1,13 +1,13 @@
 # yaml-language-server: $schema=../../schema.json
-# Developer - Claude Code delegation, PR factory
+# Developer - direct implementation, PR factory
 $extends: defaults
 
 agent_id: developer
 display_name: Developer
 description: |
   Implementation engine. Receives approved ideas and implementation tasks,
-  delegates to Claude Code sessions, manages PRs. Throughput-focused and
-  systematic. One todo = one delegation = one focused change.
+  implements changes directly in the workspace repo, manages PRs.
+  Throughput-focused and systematic. One todo = one focused change.
 icon: code
 color: "#89b4fa"
 tags:

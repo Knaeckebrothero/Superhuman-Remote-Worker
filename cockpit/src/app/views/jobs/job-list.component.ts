@@ -494,7 +494,7 @@ interface JobRow {
       .expand-btn {
         background: rgba(127, 132, 156, 0.1);
         border: 1px solid rgba(127, 132, 156, 0.25);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         color: var(--text-muted, #7f849c);
         cursor: pointer;
         padding: 2px;
@@ -543,7 +543,7 @@ interface JobRow {
       .config-badge {
         display: inline-block;
         padding: 1px 5px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 9px;
         font-weight: 500;
         text-transform: uppercase;
@@ -557,7 +557,7 @@ interface JobRow {
       .delegation-badge {
         display: inline-block;
         padding: 1px 5px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 9px;
         font-weight: 500;
         letter-spacing: 0.3px;
@@ -572,7 +572,7 @@ interface JobRow {
         display: inline-block;
         width: 16px;
         height: 16px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 9px;
         font-weight: 600;
         line-height: 16px;

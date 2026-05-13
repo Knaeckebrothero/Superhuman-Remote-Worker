@@ -104,7 +104,7 @@ import {
       align-items: center;
       gap: 10px;
       padding: 8px 10px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       border-left: 2px solid transparent;
       cursor: pointer;
       transition: background 0.15s, border-color 0.15s;
@@ -183,7 +183,7 @@ import {
     .inline-input {
       padding: 4px 8px;
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 4px;
+      border-radius: var(--radius-control);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-primary, var(--text-primary));
       font-family: inherit;

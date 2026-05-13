@@ -28,7 +28,7 @@ import { AppIconComponent } from '../../ui/icon';
         height: 32px;
         background: transparent;
         border: 1px solid var(--border-color, #313244);
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         color: var(--text-muted, #6c7086);
         cursor: pointer;
         padding: 0;

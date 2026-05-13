@@ -545,7 +545,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     .admin-section {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
       padding: 24px;
     }
     .section-spacer { margin-top: 24px; }
@@ -563,7 +563,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     .key-table {
       margin-bottom: 20px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       overflow: hidden;
     }
     .key-header,
@@ -595,7 +595,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     .test-result {
       margin: 8px 0;
       padding: 8px 12px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-size: 12px;
     }
     .test-result.ok {
@@ -614,7 +614,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
     }
     .endpoint-card {
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 14px;
       margin-bottom: 12px;
     }
@@ -699,7 +699,7 @@ const DISCOVERABLE_PROVIDERS: ReadonlySet<string> = new Set([
       padding: 14px;
       background: var(--surface-0);
       border: 1px dashed var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
     }
     .discovery-head {
       display: flex;

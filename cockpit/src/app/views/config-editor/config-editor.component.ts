@@ -424,7 +424,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       padding: 8px 12px;
       background: var(--surface-0, var(--surface-0));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       cursor: pointer;
       color: var(--text-primary, var(--text-primary));
       font-size: 13px;
@@ -558,7 +558,7 @@ function getNestedValue(obj: unknown, path: string): unknown {
       margin-top: 4px;
       padding: 4px 8px;
       background: var(--danger-tint);
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
     }
   `],
 })

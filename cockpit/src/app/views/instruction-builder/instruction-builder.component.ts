@@ -330,7 +330,7 @@ interface ChatMessage {
 
       .message-content {
         padding: 10px 14px;
-        border-radius: 12px;
+        border-radius: var(--radius-lg);
         font-size: 13px;
         line-height: 1.5;
         white-space: pre-wrap;
@@ -376,7 +376,7 @@ interface ChatMessage {
         align-items: center;
         gap: 4px;
         padding: 3px 8px;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         background: var(--success-tint);
         border: 1px solid var(--success-tint);
         font-size: 11px;
@@ -394,7 +394,7 @@ interface ChatMessage {
         overflow-y: auto;
         white-space: pre-wrap;
         background: rgba(148, 226, 213, 0.05);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         padding: 8px 8px 8px 12px;
       }
 
@@ -427,7 +427,7 @@ interface ChatMessage {
         gap: 8px;
         padding: 6px 10px;
         margin-bottom: 8px;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: var(--danger-tint);
         border: 1px solid var(--danger-tint);
         font-size: 12px;
@@ -457,7 +457,7 @@ interface ChatMessage {
         flex: 1;
         padding: 10px 12px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         background: var(--surface-0, #313244);
         color: var(--text-primary, #cdd6f4);
         font-family: inherit;
@@ -519,7 +519,7 @@ interface ChatMessage {
       :host ::ng-deep .markdown-body pre {
         background: var(--timeline-bg, #11111b);
         padding: 12px;
-        border-radius: 8px;
+        border-radius: var(--radius-tag);
         overflow-x: auto;
         margin: 0.4em 0;
         border: 1px solid var(--border-color, #313244);
@@ -538,7 +538,7 @@ interface ChatMessage {
       :host ::ng-deep .markdown-body code {
         background: var(--surface-0, #313244);
         padding: 0.15em 0.4em;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
         font-size: 0.9em;
         border: 1px solid var(--border-color, #313244);
@@ -559,7 +559,7 @@ interface ChatMessage {
         padding: 0.3em 0 0.3em 0.8em;
         border-left: 3px solid var(--accent-color, #cba6f7);
         background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-        border-radius: 0 6px 6px 0;
+        border-radius: 0 var(--radius-control) var(--radius-control) 0;
         color: var(--text-secondary, #a6adc8);
       }
 
@@ -615,7 +615,7 @@ interface ChatMessage {
         height: 28px;
         padding: 0;
         border: none;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: var(--surface-0, #313244);
         color: var(--text-muted, var(--text-muted));
         cursor: pointer;
@@ -711,7 +711,7 @@ interface ChatMessage {
       .workspace-proposal-card {
         margin: 8px 0;
         border: 1px solid rgba(250, 179, 135, 0.3);
-        border-radius: 10px;
+        border-radius: var(--radius-surface);
         background: rgba(250, 179, 135, 0.06);
         overflow: hidden;
       }
@@ -742,7 +742,7 @@ interface ChatMessage {
       .proposal-title code {
         background: rgba(250, 179, 135, 0.15);
         padding: 1px 5px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 11px;
       }
 
@@ -754,7 +754,7 @@ interface ChatMessage {
 
       .diff-section {
         margin-bottom: 8px;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         overflow: hidden;
       }
 
@@ -812,13 +812,13 @@ interface ChatMessage {
       .diff-current {
         background: rgba(49, 50, 68, 0.5);
         border: 1px solid var(--border-color, #313244);
-        border-radius: 6px;
+        border-radius: var(--radius-control);
       }
 
       .diff-new {
         background: var(--success-tint);
         border: 1px solid var(--success-tint);
-        border-radius: 6px;
+        border-radius: var(--radius-control);
       }
 
       .proposal-actions {
