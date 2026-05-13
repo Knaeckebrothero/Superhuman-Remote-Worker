@@ -15,11 +15,21 @@ excluded_rules = [
     "prefer-text-field",
 ]
 
-# 0001_initial.sql is a snapshot of the cutover state, not a hand-written
-# migration. It would trip rules that are appropriate for ALTERs on a hot
-# prod table but irrelevant for an empty-DB bootstrap. Future numbered
-# migrations are linted normally.
+# Files excluded from lint coverage. Two categories:
+#
+#   1. 0001_initial.sql (both DBs) — snapshot of the cutover state, not a
+#      hand-written migration. Trips rules appropriate for ALTERs on a hot
+#      prod table but irrelevant for an empty-DB bootstrap.
+#
+#   2. 0004 / 0006 — shipped with BIGSERIAL primary keys, already applied
+#      and therefore checksum-locked by the migration runner. The
+#      prefer-identity warning here can't be acted on without breaking
+#      the runner; the BIGSERIAL → IDENTITY conversion is delivered as a
+#      forward migration (0007). New migrations are linted normally and
+#      should still prefer IDENTITY columns.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
+    "orchestrator/database/migrations/app/0004_thread_events.sql",
+    "orchestrator/database/migrations/app/0006_headless_notifications.sql",
 ]
