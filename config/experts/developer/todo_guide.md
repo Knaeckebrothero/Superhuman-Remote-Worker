@@ -1,11 +1,11 @@
 # Todo Crafting Guide — Developer
 
 **You MUST read this file before calling `next_phase_todos`.** The tool will reject
-your call if you haven't. This guide teaches you how to create effective, delegation-ready todos.
+your call if you haven't. This guide teaches you how to create effective, execution-ready todos.
 
 ---
 
-## Core Principle: One Todo = One Delegation
+## Core Principle: One Todo = One Focused Change
 
 **Target: 5-10 todos per tactical phase.** Adapt based on task complexity:
 - **Simple, well-defined tasks**: 5-7 todos (straightforward implementations)
@@ -14,7 +14,7 @@ your call if you haven't. This guide teaches you how to create effective, delega
 
 Each tactical phase ends with a strategic review. More frequent reviews mean:
 - Earlier detection of wrong directions
-- Better-adapted delegation prompts based on what Claude Code actually produced
+- Better-adapted todos based on what actually landed in the diff
 - Less wasted work if the approach needs to change
 
 A phase should represent one coherent unit of work — "explore the codebase," "implement
@@ -24,11 +24,11 @@ the auth module," "add tests for the API endpoints" — not an entire feature.
 
 ## Todo Specificity Rules
 
-Every todo must be specific enough to convert directly into a `claude_code` prompt.
+Every todo must be specific enough to act on immediately during the tactical phase.
 
-### Vague → Delegation-Ready Examples
+### Vague → Execution-Ready Examples
 
-| Vague (fails) | Delegation-ready (works) |
+| Vague (fails) | Execution-ready (works) |
 |---|---|
 | "Fix the tests" | "Fix failing test in repo/tests/test_auth.py::test_login_invalid_token — handle empty session token by returning 401. Follow guard pattern from repo/src/auth/refresh.py:30. Run pytest tests/test_auth.py" |
 | "Add the API endpoint" | "Add GET /api/users/{id} endpoint in repo/src/routes/users.py. Return UserResponse schema from repo/src/schemas/user.py. Follow pattern from repo/src/routes/items.py:get_item. Run pytest tests/test_routes_users.py" |
@@ -37,19 +37,19 @@ Every todo must be specific enough to convert directly into a `claude_code` prom
 | "Update the frontend" | "Add user profile page component in repo/frontend/src/components/UserProfile.tsx. Display name, email, avatar. Follow component pattern from repo/frontend/src/components/ItemDetail.tsx. Run npm test -- --testPathPattern=UserProfile" |
 | "Set up CI" | "Create repo/.github/workflows/ci.yml with: checkout, setup Python 3.11, install requirements.txt, run pytest tests/ -v. Follow structure from existing repo/.github/workflows/lint.yml" |
 
-### What Makes a Delegation-Ready Todo
+### What Makes an Execution-Ready Todo
 
 1. **Names target files** — exact paths to read/modify (e.g., `repo/src/auth/login.py`)
 2. **Names the specific change** — what to add, fix, or modify
 3. **Names a reference pattern** — an existing file that shows the convention to follow
 4. **Names the verification command** — the test or check to run after implementation
-5. **Completable in one delegation** — if it needs more than one `claude_code` call, split it
+5. **Completable in one focused change** — if it needs more than ~3 files touched, split it
 
-### The Delegation Test
+### The Specificity Test
 
-Before finalizing each todo, ask: "Could I convert this directly into a GOAL/CONTEXT/SCOPE/CONSTRAINTS/VERIFY prompt?"
+Before finalizing each todo, ask: "Could I open this todo, read the files it names, and start typing the fix immediately?"
 - "Implement the feature" → What feature? Which files? What convention? Too vague.
-- "Add password validation to repo/src/auth/validators.py — min 8 chars, 1 uppercase, 1 digit. Follow pattern from email_validator in same file. Run pytest tests/test_validators.py" → Clear delegation prompt.
+- "Add password validation to repo/src/auth/validators.py — min 8 chars, 1 uppercase, 1 digit. Follow pattern from email_validator in same file. Run pytest tests/test_validators.py" → Clear, actionable.
 
 ---
 
@@ -57,7 +57,7 @@ Before finalizing each todo, ask: "Could I convert this directly into a GOAL/CON
 
 ### 1. Codebase Exploration Phase (first phase for any new repo)
 
-Purpose: Understand the repository before delegating any code changes.
+Purpose: Understand the repository before changing any code.
 
 Example todos:
 - "Read repo/README.md and repo/package.json (or requirements.txt) to understand project structure and dependencies"
@@ -75,24 +75,24 @@ Example todos:
 - "Record framework, conventions, test command, key entry points, branch strategy in notes/repository_notes.md"
 {% endif -%}
 
-### 2. Implementation Phase (core delegation work)
+### 2. Implementation Phase (core development work)
 
-Purpose: Delegate focused code changes to Claude Code, one per todo.
+Purpose: Land focused code changes, one per todo.
 
 Example todos:
-- "Delegate: Add UserService class in repo/src/services/user_service.py with create, read, update, delete methods. Follow pattern from repo/src/services/item_service.py. Run pytest tests/test_user_service.py"
-- "Delegate: Add user routes in repo/src/routes/users.py — CRUD endpoints using UserService. Follow repo/src/routes/items.py pattern. Run pytest tests/test_routes_users.py"
+- "Add UserService class in repo/src/services/user_service.py with create, read, update, delete methods. Follow pattern from repo/src/services/item_service.py. Run pytest tests/test_user_service.py"
+- "Add user routes in repo/src/routes/users.py — CRUD endpoints using UserService. Follow repo/src/routes/items.py pattern. Run pytest tests/test_routes_users.py"
 - "Verify via git_diff: confirm only expected files changed, no unrelated modifications"
-- "Delegate: Add migration script in repo/migrations/003_add_users_table.py. Follow pattern from repo/migrations/002_add_items_table.py. Run migration and verify schema"
+- "Add migration script in repo/migrations/003_add_users_table.py. Follow pattern from repo/migrations/002_add_items_table.py. Run migration and verify schema"
 
 ### 3. Testing Phase (verify and harden)
 
 Purpose: Add tests, fix failures, ensure coverage.
 
 Example todos:
-- "Delegate: Add unit tests for UserService in repo/tests/test_user_service.py. Cover: create valid user, duplicate email error, missing required fields, update nonexistent user. Run pytest tests/test_user_service.py -v"
-- "Delegate: Add integration tests for user API routes in repo/tests/test_routes_users.py. Cover: CRUD operations, auth required, invalid input. Run pytest tests/test_routes_users.py -v"
-- "Delegate: Run full test suite (pytest tests/ -v), fix any regressions introduced by the user feature"
+- "Add unit tests for UserService in repo/tests/test_user_service.py. Cover: create valid user, duplicate email error, missing required fields, update nonexistent user. Run pytest tests/test_user_service.py -v"
+- "Add integration tests for user API routes in repo/tests/test_routes_users.py. Cover: CRUD operations, auth required, invalid input. Run pytest tests/test_routes_users.py -v"
+- "Run full test suite (pytest tests/ -v), fix any regressions introduced by the user feature"
 - "Verify via git_diff: confirm test files are substantive (not empty stubs or skipped tests)"
 
 ### 4. PR/Commit Phase (package and ship)
@@ -101,8 +101,8 @@ Purpose: Create clean, focused commits and PRs.
 
 Example todos:
 - "Review all changes via the git_diff tool against the phase_N_start tag — confirm scope matches the feature"
-- "Delegate: Clean up any debug prints, commented-out code, or TODO markers. Run linter. Run full test suite"
-- "Delegate: Stage all changes, commit with message 'feat: add user CRUD endpoints with tests', push to origin feature/users"
+- "Clean up any debug prints, commented-out code, or TODO markers. Run linter. Run full test suite"
+- "Stage all changes via run_command, commit with message 'feat: add user CRUD endpoints with tests', push to origin feature/users"
 - "Verify via git_log: confirm commit is clean and push succeeded"
 
 ### 5. Bug Fix Phase (diagnose and fix)
@@ -112,8 +112,8 @@ Purpose: Investigate a specific bug, implement the fix, add regression tests.
 Example todos:
 - "Read the bug report/error log. Identify the affected file and function"
 - "Read repo/src/affected_file.py to understand current behavior"
-- "Delegate: Fix [specific bug] in repo/src/affected_file.py:line. Root cause: [explanation]. Add guard clause for [condition]. Run pytest tests/test_affected.py"
-- "Delegate: Add regression test in repo/tests/test_affected.py::test_bug_description that reproduces the original bug and confirms the fix. Run pytest tests/test_affected.py -v"
+- "Fix [specific bug] in repo/src/affected_file.py:line. Root cause: [explanation]. Add guard clause for [condition]. Run pytest tests/test_affected.py"
+- "Add regression test in repo/tests/test_affected.py::test_bug_description that reproduces the original bug and confirms the fix. Run pytest tests/test_affected.py -v"
 - "Verify via git_diff: confirm fix is minimal and targeted, no unrelated changes"
 
 ### 6. Refactoring Phase (restructure without changing behavior)
@@ -122,32 +122,21 @@ Purpose: Improve code structure while preserving all existing behavior.
 
 Example todos:
 - "Run full test suite (pytest tests/ -v) and record baseline results — all tests must pass before refactoring"
-- "Delegate: Extract [logic] from repo/src/module.py into repo/src/new_module.py. Update imports in all consumers. Run pytest tests/ -v"
+- "Extract [logic] from repo/src/module.py into repo/src/new_module.py. Update imports in all consumers. Run pytest tests/ -v"
 - "Verify via git_diff: confirm only structural changes, no behavior changes"
 - "Run full test suite again — same tests must pass with same results"
 
 ---
 
-## Session Management Guidance
-
-- **New session** for each independent todo — gives Claude Code a clean context
-- **Resume session** (pass `session_id`) when:
-  - A delegation needs corrections after verification
-  - You need to run additional tests on the same changes
-  - Follow-up work touches the same files
-- **Always save `session_id`** in todo completion notes for potential follow-ups
-
----
-
 ## Verification Discipline
 
-Every delegation must be independently verified. Do not trust Claude Code's self-reported output.
+Every change must be independently verified before `todo_complete`.
 
 **Verification checklist per todo:**
 1. `git_diff` — Are the changes what you expected? No unrelated files?
-2. `read_file` — Spot-check key files for correctness
-3. Test output — Did the specified tests actually pass? Read the output for errors even if exit code is 0.
-4. Scope check — Did the delegation stay within the specified files?
+2. `read_file` — Spot-check the modified file (write_file overwrites — confirm you preserved everything you meant to).
+3. Test output — Did the specified tests actually pass? Read the output for "0 tests collected", "skipped", or warning lines even if exit code is 0.
+4. Scope check — Did the change stay within the files the todo named?
 
 **Evidence-based completion:** Todo notes should include concrete evidence:
 - Bad: "Implemented the feature, tests pass"
