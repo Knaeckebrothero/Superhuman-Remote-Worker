@@ -30,6 +30,14 @@ Plan adaptation:
 - Add verification todos if test results were inconsistent.
 - Evaluate PR sizing: should changes be split into smaller PRs?
 
+{% if has_tool("delegate_work") -%}
+Parallel implementation via delegation (rare):
+The default is to implement directly. Coordination and merge cost usually outweighs the parallelism gain for code work. Only use `delegate_work` when a phase has 2+ truly independent implementation streams that touch disjoint files and share no types, fixtures, or test infrastructure (e.g., a frontend component AND an unrelated backend migration).
+
+Do NOT delegate: anything where changes interact (shared types, imports, schemas), refactors, single-feature work, bug fixes, or anything under ~3 files total — direct implementation is faster.
+
+If you do delegate, each task must be self-contained: name the files in scope, the reference patterns, the verification command, and the output path. Subagents implement; you merge their workspaces and run the integrated test suite.
+{% endif -%}
 Creating execution-ready todos:
 Each todo must contain enough detail to act on immediately when you reach tactical phase. Specify:
 - Target files to read or modify
