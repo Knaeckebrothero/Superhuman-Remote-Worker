@@ -21,15 +21,20 @@ excluded_rules = [
 #      hand-written migration. Trips rules appropriate for ALTERs on a hot
 #      prod table but irrelevant for an empty-DB bootstrap.
 #
-#   2. 0004 / 0006 — shipped with BIGSERIAL primary keys, already applied
-#      and therefore checksum-locked by the migration runner. The
-#      prefer-identity warning here can't be acted on without breaking
-#      the runner; the BIGSERIAL → IDENTITY conversion is delivered as a
-#      forward migration (0007). New migrations are linted normally and
-#      should still prefer IDENTITY columns.
+#   2. Already-applied migrations whose lint findings can't be acted on
+#      without tripping the migration runner's checksum guard. The
+#      underlying advice (prefer IDENTITY over BIGSERIAL, NOT VALID on
+#      new CHECK constraints, CREATE INDEX CONCURRENTLY in .notx.sql) is
+#      documented in docs/db_migration.md and applies to all NEW migrations.
+#      Files here shipped before squawk caught them; rewriting in place
+#      would re-execute against a DB that's already at the target state.
+#        - 0004 / 0006: BIGSERIAL primary keys (fixed forward by 0007).
+#        - 0008: ADD CHECK without NOT VALID and CREATE INDEX without
+#                CONCURRENTLY on threads. Already applied 2026-05-13.
 excluded_paths = [
     "orchestrator/database/migrations/app/0001_initial.sql",
     "orchestrator/database/migrations/vector/0001_initial.sql",
     "orchestrator/database/migrations/app/0004_thread_events.sql",
     "orchestrator/database/migrations/app/0006_headless_notifications.sql",
+    "orchestrator/database/migrations/app/0008_thread_awaiting_user.sql",
 ]

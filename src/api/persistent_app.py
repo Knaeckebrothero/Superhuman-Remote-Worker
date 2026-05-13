@@ -1813,17 +1813,27 @@ async def _loop_get_user_input() -> str:
 
     _broadcast("ready", {})
 
-    # Phase 5: natural-pause transition. Flip to 'awaiting_user' iff at least
-    # one turn has completed (i.e. not the initial boot wait — the boot-WS
-    # watchdog covers that) AND no WS subscriber is attached. Idempotent on
-    # the orchestrator side: repeated writes preserve awaiting_user_since.
-    if (
+    # Phase 5/6: natural-pause transition to 'awaiting_user'. Eager mode
+    # (default) only flips when untethered — the agent is presumed to be
+    # working in the background and we only need to flag-and-notify when
+    # the user has nobody watching. Polite mode flips at every turn boundary
+    # regardless of subscribers — the user has explicitly opted in to a
+    # review-heavy "see every step" workflow and wants notification + an
+    # explicit reply gate after each completed turn. Idempotent on the
+    # orchestrator side: repeated writes preserve awaiting_user_since.
+    headless_mode = "eager"
+    if _session is not None:
+        headless_cfg = getattr(_session.config, "headless", None)
+        if headless_cfg is not None:
+            headless_mode = getattr(headless_cfg, "mode", "eager") or "eager"
+    should_flip = (
         _session is not None
         and _session.turn_count > 0
-        and not _subscribers
         and _orchestrator_client is not None
         and _thread_id is not None
-    ):
+        and (headless_mode == "polite" or not _subscribers)
+    )
+    if should_flip:
         asyncio.create_task(
             _safe_set_thread_status("awaiting_user"),
             name="phase5-flip-awaiting-user",
