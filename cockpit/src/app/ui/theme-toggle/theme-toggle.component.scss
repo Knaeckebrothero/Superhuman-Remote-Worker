@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-block;
@@ -12,7 +13,7 @@
   height: 32px;
   padding: 0 32px 0 12px;
   border: 1px solid var(--border-color);
-  border-radius: v.$radius-md;
+  @include shape.control;
   background: var(--surface-0);
   color: var(--text-primary);
   font-size: v.$font-size-xs;

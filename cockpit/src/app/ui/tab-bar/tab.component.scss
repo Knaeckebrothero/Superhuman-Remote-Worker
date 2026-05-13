@@ -1,11 +1,12 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: v.$space-xs v.$space-md;
-  border-radius: v.$radius-sm;
+  @include shape.control;
   border: 1px solid var(--border-color);
   background: transparent;
   color: var(--text-muted);
