@@ -60,7 +60,7 @@ body {
 
 ::-webkit-scrollbar-thumb {
   background: var(--surface-1);
-  border-radius: v.$radius-sm;
+  border-radius: var(--radius-tag);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -84,7 +84,7 @@ textarea:focus-visible {
 // --- Selection ---
 ::selection {
   background: var(--accent-color);
-  color: var(--timeline-bg);
+  color: var(--on-accent, var(--timeline-bg));
 }
 
 // --- Mobile touch adjustments ---
@@ -116,14 +116,14 @@ textarea:focus-visible {
   background: var(--surface-2);
   color: var(--text-primary);
   border: 1px solid var(--border-color);
-  border-radius: v.$radius-sm;
+  border-radius: var(--radius-tag);
   box-shadow: var(--shadow-md);
   font-family: v.$font-family-base;
   font-size: v.$font-size-xs;
   font-weight: v.$font-weight-medium;
   line-height: v.$line-height-tight;
   white-space: normal;
-  word-wrap: break-word;
+  overflow-wrap: break-word;
   animation: app-tooltip-fade 0.15s ease-out;
 }
 

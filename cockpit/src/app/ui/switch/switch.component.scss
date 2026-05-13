@@ -42,7 +42,9 @@
   flex-shrink: 0;
   display: inline-block;
   background: var(--surface-1);
+
   @include shape.pill;
+
   transition:
     background-color 0.15s ease,
     border-color 0.15s ease;
@@ -63,7 +65,9 @@
   top: 2px;
   left: 2px;
   background: var(--text-primary);
+
   @include shape.circle;
+
   transition:
     transform 0.18s cubic-bezier(0.4, 0, 0.2, 1),
     background-color 0.15s ease;

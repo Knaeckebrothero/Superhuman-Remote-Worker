@@ -21,23 +21,22 @@
   // --- Typography families ---
   --font-family-base:
     -apple-system,
-    BlinkMacSystemFont,
+    blinkmacsystemfont,
     'Segoe UI',
-    Roboto,
-    Oxygen,
-    Ubuntu,
+    roboto,
+    oxygen,
+    ubuntu,
     sans-serif;
 
   // Display family defaults to the base; Roman themes override to Cinzel via
   // _shape-overrides.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
-
   --font-family-mono:
     ui-monospace,
     'SFMono-Regular',
-    Menlo,
-    Monaco,
+    menlo,
+    monaco,
     'Cascadia Mono',
-    Consolas,
+    consolas,
     monospace;
 }

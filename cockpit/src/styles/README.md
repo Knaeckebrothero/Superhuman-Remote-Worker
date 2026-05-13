@@ -6,7 +6,7 @@ This is the engineering side of the design system. For brand intent, palette rat
 
 ```
 src/styles/
-├── _variables.scss            Sass scalars (spacing, breakpoints, z-index, type scale). Radii also live here as legacy compat — new code reads --radius-* CSS variables.
+├── _variables.scss            Sass scalars (spacing, breakpoints, z-index, type scale). Radii live in _root-tokens.scss as CSS variables — there are no Sass `$radius-*` scalars anymore.
 ├── _mixins.scss               Utility mixins (focus-ring, breakpoints, truncate, visually-hidden).
 ├── _root-tokens.scss          Primitive CSS variables at :root (--radius-sm/md/lg/xl/full, --font-family-base/display/mono).
 ├── _semantic-tokens.scss      Role tokens at :root (--radius-control/surface/pill/tag, --font-primary/control/mono).
@@ -228,9 +228,34 @@ When changing themes or tokens, run:
 ```bash
 npm test -- --run        # vitest, including theme.service.spec.ts
 npm run build            # full Angular production build
+npm run lint:styles      # stylelint on src/**/*.scss
 ```
 
 The theme service spec covers preference resolution, legacy migration, system-mode listening, and body-class swapping. SCSS errors surface during the production build (the dev server's HMR can hide them).
+
+## Stylelint
+
+`.stylelintrc.json` extends `stylelint-config-standard-scss` with cockpit-specific overrides. The rule that exists *because of this design system* is the `border-radius` regression guard:
+
+```json
+"declaration-property-value-disallowed-list": {
+  "border-radius": ["/\\d+px/"],
+  "border-top-left-radius": ["/\\d+px/"],
+  "border-top-right-radius": ["/\\d+px/"],
+  "border-bottom-left-radius": ["/\\d+px/"],
+  "border-bottom-right-radius": ["/\\d+px/"]
+}
+```
+
+`var(--*)`, `0`, `50%`, and shorthand asymmetric values like `0 var(--radius-control) var(--radius-control) 0` are all allowed. Raw `Npx` values are blocked. If you genuinely need a one-off px value — don't; consume `--radius-control` or declare a component-local override (`--btn-radius: var(--radius-control)` then override that). The rule is the safety net that protects the token consistency built over Phases 1-4.
+
+**Scope:** the lint script only runs on `*.scss` files, not on Angular inline `styles:` arrays in `.ts` files. Inline styles ship through Angular's SCSS preprocessor but stylelint has no Angular-aware processor to extract them. Inline-TS radii are not lint-enforced; a periodic grep (`grep -rnE "border-radius: *[0-9]+px" src/`) is the manual backstop.
+
+A few standard-scss rules are disabled — see `.stylelintrc.json` comments-in-spirit:
+- `value-keyword-case` (would lowercase `BlinkMacSystemFont` and break font convention)
+- `scss/comment-no-empty` (flags `// --- Section ---` divider comments)
+- `color-function-alias-notation` (keeps `rgba()` legal alongside `rgb()` with alpha)
+- A handful of cosmetic rules (`declaration-block-single-line-max-declarations`, etc.) that don't add signal at this scale.
 
 ## Cross-references
 

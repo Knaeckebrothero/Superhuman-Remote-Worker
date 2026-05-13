@@ -4,8 +4,7 @@
   display: inline-flex;
 
   &[data-orientation='horizontal'] {
-    flex-direction: row;
-    flex-wrap: wrap;
+    flex-flow: row wrap;
     gap: v.$space-md;
   }
 
