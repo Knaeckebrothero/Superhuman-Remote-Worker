@@ -231,20 +231,14 @@ class TestConsumeMagicLink:
 
 
 # ---------------------------------------------------------------------------
-# Section 2 — Dedup + rate-limit probes
+# Section 2 — Rate-limit probe
 # ---------------------------------------------------------------------------
-
-
-class TestAlreadyNotified:
-    @pytest.mark.asyncio
-    async def test_returns_false_when_no_row(self):
-        db = _make_db(fetchval=None)
-        assert await hn.already_notified(db, "t", "r") is False
-
-    @pytest.mark.asyncio
-    async def test_returns_true_when_row_exists(self):
-        db = _make_db(fetchval=1)
-        assert await hn.already_notified(db, "t", "r") is True
+#
+# The standalone dedup probe (`already_notified`) was retired 2026-05-13 —
+# the sweeper SQL is now the authoritative dedup, and an in-process probe
+# only duplicated logic that could drift apart. See
+# orchestrator/main.py:thread_permission_notify_sweeper for the widened
+# IN-set that absorbed the probe's responsibilities.
 
 
 class TestThreadRateLimited:
@@ -284,29 +278,10 @@ def _email_service_mock(*, is_configured=True, send_returns=True):
 
 class TestSendPermissionPendingEmail:
     @pytest.mark.asyncio
-    async def test_skips_when_already_notified(self):
-        db = _make_db()
-        # already_notified() returns truthy.
-        db._fake_conn.fetchval = AsyncMock(return_value=1)
-        es = _email_service_mock()
-        result = await hn.send_permission_pending_email(
-            db,
-            es,
-            thread_id="t",
-            approval_id="a",
-            cockpit_external_url="http://x",
-        )
-        assert result == {"status": "skipped_dedup"}
-        # No email was sent.
-        es._send.assert_not_called()
-
-    @pytest.mark.asyncio
     async def test_skips_when_rate_limited(self):
         db = _make_db()
-        # Sequence: dedup-probe → 0 (not notified), then 5min-count → 10
-        # (over), 60min-count → 10 (over). already_notified must return
-        # falsy first, then rate_limited returns True.
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 10, 10])
+        # Sequence: 5min-count → 10 (over), 60min-count → 10 (over).
+        db._fake_conn.fetchval = AsyncMock(side_effect=[10, 10])
         es = _email_service_mock()
         result = await hn.send_permission_pending_email(
             db,
@@ -340,7 +315,6 @@ class TestSendPermissionPendingEmail:
         }
 
         # Sequencing — order matters:
-        #   already_notified probe (fetchval)    → 0 (not notified)
         #   thread_rate_limited (fetchval x2)    → 0, 0
         #   thread row (fetchrow)                → thread_row
         #   permission row (fetchrow)            → permission_row
@@ -350,7 +324,6 @@ class TestSendPermissionPendingEmail:
         db = _make_db()
         db._fake_conn.fetchval = AsyncMock(
             side_effect=[
-                0,  # already_notified
                 0,  # rate_limited 5min
                 0,  # rate_limited 60min
                 "tok-row-1",  # generate_magic_link_token approve
@@ -393,7 +366,7 @@ class TestSendPermissionPendingEmail:
         user_row = {"id": "user-uuid", "email": None, "display_name": "Alice"}
 
         db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0, 0])
+        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
         db._fake_conn.fetchrow = AsyncMock(
             side_effect=[thread_row, permission_row, user_row]
         )
@@ -427,7 +400,7 @@ class TestSendPermissionPendingEmail:
         }
 
         db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0, 0])
+        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
         db._fake_conn.fetchrow = AsyncMock(
             side_effect=[thread_row, permission_row, user_row]
         )
@@ -455,8 +428,9 @@ class TestSendPermissionPendingEmail:
             "status": "approved",  # already resolved
         }
         db = _make_db()
-        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0, 0])
+        db._fake_conn.fetchval = AsyncMock(side_effect=[0, 0])
         db._fake_conn.fetchrow = AsyncMock(side_effect=[thread_row, permission_row])
+        db._fake_conn.execute = AsyncMock()
         es = _email_service_mock()
         result = await hn.send_permission_pending_email(
             db,
@@ -467,6 +441,13 @@ class TestSendPermissionPendingEmail:
         )
         assert result["status"] == "skipped_already_resolved"
         es._send.assert_not_called()
+        # The race must be recorded in thread_notifications so the
+        # sweeper's widened IN-set can suppress re-dispatch.
+        assert db._fake_conn.execute.await_count >= 1
+        recorded_sql = db._fake_conn.execute.await_args.args[0]
+        assert "INSERT INTO thread_notifications" in recorded_sql
+        bound = db._fake_conn.execute.await_args.args
+        assert "skipped_already_resolved" in bound
 
 
 # ---------------------------------------------------------------------------
@@ -537,3 +518,63 @@ class TestTruncateArgsForEmail:
         # handles this — but if the type explodes, we still get something).
         out = hn._truncate_args_for_email({"x": _NotJsonable()})
         assert isinstance(out, str)
+
+
+# ---------------------------------------------------------------------------
+# Section 6 — Sweeper dedup SQL contract
+# ---------------------------------------------------------------------------
+#
+# Captures the SELECT the permission-notify sweeper builds and asserts on
+# its shape. Live DB round-trips are covered by the smoke runbook; here we
+# pin the SQL contract so regressions on the IN-set or recency floor are
+# caught at unit-test time.
+
+
+class TestPermissionNotifySweeperSQL:
+    @pytest.mark.asyncio
+    async def test_dedup_filter_includes_permanent_skips_and_floor(self):
+        import asyncio
+
+        import orchestrator.main as orch_main
+
+        captured: dict = {}
+        evt = asyncio.Event()
+
+        async def _fake_fetch(query: str, *args):
+            captured["query"] = query
+            captured["args"] = args
+            # Signal shutdown so the sweeper's wait_for exits and the
+            # loop terminates cleanly after this first fetch.
+            evt.set()
+            return []
+
+        fake_conn = MagicMock()
+        fake_conn.fetch = _fake_fetch
+
+        class _Acquire:
+            async def __aenter__(self_inner):
+                return fake_conn
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return None
+
+        orch_main.postgres_db = MagicMock()
+        orch_main.postgres_db.acquire = lambda: _Acquire()
+
+        await orch_main.thread_permission_notify_sweeper(evt)
+
+        q = captured.get("query", "")
+        # Permanent skips suppress forever.
+        assert "'skipped_no_email'" in q
+        assert "'skipped_already_resolved'" in q
+        # Transient skips have a recency floor.
+        assert "'skipped_rate_limit'" in q
+        assert "'skipped_smtp'" in q
+        assert "make_interval(secs => $2)" in q
+        # The recency-floor parameter is the second bind, expressed as
+        # int seconds = 2 × sweeper interval (default 30s → 60s).
+        args = captured.get("args", ())
+        assert len(args) == 2
+        # Args is (age_threshold_str, recency_floor_secs).
+        assert isinstance(args[1], int)
+        assert args[1] >= 60

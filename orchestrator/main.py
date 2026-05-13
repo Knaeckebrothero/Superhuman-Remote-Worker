@@ -11789,6 +11789,13 @@ async def thread_permission_notify_sweeper(
     while not shutdown_event.is_set():
         try:
             async with postgres_db.acquire() as conn:
+                # Suppress requests with terminal-or-permanent outcomes
+                # ('sent', 'failed', 'skipped_no_email',
+                # 'skipped_already_resolved') forever. Suppress
+                # transient outcomes ('skipped_rate_limit',
+                # 'skipped_smtp') only inside a recency window of
+                # 2 × sweeper interval, so they can re-try once the
+                # transient condition clears.
                 rows = await conn.fetch(
                     "SELECT id, thread_id "
                     "FROM thread_permission_requests "
@@ -11799,11 +11806,25 @@ async def thread_permission_notify_sweeper(
                     "    SELECT 1 FROM thread_notifications tn "
                     "    WHERE tn.request_id = thread_permission_requests.id "
                     "      AND tn.kind = 'permission_pending' "
-                    "      AND tn.delivery_status IN ('sent', 'failed')"
+                    "      AND ("
+                    "        tn.delivery_status IN ("
+                    "          'sent', 'failed', "
+                    "          'skipped_no_email', "
+                    "          'skipped_already_resolved'"
+                    "        ) "
+                    "        OR ("
+                    "          tn.delivery_status IN ("
+                    "            'skipped_rate_limit', 'skipped_smtp'"
+                    "          ) "
+                    "          AND tn.sent_at > now() - "
+                    "              make_interval(secs => $2)"
+                    "        )"
+                    "      )"
                     "  ) "
                     "ORDER BY requested_at ASC "
                     "LIMIT 50",
                     str(age_threshold_s),
+                    interval_s * 2,
                 )
             for row in rows:
                 try:

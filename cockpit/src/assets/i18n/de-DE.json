@@ -400,6 +400,14 @@
       "configDefault": "Standard",
       "configDeveloper": "Entwickler",
       "configScholar": "Forscher",
+      "headlessMode": "Headless-Verhalten",
+      "headlessModeDefault": "Standard (Eifrig)",
+      "headlessModeEager": "Eifrig — arbeitet weiter, auch ohne offene Sitzung",
+      "headlessModePolite": "Höflich — pausiert zwischen Runden bis zur Rückkehr",
+      "attentionSleep": "Aufmerksamkeits-Timeout (Minuten)",
+      "attentionSleepHint": "Wie lange der Arbeitsbereich warm bleibt, nachdem der Agent eine natürliche Pause erreicht hat und niemand zuschaut. Leer lassen für den Systemstandard (60 Min).",
+      "notificationChannels": "Benachrichtigungskanäle",
+      "notificationChannelEmail": "Per E-Mail benachrichtigen, wenn der Agent Aufmerksamkeit benötigt",
       "save": "Einstellungen für persistenten Agent speichern"
     },
     "communication": {
