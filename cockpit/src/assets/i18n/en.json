@@ -400,6 +400,14 @@
       "configDefault": "Default",
       "configDeveloper": "Developer",
       "configScholar": "Scholar",
+      "headlessMode": "Headless Behavior",
+      "headlessModeDefault": "Default (Eager)",
+      "headlessModeEager": "Eager — keep working while untethered",
+      "headlessModePolite": "Polite — park between turns until you return",
+      "attentionSleep": "Attention Sleep (minutes)",
+      "attentionSleepHint": "How long to keep the workspace warm after the agent reaches a natural pause and no one is watching. Leave blank for the system default (60 min).",
+      "notificationChannels": "Notification Channels",
+      "notificationChannelEmail": "Email me when the agent needs my attention",
       "save": "Save Persistent Agent Settings"
     },
     "communication": {

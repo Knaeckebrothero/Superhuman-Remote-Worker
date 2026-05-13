@@ -170,21 +170,6 @@ async def consume_magic_link(
     return dict(row) if row else None
 
 
-async def already_notified(db: Any, thread_id: str, request_id: str) -> bool:
-    """Dedup probe: has (thread_id, request_id) already produced a sent
-    notification? Skipped rows do not count."""
-    async with db.acquire() as conn:
-        existing = await conn.fetchval(
-            "SELECT 1 FROM thread_notifications "
-            "WHERE thread_id = $1 AND request_id = $2 "
-            "  AND delivery_status IN ('sent', 'failed') "
-            "LIMIT 1",
-            thread_id,
-            request_id,
-        )
-    return bool(existing)
-
-
 async def thread_rate_limited(db: Any, thread_id: str) -> bool:
     """Rate-limit probe: HEADLESS_RATE_5MIN per 5min OR HEADLESS_RATE_HOUR
     per 60min. Returns True if the thread is over either ceiling."""
@@ -330,25 +315,16 @@ async def send_permission_pending_email(
 ) -> dict[str, Any]:
     """Compose and send the approve-pending email.
 
-    Returns a dict with `status` ∈ {sent, failed, skipped_dedup,
-    skipped_rate_limit, skipped_no_email, skipped_smtp}. Every outcome
-    is recorded in thread_notifications for observability.
+    Returns a dict with `status` ∈ {sent, failed, skipped_rate_limit,
+    skipped_no_email, skipped_smtp, skipped_already_resolved}. Every
+    outcome is recorded in thread_notifications for observability.
 
-    Idempotent: dedup on (thread_id, approval_id) means safe to call
-    from a polling watcher.
+    Idempotent under the sweeper: the sweeper's SQL filters out
+    requests with terminal/permanent delivery outcomes, so this entry
+    point only sees first-time dispatches plus the small window where
+    a transient skip has expired.
     """
-    # 1. Dedup.
-    if await already_notified(db, thread_id, approval_id):
-        await record_notification(
-            db,
-            thread_id=thread_id,
-            request_id=approval_id,
-            kind="permission_pending",
-            delivery_status="skipped_dedup",
-        )
-        return {"status": "skipped_dedup"}
-
-    # 2. Rate limit.
+    # 1. Rate limit.
     if await thread_rate_limited(db, thread_id):
         await record_notification(
             db,
@@ -359,7 +335,7 @@ async def send_permission_pending_email(
         )
         return {"status": "skipped_rate_limit"}
 
-    # 3. Load context: thread → user → email; approval → tool details.
+    # 2. Load context: thread → user → email; approval → tool details.
     async with db.acquire() as conn:
         thread_row = await conn.fetchrow(
             "SELECT id, user_id, title FROM threads WHERE id = $1",
@@ -382,7 +358,18 @@ async def send_permission_pending_email(
         return {"status": "failed", "reason": "thread_or_request_missing"}
 
     if permission_row["status"] != "pending":
-        # Resolved between watcher detection and send — don't email.
+        # Resolved between sweeper detection and send. Record it so the
+        # sweeper's widened IN-set suppresses re-dispatch — the
+        # status='pending' filter does the same job today, but recording
+        # the race keeps thread_notifications a complete audit trail and
+        # protects against future changes to the sweeper SQL.
+        await record_notification(
+            db,
+            thread_id=thread_id,
+            request_id=approval_id,
+            kind="permission_pending",
+            delivery_status="skipped_already_resolved",
+        )
         return {"status": "skipped_already_resolved"}
 
     user_id = thread_row["user_id"]
@@ -415,7 +402,7 @@ async def send_permission_pending_email(
         )
         return {"status": "skipped_smtp"}
 
-    # 4. Generate two tokens — one per decision. Both bound to the same
+    # 3. Generate two tokens — one per decision. Both bound to the same
     # approval_id and expire on the same clock.
     approve_token, _ = await generate_magic_link_token(
         db,
@@ -434,7 +421,7 @@ async def send_permission_pending_email(
         intended_decision="denied",
     )
 
-    # 5. Compose bodies.
+    # 4. Compose bodies.
     requested_at = permission_row["requested_at"]
     if isinstance(requested_at, datetime):
         if requested_at.tzinfo is None:
@@ -463,7 +450,7 @@ async def send_permission_pending_email(
 
     subject = f"[SRW] Approval needed: {permission_row['tool_name']}"
 
-    # 6. Dispatch via EmailService internals (private _send is fine —
+    # 5. Dispatch via EmailService internals (private _send is fine —
     # same package). We avoid send_agent_message because that template
     # is job-oriented; this notification is thread-only.
     sent_ok = False

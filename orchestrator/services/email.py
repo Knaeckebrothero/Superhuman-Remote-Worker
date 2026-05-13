@@ -28,6 +28,26 @@ import aiosmtplib
 logger = logging.getLogger(__name__)
 
 
+# RFC 6761 §6 reserved TLDs that are guaranteed not to resolve in the public
+# DNS. SMTP bridges typically accept envelopes addressed to them at the
+# protocol level (RCPT TO parses, server says 250) without actually being
+# able to deliver, so without this guard we record delivery_status='sent'
+# for messages that physically cannot reach an inbox.
+_RFC6761_RESERVED_TLDS = frozenset({"invalid", "test", "example", "localhost"})
+
+
+def _is_undeliverable_recipient(addr: str) -> bool:
+    """True if `addr` is structurally undeliverable (malformed, or in a
+    reserved TLD per RFC 6761). Cheap syntactic check — no DNS lookup."""
+    if not addr or "@" not in addr:
+        return True
+    local, _, domain = addr.rpartition("@")
+    if not local or not domain or domain.startswith(".") or ".." in domain:
+        return True
+    tld = domain.rsplit(".", 1)[-1].lower()
+    return tld in _RFC6761_RESERVED_TLDS
+
+
 class EmailService:
     """Async SMTP email sender."""
 
@@ -100,6 +120,14 @@ class EmailService:
             logger.warning("SMTP not configured — cannot send email")
             return False
 
+        recipients = to if isinstance(to, list) else [to]
+        bad = [r for r in recipients if _is_undeliverable_recipient(r)]
+        if bad:
+            logger.warning(
+                "Refusing to send email to undeliverable recipient(s): %s", bad
+            )
+            return False
+
         msg = MIMEMultipart("alternative")
         msg["From"] = self.from_address
         msg["To"] = ", ".join(to) if isinstance(to, list) else to
@@ -114,8 +142,6 @@ class EmailService:
             msg["References"] = references
         msg.attach(MIMEText(body_text, "plain"))
         msg.attach(MIMEText(body_html, "html"))
-
-        recipients = to if isinstance(to, list) else [to]
 
         try:
             tls_context = self._get_tls_context()
