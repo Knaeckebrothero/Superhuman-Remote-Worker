@@ -30,7 +30,10 @@ def _make_postgres_conn(
 
     fake_conn = MagicMock()
     fake_conn.fetchval = AsyncMock()
-    fake_conn.fetchrow = AsyncMock()
+    # Default to None (asyncpg's "no row" return) so callers without an
+    # explicit update_returns don't accidentally trip Phase 5's
+    # SELECT-first-by-tool_call_id guard in _loop_permission_check.
+    fake_conn.fetchrow = AsyncMock(return_value=None)
     fake_conn.execute = AsyncMock()
     fake_conn.add_listener = AsyncMock()
     fake_conn.remove_listener = AsyncMock()
