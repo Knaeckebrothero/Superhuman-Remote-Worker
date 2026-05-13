@@ -2833,6 +2833,11 @@ class UserSettingsUpdate(BaseModel):
     default_tactical_model: str | None = None
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
+    # Phase 6: persistent_agent sub-object covers headless_mode,
+    # headless_attention_sleep_minutes, notification_channels, plus the
+    # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
+    # keys already read in create_thread. Patch-replaces the whole sub-object.
+    persistent_agent: dict[str, Any] | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -9986,6 +9991,22 @@ async def create_thread(
                 config_override["command_allowlist"] = user_settings[
                     "command_allowlist"
                 ]
+            # Phase 6: headless behavior (polite/eager + attention-sleep TTL +
+            # notification channels). Carried under config_override.headless
+            # so the agent's loader maps it onto AgentConfig.headless.
+            headless_override: dict[str, Any] = {}
+            if user_settings.get("headless_mode"):
+                headless_override["mode"] = user_settings["headless_mode"]
+            if user_settings.get("headless_attention_sleep_minutes") is not None:
+                headless_override["attention_sleep_minutes"] = int(
+                    user_settings["headless_attention_sleep_minutes"]
+                )
+            if user_settings.get("notification_channels"):
+                headless_override["notification_channels"] = list(
+                    user_settings["notification_channels"]
+                )
+            if headless_override:
+                config_override["headless"] = headless_override
 
         # Per-session overrides from request (take priority over user defaults)
         if request_body.model:
@@ -11873,16 +11894,31 @@ async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
         try:
             if workspace_suspension_service.is_enabled:
                 async with postgres_db.acquire() as conn:
+                    # Phase 6: per-thread TTL resolution. Priority order is
+                    # (1) thread.metadata.config_override.headless overrides,
+                    # (2) users.settings.persistent_agent overrides,
+                    # (3) the global HEADLESS_ATTENTION_SLEEP_MINUTES default.
+                    # ttl <= 0 disables the watchdog for that thread, matching
+                    # the cockpit UX of "Never auto-suspend".
                     rows = await conn.fetch(
-                        "SELECT id "
-                        "FROM threads "
-                        "WHERE status = 'awaiting_user' "
-                        "  AND awaiting_user_since IS NOT NULL "
-                        "  AND awaiting_user_since < "
-                        "      now() - ($1 || ' minutes')::interval "
-                        "ORDER BY awaiting_user_since ASC "
+                        "SELECT t.id "
+                        "FROM threads t "
+                        "LEFT JOIN users u ON u.id = t.user_id "
+                        "WHERE t.status = 'awaiting_user' "
+                        "  AND t.awaiting_user_since IS NOT NULL "
+                        "  AND COALESCE("
+                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
+                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
+                        "    $1::int"
+                        "  ) > 0 "
+                        "  AND t.awaiting_user_since < now() - make_interval(mins => COALESCE("
+                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
+                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
+                        "    $1::int"
+                        "  )) "
+                        "ORDER BY t.awaiting_user_since ASC "
                         "LIMIT 50",
-                        str(ttl_minutes),
+                        int(ttl_minutes),
                     )
 
                 for row in rows:
