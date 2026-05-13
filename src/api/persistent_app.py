@@ -1639,9 +1639,19 @@ def _subscribe(client_id: str) -> asyncio.Queue:
     Each WebSocket connection (and later, each SSE consumer) gets its own
     bounded queue. _broadcast() enqueues onto every registered queue;
     _run_subscriber_pump drains one queue into one WS.
+
+    Phase 5: if this is the first subscriber after an untethered pause,
+    schedule a status revert to 'active' so the attention-sleep watchdog
+    disarms. Fire-and-forget — a failed status write doesn't block the
+    attach.
     """
+    was_empty = not _subscribers
     queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
     _subscribers[client_id] = queue
+    if was_empty and _orchestrator_client is not None and _thread_id is not None:
+        asyncio.create_task(
+            _safe_set_thread_status("active"), name="phase5-revert-active"
+        )
     return queue
 
 
@@ -1651,6 +1661,18 @@ def _unsubscribe(client_id: str) -> None:
     This is what WS close calls. The loop keeps running with one fewer audience.
     """
     _subscribers.pop(client_id, None)
+
+
+async def _safe_set_thread_status(status: str) -> None:
+    """Best-effort wrapper around _update_thread_status for fire-and-forget
+    Phase 5 transitions (awaiting_user / active revert). A transient failure
+    here is acceptable — the next natural-pause or subscriber attach will
+    retry.
+    """
+    try:
+        await _update_thread_status(status)
+    except Exception as e:
+        logger.warning("Failed to set thread status to %s: %s", status, e)
 
 
 def _broadcast(method: str, params: Dict[str, Any]) -> None:
@@ -1790,6 +1812,22 @@ async def _loop_get_user_input() -> str:
         raise RuntimeError("_loop_user_queue not initialized — session torn down?")
 
     _broadcast("ready", {})
+
+    # Phase 5: natural-pause transition. Flip to 'awaiting_user' iff at least
+    # one turn has completed (i.e. not the initial boot wait — the boot-WS
+    # watchdog covers that) AND no WS subscriber is attached. Idempotent on
+    # the orchestrator side: repeated writes preserve awaiting_user_since.
+    if (
+        _session is not None
+        and _session.turn_count > 0
+        and not _subscribers
+        and _orchestrator_client is not None
+        and _thread_id is not None
+    ):
+        asyncio.create_task(
+            _safe_set_thread_status("awaiting_user"),
+            name="phase5-flip-awaiting-user",
+        )
 
     if _session is None:
         return await queue.get()
@@ -2089,6 +2127,43 @@ async def _loop_permission_check(
         if tool_name not in shell_tools:
             return True
 
+    # Phase 5 wake path: if this tool_call_id was already resolved (typical
+    # case: user clicked the magic-link approve/deny while the agent was
+    # suspended; on wake LangGraph restores the same tool_call_id from
+    # checkpoint), reuse that decision instead of inserting a fresh
+    # request. We only honor terminal 'approved'/'denied' here — 'expired'
+    # means the prior request timed out without a user response, so the
+    # new attempt deserves a fresh prompt.
+    if _session.postgres_conn is not None and _thread_id is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT status FROM thread_permission_requests "
+                    "WHERE thread_id = $1 AND tool_call_id = $2 "
+                    "  AND status IN ('approved', 'denied') "
+                    "ORDER BY decided_at DESC NULLS LAST LIMIT 1",
+                    _thread_id,
+                    tool_call_id,
+                )
+            if existing is not None:
+                decision = existing["status"]
+                _session.tool_decisions[tool_call_id] = decision
+                logger.info(
+                    "Phase 5 wake: reusing prior %s decision for tool_call %s "
+                    "(tool=%s)",
+                    decision,
+                    tool_call_id,
+                    tool_name,
+                )
+                return decision == "approved"
+        except Exception as e:
+            # Soft-fail: fall through to the regular INSERT-and-wait path.
+            logger.warning(
+                "Wake-path SELECT for tool_call %s failed (%s); falling back",
+                tool_call_id,
+                e,
+            )
+
     # Supervised mode (or shell under auto_accept): ask user via the
     # durable permission table, then wait on LISTEN/NOTIFY.
     request_id = await _insert_permission_request(tool_call_id, tool_name, tool_args)
@@ -2109,6 +2184,15 @@ async def _loop_permission_check(
             "args": _safe_serialize(tool_args),
         },
     )
+
+    # Phase 5: sudo gate hit untethered is the second natural-pause site.
+    # Flip the thread so the attention-sleep watchdog can fire after the
+    # configured TTL. Idempotent against the _loop_get_user_input write.
+    if not _subscribers and _orchestrator_client is not None and _thread_id is not None:
+        asyncio.create_task(
+            _safe_set_thread_status("awaiting_user"),
+            name="phase5-flip-awaiting-user-sudo",
+        )
 
     final_status = await _wait_for_permission_resolution(request_id)
     approved = final_status == "approved"
