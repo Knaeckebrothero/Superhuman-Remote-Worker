@@ -1102,6 +1102,19 @@ class InteractiveConfig:
 
 
 @dataclass
+class HeadlessConfig:
+    """Headless / untethered behavior for persistent sessions.
+
+    Sourced from users.settings.persistent_agent, optionally overridden per
+    thread via threads.metadata.config_override.headless.
+    """
+
+    mode: str = "eager"  # eager | polite
+    attention_sleep_minutes: int = 60  # 0 disables the watchdog
+    notification_channels: List[str] = field(default_factory=lambda: ["email"])
+
+
+@dataclass
 class DelegationConfig:
     """Subagent delegation configuration.
 
@@ -1146,6 +1159,7 @@ class AgentConfig:
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
     delegation: DelegationConfig = field(default_factory=DelegationConfig)
     interactive: InteractiveConfig = field(default_factory=InteractiveConfig)
+    headless: HeadlessConfig = field(default_factory=HeadlessConfig)
     autonomy: str = "partial"
 
     # Additional agent-specific config (preserved from JSON)
@@ -1495,6 +1509,7 @@ def load_agent_config(
         "instruction_files",
         "delegation",
         "interactive",
+        "headless",
         "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
@@ -1504,6 +1519,16 @@ def load_agent_config(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
+    )
+
+    # Parse headless config (Phase 6 — polite mode + per-thread attention-sleep)
+    headless_data = data.get("headless") or {}
+    headless_config = HeadlessConfig(
+        mode=headless_data.get("mode") or "eager",
+        attention_sleep_minutes=int(headless_data.get("attention_sleep_minutes") or 60),
+        notification_channels=list(
+            headless_data.get("notification_channels") or ["email"]
+        ),
     )
 
     return AgentConfig(
@@ -1522,6 +1547,7 @@ def load_agent_config(
         instruction_files=instruction_files,
         delegation=delegation_config,
         interactive=interactive_config,
+        headless=headless_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
@@ -1684,6 +1710,7 @@ def load_agent_config_from_dict(
         "instruction_files",
         "delegation",
         "interactive",
+        "headless",
         "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
@@ -1693,6 +1720,16 @@ def load_agent_config_from_dict(
     interactive_config = InteractiveConfig(
         permission_mode=interactive_data.get("permission_mode", "supervised"),
         idle_timeout_minutes=interactive_data.get("idle_timeout_minutes", 30),
+    )
+
+    # Parse headless config (Phase 6 — polite mode + per-thread attention-sleep)
+    headless_data = data.get("headless") or {}
+    headless_config = HeadlessConfig(
+        mode=headless_data.get("mode") or "eager",
+        attention_sleep_minutes=int(headless_data.get("attention_sleep_minutes") or 60),
+        notification_channels=list(
+            headless_data.get("notification_channels") or ["email"]
+        ),
     )
 
     return AgentConfig(
@@ -1711,6 +1748,7 @@ def load_agent_config_from_dict(
         instruction_files=instruction_files,
         delegation=delegation_config,
         interactive=interactive_config,
+        headless=headless_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
