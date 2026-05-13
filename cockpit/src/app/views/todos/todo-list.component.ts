@@ -239,14 +239,14 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       flex: 1;
       height: 6px;
       background: var(--surface-0, var(--surface-0));
-      border-radius: 3px;
+      border-radius: var(--radius-pill);
       overflow: hidden;
     }
 
     .progress-fill {
       height: 100%;
       background: linear-gradient(90deg, var(--success), var(--info));
-      border-radius: 3px;
+      border-radius: var(--radius-pill);
       transition: width 0.3s ease;
     }
 
@@ -342,7 +342,7 @@ import { AppSpinnerComponent } from '../../ui/spinner';
       gap: 10px;
       padding: 10px 12px;
       margin-bottom: 4px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       background: var(--surface-0, var(--surface-0));
       border-left: 3px solid var(--border-color, var(--surface-1));
       transition: all 0.15s ease;

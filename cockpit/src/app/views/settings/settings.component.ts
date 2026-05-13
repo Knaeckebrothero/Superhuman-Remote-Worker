@@ -1010,7 +1010,7 @@ const EXPIRY_OPTIONS = [
     .settings-section {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
       padding: 24px;
     }
 
@@ -1032,7 +1032,7 @@ const EXPIRY_OPTIONS = [
     .section-desc code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 12px;
     }
 
@@ -1040,7 +1040,7 @@ const EXPIRY_OPTIONS = [
     .key-table, .token-table {
       margin-bottom: 20px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       overflow: hidden;
     }
 
@@ -1093,7 +1093,7 @@ const EXPIRY_OPTIONS = [
     .new-token-banner {
       background: var(--success-tint);
       border: 1px solid var(--success);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 14px;
       margin-bottom: 20px;
     }
@@ -1116,7 +1116,7 @@ const EXPIRY_OPTIONS = [
       padding: 8px 12px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary);
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
       font-size: 12px;
@@ -1174,7 +1174,7 @@ const EXPIRY_OPTIONS = [
       padding: 8px 12px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary);
       font-family: inherit;
       font-size: 13px;
@@ -1185,7 +1185,7 @@ const EXPIRY_OPTIONS = [
     /* LLM Endpoints */
     .endpoint-card {
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 12px;
       margin-bottom: 12px;
       background: var(--surface-0);
@@ -1230,7 +1230,7 @@ const EXPIRY_OPTIONS = [
     .test-result {
       font-size: 12px;
       padding: 6px 10px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       margin-bottom: 10px;
     }
 
@@ -1281,7 +1281,7 @@ const EXPIRY_OPTIONS = [
     .code-block {
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-tag);
       padding: 14px;
       padding-right: 80px;
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
@@ -1318,7 +1318,7 @@ const EXPIRY_OPTIONS = [
       padding: 12px 16px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 16px;
     }
 
@@ -1352,7 +1352,7 @@ const EXPIRY_OPTIONS = [
       gap: 12px;
       padding: 8px 14px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 6px;
     }
 
@@ -1378,7 +1378,7 @@ const EXPIRY_OPTIONS = [
       padding: 4px 10px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
       font-size: 12px;
       color: var(--text-secondary);
@@ -1390,7 +1390,7 @@ const EXPIRY_OPTIONS = [
       padding: 16px;
       background: var(--surface-0);
       border: 1px solid var(--accent-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
     }
 
     .codex-callback-title {
@@ -1411,7 +1411,7 @@ const EXPIRY_OPTIONS = [
     .codex-callback-steps code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 12px;
     }
 
@@ -1438,7 +1438,7 @@ const EXPIRY_OPTIONS = [
     .codex-callback-hint code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
     }
 

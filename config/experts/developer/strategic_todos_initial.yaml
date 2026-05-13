@@ -31,7 +31,7 @@ todos:
       COMPLETION CRITERIA: Knowledge notes created for all five categories above
       (verify with kb_list). instructions.md and task_brief.md have been read in full.
 
-      INSTEAD OF: Starting to write code or call claude_code — this phase is read-only.
+      INSTEAD OF: Starting to write or modify code — this phase is read-only.
       Instead of skimming instructions.md — read every line, since every task failure
       starts with skipping this step.
 
@@ -83,9 +83,9 @@ todos:
       - Phase name and description
       - Phase type: exploration, implementation, testing, refactoring, pr, or bug-fix
       - Expected outcome: which deliverable(s) this phase advances
-      - Estimated delegation count: how many claude_code calls this phase needs
+      - Estimated todo count: how many focused changes this phase needs
 
-      PHASE SIZING: Target 5-10 delegation-ready todos per tactical phase. Prefer
+      PHASE SIZING: Target 5-10 execution-ready todos per tactical phase. Prefer
       many short phases over few long ones. Each phase should be one coherent unit
       of work (e.g., "implement the auth module," "add user API tests," "fix login bug").
 
@@ -96,7 +96,7 @@ todos:
       4. Integration/PR phase (clean up, commit, push)
 
       Focus on the first 2-3 phases in detail. Later phases can be sketches — they
-      WILL be adapted as you learn from Claude Code's actual output. Every phase must
+      WILL be adapted as you learn from what actually landed in the diff. Every phase must
       map to a concrete deliverable from instructions.md.
 
       PLAN VERIFICATION: After creating the plan, cross-check it against instructions.md.
@@ -108,8 +108,8 @@ todos:
       INSTEAD OF: Planning "cleanup", "archiving", or "final packaging" phases —
       git versioning handles history and Gitea handles delivery. Instead of creating
       phases that produce nothing listed in instructions.md. Instead of over-planning —
-      you will adapt the plan after every tactical phase based on what Claude Code
-      actually produces.
+      you will adapt the plan after every tactical phase based on what actually lands
+      in the diff.
 
   - id: 4
     content: >-
@@ -146,7 +146,7 @@ todos:
 
       After reading the guide, create 5-10 todos for the first tactical phase.
       Each todo must be:
-      - A concrete delegation completable in one claude_code call
+      - A concrete, focused change completable in one tactical step
       - Specific: names exact files, the change to make, the pattern to follow,
         and the verification command
       - Directly advancing a deliverable from instructions.md

@@ -354,7 +354,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         align-items: center;
         justify-content: space-between;
         padding: 10px 14px;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         margin-bottom: 16px;
         font-size: 13px;
       }
@@ -397,7 +397,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .btn-text {
         padding: 2px 8px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-muted, #6c7086);
         font-size: 11px;
@@ -431,7 +431,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .preset-chip {
         padding: 6px 14px;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 16px;
+        border-radius: var(--radius-pill);
         background: var(--surface-0, var(--surface-0));
         color: var(--text-secondary, var(--text-secondary));
         font-size: 12px;
@@ -476,7 +476,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         -webkit-appearance: none;
         appearance: none;
         background: var(--border-color, var(--surface-1));
-        border-radius: 2px;
+        border-radius: var(--radius-pill);
         outline: none;
       }
 
@@ -518,7 +518,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .phase-card {
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         background: var(--surface-0, var(--surface-0));
         padding: 14px;
         min-width: 0;
@@ -611,7 +611,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         gap: 10px;
         padding: 8px 10px;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         transition: all 0.15s ease;
@@ -703,7 +703,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         min-width: 0;
         overflow: hidden;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         text-align: left;
@@ -770,7 +770,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       .expert-tag {
         font-size: 10px;
         padding: 1px 6px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         background: color-mix(in srgb, var(--accent-color) 8%, transparent);
         color: color-mix(in srgb, var(--accent-color) 35%, var(--text-secondary) 65%);
       }
@@ -778,7 +778,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
       /* Dropzone */
       .dropzone {
         border: 2px dashed var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         padding: 20px;
         text-align: center;
         cursor: pointer;
@@ -841,7 +841,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         gap: 10px;
         padding: 8px 10px;
         background: var(--panel-bg, var(--panel-bg));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         border: 1px solid var(--border-color, var(--surface-0));
       }
 
@@ -857,7 +857,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         width: 36px;
         height: 36px;
         object-fit: cover;
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
       }
 
       .file-icon {
@@ -897,7 +897,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         width: 60px;
         height: 4px;
         background: var(--border-color, var(--surface-0));
-        border-radius: 2px;
+        border-radius: var(--radius-pill);
         overflow: hidden;
       }
 
@@ -938,7 +938,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         padding: 10px;
         margin-bottom: 16px;
         border: 1px dashed var(--border-color, var(--surface-1));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-muted, #6c7086);
         font-size: 12px;
@@ -960,7 +960,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         padding: 16px;
         margin-bottom: 16px;
         background: rgba(0, 0, 0, 0.2);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         border: 1px solid var(--border-color, var(--surface-0));
       }
 
@@ -987,7 +987,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
         gap: 10px;
         padding: 10px 12px;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: var(--surface-0, var(--surface-0));
         cursor: pointer;
         transition: all 0.15s ease;
@@ -1032,7 +1032,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
 
       .ds-ro-badge {
         padding: 2px 6px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
         background: var(--info-tint);

@@ -229,7 +229,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
         padding: 10px 12px;
         background: var(--surface-0, var(--surface-0));
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         cursor: pointer;
         transition: all 0.15s ease;
       }

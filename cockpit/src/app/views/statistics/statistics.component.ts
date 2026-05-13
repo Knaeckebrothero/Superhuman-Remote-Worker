@@ -179,7 +179,7 @@ import {
       .refresh-btn {
         padding: 5px 12px;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, var(--text-secondary));
         font-size: 11px;
@@ -202,7 +202,7 @@ import {
         margin-bottom: 20px;
         padding: 12px;
         background: var(--surface-0, var(--surface-0));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
       }
 
       .section-title {
@@ -217,9 +217,9 @@ import {
 
       .alert-badge {
         padding: 2px 8px;
-        border-radius: 10px;
+        border-radius: var(--radius-pill);
         background: var(--danger);
-        color: var(--timeline-bg, var(--timeline-bg));
+        color: var(--on-danger, var(--timeline-bg, #11111b));
         font-size: 11px;
         font-weight: 600;
       }
@@ -241,7 +241,7 @@ import {
       .metric-card {
         padding: 12px;
         background: rgba(0, 0, 0, 0.2);
-        border-radius: 6px;
+        border-radius: var(--radius-surface);
         text-align: center;
       }
 
@@ -323,7 +323,7 @@ import {
         padding: 10px;
         background: var(--danger-tint);
         border: 1px solid var(--danger-tint);
-        border-radius: 6px;
+        border-radius: var(--radius-surface);
       }
 
       .stuck-header {
@@ -335,7 +335,7 @@ import {
 
       .stuck-component {
         padding: 2px 6px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
       }

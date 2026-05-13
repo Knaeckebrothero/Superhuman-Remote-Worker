@@ -232,7 +232,7 @@ let cytoscape: any;
     .btn {
       padding: 6px 12px;
       border: 1px solid var(--border-color, #45475a);
-      border-radius: 4px;
+      border-radius: var(--radius-control);
       background: var(--panel-header-bg, #1e1e2e);
       color: var(--text-secondary, #a6adc8);
       font-size: 12px;
@@ -318,7 +318,7 @@ let cytoscape: any;
       -webkit-appearance: none;
       appearance: none;
       background: var(--panel-bg, #181825);
-      border-radius: 3px;
+      border-radius: var(--radius-pill);
       outline: none;
     }
 

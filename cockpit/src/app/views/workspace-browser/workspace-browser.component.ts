@@ -204,7 +204,7 @@ interface RepoEntry {
       .crumb {
         padding: 2px 4px;
         border: none;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         background: transparent;
         color: var(--text-muted, #6c7086);
         font-size: 11px;

@@ -162,7 +162,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         gap: 6px;
         padding: 6px 12px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 12px;
@@ -178,13 +178,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 
       .table-tab.active {
         background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        color: var(--on-accent, var(--timeline-bg, #11111b));
       }
 
       .row-count {
         font-size: 10px;
         padding: 2px 6px;
-        border-radius: 10px;
+        border-radius: var(--radius-pill);
         background: rgba(0, 0, 0, 0.2);
       }
 
@@ -196,7 +196,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         margin-left: auto;
         padding: 6px 10px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 14px;
@@ -243,7 +243,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .error-state button {
         padding: 8px 16px;
         border: 1px solid #f38ba8;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: #f38ba8;
         cursor: pointer;
@@ -377,7 +377,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
       .page-btn {
         padding: 4px 12px;
         border: 1px solid var(--border-color, #313244);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 12px;

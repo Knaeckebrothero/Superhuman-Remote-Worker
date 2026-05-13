@@ -322,7 +322,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
       .filter-btn {
         padding: 5px 12px;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 11px;
@@ -338,7 +338,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
 
       .filter-btn.active {
         background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         border-color: var(--accent-color, #cba6f7);
       }
 
@@ -386,7 +386,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
       .error-state button {
         padding: 8px 16px;
         border: 1px solid #f38ba8;
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: #f38ba8;
         cursor: pointer;
@@ -430,7 +430,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
       .entry-item {
         border-left: 3px solid var(--border-color, #45475a);
         margin-bottom: 4px;
-        border-radius: 4px;
+        border-radius: var(--radius-surface);
         background: var(--surface-0, #313244);
         transition: all 0.15s ease;
       }
@@ -474,7 +474,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
 
       .step-badge {
         padding: 2px 6px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         font-size: 10px;
         font-weight: 600;
         color: var(--timeline-bg, #11111b);
@@ -557,7 +557,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         display: block;
         padding: 6px 8px;
         background: rgba(0, 0, 0, 0.2);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-size: 11px;
         line-height: 1.4;
       }
@@ -566,7 +566,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
         margin: 0;
         padding: 6px 8px;
         background: rgba(0, 0, 0, 0.2);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
         color: #a6e3a1;
@@ -584,9 +584,9 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
 
       .tool-chip {
         padding: 2px 8px;
-        border-radius: 3px;
+        border-radius: var(--radius-tag);
         background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+        color: var(--on-accent, var(--timeline-bg, #11111b));
         font-size: 11px;
         font-family: 'JetBrains Mono', monospace;
       }
@@ -615,7 +615,7 @@ import {AppSpinnerComponent} from '../../../ui/spinner';
       .pos-btn {
         padding: 4px 8px;
         border: 1px solid var(--border-color, #313244);
-        border-radius: 4px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         font-size: 14px;

@@ -128,7 +128,7 @@ interface MenuSection {
         width: 36px;
         height: 36px;
         border: none;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #a6adc8);
         cursor: pointer;
@@ -155,7 +155,7 @@ interface MenuSection {
         overflow-y: auto;
         background: var(--panel-bg, #181825);
         border: 1px solid var(--border-color, #313244);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         z-index: 1000;
       }
@@ -184,7 +184,7 @@ interface MenuSection {
         align-items: center;
         gap: 12px;
         padding: 10px 12px;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         text-decoration: none;
         color: var(--text-primary, #cdd6f4);
         cursor: pointer;
