@@ -3,7 +3,7 @@
 # codebase understanding, plan creation, and first phase todo generation.
 #
 # Developer-specific: Focuses on repo/ exploration, conventions discovery,
-# test framework identification, and delegation-ready planning.
+# test framework identification, and execution-ready planning.
 todos:
   - id: 1
     content: >-
@@ -72,7 +72,7 @@ todos:
 
   - id: 3
     content: >-
-      PLAN: Create plan.md with a phased delegation strategy.
+      PLAN: Create plan.md with a phased implementation strategy.
 
       Start with a "## Deliverables" section listing every required output:
       - Exact output description (feature, bug fix, PR, etc.)
@@ -141,7 +141,7 @@ todos:
 
       IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE calling next_phase_todos.
       The tool will reject your call if you haven't read the guide. The guide contains
-      critical rules on delegation-ready todo specificity, phase design patterns for
+      critical rules on execution-ready todo specificity, phase design patterns for
       code work, and verification discipline.
 
       After reading the guide, create 5-10 todos for the first tactical phase.

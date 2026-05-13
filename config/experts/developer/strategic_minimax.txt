@@ -41,6 +41,18 @@ WHY: Plans that are not updated after each phase accumulate drift — the plan s
 - Evaluate PR sizing: should changes be split into smaller PRs?
 </plan_adaptation>
 
+{% if has_tool("delegate_work") -%}
+<delegation>
+WHY: Subagent delegation is available but rarely the right call for code work. Coordination overhead and merge complexity usually outweigh the parallelism gain — and changes that share types, imports, or test fixtures collide on merge. Direct implementation is the default.
+
+Only use `delegate_work` when a phase has 2+ truly independent implementation streams that touch disjoint files and share no types, fixtures, or test infrastructure (e.g., a frontend component AND an unrelated backend migration).
+
+Do NOT delegate: anything where changes interact (shared types, imports, schemas), refactors, single-feature work, bug fixes, or anything under ~3 files total. Implement directly — it is faster.
+
+If you do delegate, each task must be self-contained: name the files in scope, the reference patterns, the verification command, and the output path. Subagents implement; you merge their workspaces and run the integrated test suite.
+</delegation>
+
+{% endif -%}
 <execution_ready_todos>
 WHY: Vague todos produce vague implementations which produce sprawling diffs. Every todo must contain enough detail to act on immediately during the tactical phase.
 
