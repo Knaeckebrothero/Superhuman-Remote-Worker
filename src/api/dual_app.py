@@ -1020,13 +1020,25 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
     @app.get("/session/status", tags=["Session"])
     async def session_status() -> JSONResponse:
-        """Check if session is fully set up and ready for WebSocket."""
+        """Check if session is fully set up and ready for WebSocket.
+
+        Readiness gates on _loop_user_queue too — _attach_session sets
+        _session.llm_with_tools early (during PersistentSession.setup) but
+        the loop primitives are initialized later in the same coroutine.
+        Returning ready=True before the queue exists causes
+        handle_persistent_websocket to accept the WS and the loop to
+        crash on its first _loop_get_user_input call.
+        """
         import src.api.persistent_app as pa
 
         if _pod_state != PodState.SESSION:
             return JSONResponse({"ready": False, "state": _pod_state.value})
 
-        is_ready = pa._session is not None and pa._session.llm_with_tools is not None
+        is_ready = (
+            pa._session is not None
+            and pa._session.llm_with_tools is not None
+            and pa._loop_user_queue is not None
+        )
         return JSONResponse(
             {
                 "ready": is_ready,
