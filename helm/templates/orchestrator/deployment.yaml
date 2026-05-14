@@ -208,6 +208,55 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: {{ if .Values.keycloak.internal }}KEYCLOAK_ADMIN_PASSWORD{{ else }}KC_ADMIN_PASSWORD{{ end }}
                   optional: true
+            # Cookie BFF — see docs/features/auth_bff_and_api_tokens.md.
+            # KEYCLOAK_CLIENT_ID + the SRW_* knobs come from the ConfigMap;
+            # KC_CLIENT_SECRET is pulled from the runtime srw Secret (synced
+            # from the same Vault path as MCP_OIDC_CLIENT_SECRET et al.).
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: KEYCLOAK_CLIENT_ID
+            - name: KC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: KC_CLIENT_SECRET
+            - name: SRW_BFF_REDIRECT_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_BFF_REDIRECT_URI
+            - name: SRW_SPA_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_SPA_BASE_URL
+            - name: SRW_COOKIE_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_COOKIE_DOMAIN
+            - name: SRW_COOKIE_SECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_COOKIE_SECURE
+            - name: SRW_SESSION_IDLE_TIMEOUT_S
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_SESSION_IDLE_TIMEOUT_S
+            - name: SRW_SESSION_ABSOLUTE_TIMEOUT_S
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_SESSION_ABSOLUTE_TIMEOUT_S
+            - name: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:

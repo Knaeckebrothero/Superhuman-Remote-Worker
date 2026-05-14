@@ -166,6 +166,36 @@ cockpit:
   # Admin → Providers. See docs/features/db_backed_llm_config.md.
 
 # =============================================================================
+# Auth — cockpit cookie BFF + (future) PAT system
+# =============================================================================
+# Knobs for the orchestrator's cookie-backed session layer for the cockpit.
+# See docs/features/auth_bff_and_api_tokens.md. The cookie domain defaults
+# to a leading-dot prefix of global.domain so the cookie rides on both the
+# cockpit and api subdomains; override below for non-shared parents.
+auth:
+  bff:
+    # -- Keycloak client_id used by the orchestrator BFF when exchanging
+    # the auth code at /token. Confidential client, distinct from the
+    # cockpit SPA's public client (keycloak.cockpitClientId). They share
+    # the realm + the user identity; only the auth model differs.
+    clientId: "cockpit-bff"
+    # -- Cookie Domain attribute. Empty string ("") = host-only (right for
+    # localhost dev). Default at render time = ".{{ global.domain }}".
+    cookieDomain: ""
+    # -- "1"=Secure flag set (production), "0"=cleartext for HTTP-only dev.
+    cookieSecure: "1"
+    # -- Idle session expiry (seconds). Validator rejects a session whose
+    # last_seen_at is older than now() - this.
+    sessionIdleTimeoutSeconds: 1800
+    # -- Hard session lifetime (seconds). Anchored to KC refresh-token TTL
+    # at session creation.
+    sessionAbsoluteTimeoutSeconds: 2592000
+    # -- How early (seconds) the validator refreshes the stored KC access
+    # token before its `exp` claim. 60s avoids the rare clock-skew window
+    # where the validator reuses a token KC has already rejected.
+    accessTokenRefreshSkewSeconds: 60
+
+# =============================================================================
 # MCP Server (Claude Code / AI platform integration)
 # =============================================================================
 mcp:
