@@ -50,9 +50,23 @@ data:
   KEYCLOAK_URL: {{ include "srw.keycloakInternalUrl" . | quote }}
   KEYCLOAK_ISSUER_URL: {{ include "srw.authUrl" . | quote }}
   KEYCLOAK_REALM: {{ .Values.keycloak.realm | quote }}
+  # Orchestrator BFF client (confidential, NOT the cockpit SPA public client).
+  # The cockpit SPA still uses .Values.keycloak.cockpitClientId for its
+  # PKCE-only Bearer flow.
+  KEYCLOAK_CLIENT_ID: {{ .Values.auth.bff.clientId | quote }}
   {{- if .Values.keycloak.adminApiDisabled }}
   KEYCLOAK_ADMIN_API_DISABLED: {{ "true" | quote }}
   {{- end }}
+
+  # Cookie BFF — orchestrator-issued sessions for the cockpit.
+  # See docs/features/auth_bff_and_api_tokens.md.
+  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (include "srw.apiUrl" .) | quote }}
+  SRW_SPA_BASE_URL: {{ include "srw.cockpitUrl" . | quote }}
+  SRW_COOKIE_DOMAIN: {{ .Values.auth.bff.cookieDomain | default (printf ".%s" .Values.global.domain) | quote }}
+  SRW_COOKIE_SECURE: {{ .Values.auth.bff.cookieSecure | default "1" | quote }}
+  SRW_SESSION_IDLE_TIMEOUT_S: {{ .Values.auth.bff.sessionIdleTimeoutSeconds | default 1800 | int | quote }}
+  SRW_SESSION_ABSOLUTE_TIMEOUT_S: {{ .Values.auth.bff.sessionAbsoluteTimeoutSeconds | default 2592000 | int | quote }}
+  SRW_ACCESS_TOKEN_REFRESH_SKEW_S: {{ .Values.auth.bff.accessTokenRefreshSkewSeconds | default 60 | int | quote }}
 
   # CORS (orchestrator reads this for additional allowed origins)
   CORS_ORIGINS: {{ include "srw.cockpitUrl" . | quote }}
