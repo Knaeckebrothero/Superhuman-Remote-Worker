@@ -13,13 +13,19 @@ Three layered checks on non-safe methods:
    ``Sec-Fetch-Site`` (very few; mostly buggy proxies). Only enforced when
    ``Sec-Fetch-Site`` is absent.
 
-Bearer-authenticated requests (PATs, MCP tokens, transitional JWT) skip
-CSRF entirely — they are bearer-auth, no cookie ride-along, no cross-site
-forgery vector.
+Requests that DON'T present the ``srw_session`` cookie skip CSRF entirely.
+The cookie *is* the CSRF vector — without it, there is no browser-mediated
+session to forge against:
+- Bearer-authenticated callers (PATs, MCP tokens, transitional JWT).
+- ``X-Internal-Key`` callers (MCP server pod).
+- In-cluster agent → orchestrator HTTP traffic (no cookie, no auth — the
+  trust boundary is the cluster network; see ``/api/agents/register`` and
+  the other "no auth, agent-facing" routes in main.py).
 
-Exempt paths:
-- ``/auth/backchannel-logout`` — Keycloak posts a signed JWT here; no browser
-  context, no cookie. Signature verification stands in for CSRF.
+Exempt paths (kept for explicitness even though they would skip via the
+no-cookie rule):
+- ``/auth/backchannel-logout`` — Keycloak posts a signed JWT here; no
+  browser context, no cookie. Signature verification stands in for CSRF.
 - ``/api/internal/*`` — MCP-mediated trust path with its own header check.
 - ``/api/health`` — unauthenticated health probe.
 """
@@ -89,8 +95,19 @@ class CSRFMiddleware:
 
         request = Request(scope)
 
+        # No session cookie → no CSRF vector. Browser cross-site requests
+        # ride on the user's cookie; without one, an attacker can't impersonate
+        # the user via a forged form. This also covers in-cluster agent
+        # traffic and any other non-browser client (CI, curl, n8n) that
+        # legitimately needs to POST without going through the BFF.
+        if "srw_session" not in request.cookies:
+            await self.app(scope, receive, send)
+            return
+
         # Bearer-authenticated requests skip CSRF entirely. PATs, MCP tokens,
-        # and transitional JWT-from-cockpit all match here.
+        # and transitional JWT-from-cockpit all match here. (Reached only on
+        # the rare hybrid request that carries BOTH a cookie and a Bearer —
+        # we trust the Bearer in that case.)
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
             await self.app(scope, receive, send)
