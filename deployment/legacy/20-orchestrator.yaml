@@ -120,6 +120,52 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: KEYCLOAK_ADMIN_PASSWORD
+            # Cookie BFF (see docs/features/auth_bff_and_api_tokens.md)
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: KEYCLOAK_CLIENT_ID
+            - name: KC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KC_CLIENT_SECRET
+            - name: SRW_BFF_REDIRECT_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_BFF_REDIRECT_URI
+            - name: SRW_SPA_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_SPA_BASE_URL
+            - name: SRW_COOKIE_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_COOKIE_DOMAIN
+            - name: SRW_COOKIE_SECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_COOKIE_SECURE
+            - name: SRW_SESSION_IDLE_TIMEOUT_S
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_SESSION_IDLE_TIMEOUT_S
+            - name: SRW_SESSION_ABSOLUTE_TIMEOUT_S
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_SESSION_ABSOLUTE_TIMEOUT_S
+            - name: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SRW_ACCESS_TOKEN_REFRESH_SKEW_S
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:
