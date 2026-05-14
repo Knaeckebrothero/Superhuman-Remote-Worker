@@ -2,7 +2,7 @@ import {Component, effect, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
-import {KeycloakService} from '../../core/services/keycloak.service';
+import {SessionService} from '../../core/services/session.service';
 import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
@@ -286,7 +286,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 export class ProjectListPageComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
-  private readonly keycloak = inject(KeycloakService);
+  private readonly session = inject(SessionService);
   private readonly router = inject(Router);
 
   readonly projects = signal<Project[]>([]);
@@ -347,10 +347,11 @@ export class ProjectListPageComponent implements OnInit {
         this.formName.set('');
         this.formDescription.set('');
         this.formGoal.set('');
-        // Refresh the Keycloak token so the new `project-{id}` group claim
-        // reaches OpenCloud on the next request — otherwise the Space stays
-        // invisible until the session expires.
-        this.keycloak.forceRefreshToken();
+        // Refresh the server-side access token so the new `project-{id}`
+        // group claim propagates — otherwise downstream services that read
+        // groups from the JWT stay out of sync until the next natural
+        // refresh.
+        void this.session.forceRefresh();
         this.refresh();
       }
     });

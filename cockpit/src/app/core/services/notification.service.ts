@@ -87,7 +87,9 @@ export class NotificationService {
   connectSSE(): void {
     if (this.eventSource) return;
 
-    this.eventSource = new EventSource(`${this.baseUrl}/notifications/events`);
+    this.eventSource = new EventSource(`${this.baseUrl}/notifications/events`, {
+      withCredentials: true,
+    });
 
     this.eventSource.onmessage = (e: MessageEvent) => {
       this.zone.run(() => {

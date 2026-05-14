@@ -145,7 +145,11 @@ def _clear_pre_auth_cookie(resp: Response) -> None:
 
 
 @router.get("/login")
-async def login(request: Request, return_to: str | None = None) -> Response:
+async def login(
+    request: Request,
+    return_to: str | None = None,
+    ui_locales: str | None = None,
+) -> Response:
     """Kick off an OAuth code+PKCE flow against Keycloak.
 
     The browser navigates directly to this endpoint (no SPA token involved).
@@ -169,17 +173,25 @@ async def login(request: Request, return_to: str | None = None) -> Response:
         return_to=safe_return,
     )
 
-    query = urlencode(
-        {
-            "response_type": "code",
-            "client_id": kc_bff_client.client_id,
-            "redirect_uri": kc_bff_client.redirect_uri,
-            "scope": "openid profile email",
-            "state": state,
-            "code_challenge": _pkce_challenge(verifier),
-            "code_challenge_method": "S256",
-        }
-    )
+    params: dict[str, str] = {
+        "response_type": "code",
+        "client_id": kc_bff_client.client_id,
+        "redirect_uri": kc_bff_client.redirect_uri,
+        "scope": "openid profile email",
+        "state": state,
+        "code_challenge": _pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+    }
+    # Forward the SPA's preferred language to Keycloak's login form. Only
+    # short, well-formed BCP47 tags are passed through so a hostile query
+    # param can't push arbitrary content into Keycloak's `Accept-Language`.
+    if (
+        ui_locales
+        and len(ui_locales) <= 16
+        and all(c.isalnum() or c == "-" for c in ui_locales)
+    ):
+        params["ui_locales"] = ui_locales
+    query = urlencode(params)
     url = f"{kc_bff_client.authorize_endpoint}?{query}"
 
     resp = RedirectResponse(url, status_code=302)
