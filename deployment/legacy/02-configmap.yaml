@@ -35,6 +35,19 @@ data:
   KEYCLOAK_URL: "http://srw-keycloak:8080"
   KEYCLOAK_ISSUER_URL: "https://auth.superhuman-remote-worker.com"
   KEYCLOAK_REALM: "srw"
+  # Cockpit-as-BFF: the cockpit client must be set to confidential in the
+  # realm config; orchestrator uses KC_CLIENT_SECRET (from srw-secrets)
+  # to authenticate at the /token endpoint during code exchange + refresh.
+  KEYCLOAK_CLIENT_ID: "cockpit"
+
+  # Cookie BFF (see docs/features/auth_bff_and_api_tokens.md)
+  SRW_BFF_REDIRECT_URI: "https://api.superhuman-remote-worker.com/auth/callback"
+  SRW_SPA_BASE_URL: "https://superhuman-remote-worker.com"
+  SRW_COOKIE_DOMAIN: ".superhuman-remote-worker.com"
+  SRW_COOKIE_SECURE: "1"
+  SRW_SESSION_IDLE_TIMEOUT_S: "1800"
+  SRW_SESSION_ABSOLUTE_TIMEOUT_S: "2592000"
+  SRW_ACCESS_TOKEN_REFRESH_SKEW_S: "60"
 
   # CORS (orchestrator reads this for additional allowed origins)
   CORS_ORIGINS: "https://superhuman-remote-worker.com"
