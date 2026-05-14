@@ -19,7 +19,10 @@
   --radius-full: 999px;   // pill / functional circles
 
   // --- Typography families ---
+  // Inter + JetBrains Mono are loaded via index.html alongside Cinzel; the
+  // system stack stays as a fallback for first paint and offline.
   --font-family-base:
+    'Inter',
     -apple-system,
     blinkmacsystemfont,
     'Segoe UI',
@@ -32,6 +35,7 @@
   // _shape-overrides.scss. Loaded in cockpit/src/index.html.
   --font-family-display: var(--font-family-base);
   --font-family-mono:
+    'JetBrains Mono',
     ui-monospace,
     'SFMono-Regular',
     menlo,

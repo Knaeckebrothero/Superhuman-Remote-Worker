@@ -1,0 +1,338 @@
+---
+tags:
+  - feature
+  - sessions
+  - cockpit
+  - prompting
+  - llm
+  - ux
+aliases:
+  - between-tool narration
+  - inline narration
+  - chat narration
+  - agent commentary
+  - preamble text
+related:
+  - "[[sessions]]"
+  - "[[persistent_chat_visual_refresh]]"
+  - "[[persistent_chat_ui_redesign]]"
+  - "[[headless_persistent_sessions]]"
+  - "[[prompting]]"
+  - "[[notify_user_tool]]"
+  - "[[persistent_chat_tool_only_messages_not_expandable]]"
+---
+
+# Session Narration
+
+> Claude Code shows brief one-liners between tool calls — "Let me check the file.", "Now I'll run the tests." Our persistent session UI shows a wall of tool-call cards with no narration. We have most of the plumbing already; the question is which approach we want and what tradeoffs we accept.
+
+**Status:** Research / discovery — no decisions yet. This document collects findings to inform a follow-up design pass.
+**Filed:** 2026-05-13
+
+## Motivation
+
+In a long-running persistent session the agent regularly does 50-100+ tool calls per task. Today the cockpit chat surfaces those as a sequence of tool-call cards with no model commentary between them. The user sees *that* something is happening but not *why* — and the visual experience is "wall of cards" rather than "agent narrating its work."
+
+For comparison, Claude Code emits short sentences like *"Let me read the migration first."* or *"That fixed it — running the tests."* between tool calls. Users describe these as the single biggest difference between "agent is doing stuff" and "agent is collaborating with me."
+
+This document captures what we learned about how Claude Code and other CLI agents produce that text, what API-level mechanisms enable it, what already exists in our stack, and what the option space looks like.
+
+## Open questions that drove the research
+
+The questions the user posed when scoping this work:
+
+1. Is the text Claude Code shows the **model's reasoning tokens**, or is the model **prompted/trained** to narrate, or is there a **special tool** for it?
+2. Could we use the **auxiliary LLM** to generate narration?
+3. Does narration become **part of the conversation history**, or is it ephemeral UI-only?
+4. We capture `reasoning_content` for the **worker agent** today — could we surface that for sessions too?
+5. How do **other CLI coding agents** handle this?
+
+Short answers are in the [§Findings](#findings) section; the rest of the document is the supporting detail.
+
+## Findings
+
+### 1. Claude Code's mechanism — plain text blocks, prompted
+
+The between-tool sentences are ordinary `text` content blocks the model emits in the same assistant message as its `tool_use` blocks. The Messages API allows a single assistant turn's `content` to contain ordered blocks `[{type:"text", text:"..."}, {type:"tool_use", ...}]`; the streaming protocol (`content_block_start` → N×`content_block_delta` → `content_block_stop`) emits each in order. Claude Code renders block 0 as the chat line and block 1 as the tool card.
+
+No special "narrate" tool. No sidecar LLM. The behavior is **prompted** by directives in the system prompt — the [leaked Claude Code prompt](https://github.com/asgeirtj/system_prompts_leaks/blob/main/Anthropic/claude-code.md) (npm sourcemap leak, [VentureBeat 2026-03-31](https://venturebeat.com/technology/claude-codes-source-code-appears-to-have-leaked-heres-what-we-know)) contains:
+
+> "Before your first tool call, state in one sentence what you're about to do."
+>
+> "While working, give short updates at key moments: when you find something, when you change direction, or when you hit a blocker. Brief is good — silent is not. One sentence per update is almost always enough."
+>
+> "Don't narrate your internal deliberation. User-facing text should be relevant communication to the user, not a running commentary on your thought process."
+>
+> "Assume users can't see most tool calls or thinking — only your text output."
+
+The streaming docs ([platform.claude.com/docs/en/build-with-claude/streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)) show the canonical interleaved example: index 0 streams `"Okay, let's check the weather for San Francisco, CA:"` then index 1 opens as `tool_use` with `input_json_delta` chunks.
+
+### 2. Reasoning/`thinking` is a separate channel
+
+Anthropic's interleaved thinking emits a distinct block type `{type:"thinking", thinking:"...", signature:"..."}` alongside `text` and `tool_use` blocks. From the [extended thinking docs](https://platform.claude.com/docs/en/build-with-claude/extended-thinking):
+
+> "With interleaved thinking enabled, Claude can think after receiving each tool result, allowing it to reason about intermediate results before continuing."
+>
+> "During tool use, you must pass `thinking` blocks back to the API, and you must include the complete unmodified block back to the API."
+>
+> "The entire sequence of consecutive `thinking` blocks must match the outputs generated by the model during the original request; you can't rearrange or modify the sequence."
+
+Claude Code surfaces `thinking` blocks collapsed under a "Thinking..." UI affordance, **separate from the inline narration sentences**. The visible preamble text is `text` blocks (governed by the prompt directives in §1); the thinking lane is for the model's deliberation.
+
+### 3. Other CLI agents — most do the same thing
+
+| Agent | Mechanism |
+|---|---|
+| **Aider** ([docs](https://aider.chat/docs/), [repo](https://github.com/Aider-AI/aider)) | Streams model text live in the terminal around its SEARCH/REPLACE blocks. No tool-calling protocol — just text. R1-style `reasoning_content` rendered in a "thinking" pane. |
+| **Cursor Composer/Agent** ([2.0 blog](https://cursor.com/blog/2-0), [Composer post](https://cursor.com/blog/composer)) | Composer model emits short status text between tool calls; up to 25 tool calls per turn. |
+| **OpenAI Codex CLI** ([config](https://developers.openai.com/codex/config-reference), [advanced](https://developers.openai.com/codex/config-advanced)) | Shows reasoning **summaries** between tool calls by default. `show_raw_agent_reasoning` exposes raw text; `model_reasoning_summary` suppresses entirely. Narration is mostly the reasoning summary stream, not assistant text. |
+| **Cline** ([repo](https://github.com/cline/cline), [marketplace](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev)) | XML-encoded tool calls inline in the streamed response; the model's prose preceding each `<tool>` tag is the narration. |
+| **Continue.dev** ([agent docs](https://docs.continue.dev/ide-extensions/agent/how-it-works)) | XML-encoded tools in the system message; text outside the XML tags becomes between-tool narration. |
+| **opencode/Crush** ([issue #3555](https://github.com/anomalyco/opencode/issues/3555)) | Open issue tracking proper `reasoning_content` rendering for MiniMax M2 — confirms the dominant pattern of routing model `reasoning_content` to a dedicated "thinking" pane. |
+
+**Common pattern across the ecosystem:** render the model's plain text block as inline narration; route reasoning/thinking to a separate collapsible lane.
+
+### 4. Provider compatibility — the echo-back matrix
+
+Plain text blocks are portable across providers and have no special handling rules. Reasoning/thinking blocks are not portable — each provider has different rules for whether you can echo them back to the model on subsequent turns:
+
+| Provider / model | Reasoning channel | Echo-back rule |
+|---|---|---|
+| **Anthropic** (`thinking` blocks) | Separate content block with `signature` | Must echo verbatim within an active tool-use cycle; can drop afterward. Signed/integrity-checked. ([docs](https://platform.claude.com/docs/en/build-with-claude/extended-thinking)) |
+| **DeepSeek R1** (`reasoning_content`) | `choices[0].message.reasoning_content` | **HTTP 400 if echoed back.** Strip before re-sending. ([DeepSeek docs](https://api-docs.deepseek.com/guides/reasoning_model)) |
+| **MiniMax M2** (`reasoning_details`) | `<think>...</think>` in `content` by default; `reasoning_details` with `reasoning_split=True` | Must echo verbatim for interleaved thinking to work. Non-conforming by default. ([MiniMax docs](https://platform.minimax.io/docs/guides/text-m2-function-call), [interleaved thinking post](https://www.minimax.io/news/why-is-interleaved-thinking-important-for-m2)) |
+| **OpenAI o3/GPT-5** | Server-side encrypted reasoning items; sanitized summaries via `output_text` | Raw reasoning **never exposed**. Summaries available; encrypted reasoning can be persisted server-side or echoed via `include=["reasoning.encrypted_content"]`. o3 benefits from echoing reasoning items adjacent to tool calls. ([reasoning guide](https://developers.openai.com/api/docs/guides/reasoning), [cookbook](https://cookbook.openai.com/examples/responses_api/reasoning_items)) |
+| **gpt-oss-120b** | `choice.message.reasoning_content` | No echo requirement documented. ([HF card](https://huggingface.co/openai/gpt-oss-120b), [OpenAI page](https://developers.openai.com/api/docs/models/gpt-oss-120b)) |
+| **Qwen3-thinking** (via vLLM) | `choices[0].message.reasoning_content` | No echo requirement. Enabled via `--enable-reasoning --reasoning-parser deepseek_r1`. ([vLLM docs](https://docs.vllm.ai/en/v0.9.1/features/reasoning_outputs.html)) |
+
+**Implication:** any narration scheme that relies on reasoning content needs per-provider handling. A scheme that relies on plain text blocks works everywhere.
+
+## What already exists in our stack
+
+A surprising amount of the substrate is already wired up — the gaps are localized.
+
+| Capability | Where | State |
+|---|---|---|
+| **Astream of assistant messages** | `src/persistent_graph.py:531,597` — `astream()` with `ainvoke()` fallback | Working |
+| **Text deltas streamed alongside tool_calls** | `src/persistent_graph.py:546,559` — `callbacks.on_token()` fires for content text *regardless of whether `tool_calls` are present later in the same chunk* | **Already works** — the backend will forward narration text if the model emits it |
+| **Thinking blocks streamed** | `src/persistent_graph.py:553` (streaming, `type:"thinking"` blocks), `:619`, `:777` (non-streaming, `additional_kwargs["reasoning_content"]`) → `callbacks.on_thinking()` | Working for streaming + non-streaming paths |
+| **Tool lifecycle callbacks** | `src/persistent_graph.py:861` `on_tool_start`, `:904` `on_tool_result` | Working |
+| **Turn lifecycle callbacks** | `src/persistent_graph.py:240,295` `on_turn_start` / `on_turn_complete` | Working |
+| **WS frame types understood by cockpit** | `cockpit/src/app/core/services/persistent-chat.service.ts:765` `token`, `:769` `thinking`, `:772-781` `tool.started`, `:784-794` `tool.completed`, `:797-802` `permission.request`, `:755-759,:805-810` lifecycle, `:716-744` `session.state`/`greeting`, `:824-826` `narration.changed` | All wired |
+| **ChatMessage model** | `cockpit/src/app/core/services/persistent-chat.service.ts:16-26` — `content`, `toolCalls?`, `thinking?`, `timestamp` | `thinking?` field exists but is **not rendered** |
+| **Streaming accumulators** | `persistent-chat.service.ts:101-102,759-760` `streamingText`, `streamingThinking` signals; `:761` `currentToolCalls` | All three accumulate during a turn; `finalizeStreaming()` at `:991-1012` collapses them into the final `ChatMessage` |
+| **Narration mode infrastructure (half-built)** | `persistent-chat.service.ts:113` `narrationMode` signal, `:74` typed `'silent' \| 'verbose' \| 'auto'`, `:609,612` `/silent` `/verbose` slash commands, `:684-687` `setNarrationMode()`, `:686` `narration.set` send, `:824-826` `narration.changed` receive | **UI accepts the setting and sends to backend; backend does not read it** |
+| **Worker reasoning persistence (for contrast)** | `src/core/archiver.py:599-606,625` extracts `additional_kwargs["reasoning_content"]` and stores under `reasoning` key in MongoDB `chat_history`; `:387` only for `call_type == "main"`; `:364-366` token usage includes `reasoning_tokens` | Sidecar persistence only — reasoning does not enter the message thread |
+| **Config knob** | `config/persistent_defaults.yaml:174` `narration_mode: auto` | Declared but **not read by `persistent_graph.py`** |
+
+## What's missing
+
+Inventoried, not prioritized:
+
+1. **The interactive system prompt actively suppresses narration.** `config/prompts/systemprompt_interactive.txt:23,68` contains:
+   > *"Do not emit verbose chain-of-thought. Be direct and conversational."*
+
+   A model reads "direct and conversational" as "skip preambles, just do." Claude Code's prompt is the opposite stance: *"Brief is good — silent is not."* Without a prompt change, no other approach will produce narration unless we synthesize it externally.
+
+2. **No UI render lane for the `thinking?` field.** The field is declared on `ChatMessage` and the `streamingThinking` signal accumulates deltas, but no component reads either. Whether the design intent was to render it later or leave it as backend-only is unclear from the code.
+
+3. **The backend ignores `narration_mode`.** `persistent_defaults.yaml:174` declares it; the cockpit's `narration.set` frame reaches the backend (`:824-826` is the cockpit-side ack of `narration.changed` coming back); but `persistent_graph.py` doesn't branch on it. Whatever it's supposed to control isn't wired.
+
+4. **No echo-back machinery for `thinking` blocks.** If we ever want interleaved thinking to actually carry across tool calls on Claude / MiniMax, we'd need to persist the `signature` (Claude) or `reasoning_details` (MiniMax) verbatim and round-trip them. Today the worker captures `reasoning_content` to MongoDB but discards `signature` and treats it as a sidecar — not re-injected into the next call.
+
+5. **Mobile chat (`cockpit/src/app/simple/`) and desktop chat may need different treatment.** Memory mentions both surfaces exist; whether the narration lane should render the same in both is an open UX question, not an inventory item.
+
+## Design options
+
+Five distinct shapes the feature could take. **Not mutually exclusive** — most real designs combine 1 + (2 or 3). Listed without recommendation.
+
+### Option A — Prompt-driven narration on plain text blocks
+
+Rewrite the interactive system prompt to instruct the model to emit a short preamble before tool calls, in the Claude Code pattern. The text streams as `content` blocks alongside `tool_use` blocks in the same assistant message. Backend already forwards these (see [§What already exists](#what-already-exists-in-our-stack), row 2).
+
+**What it needs:**
+- New prompt section in `config/prompts/systemprompt_interactive.txt` (or a sibling file resolved via `config/prompt_matrix.yaml`).
+- Remove or rewrite the line at `:23,68` that suppresses narration.
+- Optionally: gate behavior on `narration_mode` (silent = no preamble, auto = light, verbose = more).
+
+**What it works on:** every provider (Anthropic, OpenAI, gpt-oss, MiniMax, DeepSeek, Qwen, etc.). Plain text blocks are universal.
+
+**What it doesn't solve:** any per-model `reasoning_content` does not get surfaced; the model has to *choose* to emit narration each turn (vs being given a dedicated channel).
+
+**Tradeoffs:**
+- + Smallest change, no new infra, portable.
+- + Narration becomes part of context — model "remembers" what it told the user (useful for coherence).
+- − Costs context tokens on each turn the model narrates.
+- − Some models are worse at following narrate-before-tool directives; might need per-model prompt tuning (`prompt_matrix.yaml` already supports this).
+- − Doesn't surface the model's actual reasoning, only what it explicitly verbalizes for the user.
+
+### Option B — Render existing `thinking` content in a collapsible UI lane
+
+Wire the `thinking?` field through `finalizeStreaming()` and add a collapsible "Thinking" surface in the chat component. Backend already streams `thinking` events (Anthropic interleaved + OSS `reasoning_content`); the UI accumulates them but doesn't render.
+
+**What it needs:**
+- UI component changes in the chat surfaces (`cockpit/src/app/simple/...`, plus desktop chat).
+- A render decision: inline collapsed under each tool-call card, or as a sibling lane above the bubble, or as a per-message toggle.
+- A persistence decision: include the `thinking` field in `thread_messages` so it replays on reconnect, or treat as ephemeral.
+
+**What it works on:** any provider that emits `thinking` or `reasoning_content` (Anthropic with extended thinking, gpt-oss, Qwen3-thinking, DeepSeek, MiniMax with reasoning split, OpenAI summaries via Codex-like path).
+
+**What it doesn't solve:** models without reasoning emit nothing here; surface stays empty.
+
+**Tradeoffs:**
+- + Reuses existing event pipeline end-to-end.
+- + Surfaces actual model reasoning, not just summarized narration.
+- − Reasoning is often long and unstructured; UX needs collapsing/truncation.
+- − Cross-provider echo-back rules are nontrivial ([§Provider compatibility](#4-provider-compatibility--the-echo-back-matrix)) — if we want the reasoning to *carry forward* across tool calls (interleaved thinking), Option B alone isn't enough; we'd also need (D).
+- − Doesn't address the wall-of-tool-calls problem for models that don't emit reasoning.
+
+### Option C — Dedicated "narrate" tool
+
+Register a phase-restricted tool the model calls to emit a UI-only message (no side effect, no result echo back into context). Renders as an inline note between tool cards.
+
+**What it needs:**
+- New tool in `src/tools/registry.py` and prompt guidance to call it before/between tool calls.
+- WS frame type (`narration.emit` or extend `token`) to forward the call.
+- Decision about whether the tool call appears in the message thread or is stripped.
+
+**What it works on:** every provider (uses standard tool-calling API).
+
+**Tradeoffs:**
+- − Adds a model-side wart for zero capability gain over Option A — the model already knows how to emit text.
+- − Each narration costs a tool-call round-trip (latency + tokens).
+- − Tool-calling models sometimes fail to call no-op tools when they're "in the flow" — getting consistent narration is harder than prompting plain text.
+- + One advantage: structured payload (e.g. `{"phase": "starting", "summary": "..."}`) for richer UI rendering. Unclear if that's worth it.
+
+Listed for completeness; no agent in the ecosystem survey uses this pattern.
+
+### Option D — Auxiliary-LLM-generated narration
+
+Spin a cheap fast model in parallel to the main loop, fed a summary of the last N tool calls, generating commentary. Emitted to the UI on a dedicated channel.
+
+**What it needs:**
+- New worker on `asyncio.create_task()` similar to the memory observer pattern.
+- Cadence policy (every N tool calls? every K seconds? on phase boundary?).
+- Stream-to-UI channel.
+
+**Tradeoffs:**
+- + Doesn't add tokens to the main model's context.
+- + Could narrate models that don't natively narrate (and don't have reasoning output).
+- − Latency: aux LLM lags behind the action; commentary arrives after the user already sees the tool call.
+- − Divergence: aux model's narrative may not match what the main model is actually trying to do.
+- − Extra cost ($, infra).
+- − Distinct problem from what the user asked about; better suited to "summary card after long runs" than between-tool narration.
+
+The ecosystem survey found no major agent doing this for inline narration; Codex CLI's summaries come from the same model that's executing, not an auxiliary.
+
+### Option E — Echo-back reasoning carry (interleaved thinking, for capable providers)
+
+For Anthropic / MiniMax: capture `thinking` / `reasoning_details` blocks verbatim including their `signature`, store them on the message, and re-send on subsequent turns to enable true interleaved thinking. The model reasons after each tool result, that reasoning influences the next tool call, and (separately) we render it via Option B.
+
+**What it needs:**
+- Storage extension: `thread_messages` (or a sibling table) needs a column for the verbatim block sequence including signatures.
+- Round-trip logic in `persistent_graph.py` to re-inject these blocks on next-turn assembly.
+- Per-provider branching: Anthropic format vs MiniMax format vs strip-before-send (DeepSeek).
+- The auxiliary work in `core/archiver.py:599-625` captures `reasoning_content` but discards `signature` — this would need extending.
+
+**What it works on:** Anthropic (with extended thinking enabled), MiniMax M2 (with `reasoning_split=True`). Doesn't apply to DeepSeek (400 on echo) or OpenAI (no raw exposure).
+
+**Tradeoffs:**
+- + Genuine quality improvement: model can carry reasoning across tool calls, not just emit it as fire-and-forget.
+- − Provider-specific code paths and storage.
+- − Doesn't solve the user-visible narration problem on its own (still needs A or B for the actual UX surface).
+- − Most complex option; deferred candidate.
+
+## Provider compatibility summary
+
+| Option | Anthropic | OpenAI o3/GPT-5 | gpt-oss | MiniMax M2 | DeepSeek R1 | Qwen3-thinking |
+|---|---|---|---|---|---|---|
+| A — Prompt-driven text | Yes | Yes | Yes | Yes | Yes | Yes |
+| B — Render thinking lane | Yes (`thinking`) | Summaries only | Yes (`reasoning_content`) | Yes (with `reasoning_split`) | Yes (display only) | Yes |
+| C — Narrate tool | Yes | Yes | Yes | Yes | Yes | Yes |
+| D — Aux LLM | Yes (provider-agnostic) | " | " | " | " | " |
+| E — Echo-back carry | Yes (signed) | Encrypted only | N/A | Yes (verbatim) | **NO** (400 error) | N/A |
+
+## Conversation-history question
+
+A specific sub-question the user raised: *"Do narration outputs become part of the conversation history?"*
+
+Three coherent stances, each with consequences:
+
+1. **Part of history (default for Option A).** Plain text blocks emitted by the model are stored on the assistant message and re-sent on the next turn. The model sees what it told the user. Costs context tokens; helps coherence (the model won't repeat itself, can refer back to what it said).
+
+2. **Ephemeral UI-only (default for Option D, possible for B).** Generated server-side, sent to the UI, never re-injected into the model's context. No token cost on subsequent turns; no coherence benefit.
+
+3. **Hybrid: stored on the message, conditionally re-sent.** Strip narration from older messages when assembling the next turn (similar to how Anthropic auto-filters `thinking` blocks outside the active tool-use cycle). Best of both worlds; adds storage + assembly complexity.
+
+This question can be answered independently per option and doesn't have to be resolved up-front.
+
+## Interactions with other features
+
+- **[[headless_persistent_sessions]]** — Eager mode means the agent generates output even when no UI is attached. Narration written to the event log replays on reconnect. Persistence question (above) intersects directly: if narration is ephemeral, an untethered eager run produces no narration record; reattach catches only tool calls.
+- **[[persistent_chat_visual_refresh]]** — The chat UI redesign in flight defines the visual surface. A narration lane is a render target it would need to support.
+- **[[persistent_chat_tool_only_messages_not_expandable]]** — Open issue: messages that contain only tool calls (no text) can't be expanded to show details. Narration would convert most tool-only messages into text+tool messages, potentially obsoleting this issue *or* changing its scope.
+- **[[notify_user_tool]]** — The agent-side "notify user via external channel" tool. Different surface (external — email / push) but overlapping concept (agent communicating with the user outside tool output). Worth not duplicating the user-facing concept across surfaces.
+- **[[prompting]]** — Foundational prompting doc. Any prompt change here should reference and be referenced from there.
+- **[[sessions]]** — Foundational session model. Narration storage decisions (if any) layer on top.
+
+## Open questions
+
+1. **Should narration persist in the transcript or be ephemeral?** See [§Conversation-history question](#conversation-history-question). Affects `thread_messages` schema if persisted; affects event-log retention if ephemeral.
+2. **Should narration intensity be user-controlled per thread?** The existing `narration_mode: silent | verbose | auto` infrastructure (UI half-built, backend unwired) suggests prior intent toward yes. What does each mode actually do?
+3. **Per-model variation.** Some models (gpt-oss, smaller OSS) ignore "narrate before tool" directives more often. Do we want `prompt_matrix.yaml` variants for narration, or accept best-effort?
+4. **Does the worker agent also get narration?** Today only the persistent agent has a live UI surface to narrate to. But the worker has the Cockpit job-detail view — would inline narration there be useful, or noise?
+5. **Mobile vs desktop UI affordance.** `cockpit/src/app/simple/` (mobile-first) and the desktop chat may want different narration density / collapse behavior.
+6. **Reasoning summary as fallback for non-reasoning models.** Codex CLI shows reasoning summaries instead of raw reasoning. For models we run that don't emit `reasoning_content`, would a one-shot summary from an aux call be valuable, or is plain-text narration (Option A) sufficient?
+7. **What does "verbose" mean if Option A is chosen?** A narration knob on a prompt-driven approach can only adjust prompt directives, not generate more text. Does verbose = "instruct the model to narrate more steps" or "include reasoning lane as well"?
+8. **Tool-only loops.** When the agent is doing 20 reads in a row to scan a directory, do we want narration on every one, or batched ("Now scanning the migrations directory..." → 20 tool calls → "Found 3 migrations touching this table.")? Prompting can ask for this but enforcement is unreliable.
+9. **Backwards compatibility with existing thread transcripts.** If narration becomes part of `thread_messages`, do replays of old threads (pre-narration) render correctly? Almost certainly yes (just empty narration field), but worth confirming.
+10. **Cross-tab behavior.** Two tabs on the same thread — does the second tab see narration that streamed before it attached? Tied to the event log design in [[headless_persistent_sessions]].
+
+## Related code
+
+- `src/persistent_graph.py:531,597` — `astream()` / `ainvoke()` entry points
+- `src/persistent_graph.py:546,559` — text token streaming
+- `src/persistent_graph.py:553,619,777` — thinking content streaming (streaming + non-streaming paths)
+- `src/persistent_graph.py:861,904` — tool lifecycle
+- `src/persistent_graph.py:240,295` — turn lifecycle
+- `src/core/archiver.py:387,599-606,625` — worker reasoning capture (MongoDB sidecar)
+- `cockpit/src/app/core/services/persistent-chat.service.ts:16-26` — `ChatMessage` interface (`thinking?` field present, unused in render)
+- `cockpit/src/app/core/services/persistent-chat.service.ts:74,113,609,612,684-687,824-826` — narration mode infrastructure (half-built)
+- `cockpit/src/app/core/services/persistent-chat.service.ts:101-102,759-760,761,991-1012` — streaming accumulators + finalize
+- `cockpit/src/app/core/services/persistent-chat.service.ts:716-744,755-810` — WS frame handlers
+- `cockpit/src/app/simple/` — mobile chat shell (alternate render surface)
+- `config/prompts/systemprompt_interactive.txt:23,68` — the line that currently suppresses narration
+- `config/persistent_defaults.yaml:174` — `narration_mode: auto` (declared, unread)
+- `config/interactive.yaml` — expert config (no narration mention)
+- `config/prompt_matrix.yaml` — model-family prompt resolution (where per-model narration prompts would slot)
+
+## References
+
+### Claude Code
+
+- [github.com/anthropics/claude-code](https://github.com/anthropics/claude-code) — docs/plugins repo; CLI source not published.
+- [VentureBeat: Claude Code source appears to have leaked (2026-03-31)](https://venturebeat.com/technology/claude-codes-source-code-appears-to-have-leaked-heres-what-we-know) — npm sourcemap leak confirmed by Anthropic as accidental.
+- [asgeirtj/system_prompts_leaks — `Anthropic/claude-code.md`](https://github.com/asgeirtj/system_prompts_leaks) — mirror of the leaked system prompt.
+- [dbreunig: How Claude Code Builds a System Prompt](https://www.dbreunig.com/2026/04/04/how-claude-code-builds-a-system-prompt.html) — analysis of the ~30 dynamically assembled prompt components.
+
+### Anthropic API
+
+- [Streaming messages](https://platform.claude.com/docs/en/build-with-claude/streaming) — SSE protocol, `content_block_delta`, `text_delta`, `input_json_delta`, `thinking_delta`, `signature_delta`.
+- [Building with extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking) — `thinking` block format, signing, echo-back rules.
+
+### Other CLI agents
+
+- [Aider docs](https://aider.chat/docs/) / [repo](https://github.com/Aider-AI/aider)
+- [Cursor 2.0](https://cursor.com/blog/2-0) / [Composer announcement](https://cursor.com/blog/composer)
+- [OpenAI Codex CLI config reference](https://developers.openai.com/codex/config-reference) / [advanced config](https://developers.openai.com/codex/config-advanced)
+- [Cline repo](https://github.com/cline/cline) / [VS Code marketplace](https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude-dev)
+- [Continue.dev — How Agent Mode Works](https://docs.continue.dev/ide-extensions/agent/how-it-works)
+- [opencode issue #3555 — MiniMax M2 reasoning_content rendering](https://github.com/anomalyco/opencode/issues/3555)
+
+### Provider reasoning model docs
+
+- [DeepSeek — reasoning_model docs](https://api-docs.deepseek.com/guides/reasoning_model)
+- [vLLM — reasoning outputs](https://docs.vllm.ai/en/v0.9.1/features/reasoning_outputs.html)
+- [gpt-oss-120b HF card](https://huggingface.co/openai/gpt-oss-120b) / [OpenAI model page](https://developers.openai.com/api/docs/models/gpt-oss-120b)
+- [MiniMax M2 — function call docs](https://platform.minimax.io/docs/guides/text-m2-function-call) / [interleaved thinking post](https://www.minimax.io/news/why-is-interleaved-thinking-important-for-m2)
+- [OpenAI reasoning guide](https://developers.openai.com/api/docs/guides/reasoning) / [cookbook: reasoning items](https://cookbook.openai.com/examples/responses_api/reasoning_items)

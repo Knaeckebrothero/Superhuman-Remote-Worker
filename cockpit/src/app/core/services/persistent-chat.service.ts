@@ -1,16 +1,44 @@
-import {computed, inject, Injectable, signal} from '@angular/core';
+import {computed, inject, Injectable, NgZone, signal} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import {ThreadStatus} from '../models/api.model';
 import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
 import {ApiService} from './api.service';
+import {IndexedDbService} from './indexed-db.service';
 
-const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
-const RECONNECT_CAP_MS = 30000;
-const RECONNECT_JITTER = 0.1;
-const RECONNECT_MAX_ATTEMPTS = 12;
-const RECONNECT_TERMINAL_CODES = new Set([1000, 4404, 4408, 4503]);
+/**
+ * Transport architecture (post WS→SSE migration, 2026-05-13):
+ *
+ *  • Server → client: GET /api/persistent/threads/{id}/stream — Server-Sent
+ *    Events. EventSource handles reconnect natively with the `Last-Event-ID`
+ *    header (set automatically by the browser from the latest `id:` line we
+ *    received). We additionally persist the cursor `(epoch, seq)` in IndexedDB
+ *    so cross-tab-close resume works — when the user reopens the tab, we read
+ *    the saved cursor and pass it as the initial `Last-Event-ID` so any events
+ *    the agent produced while we were away replay cleanly.
+ *
+ *  • Client → server: POST /api/persistent/threads/{id}/input (messages) and
+ *    POST /api/persistent/threads/{id}/interrupt (interrupt). Canonical REST.
+ *
+ *  • Control plane: the agent's existing WebSocket handler is retained for the
+ *    smaller verbs — approve/deny, slash commands, mode + narration + config
+ *    updates, vm-upgrade. Reason: these only fire while the user is actively
+ *    in the cockpit. A future PR can fold them into a generic
+ *    POST /control endpoint, but doing so requires invasive refactoring of
+ *    the agent's WS dispatch (moving its `_ws_send` error returns over to
+ *    proper HTTP semantics + broadcasting success notifications via
+ *    `_broadcast` so SSE consumers see them too). Out of scope for the
+ *    migration that gets browser-close-survival to users.
+ *
+ * `gone_beyond_horizon`: the server emits this single named event when the
+ * cursor is outside replay range (epoch mismatch or seq older than retention).
+ * Handler: drop the cursor, REST-reload the message history snapshot, reopen
+ * the stream without a cursor.
+ */
+
+const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
+const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 
 /** A chat message in the persistent session. */
 export interface ChatMessage {
@@ -74,10 +102,7 @@ type PermissionMode = 'supervised' | 'auto_accept' | 'autonomous';
 export type NarrationMode = 'silent' | 'verbose' | 'auto';
 
 /**
- * WebSocket client for persistent agent sessions.
- *
- * Manages the connection to /ws/persistent/{threadId} (via orchestrator proxy)
- * or directly to the agent pod's /ws/chat endpoint for local development.
+ * Persistent agent session client. See file header for transport rationale.
  *
  * All state is exposed as Angular signals for reactive UI updates.
  */
@@ -85,16 +110,21 @@ export type NarrationMode = 'silent' | 'verbose' | 'auto';
 export class PersistentChatService {
     private readonly http = inject(HttpClient);
     private readonly api = inject(ApiService);
+    private readonly cache = inject(IndexedDbService);
+    private readonly zone = inject(NgZone);
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
     readonly isConnected = computed(() => this.connectionState() === 'connected');
     readonly threadId = signal<string | null>(null);
 
-    // --- Reconnect engine ---
+    // --- Reconnect surface (kept for back-compat with the resume banner UI).
+    // EventSource handles reconnect natively, so these mostly stay quiet —
+    // we only bump `reconnectAttempt` while the SSE is in CONNECTING after an
+    // earlier OPEN, and only set `reconnectGaveUp` on terminal CLOSED.
     readonly reconnectAttempt = signal<number>(0);
     readonly reconnectGaveUp = signal<boolean>(false);
-    readonly reconnectMaxAttempts = RECONNECT_MAX_ATTEMPTS;
+    readonly reconnectMaxAttempts = -1; // unbounded; browser owns the loop
 
     // --- Chat state ---
     readonly messages = signal<ChatMessage[]>([]);
@@ -161,15 +191,18 @@ export class PersistentChatService {
     // --- Error ---
     readonly error = signal<string | null>(null);
 
-    private ws: WebSocket | null = null;
-    private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private sse: EventSource | null = null;
+    private controlWs: WebSocket | null = null;
+    private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private controlWsReconnectAttempt = 0;
     private intentionalClose = false;
-    private lastConnectUrl: string | null = null;
 
     /**
      * Connect to a persistent agent session.
      *
-     * Loads history via REST first, then opens the orchestrator's WS proxy.
+     * Loads thread metadata + transcript history from REST, then opens the
+     * SSE stream (replay-from-cursor when we have one cached) and the
+     * control WS.
      */
     async connect(threadId: string): Promise<void> {
         this.disconnect();
@@ -201,13 +234,9 @@ export class PersistentChatService {
             return;
         }
 
-        const apiUrl = environment.apiUrl;
-        const wsBase = apiUrl
-            .replace(/\/api\/?$/, '')
-            .replace(/^http/, 'ws');
-        const url = `${wsBase}/ws/persistent/${threadId}`;
-
-        this._connectWs(url);
+        this.intentionalClose = false;
+        await this._openSse(threadId);
+        this._openControlWs(threadId);
     }
 
     /**
@@ -263,7 +292,7 @@ export class PersistentChatService {
                 this.messages.set(historical);
             }
             this.historyLoaded.set(true);
-        } catch (e) {
+        } catch {
             // History load failure is non-fatal — proceed with empty history
             this.historyLoaded.set(true);
         }
@@ -292,152 +321,237 @@ export class PersistentChatService {
         }
     }
 
-    /** Open the WebSocket connection. */
-    private _connectWs(url: string): void {
-        this.intentionalClose = false;
-        this.lastConnectUrl = url;
-        this.ws = new WebSocket(url);
+    // ── SSE receive path ─────────────────────────────────────────────────
 
-        this.ws.onopen = () => {
-            this.connectionState.set('connected');
-            this.error.set(null);
-            this.reconnectAttempt.set(0);
-            this.reconnectGaveUp.set(false);
+    /**
+     * Open the SSE event stream. When IndexedDB has a cached cursor for
+     * this thread we can't use the EventSource constructor to pass a custom
+     * `Last-Event-ID` header (the API doesn't accept request headers), so
+     * we encode the cursor as a query parameter — the server reads either
+     * the header or `?last_event_id=...`. After the first event arrives,
+     * the browser tracks the cursor itself via the `id:` lines.
+     */
+    private async _openSse(threadId: string): Promise<void> {
+        const cursor = await this.cache.getThreadCursor(threadId);
+        const cursorQuery = cursor ? `?last_event_id=${encodeURIComponent(`${cursor.epoch}:${cursor.seq}`)}` : '';
+        const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream${cursorQuery}`;
+
+        // withCredentials true so cookies (Keycloak session) ride along.
+        this.sse = new EventSource(url, {withCredentials: true});
+
+        this.sse.onopen = () => {
+            this.zone.run(() => {
+                this.connectionState.set('connected');
+                this.error.set(null);
+                this.reconnectAttempt.set(0);
+                this.reconnectGaveUp.set(false);
+            });
         };
 
-        this.ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                this.handleMessage(data);
-            } catch {
-                // Ignore malformed messages
-            }
+        this.sse.onmessage = (event: MessageEvent) => {
+            this.zone.run(() => this._handleSseFrame(event));
         };
 
-        this.ws.onclose = (event) => {
-            this.connectionState.set('disconnected');
-            this.isStreaming.set(false);
-            this.isWaitingForInput.set(false);
+        this.sse.addEventListener('gone_beyond_horizon', (event) => {
+            this.zone.run(() => this._handleGoneBeyondHorizon(event as MessageEvent));
+        });
 
-            if (this.intentionalClose) return;
-
-            const willReconnect = this.shouldReconnect(event.code);
-
-            // Don't surface a generic error string when the reconnect banner
-            // is about to take over — it's the better signal for the user.
-            if (!willReconnect && event.code !== 1000 && event.code !== 4408) {
-                this.error.set(`Connection closed: ${event.reason || `code ${event.code}`}`);
-            }
-
-            // The agent's _detach_session() writes the row to 'ended' AFTER the
-            // WS dies (idle timeout, agent crash, network drop). Re-fetch meta
-            // so the UI picks up the flip and renders the resume card without
-            // requiring a manual reload.
-            const threadIdAtClose = this.threadId();
-            if (threadIdAtClose) {
-                setTimeout(async () => {
-                    if (this.threadId() !== threadIdAtClose) return;
-                    if (this.connectionState() === 'connected') return;
-                    await this.loadThreadMeta(threadIdAtClose);
-                    if (this.threadStatus() === 'ended') {
-                        this._cancelReconnect();
-                    }
-                }, 1500);
-            }
-
-            if (willReconnect) {
-                this._scheduleReconnect();
-            }
-        };
-
-        this.ws.onerror = () => {
-            // Mid-reconnect, the close handler drives the loop — don't surface
-            // a redundant error state that would mask the reconnect banner.
-            if (this.reconnectAttempt() > 0) return;
-            this.connectionState.set('error');
-            this.error.set('WebSocket connection failed');
+        this.sse.onerror = () => {
+            this.zone.run(() => {
+                if (!this.sse) return;
+                if (this.sse.readyState === EventSource.CLOSED) {
+                    // Terminal — auth failure, thread gone, etc. The browser
+                    // gave up. Don't bury the UI in a generic banner; let
+                    // the threadStatus refresh below surface "ended" if
+                    // that's what happened.
+                    this.connectionState.set('error');
+                    this.reconnectGaveUp.set(true);
+                    this._refreshStatusAfterDrop(threadId);
+                } else {
+                    // CONNECTING — the browser is retrying. Show reconnecting.
+                    this.connectionState.set('connecting');
+                    this.reconnectAttempt.update(n => n + 1);
+                }
+            });
         };
     }
 
-    private shouldReconnect(code: number): boolean {
-        if (RECONNECT_TERMINAL_CODES.has(code)) return false;
-        if (this.threadStatus() === 'ended') return false;
-        return true;
-    }
-
-    private _scheduleReconnect(): void {
-        if (this.intentionalClose) return;
-        if (this.threadStatus() === 'ended') return;
-
-        if (this.reconnectAttempt() >= RECONNECT_MAX_ATTEMPTS) {
-            this.reconnectGaveUp.set(true);
-            return;
+    private _handleSseFrame(event: MessageEvent): void {
+        // event.lastEventId is "<epoch>:<seq>". Save before dispatch so a
+        // dispatch error doesn't lose our place — the SSE replay logic
+        // tolerates re-receiving the same seq (it'll just be a no-op given
+        // the seq > $3 guard server-side).
+        if (event.lastEventId) {
+            const tid = this.threadId();
+            if (tid) this._saveCursor(tid, event.lastEventId);
         }
 
-        const idx = this.reconnectAttempt();
-        const baseDelay = RECONNECT_DELAYS_MS[idx] ?? RECONNECT_CAP_MS;
-        const jitter = baseDelay * RECONNECT_JITTER * (Math.random() * 2 - 1);
-        const delay = Math.max(0, Math.round(baseDelay + jitter));
+        let frame: { method: string; params?: Record<string, unknown> };
+        try {
+            frame = JSON.parse(event.data);
+        } catch {
+            return;
+        }
+        this._handleEvent(frame);
+    }
 
-        this.reconnectAttempt.set(idx + 1);
+    /**
+     * gone_beyond_horizon: cursor is too stale to replay (epoch mismatch or
+     * seq older than retention). Drop our cursor, REST-reload the transcript
+     * snapshot so the user at least sees completed turns, and reopen the
+     * stream from current tail.
+     */
+    private async _handleGoneBeyondHorizon(event: MessageEvent): Promise<void> {
+        const tid = this.threadId();
+        if (!tid) return;
+        await this.cache.deleteThreadCursor(tid);
+        if (this.sse) {
+            this.sse.close();
+            this.sse = null;
+        }
+        // Reload transcript so visible history doesn't have a silent gap.
+        await this.loadHistory(tid);
+        // Reopen with no cursor — server starts us at the current tail.
+        await this._openSse(tid);
+    }
 
-        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = null;
+    private _saveCursor(threadId: string, lastEventId: string): void {
+        // Parse "<epoch>:<seq>"; ignore malformed (keepalives, etc.).
+        const colon = lastEventId.indexOf(':');
+        if (colon <= 0) return;
+        const epoch = Number(lastEventId.slice(0, colon));
+        const seq = Number(lastEventId.slice(colon + 1));
+        if (!Number.isFinite(epoch) || !Number.isFinite(seq)) return;
+        // Fire-and-forget; cursor staleness is recoverable.
+        void this.cache.setThreadCursor(threadId, epoch, seq);
+    }
+
+    /**
+     * After SSE drops to CLOSED, the agent may have flipped this thread to
+     * `ended` (idle archive, /done from another client). Re-fetch meta so the
+     * UI swaps to the resume card instead of stuck on "connection error".
+     */
+    private _refreshStatusAfterDrop(threadId: string): void {
+        setTimeout(async () => {
+            if (this.threadId() !== threadId) return;
+            await this.loadThreadMeta(threadId);
+        }, 1500);
+    }
+
+    // ── Control WS (slash commands + permission decisions) ───────────────
+
+    private _openControlWs(threadId: string): void {
+        const apiUrl = environment.apiUrl;
+        const wsBase = apiUrl.replace(/\/api\/?$/, '').replace(/^http/, 'ws');
+        const url = `${wsBase}/ws/persistent/${threadId}`;
+
+        this.controlWs = new WebSocket(url);
+        this.controlWs.onclose = () => {
+            this.controlWs = null;
             if (this.intentionalClose) return;
-            if (this.threadStatus() === 'ended') return;
-            const url = this.lastConnectUrl;
-            if (!url) return;
-            this.connectionState.set('connecting');
-            this._connectWs(url);
+            if (this.threadId() !== threadId) return;
+            // Tiny linear backoff — primary connection signal lives on the SSE
+            // so we don't need the WS aggressively reconnecting.
+            this._scheduleControlWsReconnect(threadId);
+        };
+        this.controlWs.onerror = () => {
+            // The close handler will fire; nothing to do here.
+        };
+        // We don't subscribe to onmessage — the server still broadcasts
+        // frames over WS for back-compat (the agent doesn't know about SSE
+        // attach yet), but SSE is now the canonical receive path. Listening
+        // here would double-dispatch every event.
+    }
+
+    private _scheduleControlWsReconnect(threadId: string): void {
+        if (this.controlWsReconnectAttempt >= CONTROL_WS_RECONNECT_MAX_ATTEMPTS) {
+            // Give up silently; user actions that need the WS will reopen
+            // on demand via _ensureControlWs.
+            return;
+        }
+        const idx = this.controlWsReconnectAttempt;
+        const delay = CONTROL_WS_RECONNECT_DELAYS_MS[Math.min(idx, CONTROL_WS_RECONNECT_DELAYS_MS.length - 1)];
+        this.controlWsReconnectAttempt = idx + 1;
+        this.controlWsReconnectTimer = setTimeout(() => {
+            this.controlWsReconnectTimer = null;
+            if (this.intentionalClose) return;
+            if (this.threadId() !== threadId) return;
+            this._openControlWs(threadId);
         }, delay);
     }
 
-    private _cancelReconnect(): void {
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
-        }
-        this.reconnectAttempt.set(0);
-        this.reconnectGaveUp.set(false);
+    /** Open a control WS on demand if one isn't already open. Used by
+     *  slash-command and permission paths when the user clicks during a
+     *  brief reconnect window. */
+    private _ensureControlWs(): void {
+        const tid = this.threadId();
+        if (!tid) return;
+        if (this.controlWs?.readyState === WebSocket.OPEN) return;
+        if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
+        this.controlWsReconnectAttempt = 0;
+        this._openControlWs(tid);
     }
 
-    /** Cancel the current backoff wait and immediately fire a reconnect attempt.
-     *  From the gave-up state, also resets the attempt counter. */
+    /** Send a control-plane command. If the WS isn't open, open it; the
+     *  send goes out as soon as the connection establishes. */
+    private _sendControl(data: Record<string, unknown>): void {
+        if (this.controlWs?.readyState === WebSocket.OPEN) {
+            this.controlWs.send(JSON.stringify(data));
+            return;
+        }
+        // Best-effort: queue by re-opening and sending on next 'open'.
+        this._ensureControlWs();
+        const ws = this.controlWs;
+        if (!ws) return;
+        const sendWhenOpen = () => {
+            ws.removeEventListener('open', sendWhenOpen);
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+            }
+        };
+        ws.addEventListener('open', sendWhenOpen);
+    }
+
+    /** Cancel the current backoff wait and immediately reopen the SSE.
+     *  Resets gave-up state. */
     reconnectNow(): void {
         if (this.intentionalClose) return;
-        if (!this.lastConnectUrl) return;
+        const tid = this.threadId();
+        if (!tid) return;
 
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
+        this.reconnectGaveUp.set(false);
+        this.reconnectAttempt.set(0);
+        if (this.sse) {
+            this.sse.close();
+            this.sse = null;
         }
-
-        if (this.reconnectGaveUp()) {
-            this.reconnectAttempt.set(0);
-            this.reconnectGaveUp.set(false);
-        }
-
-        this.reconnectAttempt.set(this.reconnectAttempt() + 1);
         this.connectionState.set('connecting');
-        this._connectWs(this.lastConnectUrl);
+        void this._openSse(tid);
     }
 
     /** Disconnect from the session. */
     disconnect(): void {
         this.intentionalClose = true;
-        if (this.reconnectTimer) {
-            clearTimeout(this.reconnectTimer);
-            this.reconnectTimer = null;
+        if (this.controlWsReconnectTimer) {
+            clearTimeout(this.controlWsReconnectTimer);
+            this.controlWsReconnectTimer = null;
+        }
+        this.controlWsReconnectAttempt = 0;
+        if (this.sse) {
+            this.sse.close();
+            this.sse = null;
+        }
+        if (this.controlWs) {
+            this.controlWs.onclose = null;
+            try {
+                this.controlWs.close(1000);
+            } catch {
+                // ignore
+            }
+            this.controlWs = null;
         }
         this.reconnectAttempt.set(0);
         this.reconnectGaveUp.set(false);
-        this.lastConnectUrl = null;
-        if (this.ws) {
-            this.ws.onclose = null; // Prevent error handling on intentional close
-            this.ws.close(1000);
-            this.ws = null;
-        }
         this.connectionState.set('disconnected');
         this.isStreaming.set(false);
         this.isWaitingForInput.set(false);
@@ -495,8 +609,8 @@ export class PersistentChatService {
      *  When ``pendingAttachments`` is non-empty, files are uploaded to the
      *  thread workspace's ``uploads/`` directory first, then a hint listing
      *  the uploaded filenames is appended to the message text the agent
-     *  receives over the WS. The displayed user message keeps the original
-     *  text and shows uploaded files as separate attachment chips.
+     *  receives. The displayed user message keeps the original text and
+     *  shows uploaded files as separate attachment chips.
      */
     async sendMessage(content: string): Promise<void> {
         const trimmed = content.trim();
@@ -547,11 +661,11 @@ export class PersistentChatService {
         }));
 
         // What the agent sees: text + a plain-language hint about the files.
-        let wsContent = trimmed;
+        let sendContent = trimmed;
         if (attachments.length > 0) {
             const list = attachments.map((a) => a.name).join(', ');
             const hint = `[Attached files in uploads/: ${list}]`;
-            wsContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
+            sendContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
         }
 
         // Add to local messages — content is the user's typed text only;
@@ -567,13 +681,33 @@ export class PersistentChatService {
         ]);
 
         // If session isn't ready yet, queue and send when ready.
-        if (!this.sessionReady() || !this.ws) {
-            this.pendingMessage.set(wsContent);
+        if (!this.sessionReady()) {
+            this.pendingMessage.set(sendContent);
             return;
         }
 
         this.isWaitingForInput.set(false);
-        this.send({method: 'message', content: wsContent});
+        await this._postInput(sendContent);
+    }
+
+    /** POST the input to the orchestrator's REST endpoint. */
+    private async _postInput(content: string): Promise<void> {
+        const tid = this.threadId();
+        if (!tid) return;
+        try {
+            await firstValueFrom(
+                this.http.post<{ accepted: boolean; turn_id: number }>(
+                    `${environment.apiUrl}/persistent/threads/${tid}/input`,
+                    {content}
+                )
+            );
+        } catch (err: any) {
+            // 409 means a duplicate POST landed for the same turn — surface
+            // the existing inflight turn_id and otherwise ignore; the user
+            // sees the response stream via SSE.
+            if (err?.status === 409) return;
+            this.error.set(this.sanitizeError(err?.error?.detail || err?.message));
+        }
     }
 
     /** Parse and dispatch slash commands. Returns true if handled. */
@@ -584,14 +718,14 @@ export class PersistentChatService {
 
         switch (cmd) {
             case '/compact':
-                this.send({method: 'compact', focus: arg});
+                this._sendControl({method: 'compact', focus: arg});
                 this.messages.update(msgs => [...msgs, {
                     role: 'system', content: `Compacting context${arg ? ` (focus: ${arg})` : ''}...`,
                     timestamp: new Date(),
                 }]);
                 return true;
             case '/done':
-                this.send({method: 'archive'});
+                this._sendControl({method: 'archive'});
                 this.messages.update(msgs => [...msgs, {
                     role: 'system', content: 'Ending session...', timestamp: new Date(),
                 }]);
@@ -612,7 +746,7 @@ export class PersistentChatService {
                 this.setNarrationMode('verbose');
                 return true;
             case '/undo':
-                this.send({method: 'undo'});
+                this._sendControl({method: 'undo'});
                 this.messages.update(msgs => [...msgs, {
                     role: 'system', content: 'Undoing last file changes...', timestamp: new Date(),
                 }]);
@@ -627,7 +761,7 @@ export class PersistentChatService {
         const pending = this.pendingPermission();
         this.pendingPermission.set(null);
         if (pending?.id) this.recordLiveDecision(pending.id, 'approved');
-        this.send({method: 'approve'});
+        this._sendControl({method: 'approve'});
     }
 
     /** Deny a pending permission request. */
@@ -649,7 +783,7 @@ export class PersistentChatService {
                 }];
             });
         }
-        this.send({method: 'deny'});
+        this._sendControl({method: 'deny'});
     }
 
     private recordLiveDecision(id: string, decision: 'approved' | 'denied'): void {
@@ -658,11 +792,24 @@ export class PersistentChatService {
         );
     }
 
-    /** Interrupt the current turn. */
-    interrupt(): void {
-        if (this.isInterrupting()) return; // Already interrupting
+    /** Interrupt the current turn — REST POST. */
+    async interrupt(): Promise<void> {
+        if (this.isInterrupting()) return;
         this.isInterrupting.set(true);
-        this.send({method: 'interrupt'});
+        const tid = this.threadId();
+        if (!tid) return;
+        try {
+            await firstValueFrom(
+                this.http.post(`${environment.apiUrl}/persistent/threads/${tid}/interrupt`, {})
+            );
+        } catch (err: any) {
+            // Interrupt failures are rare and the SSE will surface the next
+            // turn boundary regardless — log and reset the flag.
+            this.isInterrupting.set(false);
+            console.warn('[persistent-chat] interrupt failed:', err);
+        }
+        // On success, the agent emits `interrupt.ack` over SSE and the
+        // handler below resets isInterrupting/isStreaming/currentTurnId.
     }
 
     /** Stop a pending permission prompt + halt the turn so the user can
@@ -672,23 +819,23 @@ export class PersistentChatService {
      *  next loop iteration bails out instead of acting on the denial. */
     stop(): void {
         this.deny();
-        this.interrupt();
+        void this.interrupt();
     }
 
     /** Change permission mode. */
     setMode(mode: PermissionMode): void {
         this.permissionMode.set(mode);
-        this.send({method: 'mode.set', mode});
+        this._sendControl({method: 'mode.set', mode});
     }
 
     setNarrationMode(mode: NarrationMode): void {
         this.narrationMode.set(mode);
-        this.send({method: 'narration.set', mode});
+        this._sendControl({method: 'narration.set', mode});
     }
 
     /** Update session config (model, temperature, etc.) at runtime. */
     updateConfig(config: Record<string, unknown>): void {
-        this.send({method: 'config.update', config});
+        this._sendControl({method: 'config.update', config});
     }
 
     /** Clear message history (local only). */
@@ -696,15 +843,9 @@ export class PersistentChatService {
         this.messages.set([]);
     }
 
-    // --- Private ---
+    // ── Event handling (shared by SSE and historical WS path) ───────────
 
-    private send(data: Record<string, unknown>): void {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify(data));
-        }
-    }
-
-    private handleMessage(data: { method: string; params?: Record<string, unknown> }): void {
+    private _handleEvent(data: { method: string; params?: Record<string, unknown> }): void {
         const params = data.params ?? {};
 
         switch (data.method) {
@@ -980,10 +1121,11 @@ export class PersistentChatService {
         const pending = this.pendingMessage();
         if (pending) {
             this.pendingMessage.set(null);
-            // Send directly — the message was already added to the messages array
-            // when the user submitted it, so we skip sendMessage() to avoid duplicates.
+            // Send directly — the message was already added to the messages
+            // array when the user submitted it, so we skip sendMessage() to
+            // avoid duplicates.
             this.isWaitingForInput.set(false);
-            this.send({method: 'message', content: pending});
+            void this._postInput(pending);
         }
     }
 
