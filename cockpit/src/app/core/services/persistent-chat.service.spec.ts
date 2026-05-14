@@ -5,6 +5,16 @@ import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {
+    AssistantTurn,
+    isAssistantTurn,
+    isSystemTurn,
+    isToolCall,
+    isUserTurn,
+    TextEvent,
+    ToolCallEvent,
+    UserTurn,
+} from '../models/turn.model';
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -172,7 +182,9 @@ describe('PersistentChatService — initial state', () => {
         expect(service.connectionState()).toBe('disconnected');
         expect(service.isConnected()).toBe(false);
         expect(service.threadId()).toBeNull();
-        expect(service.messages()).toEqual([]);
+        expect(service.turns()).toEqual([]);
+        expect(service.currentStreamingTurn()).toBeNull();
+        expect(service.isStreaming()).toBe(false);
         expect(service.historyLoaded()).toBe(false);
         expect(service.permissionMode()).toBe('supervised');
         expect(service.narrationMode()).toBe('auto');
@@ -295,25 +307,32 @@ describe('PersistentChatService — SSE event dispatch', () => {
         return {...ctx, es};
     }
 
-    it('appends token frames to the streamingText signal', async () => {
+    it('appends token frames into the active turn as a streaming TextEvent', async () => {
         const {service, es} = await setup();
         fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
         fireSseMessage(es, {method: 'token', params: {content: 'Hello '}}, '1:2');
         fireSseMessage(es, {method: 'token', params: {content: 'world'}}, '1:3');
-        expect(service.streamingText()).toBe('Hello world');
+        const turn = service.currentStreamingTurn();
+        expect(turn).not.toBeNull();
+        const text = turn!.events.find((e) => e.kind === 'text') as TextEvent;
+        expect(text.content).toBe('Hello world');
+        expect(text.status).toBe('streaming');
         expect(service.isStreaming()).toBe(true);
     });
 
-    it('handles turn.completed by finalizing the streaming text into messages', async () => {
+    it('handles turn.completed by closing the active turn and clearing the streaming flag', async () => {
         const {service, es} = await setup();
-        fireSseMessage(es, {method: 'turn.started', params: {}}, '1:1');
+        fireSseMessage(es, {method: 'turn.started', params: {turn_id: 1}}, '1:1');
         fireSseMessage(es, {method: 'token', params: {content: 'done'}}, '1:2');
-        fireSseMessage(es, {method: 'turn.completed', params: {}}, '1:3');
-        expect(service.streamingText()).toBe('');
+        fireSseMessage(es, {method: 'turn.completed', params: {turn_id: 1}}, '1:3');
         expect(service.isStreaming()).toBe(false);
-        const finalMsg = service.messages().slice(-1)[0];
-        expect(finalMsg.role).toBe('assistant');
-        expect(finalMsg.content).toBe('done');
+        expect(service.currentStreamingTurn()).toBeNull();
+        const assistantTurns = service.turns().filter(isAssistantTurn);
+        const last = assistantTurns[assistantTurns.length - 1] as AssistantTurn;
+        expect(last.status).toBe('done');
+        const text = last.events.find((e) => e.kind === 'text') as TextEvent;
+        expect(text.content).toBe('done');
+        expect(text.status).toBe('done');
     });
 
     it('sets pendingPermission on permission.request', async () => {
@@ -559,10 +578,10 @@ describe('PersistentChatService — REST sends', () => {
         );
         expect(inputCall).toBeDefined();
         expect(inputCall![1]).toEqual({content: 'hello'});
-        // Local optimistic message added.
-        const lastMsg = ctx.service.messages().slice(-1)[0];
-        expect(lastMsg.role).toBe('user');
-        expect(lastMsg.content).toBe('hello');
+        // Local optimistic UserTurn added.
+        const userTurns = ctx.service.turns().filter(isUserTurn);
+        const last = userTurns[userTurns.length - 1] as UserTurn;
+        expect(last.content).toBe('hello');
     });
 
     it('sendMessage queues content if session is not yet ready', async () => {
@@ -644,8 +663,10 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         expect(ctx.service.pendingPermission()).toBeNull();
     });
 
-    it('deny() sends {method: "deny"} and seeds the denied tool call', async () => {
+    it('deny() sends {method: "deny"} and seeds the denied tool call in the active turn', async () => {
         const ctx = await readySession();
+        // Real permission.request always fires inside a turn — set that up.
+        fireSseMessage(ctx.sseInstances[0], {method: 'turn.started', params: {turn_id: 1}}, '1:2');
         (ctx.service as any).pendingPermission.set({
             id: 'tc-2', tool: 'rm_rf', args: {path: '/'},
         });
@@ -653,18 +674,20 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
         ctx.service.deny();
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'deny'});
-        const denied = ctx.service.currentToolCalls().find((tc) => tc.id === 'tc-2');
-        expect(denied?.status).toBe('denied');
-        expect(denied?.decision).toBe('denied');
+        const turn = ctx.service.currentStreamingTurn()!;
+        const denied = turn.events.filter(isToolCall).find((tc) => tc.id === 'tc-2') as ToolCallEvent;
+        expect(denied).toBeDefined();
+        expect(denied.status).toBe('denied');
+        expect(denied.decision).toBe('denied');
     });
 
-    it('/compact slash command sends compact + adds a system message', async () => {
+    it('/compact slash command sends compact + adds a system turn', async () => {
         const ctx = await readySession();
         await ctx.service.sendMessage('/compact recent edits');
         const sent = ctx.wsInstances[0].send.mock.calls.map((c: any) => JSON.parse(c[0]));
         expect(sent).toContainEqual({method: 'compact', focus: 'recent edits'});
-        const sys = ctx.service.messages().filter((m) => m.role === 'system');
-        expect(sys.slice(-1)[0].content).toMatch(/Compacting/);
+        const systemTurns = ctx.service.turns().filter(isSystemTurn);
+        expect(systemTurns.slice(-1)[0].content).toMatch(/Compacting/);
     });
 
     it('/done sends archive', async () => {

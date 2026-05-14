@@ -19,6 +19,19 @@ import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {
+    AssistantTurn,
+    countEvents,
+    isAssistantTurn,
+    isSystemTurn,
+    isUserTurn,
+    lastTextOf,
+    TextEvent,
+    ThoughtEvent,
+    ToolCallEvent,
+    Turn,
+    TurnEvent,
+} from '../../core/models/turn.model';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
@@ -396,44 +409,44 @@ const CATEGORY_LABELS: Record<string, string> = {
         </div>
       </ng-template>
 
+      <!-- Per-event card templates (referenced by the turn loop below). -->
+      <ng-template #thoughtCard let-event>
+        <details class="thinking-block event-thought"
+                 [attr.open]="event.status === 'streaming' || chat.narrationMode() === 'verbose' ? '' : null">
+          <summary class="thinking-header">
+            <app-icon size="sm" class="thinking-icon">psychology</app-icon>
+            <span class="thinking-label">
+              {{ (event.status === 'streaming' ? 'chat.thinking.now' : 'chat.thinking.past') | transloco }}
+            </span>
+          </summary>
+          <div class="thinking-content">{{ event.content }}</div>
+        </details>
+      </ng-template>
+
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
-        @for (msg of chat.messages(); track $index) {
-          <div class="message" [class]="'message-' + msg.role"
-               [class.historical]="msg.historical"
-               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length"
-               [class.dimmed]="isShowingReconnectBanner() && $index === chat.messages().length - 1">
-            @if (msg.role === 'system') {
-              <div class="system-message">
-                <app-icon size="sm" class="system-icon">info</app-icon>
-                {{ msg.content }}
+        @for (turn of chat.turns(); track turn.id; let isLast = $last) {
+          @switch (turn.kind) {
+            @case ('system') {
+              <div class="message message-system">
+                <div class="system-message">
+                  <app-icon size="sm" class="system-icon">info</app-icon>
+                  {{ turn.content }}
+                </div>
               </div>
-            } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
-              <!-- Tool-only message: compact inline indicator, expandable to show args/results -->
-              <details
-                class="tool-summary tool-only-summary"
-                [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null"
-              >
-                <summary class="tool-only-row">
-                  <app-icon size="sm" class="tool-summary-chevron tool-only-chevron">chevron_right</app-icon>
-                  <app-icon size="sm" class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</app-icon>
-                  <span class="tool-only-label">{{ toolSummaryLabel(msg.toolCalls!) }}</span>
-                  <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
-                </summary>
-                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
-              </details>
-            } @else {
-              <div class="avatar">
-                <app-icon size="sm" class="avatar-icon">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</app-icon>
-              </div>
-              <div class="message-body">
-                @if (msg.role === 'user') {
-                  @if (msg.content) {
-                    <div class="user-text">{{ msg.content }}</div>
+            }
+            @case ('user') {
+              <div class="message message-user" [class.historical]="turn.historical">
+                <div class="avatar">
+                  <app-icon size="sm" class="avatar-icon">person</app-icon>
+                </div>
+                <div class="message-body">
+                  @if (turn.content) {
+                    <div class="user-text">{{ turn.content }}</div>
                   }
-                  @if (msg.attachments?.length) {
+                  @if (turn.attachments?.length) {
                     <div class="user-attachments">
-                      @for (att of msg.attachments; track att.path) {
+                      @for (att of turn.attachments; track att.path) {
                         <span class="user-attachment-chip" [title]="att.path">
                           <app-icon size="sm">{{
                             att.mimeType.startsWith('image/') ? 'image' :
@@ -446,21 +459,96 @@ const CATEGORY_LABELS: Record<string, string> = {
                       }
                     </div>
                   }
-                } @else {
-                  @if (msg.thinking && chat.narrationMode() !== 'silent') {
-                    <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
-                      <summary class="thinking-header">
-                        <app-icon size="sm" class="thinking-icon">psychology</app-icon>
-                        <span class="thinking-label">{{ 'chat.thinking.past' | transloco }}</span>
-                      </summary>
-                      <div class="thinking-content">{{ msg.thinking }}</div>
-                    </details>
+                </div>
+              </div>
+            }
+            @case ('assistant') {
+              @let isCollapsed = isTurnCollapsed(turn);
+              @let counts = turnEventCounts(turn);
+              @let last = lastTextEvent(turn);
+              @let streaming = turn.status === 'streaming';
+              @let ttsKey = 'turn:' + turn.id;
+              @let ttsS = ttsStateFor(ttsKey);
+              <div class="message message-assistant turn-bubble"
+                   [class.historical]="turn.historical"
+                   [class.streaming]="streaming"
+                   [class.collapsed]="isCollapsed"
+                   [class.dimmed]="isShowingReconnectBanner() && isLast">
+                <div class="avatar">
+                  <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
+                </div>
+                <div class="message-body turn-body">
+                  <!-- Whole-turn chevron: collapses every event into the
+                       per-type badge summary + last-text headline. Hidden
+                       when the turn has 0–1 events (nothing to collapse). -->
+                  @if (turn.events.length > 1) {
+                    <button type="button"
+                            class="turn-chevron"
+                            [attr.aria-expanded]="!isCollapsed"
+                            (click)="toggleTurnCollapse(turn)">
+                      <app-icon size="sm" class="turn-chevron-icon">{{ isCollapsed ? 'chevron_right' : 'expand_more' }}</app-icon>
+                      <span class="turn-chevron-badge">
+                        @if (counts.thoughts > 0) {
+                          <span class="badge-thought" [title]="('chat.turn.thoughtCount' | transloco:{count: counts.thoughts})">◐ {{ counts.thoughts }}</span>
+                        }
+                        @if (counts.texts > 0 && !isCollapsed) {
+                          <span class="badge-text" [title]="('chat.turn.textCount' | transloco:{count: counts.texts})">✎ {{ counts.texts }}</span>
+                        }
+                        @if (counts.tools > 0) {
+                          <span class="badge-tool" [title]="('chat.turn.toolCount' | transloco:{count: counts.tools})">▶ {{ counts.tools }}</span>
+                        }
+                      </span>
+                    </button>
                   }
-                  @if (msg.content) {
-                    <markdown [data]="msg.content"></markdown>
+
+                  @if (isCollapsed) {
+                    <!-- Collapsed: show only the final text event as headline. -->
+                    @if (last) {
+                      <markdown class="turn-headline" [data]="last.content"></markdown>
+                    } @else {
+                      <div class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</div>
+                    }
+                  } @else {
+                    <!-- Expanded: every event rendered as its own card. -->
+                    @for (event of turn.events; track event.id) {
+                      @switch (event.kind) {
+                        @case ('thought') {
+                          @if (chat.narrationMode() !== 'silent') {
+                            <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                          }
+                        }
+                        @case ('text') {
+                          <div class="event-text">
+                            <markdown [data]="event.content"></markdown>
+                          </div>
+                        }
+                        @case ('tool_call') {
+                          <div class="event-tool">
+                            <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                            @if (event.decision; as d) {
+                              <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                                <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                                <span class="resolved-title">{{ event.tool }}</span>
+                              </div>
+                            }
+                          </div>
+                        }
+                      }
+                    }
+
+                    <!-- Streaming pulse while the turn is in flight with nothing yet. -->
+                    @if (streaming && turn.events.length === 0 && !chat.pendingPermission()) {
+                      <div class="thinking">
+                        <span class="thinking-dot"></span>
+                        <span class="thinking-dot"></span>
+                        <span class="thinking-dot"></span>
+                      </div>
+                    }
                   }
-                  @if (msg.content) {
-                    @let ttsS = ttsStateFor($index);
+
+                  <!-- TTS button on the turn's final text. -->
+                  @if (last && !streaming) {
                     <div class="message-actions">
                       <button
                         type="button"
@@ -474,7 +562,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                           ttsS.error ? 'chat.tts.error' :
                           'chat.tts.play'
                         ) | transloco"
-                        (click)="toggleTts($index, msg.content)"
+                        (click)="toggleTts(ttsKey, last.content)"
                       >
                         @if (ttsS.isGenerating) {
                           <span class="action-spinner-sm"></span>
@@ -488,34 +576,12 @@ const CATEGORY_LABELS: Record<string, string> = {
                       </button>
                     </div>
                   }
-                  @if (msg.toolCalls?.length) {
-                    <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null">
-                      <summary class="tool-summary-line">
-                        <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
-                        <span class="tool-summary-text">
-                          {{ (msg.toolCalls!.length === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: msg.toolCalls!.length } }}
-                          {{ toolSummaryLabel(msg.toolCalls!) }}
-                        </span>
-                        <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
-                      </summary>
-                      <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
-                    </details>
-                    @for (tc of msg.toolCalls; track tc.id) {
-                      @if (tc.decision; as d) {
-                        <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                          <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                          <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                          <span class="resolved-title">{{ tc.tool }}</span>
-                          <time class="resolved-time">{{ formatTime(msg.timestamp) }}</time>
-                        </div>
-                      }
-                    }
-                  }
-                }
+                </div>
               </div>
             }
-          </div>
-          @if (msg.historical && chat.messages()[$index + 1] && !chat.messages()[$index + 1].historical) {
+          }
+          <!-- Divider between historical-loaded turns and the live session. -->
+          @if (showSessionDividerAfter(turn, $index)) {
             <div class="session-divider">
               <span class="divider-line"></span>
               <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
@@ -554,7 +620,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         <!-- Startup/resume card: shown when history exists but session not yet ready.
              Suppressed for ended threads — the F3 resume card below is the call-to-action
              there, and there's no actual provisioning in flight until the user opts in. -->
-        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
+        @if (chat.turns().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
           <div class="startup-wrapper resume">
             <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
@@ -565,7 +631,7 @@ const CATEGORY_LABELS: Record<string, string> = {
             <div class="startup-card-head">
               <span class="startup-card-spinner"></span>
               <span class="startup-card-title">
-                {{ (chat.messages().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
+                {{ (chat.turns().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
               </span>
             </div>
             <div class="startup-steps">
@@ -583,66 +649,6 @@ const CATEGORY_LABELS: Record<string, string> = {
             </div>
           </div>
         </ng-template>
-
-        <!-- Streaming response -->
-        @if (chat.isStreaming()) {
-          <div class="message message-assistant">
-            <div class="avatar">
-              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
-            </div>
-            <div class="message-body">
-              @if (chat.streamingThinking() && chat.narrationMode() !== 'silent') {
-                <details class="thinking-block" open>
-                  <summary class="thinking-header">
-                    <app-icon size="sm" class="thinking-icon">psychology</app-icon>
-                    <span class="thinking-label">{{ 'chat.thinking.now' | transloco }}</span>
-                  </summary>
-                  <div class="thinking-content">{{ chat.streamingThinking() }}</div>
-                </details>
-              }
-              @if (chat.streamingText()) {
-                <markdown [data]="chat.streamingText()"></markdown>
-              }
-              @if (chat.currentToolCalls().length) {
-                @if (hasRunningTools(chat.currentToolCalls())) {
-                  <div class="tool-progress">
-                    <span class="tool-progress-spinner"></span>
-                    <span class="tool-progress-text">{{ currentToolLabelHuman(chat.currentToolCalls()) }}...</span>
-                  </div>
-                }
-                @if (hasCompletedTools(chat.currentToolCalls())) {
-                  <details class="tool-summary" open>
-                    <summary class="tool-summary-line">
-                      <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
-                      <span class="tool-summary-text">
-                        {{ (completedToolCount(chat.currentToolCalls()) === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: completedToolCount(chat.currentToolCalls()) } }}
-                        {{ toolSummaryLabel(completedOnly(chat.currentToolCalls())) }}
-                      </span>
-                      <span class="tool-summary-dot completed"></span>
-                    </summary>
-                    <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: completedOnly(chat.currentToolCalls()) }"></ng-container>
-                  </details>
-                }
-                @for (tc of chat.currentToolCalls(); track tc.id) {
-                  @if (tc.decision; as d) {
-                    <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                      <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                      <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                      <span class="resolved-title">{{ tc.tool }}</span>
-                    </div>
-                  }
-                }
-              }
-              @if (!chat.streamingText() && !chat.currentToolCalls().length && !chat.pendingPermission()) {
-                <div class="thinking">
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                </div>
-              }
-            </div>
-          </div>
-        }
 
         <!-- Inline approval card (mile marker) — anchored to the live turn,
              not gated on streaming state so it stays visible across edge cases. -->
@@ -3010,12 +3016,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private capabilitiesSub?: Subscription;
     private recordingStateSub?: Subscription;
 
-    // Per-assistant-message TTS state. Keyed by the message index in
-    // chat.messages(). Indices are stable in practice — the messages
-    // array only ever appends.
-    readonly ttsState = signal<Record<number, TtsMessageState>>({});
+    // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
+    // state survives across re-renders even if the turn list is reordered.
+    readonly ttsState = signal<Record<string, TtsMessageState>>({});
     private currentTtsAudio: HTMLAudioElement | null = null;
-    private currentTtsIndex: number | null = null;
+    private currentTtsKey: string | null = null;
     // Tracks blob URLs we've created so we can revoke them on destroy.
     private readonly ttsBlobUrls = new Set<string>();
 
@@ -3065,7 +3070,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly startupSteps = computed(() => {
         const order = this.STARTUP_PHASE_ORDER;
         const phase = this.chat.startupPhase();
-        const isResuming = this.chat.messages().length > 0;
+        const isResuming = this.chat.turns().length > 0;
         // Subscribe to phase tracking changes and to the live tick.
         this.phaseRevision();
         const now = this.nowTick();
@@ -3138,11 +3143,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             error: () => this.pickedSuggestions.set([]),
         });
 
-        // Auto-scroll when messages, streaming, or tool calls change
+        // Auto-scroll when turns or in-flight events change. Reading both the
+        // turn list and the in-flight turn's events array keeps the effect
+        // subscribed to deltas on the active streaming turn.
         effect(() => {
-            this.chat.messages();
-            this.chat.streamingText();
-            this.chat.currentToolCalls();
+            this.chat.turns();
+            const active = this.chat.currentStreamingTurn();
+            if (active) active.events.length;
             this.chat.pendingPermission();
 
             if (this.autoScroll) {
@@ -3153,7 +3160,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Track new messages that arrive while the user has scrolled up.
         // Drives the "Jump to latest · N new" pill (F5).
         effect(() => {
-            const len = this.chat.messages().length;
+            const len = this.chat.turns().length;
             const away = this.scrolledAway();
             if (len < this.lastSeenMessageCount) {
                 // Thread switch or messages cleared — start fresh.
@@ -3257,7 +3264,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.connectionState() === 'disconnected'
         && this.chat.threadStatus() === 'active'
         && this.chat.sessionReady()
-        && this.chat.messages().length > 0,
+        && this.chat.turns().length > 0,
     );
 
     readonly scrolledAway = signal(false);
@@ -3330,7 +3337,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 // ignore
             }
             this.currentTtsAudio = null;
-            this.currentTtsIndex = null;
+            this.currentTtsKey = null;
         }
         this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         this.ttsBlobUrls.clear();
@@ -3541,35 +3548,35 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // ===== TTS playback =====
 
-    /** Read state for a given message index (always returns a defaulted object). */
-    ttsStateFor(index: number): TtsMessageState {
+    /** Read state for a given turn key (always returns a defaulted object). */
+    ttsStateFor(key: string): TtsMessageState {
         return (
-            this.ttsState()[index] ?? {isGenerating: false, isPlaying: false, error: false}
+            this.ttsState()[key] ?? {isGenerating: false, isPlaying: false, error: false}
         );
     }
 
-    /** Mutate state for one message index. */
-    private setTtsState(index: number, patch: Partial<TtsMessageState>): void {
+    /** Mutate state for one turn key. */
+    private setTtsState(key: string, patch: Partial<TtsMessageState>): void {
         this.ttsState.update((cur) => ({
             ...cur,
-            [index]: {...this.ttsStateFor(index), ...patch},
+            [key]: {...this.ttsStateFor(key), ...patch},
         }));
     }
 
     /**
-     * Play, pause, or generate-then-play TTS for an assistant message.
+     * Play, pause, or generate-then-play TTS for an assistant turn's final text.
      *
      * - First click: fetch the audio (formulation + synthesis on the server),
      *   then start playback.
      * - Subsequent clicks: toggle play/pause on the cached blob.
      */
-    async toggleTts(index: number, content: string): Promise<void> {
-        const state = this.ttsStateFor(index);
+    async toggleTts(key: string, content: string): Promise<void> {
+        const state = this.ttsStateFor(key);
         const threadId = this.chat.threadId();
         if (!threadId || !content.trim()) return;
 
-        // Stop any other message that's playing.
-        if (this.currentTtsIndex !== null && this.currentTtsIndex !== index) {
+        // Stop any other turn that's playing.
+        if (this.currentTtsKey !== null && this.currentTtsKey !== key) {
             this.stopCurrentTts();
         }
 
@@ -3579,12 +3586,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
 
         if (state.audioUrl) {
-            this.playCachedTts(index, state.audioUrl);
+            this.playCachedTts(key, state.audioUrl);
             return;
         }
 
         // Need to fetch the audio first.
-        this.setTtsState(index, {isGenerating: true, error: false});
+        this.setTtsState(key, {isGenerating: true, error: false});
         const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
         let result;
         try {
@@ -3593,28 +3600,23 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             );
         } catch (e) {
             console.error('TTS generate threw', e);
-            this.setTtsState(index, {isGenerating: false, error: true});
+            this.setTtsState(key, {isGenerating: false, error: true});
             return;
         }
         if (result === null || result === 'unavailable') {
-            this.setTtsState(index, {
+            this.setTtsState(key, {
                 isGenerating: false,
                 error: result === null,
             });
-            // 'unavailable' (204) is silent — server told us TTS isn't
-            // configured; the button stays in idle, the user can click
-            // again but nothing more useful will happen.
             return;
         }
         const url = URL.createObjectURL(result);
         this.ttsBlobUrls.add(url);
-        this.setTtsState(index, {isGenerating: false, audioUrl: url, error: false});
-        this.playCachedTts(index, url);
+        this.setTtsState(key, {isGenerating: false, audioUrl: url, error: false});
+        this.playCachedTts(key, url);
     }
 
-    private playCachedTts(index: number, url: string): void {
-        // Reuse a single Audio instance so memory stays bounded across
-        // many messages.
+    private playCachedTts(key: string, url: string): void {
         if (!this.currentTtsAudio) {
             this.currentTtsAudio = new Audio();
             this.currentTtsAudio.addEventListener('ended', () => this.onTtsEnded());
@@ -3622,51 +3624,48 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.currentTtsAudio.addEventListener('error', () => this.onTtsError());
         }
         this.currentTtsAudio.src = url;
-        this.currentTtsIndex = index;
-        this.setTtsState(index, {isPlaying: true});
+        this.currentTtsKey = key;
+        this.setTtsState(key, {isPlaying: true});
         this.currentTtsAudio.play().catch((e) => {
             console.error('TTS playback failed', e);
-            this.setTtsState(index, {isPlaying: false, error: true});
-            this.currentTtsIndex = null;
+            this.setTtsState(key, {isPlaying: false, error: true});
+            this.currentTtsKey = null;
         });
     }
 
     private stopCurrentTts(): void {
-        if (!this.currentTtsAudio || this.currentTtsIndex === null) return;
+        if (!this.currentTtsAudio || this.currentTtsKey === null) return;
         try {
             this.currentTtsAudio.pause();
             this.currentTtsAudio.currentTime = 0;
         } catch {
             // ignore
         }
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false});
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsEnded(): void {
-        if (this.currentTtsIndex === null) return;
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false});
+        if (this.currentTtsKey === null) return;
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsPaused(): void {
-        // The 'pause' event also fires when src changes or when stop()
-        // pauses the element. Only react when the audio is *user-paused*
-        // mid-track (currentTime > 0 and not at end).
-        if (this.currentTtsIndex === null || !this.currentTtsAudio) return;
+        if (this.currentTtsKey === null || !this.currentTtsAudio) return;
         const a = this.currentTtsAudio;
         if (a.ended || a.currentTime === 0) return;
-        const idx = this.currentTtsIndex;
-        this.setTtsState(idx, {isPlaying: false});
+        const k = this.currentTtsKey;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsError(): void {
-        if (this.currentTtsIndex === null) return;
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false, error: true});
+        if (this.currentTtsKey === null) return;
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false, error: true});
     }
 
     // ===== Drag-and-drop file handling =====
@@ -3752,7 +3751,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.autoScroll = true;
         this.scrolledAway.set(false);
         this.newMessageCount.set(0);
-        this.lastSeenMessageCount = this.chat.messages().length;
+        this.lastSeenMessageCount = this.chat.turns().length;
         this.scrollToBottom();
     }
 
@@ -3949,6 +3948,59 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             pre.style.position = 'relative';
             pre.appendChild(btn);
         }
+    }
+
+    // ===== Turn-bubble helpers =====
+
+    /**
+     * Auto-collapse threshold: assistant turns with more than this many events
+     * collapse to the headline-only view by default once they're done. Streaming
+     * turns are never auto-collapsed. The user can override either way via the
+     * chevron, in which case userTurnCollapsed wins.
+     */
+    private readonly AUTO_COLLAPSE_THRESHOLD = 8;
+
+    /**
+     * Per-turn user override for collapse state. Keyed by turn id. Value is
+     * `true` when the user explicitly collapsed it, `false` when they explicitly
+     * expanded it. Absent = use the auto rule.
+     */
+    private readonly userTurnCollapsed = signal<Record<string, boolean>>({});
+
+    /** Whether the given assistant turn should render in collapsed mode. */
+    isTurnCollapsed(turn: AssistantTurn): boolean {
+        const explicit = this.userTurnCollapsed()[turn.id];
+        if (explicit !== undefined) return explicit;
+        if (turn.status === 'streaming') return false;
+        return turn.events.length > this.AUTO_COLLAPSE_THRESHOLD;
+    }
+
+    /** Toggle the user-explicit collapse state for a turn. */
+    toggleTurnCollapse(turn: AssistantTurn): void {
+        const wasCollapsed = this.isTurnCollapsed(turn);
+        this.userTurnCollapsed.update((cur) => ({...cur, [turn.id]: !wasCollapsed}));
+    }
+
+    /** Per-type event counts for the chevron badge. */
+    turnEventCounts(turn: AssistantTurn) {
+        return countEvents(turn);
+    }
+
+    /** Last text event in a turn — used as the collapsed-view headline. */
+    lastTextEvent(turn: AssistantTurn): TextEvent | undefined {
+        return lastTextOf(turn);
+    }
+
+    /**
+     * True when the current turn is historical and the next turn isn't —
+     * the boundary between session reload and live activity.
+     */
+    showSessionDividerAfter(turn: Turn, index: number): boolean {
+        const next = this.chat.turns()[index + 1];
+        if (!next) return false;
+        const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
+        const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
+        return turnHistorical && !nextHistorical;
     }
 
     // Tool call display helpers

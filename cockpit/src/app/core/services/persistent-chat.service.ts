@@ -4,8 +4,18 @@ import {firstValueFrom} from 'rxjs';
 import {environment} from '../environment';
 import {ThreadStatus} from '../models/api.model';
 import {FilePreview, ThreadUploadedFile, UploadStatus} from '../models/file.model';
+import {
+    AssistantTurn,
+    ConversationState,
+    EMPTY_CONVERSATION,
+    isAssistantTurn,
+    SystemTurn,
+    Turn,
+    UserTurn,
+} from '../models/turn.model';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {reduce, ReducerAction} from './turn-reducer';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -39,20 +49,6 @@ import {IndexedDbService} from './indexed-db.service';
 
 const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
 const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
-
-/** A chat message in the persistent session. */
-export interface ChatMessage {
-    role: 'user' | 'assistant' | 'system';
-    content: string;
-    toolCalls?: ToolCallInfo[];
-    /** Model reasoning/thinking text (collapsed by default in UI). */
-    thinking?: string;
-    timestamp: Date;
-    /** True for messages loaded from DB history (not live). */
-    historical?: boolean;
-    /** Files uploaded to the workspace alongside this user message. */
-    attachments?: ChatAttachment[];
-}
 
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
@@ -126,13 +122,28 @@ export class PersistentChatService {
     readonly reconnectGaveUp = signal<boolean>(false);
     readonly reconnectMaxAttempts = -1; // unbounded; browser owns the loop
 
-    // --- Chat state ---
-    readonly messages = signal<ChatMessage[]>([]);
-    readonly streamingText = signal('');
-    readonly streamingThinking = signal('');
-    readonly isStreaming = signal(false);
+    // --- Conversation state ---
+    //
+    // One signal holds the whole conversation as an ordered list of typed
+    // Turns (user / assistant / system). Each AssistantTurn carries an
+    // ordered list of typed events (thought | text | tool_call). The reducer
+    // (./turn-reducer.ts) maps wire-level SSE events to state mutations and
+    // is keyed by stable ids so SSE replay is idempotent.
+    //
+    // See `docs/features/session_turn_rendering.md` for the design.
+    readonly conversation = signal<ConversationState>(EMPTY_CONVERSATION);
+    readonly turns = computed(() => this.conversation().turns);
+    readonly currentStreamingTurn = computed<AssistantTurn | null>(() => {
+        const state = this.conversation();
+        if (!state.activeAssistantTurnId) return null;
+        const t = state.turns.find(
+            (turn): turn is AssistantTurn =>
+                isAssistantTurn(turn) && turn.id === state.activeAssistantTurnId,
+        );
+        return t ?? null;
+    });
+    readonly isStreaming = computed(() => this.conversation().activeAssistantTurnId !== null);
     readonly isInterrupting = signal(false);
-    readonly currentToolCalls = signal<ToolCallInfo[]>([]);
     readonly historyLoaded = signal(false);
 
     // --- Permission state ---
@@ -143,7 +154,17 @@ export class PersistentChatService {
     readonly narrationMode = signal<NarrationMode>('auto');
 
     // --- Turn tracking ---
-    readonly currentTurnId = signal<number | null>(null);
+    /**
+     * The numeric `turn_id` of the in-flight turn, or null when no turn is
+     * streaming. Derived from the active turn in `conversation` — synthetic
+     * turns (e.g. greetings) have non-numeric ids and resolve to null.
+     */
+    readonly currentTurnId = computed<number | null>(() => {
+        const id = this.conversation().activeAssistantTurnId;
+        if (!id) return null;
+        const n = Number(id);
+        return Number.isFinite(n) ? n : null;
+    });
     readonly isWaitingForInput = signal(false);
 
     // --- Session metadata (loaded from REST on connect) ---
@@ -206,7 +227,7 @@ export class PersistentChatService {
      */
     async connect(threadId: string): Promise<void> {
         this.disconnect();
-        this.messages.set([]);
+        this.dispatch({type: 'reset', threadId});
         this.connectionState.set('connecting');
         this.error.set(null);
         this.historyLoaded.set(false);
@@ -264,7 +285,16 @@ export class PersistentChatService {
         }
     }
 
-    /** Load message history from REST endpoint. */
+    /**
+     * Load message history from REST endpoint and rehydrate as Turns.
+     *
+     * Server returns flat HistoryMessage rows (one per agent iteration); we
+     * group consecutive assistant rows on `turn_number` into a single
+     * AssistantTurn so the rendered bubble matches the live experience.
+     * Thinking content is not persisted in `thread_messages` so historical
+     * turns won't have thought events — known gap, see
+     * `docs/features/session_turn_rendering.md`.
+     */
     private async loadHistory(threadId: string): Promise<void> {
         try {
             const resp = await firstValueFrom(
@@ -274,22 +304,8 @@ export class PersistentChatService {
             );
 
             if (resp.messages?.length) {
-                const historical: ChatMessage[] = resp.messages
-                    .filter(m => ['user', 'human', 'HumanMessageChunk', 'ai', 'assistant', 'AIMessageChunk'].includes(m.role))
-                    .map(m => ({
-                        role: ['human', 'user', 'HumanMessageChunk'].includes(m.role) ? 'user' as const : 'assistant' as const,
-                        content: m.content || '',
-                        toolCalls: m.tool_calls?.map(tc => ({
-                            id: tc.id || '',
-                            tool: tc.name || '',
-                            args: tc.args || {},
-                            status: (tc.decision === 'denied' ? 'denied' : 'completed') as 'denied' | 'completed',
-                            decision: tc.decision,
-                        })),
-                        timestamp: new Date(m.created_at || Date.now()),
-                        historical: true,
-                    }));
-                this.messages.set(historical);
+                const turns = historyToTurns(resp.messages);
+                this.dispatch({type: 'load_history', threadId, turns});
             }
             this.historyLoaded.set(true);
         } catch {
@@ -554,7 +570,9 @@ export class PersistentChatService {
         this.reconnectAttempt.set(0);
         this.reconnectGaveUp.set(false);
         this.connectionState.set('disconnected');
-        this.isStreaming.set(false);
+        // If a turn was streaming when we disconnected, mark it interrupted
+        // so isStreaming flips to false and the bubble shows it stopped.
+        this._closeActiveTurnIfAny('turn_interrupted');
         this.isWaitingForInput.set(false);
         this.sessionReady.set(false);
         this.startupPhase.set(null);
@@ -669,17 +687,15 @@ export class PersistentChatService {
             sendContent = trimmed ? `${trimmed}\n\n${hint}` : hint;
         }
 
-        // Add to local messages — content is the user's typed text only;
-        // uploaded files render as separate attachment chips in the UI.
-        this.messages.update((msgs) => [
-            ...msgs,
-            {
-                role: 'user',
-                content: trimmed,
-                timestamp: new Date(),
-                attachments: attachments.length > 0 ? attachments : undefined,
-            },
-        ]);
+        // Add to local conversation — content is the user's typed text
+        // only; uploaded files render as separate attachment chips.
+        this.dispatch({
+            type: 'user_message',
+            id: makeLocalId('user'),
+            content: trimmed,
+            attachments: attachments.length > 0 ? attachments : undefined,
+            timestamp: Date.now(),
+        });
 
         // If session isn't ready yet, queue and send when ready.
         if (!this.sessionReady()) {
@@ -720,16 +736,11 @@ export class PersistentChatService {
         switch (cmd) {
             case '/compact':
                 this._sendControl({method: 'compact', focus: arg});
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system', content: `Compacting context${arg ? ` (focus: ${arg})` : ''}...`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(`Compacting context${arg ? ` (focus: ${arg})` : ''}...`);
                 return true;
             case '/done':
                 this._sendControl({method: 'archive'});
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system', content: 'Ending session...', timestamp: new Date(),
-                }]);
+                this._systemMessage('Ending session...');
                 return true;
             case '/auto':
                 this.setMode('auto_accept');
@@ -748,20 +759,34 @@ export class PersistentChatService {
                 return true;
             case '/undo':
                 this._sendControl({method: 'undo'});
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system', content: 'Undoing last file changes...', timestamp: new Date(),
-                }]);
+                this._systemMessage('Undoing last file changes...');
                 return true;
             default:
                 return false;
         }
     }
 
+    private _systemMessage(content: string): void {
+        this.dispatch({
+            type: 'system_message',
+            id: makeLocalId('sys'),
+            content,
+            timestamp: Date.now(),
+        });
+    }
+
     /** Approve a pending permission request. */
     approve(): void {
         const pending = this.pendingPermission();
         this.pendingPermission.set(null);
-        if (pending?.id) this.recordLiveDecision(pending.id, 'approved');
+        if (pending?.id) {
+            this.dispatch({
+                type: 'permission_decision',
+                toolUseId: pending.id,
+                decision: 'approved',
+                timestamp: Date.now(),
+            });
+        }
         this._sendControl({method: 'approve'});
     }
 
@@ -770,27 +795,17 @@ export class PersistentChatService {
         const pending = this.pendingPermission();
         this.pendingPermission.set(null);
         if (pending?.id) {
-            // Denied tools never get a tool.started event, so seed a synthetic
-            // entry in currentToolCalls so the marker renders inline with the
-            // turn rather than vanishing on the next token.
-            this.currentToolCalls.update(calls => {
-                if (calls.some(c => c.id === pending.id)) return calls;
-                return [...calls, {
-                    id: pending.id,
-                    tool: pending.tool,
-                    args: pending.args,
-                    status: 'denied',
-                    decision: 'denied',
-                }];
+            // The reducer handles both the existing-pending-call case and
+            // the no-prior-tool_started case (synthetic denied entry) — see
+            // turn-reducer.ts:permission_decision.
+            this.dispatch({
+                type: 'permission_decision',
+                toolUseId: pending.id,
+                decision: 'denied',
+                timestamp: Date.now(),
             });
         }
         this._sendControl({method: 'deny'});
-    }
-
-    private recordLiveDecision(id: string, decision: 'approved' | 'denied'): void {
-        this.currentToolCalls.update(calls =>
-            calls.map(c => (c.id === id ? {...c, decision} : c)),
-        );
     }
 
     /** Interrupt the current turn — REST POST. */
@@ -839,24 +854,23 @@ export class PersistentChatService {
         this._sendControl({method: 'config.update', config});
     }
 
-    /** Clear message history (local only). */
+    /** Clear conversation history (local only). */
     clearMessages(): void {
-        this.messages.set([]);
+        this.dispatch({type: 'reset', threadId: this.threadId()});
     }
 
     // ── Event handling (shared by SSE and historical WS path) ───────────
 
     private _handleEvent(data: { method: string; params?: Record<string, unknown> }): void {
         const params = data.params ?? {};
+        const now = Date.now();
 
         switch (data.method) {
             case 'status':
-                // Startup progress from orchestrator (provisioning → booting → connecting)
                 this.startupPhase.set((params['phase'] as string) || null);
                 break;
 
             case 'session.state':
-                // Sync client state with agent's current state on connect
                 if (params['permission_mode']) {
                     this.permissionMode.set(params['permission_mode'] as PermissionMode);
                 }
@@ -872,91 +886,106 @@ export class PersistentChatService {
                 if (params['temperature'] != null) {
                     this.temperature.set(params['temperature'] as number);
                 }
-                // session.state comes from the agent — implies agent is alive.
-                // Mark ready as fallback in case the 'ready' message is lost.
                 this.markSessionReady();
                 break;
 
-            case 'greeting':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'assistant',
+            case 'greeting': {
+                // Synthetic single-turn assistant message — agent welcome line.
+                const id = makeLocalId('greet');
+                this.dispatch({type: 'turn_started', turnId: id, startedAt: now});
+                this.dispatch({
+                    type: 'token',
                     content: (params['content'] as string) || '',
-                    timestamp: new Date(),
-                }]);
+                    timestamp: now,
+                });
+                this.dispatch({type: 'turn_completed', turnId: id, finishedAt: now});
                 this.isWaitingForInput.set(true);
                 break;
+            }
 
             case 'ready':
                 this.isWaitingForInput.set(true);
-                this.isStreaming.set(false);
-                // Finalize any streaming text into a message
-                this.finalizeStreaming();
+                // If a turn is still open (race with turn.completed dropped), close it.
+                this._closeActiveTurnIfAny('turn_completed');
                 this.markSessionReady();
                 break;
 
-            case 'turn.started':
-                this.currentTurnId.set((params['turn_id'] as number) ?? null);
-                this.turnCount.update(c => c + 1);
-                this.isStreaming.set(true);
-                this.streamingText.set('');
-                this.streamingThinking.set('');
-                this.currentToolCalls.set([]);
+            case 'turn.started': {
+                const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
+                this.turnCount.update((c) => c + 1);
+                this.dispatch({
+                    type: 'turn_started',
+                    turnId,
+                    startedAt: now,
+                    model: (params['model'] as string) || undefined,
+                });
                 break;
+            }
 
             case 'token':
-                this.streamingText.update((t) => t + ((params['content'] as string) || ''));
-                break;
-
-            case 'thinking':
-                this.streamingThinking.update((t) => t + ((params['content'] as string) || ''));
-                break;
-
-            case 'tool.started': {
-                const tc: ToolCallInfo = {
-                    id: (params['id'] as string) || '',
-                    tool: (params['tool'] as string) || '',
-                    args: (params['args'] as Record<string, unknown>) || {},
-                    status: 'running',
-                    category: (params['category'] as string) || undefined,
-                };
-                this.currentToolCalls.update((calls) => [...calls, tc]);
-                break;
-            }
-
-            case 'tool.completed': {
-                const id = params['id'] as string;
-                const nextStatus: 'completed' | 'error' = params['is_error'] ? 'error' : 'completed';
-                this.currentToolCalls.update((calls) =>
-                    calls.map((tc) =>
-                        tc.id === id
-                            ? {...tc, status: nextStatus, result: (params['result'] as string) || ''}
-                            : tc,
-                    ),
-                );
-                break;
-            }
-
-            case 'permission.request':
-                this.pendingPermission.set({
-                    id: (params['id'] as string) || '',
-                    tool: (params['tool'] as string) || '',
-                    args: (params['args'] as Record<string, unknown>) || {},
+                this.dispatch({
+                    type: 'token',
+                    content: (params['content'] as string) || '',
+                    timestamp: now,
                 });
                 break;
 
-            case 'turn.completed':
-                this.finalizeStreaming();
-                this.isStreaming.set(false);
-                this.isInterrupting.set(false);
-                this.currentTurnId.set(null);
+            case 'thinking':
+                this.dispatch({
+                    type: 'thinking',
+                    content: (params['content'] as string) || '',
+                    timestamp: now,
+                });
                 break;
 
-            case 'interrupt.ack':
-                // Backend confirmed interrupt — immediately finalize UI
-                this.finalizeStreaming();
-                this.isStreaming.set(false);
+            case 'tool.started':
+                this.dispatch({
+                    type: 'tool_started',
+                    toolUseId: (params['id'] as string) || '',
+                    tool: (params['tool'] as string) || '',
+                    args: (params['args'] as Record<string, unknown>) || {},
+                    category: (params['category'] as string) || undefined,
+                    timestamp: now,
+                });
+                break;
+
+            case 'tool.completed':
+                this.dispatch({
+                    type: 'tool_completed',
+                    toolUseId: (params['id'] as string) || '',
+                    result: (params['result'] as string) || '',
+                    isError: !!params['is_error'],
+                    timestamp: now,
+                });
+                break;
+
+            case 'permission.request': {
+                const id = (params['id'] as string) || '';
+                const tool = (params['tool'] as string) || '';
+                const args = (params['args'] as Record<string, unknown>) || {};
+                this.pendingPermission.set({id, tool, args});
+                this.dispatch({
+                    type: 'permission_request',
+                    toolUseId: id,
+                    tool,
+                    args,
+                    timestamp: now,
+                });
+                break;
+            }
+
+            case 'turn.completed': {
+                const turnId = String(params['turn_id'] ?? this.conversation().activeAssistantTurnId ?? '');
+                if (turnId) {
+                    this.dispatch({type: 'turn_completed', turnId, finishedAt: now});
+                }
                 this.isInterrupting.set(false);
-                this.currentTurnId.set(null);
+                break;
+            }
+
+            case 'interrupt.ack':
+                this._closeActiveTurnIfAny('turn_interrupted');
+                this.isInterrupting.set(false);
                 break;
 
             case 'mode.changed':
@@ -986,66 +1015,46 @@ export class PersistentChatService {
                 break;
 
             case 'context.compacted':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: `Context compacted: ${params['before']} → ${params['after']} messages`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(
+                    `Context compacted: ${params['before']} → ${params['after']} messages`,
+                );
                 break;
 
             case 'session.ended':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system', content: 'Session ended.', timestamp: new Date(),
-                }]);
+                this._systemMessage('Session ended.');
                 this.isWaitingForInput.set(false);
                 this.threadStatus.set('ended');
                 this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'session.idle_timeout':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(
+                    `Session paused after ${(params['timeout_minutes'] as number) || 30} minutes of inactivity. Your work has been saved.`,
+                );
                 this.isWaitingForInput.set(false);
-                // The agent's idle archive flips the row to 'ended'. Reflect
-                // that locally so the UI swaps to the read-only resume card.
                 this.threadStatus.set('ended');
                 this.endedAt.set(new Date().toISOString());
                 break;
 
             case 'vm_upgrade.needed':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}. `
-                        + `Use the upgrade button or send /upgrade to switch to a VM workspace.`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(
+                    `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}. `
+                    + `Use the upgrade button or send /upgrade to switch to a VM workspace.`,
+                );
                 break;
 
             case 'vm_upgrade.started':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: 'Upgrading workspace to VM, please wait...',
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage('Upgrading workspace to VM, please wait...');
                 break;
 
             case 'vm_upgrade.complete':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: 'VM upgrade complete. Workspace is now running on a VM with sudo access.',
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage('VM upgrade complete. Workspace is now running on a VM with sudo access.');
                 break;
 
             case 'vm_upgrade.failed':
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: `VM upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(
+                    `VM upgrade failed: ${(params['reason'] as string) || 'unknown error'}`,
+                );
                 break;
 
             case 'tasks.updated':
@@ -1058,17 +1067,27 @@ export class PersistentChatService {
 
             case 'files.restored':
                 this.undoAvailable.set(false);
-                this.messages.update(msgs => [...msgs, {
-                    role: 'system',
-                    content: `Restored ${(params['paths'] as string[])?.length || 0} file(s) to pre-edit state.`,
-                    timestamp: new Date(),
-                }]);
+                this._systemMessage(
+                    `Restored ${(params['paths'] as string[])?.length || 0} file(s) to pre-edit state.`,
+                );
                 break;
 
             case 'error':
                 this.error.set(this.sanitizeError(params['message'] as string));
                 break;
         }
+    }
+
+    /** Close the in-flight turn (if any) as either done or interrupted. */
+    private _closeActiveTurnIfAny(kind: 'turn_completed' | 'turn_interrupted'): void {
+        const activeId = this.conversation().activeAssistantTurnId;
+        if (!activeId) return;
+        this.dispatch({type: kind, turnId: activeId, finishedAt: Date.now()});
+    }
+
+    /** Apply a reducer action to the conversation state. */
+    private dispatch(action: ReducerAction): void {
+        this.conversation.update((s) => reduce(s, action));
     }
 
     /**
@@ -1130,29 +1149,92 @@ export class PersistentChatService {
         }
     }
 
-    /** Move accumulated streaming text + tool calls + thinking into the messages array. */
-    private finalizeStreaming(): void {
-        const text = this.streamingText();
-        const thinking = this.streamingThinking();
-        const tools = this.currentToolCalls();
+}
 
-        if (text || thinking || tools.length > 0) {
-            this.messages.update((msgs) => [
-                ...msgs,
-                {
-                    role: 'assistant',
-                    content: text,
-                    toolCalls: tools.length > 0 ? [...tools] : undefined,
-                    thinking: thinking || undefined,
-                    timestamp: new Date(),
-                },
-            ]);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+let _localIdCounter = 0;
+
+/** Generate a short, monotonic, locally-unique id for synthetic turns. */
+function makeLocalId(prefix: string): string {
+    _localIdCounter += 1;
+    return `${prefix}-${Date.now()}-${_localIdCounter}`;
+}
+
+/**
+ * Group flat HistoryMessage rows into Turns for the rehydration path.
+ *
+ * Multiple assistant rows that share a `turn_number` collapse into one
+ * AssistantTurn (each row contributes a text event plus any tool calls).
+ * Thinking is not persisted in `thread_messages` so historical turns won't
+ * have thought events.
+ */
+function historyToTurns(messages: HistoryMessage[]): Turn[] {
+    const turns: Turn[] = [];
+    const turnByNumber = new Map<number, AssistantTurn>();
+
+    for (const m of messages) {
+        const isUser = ['human', 'user', 'HumanMessageChunk'].includes(m.role);
+        const isAssistant = ['ai', 'assistant', 'AIMessageChunk'].includes(m.role);
+        if (!isUser && !isAssistant) continue;
+
+        const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
+
+        if (isUser) {
+            const u: UserTurn = {
+                kind: 'user',
+                id: m.id,
+                content: m.content || '',
+                timestamp: ts,
+                historical: true,
+            };
+            turns.push(u);
+            continue;
         }
 
-        this.streamingText.set('');
-        this.streamingThinking.set('');
-        this.currentToolCalls.set([]);
+        let turn = m.turn_number != null ? turnByNumber.get(m.turn_number) : undefined;
+        if (!turn) {
+            turn = {
+                kind: 'assistant',
+                id: m.id,
+                events: [],
+                status: 'done',
+                startedAt: ts,
+                finishedAt: ts,
+                historical: true,
+            };
+            if (m.turn_number != null) turnByNumber.set(m.turn_number, turn);
+            turns.push(turn);
+        }
+
+        if (m.content) {
+            turn.events.push({
+                kind: 'text',
+                id: `${turn.id}.b${turn.events.length}`,
+                content: m.content,
+                status: 'done',
+                startedAt: ts,
+            });
+        }
+        if (m.tool_calls) {
+            for (const tc of m.tool_calls) {
+                turn.events.push({
+                    kind: 'tool_call',
+                    id: tc.id || `${turn.id}.tc${turn.events.length}`,
+                    tool: tc.name || '',
+                    args: tc.args || {},
+                    status: tc.decision === 'denied' ? 'denied' : 'completed',
+                    decision: tc.decision,
+                    startedAt: ts,
+                });
+            }
+        }
+        turn.finishedAt = ts;
     }
+
+    return turns;
 }
 
 /** Shape of a message from the REST history endpoint. */
