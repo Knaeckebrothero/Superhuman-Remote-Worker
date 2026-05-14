@@ -111,7 +111,9 @@ data:
     }
 
     # ------------------------------------------------------------------
-    # srw-cockpit (public SPA, PKCE S256)
+    # srw-cockpit (public SPA, PKCE S256). Stays public — the cookie BFF
+    # uses a separate confidential client (cockpit-bff, below) so the SPA's
+    # PKCE-only token exchange keeps working.
     # ------------------------------------------------------------------
     echo "[bootstrap] === $COCKPIT_CLIENT_ID (public SPA on https://$COCKPIT_HOST) ==="
     cat >/tmp/cockpit.json <<JSON
@@ -136,6 +138,47 @@ data:
     }
     JSON
     upsert_client "$COCKPIT_CLIENT_ID" /tmp/cockpit.json >/dev/null
+
+    # ------------------------------------------------------------------
+    # srw-cockpit-bff (confidential — orchestrator BFF code exchange + refresh)
+    # ------------------------------------------------------------------
+    # Skipped when KC_CLIENT_SECRET is unset (pre-BFF deployments). When
+    # set, registers the orchestrator's /auth/callback as a redirect URI
+    # and the /auth/backchannel-logout endpoint. The cockpit SPA never
+    # uses this client — it's only consumed by orchestrator/auth/bff.py.
+    if [ -n "${KC_CLIENT_SECRET:-}" ] && [ -n "${API_HOST:-}" ]; then
+      BFF_CID="${BFF_CLIENT_ID:-cockpit-bff}"
+      echo "[bootstrap] === $BFF_CID (confidential BFF on https://$API_HOST) ==="
+      cat >/tmp/cockpit-bff.json <<JSON
+    {
+      "clientId": "$BFF_CID",
+      "name": "SRW Cockpit BFF ($API_HOST)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "$KC_CLIENT_SECRET",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:8085/auth/callback",
+        "https://$API_HOST/auth/callback"
+      ],
+      "webOrigins": [
+        "https://$API_HOST"
+      ],
+      "attributes": {
+        "post.logout.redirect.uris": "https://$COCKPIT_HOST/*##https://$API_HOST/*",
+        "backchannel.logout.url": "https://$API_HOST/auth/backchannel-logout",
+        "backchannel.logout.session.required": "true",
+        "backchannel.logout.revoke.offline.tokens": "false"
+      }
+    }
+    JSON
+      upsert_client "$BFF_CID" /tmp/cockpit-bff.json >/dev/null
+    fi
 
     # ------------------------------------------------------------------
     # srw-mcp (confidential, secret supplied from chart Secret)

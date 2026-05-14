@@ -109,6 +109,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
                   key: MCP_OIDC_CLIENT_SECRET
+            # Cockpit BFF — registered alongside the MCP client. The
+            # cockpit client flips from public-PKCE to confidential-secret
+            # once a non-empty value lands here; absence keeps it public
+            # for backwards compatibility (transitional).
+            - name: KC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.keycloakBootstrapAdminSecretName" . }}
+                  key: KC_CLIENT_SECRET
+                  optional: true
+            # Public origin for the orchestrator BFF — used to register
+            # the cockpit-bff client's /auth/callback redirect URI and
+            # backchannel-logout endpoint in Keycloak.
+            - name: API_HOST
+              value: {{ include "srw.host" (dict "context" . "key" "api" "default" "api") | quote }}
+            - name: BFF_CLIENT_ID
+              value: {{ .Values.auth.bff.clientId | quote }}
             {{- if and $sa $sa.cloud $sa.cloud.enabled }}
             # Cloud service-account user — created in TARGET_REALM. Username
             # and password come from the same chart Secret keys the agent

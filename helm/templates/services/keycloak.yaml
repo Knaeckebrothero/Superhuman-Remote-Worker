@@ -130,6 +130,53 @@ data:
           ]
         },
         {
+          "clientId": "cockpit-bff",
+          "name": "SRW Cockpit BFF",
+          "description": "Confidential client for the orchestrator's cookie BFF (docs/features/auth_bff_and_api_tokens.md). Distinct from the cockpit SPA's public client — same realm + same user identity, different auth model.",
+          "enabled": true,
+          "publicClient": false,
+          "clientAuthenticatorType": "client-secret",
+          "secret": "${KC_CLIENT_SECRET}",
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "protocol": "openid-connect",
+          "redirectUris": [
+            "http://localhost:8085/auth/callback",
+            "{{ include "srw.apiUrl" . }}/auth/callback"
+          ],
+          "webOrigins": [
+            "{{ include "srw.apiUrl" . }}"
+          ],
+          "attributes": {
+            "post.logout.redirect.uris": "{{ include "srw.cockpitUrl" . }}/*##{{ include "srw.apiUrl" . }}/*",
+            "backchannel.logout.url": "{{ include "srw.apiUrl" . }}/auth/backchannel-logout",
+            "backchannel.logout.session.required": "true",
+            "backchannel.logout.revoke.offline.tokens": "false"
+          },
+          "defaultClientScopes": [
+            "openid",
+            "profile",
+            "email",
+            "roles"
+          ],
+          "optionalClientScopes": [
+            "offline_access"
+          ],
+          "protocolMappers": [
+            {
+              "name": "sub",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-sub-mapper",
+              "config": {
+                "introspection.token.claim": "true",
+                "access.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
           "clientId": "gitea",
           "name": "Gitea",
           "description": "Git repository service (confidential client)",
@@ -653,6 +700,24 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_OIDC_CLIENT_SECRET
                   optional: true
+            # Cockpit BFF — flips the cockpit client from public-PKCE to
+            # confidential when a value is present. Absence keeps the
+            # client public (pre-BFF behavior). See
+            # docs/features/auth_bff_and_api_tokens.md.
+            - name: KC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "srw.secretName" . }}
+                  key: KC_CLIENT_SECRET
+                  optional: true
+            - name: COCKPIT_CLIENT_ID
+              value: {{ .Values.keycloak.cockpitClientId | quote }}
+            - name: BFF_CLIENT_ID
+              value: {{ .Values.auth.bff.clientId | quote }}
+            - name: API_URL
+              value: {{ include "srw.apiUrl" . | quote }}
+            - name: COCKPIT_URL
+              value: {{ include "srw.cockpitUrl" . | quote }}
             - name: SMTP_HOST
               valueFrom:
                 configMapKeyRef:
@@ -693,19 +758,78 @@ spec:
                     # passwords propagate without requiring a DB wipe.
                     $KC set-password -r {{ .Values.keycloak.realm }} --username test --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
                     # --- Sync client secrets ---
+                    # cockpit-bff is included so secret rotations in Vault
+                    # propagate to KC on the next pod restart. The other
+                    # entries pre-date the BFF and follow the same pattern.
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
                                 {{- if .Values.nextcloud.enabled }}
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
                                 {{- end }}
                                 "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
-                                "mcp-server:$MCP_OIDC_CLIENT_SECRET"; do
+                                "mcp-server:$MCP_OIDC_CLIENT_SECRET" \
+                                "${BFF_CLIENT_ID:-cockpit-bff}:$KC_CLIENT_SECRET"; do
                       CID="${pair%%:*}"; SEC="${pair#*:}"
                       [ -z "$SEC" ] && continue
                       ID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$CID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
                       [ -z "$ID" ] && continue
                       $KC update "clients/$ID" -r {{ .Values.keycloak.realm }} -s "secret=$SEC" 2>/dev/null
                     done
+                    # --- Enforce cockpit client = public-PKCE ---
+                    # Self-heal for clusters where someone manually flipped
+                    # the cockpit client to confidential in the KC admin UI
+                    # (a tempting wrong turn before cockpit-bff existed). The
+                    # cockpit SPA does PKCE-only token exchange and cannot
+                    # supply a client_secret, so confidential cockpit silently
+                    # breaks SPA login. cockpit-bff carries the BFF identity.
+                    if [ -n "$COCKPIT_CLIENT_ID" ]; then
+                      COCKID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$COCKPIT_CLIENT_ID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      if [ -n "$COCKID" ]; then
+                        $KC update "clients/$COCKID" -r {{ .Values.keycloak.realm }} \
+                          -s "publicClient=true" \
+                          -s "clientAuthenticatorType=client-secret" 2>/dev/null \
+                          || echo "WARN: kcadm cockpit public-flip failed"
+                      fi
+                    fi
+                    # --- Ensure cockpit-bff confidential client exists ---
+                    # Realm-import creates it on fresh installs (line ~117 of
+                    # this file). For existing realms that pre-date the BFF,
+                    # we create-if-missing here. The "Sync client secrets"
+                    # loop above already keeps the secret rotated.
+                    if [ -n "$KC_CLIENT_SECRET" ] && [ -n "$API_URL" ]; then
+                      BFF_CID="${BFF_CLIENT_ID:-cockpit-bff}"
+                      BFFID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$BFF_CID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      if [ -z "$BFFID" ]; then
+                        $KC create clients -r {{ .Values.keycloak.realm }} \
+                          -s "clientId=$BFF_CID" \
+                          -s "name=SRW Cockpit BFF" \
+                          -s "enabled=true" \
+                          -s "publicClient=false" \
+                          -s "clientAuthenticatorType=client-secret" \
+                          -s "secret=$KC_CLIENT_SECRET" \
+                          -s "standardFlowEnabled=true" \
+                          -s "directAccessGrantsEnabled=false" \
+                          -s "serviceAccountsEnabled=false" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\"]" \
+                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "attributes.\"backchannel.logout.session.required\"=true" \
+                          -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
+                          || echo "WARN: kcadm cockpit-bff create failed"
+                      else
+                        # Always re-assert the redirect URI + backchannel
+                        # logout URL — a Vault-domain change or chart bump
+                        # needs to propagate without manual UI clicks.
+                        $KC update "clients/$BFFID" -r {{ .Values.keycloak.realm }} \
+                          -s "publicClient=false" \
+                          -s "clientAuthenticatorType=client-secret" \
+                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\"]" \
+                          -s "webOrigins=[\"$API_URL\"]" \
+                          -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
+                          -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
+                          || echo "WARN: kcadm cockpit-bff update failed"
+                      fi
+                    fi
                     # --- Sync SMTP config ---
                     # Sole source of truth for SMTP — realm-import JSON
                     # deliberately omits smtpServer because the import-time
