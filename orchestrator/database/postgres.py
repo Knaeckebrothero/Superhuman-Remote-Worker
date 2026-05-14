@@ -3435,6 +3435,227 @@ class PostgresDB:
             )
 
     # =========================================================================
+    # BFF SESSION OPERATIONS  (Cookie BFF — see auth_bff_and_api_tokens.md §1.2)
+    # =========================================================================
+
+    async def create_srw_session(
+        self,
+        *,
+        user_id: str,
+        kc_sub: str,
+        access_token: str,
+        refresh_token: str,
+        id_token: str,
+        access_expires_at,
+        absolute_expires_at,
+        kc_sid: str | None = None,
+        user_agent: str | None = None,
+        created_ip: str | None = None,
+    ) -> str:
+        """Insert a new BFF session row and return its UUID (the cookie value)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO srw_sessions (
+                    user_id, kc_sub, kc_sid,
+                    access_token, refresh_token, id_token,
+                    access_expires_at, absolute_expires_at,
+                    user_agent, created_ip
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id
+                """,
+                user_id,
+                kc_sub,
+                kc_sid,
+                access_token,
+                refresh_token,
+                id_token,
+                access_expires_at,
+                absolute_expires_at,
+                user_agent,
+                created_ip,
+            )
+            return str(row["id"])
+
+    async def get_srw_session(self, session_id: str) -> Dict[str, Any] | None:
+        """Fetch an un-revoked session row by UUID. Returns None for revoked rows.
+
+        Idle/absolute-expiry are enforced by the validator (which holds the
+        clock), not here — the validator needs the row in either case to
+        decide whether to refresh or kill the session.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, kc_sub, kc_sid,
+                       access_token, refresh_token, id_token,
+                       access_expires_at, absolute_expires_at,
+                       created_at, last_seen_at, user_agent, created_ip
+                FROM srw_sessions
+                WHERE id = $1 AND revoked_at IS NULL
+                """,
+                session_id,
+            )
+            return dict(row) if row else None
+
+    async def touch_srw_session_last_seen(self, session_id: str) -> None:
+        """Bump last_seen_at to now() — anchors the idle-timeout window."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE srw_sessions SET last_seen_at = now() WHERE id = $1",
+                session_id,
+            )
+
+    async def refresh_srw_session_tokens(
+        self,
+        session_id: str,
+        *,
+        access_token: str,
+        refresh_token: str,
+        access_expires_at,
+        id_token: str | None = None,
+    ) -> None:
+        """Write back fresh tokens after a successful KC refresh.
+
+        Keycloak may or may not rotate the refresh token; we always store
+        whatever it gave us. id_token is preserved if KC didn't issue a new
+        one (some flows omit it on refresh — we keep the original so logout
+        still has a valid id_token_hint).
+        """
+        async with self.acquire() as conn:
+            if id_token is None:
+                await conn.execute(
+                    """
+                    UPDATE srw_sessions
+                       SET access_token = $2,
+                           refresh_token = $3,
+                           access_expires_at = $4,
+                           last_seen_at = now()
+                     WHERE id = $1
+                    """,
+                    session_id,
+                    access_token,
+                    refresh_token,
+                    access_expires_at,
+                )
+            else:
+                await conn.execute(
+                    """
+                    UPDATE srw_sessions
+                       SET access_token = $2,
+                           refresh_token = $3,
+                           id_token = $4,
+                           access_expires_at = $5,
+                           last_seen_at = now()
+                     WHERE id = $1
+                    """,
+                    session_id,
+                    access_token,
+                    refresh_token,
+                    id_token,
+                    access_expires_at,
+                )
+
+    async def delete_srw_session(self, session_id: str) -> None:
+        """Hard-delete a session row. Used by /auth/logout and the session-
+        fixation defense in /auth/callback (kill the old cookie's row before
+        issuing a new one).
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM srw_sessions WHERE id = $1",
+                session_id,
+            )
+
+    async def delete_srw_sessions_by_kc_sid(self, kc_sid: str) -> int:
+        """Delete every session row tied to a Keycloak SID. Used by the
+        /auth/backchannel-logout endpoint when KC tells us the user logged
+        out at the IdP. Returns the number of rows deleted (for audit).
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM srw_sessions WHERE kc_sid = $1",
+                kc_sid,
+            )
+            # asyncpg returns 'DELETE N'
+            try:
+                return int(result.split()[-1])
+            except (ValueError, IndexError):
+                return 0
+
+    async def cleanup_expired_srw_sessions(self) -> None:
+        """Delete sessions past their absolute lifetime, plus any revoked
+        sessions older than 7 days (keeps audit visibility for a week).
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM srw_sessions
+                WHERE absolute_expires_at < now()
+                   OR (revoked_at IS NOT NULL AND revoked_at < now() - INTERVAL '7 days')
+                """
+            )
+
+    async def create_srw_pre_auth(
+        self,
+        *,
+        state: str,
+        pkce_verifier: str,
+        return_to: str,
+        ttl_seconds: int = 300,
+    ) -> str:
+        """Park OAuth state + PKCE verifier for the /auth/callback round-trip.
+
+        Returns the row UUID (which becomes the srw_pre_auth cookie value).
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO srw_pre_auth_states (state, pkce_verifier, return_to, expires_at)
+                VALUES ($1, $2, $3, now() + ($4 || ' seconds')::interval)
+                RETURNING id
+                """,
+                state,
+                pkce_verifier,
+                return_to,
+                str(ttl_seconds),
+            )
+            return str(row["id"])
+
+    async def consume_srw_pre_auth(self, pre_auth_id: str) -> Dict[str, Any] | None:
+        """Single-use consumption of a pre-auth row. CAS on consumed_at.
+
+        Returns the row contents iff it was un-consumed and unexpired at
+        consumption time; None otherwise. Mirrors the magic_link_tokens
+        pattern (0006_headless_notifications.sql).
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE srw_pre_auth_states
+                   SET consumed_at = now()
+                 WHERE id = $1
+                   AND consumed_at IS NULL
+                   AND expires_at > now()
+                RETURNING state, pkce_verifier, return_to
+                """,
+                pre_auth_id,
+            )
+            return dict(row) if row else None
+
+    async def cleanup_expired_srw_pre_auth(self) -> None:
+        """Delete pre-auth rows past TTL or consumed > 1 hour ago."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM srw_pre_auth_states
+                WHERE expires_at < now()
+                   OR (consumed_at IS NOT NULL AND consumed_at < now() - INTERVAL '1 hour')
+                """
+            )
+
+    # =========================================================================
     # USER API KEY OPERATIONS
     # =========================================================================
 

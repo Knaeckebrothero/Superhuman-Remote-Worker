@@ -99,8 +99,12 @@ from database import (  # noqa: E402
 from security.auth import (  # noqa: E402
     get_current_user,
     require_approved_user,
+    resolve_ws_user,
     cleanup_expired_tokens,
+    cleanup_expired_sessions,
 )
+from security.csrf import CSRFMiddleware  # noqa: E402
+from auth import bff_router  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -3171,6 +3175,9 @@ async def lifespan(app: FastAPI):
     token_cleanup_task = asyncio.create_task(
         cleanup_expired_tokens(postgres_db, _shutdown_event)
     )
+    session_cleanup_task = asyncio.create_task(
+        cleanup_expired_sessions(postgres_db, _shutdown_event)
+    )
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
@@ -3245,6 +3252,7 @@ async def lifespan(app: FastAPI):
     _shutdown_event.set()
     await stale_detector_task
     await token_cleanup_task
+    await session_cleanup_task
     await dispatcher_task
     await sudo_sweeper_task
     await thread_events_prune_task
@@ -3285,6 +3293,15 @@ app = FastAPI(
     default_response_class=CustomJSONResponse,
 )
 
+# CSRF defense for the cookie BFF. Middleware order matters: Starlette
+# runs the OUTERMOST `add_middleware` last, so we add CSRF first and CORS
+# second. Result: incoming request → CORS preflight/origin handling →
+# CSRF check → app. That means OPTIONS preflights are still answered by
+# CORS (which is good — preflights are unauthenticated), while real
+# POST/PUT/DELETE/PATCH requests get the layered Sec-Fetch-Site +
+# X-CSRF + Origin allowlist check before they reach any handler.
+app.add_middleware(CSRFMiddleware)
+
 # CORS for Angular frontend (dev server on 4200, production/SSR on 4000)
 app.add_middleware(
     CORSMiddleware,
@@ -3298,6 +3315,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Expose nothing extra — the BFF only returns JSON + Set-Cookie, and
+    # browsers already see Set-Cookie. Keeping this explicit makes the
+    # CSP-style header surface visible.
 )
 
 
@@ -3383,6 +3403,7 @@ async def request_logging_middleware(request: Request, call_next):
 
 
 # Include routers
+app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 
@@ -12272,10 +12293,36 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
     # Must accept before we can send/close — FastAPI raises 500 otherwise
     await ws.accept()
 
+    # Cookie auth: browsers send the BFF session cookie on WS handshake
+    # automatically when the URL is on the API host. Closes the prior
+    # zero-auth hole — pre-BFF, this endpoint accepted any caller who
+    # knew (or guessed) the thread UUID. See
+    # docs/features/auth_bff_and_api_tokens.md §1.1.
+    user = await resolve_ws_user(ws, postgres_db)
+    if not user:
+        await ws.close(code=4401, reason="Authentication required")
+        return
+    if not user.get("is_approved"):
+        await ws.close(code=4403, reason="Account pending approval")
+        return
+
     # Resolve thread → agent → pod_ip
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         await ws.close(code=4404, reason="Thread not found")
+        return
+
+    # Thread ownership: a session can only attach to its own threads. The
+    # cockpit's persistent-chat UI already enforces this in its REST flow,
+    # but the WS handshake is a separate trust boundary.
+    if str(thread.get("user_id") or "") != str(user["id"]):
+        logger.warning(
+            "WS: user %s tried to attach to thread %s owned by %s",
+            user["id"],
+            thread_id,
+            thread.get("user_id"),
+        )
+        await ws.close(code=4403, reason="Thread access denied")
         return
 
     # Restore suspended workspace before connecting to agent
