@@ -22,7 +22,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 
 from .models import (
@@ -1074,6 +1074,37 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         except Exception as e:
             logger.exception("Failed to detach session")
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    # --- Persistent-session REST endpoints (orchestrator-driven turns) ---
+    #
+    # Mirror of /api/{input,interrupt,approve} in persistent_app.py. The
+    # orchestrator forwards from POST /api/persistent/threads/{id}/{input,
+    # interrupt,approve} to whichever agent is attached to the thread, which
+    # in cluster usage is a dual-mode pod. Without these routes the agent
+    # returns 404 and the cockpit's turn never lands. See task #136 /
+    # docs/issues/persistent_session_dual_mode_phase1_gap.md for the parallel
+    # WS-handler gap this duplication caused.
+
+    @app.post("/api/input", tags=["Session"])
+    async def api_input(request: Request):
+        if _pod_state != PodState.SESSION:
+            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+        import src.api.persistent_app as pa
+        return await pa.handle_api_input(request)
+
+    @app.post("/api/interrupt", tags=["Session"])
+    async def api_interrupt():
+        if _pod_state != PodState.SESSION:
+            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+        import src.api.persistent_app as pa
+        return await pa.handle_api_interrupt()
+
+    @app.post("/api/approve", tags=["Session"])
+    async def api_approve(request: Request):
+        if _pod_state != PodState.SESSION:
+            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+        import src.api.persistent_app as pa
+        return await pa.handle_api_approve(request)
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
