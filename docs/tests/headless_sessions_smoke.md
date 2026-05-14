@@ -651,6 +651,150 @@ If you skip this step, each P5.6 run leaks 1 workspace pod, 1 PVC, and 1 agent p
 
 ---
 
+## Phase 7 (cockpit) sections — SSE migration
+
+These verify the cockpit's WS→SSE migration shipped 2026-05-13. They run against a real cockpit dev server + the existing orchestrator (cluster or local uvicorn). Unit tests in `cockpit/src/app/core/services/persistent-chat.service.spec.ts` cover the dispatcher with mocked EventSource + fake IndexedDB; this section catches the wire-up concerns the mocks can't see.
+
+Prereqs in addition to §0:
+
+```bash
+# Cockpit dev server on :4200
+(cd cockpit && npm start)
+
+# Confirm the orchestrator is reachable from your browser host (port-forwarded
+# cluster orchestrator or local uvicorn).
+curl -s http://localhost:8085/api/health | head -c 100
+```
+
+Sign into the cockpit (Keycloak SSO via the normal flow) before starting. Open browser devtools — you'll want the Network and Application tabs visible.
+
+Pick a thread to target. Either pick an existing one and note its UUID, or create one:
+
+```bash
+THREAD_ID=$(psql_dev -t -c "SELECT id FROM threads WHERE status='active' LIMIT 1;" | tr -d ' ')
+echo "Targeting thread $THREAD_ID"
+```
+
+### P7.1 — SSE stream attaches on thread open (no cached cursor)
+
+Navigate to `http://localhost:4200/sessions/$THREAD_ID` (or whatever the cockpit's thread-detail route is for your shell — desktop layout uses `/sessions/<id>`, simple layout uses `/chat/<id>`).
+
+**Pass criteria:**
+
+- Network tab shows exactly one `GET /api/persistent/threads/<id>/stream` request, with response type `text/event-stream` and status `200`.
+- The request URL has **no** `last_event_id` query parameter (first visit — IndexedDB has no row yet).
+- Application → IndexedDB → `cockpit-cache` shows a `threadCursors` object store (created at schema v3) but it's empty until events arrive.
+- Console has no errors.
+
+### P7.2 — Cursor saved on each event
+
+In another terminal, manually drive events to verify the cockpit saves the cursor:
+
+```bash
+psql_dev -c "
+  UPDATE threads SET events_epoch = COALESCE(events_epoch, 0) WHERE id = '$THREAD_ID';
+
+  INSERT INTO thread_events (thread_id, epoch, seq, kind, payload)
+  VALUES
+    ('$THREAD_ID', 0, 10001, 'token', '{\"content\": \"smoke-\"}'::jsonb),
+    ('$THREAD_ID', 0, 10002, 'token', '{\"content\": \"chunk\"}'::jsonb);
+"
+```
+
+Within ~200ms the cockpit's SSE poll picks them up.
+
+**Pass criteria:**
+
+- Application → IndexedDB → `threadCursors` now has a row keyed by the thread UUID with `epoch=0`, `seq=10002`, fresh `updatedAt`.
+- The streaming text UI didn't add anything visible (token events without a `turn.started` are dispatched into `streamingText` but the surrounding chat panel doesn't render mid-turn text without a turn-started marker — that's expected; we're testing transport, not UX).
+
+### P7.3 — Cursor replays on tab close + reopen
+
+Close the tab (full close, not refresh). Reopen `http://localhost:4200/sessions/$THREAD_ID`.
+
+**Pass criteria:**
+
+- The new SSE request URL carries `?last_event_id=0%3A10002` (URL-encoded `0:10002`).
+- The orchestrator picks up where we left off — no replay storm of old events.
+
+This is the load-bearing path for "close browser, agent works, come back, see what happened."
+
+### P7.4 — gone_beyond_horizon triggers history reload
+
+Bump the thread's epoch on the server. The cached cursor (epoch=0) will now be invalid:
+
+```bash
+psql_dev -c "UPDATE threads SET events_epoch = events_epoch + 1 WHERE id = '$THREAD_ID';"
+```
+
+Disconnect the cockpit's SSE briefly (devtools Network → right-click the stream → "Block request URL", reload, unblock) so it reopens and re-sends the stale cursor.
+
+**Pass criteria:**
+
+- Network tab shows the SSE response includes an `event: gone_beyond_horizon` frame and the connection closes.
+- A new `GET /api/persistent/threads/<id>/messages` request fires immediately after (cockpit's transcript reload).
+- A second SSE request fires after that, this time **without** `?last_event_id=` (cursor was dropped).
+- IndexedDB → `threadCursors` for this thread is gone for a beat, then re-populates with the new epoch as fresh events arrive.
+
+### P7.5 — POST /input replaces WS send for messages
+
+Type a message in the chat composer and submit.
+
+**Pass criteria:**
+
+- Network tab shows `POST /api/persistent/threads/<id>/input` with body `{"content": "<your message>"}` and status 200.
+- The user's message renders optimistically in the chat panel.
+- **No** outbound WS frame with `method: "message"` (devtools → Network → WS tab → click the connection → Messages — should NOT see your text as an outgoing frame).
+
+### P7.6 — POST /interrupt replaces WS send for interrupt
+
+Trigger an interrupt mid-turn (the UI button while the agent is streaming, or wait until streaming and then click).
+
+**Pass criteria:**
+
+- Network tab shows `POST /api/persistent/threads/<id>/interrupt` with empty body and status 200.
+- Subsequent `interrupt.ack` arrives over the SSE (not WS).
+- No outgoing WS frame with `method: "interrupt"`.
+
+### P7.7 — Control WS still handles slash commands + permission decisions
+
+The cockpit retains a WebSocket strictly for control-plane verbs the migration left on WS by design. Send `/done` in the composer (or click approve/deny on a permission request).
+
+**Pass criteria:**
+
+- The cockpit's WS to `/ws/persistent/<id>` is open (Network → WS).
+- The outgoing frame is `{"method": "archive"}` (for /done) or `{"method": "approve"}` / `{"method": "deny"}` (for permissions).
+- The corresponding server response (e.g. session ended, permission resolved) arrives over **SSE**, not WS.
+
+### P7.8 — 409 on concurrent multi-tab send is gracefully swallowed
+
+Open the same thread in two tabs. In both, type the same (or different) message and submit at nearly the same moment.
+
+**Pass criteria:**
+
+- Both tabs show their message added optimistically.
+- One of the `POST /input` returns 200, the other returns 409.
+- The 409 tab's error signal stays clear (the cockpit treats 409 as "server has the turn, ignore" per the migration design).
+
+### P7.9 — Teardown
+
+```bash
+psql_dev -c "
+  DELETE FROM thread_events
+  WHERE thread_id = '$THREAD_ID' AND seq >= 10001;
+"
+```
+
+Reset the events_epoch if you bumped it for P7.4:
+
+```bash
+psql_dev -c "UPDATE threads SET events_epoch = 0 WHERE id = '$THREAD_ID';"
+```
+
+In the cockpit devtools Application tab, you can also clear the `threadCursors` store entirely if you want a clean next-run baseline.
+
+---
+
 ## Common failure modes
 
 | Symptom | Likely cause |
@@ -665,5 +809,9 @@ If you skip this step, each P5.6 run leaks 1 workspace pod, 1 PVC, and 1 agent p
 | P5.3 watchdog never suspends | Workspace context missing on thread metadata → `suspend_thread_workspace` returns False early. Either provision a workspace for the test thread or accept the "suspend declined" log line as proof the watchdog selected the row. |
 | P5.4 extend POST returns 200 but no banner | The token's `thread_id` may be NULL (mint was missing the bind argument). Check `SELECT thread_id FROM magic_link_tokens WHERE token_hash = …` |
 | P5.6 wake task silent | Either `workspace_suspension_service.is_enabled` is False, or the thread's metadata doesn't carry a `workspace_container` section — both abort the wake helper early. |
+| P7.1 SSE request has no cursor when one is cached | The `getThreadCursor` Dexie read returned null on schema upgrade — check Application → IndexedDB for `cockpit-cache` schema version (should be ≥ 3). If stuck at v2, the user's browser kept the old DB; `DELETE FROM cockpit-cache` (devtools) and reload. |
+| P7.3 reload sends `last_event_id=` but server returns no events | Cursor seq is ahead of the actual `MAX(seq)` on the server (manual DELETE between sessions). Falls into the "no replay needed" branch silently — not a bug per se, but if you expected replay you need to re-INSERT events with seq > the cursor. |
+| P7.4 epoch bump doesn't trigger `gone_beyond_horizon` | The cockpit's EventSource is still in the same in-flight response when you bump — the server only re-evaluates the cursor on a fresh connection. Force a reconnect (block-request-URL trick in devtools, or `reconnectNow()` from the service). |
+| P7.5 message goes over WS, not REST | The cockpit pre-2026-05-13 build is cached. Hard-reload (Ctrl+Shift+R) or clear the service worker if one is registered. |
 
 When a step fails, capture the orchestrator logs (terminal C) and `psql_dev -c "SELECT * FROM thread_notifications ORDER BY sent_at DESC LIMIT 5;"` for triage.

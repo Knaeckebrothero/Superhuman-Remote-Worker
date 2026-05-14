@@ -17,8 +17,7 @@
   --font-family-display: var(--font-display);
 
   // Sharp Roman radii — override the primitive scale declared in
-  // _root-tokens.scss. Role tokens (--radius-control, --radius-surface, etc.)
-  // alias these, so flipping the scale flattens every role that references it.
+  // _root-tokens.scss.
   --radius-sm:   0;
   --radius-md:   0;
   --radius-lg:   2px;
@@ -26,6 +25,18 @@
 
   // --radius-full stays at the primitive default (999px) — functional circles
   // (radio dots, switch knobs, spinners, avatars) keep their semantic shape.
+
+  // Role tokens must be re-declared here. Their var() references are resolved
+  // at computed-value time against the cascade *of the declaring element*.
+  // The :root declarations match <html> only, so var(--radius-md) there
+  // resolves against <html>'s --radius-md (the unflattened 8px) and inherits
+  // down to <body> as a pre-resolved 8px. Re-declaring under .theme-* makes
+  // the var() resolve against <body>'s cascade where the flatten lives.
+  --radius-control: var(--radius-md);
+  --radius-surface: var(--radius-md);
+  --radius-tag:     var(--radius-sm);
+  // --radius-pill aliases --radius-full (not overridden), so the :root
+  // declaration is correct everywhere — no re-decl needed.
 
   // Typography aliases — primary surfaces pick up the display font in Roman
   // themes. Consumed by the typography recipe mixins (Phase 2).
@@ -148,13 +159,6 @@
 
   .btn-primary:hover {
     background: var(--accent-hover);
-  }
-
-  // Avatars — square not round
-  .avatar,
-  .agent-avatar,
-  .user-avatar {
-    border-radius: 0;
   }
 }
 
