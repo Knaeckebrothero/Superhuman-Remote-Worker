@@ -1350,227 +1350,188 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
-        """WebSocket consumer for an already-running persistent session.
+        await handle_persistent_websocket(ws)
 
-        Headless lifecycle (chunk 1):
-          - First WS attach spawns the persistent loop with module-level
-            callbacks. Subsequent attaches just register a subscriber and
-            tap into the existing loop's broadcast stream.
-          - WS close calls _unsubscribe() and cancels this connection's pump
-            task. The loop keeps running. It only stops via
-            _loop_completion_handler (idle timeout, /done, crash) or via
-            out-of-band _terminate_session (drain, watchdog, REST detach).
-          - The pod no longer exits when the WS closes — that was the
-            WS-bound era. _schedule_exit is now driven only by drain intent
-            and shutdown paths.
-        """
-        import uuid
+    return app
 
-        await ws.accept()
 
-        # Signal the boot-WS watchdog that a connection arrived. Done before
-        # the readiness check so even a failed-to-be-ready connection counts:
-        # the user clearly came back, and a different error path applies.
-        _signal_ws_connected()
+# --- WebSocket handler (module-level so dual_app can call it too) ---
 
-        if not _session or not _session.llm_with_tools:
-            await _ws_send(ws, "error", {"message": "Agent not ready"})
-            await ws.close(code=4503, reason="Agent not ready")
-            return
 
-        # Register this WS as a subscriber on the broadcast hub.
-        client_id = uuid.uuid4().hex
-        queue = _subscribe(client_id)
-        pump_task = asyncio.create_task(
-            _run_subscriber_pump(ws, client_id, queue),
-            name=f"subscriber-pump-{client_id[:8]}",
+async def handle_persistent_websocket(ws: WebSocket) -> None:
+    """WebSocket consumer for an already-running persistent session.
+
+    Headless lifecycle (chunk 1):
+      - First WS attach spawns the persistent loop with module-level
+        callbacks. Subsequent attaches just register a subscriber and
+        tap into the existing loop's broadcast stream.
+      - WS close calls _unsubscribe() and cancels this connection's pump
+        task. The loop keeps running. It only stops via
+        _loop_completion_handler (idle timeout, /done, crash) or via
+        out-of-band _terminate_session (drain, watchdog, REST detach).
+      - The pod no longer exits when the WS closes — that was the
+        WS-bound era. _schedule_exit is now driven only by drain intent
+        and shutdown paths.
+
+    Reached from both:
+      - persistent_app.create_persistent_app()'s /ws/chat route (pure
+        persistent mode, agent.py --mode persistent).
+      - dual_app.ws_chat (dual mode — adds pod-state pre-checks then
+        delegates here). Sharing this body is what closes the Phase-1
+        gap described in
+        docs/issues/persistent_session_dual_mode_phase1_gap.md.
+    """
+    import uuid
+
+    await ws.accept()
+
+    # Signal the boot-WS watchdog that a connection arrived. Done before
+    # the readiness check so even a failed-to-be-ready connection counts:
+    # the user clearly came back, and a different error path applies.
+    _signal_ws_connected()
+
+    if not _session or not _session.llm_with_tools:
+        await _ws_send(ws, "error", {"message": "Agent not ready"})
+        await ws.close(code=4503, reason="Agent not ready")
+        return
+
+    # Register this WS as a subscriber on the broadcast hub.
+    client_id = uuid.uuid4().hex
+    queue = _subscribe(client_id)
+    pump_task = asyncio.create_task(
+        _run_subscriber_pump(ws, client_id, queue),
+        name=f"subscriber-pump-{client_id[:8]}",
+    )
+
+    logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
+
+    # Send current session state so this client can sync. Direct send —
+    # this is the welcome frame, only the connecting client cares.
+    await _ws_send(
+        ws,
+        "session.state",
+        {
+            "thread_id": _thread_id,
+            "permission_mode": _session.permission_mode,
+            "narration_mode": _session.narration_mode,
+            "turn_count": _session.turn_count,
+            "message_count": len(_session.messages),
+            "model": _session.config.llm.model,
+            "temperature": _session.config.llm.temperature,
+        },
+    )
+
+    # Spawn the persistent loop if it isn't already running. Reconnecting
+    # to a session whose loop is mid-turn just joins the broadcast — no
+    # restart, no replay (replay arrives in chunk 2 via the event log).
+    global _loop_task
+    if _loop_task is None or _loop_task.done():
+        callbacks = PersistentLoopCallbacks(
+            get_user_input=_loop_get_user_input,
+            on_token=_loop_on_token,
+            on_thinking=_loop_on_thinking,
+            on_tool_start=_loop_on_tool_start,
+            on_tool_result=_loop_on_tool_result,
+            permission_check=_loop_permission_check,
+            on_turn_start=_loop_on_turn_start,
+            on_turn_complete=_loop_on_turn_complete,
+            on_error=_loop_on_error,
+            check_interrupt=_loop_check_interrupt,
+            on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
         )
-
-        logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
-
-        # Send current session state so this client can sync. Direct send —
-        # this is the welcome frame, only the connecting client cares.
-        await _ws_send(
-            ws,
-            "session.state",
-            {
-                "thread_id": _thread_id,
-                "permission_mode": _session.permission_mode,
-                "narration_mode": _session.narration_mode,
-                "turn_count": _session.turn_count,
-                "message_count": len(_session.messages),
-                "model": _session.config.llm.model,
-                "temperature": _session.config.llm.temperature,
-            },
-        )
-
-        # Spawn the persistent loop if it isn't already running. Reconnecting
-        # to a session whose loop is mid-turn just joins the broadcast — no
-        # restart, no replay (replay arrives in chunk 2 via the event log).
-        global _loop_task
-        if _loop_task is None or _loop_task.done():
-            callbacks = PersistentLoopCallbacks(
-                get_user_input=_loop_get_user_input,
-                on_token=_loop_on_token,
-                on_thinking=_loop_on_thinking,
-                on_tool_start=_loop_on_tool_start,
-                on_tool_result=_loop_on_tool_result,
-                permission_check=_loop_permission_check,
-                on_turn_start=_loop_on_turn_start,
-                on_turn_complete=_loop_on_turn_complete,
-                on_error=_loop_on_error,
-                check_interrupt=_loop_check_interrupt,
-                on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
-            )
-            _loop_task = asyncio.create_task(
-                run_persistent_loop(
-                    llm_with_tools=_session.llm_with_tools,
-                    tools=_session.tools,
-                    context_manager=_session.context_manager,
-                    config=_session.config,
-                    system_prompt=_session.system_prompt,
-                    callbacks=callbacks,
-                    messages=_session.messages,
-                    auxiliary_llm=_session.auxiliary_llm,
-                    workspace_content=_session.get_workspace_content,
-                    recall_store=_session.recall_store,
-                    knowledge_store=_session.knowledge_store,
-                    project_id=_session.project_id,
-                    project_ids=_session.project_ids,
-                    tool_context=_session.tool_context,
-                    initial_turn_count=_session.turn_count,
-                    get_current_tools=lambda: (
-                        _session.llm_with_tools,
-                        _session.tools,
-                    ),
+        _loop_task = asyncio.create_task(
+            run_persistent_loop(
+                llm_with_tools=_session.llm_with_tools,
+                tools=_session.tools,
+                context_manager=_session.context_manager,
+                config=_session.config,
+                system_prompt=_session.system_prompt,
+                callbacks=callbacks,
+                messages=_session.messages,
+                auxiliary_llm=_session.auxiliary_llm,
+                workspace_content=_session.get_workspace_content,
+                recall_store=_session.recall_store,
+                knowledge_store=_session.knowledge_store,
+                project_id=_session.project_id,
+                project_ids=_session.project_ids,
+                tool_context=_session.tool_context,
+                initial_turn_count=_session.turn_count,
+                get_current_tools=lambda: (
+                    _session.llm_with_tools,
+                    _session.tools,
                 ),
-                name="persistent-loop",
-            )
-            asyncio.create_task(
-                _loop_completion_handler(_loop_task),
-                name="persistent-loop-completion",
-            )
-            logger.info(f"Persistent loop started: thread={_thread_id}")
-        else:
-            logger.info(
-                f"Persistent loop already running, attached as subscriber "
-                f"client={client_id[:8]}"
-            )
+            ),
+            name="persistent-loop",
+        )
+        asyncio.create_task(
+            _loop_completion_handler(_loop_task),
+            name="persistent-loop-completion",
+        )
+        logger.info(f"Persistent loop started: thread={_thread_id}")
+    else:
+        logger.info(
+            f"Persistent loop already running, attached as subscriber "
+            f"client={client_id[:8]}"
+        )
 
-        # --- WebSocket receive loop ---
-        global _loop_interrupt_flag
-        try:
-            while True:
-                raw = await ws.receive_text()
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    # Plain text → treat as message
-                    data = {"method": "message", "content": raw}
+    # --- WebSocket receive loop ---
+    global _loop_interrupt_flag
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Plain text → treat as message
+                data = {"method": "message", "content": raw}
 
-                method = data.get("method", "message")
+            method = data.get("method", "message")
 
-                if method == "message":
-                    content = data.get("content", "")
-                    if content and _loop_user_queue is not None:
-                        _loop_last_user_content[0] = content
-                        await _loop_user_queue.put(content)
+            if method == "message":
+                content = data.get("content", "")
+                if content and _loop_user_queue is not None:
+                    _loop_last_user_content[0] = content
+                    await _loop_user_queue.put(content)
 
-                elif method == "approve":
-                    # Phase 3: resolve the most-recent-pending permission
-                    # request in the DB. Cockpit can pass an explicit
-                    # approval_id to disambiguate when multiple are
-                    # pending (rare — agent's loop serializes most flows).
-                    approval_id = data.get("approval_id")
-                    asyncio.create_task(
-                        _resolve_pending_permission(
-                            "approved",
-                            approval_id=approval_id,
-                            decided_by="ws_client",
-                        ),
-                        name="resolve-approve",
-                    )
+            elif method == "approve":
+                # Phase 3: resolve the most-recent-pending permission
+                # request in the DB. Cockpit can pass an explicit
+                # approval_id to disambiguate when multiple are
+                # pending (rare — agent's loop serializes most flows).
+                approval_id = data.get("approval_id")
+                asyncio.create_task(
+                    _resolve_pending_permission(
+                        "approved",
+                        approval_id=approval_id,
+                        decided_by="ws_client",
+                    ),
+                    name="resolve-approve",
+                )
 
-                elif method == "deny":
-                    approval_id = data.get("approval_id")
-                    asyncio.create_task(
-                        _resolve_pending_permission(
-                            "denied",
-                            approval_id=approval_id,
-                            decided_by="ws_client",
-                        ),
-                        name="resolve-deny",
-                    )
+            elif method == "deny":
+                approval_id = data.get("approval_id")
+                asyncio.create_task(
+                    _resolve_pending_permission(
+                        "denied",
+                        approval_id=approval_id,
+                        decided_by="ws_client",
+                    ),
+                    name="resolve-deny",
+                )
 
-                elif method == "interrupt":
-                    # Mode picked from current _tool_inflight: graceful when
-                    # a tool is mid-invoke (let it finish, don't leak state);
-                    # hard otherwise (cancel the LLM stream now, drop the
-                    # partial AIMessage). See persistent_graph check sites.
-                    mode = "graceful" if _tool_inflight else "hard"
-                    _loop_interrupt_flag = mode
-                    await _ws_send(ws, "interrupt.ack", {"mode": mode})
-                    logger.info("Interrupt acknowledged (mode=%s)", mode)
+            elif method == "interrupt":
+                # Mode picked from current _tool_inflight: graceful when
+                # a tool is mid-invoke (let it finish, don't leak state);
+                # hard otherwise (cancel the LLM stream now, drop the
+                # partial AIMessage). See persistent_graph check sites.
+                mode = "graceful" if _tool_inflight else "hard"
+                _loop_interrupt_flag = mode
+                await _ws_send(ws, "interrupt.ack", {"mode": mode})
+                logger.info("Interrupt acknowledged (mode=%s)", mode)
 
-                elif method == "mode.set":
-                    new_mode = data.get("mode", "supervised")
-                    if new_mode in ("supervised", "auto_accept", "autonomous"):
-                        if _session is None:
-                            await _ws_send(
-                                ws,
-                                "error",
-                                {"message": "Session no longer active"},
-                            )
-                            continue
-                        _session.permission_mode = new_mode
-                        await _ws_send(ws, "mode.changed", {"mode": new_mode})
-                        logger.info(f"Permission mode changed to: {new_mode}")
-                    else:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": f"Invalid mode: {new_mode}"},
-                        )
-
-                elif method == "narration.set":
-                    new_mode = data.get("mode", "auto")
-                    if new_mode in ("silent", "verbose", "auto"):
-                        if _session is None:
-                            await _ws_send(
-                                ws,
-                                "error",
-                                {"message": "Session no longer active"},
-                            )
-                            continue
-                        _session.narration_mode = new_mode
-                        await _ws_send(ws, "narration.changed", {"mode": new_mode})
-                        logger.info(f"Narration mode changed to: {new_mode}")
-                    else:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": f"Invalid narration mode: {new_mode}"},
-                        )
-
-                elif method == "config.update":
-                    config_override = data.get("config", {})
-                    if config_override:
-                        asyncio.create_task(_handle_config_update(ws, config_override))
-
-                elif method == "compact":
-                    # Manual compaction trigger (/compact command)
-                    focus = data.get("focus", "")
-                    asyncio.create_task(_handle_compact(ws, focus))
-
-                elif method == "archive":
-                    # End session (/done command)
-                    asyncio.create_task(_handle_archive(ws))
-
-                elif method == "upgrade-to-vm":
-                    # Upgrade workspace from container to VM
-                    asyncio.create_task(_handle_vm_upgrade(ws))
-
-                elif method == "undo":
+            elif method == "mode.set":
+                new_mode = data.get("mode", "supervised")
+                if new_mode in ("supervised", "auto_accept", "autonomous"):
                     if _session is None:
                         await _ws_send(
                             ws,
@@ -1578,53 +1539,105 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                             {"message": "Session no longer active"},
                         )
                         continue
-                    turn_id = data.get("turn_id")
-                    restored = _session.undo_turn(turn_id)
-                    if restored:
-                        await _ws_send(
-                            ws,
-                            "files.restored",
-                            {
-                                "paths": restored,
-                                "turn_id": turn_id,
-                            },
-                        )
-                    else:
+                    _session.permission_mode = new_mode
+                    await _ws_send(ws, "mode.changed", {"mode": new_mode})
+                    logger.info(f"Permission mode changed to: {new_mode}")
+                else:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": f"Invalid mode: {new_mode}"},
+                    )
+
+            elif method == "narration.set":
+                new_mode = data.get("mode", "auto")
+                if new_mode in ("silent", "verbose", "auto"):
+                    if _session is None:
                         await _ws_send(
                             ws,
                             "error",
-                            {"message": "No checkpoints available to undo"},
+                            {"message": "Session no longer active"},
                         )
-
+                        continue
+                    _session.narration_mode = new_mode
+                    await _ws_send(ws, "narration.changed", {"mode": new_mode})
+                    logger.info(f"Narration mode changed to: {new_mode}")
                 else:
                     await _ws_send(
-                        ws, "error", {"message": f"Unknown method: {method}"}
+                        ws,
+                        "error",
+                        {"message": f"Invalid narration mode: {new_mode}"},
                     )
 
-        except WebSocketDisconnect:
-            logger.info(
-                f"WebSocket disconnected: thread={_thread_id} "
-                f"client={client_id[:8]} (loop continues)"
-            )
-        except Exception as e:
-            logger.exception(f"WebSocket error: {e}")
-        finally:
-            # Headless keystone: WS close only unsubscribes. The loop keeps
-            # running until _loop_completion_handler routes its natural exit,
-            # or out-of-band _terminate_session intervenes. We do NOT cancel
-            # _loop_task here, and we do NOT schedule pod exit.
-            _unsubscribe(client_id)
-            if not pump_task.done():
-                pump_task.cancel()
-                try:
-                    await pump_task
-                except asyncio.CancelledError:
-                    pass
-            logger.info(
-                f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
-            )
+            elif method == "config.update":
+                config_override = data.get("config", {})
+                if config_override:
+                    asyncio.create_task(_handle_config_update(ws, config_override))
 
-    return app
+            elif method == "compact":
+                # Manual compaction trigger (/compact command)
+                focus = data.get("focus", "")
+                asyncio.create_task(_handle_compact(ws, focus))
+
+            elif method == "archive":
+                # End session (/done command)
+                asyncio.create_task(_handle_archive(ws))
+
+            elif method == "upgrade-to-vm":
+                # Upgrade workspace from container to VM
+                asyncio.create_task(_handle_vm_upgrade(ws))
+
+            elif method == "undo":
+                if _session is None:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "Session no longer active"},
+                    )
+                    continue
+                turn_id = data.get("turn_id")
+                restored = _session.undo_turn(turn_id)
+                if restored:
+                    await _ws_send(
+                        ws,
+                        "files.restored",
+                        {
+                            "paths": restored,
+                            "turn_id": turn_id,
+                        },
+                    )
+                else:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "No checkpoints available to undo"},
+                    )
+
+            else:
+                await _ws_send(ws, "error", {"message": f"Unknown method: {method}"})
+
+    except WebSocketDisconnect:
+        logger.info(
+            f"WebSocket disconnected: thread={_thread_id} "
+            f"client={client_id[:8]} (loop continues)"
+        )
+    except Exception as e:
+        logger.exception(f"WebSocket error: {e}")
+    finally:
+        # Headless keystone: WS close only unsubscribes. The loop keeps
+        # running until _loop_completion_handler routes its natural exit,
+        # or out-of-band _terminate_session intervenes. We do NOT cancel
+        # _loop_task here, and we do NOT schedule pod exit.
+        _unsubscribe(client_id)
+        if not pump_task.done():
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+        logger.info(
+            f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
+        )
 
 
 # --- Helpers ---
