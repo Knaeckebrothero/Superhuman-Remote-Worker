@@ -305,11 +305,11 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     row = await db.get_auth_token_by_hash(digest)
     if not row or row["kind"] != "api":
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.get_user(row["user_id"])
+    user = await db.get_user(str(row["user_id"]))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
     asyncio.create_task(
-        db.touch_auth_token(row["id"], _client_ip(request)),
+        db.touch_auth_token(str(row["id"]), _client_ip(request)),
     )
     user["auth_method"] = "pat"
     user["scopes"] = list(row.get("scopes") or [])
@@ -334,11 +334,11 @@ async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
     row = await db.get_auth_token_by_hash(digest)
     if not row or row["kind"] != "mcp":
         raise HTTPException(status_code=401, detail="Invalid token")
-    user = await db.get_user(row["user_id"])
+    user = await db.get_user(str(row["user_id"]))
     if not user:
         raise HTTPException(status_code=401, detail="Invalid token")
     asyncio.create_task(
-        db.touch_auth_token(row["id"], _client_ip(request)),
+        db.touch_auth_token(str(row["id"]), _client_ip(request)),
     )
     user["auth_method"] = "mcp"
     # MCP scope semantics differ from PAT scopes — `scope` is a single
