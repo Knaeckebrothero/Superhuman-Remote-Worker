@@ -27,7 +27,7 @@ related:
 
 > The session is the source of truth, not the WebSocket. Close the browser and the agent keeps working. Reopen and the cockpit catches up like it never left. When attention is needed and nobody is watching, the system reaches out.
 
-**Status:** Phases 1-6 shipped 2026-05-12/13. All filed hygiene issues resolved. Cockpit WS→SSE migration (Phase 1+2 client) is the last remaining slice.
+**Status:** Phases 1-6 shipped 2026-05-12/13. Cockpit WS→SSE migration also shipped 2026-05-13. All filed hygiene issues resolved. Feature is complete for v1.
 **Filed:** 2026-05-12
 **Last updated:** 2026-05-13
 
@@ -70,8 +70,8 @@ Backend for all six implementation phases landed between 2026-05-12 and 2026-05-
 
 | Phase | Backend | Cockpit | Notes |
 |---|---|---|---|
-| 1 — Loop decoupling + SSE transport | ✅ shipped (`7c8d544`, `37a1692`) | ❌ pending | SSE endpoint + REST input live; Angular still uses WS |
-| 2 — Event log + epoch + horizon | ✅ shipped (`37a1692`, migration `0004_thread_events.sql`) | ❌ pending | Server writes events; cockpit doesn't yet cursor-resume |
+| 1 — Loop decoupling + SSE transport | ✅ shipped (`7c8d544`, `37a1692`) | ✅ shipped 2026-05-13 | EventSource + REST `/input`/`/interrupt`; WS retained as control plane only |
+| 2 — Event log + epoch + horizon | ✅ shipped (`37a1692`, migration `0004_thread_events.sql`) | ✅ shipped 2026-05-13 | Cursor in IndexedDB (`threadCursors`, schema v3); `gone_beyond_horizon` reloads transcript + reopens |
 | 3 — Permission gates via DB | ✅ shipped (`128f702`, migration `0005_thread_permission_requests.sql`) | n/a | LISTEN/NOTIFY path live; existing approval UI keeps working |
 | 4 — Notification fan-out + magic links | ✅ shipped (`13f7461`, migration `0006_headless_notifications.sql`) | ✅ settings UI shipped via Phase 6 | Two hygiene gaps resolved 2026-05-13 — see [Resolved issues](#resolved-issues) |
 | 5 — Attention sleep | ✅ shipped (`0e5994e`, migration `0008_thread_awaiting_user.sql`) | n/a | Cluster smoke green 2026-05-13; smoke-leak runbook callout shipped |
@@ -87,9 +87,10 @@ Three tech-debt items surfaced during smoke testing — all shipped 2026-05-13 i
 
 ### Remaining work
 
-One outstanding slice — the cockpit transport migration.
+The migration is complete for v1. Future polish items that are deliberately out of scope:
 
-1. **Cockpit WS→SSE migration** (`cockpit/src/app/core/services/persistent-chat.service.ts`). Phase 1 + Phase 2 client side. Replace the WS reconnect state machine with an `EventSource` consuming `GET /api/threads/{id}/stream`, plus `POST /api/threads/{id}/input` for turn input and `POST /api/threads/{id}/interrupt`. Persist `(epoch, seq)` cursor in IndexedDB, send via `Last-Event-ID` header on reconnect, handle `GONE_BEYOND_HORIZON` by pulling snapshot via REST. This is the keystone that makes Phases 1-5 actually visible to users. WS handler stays as opt-in fallback per the design decision.
+- **Full client→server REST migration for slash commands.** Approve/deny, compact, archive, undo, mode/narration/config updates currently still cross the WebSocket. They only fire while the user is actively in the cockpit (browser-close-survival doesn't depend on them), so leaving them on WS preserves the headless promise without invasive agent-side refactoring of the existing WS dispatch (which would need `_ws_send` error paths migrated to proper HTTP responses + `_broadcast` for SSE-consumer visibility). Defer until there's a concrete user pull for it.
+- **Custom `Last-Event-ID` request header.** EventSource doesn't accept request headers, so the cockpit passes the cached cursor as `?last_event_id=` on the initial connection (backend accepts both). On automatic browser-driven reconnects, the native `Last-Event-ID` header carries the cursor. A polyfilled EventSource would unify the two paths but adds a dependency for marginal benefit.
 
 Items that are explicitly **not** queued (deferred / out of scope by decision):
 
@@ -319,26 +320,27 @@ Each phase is independently shippable. They're ordered so each one improves the 
 
 The keystone change. Without this nothing else works.
 
-- [ ] Split `_detach_session` into `_unsubscribe(client_id)` and `_terminate_session(reason)` in `src/api/persistent_app.py`.
-- [ ] Add an in-pod subscriber list / asyncio broadcast so the loop's output fans out to zero/one/many subscribers.
-- [ ] Move loop cancellation out of transport `finally` blocks into `_terminate_session` only.
-- [ ] Add SSE endpoint `GET /api/threads/{id}/stream` honoring `Last-Event-ID` header.
-- [ ] Add REST input endpoints `POST /api/threads/{id}/input`, `POST /api/threads/{id}/interrupt`, `POST /api/threads/{id}/approve/{approval_id}`.
-- [ ] Implement interrupt semantics: if a tool call is in flight, wait for it to complete then stop (don't leak partial side effects); if the model is generating text without a pending tool call, cancel the LLM stream immediately.
-- [ ] Per-turn input lock: `POST /input` acquires a thread-scoped lock keyed by turn number; a second concurrent POST for the same turn returns 409 with the in-flight turn id. Handles multi-tab double-send cleanly.
-- [ ] Audit ingress proxy buffering — set `X-Accel-Buffering: no` on SSE responses.
-- [ ] Tests: transport close mid-turn → turn completes; subsequent reconnect sees the completed turn. Interrupt mid-text → LLM cancels immediately, no partial AIMessage persisted. Interrupt mid-tool → tool completes, no new turn starts. Concurrent POSTs from two tabs → one wins, the other gets 409.
+- [x] Split `_detach_session` into `_unsubscribe(client_id)` and `_terminate_session(reason)` in `src/api/persistent_app.py`.
+- [x] Add an in-pod subscriber list / asyncio broadcast so the loop's output fans out to zero/one/many subscribers.
+- [x] Move loop cancellation out of transport `finally` blocks into `_terminate_session` only.
+- [x] Add SSE endpoint `GET /api/threads/{id}/stream` honoring `Last-Event-ID` header.
+- [x] Add REST input endpoints `POST /api/threads/{id}/input`, `POST /api/threads/{id}/interrupt`, `POST /api/threads/{id}/approve/{approval_id}`.
+- [x] Implement interrupt semantics: if a tool call is in flight, wait for it to complete then stop (don't leak partial side effects); if the model is generating text without a pending tool call, cancel the LLM stream immediately.
+- [x] Per-turn input lock: `POST /input` acquires a thread-scoped lock keyed by turn number; a second concurrent POST for the same turn returns 409 with the in-flight turn id. Handles multi-tab double-send cleanly.
+- [x] Audit ingress proxy buffering — set `X-Accel-Buffering: no` on SSE responses.
+- [x] Cockpit consumer (`cockpit/src/app/core/services/persistent-chat.service.ts`, 2026-05-13): `EventSource` replaces the WS receive path; `POST /input` + `POST /interrupt` replace WS sends for those two verbs; control-plane verbs (approve/deny/slash commands/mode/narration/config) retained on a simplified WS channel until there's a concrete pull for full REST conversion.
+- [x] Tests: transport close mid-turn → turn completes; subsequent reconnect sees the completed turn. Interrupt mid-text → LLM cancels immediately, no partial AIMessage persisted. Interrupt mid-tool → tool completes, no new turn starts. Concurrent POSTs from two tabs → one wins, the other gets 409.
 
 ### Phase 2 — Event log + epoch + horizon
 
 The "catch up like you never left" UX, with explicit "you missed too much" path.
 
-- [ ] `thread_events` migration (new file in `orchestrator/database/migrations/app/`) with `epoch` + `(thread_id, epoch, seq)` index.
-- [ ] Loop writes events *before* broadcasting (write-then-stream, never the reverse).
-- [ ] SSE handler honors `Last-Event-ID: <epoch>:<seq>`; mismatched epoch or out-of-retention seq → emit `GONE_BEYOND_HORIZON` event with current `(epoch, server_seq, retention_horizon)`.
-- [ ] Tiered TTL prune cron: 7 days for `active`/`awaiting_user`/`suspended`, 24h for `ended`.
-- [ ] Cockpit: store last-seen `(epoch, seq)` per thread in IndexedDB, send on reconnect; handle `GONE_BEYOND_HORIZON` by pulling snapshot via REST and resubscribing fresh.
-- [ ] Tests: disconnect → 5 turns happen untethered → reconnect → cockpit shows the 5 turns. Bump `epoch` mid-stream → cockpit sees `GONE_BEYOND_HORIZON` → re-syncs cleanly.
+- [x] `thread_events` migration (`orchestrator/database/migrations/app/0004_thread_events.sql`) with `epoch` + `(thread_id, epoch, seq)` index.
+- [x] Loop writes events *before* broadcasting (write-then-stream, never the reverse).
+- [x] SSE handler honors `Last-Event-ID: <epoch>:<seq>`; mismatched epoch or out-of-retention seq → emit `gone_beyond_horizon` event with current `(epoch, server_seq, retention_horizon)`.
+- [x] Tiered TTL prune cron: 7 days for `active`/`awaiting_user`/`suspended`, 24h for `ended`.
+- [x] Cockpit (2026-05-13): cursor stored in IndexedDB as a `threadCursors` Dexie table (schema v3) keyed by threadId; passed as `?last_event_id=<epoch>:<seq>` on initial open (EventSource doesn't accept custom request headers — backend accepts both query param + header). `gone_beyond_horizon` → drop cursor + REST-reload transcript snapshot + reopen stream without a cursor. Covered by `persistent-chat.service.spec.ts` (32 tests).
+- [x] Tests: disconnect → 5 turns happen untethered → reconnect → cockpit shows the 5 turns. Bump `epoch` mid-stream → cockpit sees `gone_beyond_horizon` → re-syncs cleanly.
 
 ### Phase 3 — Permission gates outlive the transport
 

@@ -66,3 +66,20 @@ export interface JobCacheMetadata {
   /** Cache version for migration support */
   version: number;
 }
+
+/**
+ * Persistent-thread SSE replay cursor. Carried as `Last-Event-ID: <epoch>:<seq>`
+ * on reconnect so the orchestrator can pick up from where the cockpit left off,
+ * surviving full-tab close. Bumped each time we yield an event from the
+ * server-sent stream; cleared on `gone_beyond_horizon`.
+ */
+export interface ThreadCursor {
+  /** Thread UUID — primary key. */
+  threadId: string;
+  /** Event epoch (bumps on server-side rebuild — cold-checkpoint restart). */
+  epoch: number;
+  /** Highest seq we've successfully observed inside this epoch. */
+  seq: number;
+  /** ISO timestamp of the last cursor update — useful for stale-cursor cleanup. */
+  updatedAt: string;
+}

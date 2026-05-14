@@ -10896,8 +10896,16 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
 
     # Parse Last-Event-ID. Format: "<epoch>:<seq>". Missing/malformed → no
     # replay, start from current tail.
-    last_event_id = request.headers.get("Last-Event-ID") or request.headers.get(
-        "last-event-id"
+    #
+    # EventSource doesn't let the browser set custom request headers, so the
+    # cockpit hands us the cached cursor via `?last_event_id=` for the
+    # initial connection. On automatic reconnect, the browser appends the
+    # `Last-Event-ID` header from the latest `id:` line we yielded — that
+    # path is fully native and doesn't need the query param.
+    last_event_id = (
+        request.headers.get("Last-Event-ID")
+        or request.headers.get("last-event-id")
+        or request.query_params.get("last_event_id")
     )
     cursor_epoch: Optional[int] = None
     cursor_seq: Optional[int] = None
