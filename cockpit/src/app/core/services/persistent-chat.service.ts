@@ -336,7 +336,8 @@ export class PersistentChatService {
         const cursorQuery = cursor ? `?last_event_id=${encodeURIComponent(`${cursor.epoch}:${cursor.seq}`)}` : '';
         const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream${cursorQuery}`;
 
-        // withCredentials true so cookies (Keycloak session) ride along.
+        // withCredentials true so the srw_session cookie rides along on the
+        // cross-origin SSE handshake.
         this.sse = new EventSource(url, {withCredentials: true});
 
         this.sse.onopen = () => {

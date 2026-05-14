@@ -1,21 +1,24 @@
-import { Injectable, signal, computed, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { catchError, of } from 'rxjs';
-import { User } from '../models/api.model';
-import { KeycloakService } from './keycloak.service';
-import { environment } from '../environment';
+import {Injectable, signal, computed, inject} from '@angular/core';
+import {HttpClient} from '@angular/common/http';
+import {catchError, of} from 'rxjs';
+import {User} from '../models/api.model';
+import {environment} from '../environment';
+import {SessionService} from './session.service';
 
 /**
- * Manages user identity via Keycloak OIDC.
+ * Manages user identity.
  *
- * On app start (if authenticated), fetches the local user profile from the
- * orchestrator via GET /api/auth/me (which JIT-provisions the user row from
- * the Keycloak token on first login).
+ * The cookie BFF flow guarantees that if a session cookie is valid, the
+ * orchestrator can JIT-provision a local user row from the access token's
+ * claims. The cockpit fetches the profile from `GET /api/auth/me` on
+ * bootstrap (see `app.config.ts` APP_INITIALIZER) — by the time components
+ * render, `currentUser()` is either populated or the user has already been
+ * redirected to the BFF `/auth/login`.
  */
-@Injectable({ providedIn: 'root' })
+@Injectable({providedIn: 'root'})
 export class UserService {
   private readonly http = inject(HttpClient);
-  private readonly keycloak = inject(KeycloakService);
+  private readonly session = inject(SessionService);
   private readonly baseUrl = environment.apiUrl;
 
   /** All known users (loaded from API, used for color dots in job list). */
@@ -24,10 +27,10 @@ export class UserService {
   /** Currently authenticated user (from orchestrator). */
   readonly currentUser = signal<User | null>(null);
 
-  /** Whether the user is authenticated (delegates to Keycloak). */
-  readonly isAuthenticated = computed(() => this.keycloak.authenticated && this.currentUser() !== null);
+  /** Whether the user is authenticated. */
+  readonly isAuthenticated = computed(() => this.currentUser() !== null);
 
-  /** Always true — Keycloak init completes before app bootstrap via APP_INITIALIZER. */
+  /** Always true — bootstrap completes before app render via APP_INITIALIZER. */
   readonly sessionReady = signal(true);
 
   /** Whether the user's account has been approved by an admin (has 'user' role in Keycloak). */
@@ -36,18 +39,11 @@ export class UserService {
   /** Convenience: current user's ID (used by job-create, job-list, builder). */
   readonly currentUserId = computed(() => this.currentUser()?.id ?? null);
 
-  constructor() {
-    if (this.keycloak.authenticated) {
-      this.loadCurrentUser();
-      this.loadUsers();
-    }
-  }
-
   // ===========================================================================
   // User Profile
   // ===========================================================================
 
-  /** Fetch current user profile from orchestrator (JIT-provisioned from OIDC). */
+  /** Fetch current user profile from the orchestrator (JIT-provisioned from OIDC). */
   loadCurrentUser(): void {
     this.http
       .get<{ user: User }>(`${this.baseUrl}/auth/me`)
@@ -55,14 +51,15 @@ export class UserService {
       .subscribe((res) => {
         if (res?.user) {
           this.currentUser.set(res.user);
+          this.session.authenticated.set(true);
         }
       });
   }
 
-  /** Logout via Keycloak (redirects to Keycloak end-session endpoint). */
-  logout(): void {
+  /** Log out via the BFF (revoke server-side session + KC RP-initiated logout). */
+  async logout(): Promise<void> {
     this.currentUser.set(null);
-    this.keycloak.logout();
+    await this.session.logout();
   }
 
   // ===========================================================================
