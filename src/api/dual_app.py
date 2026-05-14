@@ -1088,22 +1088,31 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     @app.post("/api/input", tags=["Session"])
     async def api_input(request: Request):
         if _pod_state != PodState.SESSION:
-            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+            return JSONResponse(
+                {"error": "Pod is not in session mode"}, status_code=404
+            )
         import src.api.persistent_app as pa
+
         return await pa.handle_api_input(request)
 
     @app.post("/api/interrupt", tags=["Session"])
     async def api_interrupt():
         if _pod_state != PodState.SESSION:
-            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+            return JSONResponse(
+                {"error": "Pod is not in session mode"}, status_code=404
+            )
         import src.api.persistent_app as pa
+
         return await pa.handle_api_interrupt()
 
     @app.post("/api/approve", tags=["Session"])
     async def api_approve(request: Request):
         if _pod_state != PodState.SESSION:
-            return JSONResponse({"error": "Pod is not in session mode"}, status_code=404)
+            return JSONResponse(
+                {"error": "Pod is not in session mode"}, status_code=404
+            )
         import src.api.persistent_app as pa
+
         return await pa.handle_api_approve(request)
 
     @app.websocket("/ws/chat")
