@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from security.auth import (
     SESSION_COOKIE,
+    _merge_identity_claims,
     _refresh_session_in_place,
     _resolve_user_from_claims,
     get_current_user,
@@ -247,11 +248,20 @@ async def callback(
         raise HTTPException(status_code=502, detail="Authentication backend error")
 
     id_claims = oidc_validator.decode_id_token(id_token) or {}
-    kc_sub = claims["sub"]
+    # KC 24+ stopped including `sub` in the access token by default; the
+    # cockpit-bff client doesn't carry a client-local sub mapper (cockpit-the-
+    # SPA does, which is why the Bearer flow keeps working). The id token
+    # is required by OIDC to carry `sub`, so we lift identity claims from
+    # there into the merged dict.
+    merged_claims = _merge_identity_claims(claims, id_claims)
+    if "sub" not in merged_claims:
+        logger.warning("KC token response had no sub claim in access_token or id_token")
+        raise HTTPException(status_code=502, detail="Authentication backend error")
+    kc_sub = merged_claims["sub"]
     kc_sid = id_claims.get("sid")
 
     # JIT-provision / sync the local user row.
-    user = await _resolve_user_from_claims(claims, postgres_db)
+    user = await _resolve_user_from_claims(merged_claims, postgres_db)
 
     # Session-fixation defense (lifted from
     # Advanced-LLM-Chat/backend/security/auth.py:60-63). If the user already

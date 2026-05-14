@@ -39,6 +39,35 @@ def _refresh_skew() -> timedelta:
     return timedelta(seconds=int(os.getenv("SRW_ACCESS_TOKEN_REFRESH_SKEW_S", "60")))
 
 
+# Identity claims that live in the id token (per OIDC spec). When the access
+# token's mappers don't include them — KC 24+ default for `sub` — we lift them
+# from id token claims into the dict passed to `_resolve_user_from_claims`.
+_ID_TOKEN_IDENTITY_FIELDS = (
+    "sub",
+    "email",
+    "preferred_username",
+    "name",
+    "email_verified",
+)
+
+
+def _merge_identity_claims(access_claims: dict, id_claims: dict | None) -> dict:
+    """Return access_claims augmented with id-token identity fields.
+
+    Existing access_claims values win on overlap. Used by both the BFF
+    callback and the per-request cookie validator so the rest of the
+    auth code (e.g. `_resolve_user_from_claims`) can keep reading a
+    single dict regardless of which client's mappers ran.
+    """
+    if not id_claims:
+        return access_claims
+    merged = dict(access_claims)
+    for key in _ID_TOKEN_IDENTITY_FIELDS:
+        if key not in merged and key in id_claims:
+            merged[key] = id_claims[key]
+    return merged
+
+
 async def get_current_user(request: Request, db) -> dict:
     """FastAPI dependency: resolve the current user.
 
@@ -115,6 +144,17 @@ async def _resolve_from_cookie(session_id: str, db) -> dict | None:
     if not claims:
         # Stored access token won't validate (signing key rotated?). Kill
         # the session so the user re-authenticates cleanly.
+        await db.delete_srw_session(session_id)
+        return None
+
+    # KC 24+ default doesn't put `sub` in the access token unless a client-
+    # local mapper enables it; the id token always carries `sub` per OIDC.
+    # Merge identity fields from the stored id_token so downstream user
+    # resolution works regardless of the client's mapper config.
+    id_claims = oidc_validator.decode_id_token(sess["id_token"]) or {}
+    claims = _merge_identity_claims(claims, id_claims)
+    if "sub" not in claims:
+        logger.warning("Session %s tokens have no sub claim — killing", session_id)
         await db.delete_srw_session(session_id)
         return None
 
