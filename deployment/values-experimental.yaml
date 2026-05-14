@@ -27,7 +27,7 @@ image:
   orchestrator:
     tag: sha-603ed59
   agent:
-    tag: sha-166d54e
+    tag: sha-fb3f571
   cockpit:
     tag: sha-765a50c
   mcp:
