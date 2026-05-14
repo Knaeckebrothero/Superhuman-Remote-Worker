@@ -7,15 +7,12 @@ orchestrator/workspace/*
 project_documentation/*
 docker/certs/*
 
-/improved_sessions/*
 Advanced-LLM-Chat/*
+claude_design_system/*
 
 # SSH keys (generated for workspace/VM access — never commit)
 .dev/
 .local-ssh/
-
-# Kubeconfig (accidentally committed once — contains cluster credentials)
-/config.yaml
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config

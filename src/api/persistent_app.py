@@ -1390,7 +1390,13 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # the user clearly came back, and a different error path applies.
     _signal_ws_connected()
 
-    if not _session or not _session.llm_with_tools:
+    # Readiness gates on the loop primitives, not just the session. In dual
+    # mode /session/attach returns immediately and _attach_session runs
+    # asynchronously: _session.llm_with_tools is set early (inside .setup()),
+    # but _loop_user_queue isn't initialized until much later in the same
+    # coroutine. The loop's _loop_get_user_input callback crashes hard if
+    # the queue is None, so we must wait for it.
+    if not _session or not _session.llm_with_tools or _loop_user_queue is None:
         await _ws_send(ws, "error", {"message": "Agent not ready"})
         await ws.close(code=4503, reason="Agent not ready")
         return
