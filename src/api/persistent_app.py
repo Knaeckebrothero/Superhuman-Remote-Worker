@@ -198,13 +198,23 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
 
 
 async def _thread_status_watchdog(poll_s: int) -> None:
-    """Exit if the bound thread transitions to 'ended' out-of-band.
+    """Exit if the bound thread transitions to a terminal state out-of-band.
 
     The orchestrator's stale_agent_detector can flip a thread to 'ended'
     via ``mark_orphaned_threads_ended`` or release the binding via
     ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
-    is orphaned — no work to do, holding a slot. Poll the thread row and
-    exit if it's no longer in ('created', 'active').
+    is orphaned — no work to do, holding a slot.
+
+    'awaiting_user' is the eager-mode transient idle state set by this same
+    agent's loop on natural pause with no subscribers (Phase 5,
+    ``_loop_get_user_input``). It is NOT a terminal state — the orchestrator's
+    attention-sleep watchdog owns the eventual ``awaiting_user → suspended``
+    transition and we mustn't pre-empt it from here, or we kill the very
+    untethered-survival behaviour Phase 1 + Phase 5 were built to enable.
+
+    'suspended' means the orchestrator has already snapshotted + deleted the
+    workspace pod — at that point we're a stranded agent with no workspace,
+    so we exit.
     """
     while True:
         try:
@@ -221,7 +231,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         if not lifecycle:
             continue
         status = lifecycle.get("status")
-        if status not in ("created", "active"):
+        if status not in ("created", "active", "awaiting_user"):
             logger.info(
                 "Thread %s status is '%s' — exiting (orphaned by orchestrator).",
                 _thread_id,

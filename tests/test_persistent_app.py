@@ -1811,6 +1811,62 @@ class TestThreadStatusWatchdog:
         detach.assert_not_called()
         exit_fn.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_does_not_exit_when_thread_awaiting_user(self):
+        # Regression: Phase 5 added 'awaiting_user' as the eager-mode idle
+        # state set by the agent's own loop. The watchdog previously treated
+        # it as terminal and killed the pod in ~60s, which collapsed the
+        # untethered-survival behaviour Phase 1 + Phase 5 were built for.
+        # See docs/issues/persistent_session_watchdog_kills_awaiting_user.md.
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        client = AsyncMock()
+        client.get_thread_lifecycle = AsyncMock(
+            return_value={
+                "status": "awaiting_user",
+                "agent_id": "a-1",
+                "ended_at": None,
+            }
+        )
+        with patch.object(pa, "_orchestrator_client", client):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        task = asyncio.create_task(pa._thread_status_watchdog(poll_s=0))
+                        await asyncio.sleep(0.05)
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+        detach.assert_not_called()
+        exit_fn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exits_when_thread_suspended(self):
+        # The orchestrator's attention-sleep watchdog owns the
+        # awaiting_user → suspended transition. Once suspended, the
+        # workspace pod is gone, so this agent is stranded and must exit.
+        from src.api import persistent_app as pa
+
+        client = AsyncMock()
+        client.get_thread_lifecycle = AsyncMock(
+            return_value={
+                "status": "suspended",
+                "agent_id": "a-1",
+                "ended_at": None,
+            }
+        )
+        with patch.object(pa, "_orchestrator_client", client):
+            with patch.object(pa, "_thread_id", "thread-xyz"):
+                with patch.object(pa, "_terminate_session", new=AsyncMock()) as detach:
+                    with patch.object(pa, "_schedule_exit") as exit_fn:
+                        await pa._thread_status_watchdog(poll_s=0)
+        detach.assert_awaited_once()
+        exit_fn.assert_called_once()
+
 
 class TestStartStopWatchdogs:
     @pytest.mark.asyncio
