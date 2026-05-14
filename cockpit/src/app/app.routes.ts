@@ -1,5 +1,6 @@
 import {Routes} from '@angular/router';
 import {SettingsComponent} from './views/settings/settings.component';
+import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.component';
 import {ShellPageComponent} from './views/shell/shell.component';
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
 import {CreatePageComponent} from './views/create/create-page.component';
@@ -30,6 +31,7 @@ export const routes: Routes = [
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard] },
   { path: 'datasources', component: DatasourcesPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
+  { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
   { path: 'admin/llm', component: AdminLlmComponent, canActivate: [authGuard, adminGuard] },
   { path: 'admin/providers', redirectTo: 'admin/llm' },
   { path: 'admin/models', redirectTo: 'admin/llm' },

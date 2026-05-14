@@ -3143,94 +3143,6 @@ class PostgresDB:
             )
 
     # =========================================================================
-    # Auth Tokens (verification codes, password reset tokens)
-    # =========================================================================
-
-    async def create_auth_token(
-        self,
-        email: str,
-        token: str,
-        token_type: str,
-        user_id: str | None = None,
-        expires_minutes: int = 30,
-    ) -> None:
-        """Create an auth token (verification or password reset)."""
-        from datetime import datetime, timedelta, timezone
-
-        user_uuid = UUID(user_id) if user_id else None
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
-
-        async with self.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO auth_tokens (user_id, email, token, token_type, expires_at)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                user_uuid,
-                email.lower(),
-                token,
-                token_type,
-                expires_at,
-            )
-
-    async def get_auth_token(
-        self, token: str, token_type: str
-    ) -> Dict[str, Any] | None:
-        """Get a valid (non-expired, unused) auth token."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, user_id, email, token, token_type, expires_at, used_at, created_at
-                FROM auth_tokens
-                WHERE token = $1 AND token_type = $2
-                  AND expires_at > NOW() AND used_at IS NULL
-                """,
-                token,
-                token_type,
-            )
-        return dict(row) if row else None
-
-    async def mark_auth_token_used(self, token: str) -> None:
-        """Mark an auth token as used."""
-        async with self.acquire() as conn:
-            await conn.execute(
-                "UPDATE auth_tokens SET used_at = NOW() WHERE token = $1",
-                token,
-            )
-
-    async def delete_auth_tokens_by_email(self, email: str, token_type: str) -> None:
-        """Delete all tokens of a given type for an email (cleanup before issuing new one)."""
-        async with self.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM auth_tokens WHERE LOWER(email) = LOWER($1) AND token_type = $2",
-                email,
-                token_type,
-            )
-
-    async def delete_expired_auth_tokens(self) -> None:
-        """Delete all expired auth tokens."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM auth_tokens WHERE expires_at < NOW()"
-            )
-            if result != "DELETE 0":
-                logger.debug(f"Cleaned up expired auth tokens: {result}")
-
-    async def get_latest_auth_token_time(self, email: str, token_type: str):
-        """Get the creation time of the most recent token for rate limiting."""
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT created_at FROM auth_tokens
-                WHERE LOWER(email) = LOWER($1) AND token_type = $2
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                email,
-                token_type,
-            )
-        return row["created_at"] if row else None
-
-    # =========================================================================
     # User Auth Fields (password, email verification)
     # =========================================================================
 
@@ -3337,7 +3249,19 @@ class PostgresDB:
                 logger.info(f"Migrated existing users to verified: {result}")
 
     # =========================================================================
-    # MCP TOKEN OPERATIONS
+    # AUTH TOKEN OPERATIONS  (consolidated mcp_tokens + PATs — see
+    # docs/features/auth_bff_and_api_tokens.md §3)
+    #
+    # Two kinds live in one table:
+    #   - kind='mcp' — legacy Claude-Code/MCP tokens (srw_<32-byte>); scope
+    #     column carries 'user' / 'all' / 'project:<uuid>'. Kept untouched
+    #     so the MCP server's existing TokenVerifier flow keeps working.
+    #   - kind='api' — Personal Access Tokens (ak_<43-char>); scopes column
+    #     carries action-level scope strings ('jobs:read', 'chat:write', …).
+    #
+    # The two halves stay separate at the helper level so MCP-server calls
+    # and PAT calls never cross-pollinate. The Bearer validator dispatches
+    # by token prefix and then calls the kind-specific helper.
     # =========================================================================
 
     async def create_mcp_token(
@@ -3349,15 +3273,17 @@ class PostgresDB:
         scope: str = "user",
         expires_at=None,
         origin: str | None = None,
+        last_four: str | None = None,
     ) -> Dict[str, Any]:
-        """Create a new MCP API token."""
+        """Create a new MCP API token (kind='mcp')."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, scope, expires_at, origin)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO auth_tokens (user_id, name, token_hash, token_prefix,
+                                         kind, scope, expires_at, origin, last_four)
+                VALUES ($1, $2, $3, $4, 'mcp', $5, $6, $7, $8)
                 RETURNING id, user_id, name, token_prefix, scope, origin,
-                          expires_at, revoked_at, last_used_at, created_at
+                          expires_at, revoked_at, last_used_at, created_at, last_four
                 """,
                 user_id,
                 name,
@@ -3366,18 +3292,242 @@ class PostgresDB:
                 scope,
                 expires_at,
                 origin,
+                last_four,
             )
             return dict(row)
 
     async def get_mcp_token_by_hash(self, token_hash: str) -> Dict[str, Any] | None:
-        """Look up an active MCP token by its hash. Returns None if revoked/expired."""
+        """Look up an active MCP token by its hash. Returns None if revoked/expired/wrong kind."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT t.id, t.user_id, t.name, t.token_prefix, t.scope,
                        t.expires_at, t.last_used_at, t.created_at,
                        u.display_name, u.email
-                FROM mcp_tokens t
+                FROM auth_tokens t
+                JOIN users u ON u.id = t.user_id
+                WHERE t.token_hash = $1
+                  AND t.kind = 'mcp'
+                  AND t.revoked_at IS NULL
+                  AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
+                """,
+                token_hash,
+            )
+            return dict(row) if row else None
+
+    async def list_mcp_tokens(self, user_id: str) -> List[Dict[str, Any]]:
+        """List all MCP tokens for a user (excludes token_hash). kind='mcp' only."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, name, token_prefix, scope, last_four,
+                       expires_at, revoked_at, last_used_at, created_at
+                FROM auth_tokens
+                WHERE user_id = $1 AND kind = 'mcp'
+                ORDER BY created_at DESC
+                """,
+                user_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def revoke_mcp_token(self, token_id: str, user_id: str) -> bool:
+        """Revoke an MCP token. Returns True if a token was revoked.
+
+        Guards on kind='mcp' so a cockpit user can't accidentally revoke a
+        PAT via the MCP token UI (and vice versa).
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE auth_tokens SET revoked_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND user_id = $2 AND kind = 'mcp'
+                  AND revoked_at IS NULL
+                """,
+                token_id,
+                user_id,
+            )
+            return result == "UPDATE 1"
+
+    async def update_mcp_token_last_used(self, token_hash: str) -> None:
+        """Update the last_used_at timestamp for an MCP token.
+
+        Used by the MCP server's /api/internal/mcp-token-verify path,
+        which only has the hash at hand (no IP).
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE auth_tokens SET last_used_at = CURRENT_TIMESTAMP "
+                "WHERE token_hash = $1 AND kind = 'mcp'",
+                token_hash,
+            )
+
+    async def cleanup_expired_mcp_tokens(self) -> None:
+        """Delete expired and long-revoked auth tokens (both kinds).
+
+        Same cadence and lifecycle for both — kind='mcp' rows hit this
+        path via the legacy MCP server flow; kind='api' rows hit it via
+        the same cleanup loop in the orchestrator.
+        """
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM auth_tokens
+                WHERE (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP)
+                   OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
+                """
+            )
+            # Rotation grace: revoke kind='api' rows whose successor is
+            # older than 24h. The kind-mcp path doesn't rotate (no UI
+            # surface), so the gate is fine kind-agnostic — superseded_by
+            # is only ever set by the PAT rotate flow.
+            await conn.execute(
+                """
+                UPDATE auth_tokens
+                   SET revoked_at = CURRENT_TIMESTAMP
+                 WHERE revoked_at IS NULL
+                   AND superseded_by IS NOT NULL
+                   AND id IN (
+                       SELECT a.id FROM auth_tokens a
+                       JOIN auth_tokens b ON a.superseded_by = b.id
+                       WHERE b.created_at < CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                   )
+                """
+            )
+
+    # ── kind='api' (PAT) helpers ────────────────────────────────────────────
+
+    async def create_api_key(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+        last_four: str,
+        scopes: List[str],
+        expires_at=None,
+    ) -> Dict[str, Any]:
+        """Create a new PAT (kind='api')."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO auth_tokens (user_id, name, token_hash, token_prefix,
+                                         kind, scopes, last_four, expires_at)
+                VALUES ($1, $2, $3, $4, 'api', $5, $6, $7)
+                RETURNING id, user_id, name, token_prefix, last_four, scopes,
+                          expires_at, revoked_at, last_used_at, created_at,
+                          superseded_by
+                """,
+                user_id,
+                name,
+                token_hash,
+                token_prefix,
+                scopes,
+                last_four,
+                expires_at,
+            )
+            return dict(row)
+
+    async def list_api_keys(self, user_id: str) -> List[Dict[str, Any]]:
+        """List all PATs for a user. Excludes token_hash."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, name, token_prefix, last_four, scopes,
+                       expires_at, revoked_at, last_used_at, last_used_ip,
+                       created_at, superseded_by
+                FROM auth_tokens
+                WHERE user_id = $1 AND kind = 'api'
+                ORDER BY created_at DESC
+                """,
+                user_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def revoke_api_key(self, token_id: str, user_id: str) -> bool:
+        """Revoke a PAT (kind='api'). Returns True on success."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE auth_tokens SET revoked_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND user_id = $2 AND kind = 'api'
+                  AND revoked_at IS NULL
+                """,
+                token_id,
+                user_id,
+            )
+            return result == "UPDATE 1"
+
+    async def rotate_api_key(
+        self,
+        *,
+        old_id: str,
+        user_id: str,
+        token_hash: str,
+        token_prefix: str,
+        last_four: str,
+    ) -> Dict[str, Any] | None:
+        """Issue a successor for a PAT, name+scopes+expiry inherited.
+
+        Sets ``old.superseded_by = new.id``. The old row stays valid for
+        24h (cleanup loop revokes it). Returns the new row, or None if
+        the old token wasn't found / belonged to another user / wrong kind.
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                old = await conn.fetchrow(
+                    """
+                    SELECT id, name, scopes, expires_at
+                    FROM auth_tokens
+                    WHERE id = $1 AND user_id = $2 AND kind = 'api'
+                      AND revoked_at IS NULL
+                    """,
+                    old_id,
+                    user_id,
+                )
+                if not old:
+                    return None
+                new = await conn.fetchrow(
+                    """
+                    INSERT INTO auth_tokens (user_id, name, token_hash,
+                                             token_prefix, kind, scopes,
+                                             last_four, expires_at)
+                    VALUES ($1, $2, $3, $4, 'api', $5, $6, $7)
+                    RETURNING id, user_id, name, token_prefix, last_four,
+                              scopes, expires_at, revoked_at, last_used_at,
+                              created_at, superseded_by
+                    """,
+                    user_id,
+                    old["name"],
+                    token_hash,
+                    token_prefix,
+                    list(old["scopes"] or []),
+                    last_four,
+                    old["expires_at"],
+                )
+                await conn.execute(
+                    "UPDATE auth_tokens SET superseded_by = $1 WHERE id = $2",
+                    new["id"],
+                    old["id"],
+                )
+                return dict(new)
+
+    # ── Cross-kind helpers used by the Bearer validator ─────────────────────
+
+    async def get_auth_token_by_hash(self, token_hash: str) -> Dict[str, Any] | None:
+        """Look up an active auth token by hash (either kind). The validator
+        prefix-sniffs the token format and then enforces the kind matches
+        before trusting the row — this method just returns whatever's in
+        the table that hasn't expired or been revoked.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT t.id, t.user_id, t.name, t.kind, t.token_prefix,
+                       t.scope, t.scopes, t.expires_at, t.last_used_at,
+                       t.created_at, t.origin,
+                       u.display_name, u.email
+                FROM auth_tokens t
                 JOIN users u ON u.id = t.user_id
                 WHERE t.token_hash = $1
                   AND t.revoked_at IS NULL
@@ -3387,51 +3537,21 @@ class PostgresDB:
             )
             return dict(row) if row else None
 
-    async def list_mcp_tokens(self, user_id: str) -> List[Dict[str, Any]]:
-        """List all MCP tokens for a user (excludes token_hash)."""
+    async def touch_auth_token(self, token_id: str, ip: str | None) -> None:
+        """Fire-and-forget: bump last_used_at + last_used_ip after a Bearer
+        validation. Schema cast on the IP is best-effort; an unparseable
+        client.host (e.g. behind a misbehaving proxy) gets stored as NULL.
+        """
         async with self.acquire() as conn:
-            rows = await conn.fetch(
+            await conn.execute(
                 """
-                SELECT id, user_id, name, token_prefix, scope,
-                       expires_at, revoked_at, last_used_at, created_at
-                FROM mcp_tokens
-                WHERE user_id = $1
-                ORDER BY created_at DESC
-                """,
-                user_id,
-            )
-            return [dict(r) for r in rows]
-
-    async def revoke_mcp_token(self, token_id: str, user_id: str) -> bool:
-        """Revoke an MCP token. Returns True if a token was revoked."""
-        async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE mcp_tokens SET revoked_at = CURRENT_TIMESTAMP
-                WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+                UPDATE auth_tokens
+                   SET last_used_at = CURRENT_TIMESTAMP,
+                       last_used_ip = $2::inet
+                 WHERE id = $1
                 """,
                 token_id,
-                user_id,
-            )
-            return result == "UPDATE 1"
-
-    async def update_mcp_token_last_used(self, token_hash: str) -> None:
-        """Update the last_used_at timestamp for an MCP token."""
-        async with self.acquire() as conn:
-            await conn.execute(
-                "UPDATE mcp_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = $1",
-                token_hash,
-            )
-
-    async def cleanup_expired_mcp_tokens(self) -> None:
-        """Delete expired and long-revoked MCP tokens."""
-        async with self.acquire() as conn:
-            await conn.execute(
-                """
-                DELETE FROM mcp_tokens
-                WHERE (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP)
-                   OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
-                """
+                ip,
             )
 
     # =========================================================================

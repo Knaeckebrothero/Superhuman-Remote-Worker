@@ -725,6 +725,15 @@ const EXPIRY_OPTIONS = [
           </div>
         </section>
 
+        <!-- API Keys (PATs) link card — separate page per design doc §3.4 -->
+        <section class="settings-section section-spacer">
+          <h2 class="section-title">{{ 'settings.apiKeys.linkTitle' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.apiKeys.linkDesc' | transloco }}</p>
+          <app-button variant="primary" size="md" (clicked)="goToApiKeys()">
+            {{ 'settings.apiKeys.linkManage' | transloco }}
+          </app-button>
+        </section>
+
         <!-- Codex Proxy Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
           <section class="settings-section section-spacer">
@@ -1747,6 +1756,10 @@ export class SettingsComponent implements OnInit {
     if (diffMs < 3600_000) return this.transloco.translate('settings.helpers.timeMinutesAgo', {n: Math.floor(diffMs / 60_000)});
     if (diffMs < 86400_000) return this.transloco.translate('settings.helpers.timeHoursAgo', {n: Math.floor(diffMs / 3600_000)});
     return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
+  }
+
+  goToApiKeys(): void {
+    this.router.navigateByUrl('/settings/api-keys');
   }
 
   mcpJsonSnippet = () => {
