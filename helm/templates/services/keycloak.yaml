@@ -816,6 +816,7 @@ spec:
                           -s "attributes.\"backchannel.logout.session.required\"=true" \
                           -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff create failed"
+                        BFFID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$BFF_CID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
                       else
                         # Always re-assert the redirect URI + backchannel
                         # logout URL — a Vault-domain change or chart bump
@@ -828,6 +829,21 @@ spec:
                           -s "attributes.\"backchannel.logout.url\"=$API_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff update failed"
+                      fi
+                      # Attach default client scopes. kcadm `create clients`
+                      # does NOT resolve scope names to IDs — they have to be
+                      # PUT individually via /default-client-scopes/{id}.
+                      # Idempotent: re-PUT on an already-attached scope is a
+                      # no-op. profile + email power the email/preferred_username
+                      # claims the orchestrator's JIT provisioning reads; roles
+                      # carries realm_access.roles (is_approved derivation).
+                      if [ -n "$BFFID" ]; then
+                        for SC in profile email roles; do
+                          SCID=$($KC get client-scopes -r {{ .Values.keycloak.realm }} -q "name=$SC" --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                          [ -z "$SCID" ] && continue
+                          $KC update "clients/$BFFID/default-client-scopes/$SCID" -r {{ .Values.keycloak.realm }} 2>/dev/null \
+                            || echo "WARN: kcadm cockpit-bff scope=$SC attach failed"
+                        done
                       fi
                     fi
                     # --- Sync SMTP config ---
