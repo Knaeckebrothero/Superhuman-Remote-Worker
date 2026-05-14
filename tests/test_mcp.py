@@ -781,11 +781,18 @@ class TestMcpPersistentThreadTools:
 
 
 def _mock_request_with_headers(header_map: dict[str, str]) -> MagicMock:
-    """Create a mock Request whose .headers.get() returns from header_map."""
+    """Create a mock Request whose .headers.get() returns from header_map.
+
+    ``.cookies`` is a real empty dict — Starlette's Request exposes cookies
+    as a dict, and the BFF cookie path in ``get_current_user`` does
+    ``request.cookies.get('srw_session')``. Leaving it as a bare MagicMock
+    would return a truthy MagicMock and falsely trigger the cookie branch.
+    """
     mock_request = MagicMock()
     mock_headers = MagicMock()
     mock_headers.get = lambda key, default="": header_map.get(key, default)
     mock_request.headers = mock_headers
+    mock_request.cookies = {}
     return mock_request
 
 
