@@ -1260,91 +1260,15 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.post("/api/input")
     async def api_input(request: Request):
-        """Push user input onto the loop's queue. Body: {content, turn_id?}."""
-        if _session is None or _loop_user_queue is None:
-            return JSONResponse({"error": "Session not active"}, status_code=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        content = body.get("content", "")
-        if not isinstance(content, str) or not content:
-            return JSONResponse(
-                {"error": "content must be a non-empty string"},
-                status_code=400,
-            )
-        _loop_last_user_content[0] = content
-        await _loop_user_queue.put(content)
-        return JSONResponse(
-            {
-                "accepted": True,
-                "turn_id": _session.turn_count,
-                "queue_depth": _loop_user_queue.qsize(),
-            }
-        )
+        return await handle_api_input(request)
 
     @app.post("/api/interrupt")
     async def api_interrupt():
-        """Signal the loop to stop. Mode is hard vs graceful based on
-        whether a tool call is currently in flight."""
-        global _loop_interrupt_flag
-        if _session is None:
-            return JSONResponse({"error": "Session not active"}, status_code=503)
-        mode = "graceful" if _tool_inflight else "hard"
-        _loop_interrupt_flag = mode
-        logger.info(
-            "Interrupt received via REST (mode=%s, tool_inflight=%s)",
-            mode,
-            _tool_inflight,
-        )
-        return JSONResponse({"ack": True, "mode": mode})
+        return await handle_api_interrupt()
 
     @app.post("/api/approve")
     async def api_approve(request: Request):
-        """Resolve a pending permission gate by UPDATEing the
-        thread_permission_requests row. Body: {decision: approve|deny,
-        approval_id?}. If approval_id is omitted, the most-recent-pending
-        row for this thread is resolved (legacy single-pending-at-a-time
-        contract). The DB trigger emits NOTIFY → agent's permission_check
-        wakes up."""
-        if _session is None:
-            return JSONResponse({"error": "Session not active"}, status_code=503)
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        decision_raw = body.get("decision")
-        if decision_raw == "approve":
-            decision = "approved"
-        elif decision_raw == "deny":
-            decision = "denied"
-        else:
-            return JSONResponse(
-                {"error": "decision must be 'approve' or 'deny'"},
-                status_code=400,
-            )
-        approval_id = body.get("approval_id")
-        resolved = await _resolve_pending_permission(
-            decision,
-            approval_id=approval_id,
-            decided_by="rest_client",
-        )
-        if resolved is None:
-            return JSONResponse(
-                {
-                    "error": "No matching pending request",
-                    "approval_id": approval_id,
-                },
-                status_code=404,
-            )
-        return JSONResponse(
-            {
-                "accepted": True,
-                "decision": decision_raw,
-                "approval_id": str(resolved["id"]),
-                "tool_call_id": resolved["tool_call_id"],
-            }
-        )
+        return await handle_api_approve(request)
 
     # --- WebSocket endpoint ---
 
@@ -1353,6 +1277,106 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         await handle_persistent_websocket(ws)
 
     return app
+
+
+# --- REST handlers (module-level so dual_app can call them too) ---
+#
+# Reached from both:
+#   - persistent_app.create_persistent_app()'s /api/{input,interrupt,approve}
+#     routes (pure persistent mode, agent.py --mode persistent).
+#   - dual_app.create_dual_app() routes (dual mode — adds pod-state pre-check
+#     then delegates here).
+#
+# Mirror of the /ws/chat consolidation; same rationale, see
+# docs/issues/persistent_session_dual_mode_phase1_gap.md.
+
+
+async def handle_api_input(request: Request) -> JSONResponse:
+    """Push user input onto the loop's queue. Body: {content, turn_id?}."""
+    if _session is None or _loop_user_queue is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    content = body.get("content", "")
+    if not isinstance(content, str) or not content:
+        return JSONResponse(
+            {"error": "content must be a non-empty string"},
+            status_code=400,
+        )
+    _loop_last_user_content[0] = content
+    await _loop_user_queue.put(content)
+    return JSONResponse(
+        {
+            "accepted": True,
+            "turn_id": _session.turn_count,
+            "queue_depth": _loop_user_queue.qsize(),
+        }
+    )
+
+
+async def handle_api_interrupt() -> JSONResponse:
+    """Signal the loop to stop. Mode is hard vs graceful based on
+    whether a tool call is currently in flight."""
+    global _loop_interrupt_flag
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    mode = "graceful" if _tool_inflight else "hard"
+    _loop_interrupt_flag = mode
+    logger.info(
+        "Interrupt received via REST (mode=%s, tool_inflight=%s)",
+        mode,
+        _tool_inflight,
+    )
+    return JSONResponse({"ack": True, "mode": mode})
+
+
+async def handle_api_approve(request: Request) -> JSONResponse:
+    """Resolve a pending permission gate by UPDATEing the
+    thread_permission_requests row. Body: {decision: approve|deny,
+    approval_id?}. If approval_id is omitted, the most-recent-pending
+    row for this thread is resolved (legacy single-pending-at-a-time
+    contract). The DB trigger emits NOTIFY → agent's permission_check
+    wakes up."""
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    decision_raw = body.get("decision")
+    if decision_raw == "approve":
+        decision = "approved"
+    elif decision_raw == "deny":
+        decision = "denied"
+    else:
+        return JSONResponse(
+            {"error": "decision must be 'approve' or 'deny'"},
+            status_code=400,
+        )
+    approval_id = body.get("approval_id")
+    resolved = await _resolve_pending_permission(
+        decision,
+        approval_id=approval_id,
+        decided_by="rest_client",
+    )
+    if resolved is None:
+        return JSONResponse(
+            {
+                "error": "No matching pending request",
+                "approval_id": approval_id,
+            },
+            status_code=404,
+        )
+    return JSONResponse(
+        {
+            "accepted": True,
+            "decision": decision_raw,
+            "approval_id": str(resolved["id"]),
+            "tool_call_id": resolved["tool_call_id"],
+        }
+    )
 
 
 # --- WebSocket handler (module-level so dual_app can call it too) ---
