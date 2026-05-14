@@ -15,6 +15,7 @@ do not change.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 from datetime import datetime, timedelta, UTC
@@ -102,12 +103,21 @@ async def get_current_user(request: Request, db) -> dict:
         # Path 3: MCP internal header auth.
         return await _get_user_from_mcp_headers(request, db)
 
-    # Path 2: Keycloak Bearer JWT.
+    # Path 2: Bearer dispatch — PAT / legacy MCP / Keycloak JWT all share
+    # this header. Shape-based: three-dot tokens are JWTs; ak_ are PATs;
+    # srw_ are MCP tokens (now landing in auth_tokens with kind='mcp');
+    # anything else is a malformed credential.
     token = auth_header[7:]
-    claims = oidc_validator.validate_token(token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    return await _resolve_user_from_claims(claims, db)
+    if token.startswith("ak_"):
+        return await _resolve_pat(token, request, db)
+    if token.startswith("srw_"):
+        return await _resolve_legacy_mcp_token(token, request, db)
+    if token.count(".") == 2:
+        claims = oidc_validator.validate_token(token)
+        if not claims:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        return await _resolve_user_from_claims(claims, db)
+    raise HTTPException(status_code=401, detail="Unrecognized token format")
 
 
 async def _resolve_from_cookie(session_id: str, db) -> dict | None:
@@ -274,6 +284,86 @@ async def _resolve_user_from_claims(claims: dict, db) -> dict:
     user["is_approved"] = is_approved
     user["preferred_username"] = claims.get("preferred_username")
     return user
+
+
+async def _resolve_pat(token: str, request: Request, db) -> dict:
+    """Resolve a `ak_<…>` Personal Access Token against ``auth_tokens``.
+
+    Hashes the token, checks the kind matches the prefix (so a hash that
+    somehow showed up against a kind='mcp' row cannot impersonate a PAT),
+    enforces revocation/expiry, and fires a non-blocking touch to update
+    ``last_used_at`` + ``last_used_ip`` for audit/UX.
+
+    Returns the user dict with ``auth_method='pat'``, ``scopes`` (the
+    PAT's action scopes from the row), and ``token_id`` for downstream
+    introspection. ``is_approved`` is forced True — a PAT could only have
+    been issued by an already-approved user via the cockpit, so role
+    revocation that follows would need to revoke the token, not silently
+    leave it usable.
+    """
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    row = await db.get_auth_token_by_hash(digest)
+    if not row or row["kind"] != "api":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.get_user(row["user_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    asyncio.create_task(
+        db.touch_auth_token(row["id"], _client_ip(request)),
+    )
+    user["auth_method"] = "pat"
+    user["scopes"] = list(row.get("scopes") or [])
+    user["token_id"] = str(row["id"])
+    user["is_approved"] = True
+    return user
+
+
+async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
+    """Resolve a legacy `srw_<…>` MCP token directly against ``auth_tokens``.
+
+    The MCP server's own TokenVerifier still routes through
+    ``/api/internal/mcp-token-verify`` which calls
+    ``get_mcp_token_by_hash`` + ``update_mcp_token_last_used``. This path
+    is for callers that hit the orchestrator API *directly* with an MCP
+    token in the Authorization header — the consolidated auth surface
+    advertised in the design doc.
+
+    Forces ``is_approved=True`` for the same reason as ``_resolve_pat``.
+    """
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    row = await db.get_auth_token_by_hash(digest)
+    if not row or row["kind"] != "mcp":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.get_user(row["user_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    asyncio.create_task(
+        db.touch_auth_token(row["id"], _client_ip(request)),
+    )
+    user["auth_method"] = "mcp"
+    # MCP scope semantics differ from PAT scopes — `scope` is a single
+    # string ('user'/'all'/'project:<uuid>'). Surface as a single-element
+    # list so downstream scope-aware code can treat both kinds uniformly.
+    legacy_scope = row.get("scope") or ""
+    user["scopes"] = [legacy_scope] if legacy_scope else []
+    user["token_id"] = str(row["id"])
+    user["is_approved"] = True
+    return user
+
+
+def _client_ip(request: Request) -> str | None:
+    """Best-effort client IP for audit logging.
+
+    Behind ingress, ``request.client.host`` is the ingress pod IP; the
+    real client lives in ``X-Forwarded-For``'s leftmost entry. We accept
+    a single forwarded hop because that's what our nginx ingress sets.
+    Multi-hop XFF chains are out of scope.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    client = getattr(request, "client", None)
+    return client.host if client else None
 
 
 async def _ensure_cloud_user(

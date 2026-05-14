@@ -61,7 +61,7 @@ else:
 # Suppress uvicorn's shallow access log — replaced by request logging middleware below.
 logging.getLogger("uvicorn.access").disabled = True
 
-from datetime import date, datetime, timezone  # noqa: E402
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
@@ -2615,6 +2615,38 @@ class McpTokenCreateInternal(BaseModel):
     scope: str = Field(default="user")
     origin: str | None = None
     expires_at: str | None = Field(None, description="ISO 8601 datetime")
+
+
+# ----- API keys (Personal Access Tokens) -----
+# Distinct from `/api/settings/api-keys` (LLM provider keys). PATs are
+# Bearer-auth credentials for n8n / scripts hitting the orchestrator API
+# directly. See docs/features/auth_bff_and_api_tokens.md §3.
+
+VALID_PAT_SCOPES = {
+    "jobs:read",
+    "jobs:write",
+    "chat:read",
+    "chat:write",
+    "knowledge:read",
+    "knowledge:write",
+    "admin",
+}
+
+
+class ApiKeyCreate(BaseModel):
+    """Request body for creating a Personal Access Token."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="Display name")
+    scopes: list[str] = Field(
+        default_factory=lambda: ["jobs:read", "chat:read"],
+        description="Action scopes — see VALID_PAT_SCOPES",
+    )
+    expires_in_days: int | None = Field(
+        365,
+        ge=1,
+        le=3650,
+        description="Days until expiry (null = never). Default 1 year per design.",
+    )
 
 
 VALID_API_KEY_PROVIDERS = {
@@ -13461,6 +13493,115 @@ async def internal_mcp_token_create(
     result = {
         k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()
     }
+    return result
+
+
+# =============================================================================
+# Personal Access Token (PAT) Endpoints — see auth_bff_and_api_tokens.md §3
+# =============================================================================
+#
+# PATs live in the consolidated `auth_tokens` table with kind='api'. The
+# legacy MCP-token endpoints (above) keep working unchanged on the same
+# table with kind='mcp'. Validator path is shared (see security.auth
+# `_resolve_pat`, `_resolve_legacy_mcp_token`).
+
+
+def _serialize_api_key_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce UUID / datetime values to strings so they JSON-serialise."""
+    return {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+
+
+@app.post("/api/api-keys")
+async def create_api_key(request: Request, body: ApiKeyCreate) -> dict[str, Any]:
+    """Generate a new Personal Access Token. Plaintext returned once."""
+    user = await require_approved_user(request, postgres_db)
+
+    # Validate scope set. `admin` is gated on the user's admin flag.
+    requested = set(body.scopes)
+    if not requested:
+        raise HTTPException(status_code=400, detail="At least one scope required")
+    bad = requested - VALID_PAT_SCOPES
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown scopes: {sorted(bad)}",
+        )
+    if "admin" in requested and not user.get("is_admin", False):
+        raise HTTPException(
+            status_code=403, detail="Only admins can issue admin-scoped tokens"
+        )
+
+    token = "ak_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    token_prefix = token[:12]
+    last_four = token[-4:]
+
+    expires_at = None
+    if body.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
+    row = await postgres_db.create_api_key(
+        user_id=str(user["id"]),
+        name=body.name,
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        last_four=last_four,
+        scopes=sorted(requested),
+        expires_at=expires_at,
+    )
+    result = _serialize_api_key_row(row)
+    result["token"] = token  # Plaintext — caller must store immediately
+    return result
+
+
+@app.get("/api/api-keys")
+async def list_api_keys(request: Request) -> list[dict[str, Any]]:
+    """List the current user's PATs (no hashes, no plaintext)."""
+    user = await require_approved_user(request, postgres_db)
+    rows = await postgres_db.list_api_keys(str(user["id"]))
+    return [_serialize_api_key_row(r) for r in rows]
+
+
+@app.delete("/api/api-keys/{token_id}")
+async def revoke_api_key(request: Request, token_id: str) -> dict[str, str]:
+    """Soft-revoke a PAT."""
+    user = await require_approved_user(request, postgres_db)
+    revoked = await postgres_db.revoke_api_key(token_id, str(user["id"]))
+    if not revoked:
+        raise HTTPException(
+            status_code=404, detail="Token not found or already revoked"
+        )
+    return {"status": "revoked"}
+
+
+@app.post("/api/api-keys/{token_id}/rotate")
+async def rotate_api_key(request: Request, token_id: str) -> dict[str, Any]:
+    """Issue a successor PAT.
+
+    Same name + scopes + expiry as the source token. The old row stays
+    valid for 24h (cleanup loop revokes it) so an automation can roll
+    over without an outage.
+    """
+    user = await require_approved_user(request, postgres_db)
+    token = "ak_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    token_prefix = token[:12]
+    last_four = token[-4:]
+
+    row = await postgres_db.rotate_api_key(
+        old_id=token_id,
+        user_id=str(user["id"]),
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        last_four=last_four,
+    )
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Token not found, already revoked, or not yours",
+        )
+    result = _serialize_api_key_row(row)
+    result["token"] = token
     return result
 
 
