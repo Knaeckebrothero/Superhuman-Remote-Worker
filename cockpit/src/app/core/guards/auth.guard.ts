@@ -1,21 +1,50 @@
-import { inject } from '@angular/core';
-import { CanActivateFn } from '@angular/router';
-import { KeycloakService } from '../services/keycloak.service';
+import {effect, EffectRef, inject, Injector, runInInjectionContext} from '@angular/core';
+import {CanActivateFn} from '@angular/router';
+import {SessionService} from '../services/session.service';
+import {UserService} from '../services/user.service';
 
 /**
- * Route guard that redirects unauthenticated users to Keycloak login.
+ * Route guard.
  *
- * Because Keycloak is initialised via APP_INITIALIZER before the app boots,
- * `keycloak.authenticated` is already resolved — no async waiting needed.
+ * The cookie BFF means we have no synchronous "authenticated?" signal — we
+ * only know once `/auth/me` returned. The APP_INITIALIZER awaits the first
+ * `/auth/me` before bootstrapping; by the time a guard runs, `currentUser`
+ * is set on success or the BFF login redirect has already been kicked off.
+ *
+ * If for whatever reason `currentUser` is still null when the guard runs
+ * (race between component activation and a delayed initializer resolution),
+ * we wait one effect tick for the next non-null emission, then fall back to
+ * sending the user to login.
  */
 export const authGuard: CanActivateFn = () => {
-  const keycloak = inject(KeycloakService);
+  const session = inject(SessionService);
+  const userService = inject(UserService);
+  const injector = inject(Injector);
 
-  if (keycloak.authenticated) {
-    return true;
-  }
+  if (userService.currentUser()) return true;
 
-  // Redirect to Keycloak login page
-  keycloak.login();
-  return false;
+  return new Promise<boolean>((done) => {
+    runInInjectionContext(injector, () => {
+      let ref: EffectRef | null = null;
+      let resolved = false;
+      ref = effect(() => {
+        if (userService.currentUser()) {
+          if (resolved) return;
+          resolved = true;
+          ref?.destroy();
+          done(true);
+        }
+      });
+      // If no currentUser materialises within a short window, redirect to
+      // the BFF login. This is a defensive path — the APP_INITIALIZER
+      // should already have handled the 401 case.
+      setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        ref?.destroy();
+        session.login();
+        done(false);
+      }, 1500);
+    });
+  });
 };

@@ -25,9 +25,4 @@ export const environment = {
   pgadminUrl: getEnv('pgadminUrl', 'http://localhost:5050'),
   mongoExpressUrl: getEnv('mongoExpressUrl', 'http://localhost:8081'),
   mcpUrl: getEnv('mcpUrl', 'http://localhost:8055/mcp'),
-
-  // Keycloak SSO
-  keycloakUrl: getEnv('keycloakUrl', 'http://localhost:8180'),
-  keycloakRealm: getEnv('keycloakRealm', 'srw'),
-  keycloakClientId: getEnv('keycloakClientId', 'cockpit'),
 };

@@ -10,10 +10,9 @@
   window['env']['mcpUrl'] = 'http://localhost:8055/mcp';
   window['env']['cloudUrl'] = 'http://localhost:9200';
 
-  // Keycloak SSO
-  window['env']['keycloakUrl'] = 'http://localhost:8180';
-  window['env']['keycloakRealm'] = 'srw';
-  window['env']['keycloakClientId'] = 'cockpit';
+  // OIDC SSO is now brokered by the orchestrator cookie BFF — the cockpit
+  // doesn't talk to Keycloak directly. /auth/login on the API origin does
+  // the PKCE handshake server-side.
 
   // Available models for the job creation form (group + model IDs).
   window['env']['models'] = [

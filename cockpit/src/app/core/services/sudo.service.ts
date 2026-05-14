@@ -152,7 +152,9 @@ export class SudoService {
   connectSSE(): void {
     if (this.eventSource) return;
 
-    this.eventSource = new EventSource(`${this.baseUrl}/sudo/events`);
+    this.eventSource = new EventSource(`${this.baseUrl}/sudo/events`, {
+      withCredentials: true,
+    });
 
     this.eventSource.addEventListener('new_request', (e: MessageEvent) => {
       this.zone.run(() => {
