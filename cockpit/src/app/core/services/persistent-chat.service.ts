@@ -51,6 +51,16 @@ import {reduce, ReducerAction} from './turn-reducer';
 const CONTROL_WS_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000];
 const CONTROL_WS_RECONNECT_MAX_ATTEMPTS = 8;
 
+// SSE liveness watchdog. The orchestrator emits a typed `ping` event every
+// ~20s of idle (see `thread_event_stream` in `orchestrator/main.py`); the
+// watchdog checks every WATCHDOG_INTERVAL_MS and forces a reopen if no SSE
+// event of any kind has arrived in WATCHDOG_TIMEOUT_MS. This catches silent
+// TCP drops (Wi-Fi blip, captive portal, laptop sleep) that don't trip
+// `EventSource.onerror` until the OS-level keepalive eventually fires
+// hours later. See `docs/issues/persistent_chat_silent_disconnect.md`.
+const SSE_WATCHDOG_INTERVAL_MS = 5000;
+const SSE_WATCHDOG_TIMEOUT_MS = 45000;
+
 /** Attachment chip shown alongside a user message. */
 export interface ChatAttachment {
     name: string;
@@ -214,6 +224,8 @@ export class PersistentChatService {
     readonly error = signal<string | null>(null);
 
     private sse: EventSource | null = null;
+    private sseWatchdogTimer: ReturnType<typeof setInterval> | null = null;
+    private sseLastEventAt = 0;
     private controlWs: WebSocket | null = null;
     private controlWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     private controlWsReconnectAttempt = 0;
@@ -349,6 +361,9 @@ export class PersistentChatService {
      * the browser tracks the cursor itself via the `id:` lines.
      */
     private async _openSse(threadId: string): Promise<void> {
+        // Drop any stale watchdog from a prior open before installing a new one.
+        this._stopSseWatchdog();
+
         const cursor = await this.cache.getThreadCursor(threadId);
         const cursorQuery = cursor ? `?last_event_id=${encodeURIComponent(`${cursor.epoch}:${cursor.seq}`)}` : '';
         const url = `${environment.apiUrl}/persistent/threads/${threadId}/stream${cursorQuery}`;
@@ -363,14 +378,22 @@ export class PersistentChatService {
                 this.error.set(null);
                 this.reconnectAttempt.set(0);
                 this.reconnectGaveUp.set(false);
+                this._startSseWatchdog(threadId);
             });
         };
 
         this.sse.onmessage = (event: MessageEvent) => {
+            this.sseLastEventAt = Date.now();
             this.zone.run(() => this._handleSseFrame(event));
         };
 
+        // Server idle-heartbeat — no payload to dispatch, just liveness.
+        this.sse.addEventListener('ping', () => {
+            this.sseLastEventAt = Date.now();
+        });
+
         this.sse.addEventListener('gone_beyond_horizon', (event) => {
+            this.sseLastEventAt = Date.now();
             this.zone.run(() => this._handleGoneBeyondHorizon(event as MessageEvent));
         });
 
@@ -382,6 +405,7 @@ export class PersistentChatService {
                     // gave up. Don't bury the UI in a generic banner; let
                     // the threadStatus refresh below surface "ended" if
                     // that's what happened.
+                    this._stopSseWatchdog();
                     this.connectionState.set('error');
                     this.reconnectGaveUp.set(true);
                     this._refreshStatusAfterDrop(threadId);
@@ -392,6 +416,48 @@ export class PersistentChatService {
                 }
             });
         };
+    }
+
+    /**
+     * Liveness watchdog for the SSE receive path. Browser `EventSource` only
+     * fires `onerror` when the TCP socket closes cleanly or the OS-level
+     * keepalive trips (Linux default: 7200s), so silent network drops leave
+     * the stream in `readyState === OPEN` for hours. The orchestrator emits
+     * a typed `ping` event every ~20s of idle; if we haven't seen *any* SSE
+     * event (ping or otherwise) for SSE_WATCHDOG_TIMEOUT_MS, the connection
+     * is presumed dead and we force a reopen.
+     */
+    private _startSseWatchdog(threadId: string): void {
+        this._stopSseWatchdog();
+        this.sseLastEventAt = Date.now();
+        this.sseWatchdogTimer = setInterval(() => {
+            if (!this.sse || this.sse.readyState !== EventSource.OPEN) {
+                // CONNECTING/CLOSED is already handled by onerror.
+                return;
+            }
+            if (Date.now() - this.sseLastEventAt <= SSE_WATCHDOG_TIMEOUT_MS) {
+                return;
+            }
+            // Silent drop. Tear down and let the existing reopen path
+            // (with replay-from-cursor) take over.
+            this._stopSseWatchdog();
+            this.zone.run(() => {
+                if (this.sse) {
+                    this.sse.close();
+                    this.sse = null;
+                }
+                this.connectionState.set('connecting');
+                this.reconnectAttempt.update(n => n + 1);
+                void this._openSse(threadId);
+            });
+        }, SSE_WATCHDOG_INTERVAL_MS);
+    }
+
+    private _stopSseWatchdog(): void {
+        if (this.sseWatchdogTimer) {
+            clearInterval(this.sseWatchdogTimer);
+            this.sseWatchdogTimer = null;
+        }
     }
 
     private _handleSseFrame(event: MessageEvent): void {
@@ -571,6 +637,7 @@ export class PersistentChatService {
             this.controlWsReconnectTimer = null;
         }
         this.controlWsReconnectAttempt = 0;
+        this._stopSseWatchdog();
         if (this.sse) {
             this.sse.close();
             this.sse = null;

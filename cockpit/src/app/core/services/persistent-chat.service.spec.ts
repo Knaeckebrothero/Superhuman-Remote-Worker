@@ -605,6 +605,123 @@ describe('PersistentChatService — SSE error handling', () => {
     });
 });
 
+describe('PersistentChatService — SSE liveness watchdog', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('force-reopens the SSE when no event arrives for > 45s', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-wd');
+        // Drain the _openSse microtask chain (await getThreadCursor) so the
+        // first EventSource has been constructed.
+        await vi.advanceTimersByTimeAsync(0);
+
+        const first = ctx.sseInstances[0];
+        fireSseOpen(first);
+        expect(ctx.sseInstances.length).toBe(1);
+
+        // 50s of silence — past the 45s watchdog threshold.
+        await vi.advanceTimersByTimeAsync(50_000);
+
+        expect(first.close).toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(2);
+        expect(ctx.service.connectionState()).toBe('connecting');
+        expect(ctx.service.reconnectAttempt()).toBeGreaterThan(0);
+    });
+
+    it('treats a typed `ping` event as liveness and does not trip the watchdog', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-ping');
+        await vi.advanceTimersByTimeAsync(0);
+
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+
+        // 30s of silence, then a ping, then another 30s. Total 60s elapsed,
+        // but only 30s since the most recent ping — under the 45s threshold.
+        await vi.advanceTimersByTimeAsync(30_000);
+        fireSseNamedEvent(es, 'ping', {});
+        await vi.advanceTimersByTimeAsync(30_000);
+
+        expect(es.close).not.toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('treats a regular onmessage frame as liveness', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-msg');
+        await vi.advanceTimersByTimeAsync(0);
+
+        const es = ctx.sseInstances[0];
+        fireSseOpen(es);
+
+        await vi.advanceTimersByTimeAsync(40_000);
+        fireSseMessage(es, {method: 'thinking', params: {text: 'still here'}}, '1:1');
+        await vi.advanceTimersByTimeAsync(40_000);
+
+        expect(es.close).not.toHaveBeenCalled();
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('stops the watchdog on disconnect()', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-dc');
+        await vi.advanceTimersByTimeAsync(0);
+
+        fireSseOpen(ctx.sseInstances[0]);
+
+        ctx.service.disconnect();
+        await vi.advanceTimersByTimeAsync(60_000);
+
+        // Disconnect intentionally torn down — no auto-reopen.
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+
+    it('does not start a watchdog on terminal CLOSED', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-cl');
+        await vi.advanceTimersByTimeAsync(0);
+
+        const first = ctx.sseInstances[0];
+        fireSseOpen(first);
+        fireSseTerminalError(first);
+        expect(ctx.service.reconnectGaveUp()).toBe(true);
+
+        // After terminal close, no further reopens should happen no matter
+        // how much time passes.
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(ctx.sseInstances.length).toBe(1);
+    });
+});
+
 describe('PersistentChatService — REST sends', () => {
     let originalEs: any;
     let originalWs: any;
