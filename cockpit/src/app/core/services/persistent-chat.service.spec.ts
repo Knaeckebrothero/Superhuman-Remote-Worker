@@ -731,6 +731,78 @@ describe('PersistentChatService — control WS (slash commands + permissions)', 
     });
 });
 
+describe('PersistentChatService — control WS frame filtering', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    async function readySession() {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-status');
+        fireSseOpen(ctx.sseInstances[0]);
+        return ctx;
+    }
+
+    function fireWsFrame(ws: any, frame: Record<string, unknown>): void {
+        ws.onmessage?.({data: JSON.stringify(frame)} as MessageEvent);
+    }
+
+    it('dispatches status frames from the control WS into startupPhase', async () => {
+        const {service, wsInstances} = await readySession();
+        expect(service.startupPhase()).toBeNull();
+
+        fireWsFrame(wsInstances[0], {
+            method: 'status',
+            params: {phase: 'provisioning', elapsed_s: 2, timeout_s: 300},
+        });
+        expect(service.startupPhase()).toBe('provisioning');
+
+        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'booting'}});
+        expect(service.startupPhase()).toBe('booting');
+
+        fireWsFrame(wsInstances[0], {method: 'status', params: {phase: 'connecting'}});
+        expect(service.startupPhase()).toBe('connecting');
+    });
+
+    it('drops non-status frames on the control WS to avoid double-dispatch with SSE', async () => {
+        const {service, wsInstances} = await readySession();
+        const turnsBefore = service.turns().length;
+
+        // turn.started would create a streaming turn if dispatched.
+        fireWsFrame(wsInstances[0], {method: 'turn.started', params: {turn_id: 99}});
+        expect(service.currentStreamingTurn()).toBeNull();
+
+        // token would attach text to the streaming turn if dispatched.
+        fireWsFrame(wsInstances[0], {method: 'token', params: {content: 'should-be-dropped'}});
+        expect(service.currentStreamingTurn()).toBeNull();
+
+        // ready would flip sessionReady if dispatched — leave that to SSE.
+        fireWsFrame(wsInstances[0], {method: 'ready', params: {}});
+        expect(service.sessionReady()).toBe(false);
+
+        expect(service.turns().length).toBe(turnsBefore);
+    });
+
+    it('silently ignores malformed WS frames', async () => {
+        const {service, wsInstances} = await readySession();
+        wsInstances[0].onmessage?.({data: 'not-json{'} as MessageEvent);
+        expect(service.startupPhase()).toBeNull();
+    });
+});
+
 describe('PersistentChatService — disconnect()', () => {
     let originalEs: any;
     let originalWs: any;

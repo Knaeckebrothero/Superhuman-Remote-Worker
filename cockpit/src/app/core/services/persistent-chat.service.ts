@@ -474,10 +474,26 @@ export class PersistentChatService {
         this.controlWs.onerror = () => {
             // The close handler will fire; nothing to do here.
         };
-        // We don't subscribe to onmessage — the server still broadcasts
-        // frames over WS for back-compat (the agent doesn't know about SSE
-        // attach yet), but SSE is now the canonical receive path. Listening
-        // here would double-dispatch every event.
+        // SSE is the canonical receive path for agent-emitted events. We
+        // listen here only for `status` frames, which the orchestrator's
+        // persistent_ws_proxy emits BEFORE attaching to the agent pod
+        // ({phase: provisioning|booting|connecting}) — they never reach
+        // the thread_events log and so never come via SSE. Every other
+        // method (token, turn.*, thinking, error, ready, session.ended,
+        // title.updated, message) is also relayed over this WS for
+        // back-compat and would double-dispatch with SSE, so we discard.
+        this.controlWs.onmessage = (event: MessageEvent) => {
+            let frame: { method?: string; params?: Record<string, unknown> };
+            try {
+                frame = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            if (frame?.method !== 'status') return;
+            this.zone.run(() =>
+                this._handleEvent(frame as { method: string; params?: Record<string, unknown> }),
+            );
+        };
     }
 
     private _scheduleControlWsReconnect(threadId: string): void {

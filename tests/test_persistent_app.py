@@ -1501,7 +1501,135 @@ class TestTerminateSession:
 
 
 # ---------------------------------------------------------------------------
-# 3.17.3 Headless: module-level loop callbacks behave as the old closures did
+# 3.17.3 Headless: attach-time readiness race (handle_persistent_websocket)
+# ---------------------------------------------------------------------------
+
+
+class TestHandlePersistentWebsocketReadiness:
+    """Regression tests for the attach-time readiness race fixed in sha-a790c79.
+
+    In dual mode, POST /session/attach returns immediately while the actual
+    _attach_session work runs in the background. _session.llm_with_tools is
+    set early (inside .setup()), but _loop_user_queue is initialized much
+    later in the same coroutine. A client that opens the WS in that window
+    sees a session that looks ready but loop primitives that aren't.
+
+    Pre-fix: the WS handler only checked _session and llm_with_tools, then
+    spawned the persistent loop. The loop's _loop_get_user_input callback
+    crashed on the first await (queue was None) and the session never
+    recovered. The fix gates loop spawn on _loop_user_queue being
+    initialized too, closing the WS with code 4503 ("Agent not ready") so
+    the client retries.
+    """
+
+    @pytest.mark.asyncio
+    async def test_closes_with_4503_when_session_missing(self):
+        """No session at all — the simplest unready case."""
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        with (
+            patch("src.api.persistent_app._session", None),
+            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("src.api.persistent_app._loop_task", None),
+            patch("src.api.persistent_app._ws_connected_event", None),
+        ):
+            await pa.handle_persistent_websocket(ws)
+            assert pa._loop_task is None
+
+        ws.accept.assert_awaited_once()
+        ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
+
+    @pytest.mark.asyncio
+    async def test_closes_with_4503_when_llm_with_tools_missing(self):
+        """Session exists but .setup() hasn't bound llm_with_tools yet."""
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        session = MagicMock()
+        session.llm_with_tools = None
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("src.api.persistent_app._loop_task", None),
+            patch("src.api.persistent_app._ws_connected_event", None),
+        ):
+            await pa.handle_persistent_websocket(ws)
+            assert pa._loop_task is None
+
+        ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
+
+    @pytest.mark.asyncio
+    async def test_closes_with_4503_when_loop_user_queue_missing(self):
+        """The keystone bug: llm_with_tools is set but _loop_user_queue is None.
+
+        Pre-fix this passed the readiness check (which only inspected
+        _session and llm_with_tools), spawned the loop, and the loop's first
+        get-user-input callback crashed on the None queue.
+        """
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        session = MagicMock()
+        session.llm_with_tools = MagicMock()  # truthy
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("src.api.persistent_app._loop_task", None),
+            patch("src.api.persistent_app._ws_connected_event", None),
+        ):
+            await pa.handle_persistent_websocket(ws)
+            # The whole point of the fix: the loop must NOT have been
+            # spawned despite llm_with_tools being set.
+            assert pa._loop_task is None
+
+        ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
+
+    @pytest.mark.asyncio
+    async def test_sends_error_frame_before_close(self):
+        """Error frame must precede the close so clients see the reason."""
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        with (
+            patch("src.api.persistent_app._session", None),
+            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("src.api.persistent_app._loop_task", None),
+            patch("src.api.persistent_app._ws_connected_event", None),
+        ):
+            await pa.handle_persistent_websocket(ws)
+
+        ws.send_json.assert_awaited_once_with(
+            {"method": "error", "params": {"message": "Agent not ready"}}
+        )
+        ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
+
+    @pytest.mark.asyncio
+    async def test_signals_ws_connected_even_when_not_ready(self):
+        """The boot-WS watchdog must see the attach attempt even on an
+        unready close, otherwise a quick reconnect during the readiness
+        race could be missed and the pod could time out mid-recovery.
+        """
+        import asyncio
+
+        from src.api import persistent_app as pa
+
+        ws = AsyncMock()
+        connected = asyncio.Event()
+        with (
+            patch("src.api.persistent_app._session", None),
+            patch("src.api.persistent_app._loop_user_queue", None),
+            patch("src.api.persistent_app._loop_task", None),
+            patch("src.api.persistent_app._ws_connected_event", connected),
+        ):
+            await pa.handle_persistent_websocket(ws)
+
+        assert connected.is_set()
+        ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
+
+
+# ---------------------------------------------------------------------------
+# 3.17.4 Headless: module-level loop callbacks behave as the old closures did
 # ---------------------------------------------------------------------------
 
 
