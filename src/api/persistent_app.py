@@ -2470,6 +2470,8 @@ async def _save_message(
     content: Optional[str],
     tool_calls: Optional[Any],
     turn_number: int,
+    tool_call_id: Optional[str] = None,
+    thinking: Optional[str] = None,
 ) -> None:
     """Fire-and-forget: save a single message via orchestrator REST."""
     try:
@@ -2479,9 +2481,35 @@ async def _save_message(
             content=content,
             tool_calls=tool_calls,
             turn_number=turn_number,
+            tool_call_id=tool_call_id,
+            thinking=thinking,
         )
     except Exception as e:
         logger.warning(f"Failed to save message (non-fatal): {e}")
+
+
+def _extract_thinking(msg: Any) -> Optional[str]:
+    """Pull reasoning content out of an AIMessage for persistence.
+
+    Two sources depending on the provider:
+      - Anthropic: ``content`` is a list of blocks, thinking blocks carry
+        ``{"type": "thinking", "thinking": "..."}``.
+      - Other reasoning models (DeepSeek, GPT-5, etc.): ``additional_kwargs.
+        reasoning_content`` carries a plain string.
+    Returns None when the model didn't emit a visible reasoning channel.
+    """
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        parts = [
+            b.get("thinking", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+    rc = getattr(msg, "additional_kwargs", {}).get("reasoning_content")
+    return rc or None
 
 
 async def _save_turn_ai_messages(
@@ -2536,6 +2564,13 @@ async def _save_turn_ai_messages(
                     if decision:
                         entry["decision"] = decision
                     tc.append(entry)
+            # Extract reasoning content + tool-call back-reference BEFORE we
+            # flatten Anthropic's list-of-dicts content (which drops the
+            # thinking blocks).
+            thinking = _extract_thinking(msg) if role == "ai" else None
+            tool_call_id = (
+                getattr(msg, "tool_call_id", None) if role == "tool" else None
+            )
             # Normalize content for Anthropic list-of-dicts format
             if isinstance(content, list):
                 content = " ".join(
@@ -2551,6 +2586,8 @@ async def _save_turn_ai_messages(
                 tool_calls=tc,
                 turn_number=turn_number,
                 metrics=msg_metrics,
+                tool_call_id=tool_call_id,
+                thinking=thinking,
             )
     except Exception as e:
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")

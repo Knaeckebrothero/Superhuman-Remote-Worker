@@ -9443,6 +9443,10 @@ class AgentThreadMessageRequest(BaseModel):
     tool_calls: list[dict] | None = None
     turn_number: int | None = None
     metrics: dict | None = None
+    # Links a role='tool' row back to its originating tool_calls[].id.
+    tool_call_id: str | None = None
+    # Reasoning content captured from role='ai' rows. See migration 0011.
+    thinking: str | None = None
 
 
 @app.post("/api/agents/threads")
@@ -9848,6 +9852,8 @@ async def agent_save_message(
             tool_calls=request.tool_calls,
             turn_number=request.turn_number,
             metrics=request.metrics,
+            tool_call_id=request.tool_call_id,
+            thinking=request.thinking,
         )
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:

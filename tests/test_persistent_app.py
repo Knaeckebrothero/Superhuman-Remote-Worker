@@ -138,6 +138,8 @@ class TestSaveMessage:
             content="hello",
             tool_calls=None,
             turn_number=1,
+            tool_call_id=None,
+            thinking=None,
         )
 
     @pytest.mark.asyncio

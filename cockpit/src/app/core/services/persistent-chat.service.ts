@@ -10,6 +10,7 @@ import {
     EMPTY_CONVERSATION,
     isAssistantTurn,
     SystemTurn,
+    ToolCallEvent,
     Turn,
     UserTurn,
 } from '../models/turn.model';
@@ -1182,19 +1183,26 @@ function makeLocalId(prefix: string): string {
 /**
  * Group flat HistoryMessage rows into Turns for the rehydration path.
  *
- * Multiple assistant rows that share a `turn_number` collapse into one
- * AssistantTurn (each row contributes a text event plus any tool calls).
- * Thinking is not persisted in `thread_messages` so historical turns won't
- * have thought events.
+ * - Multiple assistant rows that share a `turn_number` collapse into one
+ *   AssistantTurn. Each row contributes (in order) an optional ThoughtEvent
+ *   (when `thinking` is populated — see migration 0011), an optional
+ *   TextEvent (when `content` is non-empty), and one ToolCallEvent per
+ *   entry in `tool_calls`.
+ * - `role='tool'` rows are matched back to their originating ToolCallEvent
+ *   by `tool_call_id` and populate its `result` / `resultStatus`. Rows
+ *   without a matching call (pre-0011 historical data) are dropped — same
+ *   user-visible behavior as before this migration.
  */
 function historyToTurns(messages: HistoryMessage[]): Turn[] {
     const turns: Turn[] = [];
     const turnByNumber = new Map<number, AssistantTurn>();
+    const toolCallById = new Map<string, ToolCallEvent>();
 
     for (const m of messages) {
         const isUser = ['human', 'user', 'HumanMessageChunk'].includes(m.role);
         const isAssistant = ['ai', 'assistant', 'AIMessageChunk'].includes(m.role);
-        if (!isUser && !isAssistant) continue;
+        const isTool = m.role === 'tool' || m.role === 'ToolMessageChunk';
+        if (!isUser && !isAssistant && !isTool) continue;
 
         const ts = m.created_at ? Date.parse(m.created_at) || Date.now() : Date.now();
 
@@ -1210,6 +1218,22 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
             continue;
         }
 
+        if (isTool) {
+            // Match result back to the originating call. Rows missing
+            // tool_call_id (pre-migration 0011 data) can't be linked and
+            // are silently dropped — same as the prior behavior.
+            const callId = m.tool_call_id;
+            if (!callId) continue;
+            const tc = toolCallById.get(callId);
+            if (!tc) continue;
+            tc.result = m.content ?? '';
+            tc.resultStatus = 'ok';
+            // Don't clobber a 'denied' decision recorded on the AI side.
+            if (tc.status !== 'denied') tc.status = 'completed';
+            continue;
+        }
+
+        // Assistant row.
         let turn = m.turn_number != null ? turnByNumber.get(m.turn_number) : undefined;
         if (!turn) {
             turn = {
@@ -1225,6 +1249,15 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
             turns.push(turn);
         }
 
+        if (m.thinking) {
+            turn.events.push({
+                kind: 'thought',
+                id: `${turn.id}.b${turn.events.length}`,
+                content: m.thinking,
+                status: 'done',
+                startedAt: ts,
+            });
+        }
         if (m.content) {
             turn.events.push({
                 kind: 'text',
@@ -1236,7 +1269,7 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
         }
         if (m.tool_calls) {
             for (const tc of m.tool_calls) {
-                turn.events.push({
+                const event: ToolCallEvent = {
                     kind: 'tool_call',
                     id: tc.id || `${turn.id}.tc${turn.events.length}`,
                     tool: tc.name || '',
@@ -1244,7 +1277,9 @@ function historyToTurns(messages: HistoryMessage[]): Turn[] {
                     status: tc.decision === 'denied' ? 'denied' : 'completed',
                     decision: tc.decision,
                     startedAt: ts,
-                });
+                };
+                turn.events.push(event);
+                if (tc.id) toolCallById.set(tc.id, event);
             }
         }
         turn.finishedAt = ts;
@@ -1260,5 +1295,9 @@ interface HistoryMessage {
     content: string | null;
     tool_calls: { name: string; args: Record<string, unknown>; id: string; decision?: 'approved' | 'denied' }[] | null;
     turn_number: number | null;
+    /** Set only on role='tool' rows — points to the AI message's tool_calls[].id. */
+    tool_call_id?: string | null;
+    /** Set only on role='ai' rows that carry reasoning content. */
+    thinking?: string | null;
     created_at: string | null;
 }
