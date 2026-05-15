@@ -407,6 +407,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls": '[{"name": "search"}]',
             "turn_number": 1,
             "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
             "created_at": ts,
         }
         conn = _mock_conn()
@@ -425,6 +427,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls": None,
             "turn_number": 1,
             "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
             "created_at": datetime(2026, 3, 30, tzinfo=timezone.utc),
         }
         conn = _mock_conn()
@@ -444,6 +448,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls": None,
             "turn_number": 1,
             "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
             "created_at": ts,
         }
         conn = _mock_conn()
@@ -462,6 +468,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls": None,
             "turn_number": 1,
             "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
             "created_at": None,
         }
         conn = _mock_conn()
@@ -480,6 +488,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls": None,
             "turn_number": 3,
             "metrics": None,
+            "tool_call_id": None,
+            "thinking": None,
             "created_at": datetime(2026, 3, 30, tzinfo=timezone.utc),
         }
         conn = _mock_conn()
@@ -494,6 +504,8 @@ class TestGetThreadMessagesHistory:
             "tool_calls",
             "turn_number",
             "metrics",
+            "tool_call_id",
+            "thinking",
             "created_at",
         }
 

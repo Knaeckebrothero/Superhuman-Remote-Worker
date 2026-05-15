@@ -502,11 +502,14 @@ const CATEGORY_LABELS: Record<string, string> = {
                   }
 
                   @if (isCollapsed) {
-                    <!-- Collapsed: show only the final text event as headline. -->
+                    <!-- Collapsed: single-line preview of the final text
+                         event. Plain text (not <markdown>) so the truncate
+                         mixin works — markdown emits inner block elements
+                         that defeat nowrap. -->
                     @if (last) {
-                      <markdown class="turn-headline" [data]="last.content"></markdown>
+                      <span class="turn-headline">{{ last.content }}</span>
                     } @else {
-                      <div class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</div>
+                      <span class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</span>
                     }
                   } @else {
                     <!-- Expanded: every event rendered as its own card. -->
@@ -1099,7 +1102,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         } else if (phase && (order as readonly string[]).includes(phase)) {
             activeIdx = (order as readonly string[]).indexOf(phase);
         } else {
-            activeIdx = isResuming ? 1 : 0;
+            // No live phase signal. Phases arrive in two batches: 'creating'
+            // is set client-side and cleared in disconnect() before the
+            // server-emitted 'provisioning' status frame arrives over the
+            // control WS. During that gap, the previous fallback (`isResuming
+            // ? 1 : 0`) regressed step 0 back to 'active', wiping the just-
+            // recorded "2.0s" with a fresh spinner. Use the completed-count
+            // as the floor so a step that finished stays done.
+            const completedCount = order.filter(k => this.phaseDurations[k] != null).length;
+            activeIdx = Math.max(completedCount, isResuming ? 1 : 0);
         }
         return order.map((key, idx) => {
             const state: 'done' | 'active' | 'todo' =

@@ -229,6 +229,70 @@ describe('PersistentChatService — connect()', () => {
         expect(service.historyLoaded()).toBe(true);
     });
 
+    it('rehydrates thinking + tool results from history (migration 0011)', async () => {
+        const {service, mockHttp} = createService();
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) {
+                return of({
+                    messages: [
+                        {
+                            id: 'u1',
+                            role: 'human',
+                            content: 'Read the file',
+                            tool_calls: null,
+                            turn_number: 1,
+                            created_at: '2026-05-15T08:00:00Z',
+                        },
+                        {
+                            id: 'a1',
+                            role: 'ai',
+                            content: null,
+                            tool_calls: [{name: 'read_file', args: {path: 'x'}, id: 'tc-1'}],
+                            turn_number: 1,
+                            thinking: 'I should read the file first.',
+                            created_at: '2026-05-15T08:00:01Z',
+                        },
+                        {
+                            id: 't1',
+                            role: 'tool',
+                            content: 'file contents here',
+                            tool_calls: null,
+                            turn_number: 1,
+                            tool_call_id: 'tc-1',
+                            created_at: '2026-05-15T08:00:02Z',
+                        },
+                        {
+                            id: 'a2',
+                            role: 'ai',
+                            content: 'Here is what I found.',
+                            tool_calls: null,
+                            turn_number: 1,
+                            created_at: '2026-05-15T08:00:03Z',
+                        },
+                    ],
+                    total: 4,
+                });
+            }
+            return of({status: 'active', total_turns: 1});
+        });
+
+        await service.connect('thread-hist');
+
+        const turns = service.turns();
+        // user turn + one collapsed assistant turn
+        const assistant = turns.find(isAssistantTurn) as AssistantTurn;
+        expect(assistant).toBeDefined();
+        // Events arrive in order: thought, tool_call (now with result), text
+        const kinds = assistant.events.map((e) => e.kind);
+        expect(kinds).toEqual(['thought', 'tool_call', 'text']);
+        const tool = assistant.events.find(isToolCall) as ToolCallEvent;
+        expect(tool.result).toBe('file contents here');
+        expect(tool.status).toBe('completed');
+        expect(tool.resultStatus).toBe('ok');
+        const thought = assistant.events[0] as any;
+        expect(thought.content).toBe('I should read the file first.');
+    });
+
     it('passes the cached cursor as ?last_event_id=<epoch>:<seq> on initial open', async () => {
         const {service, mockHttp, sseInstances} = createService({
             cursor: {epoch: 7, seq: 42, threadId: 'thread-B', updatedAt: ''} as any,

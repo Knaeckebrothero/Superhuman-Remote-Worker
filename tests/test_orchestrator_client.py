@@ -495,6 +495,8 @@ class TestSaveThreadMessage:
                     "tool_calls": [{"name": "t"}],
                     "turn_number": 3,
                     "metrics": None,
+                    "tool_call_id": None,
+                    "thinking": None,
                 },
             )
 

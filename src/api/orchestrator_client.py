@@ -218,8 +218,14 @@ class OrchestratorClient:
         tool_calls: list | None = None,
         turn_number: int | None = None,
         metrics: dict | None = None,
+        tool_call_id: str | None = None,
+        thinking: str | None = None,
     ) -> bool:
-        """Save a message to thread history via orchestrator REST. Fire-and-forget safe."""
+        """Save a message to thread history via orchestrator REST. Fire-and-forget safe.
+
+        ``tool_call_id`` is set only for role='tool' rows; ``thinking`` for
+        role='ai' rows that carry reasoning content.
+        """
         if not self._client:
             return False
 
@@ -230,6 +236,8 @@ class OrchestratorClient:
             "tool_calls": tool_calls,
             "turn_number": turn_number,
             "metrics": metrics,
+            "tool_call_id": tool_call_id,
+            "thinking": thinking,
         }
 
         try:
