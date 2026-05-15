@@ -399,7 +399,7 @@ This design hand-rolls durability on top of LangGraph's `AsyncSqliteSaver` check
 
 ## Related code
 
-- `src/api/persistent_app.py` — `_detach_session` (886), `ws_chat` (1101), `_loop_task` global (73), watchdogs (129, 158). All of Phase 1 lives here.
+- `src/api/persistent_app.py` — `_detach_session`, `_loop_task` global, watchdogs. Phase 1's keystone implementation lives here at module level — `handle_persistent_websocket` and `handle_api_{input,interrupt,approve}` are called from both `create_persistent_app()` (pure mode) and `dual_app.py` (cluster default). When extending Phase 1/5 behavior, edit the module-level functions; do **not** add a parallel implementation to `dual_app.py`. See [[persistent_session_dual_mode_phase1_gap]] for the drift incident that motivated this rule.
 - `src/persistent_graph.py` — the loop body itself. Phase 2 instrumentation hooks here.
 - `orchestrator/main.py:10931` — `persistent_ws_proxy` (kept as fallback). New SSE handler at `GET /api/threads/{id}/stream` + REST input endpoints land alongside it.
 - `orchestrator/services/workspace_suspension_service.py` — Phase 5 extension point.
@@ -427,3 +427,4 @@ This design hand-rolls durability on top of LangGraph's `AsyncSqliteSaver` check
 - **2026-05-12 (refinement pass 2):** Migration strategy: no migration needed. Headless is shipping into a pre-production codebase with no existing active sessions to preserve.
 - **2026-05-12 (refinement pass 2):** Interrupt semantics: in-flight tool call → wait for it to complete (no side-effect leak), then stop. Mid-text-generation with no tool call → cancel the LLM stream immediately.
 - **2026-05-12 (refinement pass 2):** Per-turn input lock adopted for multi-tab safety. POST /input acquires a thread-scoped, turn-number-keyed lock; concurrent POSTs return 409.
+- **2026-05-14:** Phase-1 keystone consolidated. WS handler and `/api/{input,interrupt,approve}` lifted to module-level in `persistent_app.py` (`handle_persistent_websocket`, `handle_api_*`); `dual_app.py` deletes its parallel `_run_persistent_websocket` (340 lines) and routes everything through the shared functions after a `_pod_state == PodState.SESSION` pre-check. Driven by the cluster verification finding in [[persistent_session_dual_mode_phase1_gap]]: cluster pods run dual mode by default, so the Phase-1 work that was only in `persistent_app.py` never ran in prod. The "extract → delegate" pattern is now the maintenance rule for cross-mode behavior; do not add session-side routes to `create_dual_app()` directly.
