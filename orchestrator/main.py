@@ -11076,10 +11076,15 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
                     # Adaptive backoff: 200ms × 5 empty polls, then 1s.
                     empty_polls += 1
                     wait = 1.0 if empty_polls >= 5 else 0.2
-                    # Keepalive comment every ~30s of idle.
+                    # Typed `ping` event every ~20s of idle. A bare `:`
+                    # comment would keep the socket warm but never fire
+                    # `onmessage` in the browser, leaving silent network
+                    # drops undetectable client-side. A typed event with no
+                    # `id:` line lets the cockpit watchdog observe liveness
+                    # without advancing the replay cursor.
                     idle_keepalive_at += wait
-                    if idle_keepalive_at >= 30.0:
-                        yield ": keepalive\n\n"
+                    if idle_keepalive_at >= 20.0:
+                        yield "event: ping\ndata: {}\n\n"
                         idle_keepalive_at = 0.0
                     try:
                         await asyncio.sleep(wait)
