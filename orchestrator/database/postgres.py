@@ -2364,13 +2364,22 @@ class PostgresDB:
         tool_calls: Optional[Any] = None,
         turn_number: Optional[int] = None,
         metrics: Optional[dict] = None,
+        tool_call_id: Optional[str] = None,
+        thinking: Optional[str] = None,
     ) -> str:
-        """Save a message to thread_messages. Fire-and-forget safe."""
+        """Save a message to thread_messages. Fire-and-forget safe.
+
+        ``tool_call_id`` is set only on role='tool' rows and links the result
+        back to the AIMessage's tool_calls[].id. ``thinking`` is set only on
+        role='ai' rows that carry reasoning content. See migration 0011.
+        """
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO thread_messages (thread_id, role, content, tool_calls, turn_number, metrics)
-                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+                INSERT INTO thread_messages
+                    (thread_id, role, content, tool_calls, turn_number,
+                     metrics, tool_call_id, thinking)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id
                 """,
                 thread_id,
                 role,
@@ -2378,6 +2387,8 @@ class PostgresDB:
                 json.dumps(tool_calls) if tool_calls else None,
                 turn_number,
                 json.dumps(metrics) if metrics else None,
+                tool_call_id,
+                thinking,
             )
             # Update thread activity + turn count
             await conn.execute(
@@ -2402,7 +2413,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, role, content, tool_calls, turn_number, metrics, created_at
+                SELECT id, role, content, tool_calls, turn_number, metrics,
+                       tool_call_id, thinking, created_at
                 FROM thread_messages
                 WHERE thread_id = $1
                 ORDER BY created_at ASC
@@ -2424,6 +2436,8 @@ class PostgresDB:
                 else None,
                 "turn_number": row["turn_number"],
                 "metrics": json.loads(row["metrics"]) if row["metrics"] else None,
+                "tool_call_id": row["tool_call_id"],
+                "thinking": row["thinking"],
                 "created_at": row["created_at"].isoformat()
                 if row["created_at"]
                 else None,
