@@ -51,7 +51,7 @@ The parent design is comprehensive and covers ~3 weeks of work. The motivating u
 - List user's API keys: name, created date, last used, optional expiration.
 - **Create**: dialog with name + optional expiration. Returns the key **once** (copy-to-clipboard with a "you won't see this again" warning).
 - **Revoke**: button per row, confirms before deletion.
-- Backed by a new `api_keys` table (decided in [Open Decisions](#open-decisions) below — not by reusing `mcp_tokens`).
+- Backed by the consolidated `auth_tokens` table (with `kind='api'`) introduced by the auth refactor — see [auth_bff_and_api_tokens.md §3.6](./auth_bff_and_api_tokens.md). The earlier plan for a parallel `api_keys` table was reversed 2026-05-14; see [Open Decisions](#open-decisions) below.
 
 **Cross-links: Automations ↔ Projects**
 - From an automation row: if `project_id` is set, project name links to the project detail page.
@@ -84,8 +84,8 @@ Deferred to v0.5: `/api/automations/{id}/preview`, `/api/automations/{id}/chain`
 **Backend services**
 - New: `orchestrator/services/cron_dispatcher.py` — 60s tick, `FOR UPDATE SKIP LOCKED` CTE pattern.
 - New: `orchestrator/services/automations.py` — `create_job_from_automation` helper that reuses the existing `create_job()` path.
-- Migration: `orchestrator/database/migrations/app/0003_create_automations.sql` — **full schema including event-trigger columns** so v0.5 needs no migration.
-- Migration: `orchestrator/database/migrations/app/0004_create_api_keys.sql` — small.
+- Migration: `orchestrator/database/migrations/app/NNNN_create_automations.sql` (number assigned at merge; next-available after auth refactor lands) — **full schema including event-trigger columns** so v0.5 needs no migration.
+- API key storage is provided by the auth refactor's `0010_auth_tokens_consolidation.sql`; no separate migration in this PR.
 
 **Safety guards in v0**
 - `croniter.is_valid(expr)` validation on write → 400 on bad cron.
@@ -195,64 +195,37 @@ BEGIN;
 COMMIT;
 ```
 
-The accompanying `0004_create_api_keys.sql` migration:
+No separate API key migration in this PR. The auth refactor ships `auth_tokens` (renamed from `mcp_tokens`, with `kind` column added) in `0010_auth_tokens_consolidation.sql`; this PR creates API key rows with `kind='api'` against that table. See [auth_bff_and_api_tokens.md §3.2](./auth_bff_and_api_tokens.md) for the schema.
 
-```sql
--- migration:     0004_create_api_keys.sql
--- description:   User-managed API keys for external automations
--- depends-on:    0003_create_automations
--- transactional: yes
-
-BEGIN;
-  SET LOCAL statement_timeout = '30s';
-
-  CREATE TABLE IF NOT EXISTS api_keys (
-      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-
-      name TEXT NOT NULL,
-      key_hash TEXT NOT NULL,                              -- store hash only, never plaintext
-      key_prefix TEXT NOT NULL,                            -- first 8 chars, for UX disambiguation in lists
-      scope TEXT NOT NULL DEFAULT 'jobs:write',            -- v0: single scope; v1: granular
-
-      expires_at TIMESTAMPTZ,
-      last_used_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-  );
-
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash);
-  CREATE INDEX IF NOT EXISTS idx_api_keys_owner ON api_keys (owner_id);
-COMMIT;
-```
+Dependency: this PR cannot merge until the auth refactor PR 3 (which lands `auth_tokens` consolidation) is merged.
 
 ## Implementation Order
 
 | Step | Work | Files | Effort |
 |------|------|-------|--------|
-| 1 | Migrations: `automations` + `api_keys` | `migrations/app/0003_*.sql`, `0004_*.sql` | 0.3d |
-| 2 | Postgres helpers for both tables | `orchestrator/database/postgres.py` | 0.5d |
+| 1 | Migration: `automations` | `migrations/app/NNNN_create_automations.sql` | 0.2d |
+| 2 | Postgres helpers for automations + API key helpers against `auth_tokens` | `orchestrator/database/postgres.py` | 0.5d |
 | 3 | Cron dispatcher service + tests (DST, multi-replica `SKIP LOCKED`) | `services/cron_dispatcher.py`, `tests/test_cron_dispatcher.py` | 1d |
 | 4 | `create_job_from_automation` helper | `services/automations.py` | 0.3d |
 | 5 | API endpoints — automations CRUD + run-now + pause/resume | `orchestrator/main.py` | 1d |
-| 6 | API endpoints — API keys CRUD; auth middleware accepts keys via `Authorization: Bearer` | `orchestrator/main.py`, `security/auth.py` | 0.5d |
+| 6 | API endpoints — `/api/api-keys` CRUD over `auth_tokens` (kind='api'). Bearer dispatch in `_resolve_bearer_token` lands with the auth refactor; this PR just wires the user-facing endpoints. | `orchestrator/main.py` | 0.3d |
 | 7 | Cockpit Automations tab — list + editor + cron preview + escape-hatch panel | `cockpit/src/app/views/automations/` | 1.5d |
 | 8 | Cockpit API Keys settings page | `cockpit/src/app/views/settings/api-keys/` | 0.5d |
 | 9 | Cockpit project-detail: Automations section + cross-link | `cockpit/src/app/views/projects/project-detail/` | 0.3d |
 | 10 | External API docs page | `docs/features/automations_api.md` | 0.3d |
 | 11 | i18n keys (EN + DE) | `cockpit/src/assets/i18n/{en,de-DE}.json` | 0.3d |
 
-**Total: ~5.5 dev days.**
+**Total: ~5.3 dev days.** Depends on auth refactor PR 3 (consolidation) being merged first.
 
 ## Files Created
 
 ### Backend
-- `orchestrator/database/migrations/app/0003_create_automations.sql`
-- `orchestrator/database/migrations/app/0004_create_api_keys.sql`
+- `orchestrator/database/migrations/app/NNNN_create_automations.sql` (next-available number at merge time)
 - `orchestrator/services/cron_dispatcher.py`
 - `orchestrator/services/automations.py`
 - `tests/test_cron_dispatcher.py`
 - `tests/test_automations_api.py`
-- `tests/test_api_keys.py`
+- `tests/test_api_keys.py` (tests the `/api/api-keys` endpoints against the consolidated `auth_tokens` table)
 
 ### Frontend
 - `cockpit/src/app/views/automations/automations-page.component.ts`
@@ -272,8 +245,8 @@ COMMIT;
 
 | File | Change |
 |------|--------|
-| `orchestrator/main.py` | Mount `/api/automations` and `/api/api-keys` routes; start `cron_dispatcher` in lifespan at `:3008-3023`; teach auth middleware to accept API keys via `Authorization: Bearer ak_…` |
-| `orchestrator/security/auth.py` | New `_get_user_from_api_key` path alongside existing OIDC + MCP-token paths |
+| `orchestrator/main.py` | Mount `/api/automations` and `/api/api-keys` routes; start `cron_dispatcher` in lifespan at `:3008-3023`. The Bearer-dispatch path that accepts `ak_…` tokens lands with the auth refactor (see `auth_bff_and_api_tokens.md` §3.5). |
+| `orchestrator/security/auth.py` | No change in this PR — the Bearer dispatch (`_resolve_bearer_token`) is added by the auth refactor and handles both `ak_…` and `srw_…` prefixes. |
 | `requirements.txt` | Add `croniter` if not already present |
 | `cockpit/package.json` | Add `cronstrue` and `cron-parser`. Evaluate `ngx-cron-editor` (v0.10.2, Nov 2025) as the picker; fall back to hand-built preset picker if friend-test fails |
 | `cockpit/src/app/app.routes.ts` | Add `/automations` and `/settings/api-keys` routes (auth-guarded) |
@@ -282,16 +255,16 @@ COMMIT;
 
 ## API Key Auth Wiring
 
-The auth middleware at `orchestrator/security/auth.py` already supports two paths (Keycloak Bearer, MCP X-headers). v0 adds a third: API key via `Authorization: Bearer ak_<key>`.
+The Bearer dispatch (`_resolve_bearer_token`) is owned by the auth refactor — see [auth_bff_and_api_tokens.md §3.5](./auth_bff_and_api_tokens.md). It handles `ak_…` (API key, `kind='api'`) and `srw_…` (legacy MCP, `kind='mcp'`) by prefix-sniff, hashes via SHA-256, looks up against the consolidated `auth_tokens` table.
 
-Lookup flow:
-1. Header `Authorization: Bearer ak_<key>`?
-2. Hash the key (`hashlib.sha256` is fine — keys are high-entropy random; no per-key salt needed).
-3. `SELECT owner_id, scope, expires_at FROM api_keys WHERE key_hash = $1`.
-4. If row found and not expired and scope permits the route → set `request.state.user_id = owner_id`, update `last_used_at` (debounced, async fire-and-forget).
+Lookup flow (for context — this PR just wires the user-facing `/api/api-keys` endpoints):
+1. Header `Authorization: Bearer ak_<key>` → prefix matches `ak_`.
+2. `hashlib.sha256(token).hexdigest()`.
+3. `SELECT user_id, kind, scope, expires_at FROM auth_tokens WHERE token_hash = $1 AND kind = 'api'`.
+4. Row found + not revoked + not expired + scope permits → set `request.state.user_id = user_id`, fire-and-forget update of `last_used_at`/`last_used_ip`.
 5. Else 401.
 
-Key format: `ak_` prefix + 32 random URL-safe characters. Total visible length 35 chars. The `ak_` prefix lets future key types (e.g. `ar_` for read-only) coexist without lookup ambiguity.
+Key format: `ak_` prefix + 32 random URL-safe characters (256 bits of entropy via `secrets.token_urlsafe(32)`). The `ak_` prefix lets future key types (`ar_` read-only, `as_` service, etc.) coexist without lookup ambiguity. Format and entropy details in [auth_bff_and_api_tokens.md §3.1](./auth_bff_and_api_tokens.md).
 
 ## Friend-Test Gates Before Shipping
 
@@ -307,7 +280,7 @@ These are the must-pass checks before merging v0:
 
 ## Open Decisions
 
-1. **API key storage:** new `api_keys` table (chosen) vs. reuse `mcp_tokens`. Reasoning: `mcp_tokens` is implicitly tied to MCP session semantics; reusing would conflate concerns. Cost of a new table is ~10 lines of schema; clean separation is worth it.
+1. **API key storage:** ~~new `api_keys` table~~ → **reversed 2026-05-14: consolidate into the renamed `auth_tokens` table** (formerly `mcp_tokens`) with a `kind` column. Rationale: the schema of `mcp_tokens` is generic; "MCP session semantics" lives in the validator path (FastMCP's `TokenVerifier`), not the data shape. The wider auth refactor consolidating sessions and tokens makes parallel tables redundant. See [auth_bff_and_api_tokens.md §3.6](./auth_bff_and_api_tokens.md) for the full reasoning. The original decision was filed before the BFF refactor was on the table.
 2. **Escape-hatch placement:** sticky panel at bottom of Automations tab (chosen) vs. modal triggered by a button vs. dedicated page. Reasoning: discoverability beats compactness; sticky panel is the same pattern HomeAssistant uses for "More info" links.
 3. **API key scopes (v0):** single `jobs:write` scope (chosen) vs. granular (`jobs:read`, `jobs:write`, `automations:write`). Reasoning: v0 has one consumer pattern (external triggering); split scopes when there's a real second consumer.
 4. **Cron picker UI:** `ngx-cron-editor` evaluation. If it passes the friend-test, use it; if not, hand-built preset picker. Decide during step 7.
