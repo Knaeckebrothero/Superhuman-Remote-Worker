@@ -52,6 +52,16 @@ def _cookie_secure() -> bool:
     return os.getenv("SRW_COOKIE_SECURE", "1") == "1"
 
 
+def _cookie_samesite() -> str:
+    """Cookie SameSite attribute. "lax" is right for same-site prod deployments
+    (cockpit and api on the same base domain). For local dev where cockpit is
+    on `localhost` and api is on `api.localhost`, browsers treat those as
+    cross-site and SameSite=Lax blocks the cookie on cross-site XHR — set to
+    "none" in that case. SameSite=None requires Secure=true (browser-enforced).
+    """
+    return os.getenv("SRW_COOKIE_SAMESITE", "lax").lower()
+
+
 def _absolute_lifetime() -> timedelta:
     return timedelta(
         seconds=int(os.getenv("SRW_SESSION_ABSOLUTE_TIMEOUT_S", "2592000"))
@@ -107,7 +117,7 @@ def _set_session_cookie(resp: Response, session_id: str) -> None:
         domain=_cookie_domain(),
         secure=_cookie_secure(),
         httponly=True,
-        samesite="lax",
+        samesite=_cookie_samesite(),
     )
 
 
@@ -129,7 +139,7 @@ def _set_pre_auth_cookie(resp: Response, pre_auth_id: str) -> None:
         domain=_cookie_domain(),
         secure=_cookie_secure(),
         httponly=True,
-        samesite="lax",
+        samesite=_cookie_samesite(),
     )
 
 

@@ -1,0 +1,618 @@
+"""Per-resource access checks for the orchestrator API.
+
+This module is the home for the "can user U see / act on resource R?"
+question. ``security/auth.py`` resolves *who* the caller is; this module
+resolves *what* they're allowed to touch. They're deliberately split:
+
+* auth.py loads identity from a session cookie / Bearer / MCP header.
+* access.py applies the visibility model: a user can see a resource iff
+  (a) they own it, (b) they're a member of a project that owns it,
+  (c) they're an admin. MCP tokens further restrict by scope.
+
+Helpers are direct async functions (no FastAPI ``Depends`` factory),
+matching the inline ``await require_approved_user(request, db)`` style
+already used across ~86 endpoints in main.py. Each function returns the
+loaded resource on success so callers don't refetch.
+
+Status code policy: 404 when the resource doesn't exist, 403 when it
+does but the caller lacks access. Same shape as H1-H5, decided in
+``docs/multi_tenancy.md`` open-question #1.
+
+The H1-H5 hotfix helpers (``user_can_access_ide_entity``,
+``require_project_owner``, ``require_sudo_request_authority``) moved
+here from main.py without behavior changes — F2-F7 will add the new
+helpers (``require_job_access``, ``require_project_member``, etc.) to
+new endpoints. F1 is a pure foundation: no endpoint behavior changes,
+just the home for the next four bundles of work.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+from uuid import UUID
+
+from fastapi import HTTPException, Request
+
+from security.auth import require_approved_user
+
+
+Role = Literal["viewer", "editor", "owner"]
+_ROLE_RANK: dict[str, int] = {"viewer": 0, "editor": 1, "owner": 2}
+
+
+def _role_satisfies(actual: str | None, minimum: Role) -> bool:
+    """Whether ``actual`` (a row from project_members) clears ``minimum``."""
+    if actual is None:
+        return False
+    actual_rank = _ROLE_RANK.get(actual)
+    if actual_rank is None:
+        return False
+    return actual_rank >= _ROLE_RANK[minimum]
+
+
+# =============================================================================
+# MCP scope guards — applied on top of identity-based visibility
+# =============================================================================
+#
+# MCP tokens carry a legacy scope string in ``user['scopes'][0]``. F7 plumbs
+# it through ``_get_user_from_mcp_headers`` (in security/auth.py) into the
+# resolved user dict, so the helpers below can narrow further:
+#
+#   'user'           — no narrowing. Identity already restricts to the
+#                       caller's own data.
+#   'all'            — no narrowing at this layer. Admin-equivalent for the
+#                       *user* (resolved from realm role), not for the token.
+#                       A non-admin holding an 'all' token still only sees
+#                       their own data — they don't gain admin powers.
+#   'project:<uuid>' — caller can only see resources tied to that one
+#                       project. Personal resources (threads, builder
+#                       sessions) become inaccessible since they have no
+#                       project. See open-question #3 in
+#                       ``docs/multi_tenancy.md``.
+#
+# Cookie / OIDC / PAT auth paths leave ``scopes`` empty or carry non-legacy
+# entries; the guards below short-circuit to "no narrowing" for anything
+# that doesn't look like ``project:<uuid>``.
+
+
+def _scope_project_id(user: dict[str, Any]) -> UUID | None:
+    """Return the UUID a token is project-scoped to, or None.
+
+    Returns None for cookie/OIDC/PAT auth, for legacy MCP scopes ``user``
+    or ``all``, and for malformed values. Malformed ``project:<bad>``
+    returns ``None`` here; :func:`_scope_permits_project` below treats
+    that as "deny everything" so callers fail closed.
+    """
+    scopes = user.get("scopes") or []
+    if not scopes:
+        return None
+    scope = scopes[0]
+    if not isinstance(scope, str) or not scope.startswith("project:"):
+        return None
+    try:
+        return UUID(scope.split(":", 1)[1])
+    except (ValueError, IndexError):
+        # Sentinel: a project-scoped token with an unparseable UUID.
+        # Treat as a permanently-empty scope by returning a constant
+        # all-zero UUID that no project will ever match.
+        return UUID("00000000-0000-0000-0000-000000000000")
+
+
+def _scope_permits_project(user: dict[str, Any], project_id: str | UUID | None) -> bool:
+    """Whether the caller's MCP scope (if any) allows access to ``project_id``.
+
+    No scope → always True. ``project:<uuid>`` scope → True iff the project
+    matches. Anything else → True (no project-shape restriction). A None
+    ``project_id`` against a project-scoped token returns False — there's
+    no project to match.
+    """
+    scope_pid = _scope_project_id(user)
+    if scope_pid is None:
+        return True
+    if project_id is None:
+        return False
+    try:
+        target = project_id if isinstance(project_id, UUID) else UUID(str(project_id))
+    except (ValueError, TypeError):
+        return False
+    return target == scope_pid
+
+
+def _scope_permits_personal(user: dict[str, Any]) -> bool:
+    """Whether the caller's scope allows resources with no project link.
+
+    Threads and builder sessions have no project. A project-scoped MCP
+    token shouldn't be able to read or mutate them. ``user`` / ``all`` /
+    no-scope tokens always pass.
+    """
+    return _scope_project_id(user) is None
+
+
+# =============================================================================
+# Visibility — set-shaped + SQL-shaped
+# =============================================================================
+
+
+async def user_visible_project_ids(
+    user: dict[str, Any], db
+) -> set[UUID] | Literal["all"]:
+    """Project IDs the user can see via ``project_members``.
+
+    Admins return the sentinel string ``"all"`` so callers can short-circuit
+    the WHERE clause instead of materializing every project ID. An MCP
+    token with a ``project:<uuid>`` scope narrows the result to that one
+    project (admin powers are restricted by the token's scope).
+    """
+    scope_pid = _scope_project_id(user)
+    if user.get("is_admin"):
+        return {scope_pid} if scope_pid else "all"
+    rows = await db.get_projects_for_user(str(user["id"]))
+    visible = {row["id"] for row in rows}
+    if scope_pid:
+        return visible & {scope_pid}
+    return visible
+
+
+def user_visible_jobs_clause(
+    user: dict[str, Any],
+    *,
+    table_alias: str = "jobs",
+    user_param: str = "uid",
+    projects_param: str = "projects",
+) -> tuple[str, dict[str, Any]]:
+    """SQL fragment for ``WHERE`` restricting jobs to the caller's visibility.
+
+    For non-admins: ``(jobs.user_id = $uid OR jobs.project_id = ANY($projects))``.
+    For admins: ``TRUE`` (and the params dict is empty).
+
+    Callers are expected to format param placeholders to match their query
+    driver. We return a dict instead of a positional tuple so callers can
+    splice the fragment into a larger query without numbering collisions.
+
+    The ``projects`` value is left empty — callers must resolve the actual
+    project ID list via :func:`user_visible_project_ids` and pass it
+    through their own bind path. This keeps the helper synchronous and
+    side-effect-free.
+    """
+    if user.get("is_admin"):
+        return "TRUE", {}
+    fragment = (
+        f"({table_alias}.user_id = :{user_param} "
+        f"OR {table_alias}.project_id = ANY(:{projects_param}))"
+    )
+    return fragment, {user_param: user["id"], projects_param: []}
+
+
+# =============================================================================
+# Per-resource dependencies — call inline from endpoint bodies
+# =============================================================================
+
+
+async def require_project_member(
+    request: Request,
+    db,
+    project_id: str,
+    *,
+    min_role: Role = "viewer",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to be a project member at ``min_role`` or higher.
+
+    Returns ``(user, project)``. Admins bypass the role check. An MCP
+    token with a ``project:<uuid>`` scope must match ``project_id`` or
+    the call is denied. Raises 404 if the project doesn't exist, 403
+    otherwise.
+    """
+    user = await require_approved_user(request, db)
+    project = await db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    if not _scope_permits_project(user, project_id):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return user, project
+    role = await db.get_user_role_in_project(project_id, str(user["id"]))
+    if not _role_satisfies(role, min_role):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Project role '{min_role}' or higher required",
+        )
+    return user, project
+
+
+async def require_project_owner(
+    request: Request,
+    db,
+    project_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Owner-or-admin gate on a project. Returns ``(user, project)``.
+
+    Convenience wrapper for the common owner check (member mutations,
+    project mutations). Equivalent to
+    ``require_project_member(min_role='owner')`` but with a more specific
+    error string. MCP scope is enforced like ``require_project_member``.
+    """
+    user = await require_approved_user(request, db)
+    project = await db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    if not _scope_permits_project(user, project_id):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return user, project
+    role = await db.get_user_role_in_project(project_id, str(user["id"]))
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="Project owner role required")
+    return user, project
+
+
+async def require_job_access(
+    request: Request,
+    db,
+    job_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to be able to see ``job_id``. Returns ``(user, job)``.
+
+    Visible = caller owns the job, OR is a member of the job's project,
+    OR is admin. An MCP token with a ``project:<uuid>`` scope additionally
+    requires the job's ``project_id`` to match. Raises 404 if the job
+    doesn't exist, 403 otherwise.
+    """
+    user = await require_approved_user(request, db)
+    job = await db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    if not _scope_permits_project(user, job.get("project_id")):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return user, job
+    if str(job.get("user_id") or "") == str(user["id"]):
+        return user, job
+    project_id = job.get("project_id")
+    if project_id:
+        role = await db.get_user_role_in_project(str(project_id), str(user["id"]))
+        if role:
+            return user, job
+    raise HTTPException(status_code=403, detail="Not authorized to access this job")
+
+
+async def user_can_access_job(user: dict[str, Any], db, job_id: str | None) -> bool:
+    """Bool variant of :func:`require_job_access` for non-HTTP call sites.
+
+    Used by the SSE event filter in `/api/sudo/events` and similar streaming
+    paths where a missing or unauthorized job means "drop this event," not
+    "raise an exception." Admin short-circuits to True UNLESS the token is
+    project-scoped to a different project. Orphan job_ids (None / empty /
+    unknown) return False — fail closed for non-admins.
+    """
+    # Fast path: admins with no project: scope see every event regardless
+    # of whether the underlying job still exists (the SSE filter relies on
+    # this for deleted-job race conditions).
+    if user.get("is_admin") and _scope_project_id(user) is None:
+        return True
+    if not job_id:
+        return False
+    job = await db.get_job(job_id)
+    if not job:
+        return False
+    if not _scope_permits_project(user, job.get("project_id")):
+        return False
+    if user.get("is_admin"):
+        return True
+    if str(job.get("user_id") or "") == str(user["id"]):
+        return True
+    project_id = job.get("project_id")
+    if project_id:
+        role = await db.get_user_role_in_project(str(project_id), str(user["id"]))
+        if role:
+            return True
+    return False
+
+
+async def require_builder_session_owner(
+    request: Request,
+    db,
+    session_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to own the builder session. Returns ``(user, session)``.
+
+    Builder sessions are personal scratch space — there's no project
+    sharing. Admins bypass. A ``project:<uuid>``-scoped MCP token is
+    refused since the session has no project to bind to. Raises 404 if
+    the session doesn't exist, 403 if owned by someone else. Orphan
+    sessions (``user_id IS NULL``) are admin-only — fail closed.
+    """
+    user = await require_approved_user(request, db)
+    session = await db.get_builder_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=404, detail=f"Builder session '{session_id}' not found"
+        )
+    if not _scope_permits_personal(user):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return user, session
+    owner_id = session.get("user_id")
+    if owner_id and str(owner_id) == str(user["id"]):
+        return user, session
+    raise HTTPException(
+        status_code=403, detail="Not authorized to access this builder session"
+    )
+
+
+# =============================================================================
+# Specialized helpers — multi-table or service-backed
+# =============================================================================
+
+
+async def user_can_access_ide_entity(user: dict[str, Any], db, entity_id: str) -> bool:
+    """Whether ``user`` can open the embedded IDE for ``entity_id``.
+
+    The IDE proxy accepts either a job UUID or a thread UUID in the URL
+    (see ``ide_proxy_service._load_context``). We mirror that resolution
+    here: try job first, then thread.
+
+    Returns a bool — the caller decides whether to 404 (the WS path can't
+    easily distinguish "not found" from "no access" without leaking
+    existence) or to raise. Used by both ``ide_proxy_http`` and
+    ``ide_proxy_ws`` in main.py.
+
+    Admins pass (subject to scope). For jobs: owner or any project
+    member, narrowed by a ``project:<uuid>`` MCP scope. For threads:
+    owner only — a project-scoped token can't open a personal thread.
+    Orphan owners fail closed.
+    """
+    # Fast path: unscoped admin sees every entity (matches the legacy
+    # behavior the IDE proxy tests assert).
+    if user.get("is_admin") and _scope_project_id(user) is None:
+        return True
+    job = await db.get_job(entity_id)
+    if job:
+        if not _scope_permits_project(user, job.get("project_id")):
+            return False
+        if user.get("is_admin"):
+            return True
+        if str(job.get("user_id") or "") == str(user["id"]):
+            return True
+        project_id = job.get("project_id")
+        if project_id:
+            role = await db.get_user_role_in_project(str(project_id), str(user["id"]))
+            if role:
+                return True
+        return False
+    thread = await db.get_thread(entity_id)
+    if thread:
+        if not _scope_permits_personal(user):
+            return False
+        if user.get("is_admin"):
+            return True
+        return str(thread.get("user_id") or "") == str(user["id"])
+    return False
+
+
+async def require_sudo_request_authority(
+    request: Request,
+    db,
+    request_id: str,
+) -> dict[str, Any]:
+    """Require caller to be allowed to approve/deny a sudo request.
+
+    Authority = admin, OR project-owner of the related job. Job owners
+    CANNOT self-approve their own sudo requests — that would defeat the
+    gate. Orphan requests (no job or no project) are admin-only.
+
+    Returns the sudo request dict. Raises 404 if unknown, 403 otherwise.
+
+    Imports ``sudo_gate`` lazily so this module stays importable in tests
+    that don't bring up the gate service (and to avoid cycles via
+    ``main.py``).
+    """
+    from services.sudo_gate import sudo_gate  # noqa: PLC0415
+
+    user = await require_approved_user(request, db)
+    sudo_req = await sudo_gate.get_request(request_id)
+    if not sudo_req:
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    # Resolve the underlying job's project so we can apply the scope check
+    # uniformly even for the admin path.
+    job_id = sudo_req.get("job_id")
+    job_project_id = None
+    if job_id:
+        job = await db.get_job(str(job_id))
+        if job:
+            job_project_id = job.get("project_id")
+    if not _scope_permits_project(user, job_project_id):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return sudo_req
+    if job_project_id:
+        role = await db.get_user_role_in_project(str(job_project_id), str(user["id"]))
+        if role == "owner":
+            return sudo_req
+    raise HTTPException(
+        status_code=403, detail="Not authorized to act on this sudo request"
+    )
+
+
+# =============================================================================
+# Datasource visibility — credentials are NEVER returned via REST
+# =============================================================================
+
+
+def redact_datasource(ds: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``ds`` with the credentials field stripped.
+
+    F3 policy: credentials never leave the orchestrator over REST. The
+    agent reads them via internal dispatch; the cockpit's edit form is
+    expected to use a "leave blank to keep existing" UX. See
+    ``docs/multi_tenancy.md`` open-question #2 (decided: strip always).
+    """
+    if not ds:
+        return ds
+    out = dict(ds)
+    out.pop("credentials", None)
+    return out
+
+
+def redact_datasources(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """List variant of :func:`redact_datasource`."""
+    return [redact_datasource(row) for row in rows]
+
+
+async def user_can_access_datasource(
+    user: dict[str, Any], db, ds: dict[str, Any]
+) -> bool:
+    """Whether ``user`` can see ``ds`` in list/get responses.
+
+    Visible = admin, OR the caller created the datasource, OR the caller
+    is a member of any project the datasource is linked to. A
+    ``project:<uuid>`` MCP scope narrows the result: the datasource must
+    be linked to the scoped project (creator-only access doesn't survive
+    a project-scope mismatch).
+
+    Returns False for everything else, including "global" datasources
+    (`is_global=true, no project link`) the caller didn't create — those
+    are admin-only by design. Agents access globals via internal dispatch,
+    not through this gate.
+    """
+    scope_pid = _scope_project_id(user)
+    project_ids = await db.list_datasource_projects(str(ds["id"]))
+    if scope_pid is not None:
+        # Project-scoped tokens see only datasources linked to that project.
+        if scope_pid not in {UUID(str(pid)) for pid in project_ids}:
+            return False
+        # ... and only if the user is also a project member (or admin).
+        if user.get("is_admin"):
+            return True
+        role = await db.get_user_role_in_project(str(scope_pid), str(user["id"]))
+        return bool(role)
+    if user.get("is_admin"):
+        return True
+    if str(ds.get("created_by") or "") == str(user["id"]):
+        return True
+    for pid in project_ids:
+        role = await db.get_user_role_in_project(str(pid), str(user["id"]))
+        if role:
+            return True
+    return False
+
+
+async def require_datasource_access(
+    request: Request, db, datasource_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to be able to see ``datasource_id``.
+
+    Returns ``(user, datasource)``. The datasource dict still contains
+    the raw ``credentials`` field — callers MUST run it through
+    :func:`redact_datasource` before returning it to the client. Keeping
+    them in the loaded dict lets callers like ``test_datasource`` use the
+    creds internally without a second DB round-trip.
+
+    Raises 404 if missing, 403 otherwise.
+    """
+    user = await require_approved_user(request, db)
+    ds = await db.get_datasource(datasource_id)
+    if not ds:
+        raise HTTPException(
+            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+    if not await user_can_access_datasource(user, db, ds):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this datasource"
+        )
+    return user, ds
+
+
+async def require_datasource_owner(
+    request: Request, db, datasource_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to be the creator of ``datasource_id``, or admin.
+
+    Used for mutations (PUT, DELETE) and the connectivity test. Returns
+    ``(user, datasource)``. The datasource dict still contains raw
+    credentials — redact before returning to the client. A
+    ``project:<uuid>`` MCP scope restricts mutation to datasources
+    linked to that project (the token can't reach a creator's other
+    datasources).
+
+    Raises 404 if missing, 403 if caller is neither creator nor admin
+    or if the scope rejects.
+    """
+    user = await require_approved_user(request, db)
+    ds = await db.get_datasource(datasource_id)
+    if not ds:
+        raise HTTPException(
+            status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+    scope_pid = _scope_project_id(user)
+    if scope_pid is not None:
+        project_ids = await db.list_datasource_projects(str(datasource_id))
+        if scope_pid not in {UUID(str(pid)) for pid in project_ids}:
+            raise HTTPException(
+                status_code=403, detail="Access denied by MCP token scope"
+            )
+    if user.get("is_admin"):
+        return user, ds
+    if str(ds.get("created_by") or "") == str(user["id"]):
+        return user, ds
+    raise HTTPException(
+        status_code=403, detail="Only the datasource creator or an admin can do this"
+    )
+
+
+# =============================================================================
+# MCP scope — additional filter on top of user visibility
+# =============================================================================
+
+
+def apply_mcp_scope(
+    user: dict[str, Any],
+    *,
+    table_alias: str = "jobs",
+    scope_project_param: str = "scope_project",
+) -> tuple[str, dict[str, Any]]:
+    """Restrict a query further by the caller's MCP token scope.
+
+    Per open-question #3 (doc): ``scope='all'`` means "admin-equivalent
+    for this token's user". A non-admin holding an ``'all'`` token does
+    NOT get global access — they get their own visibility set, same as
+    a session cookie. A ``'user'`` scope is the explicit form of that
+    (same effect). ``'project:<uuid>'`` narrows to one project.
+
+    Returns ``(fragment, params)`` to AND into the visibility WHERE. An
+    empty fragment ``""`` means "no further restriction".
+
+    Only applies when ``user['auth_method'] == 'mcp'`` (or the future
+    PAT path that carries ``scopes=['<one-mcp-scope>']``). For session
+    cookies and OIDC Bearer paths, returns ``("", {})``.
+    """
+    scopes = user.get("scopes") or []
+    if not scopes:
+        return "", {}
+    # Legacy MCP rows carry exactly one scope string; PAT rows have a list
+    # of action scopes (not the legacy 'user'/'all'/'project:<uuid>' shape).
+    # Treat anything that doesn't look like a legacy MCP scope as a no-op
+    # here — PAT scopes are checked by the action-scope decorator, not by
+    # row-level visibility.
+    scope = scopes[0]
+    if scope in ("", "all", "user"):
+        # 'all' = admin-equivalent for this user, but actual admin-bypass
+        # is gated on the realm role, not the scope. So 'all' for a non-
+        # admin still respects user visibility. Both are no-ops here.
+        return "", {}
+    if scope.startswith("project:"):
+        project_id_str = scope.split(":", 1)[1]
+        try:
+            project_uuid = UUID(project_id_str)
+        except ValueError:
+            # Malformed scope — fail closed by intersecting with the empty
+            # set. The caller's outer query becomes unsatisfiable, which
+            # is what we want for a bad token.
+            return f"{table_alias}.project_id = :{scope_project_param}", {
+                scope_project_param: None,
+            }
+        return f"{table_alias}.project_id = :{scope_project_param}", {
+            scope_project_param: project_uuid,
+        }
+    return "", {}

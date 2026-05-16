@@ -242,6 +242,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SRW_COOKIE_SECURE
+            - name: SRW_COOKIE_SAMESITE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_COOKIE_SAMESITE
             - name: SRW_SESSION_IDLE_TIMEOUT_S
               valueFrom:
                 configMapKeyRef:

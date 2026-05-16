@@ -86,7 +86,13 @@ export interface Datasource {
   description: string | null;
   type: DatasourceType;
   connection_url: string | null;
-  credentials: Record<string, unknown>;
+  /**
+   * F3: credentials are never returned over REST anymore — the field is
+   * stripped server-side (see `redact_datasource` in
+   * `orchestrator/security/access.py`). Edit forms must use the
+   * "leave blank to keep existing" UX.
+   */
+  credentials?: Record<string, unknown>;
   cli_hint: string | null;
   default_branch: string | null;
   job_id: string | null;

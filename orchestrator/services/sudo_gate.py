@@ -197,6 +197,7 @@ class SudoGateService:
             "request_decided",
             {
                 "id": str(request_id),
+                "job_id": str(row["job_id"]) if row.get("job_id") else None,
                 "status": "approved",
                 "decided_by": decided_by,
             },
@@ -242,6 +243,7 @@ class SudoGateService:
             "request_decided",
             {
                 "id": str(request_id),
+                "job_id": str(row["job_id"]) if row.get("job_id") else None,
                 "status": "denied",
                 "decided_by": decided_by,
                 "reason": reason,
@@ -276,7 +278,7 @@ class SudoGateService:
                         decided_by = 'system',
                         decision_reason = 'TTL expired'
                     WHERE status = 'pending' AND expires_at < NOW()
-                    RETURNING id, nats_reply_subject
+                    RETURNING id, job_id, nats_reply_subject
                     """
                 )
 
@@ -305,6 +307,7 @@ class SudoGateService:
                     "request_decided",
                     {
                         "id": str(row["id"]),
+                        "job_id": str(row["job_id"]) if row.get("job_id") else None,
                         "status": "expired",
                         "decided_by": "system",
                     },
