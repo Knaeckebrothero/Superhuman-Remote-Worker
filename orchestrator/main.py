@@ -5426,9 +5426,14 @@ async def get_sudo_request(request_id: str) -> dict:
 
 @app.post("/api/sudo/requests/{request_id}/approve")
 async def approve_sudo_request(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a pending sudo request."""
+    """Approve a pending sudo request. Caller must be project owner of the related job, or admin."""
+    # H4: pre-fix, any authenticated user could approve any job's
+    # privileged shell command — a trust escalation, not just info leak.
+    await _require_sudo_request_authority(request, request_id)
     reason = body.reason if body else ""
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5441,8 +5446,11 @@ async def approve_sudo_request(
 
 
 @app.post("/api/sudo/requests/{request_id}/deny")
-async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
-    """Deny a pending sudo request."""
+async def deny_sudo_request(
+    request_id: str, body: SudoDenyRequest, request: Request
+) -> dict:
+    """Deny a pending sudo request. Caller must be project owner of the related job, or admin."""
+    await _require_sudo_request_authority(request, request_id)
     result = await sudo_gate.deny_request(request_id, reason=body.reason)
     if not result:
         raise HTTPException(
@@ -5455,9 +5463,12 @@ async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
 
 @app.post("/api/sudo/requests/{request_id}/approve-upgrade")
 async def approve_sudo_vm_upgrade(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a vm_upgrade sudo request — provisions a VM and resumes the job."""
+    """Approve a vm_upgrade sudo request — provisions a VM and resumes the job. Caller must be project owner of the related job, or admin."""
+    await _require_sudo_request_authority(request, request_id)
     reason = body.reason if body else "VM upgrade approved"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5474,9 +5485,12 @@ async def approve_sudo_vm_upgrade(
 
 @app.post("/api/sudo/requests/{request_id}/resume-without-vm")
 async def resume_sudo_without_vm(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a vm_upgrade request but resume without provisioning a VM."""
+    """Approve a vm_upgrade request but resume without provisioning a VM. Caller must be project owner of the related job, or admin."""
+    await _require_sudo_request_authority(request, request_id)
     reason = body.reason if body else "Resume without VM"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -7483,6 +7497,8 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     # Neuter code-server's service worker — it caches aggressively behind the
     # reverse proxy and breaks subsequent visits (infinite loading screen).
     # Return a no-op worker so the browser doesn't intercept fetches.
+    # Pre-auth: the script body is non-sensitive and browsers may fetch it
+    # in the background even after a cookie expires.
     if path.endswith("serviceWorker.js") or path.endswith("service-worker.js"):
         return Response(
             content="self.addEventListener('install',()=>self.skipWaiting());"
@@ -7490,6 +7506,17 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
             media_type="application/javascript",
             headers={"cache-control": "no-store"},
         )
+
+    # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
+    # the job/thread UUID got full code-server access (file r/w, terminal).
+    user = await require_approved_user(request, postgres_db)
+    if not await _user_can_access_ide_entity(user, job_id):
+        logger.warning(
+            "IDE HTTP: user %s denied access to entity %s",
+            user["id"],
+            job_id,
+        )
+        raise HTTPException(status_code=403, detail="IDE access denied")
 
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
@@ -7549,6 +7576,25 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     import asyncio
 
     import websockets
+
+    # H1: close the zero-auth hole. Browsers send the BFF session cookie on
+    # WS handshake automatically; pre-fix, this endpoint accepted any caller
+    # who knew (or guessed) the entity UUID. Same pattern as persistent_ws_proxy.
+    user = await resolve_ws_user(ws, postgres_db)
+    if not user:
+        await ws.close(code=4401, reason="Authentication required")
+        return
+    if not user.get("is_approved"):
+        await ws.close(code=4403, reason="Account pending approval")
+        return
+    if not await _user_can_access_ide_entity(user, job_id):
+        logger.warning(
+            "IDE WS: user %s denied access to entity %s",
+            user["id"],
+            job_id,
+        )
+        await ws.close(code=4403, reason="IDE access denied")
+        return
 
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
@@ -14947,6 +14993,92 @@ async def _require_admin(request: Request) -> dict[str, Any]:
     return user
 
 
+# Hotfix-grade access helpers (P0 from docs/multi_tenancy.md). These live
+# here for the H1-H4 patches; F1 will move them into
+# orchestrator/security/access.py alongside the rest of the visibility model.
+
+
+async def _user_can_access_ide_entity(user: dict[str, Any], entity_id: str) -> bool:
+    """Check IDE proxy access for a job or thread UUID.
+
+    Mirrors ide_proxy_service._load_context: tries job first, then thread.
+    Admins pass; job owners and any project member pass for jobs; thread
+    owners pass for threads. Fail-closed on missing/orphan owner.
+    """
+    if user.get("is_admin"):
+        return True
+    job = await postgres_db.get_job(entity_id)
+    if job:
+        if str(job.get("user_id") or "") == str(user["id"]):
+            return True
+        project_id = job.get("project_id")
+        if project_id:
+            role = await postgres_db.get_user_role_in_project(
+                str(project_id), str(user["id"])
+            )
+            if role:
+                return True
+        return False
+    thread = await postgres_db.get_thread(entity_id)
+    if thread:
+        return str(thread.get("user_id") or "") == str(user["id"])
+    return False
+
+
+async def _require_project_owner(
+    request: Request, project_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to be owner of project_id, or admin.
+
+    Returns (user, project). Raises 404 if the project doesn't exist,
+    403 otherwise.
+    """
+    user = await require_approved_user(request, postgres_db)
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    if user.get("is_admin"):
+        return user, project
+    role = await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
+    if role != "owner":
+        raise HTTPException(status_code=403, detail="Project owner role required")
+    return user, project
+
+
+async def _require_sudo_request_authority(
+    request: Request, request_id: str
+) -> dict[str, Any]:
+    """Require caller to be authorized to approve/deny this sudo request.
+
+    Authorization = admin, or project owner of the related job. Job
+    owners can NOT self-approve their own sudo requests (that would
+    defeat the gate). Orphan requests (no job or no project) are
+    admin-only.
+
+    Returns the sudo request dict. Raises 404 if unknown, 403 otherwise.
+    """
+    user = await require_approved_user(request, postgres_db)
+    sudo_req = await sudo_gate.get_request(request_id)
+    if not sudo_req:
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    if user.get("is_admin"):
+        return sudo_req
+    job_id = sudo_req.get("job_id")
+    if job_id:
+        job = await postgres_db.get_job(str(job_id))
+        if job and job.get("project_id"):
+            role = await postgres_db.get_user_role_in_project(
+                str(job["project_id"]), str(user["id"])
+            )
+            if role == "owner":
+                return sudo_req
+    raise HTTPException(
+        status_code=403, detail="Not authorized to act on this sudo request"
+    )
+
+
 async def _codex_proxy_request(
     method: str,
     path: str,
@@ -15601,8 +15733,13 @@ async def get_user(user_id: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/users")
 async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
-    """Create a new user with a default project (requires authentication)."""
-    await require_approved_user(request, postgres_db)
+    """Create a new user with a default project. Admin-only.
+
+    Real users are JIT-provisioned via Keycloak OIDC login (see
+    upsert_user_from_oidc). This endpoint is for admin user management
+    and tests.
+    """
+    await _require_admin(request)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
@@ -15665,8 +15802,13 @@ async def update_user(
 
 @app.delete("/api/users/{user_id}")
 async def delete_user(user_id: str, request: Request) -> dict[str, str]:
-    """Delete a user (requires authentication)."""
-    await require_approved_user(request, postgres_db)
+    """Delete a user. Admin-only.
+
+    Self-service deletion isn't exposed yet — it needs Keycloak sync and
+    explicit handling of orphaned jobs/threads/project_members. Add a
+    separate endpoint if/when the cockpit needs it.
+    """
+    await _require_admin(request)
     success = await postgres_db.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -15875,8 +16017,14 @@ async def _ensure_project_cloud_resources(
 
 
 @app.post("/api/projects")
-async def create_project(body: ProjectCreate) -> dict[str, Any]:
+async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any]:
     """Create a new project with the requesting user as owner."""
+    # H5: pre-fix, this endpoint had no auth at all and trusted body.user_id,
+    # so any unauthenticated caller could create projects owned by anyone.
+    # Admins keep the ability to create on behalf of others (legitimate
+    # setup flow); regular users get bound to themselves.
+    user = await require_approved_user(request, postgres_db)
+    owner_id = body.user_id if user.get("is_admin") else str(user["id"])
     try:
         project = await postgres_db.create_project(
             name=body.name,
@@ -15889,7 +16037,7 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
         # Add creator as owner
         await postgres_db.add_project_member(
             project_id=str(project["id"]),
-            user_id=body.user_id,
+            user_id=owner_id,
             role="owner",
         )
 
@@ -15906,9 +16054,9 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                     is_managed=True,
                 )
                 # Grant creator read access
-                if body.user_id:
+                if owner_id:
                     try:
-                        creator = await postgres_db.get_user(body.user_id)
+                        creator = await postgres_db.get_user(owner_id)
                         if creator and creator.get("email"):
                             await gitea_client.grant_user_repo_access(
                                 creator["email"], repo_name
@@ -16019,8 +16167,13 @@ async def get_project(project_id: str) -> dict[str, Any]:
 
 
 @app.patch("/api/projects/{project_id}")
-async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]:
-    """Update a project."""
+async def update_project(
+    project_id: str, body: ProjectUpdate, request: Request
+) -> dict[str, str]:
+    """Update a project. Caller must be a project owner or admin."""
+    # H5: pre-fix, anyone could rename any project, change its goal, or
+    # toggle cloud-storage settings.
+    await _require_project_owner(request, project_id)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -16050,11 +16203,11 @@ async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]
 
 
 @app.delete("/api/projects/{project_id}")
-async def delete_project(project_id: str) -> dict[str, str]:
-    """Delete a project. Cannot delete default projects."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def delete_project(project_id: str, request: Request) -> dict[str, str]:
+    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
+    # H5: pre-fix, anyone could cascade-delete any project (repos,
+    # Keycloak groups, cloud folders, knowledge index, ...).
+    _, project = await _require_project_owner(request, project_id)
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
@@ -16125,11 +16278,14 @@ async def list_project_members(project_id: str) -> list[dict[str, Any]]:
 
 
 @app.post("/api/projects/{project_id}/members")
-async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[str, Any]:
-    """Add a member to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def add_project_member(
+    project_id: str, body: ProjectMemberAdd, request: Request
+) -> dict[str, Any]:
+    """Add a member to a project. Caller must be a project owner or admin."""
+    # H3: pre-fix, anyone could invite themselves as owner of any project
+    # and then access everything in it. This is the foundational
+    # privilege-escalation path that opens every other gate.
+    _, project = await _require_project_owner(request, project_id)
     try:
         result = await postgres_db.add_project_member(
             project_id=project_id,
@@ -16170,9 +16326,11 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
 
 @app.patch("/api/projects/{project_id}/members/{user_id}")
 async def update_project_member(
-    project_id: str, user_id: str, body: ProjectMemberUpdate
+    project_id: str, user_id: str, body: ProjectMemberUpdate, request: Request
 ) -> dict[str, str]:
-    """Update a member's role in a project."""
+    """Update a member's role in a project. Caller must be a project owner or admin."""
+    # H3: role changes are sensitive — restrict to owners/admins.
+    await _require_project_owner(request, project_id)
     success = await postgres_db.update_project_member_role(
         project_id=project_id, user_id=user_id, role=body.role
     )
@@ -16182,8 +16340,20 @@ async def update_project_member(
 
 
 @app.delete("/api/projects/{project_id}/members/{user_id}")
-async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]:
-    """Remove a member from a project. Cannot remove the last owner."""
+async def remove_project_member(
+    project_id: str, user_id: str, request: Request
+) -> dict[str, str]:
+    """Remove a member from a project. Owner/admin can remove anyone; any member can remove themselves. Cannot remove the last owner."""
+    # H3: pre-fix, anyone could remove anyone (only the last-owner check
+    # was enforced). Allow self-removal so members can leave projects.
+    caller = await require_approved_user(request, postgres_db)
+    if str(caller["id"]) != str(user_id) and not caller.get("is_admin"):
+        caller_role = await postgres_db.get_user_role_in_project(
+            project_id, str(caller["id"])
+        )
+        if caller_role != "owner":
+            raise HTTPException(status_code=403, detail="Project owner role required")
+
     # Check if this is the last owner
     role = await postgres_db.get_user_role_in_project(project_id, user_id)
     if role == "owner":

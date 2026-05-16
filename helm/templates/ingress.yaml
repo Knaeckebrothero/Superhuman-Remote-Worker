@@ -21,8 +21,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -57,8 +61,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- if .Values.ingress.cors.enabled }}
     traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-cors@kubernetescrd
     {{- end }}
@@ -97,8 +105,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -135,8 +147,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -173,8 +189,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -211,8 +231,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -249,8 +273,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -287,8 +315,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -325,8 +357,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -363,8 +399,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
