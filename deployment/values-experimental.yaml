@@ -72,10 +72,6 @@ codexProxy:
 # -----------------------------------------------------------------------------
 opencloud:
   enabled: true
-  # Chart default is 64Gi (sized for prod's TUS upload buffer); Longhorn
-  # on the homelab can't schedule replicas that large right now, so cap
-  # the experimental cluster at 16Gi until disk capacity is sorted.
-  dataStorageSize: "16Gi"
 nextcloud:
   enabled: false
 # -----------------------------------------------------------------------------

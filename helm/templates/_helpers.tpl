@@ -174,19 +174,27 @@ ingress / TLS host strings without duplicating per-component logic.
 {{- . | trimPrefix "https://" | trimPrefix "http://" -}}
 {{- end }}
 
+{{/*
+URL scheme — "https" when TLS is enabled on the ingress, "http" otherwise.
+Centralized so every URL helper picks up local-dev (no-TLS) deployments.
+*/}}
+{{- define "srw.urlScheme" -}}
+{{- if .Values.ingress.tls.enabled -}}https{{- else -}}http{{- end -}}
+{{- end }}
+
 {{- define "srw.cockpitUrl" -}}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "cockpit" "default" "")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "cockpit" "default" "")) }}
 {{- end }}
 
 {{- define "srw.apiUrl" -}}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
 {{- end }}
 
 {{- define "srw.authUrl" -}}
 {{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.externalIssuerUrl }}
 {{- .Values.keycloak.externalIssuerUrl }}
 {{- else }}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "auth" "default" "auth")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "auth" "default" "auth")) }}
 {{- end }}
 {{- end }}
 
@@ -307,7 +315,7 @@ CLOUD_SERVICE_PASSWORD). Resolves to either:
 {{- if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
 {{- .Values.gitea.externalUrl }}
 {{- else }}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "git" "default" "git")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "git" "default" "git")) }}
 {{- end }}
 {{- end }}
 
@@ -328,7 +336,7 @@ Internal cluster URL for Gitea — used by orchestrator/agents for back-end API 
 {{- if and (not .Values.opencloud.enabled) (not .Values.nextcloud.enabled) .Values.cloud.externalUrl }}
 {{- .Values.cloud.externalUrl }}
 {{- else }}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "cloud" "default" "cloud")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "cloud" "default" "cloud")) }}
 {{- end }}
 {{- end }}
 
@@ -345,14 +353,14 @@ Falls back to externalUrl if externalServiceUrl is not set.
 {{- end }}
 
 {{- define "srw.mcpUrl" -}}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "mcp" "default" "mcp")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "mcp" "default" "mcp")) }}
 {{- end }}
 
 {{- define "srw.headscaleUrl" -}}
 {{- if .Values.headscale.url }}
 {{- .Values.headscale.url }}
 {{- else }}
-{{- printf "https://%s" (include "srw.host" (dict "context" . "key" "headscale" "default" "headscale")) }}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "headscale" "default" "headscale")) }}
 {{- end }}
 {{- end }}
 
