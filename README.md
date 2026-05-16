@@ -103,10 +103,19 @@ Each agent is a general-purpose LangGraph worker that can:
 
 - [Quick Start](#quick-start)
 - [Docker Compose Deployment](#docker-compose-deployment)
+- [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d)
 - [Development Setup](#development-setup)
 - [Architecture](#architecture)
 - [Debugging](#debugging)
 - [License](#license)
+
+### Which path should I use?
+
+| Goal | Path |
+|------|------|
+| Iterate on Python code (orchestrator, agent) as fast as possible | [Development Setup](#development-setup) — services run natively on the host with `uvicorn --reload` / `npm start` |
+| Run the full stack without Kubernetes (smaller deployments, no k8s API) | [Docker Compose Deployment](#docker-compose-deployment) |
+| Reproduce the production Helm chart locally to test K8s-specific code paths (provisioners, ingress, cert-manager, OIDC, etc.) | [Local Kubernetes Setup (k3d)](#local-kubernetes-setup-k3d) |
 
 ## Quick Start
 
@@ -223,6 +232,174 @@ podman-compose down -v
 ```
 
 For local builds (no GHCR access), use `docker-compose.local.yaml` instead — it builds all custom images from source.
+
+## Local Kubernetes Setup (k3d)
+
+Runs the **production Helm chart** on a local [k3d](https://k3d.io) cluster — k3s in Docker. Use this when you need to test K8s-specific code paths (workspace pod provisioning, ingress routing, cert-manager + OIDC, the Keycloak realm/client flow, etc.). The cluster can be started and stopped like any Docker container, so it doesn't consume resources when you're not working.
+
+### Prerequisites
+
+Install on the host (Fedora 43 commands shown; adapt for your distro):
+
+```bash
+# Docker Engine (k3d runs k3s as Docker containers)
+sudo dnf -y install dnf-plugins-core
+sudo dnf config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo
+sudo dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER && newgrp docker
+
+# kubectl + helm from Fedora repos
+sudo dnf -y install kubernetes-client helm
+
+# k3d (no RPM, official installer)
+curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | sudo bash
+
+# mkcert — issues a local CA that browsers + the cluster will trust
+sudo dnf -y install mkcert nss-tools
+mkcert -install                                                       # user trust + Firefox NSS
+sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install                # system trust + Chrome NSS (must use the same CAROOT)
+```
+
+Sanity check: `docker run --rm hello-world`, `k3d version`, `kubectl version --client`, `helm version`, `mkcert -CAROOT`.
+
+### 1. Create the cluster
+
+```bash
+k3d cluster create srw \
+  --servers 1 \
+  --port "80:80@loadbalancer" \
+  --port "443:443@loadbalancer" \
+  --registry-create srw-registry:0.0.0.0:5000
+```
+
+Single node, host ports 80/443 mapped to the cluster's traefik, plus a local image registry on `localhost:5000` for later (Tilt/Skaffold workflows).
+
+### 2. Install cert-manager + a mkcert ClusterIssuer
+
+The chart's ingresses request TLS certs via cert-manager. Locally we issue them from your mkcert root CA so browsers trust them without a security warning.
+
+```bash
+helm repo add jetstack https://charts.jetstack.io --force-update
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace \
+  --version v1.16.2 --set crds.enabled=true
+
+# Wait for cert-manager to be ready
+kubectl -n cert-manager rollout status deploy/cert-manager
+kubectl -n cert-manager rollout status deploy/cert-manager-webhook
+kubectl -n cert-manager rollout status deploy/cert-manager-cainjector
+
+# Wrap mkcert's CA as a cert-manager ClusterIssuer
+kubectl -n cert-manager create secret tls mkcert-ca-key-pair \
+  --cert="$HOME/.local/share/mkcert/rootCA.pem" \
+  --key="$HOME/.local/share/mkcert/rootCA-key.pem"
+
+kubectl apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata: { name: mkcert-issuer }
+spec: { ca: { secretName: mkcert-ca-key-pair } }
+EOF
+```
+
+### 3. Bootstrap the SRW namespace + VM SSH key secret
+
+The orchestrator mounts a `srw-vm-ssh-key` Secret unconditionally (for VM workspaces in prod). Locally, a dummy keypair is fine.
+
+```bash
+kubectl create namespace srw
+
+ssh-keygen -t ed25519 -f /tmp/vm-key -N "" -q
+kubectl -n srw create secret generic srw-vm-ssh-key \
+  --from-file=id_ed25519=/tmp/vm-key \
+  --from-file=id_ed25519.pub=/tmp/vm-key.pub
+rm /tmp/vm-key /tmp/vm-key.pub
+```
+
+### 4. Copy the local values file and install the chart
+
+```bash
+cp deployment/values-local.example.yaml deployment/values-local.yaml
+$EDITOR deployment/values-local.yaml   # paste at least one LLM key (OPENAI_API_KEY / ANTHROPIC_API_KEY / GROQ_API_KEY)
+
+helm install srw ./helm -n srw -f deployment/values-local.yaml
+```
+
+`deployment/values-local.yaml` is gitignored (it holds your LLM keys). Everything else in it is dev-only stub credentials.
+
+### 5. Wait for pods, then log in
+
+```bash
+kubectl -n srw get pods -w
+# Ctrl-C once all pods are 1/1 Running (the orchestrator takes longest — ~5 init containers chained on database/keycloak/gitea readiness)
+```
+
+Open `https://localhost/` in your browser and log in:
+
+| Username | Password |
+|----------|----------|
+| `test`   | `test`   |
+
+The `test` user is pre-seeded in the Keycloak realm with `admin` + `user` roles, email already verified, mapped to `srw-admin` on Gitea — no approval flow, no email verification step.
+
+| URL | What it is |
+|-----|-----------|
+| `https://localhost/`        | Cockpit (the UI) |
+| `https://api.localhost/`    | Orchestrator REST API |
+| `https://auth.localhost/`   | Keycloak (admin console at `/admin`) |
+| `https://git.localhost/`    | Gitea |
+| `https://cloud.localhost/`  | OpenCloud |
+| `https://mcp.localhost/`    | MCP server |
+
+`*.localhost` resolves to `::1` automatically (RFC 6761 + glibc `myhostname` NSS), so there's no DNS config to do.
+
+### Daily usage
+
+```bash
+k3d cluster stop  srw        # frees host ports + resources, preserves PVCs and Helm release
+k3d cluster start srw        # back online in seconds
+k3d cluster list             # see all clusters and their state
+```
+
+Stopping the cluster also frees host port 443 — important if you also access the live homelab cluster from this machine on the same domain.
+
+### Updating the install
+
+After editing `values-local.yaml`:
+
+```bash
+helm upgrade srw ./helm -n srw -f deployment/values-local.yaml
+```
+
+After editing the chart itself (templates under `helm/`):
+
+```bash
+helm upgrade srw ./helm -n srw -f deployment/values-local.yaml
+# For some changes (env.js ConfigMap edits), force a pod restart:
+kubectl -n srw rollout restart deploy/srw-cockpit
+```
+
+### Full teardown / reset
+
+```bash
+helm uninstall srw -n srw                  # remove the release (PVCs are kept by chart annotation)
+kubectl delete namespace srw               # nuke everything including PVCs and the vm-ssh-key Secret
+k3d cluster delete srw                     # destroy the whole cluster (including the local registry)
+```
+
+### Troubleshooting
+
+- **Browser shows "Not secure"** — `sudo mkcert -install` was run *without* `CAROOT`, so root created a *second* CA. Re-run it as shown in Prerequisites. Then restart the browser (Firefox/Chrome cache the NSS db at process start).
+- **`localhost` opens the wrong cluster (e.g., your homelab cockpit)** — the local LAN DNS may map your prod domain's AAAA record to `::1`, which k3d also binds. Stop k3d (`k3d cluster stop srw`) when you're not using it, or recreate the cluster with IPv4-only port binds (`--port "0.0.0.0:443:443@loadbalancer"`).
+- **`ImagePullBackOff` with 401/403** — your GHCR packages are private. Create a pull secret and uncomment `global.imagePullSecrets` in `values-local.yaml`:
+  ```bash
+  kubectl -n srw create secret docker-registry ghcr-pull-secret \
+    --docker-server=ghcr.io \
+    --docker-username=<github-user> --docker-password=<github-PAT-with-read:packages>
+  ```
+- **`PersistentVolumeClaim ... is invalid: ... storage: Forbidden: field can not be less than previous value`** — you tried to shrink a PVC. Either bump the size back up in `values-local.yaml` or delete the PVC and re-upgrade (`kubectl -n srw delete pvc <name>`).
+- **Keycloak in `CreateContainerConfigError` for missing secret keys** — the realm import references env vars for every OIDC client (even disabled ones). Check that all keys from `values-local.example.yaml` are present in `values-local.yaml`.
 
 ## Development Setup
 
