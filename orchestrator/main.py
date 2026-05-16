@@ -104,6 +104,7 @@ from security.auth import (  # noqa: E402
     cleanup_expired_sessions,
 )
 from security.access import (  # noqa: E402
+    mcp_scope_project_id,
     redact_datasource,
     redact_datasources,
     require_builder_session_owner,
@@ -113,9 +114,12 @@ from security.access import (  # noqa: E402
     require_project_member,
     require_project_owner,
     require_sudo_request_authority,
+    require_thread_owner,
+    user_can_access_any_job,
     user_can_access_datasource,
     user_can_access_ide_entity,
     user_can_access_job,
+    user_visible_project_ids,
 )
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
@@ -3523,23 +3527,6 @@ async def workspace_status() -> dict[str, Any]:
     }
 
 
-def _get_mcp_scope(request: Request) -> tuple[str | None, str | None]:
-    """Extract MCP scope from request headers (set by the MCP server).
-
-    Returns (user_id, scope) if the request comes from an authenticated
-    MCP client, otherwise (None, None). Headers are only trusted when
-    the X-Internal-Key matches MCP_INTERNAL_KEY.
-    """
-    mcp_user = request.headers.get("X-MCP-User-Id")
-    mcp_scope = request.headers.get("X-MCP-Scope")
-    if mcp_user and mcp_scope:
-        key = request.headers.get("X-Internal-Key", "")
-        expected = os.environ.get("MCP_INTERNAL_KEY", "")
-        if expected and key == expected:
-            return mcp_user, mcp_scope
-    return None, None
-
-
 @app.get("/api/jobs")
 async def list_jobs(
     request: Request,
@@ -3547,37 +3534,60 @@ async def list_jobs(
     user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List jobs with optional status and user filter.
+    """List jobs visible to the caller.
+
+    Visibility model (G1):
+        * Admins see the full fleet, optionally narrowed by ``?user_id=`` or
+          by an MCP ``project:<uuid>`` token scope.
+        * Non-admins see jobs they own OR jobs in projects they're a member
+          of, additionally narrowed by any MCP project scope.
+        * A non-admin passing ``?user_id=`` for anyone other than themselves
+          is rejected (403). Self-query (``?user_id=<self>``) is allowed but
+          redundant — the visibility OR-clause already covers it.
 
     Returns jobs enriched with audit_count from MongoDB if available.
-    MCP scope filtering is applied when the request comes from an
-    authenticated MCP client.
     """
-    # Apply MCP scope filtering
-    mcp_user, mcp_scope = _get_mcp_scope(request)
-    if mcp_scope == "user":
-        user_id = mcp_user  # Override to show only the token owner's jobs
-    elif mcp_scope and mcp_scope.startswith("project:"):
-        pass  # project filtering applied below after fetching
+    user = await require_approved_user(request, postgres_db)
+    is_admin = bool(user.get("is_admin"))
+    scope_pid = mcp_scope_project_id(user)
+
+    if user_id is not None and not is_admin and str(user_id) != str(user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to query other users' jobs",
+        )
 
     try:
-        jobs = await postgres_db.get_jobs(status=status, user_id=user_id, limit=limit)
+        if is_admin:
+            jobs = await postgres_db.get_jobs(
+                status=status,
+                user_id=user_id,
+                limit=limit,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+            )
+        else:
+            visible = await user_visible_project_ids(user, postgres_db)
+            # Non-admin always lands on a concrete set (never "all").
+            project_ids = [str(p) for p in visible] if visible != "all" else []
+            jobs = await postgres_db.get_visible_jobs(
+                owner_user_id=str(user["id"]),
+                visible_project_ids=project_ids,
+                status=status,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+                limit=limit,
+            )
 
-        # Filter by project if MCP scope is project-scoped
-        if mcp_scope and mcp_scope.startswith("project:"):
-            project_id = mcp_scope.split(":", 1)[1]
-            jobs = [j for j in jobs if str(j.get("project_id", "")) == project_id]
-
-        # Enrich with audit counts if MongoDB is available
         if mongodb.is_available:
             for job in jobs:
-                job_id = str(job["id"])
-                job["audit_count"] = await mongodb.get_audit_count(job_id)
+                jid = str(job["id"])
+                job["audit_count"] = await mongodb.get_audit_count(jid)
         else:
             for job in jobs:
                 job["audit_count"] = None
 
         return jobs
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -3585,28 +3595,12 @@ async def list_jobs(
 @app.get("/api/jobs/{job_id}")
 async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     """Get a single job by ID."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        # MCP scope check
-        mcp_user, mcp_scope = _get_mcp_scope(request)
-        if mcp_scope == "user" and str(job.get("user_id", "")) != mcp_user:
-            raise HTTPException(status_code=403, detail="Access denied by token scope")
-        elif mcp_scope and mcp_scope.startswith("project:"):
-            project_id = mcp_scope.split(":", 1)[1]
-            if str(job.get("project_id", "")) != project_id:
-                raise HTTPException(
-                    status_code=403, detail="Access denied by token scope"
-                )
-
-        # Enrich with audit count if MongoDB is available
         if mongodb.is_available:
             job["audit_count"] = await mongodb.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-
         return job
     except HTTPException:
         raise
@@ -4916,13 +4910,10 @@ async def reply_to_agent_message(
 
 
 @app.get("/api/jobs/{job_id}/messages")
-async def list_message_threads(job_id: str) -> dict[str, Any]:
+async def list_message_threads(request: Request, job_id: str) -> dict[str, Any]:
     """List message threads for a job."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         threads = await postgres_db.get_message_threads(job_id)
 
         # Enrich with job freeze status
@@ -4959,13 +4950,12 @@ async def list_message_threads(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/messages/{thread_id}")
-async def get_thread_detail(job_id: str, thread_id: str) -> dict[str, Any]:
+async def get_thread_detail(
+    request: Request, job_id: str, thread_id: str
+) -> dict[str, Any]:
     """Get full ordered messages within a thread."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         thread = await postgres_db.get_thread_messages(job_id, thread_id)
         if not thread:
             raise HTTPException(
@@ -5041,18 +5031,20 @@ class ExternalContactCreate(BaseModel):
 @app.post("/api/projects/{project_id}/contacts")
 async def add_external_contact(
     project_id: str,
-    request: ExternalContactCreate,
+    body: ExternalContactCreate,
+    request: Request,
 ) -> dict[str, Any]:
-    """Add an external contact to a project."""
+    """Add an external contact to a project. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     try:
         # Basic email format validation
-        if "@" not in request.email or "." not in request.email.split("@")[-1]:
+        if "@" not in body.email or "." not in body.email.split("@")[-1]:
             raise HTTPException(status_code=400, detail="Invalid email format")
 
         contact = await postgres_db.add_external_contact(
             project_id=project_id,
-            display_name=request.display_name,
-            email=request.email,
+            display_name=body.display_name,
+            email=body.email,
         )
         return {
             "status": "created",
@@ -5073,8 +5065,9 @@ async def add_external_contact(
 
 
 @app.get("/api/projects/{project_id}/contacts")
-async def list_external_contacts(project_id: str) -> dict[str, Any]:
+async def list_external_contacts(request: Request, project_id: str) -> dict[str, Any]:
     """List external contacts for a project."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         contacts = await postgres_db.get_external_contacts(project_id)
         return {
@@ -5096,8 +5089,11 @@ async def list_external_contacts(project_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/projects/{project_id}/contacts/{contact_id}")
-async def delete_external_contact(project_id: str, contact_id: str) -> dict[str, str]:
-    """Delete an external contact."""
+async def delete_external_contact(
+    request: Request, project_id: str, contact_id: str
+) -> dict[str, str]:
+    """Delete an external contact. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     try:
         deleted = await postgres_db.delete_external_contact(contact_id)
         if not deleted:
@@ -5423,6 +5419,7 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 
 @app.get("/api/sudo/requests")
 async def list_sudo_requests(
+    request: Request,
     job_id: str | None = Query(None, description="Filter by job ID"),
     status: str | None = Query(None, description="Filter by status"),
     request_type: str | None = Query(
@@ -5430,22 +5427,49 @@ async def list_sudo_requests(
     ),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[dict]:
-    """List sudo approval requests."""
-    return await sudo_gate.list_requests(
-        job_id=job_id,
+    """List sudo approval requests visible to the caller (G3).
+
+    With ``?job_id=``: gate on ``require_job_access``. Without: admins
+    see the full feed; non-admins receive only requests whose underlying
+    job they can access (post-fetch filter).
+    """
+    if job_id:
+        await require_job_access(request, postgres_db, job_id)
+        return await sudo_gate.list_requests(
+            job_id=job_id,
+            status=status,
+            request_type=request_type,
+            limit=limit,
+        )
+
+    caller = await require_approved_user(request, postgres_db)
+    rows = await sudo_gate.list_requests(
+        job_id=None,
         status=status,
         request_type=request_type,
         limit=limit,
     )
+    if caller.get("is_admin") and mcp_scope_project_id(caller) is None:
+        return rows
+    visible: list[dict] = []
+    for row in rows:
+        if await user_can_access_job(caller, postgres_db, row.get("job_id")):
+            visible.append(row)
+    return visible
 
 
 @app.get("/api/sudo/requests/{request_id}")
-async def get_sudo_request(request_id: str) -> dict:
-    """Get a single sudo approval request."""
+async def get_sudo_request(request: Request, request_id: str) -> dict:
+    """Get a single sudo approval request (G3: caller must access the underlying job)."""
+    caller = await require_approved_user(request, postgres_db)
     result = await sudo_gate.get_request(request_id)
     if not result:
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    if not await user_can_access_job(caller, postgres_db, result.get("job_id")):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this sudo request"
         )
     return result
 
@@ -7319,7 +7343,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
 
 @app.get("/api/jobs/{job_id}/frozen")
-async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
+async def get_frozen_job_data(request: Request, job_id: str) -> dict[str, Any]:
     """Get the frozen job data (job_frozen.json) for a pending_review job.
 
     Tries Gitea first, falls back to local workspace.
@@ -7327,12 +7351,12 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
     Returns:
         Contents of job_frozen.json (summary, deliverables, confidence, notes, etc.)
     """
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
         frozen_data = None
 
         # Primary: read freeze_data from DB
-        job = await postgres_db.get_job(job_id)
-        if job and job.get("freeze_data"):
+        if job.get("freeze_data"):
             frozen_data = job["freeze_data"]
             if isinstance(frozen_data, str):
                 frozen_data = json.loads(frozen_data)
@@ -7365,12 +7389,13 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/snapshot")
-async def get_job_snapshot(job_id: str) -> dict[str, Any]:
+async def get_job_snapshot(request: Request, job_id: str) -> dict[str, Any]:
     """Get snapshot metadata for a job.
 
     Returns status, source type, size, and environment summary.
     Used by the cockpit to show snapshot availability indicators.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         result = await snapshot_service.get_snapshot_status(job_id)
         return result
@@ -7406,11 +7431,13 @@ async def toggle_snapshot_pin(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/snapshots/stats")
-async def get_snapshot_stats() -> dict[str, Any]:
-    """Get aggregate snapshot storage statistics.
+async def get_snapshot_stats(request: Request) -> dict[str, Any]:
+    """Get aggregate snapshot storage statistics. **Admin only** (G5) —
+    storage-level metric with no per-user shape.
 
     Returns total snapshot count, total size, GC pending info.
     """
+    await _require_admin(request)
     try:
         return await snapshot_service.get_storage_stats()
     except Exception as e:
@@ -7732,8 +7759,9 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
 
 
 @app.get("/api/jobs/{job_id}/progress")
-async def get_job_progress(job_id: str) -> dict[str, Any]:
+async def get_job_progress(request: Request, job_id: str) -> dict[str, Any]:
     """Get detailed progress information for a job including ETA."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         progress = await postgres_db.get_job_progress(job_id)
         if not progress:
@@ -7747,6 +7775,7 @@ async def get_job_progress(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/audit")
 async def get_job_audit(
+    request: Request,
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
@@ -7770,6 +7799,7 @@ async def get_job_audit(
         order: asc (oldest first, default) or desc (newest first)
         filter: all, messages, tools, or errors
     """
+    await require_job_access(request, postgres_db, job_id)
     effective_size = limit if limit is not None else page_size
     if not mongodb.is_available:
         return {
@@ -7828,12 +7858,13 @@ async def get_request(doc_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/audit/timerange")
-async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
+async def get_audit_time_range(request: Request, job_id: str) -> dict[str, str] | None:
     """Get first and last timestamps for job audit entries.
 
     Returns:
         Dict with 'start' and 'end' ISO timestamps, or null if no entries/MongoDB unavailable
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return None
 
@@ -7845,6 +7876,7 @@ async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
 
 @app.get("/api/jobs/{job_id}/chat")
 async def get_job_chat_history(
+    request: Request,
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
@@ -7859,6 +7891,7 @@ async def get_job_chat_history(
         page: Page number (1-indexed). Use -1 to request the last page.
         pageSize: Number of entries per page (max 200)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -7886,6 +7919,7 @@ async def get_job_chat_history(
 
 @app.get("/api/jobs/{job_id}/repo/contents")
 async def list_repo_contents(
+    request: Request,
     job_id: str,
     path: str = Query(default="", description="Directory path within the repo"),
     ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
@@ -7897,6 +7931,7 @@ async def list_repo_contents(
     Returns:
         List of entries, each with: name, path, type ("file"|"dir"), size
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(
             status_code=503,
@@ -7917,6 +7952,7 @@ async def list_repo_contents(
 
 @app.get("/api/jobs/{job_id}/repo/file")
 async def get_repo_file(
+    request: Request,
     job_id: str,
     path: str = Query(..., description="File path within the repo"),
     ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
@@ -7926,6 +7962,7 @@ async def get_repo_file(
     Returns:
         Dict with path, content (text), and size
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(
             status_code=503,
@@ -7952,6 +7989,7 @@ async def get_repo_file(
 
 @app.get("/api/jobs/{job_id}/repo/commits")
 async def list_repo_commits(
+    request: Request,
     job_id: str,
     sha: str = Query(
         default="main", description="Branch, tag, or commit SHA to list from"
@@ -7970,6 +8008,7 @@ async def list_repo_commits(
     Returns:
         Dict with commits list and total count
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -7999,6 +8038,7 @@ async def list_repo_commits(
 
 @app.get("/api/jobs/{job_id}/repo/diff")
 async def get_repo_diff(
+    request: Request,
     job_id: str,
     base: str = Query(..., description="Base ref (commit SHA, tag, or branch)"),
     head: str = Query(default="HEAD", description="Head ref"),
@@ -8008,6 +8048,7 @@ async def get_repo_diff(
     Returns:
         Dict with base, head, and diff text
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -8024,7 +8065,9 @@ async def get_repo_diff(
 
 
 @app.get("/api/jobs/{job_id}/repo/tags")
-async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, Any]]:
+async def list_repo_tags(
+    request: Request, job_id: str, all_jobs: bool = False
+) -> list[dict[str, Any]]:
     """List tags in a job's repository.
 
     By default, only returns tags for the specified job (namespaced by
@@ -8033,6 +8076,7 @@ async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, 
     Returns:
         List of tags with name, sha, and message
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -8059,18 +8103,21 @@ async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, 
 
 
 @app.get("/api/jobs/{job_id}/workspace")
-async def get_job_workspace(job_id: str) -> dict[str, Any]:
+async def get_job_workspace(request: Request, job_id: str) -> dict[str, Any]:
     """Get workspace overview for a job.
 
     Returns:
         Dict with workspace files, workspace.md/plan.md content (truncated),
         current todos, and archive count.
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.get_workspace_overview(job_id)
 
 
 @app.get("/api/jobs/{job_id}/workspace/{path:path}")
-async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
+async def get_workspace_file(
+    request: Request, job_id: str, path: str
+) -> dict[str, str]:
     """Get content of a workspace file by relative path.
 
     Supports any file within the job workspace, including subdirectories
@@ -8083,6 +8130,7 @@ async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
     Returns:
         Dict with path and file content
     """
+    await require_job_access(request, postgres_db, job_id)
     content = workspace_service.get_workspace_file(job_id, path)
     if content is None:
         raise HTTPException(
@@ -8126,7 +8174,7 @@ async def write_workspace_file(
 
 
 @app.get("/api/jobs/{job_id}/todos")
-async def get_job_todos(job_id: str) -> dict[str, Any]:
+async def get_job_todos(request: Request, job_id: str) -> dict[str, Any]:
     """Get all todos for a job (current + archives).
 
     Returns:
@@ -8136,16 +8184,18 @@ async def get_job_todos(job_id: str) -> dict[str, Any]:
         - archives: List of archived todo files
         - has_workspace: Whether workspace directory exists
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.get_all_todos(job_id)
 
 
 @app.get("/api/jobs/{job_id}/todos/current")
-async def get_current_todos(job_id: str) -> dict[str, Any]:
+async def get_current_todos(request: Request, job_id: str) -> dict[str, Any]:
     """Get current active todos from todos.yaml.
 
     Returns:
         Dict with todos list and metadata, or 404 if not found
     """
+    await require_job_access(request, postgres_db, job_id)
     result = workspace_service.get_current_todos(job_id)
     if result is None:
         raise HTTPException(
@@ -8155,17 +8205,20 @@ async def get_current_todos(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/todos/archives")
-async def list_todo_archives(job_id: str) -> list[dict[str, Any]]:
+async def list_todo_archives(request: Request, job_id: str) -> list[dict[str, Any]]:
     """List all archived todo files for a job.
 
     Returns:
         List of archive metadata (filename, phase_name, timestamp)
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.list_archived_todos(job_id)
 
 
 @app.get("/api/jobs/{job_id}/todos/archives/{filename}")
-async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
+async def get_archived_todos(
+    request: Request, job_id: str, filename: str
+) -> dict[str, Any]:
     """Get parsed content of an archived todo file.
 
     Args:
@@ -8175,6 +8228,7 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
     Returns:
         Dict with parsed todos, summary, and metadata
     """
+    await require_job_access(request, postgres_db, job_id)
     result = workspace_service.get_archived_todos(job_id, filename)
     if result is None:
         raise HTTPException(
@@ -8190,6 +8244,7 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/audit/bulk")
 async def get_job_audit_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8203,6 +8258,7 @@ async def get_job_audit_bulk(
         offset: Number of entries to skip (default 0)
         limit: Maximum entries to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -8225,6 +8281,7 @@ async def get_job_audit_bulk(
 
 @app.get("/api/jobs/{job_id}/chat/bulk")
 async def get_job_chat_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8238,6 +8295,7 @@ async def get_job_chat_bulk(
         offset: Number of entries to skip (default 0)
         limit: Maximum entries to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -8260,6 +8318,7 @@ async def get_job_chat_bulk(
 
 @app.get("/api/jobs/{job_id}/graph/bulk")
 async def get_job_graph_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8273,6 +8332,7 @@ async def get_job_graph_bulk(
         offset: Number of deltas to skip (default 0)
         limit: Maximum deltas to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "deltas": [],
@@ -8294,7 +8354,7 @@ async def get_job_graph_bulk(
 
 
 @app.get("/api/jobs/{job_id}/version")
-async def get_job_version(job_id: str) -> dict[str, Any] | None:
+async def get_job_version(request: Request, job_id: str) -> dict[str, Any] | None:
     """Get job data version info for cache invalidation.
 
     Returns counts and timestamps that can be compared to cached values
@@ -8304,6 +8364,7 @@ async def get_job_version(job_id: str) -> dict[str, Any] | None:
         Dict with version, auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate
         Returns null if job has no audit data or MongoDB unavailable
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return None
 
@@ -8825,29 +8886,62 @@ async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any
 # =============================================================================
 
 
+async def _visibility_kwargs_for_stats(user: dict[str, Any]) -> dict[str, Any]:
+    """Build the visibility kwargs G5 passes through to postgres stats methods.
+
+    Admin without an MCP project: scope → empty dict (full fleet view).
+    Admin with project scope → just ``scope_project_id`` (AND-narrowed).
+    Non-admin → owner_user_id + visible_project_ids (+ scope_project_id).
+    """
+    scope_pid = mcp_scope_project_id(user)
+    if user.get("is_admin"):
+        if scope_pid is None:
+            return {}
+        return {"scope_project_id": str(scope_pid)}
+    visible = await user_visible_project_ids(user, postgres_db)
+    project_ids = [str(p) for p in visible] if visible != "all" else []
+    return {
+        "owner_user_id": str(user["id"]),
+        "visible_project_ids": project_ids,
+        "scope_project_id": str(scope_pid) if scope_pid else None,
+    }
+
+
 @app.get("/api/stats/jobs")
-async def get_job_statistics() -> dict[str, int]:
-    """Get overall job statistics."""
+async def get_job_statistics(request: Request) -> dict[str, int]:
+    """Get overall job statistics scoped to the caller's visibility (G5).
+
+    Admins see the full fleet (optionally narrowed by an MCP
+    ``project:<uuid>`` scope). Non-admins see only jobs they own or
+    are project members of.
+    """
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.get_job_statistics()
+        return await postgres_db.get_job_statistics(**vis)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/stats/daily")
 async def get_daily_statistics(
+    request: Request,
     days: int = Query(default=7, ge=1, le=90),
 ) -> list[dict[str, Any]]:
-    """Get daily job statistics for the past N days."""
+    """Get daily job statistics for the past N days, scoped to the caller's visibility (G5)."""
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.get_daily_statistics(days=days)
+        return await postgres_db.get_daily_statistics(days=days, **vis)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/stats/agents")
-async def get_agent_statistics() -> dict[str, Any]:
-    """Get agent workforce summary."""
+async def get_agent_statistics(request: Request) -> dict[str, Any]:
+    """Get agent workforce summary. **Admin only** (G5) — counts the
+    fleet by status, which is infra-level data tied to ``/api/agents``."""
+    await _require_admin(request)
     try:
         agents = await postgres_db.list_agents(limit=500)
 
@@ -8874,15 +8968,21 @@ async def get_agent_statistics() -> dict[str, Any]:
 
 @app.get("/api/stats/stuck")
 async def get_stuck_jobs(
+    request: Request,
     threshold_minutes: int = Query(default=60, ge=1, le=1440),
 ) -> list[dict[str, Any]]:
-    """Get jobs that appear to be stuck.
+    """Get jobs that appear to be stuck, scoped to the caller's visibility (G5).
 
     A job is considered stuck if it's in 'processing' status but hasn't
-    been updated within the threshold period.
+    been updated within the threshold period. Admins see the full
+    fleet; non-admins see only jobs they own or are project members of.
     """
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.detect_stuck_jobs(threshold_minutes=threshold_minutes)
+        return await postgres_db.detect_stuck_jobs(
+            threshold_minutes=threshold_minutes, **vis
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -8894,6 +8994,7 @@ async def get_stuck_jobs(
 
 @app.get("/api/sources")
 async def list_sources(
+    request: Request,
     job_id: str | None = Query(default=None, description="Filter by job ID"),
     type: str | None = Query(default=None, description="Filter by source type"),
     limit: int = Query(default=50, ge=1, le=500),
@@ -8901,9 +9002,25 @@ async def list_sources(
 ) -> dict[str, Any]:
     """List sources, optionally filtered by job and/or type.
 
-    When job_id is provided, returns sources linked to that job via job_sources.
-    When omitted, returns all sources across jobs.
+    Visibility model (G3):
+        * With ``?job_id=``: gate on ``require_job_access``. The job's
+          sources are returned (visible if the caller can access the job).
+        * Without ``?job_id=``: admin-only. Non-admins must filter by a
+          specific job they can access. (Cross-job source enumeration
+          would require a vector_db ⇆ postgres_db JOIN we deliberately
+          don't do; the per-job path covers the legitimate cockpit use
+          case without that complexity.)
     """
+    if job_id:
+        await require_job_access(request, postgres_db, job_id)
+    else:
+        caller = await require_approved_user(request, postgres_db)
+        if not caller.get("is_admin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Cross-job source listing requires admin role; "
+                "non-admins must pass ?job_id=",
+            )
     try:
         async with vector_db.acquire() as conn:
             conditions = []
@@ -8961,10 +9078,17 @@ async def list_sources(
 
 @app.get("/api/sources/{source_id}")
 async def get_source_detail(
+    request: Request,
     source_id: int,
     content_limit: int = Query(default=2000, ge=0, le=100000),
 ) -> dict[str, Any]:
-    """Get full detail for a single source."""
+    """Get full detail for a single source.
+
+    Visibility (G3): the source is visible if the caller can access at
+    least one job linked to it via ``job_sources``. Admins (without an
+    MCP project: scope) bypass without enumerating links.
+    """
+    caller = await require_approved_user(request, postgres_db)
     try:
         async with vector_db.acquire() as conn:
             if content_limit > 0:
@@ -9002,6 +9126,15 @@ async def get_source_detail(
             )
             result["job_ids"] = [str(r["job_id"]) for r in job_rows]
 
+            # G3 visibility: caller must be able to access at least one
+            # linked job. Admins with no MCP project: scope skip the loop.
+            if not await user_can_access_any_job(
+                caller, postgres_db, result["job_ids"]
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Not authorized to access this source"
+                )
+
             return result
     except HTTPException:
         raise
@@ -9011,6 +9144,7 @@ async def get_source_detail(
 
 @app.get("/api/jobs/{job_id}/citations")
 async def list_job_citations(
+    request: Request,
     job_id: str,
     source_id: int | None = Query(default=None),
     status: str | None = Query(
@@ -9020,6 +9154,7 @@ async def list_job_citations(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List citations for a job with optional filters."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             conditions = ["c.job_id = $1::uuid"]
@@ -9147,8 +9282,9 @@ async def get_source_tags(job_id: str, source_id: int) -> list[str]:
 
 
 @app.get("/api/jobs/{job_id}/citations/stats")
-async def get_citation_stats(job_id: str) -> dict[str, Any]:
+async def get_citation_stats(request: Request, job_id: str) -> dict[str, Any]:
     """Get citation statistics for a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             # Sources by type
@@ -9206,8 +9342,9 @@ async def get_citation_stats(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/memory/stats")
-async def get_memory_stats(job_id: str) -> dict[str, Any]:
+async def get_memory_stats(request: Request, job_id: str) -> dict[str, Any]:
     """Get memory statistics for a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -9245,8 +9382,9 @@ async def get_memory_stats(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/projects/{project_id}/memory/stats")
-async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
+async def get_project_memory_stats(request: Request, project_id: str) -> dict[str, Any]:
     """Get memory statistics for a project (all memories scoped to this project)."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -9284,6 +9422,7 @@ async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/memories")
 async def list_job_memories(
+    request: Request,
     job_id: str,
     memory_type: str | None = Query(default=None),
     source: str | None = Query(default=None),
@@ -9294,6 +9433,7 @@ async def list_job_memories(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List individual memories for a job with optional filters and pagination."""
+    await require_job_access(request, postgres_db, job_id)
     # Validate sort parameters
     valid_sort_fields = {
         "created_at",
@@ -9369,6 +9509,7 @@ async def list_job_memories(
 
 @app.get("/api/jobs/{job_id}/sources/search")
 async def search_job_sources(
+    request: Request,
     job_id: str,
     query: str = Query(..., description="Search query"),
     mode: str = Query(
@@ -9385,6 +9526,7 @@ async def search_job_sources(
     Falls back to SQL keyword search. Semantic/hybrid modes require
     the CitationEngine with pgvector.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             # Build conditions for source filtering
@@ -9994,15 +10136,20 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
 
 @app.get("/api/agents")
 async def list_agents(
+    request: Request,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List all registered agents.
+    """List all registered agents. **Admin only** (G4) — exposes pod IPs,
+    hostnames, and full fleet metadata. Non-admins must use
+    `/api/me/active-jobs` for a stripped, per-user projection of their
+    in-flight work.
 
     Args:
         status: Optional status filter (booting, ready, working, completed, failed, offline)
         limit: Maximum agents to return
     """
+    await _require_admin(request)
     try:
         return await postgres_db.list_agents(status=status, limit=limit)
     except Exception as e:
@@ -10010,8 +10157,9 @@ async def list_agents(
 
 
 @app.get("/api/agents/{agent_id}")
-async def get_agent(agent_id: str) -> dict[str, Any]:
-    """Get agent details by ID."""
+async def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
+    """Get agent details by ID. **Admin only** (G4)."""
+    await _require_admin(request)
     try:
         agent = await postgres_db.get_agent(agent_id)
         if not agent:
@@ -10024,13 +10172,15 @@ async def get_agent(agent_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/agents/{agent_id}/system-info")
-async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
+async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, Any]:
     """Proxy system info request to an agent's /system/info endpoint.
+    **Admin only** (G4) — proxies host-level CPU/memory/process/port
+    inventory from the agent container.
 
     Returns CPU, memory, disk, processes, listening ports, and network
     connections from the agent's container.
     """
-
+    await _require_admin(request)
     try:
         agent = await postgres_db.get_agent(agent_id)
         if not agent:
@@ -10634,12 +10784,7 @@ def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
 @app.get("/api/persistent/threads/{thread_id}")
 async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     """Get thread status and metadata (auth: owner only)."""
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = dict(thread)
     result["cloud_session_url"] = _resolve_cloud_session_url(thread)
     return result
@@ -10657,12 +10802,7 @@ async def end_thread(
         permanent: If true, delete the thread row and all associated messages
                    from the database. If false (default), just mark as ended.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         try:
@@ -10719,12 +10859,7 @@ async def resume_thread(
     a new agent can pick it up. The frontend navigates to the chat page after
     calling this, where the orchestrator will provision or wait for an agent.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
@@ -10877,12 +11012,7 @@ async def get_thread_messages_history(
     Returns messages ordered by created_at ASC. Paginated.
     Load this via REST before opening the WebSocket connection.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     messages = await postgres_db.get_thread_messages_history(
         thread_id=thread_id,
@@ -10948,7 +11078,8 @@ async def _resolve_thread_for_forwarding(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+    # Fail-closed for orphans (user_id IS NULL); admins bypass.
+    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
 
     # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
@@ -11024,12 +11155,7 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     Otherwise: replay everything since the cursor, then switch to live
     mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     server_epoch = int(thread.get("events_epoch") or 0)
 
@@ -11288,12 +11414,7 @@ async def thread_approve(
         404 — approval_id not found, or wrong thread, or no pending request
         409 — request already decided (idempotent re-clicks land here)
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if body.decision == "approve":
         new_status = "approved"
@@ -12160,12 +12281,7 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
     when the workspace is ready. The proxy path uses the thread_id in
     place of job_id: ``/api/ide/{thread_id}/proxy/``.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
@@ -12242,12 +12358,7 @@ async def upload_files_to_thread(
         upload_files_to_thread_workspace,
     )
 
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -12302,12 +12413,7 @@ async def synthesize_thread_message_tts(
     """
     from services.tts import generate_message_tts
 
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     content = (body.get("content") or "").strip()
     if not content:
@@ -12797,6 +12903,7 @@ async def get_job_logs(
 
 @app.get("/api/jobs/{job_id}/llm-requests")
 async def get_job_llm_requests(
+    request: Request,
     job_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -12807,6 +12914,7 @@ async def get_job_llm_requests(
     for each request. Use the _id with GET /api/requests/{doc_id} to get
     the full request/response.
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         raise HTTPException(status_code=503, detail="MongoDB not available")
 
@@ -12823,7 +12931,7 @@ async def get_job_llm_requests(
 
 
 @app.get("/api/jobs/{job_id}/shell-state")
-async def get_job_shell_state(job_id: str) -> dict[str, Any]:
+async def get_job_shell_state(request: Request, job_id: str) -> dict[str, Any]:
     """Proxy shell state request to the agent processing a job.
 
     Resolves job -> assigned agent -> pod IP, then proxies to
@@ -12831,11 +12939,8 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
     """
     import httpx as _httpx
 
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         if job.get("status") != "processing":
             raise HTTPException(
                 status_code=400,
@@ -12882,16 +12987,74 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/agents/{agent_id}")
-async def delete_agent(agent_id: str) -> dict[str, str]:
-    """Deregister an agent.
+async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
+    """Deregister an agent. **Admin only** (G4).
 
-    Called when an agent shuts down gracefully.
+    Used by the cockpit's agent-list admin tool. Agents may also call
+    this on graceful shutdown, but Track B (agent ↔ orchestrator auth)
+    will give them a proper bearer-credentialled path — for now the
+    heartbeat timeout (3min) handles agent crashes without needing
+    this endpoint to be open.
     """
+    await _require_admin(request)
     try:
         success = await postgres_db.delete_agent(agent_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
         return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Per-User Projections — safe replacement for non-admin agent visibility (G4)
+# =============================================================================
+
+
+_ME_ACTIVE_JOB_STATUSES = {"created", "processing", "paused", "pending_review"}
+
+
+@app.get("/api/me/active-jobs")
+async def list_my_active_jobs(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Caller's in-flight jobs — the non-admin replacement for `/api/agents`.
+
+    Returns jobs visible to the caller (G1 visibility OR — own jobs OR
+    project-member jobs) in any of the active statuses (created,
+    processing, paused, pending_review). The underlying ``get_jobs`` /
+    ``get_visible_jobs`` SELECT already excludes pod IPs and hostnames,
+    so this is safe to expose to non-admins. Admins still get the full
+    fleet via `/api/agents`; they can use this endpoint too if they want
+    a personal in-flight summary.
+
+    Respects MCP ``project:<uuid>`` scope narrowing.
+    """
+    user = await require_approved_user(request, postgres_db)
+    is_admin = bool(user.get("is_admin"))
+    scope_pid = mcp_scope_project_id(user)
+    try:
+        if is_admin:
+            jobs = await postgres_db.get_jobs(
+                status=None,
+                user_id=str(user["id"]),
+                limit=limit,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+            )
+        else:
+            visible = await user_visible_project_ids(user, postgres_db)
+            project_ids = [str(p) for p in visible] if visible != "all" else []
+            jobs = await postgres_db.get_visible_jobs(
+                owner_user_id=str(user["id"]),
+                visible_project_ids=project_ids,
+                status=None,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+                limit=limit,
+            )
+        return [j for j in jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
     except HTTPException:
         raise
     except Exception as e:
@@ -13243,12 +13406,15 @@ async def _get_project_jobs_repo(project_id: str) -> str | None:
 
 
 @app.get("/api/projects/{project_id}/experts")
-async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
+async def list_project_experts(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
     """List expert configurations from a project's jobs repo.
 
     Scans the experts/ directory in the project's Gitea jobs repo and returns
     metadata for each expert configuration found.
     """
+    await require_project_member(request, postgres_db, project_id)
     if not gitea_client.is_initialized:
         return []
 
@@ -13306,8 +13472,11 @@ async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/api/projects/{project_id}/experts/{expert_name}")
-async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any]:
+async def get_project_expert(
+    request: Request, project_id: str, expert_name: str
+) -> dict[str, Any]:
     """Get full detail for a project expert including merged config and instructions."""
+    await require_project_member(request, postgres_db, project_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -16030,28 +16199,56 @@ async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any
 
 @app.get("/api/projects")
 async def list_projects(
+    request: Request,
     user_id: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
-    """List projects. If user_id provided, returns projects the user is a member of."""
+    """List projects visible to the caller.
+
+    Visibility model (G2):
+        * Admins see the full list, optionally narrowed by ``?user_id=`` or
+          by an MCP ``project:<uuid>`` token scope.
+        * Non-admins see only the projects they're a member of
+          (``get_projects_for_user(caller)``), narrowed by any MCP scope.
+        * A non-admin passing ``?user_id=`` for anyone other than themselves
+          is rejected (403). Self-query is allowed but redundant.
+    """
+    caller = await require_approved_user(request, postgres_db)
+    is_admin = bool(caller.get("is_admin"))
+    scope_pid = mcp_scope_project_id(caller)
+
+    if user_id is not None and not is_admin and str(user_id) != str(caller["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to query other users' projects",
+        )
+
     try:
-        if user_id:
-            return await postgres_db.get_projects_for_user(user_id)
-        # Without user_id, return all projects (admin view)
-        async with postgres_db.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM projects WHERE status != 'deleted' ORDER BY updated_at DESC LIMIT 100"
-            )
-            return [dict(r) for r in rows]
+        if is_admin and user_id is None:
+            async with postgres_db.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM projects WHERE status != 'deleted' "
+                    "ORDER BY updated_at DESC LIMIT 100"
+                )
+                projects = [dict(r) for r in rows]
+        elif user_id is not None:
+            projects = await postgres_db.get_projects_for_user(user_id)
+        else:
+            projects = await postgres_db.get_projects_for_user(str(caller["id"]))
+
+        if scope_pid:
+            projects = [p for p in projects if str(p.get("id", "")) == str(scope_pid)]
+
+        return projects
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/projects/{project_id}")
-async def get_project(project_id: str) -> dict[str, Any]:
+async def get_project(request: Request, project_id: str) -> dict[str, Any]:
     """Get a single project by ID."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    _, project = await require_project_member(request, postgres_db, project_id)
 
     # Lazy-heal: projects created before the cloud-resource fix have no
     # folder handle. The helper is a no-op if the Space already exists.
@@ -16217,11 +16414,11 @@ async def delete_project(project_id: str, request: Request) -> dict[str, str]:
 
 
 @app.get("/api/projects/{project_id}/members")
-async def list_project_members(project_id: str) -> list[dict[str, Any]]:
+async def list_project_members(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
     """List members of a project with user info."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    await require_project_member(request, postgres_db, project_id)
     return await postgres_db.get_project_members(project_id)
 
 
@@ -16348,24 +16545,21 @@ async def remove_project_member(
 
 @app.get("/api/projects/{project_id}/repositories")
 async def list_project_repositories(
+    request: Request,
     project_id: str,
     role: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
     """List repositories attached to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    await require_project_member(request, postgres_db, project_id)
     return await postgres_db.get_project_repositories(project_id, role=role)
 
 
 @app.post("/api/projects/{project_id}/repositories")
 async def add_project_repository(
-    project_id: str, body: ProjectRepositoryCreate
+    request: Request, project_id: str, body: ProjectRepositoryCreate
 ) -> dict[str, Any]:
-    """Attach a repository to a project. Optionally creates a managed Gitea repo."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """Attach a repository to a project. Owner or admin only (creates managed Gitea repo)."""
+    await require_project_owner(request, postgres_db, project_id)
 
     repo_url = body.repo_url
     is_managed = False
@@ -16400,9 +16594,10 @@ async def add_project_repository(
 
 @app.patch("/api/projects/{project_id}/repositories/{repo_id}")
 async def update_project_repository(
-    project_id: str, repo_id: str, body: ProjectRepositoryUpdate
+    request: Request, project_id: str, repo_id: str, body: ProjectRepositoryUpdate
 ) -> dict[str, str]:
-    """Update a project repository."""
+    """Update a project repository. Owner or admin only."""
+    await require_project_owner(request, postgres_db, project_id)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -16413,8 +16608,11 @@ async def update_project_repository(
 
 
 @app.delete("/api/projects/{project_id}/repositories/{repo_id}")
-async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, str]:
-    """Remove a repository from a project. Cannot remove the jobs repo."""
+async def remove_project_repository(
+    request: Request, project_id: str, repo_id: str
+) -> dict[str, str]:
+    """Remove a repository from a project. Owner or admin only. Cannot remove the jobs repo."""
+    await require_project_owner(request, postgres_db, project_id)
     repo = await postgres_db.get_project_repository(repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -16556,23 +16754,24 @@ async def unlink_datasource_from_project(
 
 
 @app.post("/api/projects/{project_id}/jobs")
-async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
-    """Create a job within a project — delegates to create_job."""
+async def create_project_job(
+    request: Request, project_id: str, job: JobCreate
+) -> dict[str, Any]:
+    """Create a job within a project — delegates to create_job. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     job.project_id = project_id
     return await create_job(job)
 
 
 @app.get("/api/projects/{project_id}/jobs")
 async def list_project_jobs(
+    request: Request,
     project_id: str,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """List jobs belonging to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with postgres_db.acquire() as conn:
             query = "SELECT * FROM job_summary WHERE project_id = $1"

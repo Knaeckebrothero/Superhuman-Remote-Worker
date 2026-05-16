@@ -530,13 +530,22 @@ class PostgresDB:
         status: str | None = None,
         user_id: str | None = None,
         limit: int = 100,
+        *,
+        scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Get list of jobs with optional status and user filter.
+        """Get list of jobs with optional status, owner, and scope filters.
+
+        AND-style filtering — used by the admin path (full fleet view, with
+        optional ``?user_id=`` and/or MCP ``project:<uuid>`` scope narrowing).
+        Non-admin callers must go through :meth:`get_visible_jobs` instead so
+        the visibility OR-clause is applied.
 
         Args:
             status: Optional status filter (e.g., 'completed', 'processing')
-            user_id: Optional user ID filter
+            user_id: Optional user ID filter (admin cross-user query)
             limit: Maximum number of jobs to return
+            scope_project_id: MCP token ``project:<uuid>`` narrowing. When
+                set, an additional ``project_id = $scope`` filter is appended.
 
         Returns:
             List of job dicts with id, description, status, config_name, created_at, user_id
@@ -555,7 +564,85 @@ class PostgresDB:
             conditions.append(f"user_id = ${param_count}")
             values.append(UUID(user_id))
 
+        if scope_project_id:
+            param_count += 1
+            conditions.append(f"project_id = ${param_count}")
+            values.append(UUID(scope_project_id))
+
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        param_count += 1
+        values.append(limit)
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, description, status,
+                       config_name, assigned_agent_id, user_id,
+                       project_id, parent_job_id, priority,
+                       repo_name, branch_name, merge_status, created_at,
+                       context->'snapshot'->>'status' AS snapshot_status
+                FROM jobs
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ${param_count}
+                """,
+                *values,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_visible_jobs(
+        self,
+        *,
+        owner_user_id: str,
+        visible_project_ids: list[str],
+        status: str | None = None,
+        scope_project_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Get list of jobs visible to a non-admin caller (G1 visibility OR).
+
+        Applies the user-visibility model: ``(user_id = $owner OR
+        project_id = ANY($projects))``. ``owner_user_id`` is the caller's own
+        id; ``visible_project_ids`` is the list of project ids the caller is a
+        member of (from
+        :func:`security.access.user_visible_project_ids`). An empty
+        ``visible_project_ids`` is fine — the OR-clause then just restricts to
+        the caller's own jobs.
+
+        ``scope_project_id`` is the MCP token's ``project:<uuid>`` narrowing
+        (if any); AND-combined on top, which intersects the visibility set
+        down to that one project.
+
+        Admin callers must NOT use this helper — they go through
+        :meth:`get_jobs` so the OR-clause isn't applied (admins see the full
+        fleet, possibly with explicit ``?user_id=`` or scope filters).
+        """
+        conditions: list[str] = []
+        values: list[Any] = []
+        param_count = 0
+
+        if status:
+            param_count += 1
+            conditions.append(f"status = ${param_count}")
+            values.append(status)
+
+        param_count += 1
+        user_idx = param_count
+        param_count += 1
+        projects_idx = param_count
+        conditions.append(
+            f"(user_id = ${user_idx} OR project_id = ANY(${projects_idx}::uuid[]))"
+        )
+        values.append(UUID(owner_user_id))
+        values.append([UUID(p) for p in visible_project_ids])
+
+        if scope_project_id:
+            param_count += 1
+            conditions.append(f"project_id = ${param_count}")
+            values.append(UUID(scope_project_id))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
         param_count += 1
         values.append(limit)
 
@@ -1474,18 +1561,84 @@ class PostgresDB:
             else None,
         }
 
-    async def get_daily_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
+    def _visibility_clause(
+        self,
+        *,
+        owner_user_id: str | None,
+        visible_project_ids: list[str] | None,
+        scope_project_id: str | None,
+        table_alias: str = "",
+        start_idx: int = 1,
+    ) -> tuple[str, list[Any], int]:
+        """Build the G1/G5 visibility WHERE fragment for the jobs table.
+
+        Returns (sql_fragment, values, next_idx). When all visibility
+        params are None, returns empty fragment (admin view). When
+        ``owner_user_id`` is set, emits the OR-clause
+        ``(user_id = $u OR project_id = ANY($p))``. ``scope_project_id``
+        is AND-combined on top to honour MCP token narrowing.
+
+        ``table_alias`` is the SQL alias for the jobs table (e.g. ``"j"``).
+        Empty string means no alias (raw column names).
+        """
+        prefix = f"{table_alias}." if table_alias else ""
+        values: list[Any] = []
+        idx = start_idx
+        conditions: list[str] = []
+
+        if owner_user_id is not None:
+            user_idx = idx
+            idx += 1
+            projects_idx = idx
+            idx += 1
+            conditions.append(
+                f"({prefix}user_id = ${user_idx} "
+                f"OR {prefix}project_id = ANY(${projects_idx}::uuid[]))"
+            )
+            values.append(UUID(owner_user_id))
+            values.append([UUID(p) for p in (visible_project_ids or [])])
+
+        if scope_project_id is not None:
+            conditions.append(f"{prefix}project_id = ${idx}")
+            values.append(UUID(scope_project_id))
+            idx += 1
+
+        fragment = " AND ".join(conditions)
+        return fragment, values, idx
+
+    async def get_daily_statistics(
+        self,
+        days: int = 7,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get daily job statistics for the past N days.
 
         Args:
             days: Number of days to include
+            owner_user_id: G5 visibility — when set, the result is restricted
+                via the OR-clause ``(user_id = $owner OR project_id ANY
+                $visible_project_ids)``. Admins pass ``None`` to see all.
+            visible_project_ids: caller's project memberships (only consulted
+                when ``owner_user_id`` is set).
+            scope_project_id: MCP ``project:<uuid>`` narrowing — AND-combined
+                on top.
 
         Returns:
             List of daily statistics dictionaries
         """
+        visibility, vis_vals, next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            start_idx=2,  # $1 is days
+        )
+        where_extra = f" AND {visibility}" if visibility else ""
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT
                     DATE(created_at) as date,
                     COUNT(*) as jobs_created,
@@ -1494,23 +1647,43 @@ class PostgresDB:
                     COUNT(*) FILTER (WHERE status = 'cancelled') as jobs_cancelled
                 FROM jobs
                 WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
+                {where_extra}
                 GROUP BY DATE(created_at)
                 ORDER BY date DESC
                 """,
                 days,
+                *vis_vals,
             )
 
         return [dict(row) for row in rows]
 
-    async def get_job_statistics(self) -> Dict[str, int]:
+    async def get_job_statistics(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+    ) -> Dict[str, int]:
         """Get overall job statistics.
+
+        Args:
+            owner_user_id / visible_project_ids / scope_project_id:
+                G5 visibility — see :meth:`get_daily_statistics` for the
+                semantics. ``None`` on all three = full fleet (admin view).
 
         Returns:
             Dict with job counts by status
         """
+        visibility, vis_vals, _next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            start_idx=1,
+        )
+        where_clause = f"WHERE {visibility}" if visibility else ""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT
                     COUNT(*) as total_jobs,
                     COUNT(*) FILTER (WHERE status = 'created') as created,
@@ -1519,13 +1692,20 @@ class PostgresDB:
                     COUNT(*) FILTER (WHERE status = 'failed') as failed,
                     COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
                 FROM jobs
-                """
+                {where_clause}
+                """,
+                *vis_vals,
             )
 
         return dict(row) if row else {}
 
     async def detect_stuck_jobs(
-        self, threshold_minutes: int = 60
+        self,
+        threshold_minutes: int = 60,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Detect jobs that appear to be stuck.
 
@@ -1534,23 +1714,36 @@ class PostgresDB:
 
         Args:
             threshold_minutes: Minutes without activity to consider stuck
+            owner_user_id / visible_project_ids / scope_project_id:
+                G5 visibility — see :meth:`get_daily_statistics`.
 
         Returns:
             List of stuck job dictionaries with stuck reason
         """
         threshold = datetime.now(timezone.utc) - timedelta(minutes=threshold_minutes)
 
+        visibility, vis_vals, _next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            table_alias="j",
+            start_idx=2,  # $1 is threshold
+        )
+        where_extra = f" AND {visibility}" if visibility else ""
+
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT j.id, j.description, j.status,
                        j.config_name, j.assigned_agent_id, j.created_at, j.updated_at
                 FROM jobs j
                 WHERE j.status = 'processing'
                 AND j.updated_at < $1
+                {where_extra}
                 ORDER BY j.updated_at ASC
                 """,
                 threshold,
+                *vis_vals,
             )
 
         stuck_jobs = []
