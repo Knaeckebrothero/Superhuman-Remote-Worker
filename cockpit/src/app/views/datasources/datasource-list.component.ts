@@ -1093,26 +1093,22 @@ export class DatasourceListComponent implements OnInit {
       cli_hint: ds.cli_hint || '',
       default_branch: ds.default_branch || '',
     };
-    const creds = ds.credentials || {};
-    this.formCredentials = {
-      username: (creds['username'] as string) || '',
-      password: (creds['password'] as string) || (creds['token'] as string) || '',
-    };
-    // Populate repository auth fields
+    // F3 (docs/multi_tenancy.md): credentials never come back from the
+    // API. The user re-enters them only if they want to change the stored
+    // value — submitting blank fields leaves the secret untouched.
+    this.formCredentials = { username: '', password: '' };
+    // Repository auth: pick the right tab based on cli_hint so the user
+    // sees the same auth method they'd previously configured, but the
+    // SSH key field stays blank for the same "leave blank to keep" reason.
     if (ds.type === 'repository') {
-      this.gitAuthMethod = (creds['auth_method'] as 'token' | 'ssh') || 'token';
-      this.gitSshKey = (creds['ssh_key'] as string) || '';
+      this.gitAuthMethod = ds.cli_hint?.includes('ssh') ? 'ssh' : 'token';
+      this.gitSshKey = '';
     } else {
       this.gitAuthMethod = 'token';
       this.gitSshKey = '';
     }
-    // Populate generic env vars
-    if (ds.type === 'generic') {
-      const envVarsObj = (creds['env_vars'] as Record<string, string>) || {};
-      this.envVars = Object.entries(envVarsObj).map(([key, value]) => ({ key, value }));
-    } else {
-      this.envVars = [];
-    }
+    // Generic env vars also live in credentials; keep editing UX consistent.
+    this.envVars = [];
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -1460,6 +1456,11 @@ export class DatasourceListComponent implements OnInit {
   }
 
   private buildCredentials(): Record<string, unknown> | undefined {
+    // F3: when editing, blank credentials mean "leave existing alone"
+    // (the API never returns credentials, so the form can't show them
+    // back). Returning undefined skips the credentials column in the
+    // PUT body so the orchestrator preserves the stored secret.
+    const isEditing = this.editingId() !== null;
     if (this.formData.type === 'generic') {
       const envVarsObj: Record<string, string> = {};
       for (const ev of this.envVars) {
@@ -1472,10 +1473,12 @@ export class DatasourceListComponent implements OnInit {
     }
     if (this.formData.type === 'repository') {
       if (this.gitAuthMethod === 'ssh') {
-        if (!this.gitSshKey) return { read_only: true };
+        if (!this.gitSshKey) return isEditing ? undefined : { read_only: true };
         return { auth_method: 'ssh', ssh_key: this.gitSshKey };
       } else {
-        if (!this.formCredentials.password) return { read_only: true };
+        if (!this.formCredentials.password) {
+          return isEditing ? undefined : { read_only: true };
+        }
         return { auth_method: 'token', token: this.formCredentials.password };
       }
     }

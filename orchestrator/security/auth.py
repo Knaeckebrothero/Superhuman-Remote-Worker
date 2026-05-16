@@ -442,8 +442,14 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
 
     The MCP server validates the caller (OAuth / API token) and then
     forwards requests to the orchestrator with X-MCP-User-Id and
-    X-Internal-Key headers.  We trust these headers only when the
+    X-Internal-Key headers. We trust these headers only when the
     internal key matches MCP_INTERNAL_KEY.
+
+    F7: ``X-MCP-Scope`` is captured into ``user['scopes']`` so the
+    access.py visibility helpers can narrow further. Legacy MCP scope
+    strings are ``'user'``, ``'all'`` (admin-equivalent for THIS user
+    — no extra grant if the user isn't admin) or ``'project:<uuid>'``
+    (restrict to one project). Anything else is treated as a no-op.
     """
     mcp_user_id = request.headers.get("X-MCP-User-Id")
     internal_key = request.headers.get("X-Internal-Key", "")
@@ -453,6 +459,9 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
         user = await db.get_user(mcp_user_id)
         if user:
             user["is_approved"] = True  # MCP tokens are pre-validated
+            user["auth_method"] = "mcp"
+            mcp_scope = request.headers.get("X-MCP-Scope")
+            user["scopes"] = [mcp_scope] if mcp_scope else []
             return user
         logger.warning("MCP header auth: user %s not found in DB", mcp_user_id)
 

@@ -103,6 +103,20 @@ from security.auth import (  # noqa: E402
     cleanup_expired_tokens,
     cleanup_expired_sessions,
 )
+from security.access import (  # noqa: E402
+    redact_datasource,
+    redact_datasources,
+    require_builder_session_owner,
+    require_datasource_access,
+    require_datasource_owner,
+    require_job_access,
+    require_project_member,
+    require_project_owner,
+    require_sudo_request_authority,
+    user_can_access_datasource,
+    user_can_access_ide_entity,
+    user_can_access_job,
+)
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
@@ -5366,7 +5380,14 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
     Pushes events:
       - new_request: a new sudo request is pending
       - request_decided: a request was approved/denied/expired
+
+    F6: per-user filtering. Admins see every event; non-admins see only
+    events for jobs they can access (owner OR project member). Orphan
+    events with no ``job_id`` are admin-only. Filtering is applied per
+    event inside the stream rather than at connect time so a member who
+    later gains access doesn't have to reconnect.
     """
+    user = await require_approved_user(request, postgres_db)
     queue = sudo_gate.subscribe_sse()
 
     async def event_stream():
@@ -5377,6 +5398,11 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
                     break
                 try:
                     event_type, data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    job_id = data.get("job_id") if isinstance(data, dict) else None
+                    if not await user_can_access_job(user, postgres_db, job_id):
+                        # Silently drop — the caller isn't authorized to
+                        # see this event. We don't reveal existence.
+                        continue
                     yield f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
                 except asyncio.TimeoutError:
                     # Send keepalive comment
@@ -5433,7 +5459,7 @@ async def approve_sudo_request(
     """Approve a pending sudo request. Caller must be project owner of the related job, or admin."""
     # H4: pre-fix, any authenticated user could approve any job's
     # privileged shell command — a trust escalation, not just info leak.
-    await _require_sudo_request_authority(request, request_id)
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else ""
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5450,7 +5476,7 @@ async def deny_sudo_request(
     request_id: str, body: SudoDenyRequest, request: Request
 ) -> dict:
     """Deny a pending sudo request. Caller must be project owner of the related job, or admin."""
-    await _require_sudo_request_authority(request, request_id)
+    await require_sudo_request_authority(request, postgres_db, request_id)
     result = await sudo_gate.deny_request(request_id, reason=body.reason)
     if not result:
         raise HTTPException(
@@ -5468,7 +5494,7 @@ async def approve_sudo_vm_upgrade(
     body: SudoApproveRequest | None = None,
 ) -> dict:
     """Approve a vm_upgrade sudo request — provisions a VM and resumes the job. Caller must be project owner of the related job, or admin."""
-    await _require_sudo_request_authority(request, request_id)
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else "VM upgrade approved"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5490,7 +5516,7 @@ async def resume_sudo_without_vm(
     body: SudoApproveRequest | None = None,
 ) -> dict:
     """Approve a vm_upgrade request but resume without provisioning a VM. Caller must be project owner of the related job, or admin."""
-    await _require_sudo_request_authority(request, request_id)
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else "Resume without VM"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -7510,7 +7536,7 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
     # the job/thread UUID got full code-server access (file r/w, terminal).
     user = await require_approved_user(request, postgres_db)
-    if not await _user_can_access_ide_entity(user, job_id):
+    if not await user_can_access_ide_entity(user, postgres_db, job_id):
         logger.warning(
             "IDE HTTP: user %s denied access to entity %s",
             user["id"],
@@ -7587,7 +7613,7 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     if not user.get("is_approved"):
         await ws.close(code=4403, reason="Account pending approval")
         return
-    if not await _user_can_access_ide_entity(user, job_id):
+    if not await user_can_access_ide_entity(user, postgres_db, job_id):
         logger.warning(
             "IDE WS: user %s denied access to entity %s",
             user["id"],
@@ -8559,6 +8585,7 @@ async def generate_datasource_ssh_key(
 
 @app.get("/api/datasources")
 async def list_datasources(
+    request: Request,
     job_id: str | None = Query(
         default=None, description="Filter by job ID (use 'global' for global-only)"
     ),
@@ -8567,29 +8594,30 @@ async def list_datasources(
     ),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List datasources with optional filters."""
+    """List datasources visible to the caller.
+
+    F3: each row is scoped (admin / creator / project member) and the
+    `credentials` field is stripped from every row.
+    """
+    user = await require_approved_user(request, postgres_db)
     try:
-        return await postgres_db.list_datasources(
+        rows = await postgres_db.list_datasources(
             job_id=job_id, ds_type=type, limit=limit
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    visible: list[dict[str, Any]] = []
+    for ds in rows:
+        if await user_can_access_datasource(user, postgres_db, ds):
+            visible.append(ds)
+    return redact_datasources(visible)
 
 
 @app.get("/api/datasources/{datasource_id}")
-async def get_datasource(datasource_id: str) -> dict[str, Any]:
-    """Get a single datasource by ID."""
-    try:
-        ds = await postgres_db.get_datasource(datasource_id)
-        if not ds:
-            raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
-            )
-        return ds
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
+    """Get a single datasource by ID. F3: gated + credentials redacted."""
+    _, ds = await require_datasource_access(request, postgres_db, datasource_id)
+    return redact_datasource(ds)
 
 
 @app.post("/api/datasources")
@@ -8602,13 +8630,13 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
 
-    user = await get_current_user(request, postgres_db)
-    user_id = str(user["id"]) if user else None
+    user = await require_approved_user(request, postgres_db)
+    user_id = str(user["id"])
 
     credentials = _normalize_datasource_credentials(body.credentials)
 
     try:
-        return await postgres_db.create_datasource(
+        created = await postgres_db.create_datasource(
             name=body.name,
             ds_type=body.type,
             connection_url=body.connection_url,
@@ -8630,14 +8658,20 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 detail=f"A datasource named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
+    return redact_datasource(created)
 
 
 @app.put("/api/datasources/{datasource_id}")
 async def update_datasource(
-    datasource_id: str, body: DatasourceUpdate
+    request: Request, datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
-    """Update a datasource."""
-    credentials = _normalize_datasource_credentials(body.credentials)
+    """Update a datasource. F3: creator/admin only; null/empty credentials preserved."""
+    await require_datasource_owner(request, postgres_db, datasource_id)
+    # F3: if body.credentials is None or {}, do NOT touch the stored value.
+    # The cockpit's edit form sends an empty creds dict when the user
+    # didn't re-enter; passing that through would clobber the secret.
+    raw_creds = _normalize_datasource_credentials(body.credentials)
+    credentials = raw_creds if raw_creds else None
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
@@ -8669,8 +8703,9 @@ async def update_datasource(
 
 
 @app.delete("/api/datasources/{datasource_id}")
-async def delete_datasource(datasource_id: str) -> dict[str, str]:
-    """Delete a datasource."""
+async def delete_datasource(request: Request, datasource_id: str) -> dict[str, str]:
+    """Delete a datasource. F3: creator/admin only."""
+    await require_datasource_owner(request, postgres_db, datasource_id)
     try:
         # Clean up knowledge entries for all linked projects before deletion
         linked_projects = await postgres_db.list_datasource_projects(datasource_id)
@@ -8690,32 +8725,31 @@ async def delete_datasource(datasource_id: str) -> dict[str, str]:
 
 
 @app.get("/api/jobs/{job_id}/datasources")
-async def get_job_datasources(job_id: str) -> list[dict[str, Any]]:
+async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, Any]]:
     """Get resolved datasources for a job.
 
-    Returns one datasource per type, with job-specific taking precedence
-    over global datasources.
+    F3: gated by `require_job_access`; credentials redacted in the
+    response (the agent process gets them via internal dispatch, not via
+    this endpoint).
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
-        return await postgres_db.resolve_datasources_for_job(job_id)
+        rows = await postgres_db.resolve_datasources_for_job(job_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    return redact_datasources(rows)
 
 
 @app.post("/api/datasources/{datasource_id}/test")
-async def test_datasource(datasource_id: str) -> dict[str, Any]:
+async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Test connectivity to a datasource.
 
     Attempts to connect using the stored connection details and returns
-    the result. Does not modify any data.
+    the result. Does not modify any data. F3: creator/admin only (test
+    uses live credentials and probes the target).
     """
     try:
-        ds = await postgres_db.get_datasource(datasource_id)
-        if not ds:
-            raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
-            )
-
+        _, ds = await require_datasource_owner(request, postgres_db, datasource_id)
         ds_type = ds["type"]
         url = ds["connection_url"]
         creds = ds.get("credentials") or {}
@@ -14993,92 +15027,6 @@ async def _require_admin(request: Request) -> dict[str, Any]:
     return user
 
 
-# Hotfix-grade access helpers (P0 from docs/multi_tenancy.md). These live
-# here for the H1-H4 patches; F1 will move them into
-# orchestrator/security/access.py alongside the rest of the visibility model.
-
-
-async def _user_can_access_ide_entity(user: dict[str, Any], entity_id: str) -> bool:
-    """Check IDE proxy access for a job or thread UUID.
-
-    Mirrors ide_proxy_service._load_context: tries job first, then thread.
-    Admins pass; job owners and any project member pass for jobs; thread
-    owners pass for threads. Fail-closed on missing/orphan owner.
-    """
-    if user.get("is_admin"):
-        return True
-    job = await postgres_db.get_job(entity_id)
-    if job:
-        if str(job.get("user_id") or "") == str(user["id"]):
-            return True
-        project_id = job.get("project_id")
-        if project_id:
-            role = await postgres_db.get_user_role_in_project(
-                str(project_id), str(user["id"])
-            )
-            if role:
-                return True
-        return False
-    thread = await postgres_db.get_thread(entity_id)
-    if thread:
-        return str(thread.get("user_id") or "") == str(user["id"])
-    return False
-
-
-async def _require_project_owner(
-    request: Request, project_id: str
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Require caller to be owner of project_id, or admin.
-
-    Returns (user, project). Raises 404 if the project doesn't exist,
-    403 otherwise.
-    """
-    user = await require_approved_user(request, postgres_db)
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-    if user.get("is_admin"):
-        return user, project
-    role = await postgres_db.get_user_role_in_project(project_id, str(user["id"]))
-    if role != "owner":
-        raise HTTPException(status_code=403, detail="Project owner role required")
-    return user, project
-
-
-async def _require_sudo_request_authority(
-    request: Request, request_id: str
-) -> dict[str, Any]:
-    """Require caller to be authorized to approve/deny this sudo request.
-
-    Authorization = admin, or project owner of the related job. Job
-    owners can NOT self-approve their own sudo requests (that would
-    defeat the gate). Orphan requests (no job or no project) are
-    admin-only.
-
-    Returns the sudo request dict. Raises 404 if unknown, 403 otherwise.
-    """
-    user = await require_approved_user(request, postgres_db)
-    sudo_req = await sudo_gate.get_request(request_id)
-    if not sudo_req:
-        raise HTTPException(
-            status_code=404, detail=f"Sudo request '{request_id}' not found"
-        )
-    if user.get("is_admin"):
-        return sudo_req
-    job_id = sudo_req.get("job_id")
-    if job_id:
-        job = await postgres_db.get_job(str(job_id))
-        if job and job.get("project_id"):
-            role = await postgres_db.get_user_role_in_project(
-                str(job["project_id"]), str(user["id"])
-            )
-            if role == "owner":
-                return sudo_req
-    raise HTTPException(
-        status_code=403, detail="Not authorized to act on this sudo request"
-    )
-
-
 async def _codex_proxy_request(
     method: str,
     path: str,
@@ -16173,7 +16121,7 @@ async def update_project(
     """Update a project. Caller must be a project owner or admin."""
     # H5: pre-fix, anyone could rename any project, change its goal, or
     # toggle cloud-storage settings.
-    await _require_project_owner(request, project_id)
+    await require_project_owner(request, postgres_db, project_id)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -16207,7 +16155,7 @@ async def delete_project(project_id: str, request: Request) -> dict[str, str]:
     """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
     # H5: pre-fix, anyone could cascade-delete any project (repos,
     # Keycloak groups, cloud folders, knowledge index, ...).
-    _, project = await _require_project_owner(request, project_id)
+    _, project = await require_project_owner(request, postgres_db, project_id)
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
@@ -16285,7 +16233,7 @@ async def add_project_member(
     # H3: pre-fix, anyone could invite themselves as owner of any project
     # and then access everything in it. This is the foundational
     # privilege-escalation path that opens every other gate.
-    _, project = await _require_project_owner(request, project_id)
+    _, project = await require_project_owner(request, postgres_db, project_id)
     try:
         result = await postgres_db.add_project_member(
             project_id=project_id,
@@ -16330,7 +16278,7 @@ async def update_project_member(
 ) -> dict[str, str]:
     """Update a member's role in a project. Caller must be a project owner or admin."""
     # H3: role changes are sensitive — restrict to owners/admins.
-    await _require_project_owner(request, project_id)
+    await require_project_owner(request, postgres_db, project_id)
     success = await postgres_db.update_project_member_role(
         project_id=project_id, user_id=user_id, role=body.role
     )
@@ -16488,35 +16436,44 @@ async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, 
 
 
 @app.get("/api/projects/{project_id}/datasources")
-async def list_project_datasources(project_id: str) -> list[dict[str, Any]]:
-    """List datasources linked to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def list_project_datasources(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
+    """List datasources linked to a project. F3: project membership required."""
+    await require_project_member(request, postgres_db, project_id)
     try:
-        return await postgres_db.list_project_datasources(project_id)
+        rows = await postgres_db.list_project_datasources(project_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    return redact_datasources(rows)
 
 
 @app.post("/api/projects/{project_id}/datasources/{datasource_id}")
 async def link_datasource_to_project(
+    request: Request,
     project_id: str,
     datasource_id: str,
     body: ProjectDatasourceSettings | None = None,
 ) -> dict[str, str]:
     """Link an existing datasource to a project.
 
+    F3: caller must be project owner of the target project AND must be
+    able to see the datasource (admin / creator / member of one of its
+    projects). Prevents a project owner from probing for stranger
+    datasources by guessing UUIDs.
+
     Optionally pass project-level overrides (read_only, description).
     Also creates a knowledge entry so agents discover the datasource.
     """
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    user, _ = await require_project_owner(request, postgres_db, project_id)
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
             status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+    if not await user_can_access_datasource(user, postgres_db, ds):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to link this datasource"
         )
 
     try:
@@ -16541,14 +16498,16 @@ async def link_datasource_to_project(
 
 @app.patch("/api/projects/{project_id}/datasources/{datasource_id}")
 async def update_project_datasource(
+    request: Request,
     project_id: str,
     datasource_id: str,
     body: ProjectDatasourceSettings,
 ) -> dict[str, str]:
-    """Update project-level settings for a linked datasource.
+    """Update project-level settings for a linked datasource. F3: project owner only.
 
     Pass null to clear an override and fall back to datasource defaults.
     """
+    await require_project_owner(request, postgres_db, project_id)
     success = await postgres_db.update_project_datasource(
         project_id,
         datasource_id,
@@ -16576,12 +16535,13 @@ async def update_project_datasource(
 
 @app.delete("/api/projects/{project_id}/datasources/{datasource_id}")
 async def unlink_datasource_from_project(
-    project_id: str, datasource_id: str
+    request: Request, project_id: str, datasource_id: str
 ) -> dict[str, str]:
-    """Unlink a datasource from a project.
+    """Unlink a datasource from a project. F3: project owner only.
 
     Also removes the knowledge entry.
     """
+    await require_project_owner(request, postgres_db, project_id)
     removed = await postgres_db.unlink_datasource_from_project(
         project_id, datasource_id
     )
@@ -17171,11 +17131,9 @@ async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> N
 
 
 @app.get("/api/projects/{project_id}/knowledge/summary")
-async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
-    """Get knowledge base summary statistics for a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def get_knowledge_summary(request: Request, project_id: str) -> dict[str, Any]:
+    """Get knowledge base summary statistics for a project. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17219,6 +17177,7 @@ async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
 
 @app.get("/api/projects/{project_id}/knowledge")
 async def list_knowledge_notes(
+    request: Request,
     project_id: str,
     note_type: str | None = Query(default=None, alias="type"),
     status: str | None = Query(default=None),
@@ -17227,10 +17186,8 @@ async def list_knowledge_notes(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    """List knowledge notes for a project with optional filters."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """List knowledge notes for a project with optional filters. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17284,8 +17241,11 @@ async def list_knowledge_notes(
 
 
 @app.get("/api/projects/{project_id}/knowledge/{note_id}")
-async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
-    """Get a single knowledge note with full content."""
+async def get_knowledge_note(
+    request: Request, project_id: str, note_id: str
+) -> dict[str, Any]:
+    """Get a single knowledge note with full content. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -17324,13 +17284,12 @@ async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/knowledge/search")
 async def search_knowledge(
+    request: Request,
     project_id: str,
     body: KnowledgeSearchRequest,
 ) -> dict[str, Any]:
-    """Hybrid search over project knowledge base."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """Hybrid search over project knowledge base. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17383,11 +17342,13 @@ async def search_knowledge(
 
 @app.patch("/api/projects/{project_id}/knowledge/{note_id}")
 async def update_knowledge_note(
+    request: Request,
     project_id: str,
     note_id: str,
     body: KnowledgeNoteUpdate,
 ) -> dict[str, str]:
-    """Update a knowledge note's status or tags."""
+    """Update a knowledge note's status or tags. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     valid_statuses = {"active", "resolved", "superseded", "archived"}
     if body.status and body.status not in valid_statuses:
         raise HTTPException(
@@ -17463,8 +17424,11 @@ async def update_knowledge_note(
 
 
 @app.delete("/api/projects/{project_id}/knowledge/{note_id}")
-async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]:
-    """Hard delete a knowledge note from both stores."""
+async def delete_knowledge_note(
+    request: Request, project_id: str, note_id: str
+) -> dict[str, str]:
+    """Hard delete a knowledge note from both stores. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         # Delete from vector DB
         async with vector_db.acquire() as conn:
@@ -17498,11 +17462,14 @@ async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]
 
 
 @app.post("/api/projects/{project_id}/knowledge/export")
-async def export_knowledge(project_id: str) -> dict[str, Any]:
-    """Export project knowledge base as Obsidian-compatible markdown files."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def export_knowledge(request: Request, project_id: str) -> dict[str, Any]:
+    """Export project knowledge base as Obsidian-compatible markdown files.
+
+    F5: member-only. Same access requirement as the per-note read endpoint
+    — the bulk export is equivalent to scraping the list and getting each
+    note individually, so a tighter gate wouldn't close a real gap.
+    """
+    _, project = await require_project_member(request, postgres_db, project_id)
 
     kg = _get_knowledge_graph()
     if not kg:
@@ -17579,16 +17546,23 @@ async def export_knowledge(project_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/builder/sessions")
-async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
+async def create_builder_session(
+    request: Request, body: BuilderSessionCreate
+) -> dict[str, Any]:
     """Create a new builder chat session.
 
     Called when the user sends their first message in the builder chat.
     The session is not linked to a job yet (that happens on job submission).
     """
+    caller = await require_approved_user(request, postgres_db)
+    # Force ownership to the caller — body.user_id is ignored to prevent
+    # session impersonation (F2 / docs/multi_tenancy.md). Admins create
+    # their own sessions like any other user; an on-behalf-of admin flow
+    # would be a separate endpoint.
     try:
         session = await postgres_db.create_builder_session(
             expert_id=body.expert_id,
-            user_id=body.user_id,
+            user_id=str(caller["id"]),
         )
         return session
     except Exception as e:
@@ -17596,19 +17570,29 @@ async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
 
 
 @app.get("/api/builder/sessions")
-async def list_builder_sessions(user_id: str | None = None) -> list[dict[str, Any]]:
-    """List builder sessions for a user."""
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id query parameter required")
-    return await postgres_db.list_builder_sessions(user_id)
+async def list_builder_sessions(
+    request: Request, user_id: str | None = None
+) -> list[dict[str, Any]]:
+    """List builder sessions for the caller.
+
+    The ``user_id`` query parameter is supported for back-compat with the
+    cockpit but must match the caller (or the caller must be admin).
+    Cross-user listing is rejected with 403 — see F2 in
+    ``docs/multi_tenancy.md``.
+    """
+    caller = await require_approved_user(request, postgres_db)
+    target = user_id or str(caller["id"])
+    if target != str(caller["id"]) and not caller.get("is_admin"):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to list another user's sessions"
+        )
+    return await postgres_db.list_builder_sessions(target)
 
 
 @app.get("/api/builder/sessions/{session_id}")
-async def get_builder_session(session_id: str) -> dict[str, Any]:
-    """Get builder session details."""
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_builder_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Get builder session details. Owner or admin only (F2)."""
+    _, session = await require_builder_session_owner(request, postgres_db, session_id)
     return session
 
 
@@ -17677,16 +17661,17 @@ def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str,
 
 
 @app.get("/api/builder/sessions/{session_id}/messages")
-async def get_builder_messages(session_id: str) -> list[dict[str, Any]]:
-    """Get all messages for a builder session."""
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_builder_messages(
+    request: Request, session_id: str
+) -> list[dict[str, Any]]:
+    """Get all messages for a builder session. Owner or admin only (F2)."""
+    await require_builder_session_owner(request, postgres_db, session_id)
     return await postgres_db.get_builder_messages(session_id)
 
 
 @app.post("/api/builder/sessions/{session_id}/message")
 async def send_builder_message(
+    request: Request,
     session_id: str,
     body: BuilderMessageRequest,
 ) -> StreamingResponse:
@@ -17701,10 +17686,15 @@ async def send_builder_message(
     - done: stream complete with usage info
     - error: error information
     """
-    # Verify session exists
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # F2: session ownership gate + active_*_id validation. active_job_id /
+    # active_project_id end up in the LLM system prompt and steer
+    # inspection tools; an attacker who could pass arbitrary IDs would
+    # leak job/project data via the model's responses. Fail closed.
+    _, session = await require_builder_session_owner(request, postgres_db, session_id)
+    if body.active_job_id:
+        await require_job_access(request, postgres_db, body.active_job_id)
+    if body.active_project_id:
+        await require_project_member(request, postgres_db, body.active_project_id)
 
     # Store user message
     await postgres_db.create_builder_message(
