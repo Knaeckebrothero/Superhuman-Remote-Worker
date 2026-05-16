@@ -75,6 +75,18 @@ def _role_satisfies(actual: str | None, minimum: Role) -> bool:
 # that doesn't look like ``project:<uuid>``.
 
 
+def mcp_scope_project_id(user: dict[str, Any]) -> UUID | None:
+    """Public accessor for the caller's MCP ``project:<uuid>`` scope.
+
+    Thin re-export of :func:`_scope_project_id`. Useful for endpoints
+    that need to pass the scope as an explicit AND-filter param to the
+    DB layer (rather than relying on the visibility helpers' implicit
+    narrowing). Returns ``None`` for cookie/OIDC/PAT auth and for
+    non-``project:`` MCP scopes (``user`` / ``all``).
+    """
+    return _scope_project_id(user)
+
+
 def _scope_project_id(user: dict[str, Any]) -> UUID | None:
     """Return the UUID a token is project-scoped to, or None.
 
@@ -275,6 +287,25 @@ async def require_job_access(
     raise HTTPException(status_code=403, detail="Not authorized to access this job")
 
 
+async def user_can_access_any_job(
+    user: dict[str, Any], db, job_ids: list[str] | list[UUID]
+) -> bool:
+    """True if the caller can access at least one of ``job_ids``.
+
+    Convenience over a loop of :func:`user_can_access_job`. Used by
+    endpoints that resolve a resource through a M:N join (sources via
+    ``job_sources``; future: any artifact reachable by multiple jobs).
+    An empty ``job_ids`` returns False — fail closed for non-admins.
+    Admins with no project: scope pass without hitting the DB.
+    """
+    if user.get("is_admin") and _scope_project_id(user) is None:
+        return True
+    for jid in job_ids:
+        if await user_can_access_job(user, db, str(jid)):
+            return True
+    return False
+
+
 async def user_can_access_job(user: dict[str, Any], db, job_id: str | None) -> bool:
     """Bool variant of :func:`require_job_access` for non-HTTP call sites.
 
@@ -306,6 +337,34 @@ async def user_can_access_job(user: dict[str, Any], db, job_id: str | None) -> b
         if role:
             return True
     return False
+
+
+async def require_thread_owner(
+    request: Request,
+    db,
+    thread_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Require caller to own the persistent thread. Returns ``(user, thread)``.
+
+    Persistent chat threads are personal — there's no project sharing.
+    Admins bypass. A ``project:<uuid>``-scoped MCP token is refused since
+    the thread has no project to bind to. **Fail-closed for orphans:**
+    threads with ``user_id IS NULL`` (left behind by deleted users) are
+    admin-only — the pre-G3 inline checks silently allowed any caller
+    through for orphan threads, which let attackers enumerate them by
+    UUID. Raises 404 if the thread doesn't exist, 403 otherwise.
+    """
+    user = await require_approved_user(request, db)
+    thread = await db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if not _scope_permits_personal(user):
+        raise HTTPException(status_code=403, detail="Access denied by MCP token scope")
+    if user.get("is_admin"):
+        return user, thread
+    if str(thread.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+    return user, thread
 
 
 async def require_builder_session_owner(
