@@ -17,6 +17,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+import urllib.parse
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import find_dotenv, load_dotenv
@@ -60,7 +61,7 @@ else:
 # Suppress uvicorn's shallow access log — replaced by request logging middleware below.
 logging.getLogger("uvicorn.access").disabled = True
 
-from datetime import date, datetime, timezone  # noqa: E402
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
@@ -79,7 +80,12 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse, Response, StreamingResponse  # noqa: E402
+from fastapi.responses import (  # noqa: E402
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 
 from pydantic import BaseModel, Field  # noqa: E402
 
@@ -93,8 +99,12 @@ from database import (  # noqa: E402
 from security.auth import (  # noqa: E402
     get_current_user,
     require_approved_user,
+    resolve_ws_user,
     cleanup_expired_tokens,
+    cleanup_expired_sessions,
 )
+from security.csrf import CSRFMiddleware  # noqa: E402
+from auth import bff_router  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -135,6 +145,11 @@ from src.core.model_registry import (  # noqa: E402
     family_of as _model_family,
     resolve_model as _resolve_model,
 )
+from src.utils.ssh_key import (  # noqa: E402
+    InvalidSSHKeyError,
+    generate_ed25519_keypair as _generate_ed25519_keypair,
+    validate_private_key as _validate_ssh_private_key,
+)
 from langchain_core.messages import (  # noqa: E402
     AIMessage,
     BaseMessage,
@@ -160,6 +175,7 @@ from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
 from services.email import email_service  # noqa: E402
+from services import headless_notifications  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
 from services.notification_service import notification_service  # noqa: E402
 import httpx  # noqa: E402
@@ -426,9 +442,14 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 )
 
             # 3. Propagate: threads bound to offline agents → 'ended'
-            ended_count = await postgres_db.mark_orphaned_threads_ended()
-            if ended_count > 0:
-                logger.info(f"Marked {ended_count} thread(s) as ended (orphaned)")
+            ended_ids = await postgres_db.mark_orphaned_threads_ended()
+            if ended_ids:
+                logger.info(f"Marked {len(ended_ids)} thread(s) as ended (orphaned)")
+                # The DB transition leaves workspace + agent pods alive — release
+                # them here so we don't depend on the idle sweeper as the only
+                # backstop (it's disabled whenever S3 snapshots are unavailable).
+                for thread_id in ended_ids:
+                    await _release_thread_resources(thread_id)
 
             # 4. Propagate: jobs assigned to offline agents → paused
             recovered = await postgres_db.recover_orphaned_jobs()
@@ -782,6 +803,46 @@ async def _inject_dispatch_credentials(
         logger.info(
             f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
         )
+
+    # Resolve credentials for any capability/phase section the job explicitly
+    # pinned a model on. The top-level branch above only inspects `llm.model`;
+    # without this loop, an override like
+    # `{"llm": {"tactical": {"model": "X"}}}` ships the model name with no
+    # `base_url`/`api_key`, the agent's LLM factory falls back to the parent's
+    # base_url, and X's endpoint never gets hit — producing opaque 404s when
+    # X lives behind a non-default endpoint. The user-default phase pin block
+    # further down catches the same hole for unpinned phases, so the two
+    # blocks together cover both shapes: explicit job overrides (here) and
+    # user-default fallback (below).
+    for _section_name, _parent in (
+        ("auxiliary", config_override),
+        ("strategic", llm_over),
+        ("tactical", llm_over),
+    ):
+        _section = _parent.get(_section_name)
+        if not isinstance(_section, dict):
+            continue
+        _section_model = _section.get("model")
+        if not _section_model or _section.get("base_url"):
+            continue
+        await _inject_model_credentials(
+            section=_section,
+            model_id=_section_model,
+            user_id=user_id_str,
+            resolved_keys=resolved_keys,
+        )
+        if "api_key" not in _section and "base_url" not in _section:
+            logger.warning(
+                f"Dispatch: job {job_id} pinned {_section_name} model "
+                f"{_section_model!r} but no endpoint or provider key was "
+                f"resolvable — the agent will fall back to the parent "
+                f"base_url and almost certainly 404."
+            )
+        else:
+            logger.info(
+                f"Dispatch: injected credentials for {_section_name} "
+                f"override: {_section_model}"
+            )
 
     if job.get("user_id"):
         user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
@@ -1642,6 +1703,70 @@ async def _archive_and_cleanup_workspace(
     return actions
 
 
+async def _release_thread_resources(thread_id: str) -> None:
+    """Release a thread's workspace container/VM and agent pod.
+
+    Centralized so the user-facing DELETE, the agent-facing status flip,
+    and the orphan reaper share one teardown sequence. Each step swallows
+    its own exception — a failure in snapshotting must not block the
+    agent-pod delete and vice versa, otherwise resources leak.
+    """
+    try:
+        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
+    except Exception:
+        logger.exception("Workspace cleanup failed for thread %s", thread_id)
+
+    try:
+        if agent_provisioner.is_available:
+            await agent_provisioner.delete_agent_pod_by_thread(thread_id)
+        elif persistent_provisioner.is_available:
+            await persistent_provisioner.delete_agent_pod(thread_id)
+            await persistent_provisioner.delete_agent_pvc(thread_id)
+    except Exception:
+        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+
+
+async def _suspend_thread_resources(thread_id: str) -> None:
+    """Suspend a thread's workspace to S3 and release the agent pod.
+
+    Used for agent-initiated `ended` transitions where the user has not
+    asked to destroy data — idle timeout, drain, watchdog, WS disconnect.
+    Preserves the workspace via S3 snapshot so /resume can restore it
+    later (resume already routes through restore_thread_workspace when
+    it sees workspace_container.status == 'suspended').
+
+    Falls back gracefully if the suspension service is disabled or the
+    snapshot fails: the workspace stays alive (reconciler will reap it
+    eventually) but we still delete the agent pod so the slot frees.
+    """
+    suspended = False
+    try:
+        if workspace_suspension_service.is_enabled:
+            suspended = await workspace_suspension_service.suspend_thread_workspace(
+                thread_id
+            )
+    except Exception:
+        logger.exception("Workspace suspend failed for thread %s", thread_id)
+
+    if suspended:
+        # suspend_thread_workspace already deletes the agent pod.
+        return
+
+    logger.warning(
+        "Workspace suspend unavailable or failed for thread %s — keeping "
+        "workspace alive (reconciler will reap) but deleting the agent pod",
+        thread_id,
+    )
+    try:
+        if agent_provisioner.is_available:
+            await agent_provisioner.delete_agent_pod_by_thread(thread_id)
+        elif persistent_provisioner.is_available:
+            await persistent_provisioner.delete_agent_pod(thread_id)
+            await persistent_provisioner.delete_agent_pvc(thread_id)
+    except Exception:
+        logger.exception("Agent pod cleanup failed for thread %s", thread_id)
+
+
 def _provider_of_model(model: str) -> str | None:
     """Sync prefix-based provider heuristic for legacy dispatch paths.
 
@@ -2235,6 +2360,25 @@ class DatasourceUpdate(BaseModel):
     default_branch: str | None = Field(None, description="New default branch")
 
 
+class SSHKeyGenerateRequest(BaseModel):
+    """Request body for generating an SSH keypair for a repository datasource."""
+
+    comment: str | None = Field(
+        None,
+        description="Optional comment to embed in the public key (e.g. datasource name)",
+        max_length=200,
+    )
+
+
+class SSHKeyGenerateResponse(BaseModel):
+    """Response containing a freshly generated ed25519 SSH keypair."""
+
+    private_key: str = Field(..., description="OpenSSH PEM private key (no passphrase)")
+    public_key: str = Field(
+        ..., description="Single-line OpenSSH public key for the deploy-keys field"
+    )
+
+
 class ProjectDatasourceSettings(BaseModel):
     """Project-level settings when linking a datasource."""
 
@@ -2473,6 +2617,38 @@ class McpTokenCreateInternal(BaseModel):
     expires_at: str | None = Field(None, description="ISO 8601 datetime")
 
 
+# ----- API keys (Personal Access Tokens) -----
+# Distinct from `/api/settings/api-keys` (LLM provider keys). PATs are
+# Bearer-auth credentials for n8n / scripts hitting the orchestrator API
+# directly. See docs/features/auth_bff_and_api_tokens.md §3.
+
+VALID_PAT_SCOPES = {
+    "jobs:read",
+    "jobs:write",
+    "chat:read",
+    "chat:write",
+    "knowledge:read",
+    "knowledge:write",
+    "admin",
+}
+
+
+class ApiKeyCreate(BaseModel):
+    """Request body for creating a Personal Access Token."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="Display name")
+    scopes: list[str] = Field(
+        default_factory=lambda: ["jobs:read", "chat:read"],
+        description="Action scopes — see VALID_PAT_SCOPES",
+    )
+    expires_in_days: int | None = Field(
+        365,
+        ge=1,
+        le=3650,
+        description="Days until expiry (null = never). Default 1 year per design.",
+    )
+
+
 VALID_API_KEY_PROVIDERS = {
     "openai",
     "anthropic",
@@ -2693,6 +2869,11 @@ class UserSettingsUpdate(BaseModel):
     default_tactical_model: str | None = None
     default_embedding_model: str | None = None
     embedding_provider: str | None = None
+    # Phase 6: persistent_agent sub-object covers headless_mode,
+    # headless_attention_sleep_minutes, notification_channels, plus the
+    # existing model/permission_mode/greeting/idle_timeout_minutes/command_allowlist
+    # keys already read in create_thread. Patch-replaces the whole sub-object.
+    persistent_agent: dict[str, Any] | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -2865,6 +3046,13 @@ async def lifespan(app: FastAPI):
     await vector_db.connect()
     await mongodb.connect()
 
+    # Reassert MongoDB index declarations on every startup. Idempotent —
+    # existing identical indexes are a silent no-op. Closes the gap that
+    # produced the 2026-05-12 outage where the standalone init.py CLI was
+    # never actually invoked by the deploy pipeline. See
+    # docs/issues/agent_audit_collection_missing_indexes.md.
+    await mongodb.ensure_indexes()
+
     # Apply pending migrations on each DB. Each PostgresDB instance is
     # bound to its migrations directory at construction time; the runner
     # serializes via pg_advisory_xact_lock and refuses to proceed on
@@ -3019,8 +3207,18 @@ async def lifespan(app: FastAPI):
     token_cleanup_task = asyncio.create_task(
         cleanup_expired_tokens(postgres_db, _shutdown_event)
     )
+    session_cleanup_task = asyncio.create_task(
+        cleanup_expired_sessions(postgres_db, _shutdown_event)
+    )
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
+    thread_events_prune_task = asyncio.create_task(
+        thread_events_prune_sweeper(_shutdown_event)
+    )
+    headless_notify_task = asyncio.create_task(
+        thread_permission_notify_sweeper(_shutdown_event)
+    )
+    attention_sleep_task = asyncio.create_task(attention_sleep_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
@@ -3086,8 +3284,12 @@ async def lifespan(app: FastAPI):
     _shutdown_event.set()
     await stale_detector_task
     await token_cleanup_task
+    await session_cleanup_task
     await dispatcher_task
     await sudo_sweeper_task
+    await thread_events_prune_task
+    await headless_notify_task
+    await attention_sleep_task
     await ide_sweeper_task
     await ws_sweeper_task
     await gc_sweeper_task
@@ -3123,6 +3325,15 @@ app = FastAPI(
     default_response_class=CustomJSONResponse,
 )
 
+# CSRF defense for the cookie BFF. Middleware order matters: Starlette
+# runs the OUTERMOST `add_middleware` last, so we add CSRF first and CORS
+# second. Result: incoming request → CORS preflight/origin handling →
+# CSRF check → app. That means OPTIONS preflights are still answered by
+# CORS (which is good — preflights are unauthenticated), while real
+# POST/PUT/DELETE/PATCH requests get the layered Sec-Fetch-Site +
+# X-CSRF + Origin allowlist check before they reach any handler.
+app.add_middleware(CSRFMiddleware)
+
 # CORS for Angular frontend (dev server on 4200, production/SSR on 4000)
 app.add_middleware(
     CORSMiddleware,
@@ -3136,6 +3347,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Expose nothing extra — the BFF only returns JSON + Set-Cookie, and
+    # browsers already see Set-Cookie. Keeping this explicit makes the
+    # CSP-style header surface visible.
 )
 
 
@@ -3221,6 +3435,7 @@ async def request_logging_middleware(request: Request, call_next):
 
 
 # Include routers
+app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 
@@ -8248,6 +8463,54 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
 # =============================================================================
 
 
+def _normalize_datasource_credentials(
+    credentials: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Validate and normalize secret fields in a datasource credentials dict.
+
+    Currently this means: if an ``ssh_key`` is present, run it through
+    :func:`validate_private_key`, which trims surrounding whitespace,
+    normalizes line endings, and ensures the single trailing newline that
+    OpenSSL/libcrypto requires. Raises ``HTTPException(400)`` if the key
+    fails structural validation.
+    """
+    if not credentials:
+        return credentials
+    ssh_key = credentials.get("ssh_key")
+    if ssh_key is None:
+        return credentials
+    try:
+        credentials["ssh_key"] = _validate_ssh_private_key(ssh_key)
+    except InvalidSSHKeyError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid ssh_key: {exc}") from exc
+    return credentials
+
+
+@app.post(
+    "/api/datasources/ssh-keys/generate",
+    response_model=SSHKeyGenerateResponse,
+)
+async def generate_datasource_ssh_key(
+    body: SSHKeyGenerateRequest | None = None,
+) -> SSHKeyGenerateResponse:
+    """Generate a fresh ed25519 SSH keypair for the user to paste into the form.
+
+    The private half is returned in OpenSSH PEM format (already normalized
+    with a trailing newline so it round-trips through validation) and the
+    public half is returned in the single-line authorized_keys format the
+    user pastes into their provider's deploy-keys UI. The server does not
+    persist the keypair — storage happens when the user submits the
+    datasource form, which re-validates the private key via the same
+    ssh_key path as a hand-pasted key.
+    """
+    comment = (body.comment if body else None) or ""
+    keypair = _generate_ed25519_keypair(comment=comment)
+    return SSHKeyGenerateResponse(
+        private_key=keypair.private_key,
+        public_key=keypair.public_key,
+    )
+
+
 @app.get("/api/datasources")
 async def list_datasources(
     job_id: str | None = Query(
@@ -8296,19 +8559,23 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     user = await get_current_user(request, postgres_db)
     user_id = str(user["id"]) if user else None
 
+    credentials = _normalize_datasource_credentials(body.credentials)
+
     try:
         return await postgres_db.create_datasource(
             name=body.name,
             ds_type=body.type,
             connection_url=body.connection_url,
             description=body.description,
-            credentials=body.credentials,
+            credentials=credentials,
             job_id=body.job_id,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
             created_by=user_id,
             is_global=body.is_global,
         )
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = str(e)
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
@@ -8324,13 +8591,14 @@ async def update_datasource(
     datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
     """Update a datasource."""
+    credentials = _normalize_datasource_credentials(body.credentials)
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
             name=body.name,
             description=body.description,
             connection_url=body.connection_url,
-            credentials=body.credentials,
+            credentials=credentials,
             cli_hint=body.cli_hint,
             default_branch=body.default_branch,
         )
@@ -9175,6 +9443,10 @@ class AgentThreadMessageRequest(BaseModel):
     tool_calls: list[dict] | None = None
     turn_number: int | None = None
     metrics: dict | None = None
+    # Links a role='tool' row back to its originating tool_calls[].id.
+    tool_call_id: str | None = None
+    # Reasoning content captured from role='ai' rows. See migration 0011.
+    thinking: str | None = None
 
 
 @app.post("/api/agents/threads")
@@ -9358,11 +9630,20 @@ async def agent_update_thread_status(
 ) -> dict[str, str]:
     """Update thread status (no auth, agent-facing).
 
-    Used for lifecycle transitions: created → active, active → ended.
-    'ended' is also reachable via DELETE /api/persistent/threads/{id} (manual
-    end is removed from the UI but the endpoint remains for permanent delete).
+    Lifecycle transitions:
+      created → active, active → ended (existing).
+      active → awaiting_user (Phase 5: agent reached natural pause, no WS
+        subscriber). Idempotent — repeated awaiting_user writes preserve
+        the original awaiting_user_since so the attention-sleep watchdog's
+        clock keeps ticking.
+      awaiting_user → active (Phase 5: subscriber reattached). Clears
+        awaiting_user_since and extend_count.
+
+    'suspended' is reserved for the attention-sleep watchdog and is not
+    writable from agent path — would create a race where an agent flips
+    the thread back to active while the orchestrator is mid-suspend.
     """
-    valid_statuses = {"active", "ended"}
+    valid_statuses = {"active", "ended", "awaiting_user"}
     if request.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
@@ -9372,8 +9653,52 @@ async def agent_update_thread_status(
         if request.status == "ended":
             # Route through end_thread so ended_at gets stamped.
             await postgres_db.end_thread(thread_id)
-        else:
-            await postgres_db.update_thread_status(thread_id, request.status)
+            # Agent-initiated `ended` (idle timeout, drain, watchdog, WS
+            # disconnect) is almost always recoverable, not a user-intent
+            # delete — preserve the workspace via S3 snapshot so /resume
+            # can restore it. The user-facing DELETE handler still uses
+            # _release_thread_resources for true destruction.
+            # See docs/issues/persistent_session_permission_check_race.md.
+            asyncio.create_task(_suspend_thread_resources(thread_id))
+        elif request.status == "awaiting_user":
+            # Idempotent: preserve awaiting_user_since on repeated writes
+            # (the agent's loop calls this on every untethered turn-complete
+            # in eager mode; resetting the timestamp would let the
+            # attention-sleep watchdog never fire). extend_count is also
+            # preserved across repeated writes within the same session;
+            # only the active→awaiting_user transition resets it.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = 'awaiting_user', "
+                    "    awaiting_user_since = CASE "
+                    "        WHEN status = 'awaiting_user' "
+                    "             THEN awaiting_user_since "
+                    "        ELSE now() "
+                    "    END, "
+                    "    extend_count = CASE "
+                    "        WHEN status = 'awaiting_user' THEN extend_count "
+                    "        ELSE 0 "
+                    "    END, "
+                    "    last_activity = CURRENT_TIMESTAMP "
+                    "WHERE id = $1",
+                    thread_id,
+                )
+        else:  # active
+            # On revert from awaiting_user (or any other source), clear the
+            # attention-sleep timer fields so the watchdog re-arms cleanly
+            # on the next natural-pause transition.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = $2, "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0, "
+                    "    last_activity = CURRENT_TIMESTAMP "
+                    "WHERE id = $1",
+                    thread_id,
+                    request.status,
+                )
         return {"status": request.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -9527,6 +9852,8 @@ async def agent_save_message(
             tool_calls=request.tool_calls,
             turn_number=request.turn_number,
             metrics=request.metrics,
+            tool_call_id=request.tool_call_id,
+            thinking=request.thinking,
         )
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:
@@ -9723,6 +10050,22 @@ async def create_thread(
                 config_override["command_allowlist"] = user_settings[
                     "command_allowlist"
                 ]
+            # Phase 6: headless behavior (polite/eager + attention-sleep TTL +
+            # notification channels). Carried under config_override.headless
+            # so the agent's loader maps it onto AgentConfig.headless.
+            headless_override: dict[str, Any] = {}
+            if user_settings.get("headless_mode"):
+                headless_override["mode"] = user_settings["headless_mode"]
+            if user_settings.get("headless_attention_sleep_minutes") is not None:
+                headless_override["attention_sleep_minutes"] = int(
+                    user_settings["headless_attention_sleep_minutes"]
+                )
+            if user_settings.get("notification_channels"):
+                headless_override["notification_channels"] = list(
+                    user_settings["notification_channels"]
+                )
+            if headless_override:
+                config_override["headless"] = headless_override
 
         # Per-session overrides from request (take priority over user defaults)
         if request_body.model:
@@ -10248,18 +10591,8 @@ async def end_thread(
             metadata = {}
     ws_ctx = metadata.get("workspace_container") or {}
 
-    # Archive workspace (snapshot to S3) and clean up workspace container + VM
-    try:
-        await _archive_and_cleanup_workspace(thread_id, entity_type="threads")
-    except Exception as e:
-        logger.warning("Workspace cleanup failed for thread %s: %s", thread_id, e)
-
-    # Clean up agent pod (unified provisioner, then legacy fallback)
-    if agent_provisioner.is_available:
-        await agent_provisioner.delete_agent_pod_by_thread(thread_id)
-    elif persistent_provisioner.is_available:
-        await persistent_provisioner.delete_agent_pod(thread_id)
-        await persistent_provisioner.delete_agent_pvc(thread_id)
+    # Snapshot + tear down workspace container/VM and agent pod
+    await _release_thread_resources(thread_id)
 
     # Destructive cleanup of user-visible resources runs ONLY on permanent
     # delete. A soft "end" keeps the Gitea repo and the cloud session folder
@@ -10482,6 +10815,1261 @@ async def get_thread_messages_history(
         "total": total,
         "thread_id": thread_id,
     }
+
+
+# =============================================================================
+# Headless persistent sessions — Phase 2 SSE + REST transport
+# =============================================================================
+#
+# SSE replaces the WebSocket as the primary server→client path; the existing
+# /ws/persistent/{thread_id} stays as a fallback. Per
+# docs/features/headless_persistent_sessions.md.
+#
+# The per-turn input lock guards against duplicate POSTs from concurrent
+# cockpit tabs racing on the same turn. Single-instance orchestrator, so a
+# module-level dict is enough; entries auto-clean 5 min after release.
+
+_thread_turn_locks: dict[tuple[str, int], asyncio.Lock] = {}
+_thread_turn_inflight: dict[str, int] = {}
+
+
+def _ensure_thread_turn_lock(thread_id: str, turn_id: int) -> asyncio.Lock:
+    """Get or create the lock for (thread_id, turn_id). Concurrent callers
+    landing on the same tuple share the same Lock object."""
+    key = (thread_id, turn_id)
+    lock = _thread_turn_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _thread_turn_locks[key] = lock
+    return lock
+
+
+def _schedule_turn_lock_cleanup(thread_id: str, turn_id: int) -> None:
+    """Remove the lock entry 5 minutes after release. Memory-leak guard
+    for long-lived sessions accumulating per-turn locks."""
+
+    async def _later() -> None:
+        await asyncio.sleep(300)
+        _thread_turn_locks.pop((thread_id, turn_id), None)
+        if _thread_turn_inflight.get(thread_id) == turn_id:
+            _thread_turn_inflight.pop(thread_id, None)
+
+    asyncio.create_task(_later(), name=f"turn-lock-cleanup-{thread_id[:8]}")
+
+
+async def _resolve_thread_for_forwarding(
+    thread_id: str, user: dict
+) -> tuple[dict, dict]:
+    """Look up thread + bound agent for orchestrator → agent forwarding.
+
+    Returns (thread, agent). Raises HTTPException on auth or routing failures.
+    Restores a suspended workspace if needed (same pattern as the WS proxy).
+    """
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    ws_ctx = metadata.get("workspace_container") or {}
+    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
+        logger.info("Restoring suspended workspace for thread %s", thread_id)
+        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
+        if not ok:
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to restore suspended workspace",
+            )
+        thread = await postgres_db.get_thread(thread_id)
+
+    agent_id = thread.get("agent_id") if thread else None
+    if not agent_id:
+        raise HTTPException(
+            status_code=503,
+            detail="No agent bound to thread — open the SSE stream first",
+        )
+    agent = await postgres_db.get_agent(str(agent_id))
+    if not agent or not agent.get("pod_ip"):
+        raise HTTPException(
+            status_code=503,
+            detail="Agent unreachable (no pod_ip)",
+        )
+    return thread, agent
+
+
+async def _forward_to_agent(
+    agent: dict, path: str, payload: dict, timeout: float = 30.0
+) -> dict[str, Any]:
+    """POST `payload` to the agent pod's REST endpoint at `path`. Returns
+    parsed JSON body. Raises HTTPException on transport/status errors."""
+    agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}{path}"
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(agent_url, json=payload)
+    except Exception as e:
+        logger.warning("Agent forward failed: %s %s -> %s", path, agent.get("id"), e)
+        raise HTTPException(status_code=503, detail=f"Agent unreachable: {e}") from e
+    if response.status_code >= 500:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Agent error: {response.status_code} {response.text[:200]}",
+        )
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=response.text[:200],
+        )
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text[:500]}
+
+
+@app.get("/api/persistent/threads/{thread_id}/stream")
+async def thread_event_stream(thread_id: str, request: Request) -> StreamingResponse:
+    """SSE: stream this thread's event log with replay-from-cursor.
+
+    The client sends `Last-Event-ID: <epoch>:<seq>` to resume from a known
+    point. If the cursor's epoch doesn't match the server, or its seq is
+    older than retention, the server emits a single `gone_beyond_horizon`
+    event and closes — the client must drop its cursor and re-sync.
+
+    Otherwise: replay everything since the cursor, then switch to live
+    mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    server_epoch = int(thread.get("events_epoch") or 0)
+
+    # Parse Last-Event-ID. Format: "<epoch>:<seq>". Missing/malformed → no
+    # replay, start from current tail.
+    #
+    # EventSource doesn't let the browser set custom request headers, so the
+    # cockpit hands us the cached cursor via `?last_event_id=` for the
+    # initial connection. On automatic reconnect, the browser appends the
+    # `Last-Event-ID` header from the latest `id:` line we yielded — that
+    # path is fully native and doesn't need the query param.
+    last_event_id = (
+        request.headers.get("Last-Event-ID")
+        or request.headers.get("last-event-id")
+        or request.query_params.get("last_event_id")
+    )
+    cursor_epoch: Optional[int] = None
+    cursor_seq: Optional[int] = None
+    if last_event_id:
+        try:
+            e_str, s_str = last_event_id.split(":", 1)
+            cursor_epoch = int(e_str)
+            cursor_seq = int(s_str)
+        except (ValueError, AttributeError):
+            cursor_epoch = None
+            cursor_seq = None
+
+    async def event_stream():
+        # Mismatched epoch → force re-sync.
+        if cursor_epoch is not None and cursor_epoch != server_epoch:
+            async with postgres_db.acquire() as conn:
+                tail = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    thread_id,
+                    server_epoch,
+                )
+            payload = json.dumps(
+                {
+                    "method": "gone_beyond_horizon",
+                    "params": {
+                        "epoch": server_epoch,
+                        "server_seq": int(tail or 0),
+                        "reason": "epoch_mismatch",
+                    },
+                }
+            )
+            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
+            return
+
+        # Retention floor for the current epoch.
+        async with postgres_db.acquire() as conn:
+            min_seq = await conn.fetchval(
+                "SELECT MIN(seq) FROM thread_events "
+                "WHERE thread_id = $1 AND epoch = $2",
+                thread_id,
+                server_epoch,
+            )
+        min_seq = int(min_seq) if min_seq is not None else 0
+
+        # Cursor older than retention → also force re-sync.
+        if cursor_seq is not None and min_seq > 0 and cursor_seq < min_seq - 1:
+            async with postgres_db.acquire() as conn:
+                tail = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    thread_id,
+                    server_epoch,
+                )
+            payload = json.dumps(
+                {
+                    "method": "gone_beyond_horizon",
+                    "params": {
+                        "epoch": server_epoch,
+                        "server_seq": int(tail or 0),
+                        "retention_min_seq": min_seq,
+                        "reason": "cursor_older_than_retention",
+                    },
+                }
+            )
+            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
+            return
+
+        last_sent_seq = cursor_seq if cursor_seq is not None else 0
+        empty_polls = 0
+        idle_keepalive_at = 0.0
+        cancelled = False
+        try:
+            while not cancelled:
+                if await request.is_disconnected():
+                    break
+                async with postgres_db.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT seq, kind, payload "
+                        "FROM thread_events "
+                        "WHERE thread_id = $1 AND epoch = $2 AND seq > $3 "
+                        "ORDER BY seq ASC "
+                        "LIMIT 500",
+                        thread_id,
+                        server_epoch,
+                        last_sent_seq,
+                    )
+                if rows:
+                    empty_polls = 0
+                    for row in rows:
+                        seq = int(row["seq"])
+                        # row["payload"] is a JSONB column — asyncpg may
+                        # return it as str or already-parsed dict depending
+                        # on codec registration.
+                        raw_payload = row["payload"]
+                        if isinstance(raw_payload, str):
+                            payload_obj = json.loads(raw_payload)
+                        else:
+                            payload_obj = raw_payload
+                        frame = {
+                            "method": row["kind"],
+                            "params": payload_obj,
+                        }
+                        body = json.dumps(frame)
+                        yield f"id: {server_epoch}:{seq}\ndata: {body}\n\n"
+                        last_sent_seq = seq
+                    idle_keepalive_at = 0.0
+                else:
+                    # Adaptive backoff: 200ms × 5 empty polls, then 1s.
+                    empty_polls += 1
+                    wait = 1.0 if empty_polls >= 5 else 0.2
+                    # Typed `ping` event every ~20s of idle. A bare `:`
+                    # comment would keep the socket warm but never fire
+                    # `onmessage` in the browser, leaving silent network
+                    # drops undetectable client-side. A typed event with no
+                    # `id:` line lets the cockpit watchdog observe liveness
+                    # without advancing the replay cursor.
+                    idle_keepalive_at += wait
+                    if idle_keepalive_at >= 20.0:
+                        yield "event: ping\ndata: {}\n\n"
+                        idle_keepalive_at = 0.0
+                    try:
+                        await asyncio.sleep(wait)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        break
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning("thread_event_stream error (thread=%s): %s", thread_id, e)
+            return
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+class ThreadInputRequest(BaseModel):
+    """Body for POST /api/persistent/threads/{thread_id}/input."""
+
+    content: str
+    turn_id: Optional[int] = None
+
+
+@app.post("/api/persistent/threads/{thread_id}/input")
+async def thread_input(
+    thread_id: str, body: ThreadInputRequest, request: Request
+) -> dict[str, Any]:
+    """Submit user input to a thread. Per-turn lock returns 409 on dupes."""
+    user = await require_approved_user(request, postgres_db)
+    thread, agent = await _resolve_thread_for_forwarding(thread_id, user)
+
+    if not body.content or not isinstance(body.content, str):
+        raise HTTPException(
+            status_code=400, detail="content must be a non-empty string"
+        )
+
+    # Turn id defaults to the thread's current total_turns + 1. Reject
+    # arbitrarily-large values to bound the lock dict.
+    total_turns = int(thread.get("total_turns") or 0)
+    if body.turn_id is None:
+        turn_id = total_turns + 1
+    else:
+        turn_id = body.turn_id
+        if turn_id < 0 or turn_id > total_turns + 5:
+            raise HTTPException(
+                status_code=400,
+                detail=f"turn_id out of range "
+                f"(thread at turn {total_turns}, max accepted "
+                f"{total_turns + 5})",
+            )
+
+    lock = _ensure_thread_turn_lock(thread_id, turn_id)
+    if lock.locked():
+        in_flight = _thread_turn_inflight.get(thread_id, turn_id)
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "turn_in_flight",
+                "turn_id": in_flight,
+                "thread_id": thread_id,
+            },
+        )
+    async with lock:
+        _thread_turn_inflight[thread_id] = turn_id
+        try:
+            result = await _forward_to_agent(
+                agent,
+                "/api/input",
+                {"content": body.content, "turn_id": turn_id},
+            )
+        finally:
+            _schedule_turn_lock_cleanup(thread_id, turn_id)
+    return {
+        "accepted": True,
+        "turn_id": turn_id,
+        "agent": result,
+    }
+
+
+@app.post("/api/persistent/threads/{thread_id}/interrupt")
+async def thread_interrupt(thread_id: str, request: Request) -> dict[str, Any]:
+    """Interrupt the in-flight turn. Mode (hard/graceful) is decided by
+    the agent based on whether a tool is currently mid-`ainvoke`."""
+    user = await require_approved_user(request, postgres_db)
+    _, agent = await _resolve_thread_for_forwarding(thread_id, user)
+    result = await _forward_to_agent(agent, "/api/interrupt", {})
+    return {"accepted": True, "agent": result}
+
+
+class ThreadApproveRequest(BaseModel):
+    """Body for POST /api/persistent/threads/{id}/approve/{approval_id}."""
+
+    decision: str  # "approve" or "deny"
+
+
+@app.post("/api/persistent/threads/{thread_id}/approve/{approval_id}")
+async def thread_approve(
+    thread_id: str,
+    approval_id: str,
+    body: ThreadApproveRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Resolve a pending permission gate by updating thread_permission_requests
+    directly. The DB trigger fires NOTIFY → the agent's LISTEN wakes its
+    permission_check. No agent forwarding hop — this endpoint is the
+    canonical resolution path for magic-link approvals and MCP clients
+    alike. The cockpit WS approve method does the same UPDATE inside the
+    agent for back-compat.
+
+    Returns:
+        200 — request resolved (status flipped)
+        400 — invalid decision
+        403 — not thread owner
+        404 — approval_id not found, or wrong thread, or no pending request
+        409 — request already decided (idempotent re-clicks land here)
+    """
+    user = await require_approved_user(request, postgres_db)
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+        raise HTTPException(status_code=403, detail="Not your thread")
+
+    if body.decision == "approve":
+        new_status = "approved"
+    elif body.decision == "deny":
+        new_status = "denied"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be 'approve' or 'deny'",
+        )
+
+    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
+
+    async with postgres_db.acquire() as conn:
+        # Lookup-then-update so we can distinguish 404 (wrong id/thread)
+        # from 409 (already decided).
+        existing = await conn.fetchrow(
+            "SELECT id, status, tool_call_id FROM thread_permission_requests "
+            "WHERE id = $1 AND thread_id = $2",
+            approval_id,
+            thread_id,
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Permission request not found for this thread",
+            )
+        if existing["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Already {existing['status']}",
+            )
+        row = await conn.fetchrow(
+            "UPDATE thread_permission_requests "
+            "SET status = $2, decided_at = now(), decided_by = $3 "
+            "WHERE id = $1 AND status = 'pending' "
+            "RETURNING id, status, tool_call_id",
+            approval_id,
+            new_status,
+            decided_by,
+        )
+    if row is None:
+        # Lost the race — somebody else just decided this. Idempotency.
+        raise HTTPException(
+            status_code=409,
+            detail="Already decided (race lost)",
+        )
+    return {
+        "accepted": True,
+        "decision": body.decision,
+        "approval_id": str(row["id"]),
+        "status": row["status"],
+        "tool_call_id": row["tool_call_id"],
+    }
+
+
+async def thread_events_prune_sweeper(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Background task that prunes the thread_events log on retention.
+
+    Runs every THREAD_EVENTS_PRUNE_INTERVAL_S (default 300s). Two queries:
+      - DELETE rows for threads in 'ended' status older than 24h.
+      - DELETE rows for threads NOT in 'ended' older than 7 days.
+
+    Best-effort. Survives transient DB errors by logging and continuing.
+    """
+    interval_s = int(os.environ.get("THREAD_EVENTS_PRUNE_INTERVAL_S", "300"))
+    logger.info("Thread-events prune sweeper started (interval=%ds)", interval_s)
+    while not shutdown_event.is_set():
+        try:
+            async with postgres_db.acquire() as conn:
+                ended_deleted = await conn.fetchval(
+                    "WITH deleted AS ("
+                    "  DELETE FROM thread_events "
+                    "  WHERE thread_id IN ("
+                    "    SELECT id FROM threads WHERE status = 'ended'"
+                    "  ) "
+                    "  AND created_at < now() - interval '24 hours' "
+                    "  RETURNING 1"
+                    ") SELECT COUNT(*) FROM deleted"
+                )
+                active_deleted = await conn.fetchval(
+                    "WITH deleted AS ("
+                    "  DELETE FROM thread_events "
+                    "  WHERE thread_id IN ("
+                    "    SELECT id FROM threads WHERE status <> 'ended'"
+                    "  ) "
+                    "  AND created_at < now() - interval '7 days' "
+                    "  RETURNING 1"
+                    ") SELECT COUNT(*) FROM deleted"
+                )
+            if (ended_deleted or 0) + (active_deleted or 0) > 0:
+                logger.info(
+                    "thread_events prune: ended=%d active=%d",
+                    int(ended_deleted or 0),
+                    int(active_deleted or 0),
+                )
+        except Exception as e:
+            logger.warning("thread_events prune error (non-fatal): %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Thread-events prune sweeper stopped")
+
+
+# =============================================================================
+# Headless persistent sessions — Phase 4 magic-link routes + watcher
+# =============================================================================
+#
+# Email magic-links land at /magic/approve/{token}. GET renders a
+# confirmation page (read-only, prefetch-safe). POST consumes the token
+# and UPDATEs thread_permission_requests via the same trigger path as
+# the cockpit WS approve handler.
+#
+# Background watcher (thread_permission_notify_sweeper) detects pending
+# requests older than 30s with no notification on record and dispatches
+# the email via services.headless_notifications.
+
+
+# Phase 5: per-thread cap on /magic/extend clicks. 4 × 60min = 4h total
+# awaiting_user before unconditional suspension. Configurable via env for
+# ops tuning during incident response.
+_MAGIC_EXTEND_CAP: int = int(os.environ.get("HEADLESS_EXTEND_CAP", "4"))
+
+
+def _magic_link_confirmation_page(
+    *,
+    tool_name: str,
+    tool_args_preview: str,
+    intended_decision: Optional[str],
+    token: str,
+    extend_status: Optional[str] = None,
+    extends_remaining: Optional[int] = None,
+) -> str:
+    """Render the GET landing page. Single button POSTs back to the same
+    URL with the actual decision; this is what prevents email-link
+    prefetchers (Outlook Safe Links, Gmail) from auto-consuming tokens.
+
+    Phase 5: a second form lets the user POST /magic/extend/{token} to
+    bump the attention-sleep clock by 60 min without consuming the
+    approval token. extend_status (when set) drives an inline toast:
+    'extended' on success, 'cap_reached' when extend_count >= cap,
+    'not_awaiting' when the thread is no longer in awaiting_user.
+    """
+    safe_args = (
+        tool_args_preview.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    safe_tool = tool_name.replace("&", "&amp;").replace("<", "&lt;")
+    if intended_decision == "approved":
+        button_label = "Confirm: Approve"
+        button_color = "#a6e3a1"
+    elif intended_decision == "denied":
+        button_label = "Confirm: Deny"
+        button_color = "#f38ba8"
+    else:
+        button_label = "Confirm decision"
+        button_color = "#cba6f7"
+
+    quoted_token = urllib.parse.quote(token, safe="")
+
+    # Extend banner copy — friendly, action-specific.
+    extend_banner_html = ""
+    if extend_status == "extended":
+        remaining_str = (
+            f" — {extends_remaining} extends remaining"
+            if extends_remaining is not None
+            else ""
+        )
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #a6e3a1; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            f'color: #a6e3a1; font-size: 13px;">Window extended by 60 minutes'
+            f"{remaining_str}.</div>"
+        )
+    elif extend_status == "cap_reached":
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #f9e2af; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            'color: #f9e2af; font-size: 13px;">Extend limit reached — please '
+            "approve, deny, or open the cockpit.</div>"
+        )
+    elif extend_status == "not_awaiting":
+        extend_banner_html = (
+            '<div style="background: #1e2030; border: 1px solid #89b4fa; '
+            "border-radius: 6px; padding: 10px 12px; margin: 0 0 12px 0; "
+            'color: #89b4fa; font-size: 13px;">No extend needed — the agent '
+            "is already active.</div>"
+        )
+
+    # Disable the extend button if we already know the cap was hit.
+    extend_disabled_attr = (
+        ' disabled style="opacity: 0.5; cursor: not-allowed;"'
+        if extend_status == "cap_reached"
+        else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
+    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
+      <h2 style="margin: 0; color: #cba6f7; font-size: 16px;">Confirm tool decision</h2>
+    </div>
+    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
+      {extend_banner_html}
+      <p>The agent wants to call <code style="background: #181825; padding: 2px 6px; border-radius: 4px;">{safe_tool}</code> with these arguments:</p>
+      <pre style="background: #181825; padding: 12px; border-radius: 6px; overflow-x: auto; font-size: 12px; color: #a6e3a1;">{safe_args}</pre>
+    </div>
+    <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
+      <form method="POST" action="/magic/approve/{quoted_token}" style="display: inline;">
+        <button type="submit" style="background: {button_color}; color: #1e1e2e; padding: 10px 28px; border: 0; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
+      </form>
+      <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
+        <button type="submit"{extend_disabled_attr} style="background: transparent; color: #89b4fa; padding: 10px 20px; border: 1px solid #89b4fa; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px;">I'm reviewing — extend 60min</button>
+      </form>
+      <p style="margin: 16px 0 0 0; color: #6c7086; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
+    </div>
+  </div>
+</body></html>"""
+
+
+def _magic_link_result_page(
+    *,
+    title: str,
+    body: str,
+    cockpit_url: str,
+    is_error: bool = False,
+) -> str:
+    accent = "#f38ba8" if is_error else "#a6e3a1"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>SRW — {title}</title></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1e1e2e; color: #cdd6f4; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; border: 1px solid #313244; border-radius: 12px; overflow: hidden;">
+    <div style="background: #181825; padding: 16px 20px; border-bottom: 1px solid #313244;">
+      <h2 style="margin: 0; color: {accent}; font-size: 16px;">{title}</h2>
+    </div>
+    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
+      <p>{body}</p>
+      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: #cba6f7;">Open the cockpit</a></p>
+    </div>
+  </div>
+</body></html>"""
+
+
+@app.get("/magic/approve/{token}")
+async def magic_link_get(token: str) -> HTMLResponse:
+    """Show a confirmation page for the magic-link token.
+
+    Does NOT consume the token (POST does). This separation is critical:
+    email link previewers (Outlook Safe Links, Gmail) auto-fetch URLs
+    server-side; a GET-executes link would be consumed by a bot before
+    the human ever clicks.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This approval link is no longer valid. It may have "
+                    "expired, been used already, or been invalidated by a "
+                    "newer approval. Open the cockpit to see the current "
+                    "state."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    # Fetch tool details for the confirmation page.
+    async with postgres_db.acquire() as conn:
+        permission_row = await conn.fetchrow(
+            "SELECT id, tool_name, tool_args, status "
+            "FROM thread_permission_requests WHERE id = $1",
+            row["approval_id"],
+        )
+
+    if permission_row is None or permission_row["status"] != "pending":
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request has already been resolved. No "
+                    "further action is needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    tool_args = permission_row["tool_args"]
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except Exception:
+            tool_args = {}
+    elif tool_args is None:
+        tool_args = {}
+    args_preview = json.dumps(tool_args, indent=2, default=str)
+    if len(args_preview) > 600:
+        args_preview = args_preview[:600] + "\n… (truncated)"
+
+    page = _magic_link_confirmation_page(
+        tool_name=permission_row["tool_name"],
+        tool_args_preview=args_preview,
+        intended_decision=row.get("intended_decision"),
+        token=token,
+    )
+    return HTMLResponse(page)
+
+
+@app.post("/magic/approve/{token}")
+async def magic_link_post(token: str) -> HTMLResponse:
+    """Consume the token and resolve the permission request.
+
+    CAS UPDATE on magic_link_tokens (single-use) + a second UPDATE on
+    thread_permission_requests (which the agent's LISTEN picks up via
+    the existing trigger). Distinguishes 404 (invalid) from 409 (token
+    already used or request already decided) for clean UX on double-clicks.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This approval link is no longer valid. It may have "
+                    "expired or been used already."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    decision = row.get("intended_decision") or "approved"
+
+    consumed = await headless_notifications.consume_magic_link(
+        postgres_db, str(row["id"]), decision
+    )
+    if consumed is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already used",
+                body=(
+                    "This link has already been used. The agent's request "
+                    "is being processed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    # Resolve the permission request. CAS-style UPDATE so we don't race
+    # with the cockpit having already decided it.
+    decided_by_label = "magic_link"
+    if consumed.get("user_id"):
+        decided_by_label = f"user:{consumed['user_id']}"
+    async with postgres_db.acquire() as conn:
+        permission_row = await conn.fetchrow(
+            "UPDATE thread_permission_requests "
+            "SET status = $2, decided_at = now(), decided_by = $3 "
+            "WHERE id = $1 AND status = 'pending' "
+            "RETURNING id, status, tool_call_id, tool_name, thread_id",
+            consumed["approval_id"],
+            decision,
+            decided_by_label,
+        )
+
+    if permission_row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request was already resolved by another "
+                    "approval path (cockpit click, REST, or expired). "
+                    "Your action was not needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=409,
+        )
+
+    # Phase 5: if the thread is suspended (attention-sleep watchdog fired
+    # since the email was sent), kick off restore + agent-pod re-creation.
+    # The agent's wake path (_loop_permission_check select-first guard)
+    # will pick up this UPDATE's decision once the new pod is alive — no
+    # second click required.
+    asyncio.create_task(
+        _phase5_wake_if_suspended(str(permission_row["thread_id"])),
+        name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
+    )
+
+    pretty = "approved" if decision == "approved" else "denied"
+    return HTMLResponse(
+        _magic_link_result_page(
+            title=f"Tool {pretty}",
+            body=(
+                f"The agent's request to call "
+                f"<code>{permission_row['tool_name']}</code> has been "
+                f"{pretty}. The agent will resume shortly."
+            ),
+            cockpit_url=cockpit_external_url,
+        )
+    )
+
+
+@app.post("/magic/extend/{token}")
+async def magic_link_extend(token: str) -> HTMLResponse:
+    """Extend the attention-sleep window for the thread bound to this token.
+
+    Validates the token (same hash + expiry + single-use checks as
+    /magic/approve) but does NOT consume it — the user is signaling
+    "I'm still reviewing" without making the approve decision. Bumps
+    threads.awaiting_user_since forward by 60 minutes per click, capped
+    at HEADLESS_EXTEND_CAP (default 4 = 4h total ceiling).
+
+    Re-renders the confirmation page with a toast so the user can still
+    click approve/deny on the same screen. Status_code 200 throughout —
+    the page itself carries the success/cap/not-awaiting signal.
+
+    Why a separate route and not "extend ↔ approve same POST": the
+    approve handler consumes the token (single-use CAS). If extend
+    shared that path, every extend click would burn the approval token
+    and the user couldn't approve afterward.
+    """
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    row = await headless_notifications.validate_magic_link(postgres_db, token)
+    if row is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Link expired or already used",
+                body=(
+                    "This link is no longer valid. Open the cockpit to "
+                    "review the agent's current state."
+                ),
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=404,
+        )
+
+    thread_id = row.get("thread_id")
+    if thread_id is None:
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Cannot extend",
+                body="This link is not bound to a thread.",
+                cockpit_url=cockpit_external_url,
+                is_error=True,
+            ),
+            status_code=400,
+        )
+
+    # Bump awaiting_user_since iff the thread is still in awaiting_user
+    # and extend_count < cap. The CAS UPDATE returns the new row state so
+    # we can show the right banner. status='active' or 'suspended' means
+    # there's nothing to extend — the agent has either woken up already
+    # or moved beyond awaiting_user.
+    async with postgres_db.acquire() as conn:
+        updated = await conn.fetchrow(
+            "UPDATE threads "
+            "SET awaiting_user_since = now(), "
+            "    extend_count = extend_count + 1 "
+            "WHERE id = $1 "
+            "  AND status = 'awaiting_user' "
+            "  AND extend_count < $2 "
+            "RETURNING extend_count",
+            str(thread_id),
+            _MAGIC_EXTEND_CAP,
+        )
+
+    if updated is None:
+        # Distinguish cap_reached from not_awaiting for the banner copy.
+        async with postgres_db.acquire() as conn:
+            row_state = await conn.fetchrow(
+                "SELECT status, extend_count FROM threads WHERE id = $1",
+                str(thread_id),
+            )
+        if row_state is None:
+            extend_status = "not_awaiting"
+        elif row_state["status"] != "awaiting_user":
+            extend_status = "not_awaiting"
+        elif row_state["extend_count"] >= _MAGIC_EXTEND_CAP:
+            extend_status = "cap_reached"
+        else:
+            # Edge case — concurrent change between our UPDATE and SELECT.
+            # Render not_awaiting which is the gentler banner.
+            extend_status = "not_awaiting"
+        extends_remaining = None
+    else:
+        extend_status = "extended"
+        extends_remaining = max(0, _MAGIC_EXTEND_CAP - int(updated["extend_count"]))
+
+    # Re-render the confirmation page with the banner. Load the permission
+    # row again (status may have changed underneath us).
+    approval_id = row.get("approval_id")
+    if approval_id is not None:
+        async with postgres_db.acquire() as conn:
+            permission_row = await conn.fetchrow(
+                "SELECT tool_name, tool_args, status FROM "
+                "thread_permission_requests WHERE id = $1",
+                approval_id,
+            )
+    else:
+        permission_row = None
+
+    if permission_row is None or permission_row["status"] != "pending":
+        return HTMLResponse(
+            _magic_link_result_page(
+                title="Already decided",
+                body=(
+                    "The agent's request has been resolved. No further "
+                    "action is needed."
+                ),
+                cockpit_url=cockpit_external_url,
+            ),
+            status_code=200,
+        )
+
+    tool_args = permission_row["tool_args"]
+    if isinstance(tool_args, str):
+        try:
+            tool_args = json.loads(tool_args)
+        except Exception:
+            tool_args = {}
+    elif tool_args is None:
+        tool_args = {}
+    args_preview = json.dumps(tool_args, indent=2, default=str)
+    if len(args_preview) > 600:
+        args_preview = args_preview[:600] + "\n… (truncated)"
+
+    page = _magic_link_confirmation_page(
+        tool_name=permission_row["tool_name"],
+        tool_args_preview=args_preview,
+        intended_decision=row.get("intended_decision"),
+        token=token,
+        extend_status=extend_status,
+        extends_remaining=extends_remaining,
+    )
+    return HTMLResponse(page)
+
+
+async def _phase5_wake_if_suspended(thread_id: str) -> None:
+    """Restore a suspended thread's workspace + agent pod after a magic-link
+    decision. Fire-and-forget — the HTTP response has already returned.
+
+    Pattern mirrors resume_persistent_thread (main.py:10640) — restore the
+    workspace from S3, then spawn the agent pod if the persistent
+    provisioner is wired. Idempotent: status checks short-circuit when the
+    workspace is already alive (e.g. a cockpit tab is open and the click
+    came from email anyway).
+    """
+    try:
+        thread = await postgres_db.get_thread(thread_id)
+        if not thread:
+            return
+        metadata = thread.get("metadata") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        ws_ctx = metadata.get("workspace_container") or {}
+        ws_status = ws_ctx.get("status")
+        if ws_status == "suspended" and workspace_suspension_service.is_enabled:
+            logger.info(
+                "magic-link wake: restoring suspended workspace for thread %s",
+                thread_id,
+            )
+            ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
+            if not ok:
+                logger.warning(
+                    "magic-link wake: workspace restore failed for thread %s",
+                    thread_id,
+                )
+                return
+            # Reflect on the thread row that we're awake again. The agent
+            # pod's _attach_session will set this to 'active' too, but
+            # writing here closes the window where the attention-sleep
+            # watchdog could re-fire before the agent boots.
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE threads "
+                    "SET status = 'active', "
+                    "    awaiting_user_since = NULL, "
+                    "    extend_count = 0 "
+                    "WHERE id = $1 AND status IN ('suspended', 'awaiting_user')",
+                    thread_id,
+                )
+
+        # Agent pod may also have been deleted on suspension
+        # (workspace_suspension.py:502-504). Re-provision if a persistent
+        # provisioner is configured. fire-and-forget — the agent's boot
+        # will restore the LangGraph checkpoint and re-enter permission_check
+        # for the same tool_call_id, where the select-first guard picks up
+        # the decision we just UPDATEd.
+        if persistent_provisioner is not None and not thread.get("agent_id"):
+            config_name = thread.get("config_name", "persistent_defaults")
+            asyncio.create_task(
+                persistent_provisioner.create_agent_pod(
+                    thread_id, config_name=config_name
+                ),
+                name=f"phase5-create-agent-{thread_id[:8]}",
+            )
+    except Exception as e:
+        logger.warning(
+            "magic-link wake task failed for thread %s: %s",
+            thread_id,
+            e,
+        )
+
+
+async def thread_permission_notify_sweeper(
+    shutdown_event: asyncio.Event,
+) -> None:
+    """Background task: scan for permission requests waiting >N seconds and
+    dispatch the magic-link email if not yet notified.
+
+    Runs every HEADLESS_NOTIFY_INTERVAL_S (default 30s). Idempotent: the
+    send function dedup-skips rows already in thread_notifications.
+
+    Best-effort. Survives transient errors by logging and continuing.
+    """
+    interval_s = int(os.environ.get("HEADLESS_NOTIFY_INTERVAL_S", "30"))
+    age_threshold_s = int(os.environ.get("HEADLESS_NOTIFY_AGE_S", "30"))
+    logger.info(
+        "Headless permission-notify sweeper started (interval=%ds, age_threshold=%ds)",
+        interval_s,
+        age_threshold_s,
+    )
+    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
+
+    while not shutdown_event.is_set():
+        try:
+            async with postgres_db.acquire() as conn:
+                # Suppress requests with terminal-or-permanent outcomes
+                # ('sent', 'failed', 'skipped_no_email',
+                # 'skipped_already_resolved') forever. Suppress
+                # transient outcomes ('skipped_rate_limit',
+                # 'skipped_smtp') only inside a recency window of
+                # 2 × sweeper interval, so they can re-try once the
+                # transient condition clears.
+                rows = await conn.fetch(
+                    "SELECT id, thread_id "
+                    "FROM thread_permission_requests "
+                    "WHERE status = 'pending' "
+                    "  AND requested_at < now() - "
+                    "      ($1 || ' seconds')::interval "
+                    "  AND NOT EXISTS ("
+                    "    SELECT 1 FROM thread_notifications tn "
+                    "    WHERE tn.request_id = thread_permission_requests.id "
+                    "      AND tn.kind = 'permission_pending' "
+                    "      AND ("
+                    "        tn.delivery_status IN ("
+                    "          'sent', 'failed', "
+                    "          'skipped_no_email', "
+                    "          'skipped_already_resolved'"
+                    "        ) "
+                    "        OR ("
+                    "          tn.delivery_status IN ("
+                    "            'skipped_rate_limit', 'skipped_smtp'"
+                    "          ) "
+                    "          AND tn.sent_at > now() - "
+                    "              make_interval(secs => $2)"
+                    "        )"
+                    "      )"
+                    "  ) "
+                    "ORDER BY requested_at ASC "
+                    "LIMIT 50",
+                    str(age_threshold_s),
+                    interval_s * 2,
+                )
+            for row in rows:
+                try:
+                    result = await headless_notifications.send_permission_pending_email(
+                        postgres_db,
+                        email_service,
+                        thread_id=str(row["thread_id"]),
+                        approval_id=str(row["id"]),
+                        cockpit_external_url=cockpit_external_url,
+                    )
+                    if result.get("status") == "sent":
+                        logger.info(
+                            "Sent permission-pending email (thread=%s req=%s)",
+                            str(row["thread_id"])[:8],
+                            str(row["id"])[:8],
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Permission-pending email failed (req=%s): %s",
+                        str(row["id"])[:8],
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("headless permission-notify sweep error: %s", e)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Headless permission-notify sweeper stopped")
+
+
+# =============================================================================
+# Phase 5 — Attention sleep watchdog
+# =============================================================================
+#
+# Suspends thread workspaces (and the bound agent pod) when the agent has
+# been in `awaiting_user` for longer than HEADLESS_ATTENTION_SLEEP_MINUTES.
+# State machine:
+#   active ─→ awaiting_user (agent: natural pause + no WS subscriber)
+#   awaiting_user ─→ suspended (this watchdog after TTL)
+#   awaiting_user ─→ active (agent: subscriber reattach, clears timer)
+#   suspended ─→ active (magic-link wake or REST reattach restores workspace)
+#
+# Magic-link "extend window" POSTs bump awaiting_user_since forward so the
+# watchdog re-arms; threads.extend_count caps the bumps at 4 (4h total).
+#
+# Today's "tethered" signal is WS-only — Phase 5 v1 ships before the
+# cockpit migrates from WS to SSE. SSE-only consumers (MCP, curl) do not
+# block suspension; they should rely on magic-link wake to bring the
+# session back. When cockpit moves to SSE, this watchdog will need to
+# consult the orchestrator's in-process SSE attach registry too.
+
+
+_ATTENTION_SLEEP_INTERVAL_S: int = int(
+    os.environ.get("HEADLESS_ATTENTION_SLEEP_INTERVAL_S", "60")
+)
+_ATTENTION_SLEEP_MINUTES: int = int(
+    os.environ.get("HEADLESS_ATTENTION_SLEEP_MINUTES", "60")
+)
+
+
+async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task: suspend threads stuck in awaiting_user past their TTL.
+
+    Runs every HEADLESS_ATTENTION_SLEEP_INTERVAL_S (default 60s). For each
+    qualifying thread:
+      1. Call workspace_suspension_service.suspend_thread_workspace() —
+         snapshots filesystem to S3, deletes workspace pod/VM, also deletes
+         the bound agent pod (workspace_suspension.py:502-504).
+      2. CAS UPDATE thread.status from 'awaiting_user' → 'suspended'. The
+         CAS guards against the user re-attaching mid-suspend: if status
+         flipped back to 'active' between the SELECT and the UPDATE, we
+         don't clobber it.
+
+    Best-effort: a transient failure (DB unavailable, suspend service
+    error) is logged and retried on the next tick.
+    """
+    interval_s = _ATTENTION_SLEEP_INTERVAL_S
+    ttl_minutes = _ATTENTION_SLEEP_MINUTES
+    logger.info(
+        "Attention-sleep sweeper started (interval=%ds, ttl=%dmin)",
+        interval_s,
+        ttl_minutes,
+    )
+
+    while not shutdown_event.is_set():
+        try:
+            if workspace_suspension_service.is_enabled:
+                async with postgres_db.acquire() as conn:
+                    # Phase 6: per-thread TTL resolution. Priority order is
+                    # (1) thread.metadata.config_override.headless overrides,
+                    # (2) users.settings.persistent_agent overrides,
+                    # (3) the global HEADLESS_ATTENTION_SLEEP_MINUTES default.
+                    # ttl <= 0 disables the watchdog for that thread, matching
+                    # the cockpit UX of "Never auto-suspend".
+                    rows = await conn.fetch(
+                        "SELECT t.id "
+                        "FROM threads t "
+                        "LEFT JOIN users u ON u.id = t.user_id "
+                        "WHERE t.status = 'awaiting_user' "
+                        "  AND t.awaiting_user_since IS NOT NULL "
+                        "  AND COALESCE("
+                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
+                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
+                        "    $1::int"
+                        "  ) > 0 "
+                        "  AND t.awaiting_user_since < now() - make_interval(mins => COALESCE("
+                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
+                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
+                        "    $1::int"
+                        "  )) "
+                        "ORDER BY t.awaiting_user_since ASC "
+                        "LIMIT 50",
+                        int(ttl_minutes),
+                    )
+
+                for row in rows:
+                    thread_id = str(row["id"])
+                    try:
+                        ok = (
+                            await workspace_suspension_service.suspend_thread_workspace(
+                                thread_id
+                            )
+                        )
+                        if not ok:
+                            logger.info(
+                                "attention-sleep: suspend declined for thread %s "
+                                "(workspace not ready or already suspending)",
+                                thread_id,
+                            )
+                            continue
+                        async with postgres_db.acquire() as conn:
+                            updated = await conn.fetchval(
+                                "UPDATE threads "
+                                "SET status = 'suspended' "
+                                "WHERE id = $1 AND status = 'awaiting_user' "
+                                "RETURNING id",
+                                thread_id,
+                            )
+                        if updated:
+                            logger.info(
+                                "attention-sleep: thread %s suspended (was "
+                                "awaiting_user >%dm)",
+                                thread_id,
+                                ttl_minutes,
+                            )
+                        else:
+                            # Concurrent reattach won the race — workspace
+                            # is suspended but the restore path will pick it
+                            # up on the next reattach.
+                            logger.info(
+                                "attention-sleep: status flipped during "
+                                "suspend for thread %s; restore path will "
+                                "handle wake",
+                                thread_id,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "attention-sleep: suspend failed for thread %s: %s",
+                            thread_id,
+                            e,
+                        )
+        except Exception as e:
+            logger.warning("attention-sleep sweep error: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Attention-sleep sweeper stopped")
 
 
 @app.get("/api/persistent/threads/{thread_id}/ide")
@@ -10748,10 +12336,36 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
     # Must accept before we can send/close — FastAPI raises 500 otherwise
     await ws.accept()
 
+    # Cookie auth: browsers send the BFF session cookie on WS handshake
+    # automatically when the URL is on the API host. Closes the prior
+    # zero-auth hole — pre-BFF, this endpoint accepted any caller who
+    # knew (or guessed) the thread UUID. See
+    # docs/features/auth_bff_and_api_tokens.md §1.1.
+    user = await resolve_ws_user(ws, postgres_db)
+    if not user:
+        await ws.close(code=4401, reason="Authentication required")
+        return
+    if not user.get("is_approved"):
+        await ws.close(code=4403, reason="Account pending approval")
+        return
+
     # Resolve thread → agent → pod_ip
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         await ws.close(code=4404, reason="Thread not found")
+        return
+
+    # Thread ownership: a session can only attach to its own threads. The
+    # cockpit's persistent-chat UI already enforces this in its REST flow,
+    # but the WS handshake is a separate trust boundary.
+    if str(thread.get("user_id") or "") != str(user["id"]):
+        logger.warning(
+            "WS: user %s tried to attach to thread %s owned by %s",
+            user["id"],
+            thread_id,
+            thread.get("user_id"),
+        )
+        await ws.close(code=4403, reason="Thread access denied")
         return
 
     # Restore suspended workspace before connecting to agent
@@ -11890,6 +13504,115 @@ async def internal_mcp_token_create(
     result = {
         k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()
     }
+    return result
+
+
+# =============================================================================
+# Personal Access Token (PAT) Endpoints — see auth_bff_and_api_tokens.md §3
+# =============================================================================
+#
+# PATs live in the consolidated `auth_tokens` table with kind='api'. The
+# legacy MCP-token endpoints (above) keep working unchanged on the same
+# table with kind='mcp'. Validator path is shared (see security.auth
+# `_resolve_pat`, `_resolve_legacy_mcp_token`).
+
+
+def _serialize_api_key_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce UUID / datetime values to strings so they JSON-serialise."""
+    return {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+
+
+@app.post("/api/api-keys")
+async def create_api_key(request: Request, body: ApiKeyCreate) -> dict[str, Any]:
+    """Generate a new Personal Access Token. Plaintext returned once."""
+    user = await require_approved_user(request, postgres_db)
+
+    # Validate scope set. `admin` is gated on the user's admin flag.
+    requested = set(body.scopes)
+    if not requested:
+        raise HTTPException(status_code=400, detail="At least one scope required")
+    bad = requested - VALID_PAT_SCOPES
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown scopes: {sorted(bad)}",
+        )
+    if "admin" in requested and not user.get("is_admin", False):
+        raise HTTPException(
+            status_code=403, detail="Only admins can issue admin-scoped tokens"
+        )
+
+    token = "ak_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    token_prefix = token[:12]
+    last_four = token[-4:]
+
+    expires_at = None
+    if body.expires_in_days:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
+    row = await postgres_db.create_api_key(
+        user_id=str(user["id"]),
+        name=body.name,
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        last_four=last_four,
+        scopes=sorted(requested),
+        expires_at=expires_at,
+    )
+    result = _serialize_api_key_row(row)
+    result["token"] = token  # Plaintext — caller must store immediately
+    return result
+
+
+@app.get("/api/api-keys")
+async def list_api_keys(request: Request) -> list[dict[str, Any]]:
+    """List the current user's PATs (no hashes, no plaintext)."""
+    user = await require_approved_user(request, postgres_db)
+    rows = await postgres_db.list_api_keys(str(user["id"]))
+    return [_serialize_api_key_row(r) for r in rows]
+
+
+@app.delete("/api/api-keys/{token_id}")
+async def revoke_api_key(request: Request, token_id: str) -> dict[str, str]:
+    """Soft-revoke a PAT."""
+    user = await require_approved_user(request, postgres_db)
+    revoked = await postgres_db.revoke_api_key(token_id, str(user["id"]))
+    if not revoked:
+        raise HTTPException(
+            status_code=404, detail="Token not found or already revoked"
+        )
+    return {"status": "revoked"}
+
+
+@app.post("/api/api-keys/{token_id}/rotate")
+async def rotate_api_key(request: Request, token_id: str) -> dict[str, Any]:
+    """Issue a successor PAT.
+
+    Same name + scopes + expiry as the source token. The old row stays
+    valid for 24h (cleanup loop revokes it) so an automation can roll
+    over without an outage.
+    """
+    user = await require_approved_user(request, postgres_db)
+    token = "ak_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+    token_prefix = token[:12]
+    last_four = token[-4:]
+
+    row = await postgres_db.rotate_api_key(
+        old_id=token_id,
+        user_id=str(user["id"]),
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        last_four=last_four,
+    )
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Token not found, already revoked, or not yours",
+        )
+    result = _serialize_api_key_row(row)
+    result["token"] = token
     return result
 
 
@@ -14043,8 +15766,17 @@ async def _ensure_project_cloud_resources(
       exists but the user was never added to the groups — e.g. project created
       while Keycloak admin auth was broken, or a Space adopted out-of-band.
 
+    Default projects skip both: they piggyback on the owner's personal home
+    Space (already attached as a datasource by the user-creation flow), so a
+    separate project Space + `project-<id>` group would be dead state. The
+    cloud_storage_url branch in `get_project` resolves to the user's home
+    browser URL for default projects.
+
     Returns the (possibly updated) project dict.
     """
+    if project.get("is_default"):
+        return project
+
     project_id_str = str(project["id"])
     project_name = project["name"]
     group_name = f"project-{project_id_str}"
@@ -14233,27 +15965,55 @@ async def get_project(project_id: str) -> dict[str, Any]:
     project["cloud_storage_url"] = None
     backend = main_cloud_router.for_project(project)
     if backend.is_initialized:
-        handle_str = project.get("main_cloud_folder_handle")
-        legacy_folder_id = project.get("nextcloud_folder_id")
-        if handle_str or legacy_folder_id:
-            handle = ProjectFolderHandle.from_db(
-                handle_str or str(legacy_folder_id),
-                backend=project.get("main_cloud_backend") or backend.backend_id,
-            )
-            # Legacy Nextcloud handles were backfilled without vendor_meta;
-            # re-attach the mountpoint from the project name so the URL
-            # builder has what it needs.
-            if not handle.vendor_meta.get("mountpoint"):
-                handle = ProjectFolderHandle(
-                    backend=handle.backend,
-                    native_id=handle.native_id,
-                    vendor_meta={**handle.vendor_meta, "mountpoint": project["name"]},
+        if project.get("is_default"):
+            # Default projects piggyback on the owner's personal home Space —
+            # the deep-link must resolve to that home, not to a project Space
+            # (which we no longer provision for defaults — see
+            # `_ensure_project_cloud_resources`). A stale handle from older
+            # deployments is intentionally ignored here.
+            try:
+                members = await postgres_db.get_project_members(project_id)
+                owner = next((m for m in members if m.get("role") == "owner"), None)
+                owner_email = (owner or {}).get("email")
+                owner_display = (owner or {}).get("display_name") or ""
+                if owner_email:
+                    resolved = await backend.resolve_user_identity(
+                        owner_email, owner_display.lower()
+                    )
+                    if resolved:
+                        home = await backend.get_user_home(resolved)
+                        if home and home.browser_url:
+                            project["cloud_storage_url"] = home.browser_url
+            except Exception as e:
+                logger.warning(
+                    f"Failed to resolve user-home URL for default project "
+                    f"{project_id}: {e}"
                 )
-            project["cloud_storage_url"] = backend.get_project_folder_browser_url(
-                handle
-            )
-        elif project.get("is_default"):
-            project["cloud_storage_url"] = backend.get_default_home_browser_url()
+            if not project["cloud_storage_url"]:
+                project["cloud_storage_url"] = backend.get_default_home_browser_url()
+        else:
+            handle_str = project.get("main_cloud_folder_handle")
+            legacy_folder_id = project.get("nextcloud_folder_id")
+            if handle_str or legacy_folder_id:
+                handle = ProjectFolderHandle.from_db(
+                    handle_str or str(legacy_folder_id),
+                    backend=project.get("main_cloud_backend") or backend.backend_id,
+                )
+                # Legacy Nextcloud handles were backfilled without vendor_meta;
+                # re-attach the mountpoint from the project name so the URL
+                # builder has what it needs.
+                if not handle.vendor_meta.get("mountpoint"):
+                    handle = ProjectFolderHandle(
+                        backend=handle.backend,
+                        native_id=handle.native_id,
+                        vendor_meta={
+                            **handle.vendor_meta,
+                            "mountpoint": project["name"],
+                        },
+                    )
+                project["cloud_storage_url"] = backend.get_project_folder_browser_url(
+                    handle
+                )
 
     return project
 

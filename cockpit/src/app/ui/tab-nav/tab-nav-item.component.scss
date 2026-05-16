@@ -4,7 +4,6 @@
   display: inline-flex;
   align-items: center;
   gap: v.$space-xs;
-
   background: transparent;
   border: none;
   color: var(--text-muted);
@@ -13,7 +12,6 @@
   font-weight: v.$font-weight-medium;
   cursor: pointer;
   user-select: none;
-
   transition:
     color 0.15s ease,
     background-color 0.15s ease,
@@ -27,7 +25,7 @@
     outline-offset: -2px;
   }
 
-  &:hover:not([data-disabled]):not([data-active]) {
+  &:hover:not([data-disabled], [data-active]) {
     color: var(--text-primary);
     background: var(--hover);
   }

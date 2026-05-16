@@ -29,6 +29,7 @@
   &:focus {
     outline: none;
   }
+
   &:focus-visible {
     @include focus-ring;
   }
@@ -55,22 +56,16 @@
   padding: 0;
   margin: -1px;
   overflow: hidden;
-  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
 }
 
 // Media query helpers.
 @mixin breakpoint-up($name) {
-  @if $name == sm { @media (min-width: v.$breakpoint-sm) { @content; } }
-  @else if $name == md { @media (min-width: v.$breakpoint-md) { @content; } }
-  @else if $name == lg { @media (min-width: v.$breakpoint-lg) { @content; } }
-  @else if $name == xl { @media (min-width: v.$breakpoint-xl) { @content; } }
+  @if $name == sm { @media (min-width: v.$breakpoint-sm) { @content; } } @else if $name == md { @media (min-width: v.$breakpoint-md) { @content; } } @else if $name == lg { @media (min-width: v.$breakpoint-lg) { @content; } } @else if $name == xl { @media (min-width: v.$breakpoint-xl) { @content; } }
 }
 
 @mixin breakpoint-down($name) {
-  @if $name == sm { @media (max-width: v.$breakpoint-sm - 0.02px) { @content; } }
-  @else if $name == md { @media (max-width: v.$breakpoint-md - 0.02px) { @content; } }
-  @else if $name == lg { @media (max-width: v.$breakpoint-lg - 0.02px) { @content; } }
-  @else if $name == xl { @media (max-width: v.$breakpoint-xl - 0.02px) { @content; } }
+  @if $name == sm { @media (max-width: v.$breakpoint-sm - 0.02px) { @content; } } @else if $name == md { @media (max-width: v.$breakpoint-md - 0.02px) { @content; } } @else if $name == lg { @media (max-width: v.$breakpoint-lg - 0.02px) { @content; } } @else if $name == xl { @media (max-width: v.$breakpoint-xl - 0.02px) { @content; } }
 }

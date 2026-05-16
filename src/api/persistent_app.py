@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
@@ -23,8 +23,6 @@ from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..agent import UniversalAgent
 from ..persistent_graph import (
-    APPROVE_SENTINEL,
-    DENY_SENTINEL,
     IdleTimeoutError,
     PersistentLoopCallbacks,
     run_persistent_loop,
@@ -64,10 +62,61 @@ _drain_intent_handled: bool = False
 #   _watchdog_tasks      → background tasks cancelled on detach/shutdown.
 _ws_connected_event: Optional[asyncio.Event] = None
 _watchdog_tasks: list[asyncio.Task] = []
+
+# Reference to the currently running persistent-loop task. Set by ws_chat when
+# it spawns the loop, cleared when _terminate_session runs. _terminate_session()
+# cancels and awaits it before nulling _session, so out-of-band callers
+# (heartbeat intents, thread-status watchdog, drain) can't race the in-flight
+# turn into a NoneType.permission_mode crash. See
+# docs/issues/persistent_session_permission_check_race.md.
+#
+# Headless sessions (chunk 1): the loop now outlives any single WebSocket. It is
+# only cancelled by _terminate_session, never by WS close.
+_loop_task: Optional[asyncio.Task] = None
 _session_boot_ws_timeout_s: int = int(
     os.environ.get("SESSION_BOOT_WS_TIMEOUT_S", "600")
 )
 _thread_status_poll_s: int = int(os.environ.get("THREAD_STATUS_POLL_S", "60"))
+
+# Subscriber registry for headless persistent sessions.
+#
+# Loop-driven output (token chunks, tool events, turn lifecycle, etc.) used to
+# be sent directly to a single WebSocket scoped to ws_chat. Under headless
+# semantics the loop must outlive any single WS attach, so the loop instead
+# broadcasts via _broadcast() and each WebSocket connection registers its own
+# queue via _subscribe(). A _run_subscriber_pump task drains each queue into
+# its WS. Closing a WS just calls _unsubscribe() — the loop keeps running.
+#
+# Keyed by client_id (generated server-side per WS connection). Bounded queue
+# protects the loop from a slow consumer: on overflow the oldest frame is
+# dropped (token-stream pacing semantics).
+_SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
+_subscribers: Dict[str, asyncio.Queue] = {}
+
+# Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
+# hoisted to module level so they survive WS reconnect. All three are reset
+# on session attach / cleared on _terminate_session.
+_loop_user_queue: Optional[asyncio.Queue] = None
+# Tri-state interrupt flag (phase 2): None = no interrupt pending,
+# "graceful" = stop after current tool call completes, "hard" = cancel the
+# in-flight LLM stream immediately and drop the partial AIMessage. Set by
+# the agent's POST /api/interrupt handler based on current _tool_inflight
+# state. Consumed by persistent_graph's check_interrupt callback at three
+# sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
+# path uses the same flag — sets "hard" when no tool is inflight.
+_loop_interrupt_flag: Optional[str] = None
+_loop_last_user_content: List[str] = [""]
+
+# True while a tool call is mid-`ainvoke`. Read by POST /api/interrupt to
+# pick hard vs graceful mode. Set in _loop_on_tool_start, cleared in
+# _loop_on_tool_result.
+_tool_inflight: bool = False
+
+# Phase 2 event-log cursor. Allocated synchronously by _broadcast; the DB
+# write is scheduled via asyncio.create_task (fire-and-forget). Initialized
+# in _attach_session with epoch bump on cold restart; cleared on terminate.
+_events_epoch: int = 0
+_next_seq: int = 0
 
 
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
@@ -93,7 +142,7 @@ async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
         intents.get("drain_reason", "unspecified"),
     )
     try:
-        await _detach_session()
+        await _terminate_session("drain")
     except Exception as e:
         logger.warning(f"Detach during drain-intent handling failed: {e}")
     _schedule_exit(delay=1.0)
@@ -142,20 +191,30 @@ async def _boot_ws_watchdog(timeout_s: int) -> None:
             _thread_id,
         )
     try:
-        await _detach_session()
+        await _terminate_session("boot_ws_timeout")
     except Exception as e:
         logger.warning(f"Detach during boot-WS timeout failed: {e}")
     _schedule_exit(delay=1.0)
 
 
 async def _thread_status_watchdog(poll_s: int) -> None:
-    """Exit if the bound thread transitions to 'ended' out-of-band.
+    """Exit if the bound thread transitions to a terminal state out-of-band.
 
     The orchestrator's stale_agent_detector can flip a thread to 'ended'
     via ``mark_orphaned_threads_ended`` or release the binding via
     ``mark_stuck_session_agents_ready`` (PR 1). When that happens this pod
-    is orphaned — no work to do, holding a slot. Poll the thread row and
-    exit if it's no longer in ('created', 'active').
+    is orphaned — no work to do, holding a slot.
+
+    'awaiting_user' is the eager-mode transient idle state set by this same
+    agent's loop on natural pause with no subscribers (Phase 5,
+    ``_loop_get_user_input``). It is NOT a terminal state — the orchestrator's
+    attention-sleep watchdog owns the eventual ``awaiting_user → suspended``
+    transition and we mustn't pre-empt it from here, or we kill the very
+    untethered-survival behaviour Phase 1 + Phase 5 were built to enable.
+
+    'suspended' means the orchestrator has already snapshotted + deleted the
+    workspace pod — at that point we're a stranded agent with no workspace,
+    so we exit.
     """
     while True:
         try:
@@ -172,14 +231,14 @@ async def _thread_status_watchdog(poll_s: int) -> None:
         if not lifecycle:
             continue
         status = lifecycle.get("status")
-        if status not in ("created", "active"):
+        if status not in ("created", "active", "awaiting_user"):
             logger.info(
                 "Thread %s status is '%s' — exiting (orphaned by orchestrator).",
                 _thread_id,
                 status,
             )
             try:
-                await _detach_session()
+                await _terminate_session("thread_ended_oob")
             except Exception as e:
                 logger.warning(f"Detach during status-watchdog exit failed: {e}")
             _schedule_exit(delay=1.0)
@@ -344,7 +403,7 @@ async def lifespan(app: FastAPI):
 
     # Detach any active session
     if _session:
-        await _detach_session()
+        await _terminate_session("shutdown")
 
     if _orchestrator_client:
         try:
@@ -656,19 +715,48 @@ async def _attach_session(
     # cloned on the remote workspace container (not the agent pod).
     if repo_datasources and _session.workspace_manager:
         from ..managers.git_manager import GitManager
+        from ..utils.git_url import repo_name_from_url
+        from ..utils.ssh_key import normalize_private_key
         import re as _re
 
         ws_mgr = _session.workspace_manager
         backend = ws_mgr.backend if hasattr(ws_mgr, "backend") else None
         use_backend = backend is not None and getattr(backend, "supports_shell", False)
+        # Track repo names already assigned this session so we can append a
+        # numeric suffix when two datasources resolve to the same name (e.g.
+        # forks of the same upstream).
+        used_repo_names: set[str] = set()
         for ds in repo_datasources:
+            # ds_name is the safe form of the user-supplied datasource label.
+            # We keep using it as the SSH key filename and SSH config alias
+            # so that two datasources with different keys for the same repo
+            # don't clobber each other's auth material.
+            ds_name = (
+                _re.sub(r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()).strip("-")
+                or "repo"
+            )
             try:
-                name = _re.sub(
-                    r"[^a-z0-9]+", "-", ds.get("name", "repo").lower()
-                ).strip("-")
                 repo_url = ds.get("connection_url", "")
                 branch = ds.get("default_branch")
                 creds = ds.get("credentials") or {}
+
+                # The clone directory and source_repos registry key use the
+                # upstream repo name (Superhuman-Remote-Worker, not
+                # "read-only-version-of-..."). Fall back to the datasource
+                # label only if URL parsing yields nothing usable.
+                base_repo_name = repo_name_from_url(repo_url, fallback=ds_name)
+                repo_name = base_repo_name
+                suffix = 2
+                while repo_name in used_repo_names:
+                    repo_name = f"{base_repo_name}-{suffix}"
+                    suffix += 1
+                if repo_name != base_repo_name:
+                    logger.info(
+                        "Repo name collision for %s; cloning into %s instead",
+                        base_repo_name,
+                        repo_name,
+                    )
+                used_repo_names.add(repo_name)
 
                 # Determine auth method: explicit field, or infer from
                 # credentials keys (ssh_key present → ssh).
@@ -683,6 +771,11 @@ async def _attach_session(
                     import shlex
                     from urllib.parse import urlparse
 
+                    # Normalize defensively: orchestrator validation already
+                    # runs on save, but legacy rows in the datasources table
+                    # may predate it. Cheap insurance.
+                    ssh_key_text = normalize_private_key(creds["ssh_key"])
+
                     parsed = urlparse(repo_url)
                     host = parsed.hostname or "localhost"
 
@@ -692,14 +785,14 @@ async def _attach_session(
                         # tripping the workspace-boundary check on write_file;
                         # resolve_home_path gives us the absolute path for the
                         # subsequent chmod and SSH config IdentityFile entry.
-                        rel_key = f".ssh/repo_{name}"
+                        rel_key = f".ssh/repo_{ds_name}"
                         key_path = backend.resolve_home_path(rel_key)
                         backend.shell_run(
                             "mkdir -p ~/.ssh && chmod 700 ~/.ssh",
                             timeout=10,
                             tab_name="git",
                         )
-                        backend.write_home_file(rel_key, creds["ssh_key"])
+                        backend.write_home_file(rel_key, ssh_key_text)
                         backend.shell_run(
                             f"chmod 600 {shlex.quote(key_path)}",
                             timeout=10,
@@ -720,9 +813,9 @@ async def _attach_session(
                         # Local: write SSH key to agent filesystem
                         ssh_dir = os.path.expanduser("~/.ssh")
                         os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-                        key_file = os.path.join(ssh_dir, f"repo_{name}")
+                        key_file = os.path.join(ssh_dir, f"repo_{ds_name}")
                         with open(key_file, "w") as f:
-                            f.write(creds["ssh_key"])
+                            f.write(ssh_key_text)
                         os.chmod(key_file, 0o600)
                         config_path = os.path.join(ssh_dir, "config")
                         with open(config_path, "a") as f:
@@ -743,7 +836,7 @@ async def _attach_session(
                         repo_url = f"git@{host}:{path}"
                         logger.info(
                             "Converted HTTPS URL to SSH for %s: %s",
-                            name,
+                            ds_name,
                             repo_url,
                         )
 
@@ -756,8 +849,8 @@ async def _attach_session(
                         + (f":{parsed.port}" if parsed.port else "")
                     ).geturl()
 
-                target = ws_mgr.path / "repos" / name
-                remote_cwd = f"repos/{name}"
+                target = ws_mgr.path / "repos" / repo_name
+                remote_cwd = f"repos/{repo_name}"
                 git_mgr = GitManager.clone(
                     repo_url,
                     target,
@@ -767,10 +860,18 @@ async def _attach_session(
                 if git_mgr:
                     if branch:
                         git_mgr.checkout_branch(branch)
-                    ws_mgr.source_repos[name] = git_mgr
-                    logger.info("Cloned repository datasource: %s", name)
+                    ws_mgr.source_repos[repo_name] = git_mgr
+                    logger.info(
+                        "Cloned repository datasource %r into repos/%s",
+                        ds_name,
+                        repo_name,
+                    )
                 else:
-                    logger.warning("Failed to clone repository datasource: %s", name)
+                    logger.warning(
+                        "Failed to clone repository datasource %r (target repos/%s)",
+                        ds_name,
+                        repo_name,
+                    )
             except Exception as e:
                 logger.warning(
                     "Failed to clone repository datasource %s: %s",
@@ -827,29 +928,122 @@ async def _attach_session(
     # Mark thread as active
     await _update_thread_status("active")
 
+    # Initialize headless loop primitives. These survive WS reconnect so that
+    # the loop can keep reading input / responding to interrupts across
+    # transport churn. Cleared in _terminate_session.
+    global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    _loop_user_queue = asyncio.Queue()
+    _loop_interrupt_flag = None
+    _loop_last_user_content = [""]
+
+    # Phase 2 event-log cursor init. The current epoch lives on the threads
+    # row; we bump it iff the previous epoch has events (i.e. this is a
+    # cold-checkpoint restart that lost the in-memory seq counter). A fresh
+    # epoch with no rows is reused as-is. _next_seq always starts at 0
+    # locally — _broadcast pre-increments before writing the first event.
+    global _events_epoch, _next_seq, _tool_inflight
+    _tool_inflight = False
+    _events_epoch = 0
+    _next_seq = 0
+    if _session is not None and _session.postgres_conn is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                current_epoch = await conn.fetchval(
+                    "SELECT events_epoch FROM threads WHERE id = $1",
+                    _thread_id,
+                )
+                if current_epoch is None:
+                    current_epoch = 0
+                max_seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
+                    "WHERE thread_id = $1 AND epoch = $2",
+                    _thread_id,
+                    current_epoch,
+                )
+                if max_seq and max_seq > 0:
+                    # Cold-checkpoint restart: previous epoch has events
+                    # but we lost the in-memory counter. Bump to a fresh
+                    # epoch so cursors from the previous run trigger
+                    # GONE_BEYOND_HORIZON on reconnect.
+                    new_epoch = await conn.fetchval(
+                        "UPDATE threads SET events_epoch = events_epoch + 1 "
+                        "WHERE id = $1 RETURNING events_epoch",
+                        _thread_id,
+                    )
+                    _events_epoch = int(new_epoch)
+                    logger.info(
+                        "Bumped events_epoch to %d for thread %s "
+                        "(previous epoch had %d events)",
+                        _events_epoch,
+                        _thread_id,
+                        max_seq,
+                    )
+                else:
+                    _events_epoch = int(current_epoch)
+        except Exception as e:
+            logger.warning(
+                "events_epoch init failed for thread %s (non-fatal): %s",
+                _thread_id,
+                e,
+            )
+
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
-    # out-of-band thread.status='ended'. Cancelled by _detach_session.
+    # out-of-band thread.status='ended'. Cancelled by _terminate_session.
     _start_watchdogs()
 
-    logger.info(f"Session attached: thread={_thread_id}")
+    logger.info(f"Session attached: thread={_thread_id} events_epoch={_events_epoch}")
 
 
-async def _detach_session() -> None:
+async def _terminate_session(reason: str) -> None:
     """Tear down the current session and return to idle.
 
-    1. Mark thread as ended (still resumable)
-    2. Git commit + push
-    3. Clean up session resources
-    4. Clear session globals
-    5. Increment session counter, exit if max reached
+    Called by:
+      - WS-handler finally block? NO — under headless semantics WS close only
+        unsubscribes; the loop survives. WS close never calls this.
+      - Out-of-band lifecycle: drain intent, boot-WS timeout, thread-status
+        watchdog, REST /session/detach, process shutdown, MAX_SESSIONS sweep.
+      - The persistent loop's own completion handler (idle timeout, crash,
+        clean /done exit) routes here via _loop_completion_handler.
+
+    Steps:
+      1. Cancel in-flight persistent-loop task (prevents permission_check race
+         that the commit 3a1d265 race-fix protects against).
+      2. Mark thread as ended (still resumable — `ended` is the only inactive
+         state).
+      3. Git commit + push.
+      4. Clean up session resources.
+      5. Clear session globals AND headless input primitives + subscribers.
+      6. Increment session counter, exit if max reached.
+
+    `reason` is logged and stored for observability — e.g. "drain",
+    "idle_timeout", "loop_crash", "loop_complete", "shutdown", "rest_detach",
+    "thread_ended_oob", "boot_ws_timeout", "legacy".
     """
-    global _session, _thread_id, _sessions_served
+    global _session, _thread_id, _sessions_served, _loop_task
+    global _loop_user_queue, _loop_interrupt_flag, _loop_last_user_content
+    global _events_epoch, _next_seq, _tool_inflight
 
     if not _session:
         return
 
     thread_id = _thread_id
-    logger.info(f"Detaching session: thread={thread_id}")
+    logger.info(f"Terminating session: thread={thread_id} reason={reason}")
+
+    # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
+    # drain, thread-status watchdog) reach this without going through the
+    # loop's normal exit path, so without this the loop's next
+    # _session.permission_mode access AttributeErrors when we null _session
+    # below. Skipped when invoked from inside the loop itself (e.g. via
+    # _loop_completion_handler's cleanup, which would deadlock awaiting self).
+    loop_task = _loop_task
+    if loop_task is not None and loop_task is not asyncio.current_task():
+        if not loop_task.done():
+            loop_task.cancel()
+            try:
+                await loop_task
+            except (asyncio.CancelledError, Exception):
+                pass
+    _loop_task = None
 
     # Cancel self-cleanup watchdogs first — we're about to do the cleanup
     # they would have triggered, no point letting them race the detach.
@@ -885,6 +1079,21 @@ async def _detach_session() -> None:
     _session = None
     _thread_id = None
 
+    # Clear headless input primitives + subscriber registry. The pump tasks
+    # owned by each subscriber are cancelled by their ws_chat finally blocks
+    # when those handlers notice the WS close; dropping the registry here
+    # ensures stale entries don't accumulate across sessions.
+    _loop_user_queue = None
+    _loop_interrupt_flag = None
+    _loop_last_user_content = [""]
+    _subscribers.clear()
+
+    # Phase 2 event-log cursor reset. The next session attach reads the
+    # epoch fresh from the threads table.
+    _events_epoch = 0
+    _next_seq = 0
+    _tool_inflight = False
+
     # Safety valve: restart after N sessions to guard against state leakage
     _sessions_served += 1
     if _max_sessions_per_process > 0 and _sessions_served >= _max_sessions_per_process:
@@ -897,8 +1106,20 @@ async def _detach_session() -> None:
         sys.exit(0)
 
     logger.info(
-        f"Session detached: thread={thread_id} (sessions served: {_sessions_served})"
+        f"Session terminated: thread={thread_id} "
+        f"reason={reason} (sessions served: {_sessions_served})"
     )
+
+
+async def _detach_session() -> None:
+    """Back-compat shim. Prefer _terminate_session(reason) at new call sites.
+
+    Kept so existing tests patching `_detach_session` continue to work and so
+    code paths not yet updated don't break. Logs at DEBUG so each invocation
+    is traceable.
+    """
+    logger.debug("_detach_session() called via back-compat shim")
+    await _terminate_session("legacy")
 
 
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
@@ -1018,7 +1239,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
         thread_id = _thread_id
         try:
-            await _detach_session()
+            await _terminate_session("rest_detach")
             return JSONResponse(
                 {
                     "status": "detached",
@@ -1030,265 +1251,225 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
             logger.exception(f"Failed to detach session for thread {thread_id}")
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    # --- Headless REST input endpoints (phase 2) ---
+    #
+    # Counterparts to the WS-receive-loop methods, exposed so the orchestrator's
+    # SSE-based clients (cockpit chunk 3, MCP, curl) can drive the session
+    # without a WebSocket. The orchestrator forwards from
+    # POST /api/threads/{id}/{input,interrupt,approve/{approval_id}}.
+
+    @app.post("/api/input")
+    async def api_input(request: Request):
+        return await handle_api_input(request)
+
+    @app.post("/api/interrupt")
+    async def api_interrupt():
+        return await handle_api_interrupt()
+
+    @app.post("/api/approve")
+    async def api_approve(request: Request):
+        return await handle_api_approve(request)
+
     # --- WebSocket endpoint ---
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
-        await ws.accept()
+        await handle_persistent_websocket(ws)
 
-        # Signal the boot-WS watchdog that a connection arrived. Done before
-        # the readiness check so even a failed-to-be-ready connection counts:
-        # the user clearly came back, and a different error path applies.
-        _signal_ws_connected()
+    return app
 
-        if not _session or not _session.llm_with_tools:
-            await _ws_send(ws, "error", {"message": "Agent not ready"})
-            await ws.close(code=4503, reason="Agent not ready")
-            return
 
-        logger.info(f"WebSocket connected: thread={_thread_id}")
+# --- REST handlers (module-level so dual_app can call them too) ---
+#
+# Reached from both:
+#   - persistent_app.create_persistent_app()'s /api/{input,interrupt,approve}
+#     routes (pure persistent mode, agent.py --mode persistent).
+#   - dual_app.create_dual_app() routes (dual mode — adds pod-state pre-check
+#     then delegates here).
+#
+# Mirror of the /ws/chat consolidation; same rationale, see
+# docs/issues/persistent_session_dual_mode_phase1_gap.md.
 
-        # Send current session state so the client can sync
-        await _ws_send(
-            ws,
-            "session.state",
+
+async def handle_api_input(request: Request) -> JSONResponse:
+    """Push user input onto the loop's queue. Body: {content, turn_id?}."""
+    if _session is None or _loop_user_queue is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    content = body.get("content", "")
+    if not isinstance(content, str) or not content:
+        return JSONResponse(
+            {"error": "content must be a non-empty string"},
+            status_code=400,
+        )
+    _loop_last_user_content[0] = content
+    await _loop_user_queue.put(content)
+    return JSONResponse(
+        {
+            "accepted": True,
+            "turn_id": _session.turn_count,
+            "queue_depth": _loop_user_queue.qsize(),
+        }
+    )
+
+
+async def handle_api_interrupt() -> JSONResponse:
+    """Signal the loop to stop. Mode is hard vs graceful based on
+    whether a tool call is currently in flight."""
+    global _loop_interrupt_flag
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    mode = "graceful" if _tool_inflight else "hard"
+    _loop_interrupt_flag = mode
+    logger.info(
+        "Interrupt received via REST (mode=%s, tool_inflight=%s)",
+        mode,
+        _tool_inflight,
+    )
+    return JSONResponse({"ack": True, "mode": mode})
+
+
+async def handle_api_approve(request: Request) -> JSONResponse:
+    """Resolve a pending permission gate by UPDATEing the
+    thread_permission_requests row. Body: {decision: approve|deny,
+    approval_id?}. If approval_id is omitted, the most-recent-pending
+    row for this thread is resolved (legacy single-pending-at-a-time
+    contract). The DB trigger emits NOTIFY → agent's permission_check
+    wakes up."""
+    if _session is None:
+        return JSONResponse({"error": "Session not active"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    decision_raw = body.get("decision")
+    if decision_raw == "approve":
+        decision = "approved"
+    elif decision_raw == "deny":
+        decision = "denied"
+    else:
+        return JSONResponse(
+            {"error": "decision must be 'approve' or 'deny'"},
+            status_code=400,
+        )
+    approval_id = body.get("approval_id")
+    resolved = await _resolve_pending_permission(
+        decision,
+        approval_id=approval_id,
+        decided_by="rest_client",
+    )
+    if resolved is None:
+        return JSONResponse(
             {
-                "thread_id": _thread_id,
-                "permission_mode": _session.permission_mode,
-                "narration_mode": _session.narration_mode,
-                "turn_count": _session.turn_count,
-                "message_count": len(_session.messages),
-                "model": _session.config.llm.model,
-                "temperature": _session.config.llm.temperature,
+                "error": "No matching pending request",
+                "approval_id": approval_id,
             },
+            status_code=404,
         )
+    return JSONResponse(
+        {
+            "accepted": True,
+            "decision": decision_raw,
+            "approval_id": str(resolved["id"]),
+            "tool_call_id": resolved["tool_call_id"],
+        }
+    )
 
-        # Queue for user input (bridges WS receive loop → persistent loop)
-        user_queue: asyncio.Queue[str] = asyncio.Queue()
-        interrupt_flag = False
-        # Track last user message for persistence
-        _last_user_content: List[str] = [""]
 
-        def check_interrupt() -> bool:
-            nonlocal interrupt_flag
-            if interrupt_flag:
-                interrupt_flag = False
-                return True
-            return False
+# --- WebSocket handler (module-level so dual_app can call it too) ---
 
-        # Compute idle timeout from config
-        idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
-        idle_timeout_seconds = (
-            idle_timeout_minutes * 60 if idle_timeout_minutes > 0 else None
-        )
 
-        async def get_user_input() -> str:
-            await _ws_send(ws, "ready", {})
-            if idle_timeout_seconds:
-                try:
-                    return await asyncio.wait_for(
-                        user_queue.get(), timeout=idle_timeout_seconds
-                    )
-                except asyncio.TimeoutError:
-                    logger.info(
-                        f"Idle timeout ({idle_timeout_minutes}min) "
-                        f"for thread {_thread_id}"
-                    )
-                    await _ws_send(
-                        ws,
-                        "session.idle_timeout",
-                        {
-                            "thread_id": _thread_id,
-                            "message": "Session paused due to inactivity. "
-                            "Your work has been saved.",
-                            "timeout_minutes": idle_timeout_minutes,
-                        },
-                    )
-                    try:
-                        await ws.close(code=4408, reason="Idle timeout")
-                    except Exception:
-                        pass
-                    raise IdleTimeoutError(
-                        f"Idle timeout after {idle_timeout_seconds}s"
-                    )
-            return await user_queue.get()
+async def handle_persistent_websocket(ws: WebSocket) -> None:
+    """WebSocket consumer for an already-running persistent session.
 
-        async def on_token(token: str) -> None:
-            await _ws_send(ws, "token", {"content": token})
+    Headless lifecycle (chunk 1):
+      - First WS attach spawns the persistent loop with module-level
+        callbacks. Subsequent attaches just register a subscriber and
+        tap into the existing loop's broadcast stream.
+      - WS close calls _unsubscribe() and cancels this connection's pump
+        task. The loop keeps running. It only stops via
+        _loop_completion_handler (idle timeout, /done, crash) or via
+        out-of-band _terminate_session (drain, watchdog, REST detach).
+      - The pod no longer exits when the WS closes — that was the
+        WS-bound era. _schedule_exit is now driven only by drain intent
+        and shutdown paths.
 
-        async def on_thinking(content: str) -> None:
-            await _ws_send(ws, "thinking", {"content": content})
+    Reached from both:
+      - persistent_app.create_persistent_app()'s /ws/chat route (pure
+        persistent mode, agent.py --mode persistent).
+      - dual_app.ws_chat (dual mode — adds pod-state pre-checks then
+        delegates here). Sharing this body is what closes the Phase-1
+        gap described in
+        docs/issues/persistent_session_dual_mode_phase1_gap.md.
+    """
+    import uuid
 
-        async def on_tool_start(
-            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
-        ) -> None:
-            meta = TOOL_REGISTRY.get(tool_name, {})
-            await _ws_send(
-                ws,
-                "tool.started",
-                {
-                    "tool": tool_name,
-                    "args": _safe_serialize(tool_args),
-                    "id": tool_call_id,
-                    "category": meta.get("category", ""),
-                },
-            )
+    await ws.accept()
 
-        async def on_tool_result(
-            tool_name: str,
-            result: str,
-            tool_call_id: str,
-            is_error: bool = False,
-        ) -> None:
-            # Truncate large results for WS (full result is in message history)
-            display_result = result[:2000] + "..." if len(result) > 2000 else result
-            await _ws_send(
-                ws,
-                "tool.completed",
-                {
-                    "tool": tool_name,
-                    "result": display_result,
-                    "id": tool_call_id,
-                    "is_error": is_error,
-                },
-            )
+    # Signal the boot-WS watchdog that a connection arrived. Done before
+    # the readiness check so even a failed-to-be-ready connection counts:
+    # the user clearly came back, and a different error path applies.
+    _signal_ws_connected()
 
-            # Notify frontend of file checkpoint availability after writes
-            if tool_name in ("write_file", "edit_file"):
-                await _ws_send(
-                    ws,
-                    "file.checkpoint",
-                    {
-                        "turn_id": _session.turn_count,
-                    },
-                )
+    # Readiness gates on the loop primitives, not just the session. In dual
+    # mode /session/attach returns immediately and _attach_session runs
+    # asynchronously: _session.llm_with_tools is set early (inside .setup()),
+    # but _loop_user_queue isn't initialized until much later in the same
+    # coroutine. The loop's _loop_get_user_input callback crashes hard if
+    # the queue is None, so we must wait for it.
+    if not _session or not _session.llm_with_tools or _loop_user_queue is None:
+        await _ws_send(ws, "error", {"message": "Agent not ready"})
+        await ws.close(code=4503, reason="Agent not ready")
+        return
 
-            # Broadcast task state after task tool calls
-            if (
-                tool_name in ("task_add", "task_complete", "task_list")
-                and _session.session_task_manager
-            ):
-                await _ws_send(
-                    ws,
-                    "tasks.updated",
-                    {
-                        "tasks": _session.session_task_manager.to_dict_list(),
-                    },
-                )
+    # Register this WS as a subscriber on the broadcast hub.
+    client_id = uuid.uuid4().hex
+    queue = _subscribe(client_id)
+    pump_task = asyncio.create_task(
+        _run_subscriber_pump(ws, client_id, queue),
+        name=f"subscriber-pump-{client_id[:8]}",
+    )
 
-        async def permission_check(
-            tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
-        ) -> bool:
-            mode = _session.permission_mode
+    logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
 
-            if mode == "autonomous":
-                return True
+    # Send current session state so this client can sync. Direct send —
+    # this is the welcome frame, only the connecting client cares.
+    await _ws_send(
+        ws,
+        "session.state",
+        {
+            "thread_id": _thread_id,
+            "permission_mode": _session.permission_mode,
+            "narration_mode": _session.narration_mode,
+            "turn_count": _session.turn_count,
+            "message_count": len(_session.messages),
+            "model": _session.config.llm.model,
+            "temperature": _session.config.llm.temperature,
+        },
+    )
 
-            if mode == "auto_accept":
-                # Auto-accept reads and writes; still ask for shell commands
-                shell_tools = {"run_command", "shell_execute", "shell_read"}
-                if tool_name not in shell_tools:
-                    return True
-
-            # Supervised mode (or shell in auto_accept): ask user
-            await _ws_send(
-                ws,
-                "permission.request",
-                {
-                    "id": tool_call_id,
-                    "tool": tool_name,
-                    "args": _safe_serialize(tool_args),
-                },
-            )
-
-            # Wait for approval (with timeout)
-            try:
-                response = await asyncio.wait_for(user_queue.get(), timeout=300)
-                approved = response == APPROVE_SENTINEL
-            except asyncio.TimeoutError:
-                approved = False
-            _session.tool_decisions[tool_call_id] = "approved" if approved else "denied"
-            return approved
-
-        async def on_turn_start(turn_id: int) -> None:
-            _session.turn_count = turn_id
-            await _ws_send(ws, "turn.started", {"turn_id": turn_id})
-            # Save user message to DB (bounded await — no messages lost on crash)
-            if _orchestrator_client and _last_user_content[0]:
-                try:
-                    await asyncio.wait_for(
-                        _save_message(
-                            _orchestrator_client,
-                            _thread_id,
-                            "user",
-                            _last_user_content[0],
-                            None,
-                            turn_id,
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("User message save timed out (5s) — proceeding")
-
-        async def on_turn_complete(turn_id: int, metrics: dict | None = None) -> None:
-            await _ws_send(ws, "turn.completed", {"turn_id": turn_id})
-            # Save AI messages from this turn to DB (bounded await)
-            if _orchestrator_client:
-                try:
-                    await asyncio.wait_for(
-                        _save_turn_ai_messages(
-                            _orchestrator_client,
-                            _thread_id,
-                            _session.messages,
-                            turn_id,
-                            metrics=metrics,
-                            tool_decisions=dict(_session.tool_decisions),
-                        ),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning("AI message save timed out (5s) — proceeding")
-            _session.tool_decisions.clear()
-
-            # Auto-generate title after first few turns (fire-and-forget).
-            # Retry on turns 1-3 in case the LLM is transiently unreachable.
-            if turn_id <= 3 and _session.postgres_conn:
-                asyncio.create_task(_auto_title_after_first_turn(ws))
-
-            # Push workspace changes to Nextcloud (fire-and-forget)
-            if _session.workspace_sync:
-                asyncio.create_task(_session.workspace_sync.push())
-
-        async def on_error(message: str) -> None:
-            await _ws_send(ws, "error", {"message": message})
-
-        async def on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
-            """Notify client that sudo was detected and VM upgrade is available."""
-            await _ws_send(
-                ws,
-                "vm_upgrade.needed",
-                {
-                    "reason": freeze_data.get("reason", "sudo detected"),
-                    "command": freeze_data.get("command"),
-                },
-            )
-
+    # Spawn the persistent loop if it isn't already running. Reconnecting
+    # to a session whose loop is mid-turn just joins the broadcast — no
+    # restart, no replay (replay arrives in chunk 2 via the event log).
+    global _loop_task
+    if _loop_task is None or _loop_task.done():
         callbacks = PersistentLoopCallbacks(
-            get_user_input=get_user_input,
-            on_token=on_token,
-            on_thinking=on_thinking,
-            on_tool_start=on_tool_start,
-            on_tool_result=on_tool_result,
-            permission_check=permission_check,
-            on_turn_start=on_turn_start,
-            on_turn_complete=on_turn_complete,
-            on_error=on_error,
-            check_interrupt=check_interrupt,
-            on_vm_upgrade_needed=on_vm_upgrade_needed,
+            get_user_input=_loop_get_user_input,
+            on_token=_loop_on_token,
+            on_thinking=_loop_on_thinking,
+            on_tool_start=_loop_on_tool_start,
+            on_tool_result=_loop_on_tool_result,
+            permission_check=_loop_permission_check,
+            on_turn_start=_loop_on_turn_start,
+            on_turn_complete=_loop_on_turn_complete,
+            on_error=_loop_on_error,
+            check_interrupt=_loop_check_interrupt,
+            on_vm_upgrade_needed=_loop_on_vm_upgrade_needed,
         )
-
-        # Start persistent loop as background task
-        loop_task = asyncio.create_task(
+        _loop_task = asyncio.create_task(
             run_persistent_loop(
                 llm_with_tools=_session.llm_with_tools,
                 tools=_session.tools,
@@ -1305,155 +1486,885 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 project_ids=_session.project_ids,
                 tool_context=_session.tool_context,
                 initial_turn_count=_session.turn_count,
-                get_current_tools=lambda: (_session.llm_with_tools, _session.tools),
-            )
+                get_current_tools=lambda: (
+                    _session.llm_with_tools,
+                    _session.tools,
+                ),
+            ),
+            name="persistent-loop",
+        )
+        asyncio.create_task(
+            _loop_completion_handler(_loop_task),
+            name="persistent-loop-completion",
+        )
+        logger.info(f"Persistent loop started: thread={_thread_id}")
+    else:
+        logger.info(
+            f"Persistent loop already running, attached as subscriber "
+            f"client={client_id[:8]}"
         )
 
-        # --- WebSocket receive loop ---
-        try:
-            while True:
-                raw = await ws.receive_text()
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    # Plain text → treat as message
-                    data = {"method": "message", "content": raw}
+    # --- WebSocket receive loop ---
+    global _loop_interrupt_flag
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                # Plain text → treat as message
+                data = {"method": "message", "content": raw}
 
-                method = data.get("method", "message")
+            method = data.get("method", "message")
 
-                if method == "message":
-                    content = data.get("content", "")
-                    if content:
-                        _last_user_content[0] = content
-                        await user_queue.put(content)
+            if method == "message":
+                content = data.get("content", "")
+                if content and _loop_user_queue is not None:
+                    _loop_last_user_content[0] = content
+                    await _loop_user_queue.put(content)
 
-                elif method == "approve":
-                    await user_queue.put(APPROVE_SENTINEL)
+            elif method == "approve":
+                # Phase 3: resolve the most-recent-pending permission
+                # request in the DB. Cockpit can pass an explicit
+                # approval_id to disambiguate when multiple are
+                # pending (rare — agent's loop serializes most flows).
+                approval_id = data.get("approval_id")
+                asyncio.create_task(
+                    _resolve_pending_permission(
+                        "approved",
+                        approval_id=approval_id,
+                        decided_by="ws_client",
+                    ),
+                    name="resolve-approve",
+                )
 
-                elif method == "deny":
-                    await user_queue.put(DENY_SENTINEL)
+            elif method == "deny":
+                approval_id = data.get("approval_id")
+                asyncio.create_task(
+                    _resolve_pending_permission(
+                        "denied",
+                        approval_id=approval_id,
+                        decided_by="ws_client",
+                    ),
+                    name="resolve-deny",
+                )
 
-                elif method == "interrupt":
-                    interrupt_flag = True
-                    await _ws_send(ws, "interrupt.ack", {})
-                    logger.info("Interrupt acknowledged")
+            elif method == "interrupt":
+                # Mode picked from current _tool_inflight: graceful when
+                # a tool is mid-invoke (let it finish, don't leak state);
+                # hard otherwise (cancel the LLM stream now, drop the
+                # partial AIMessage). See persistent_graph check sites.
+                mode = "graceful" if _tool_inflight else "hard"
+                _loop_interrupt_flag = mode
+                await _ws_send(ws, "interrupt.ack", {"mode": mode})
+                logger.info("Interrupt acknowledged (mode=%s)", mode)
 
-                elif method == "mode.set":
-                    new_mode = data.get("mode", "supervised")
-                    if new_mode in ("supervised", "auto_accept", "autonomous"):
-                        _session.permission_mode = new_mode
-                        await _ws_send(ws, "mode.changed", {"mode": new_mode})
-                        logger.info(f"Permission mode changed to: {new_mode}")
-                    else:
+            elif method == "mode.set":
+                new_mode = data.get("mode", "supervised")
+                if new_mode in ("supervised", "auto_accept", "autonomous"):
+                    if _session is None:
                         await _ws_send(
                             ws,
                             "error",
-                            {"message": f"Invalid mode: {new_mode}"},
+                            {"message": "Session no longer active"},
                         )
-
-                elif method == "narration.set":
-                    new_mode = data.get("mode", "auto")
-                    if new_mode in ("silent", "verbose", "auto"):
-                        _session.narration_mode = new_mode
-                        await _ws_send(ws, "narration.changed", {"mode": new_mode})
-                        logger.info(f"Narration mode changed to: {new_mode}")
-                    else:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": f"Invalid narration mode: {new_mode}"},
-                        )
-
-                elif method == "config.update":
-                    config_override = data.get("config", {})
-                    if config_override:
-                        asyncio.create_task(_handle_config_update(ws, config_override))
-
-                elif method == "compact":
-                    # Manual compaction trigger (/compact command)
-                    focus = data.get("focus", "")
-                    asyncio.create_task(_handle_compact(ws, focus))
-
-                elif method == "archive":
-                    # End session (/done command)
-                    asyncio.create_task(_handle_archive(ws))
-
-                elif method == "upgrade-to-vm":
-                    # Upgrade workspace from container to VM
-                    asyncio.create_task(_handle_vm_upgrade(ws))
-
-                elif method == "undo":
-                    turn_id = data.get("turn_id")
-                    restored = _session.undo_turn(turn_id)
-                    if restored:
-                        await _ws_send(
-                            ws,
-                            "files.restored",
-                            {
-                                "paths": restored,
-                                "turn_id": turn_id,
-                            },
-                        )
-                    else:
-                        await _ws_send(
-                            ws,
-                            "error",
-                            {"message": "No checkpoints available to undo"},
-                        )
-
+                        continue
+                    _session.permission_mode = new_mode
+                    await _ws_send(ws, "mode.changed", {"mode": new_mode})
+                    logger.info(f"Permission mode changed to: {new_mode}")
                 else:
                     await _ws_send(
-                        ws, "error", {"message": f"Unknown method: {method}"}
+                        ws,
+                        "error",
+                        {"message": f"Invalid mode: {new_mode}"},
                     )
 
-        except WebSocketDisconnect:
-            logger.info(f"WebSocket disconnected: thread={_thread_id}")
-        except Exception as e:
-            logger.exception(f"WebSocket error: {e}")
-        finally:
-            # Check if loop exited due to idle timeout
-            idle_timed_out = False
-            if loop_task.done() and not loop_task.cancelled():
-                try:
-                    loop_task.result()
-                except IdleTimeoutError:
-                    idle_timed_out = True
-                except Exception:
-                    pass
+            elif method == "narration.set":
+                new_mode = data.get("mode", "auto")
+                if new_mode in ("silent", "verbose", "auto"):
+                    if _session is None:
+                        await _ws_send(
+                            ws,
+                            "error",
+                            {"message": "Session no longer active"},
+                        )
+                        continue
+                    _session.narration_mode = new_mode
+                    await _ws_send(ws, "narration.changed", {"mode": new_mode})
+                    logger.info(f"Narration mode changed to: {new_mode}")
+                else:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": f"Invalid narration mode: {new_mode}"},
+                    )
 
-            if not loop_task.done():
-                loop_task.cancel()
-                try:
-                    await loop_task
-                except asyncio.CancelledError:
-                    pass
+            elif method == "config.update":
+                config_override = data.get("config", {})
+                if config_override:
+                    asyncio.create_task(_handle_config_update(ws, config_override))
 
-            if idle_timed_out:
-                await _handle_idle_archive(ws)
+            elif method == "compact":
+                # Manual compaction trigger (/compact command)
+                focus = data.get("focus", "")
+                asyncio.create_task(_handle_compact(ws, focus))
 
-            # Always detach session on disconnect (idle timeout or not).
-            # Sets thread status to 'ended' and cleans up session state.
-            await _detach_session()
+            elif method == "archive":
+                # End session (/done command)
+                asyncio.create_task(_handle_archive(ws))
 
-            logger.info(f"WebSocket session ended: thread={_thread_id}")
+            elif method == "upgrade-to-vm":
+                # Upgrade workspace from container to VM
+                asyncio.create_task(_handle_vm_upgrade(ws))
 
-            # Exit process so the pod terminates cleanly.
-            # In K8s (restartPolicy: Never) this lets the stale agent
-            # detector mark the agent offline as a safety net.
-            _schedule_exit(delay=2.0)
+            elif method == "undo":
+                if _session is None:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "Session no longer active"},
+                    )
+                    continue
+                turn_id = data.get("turn_id")
+                restored = _session.undo_turn(turn_id)
+                if restored:
+                    await _ws_send(
+                        ws,
+                        "files.restored",
+                        {
+                            "paths": restored,
+                            "turn_id": turn_id,
+                        },
+                    )
+                else:
+                    await _ws_send(
+                        ws,
+                        "error",
+                        {"message": "No checkpoints available to undo"},
+                    )
 
-    return app
+            else:
+                await _ws_send(ws, "error", {"message": f"Unknown method: {method}"})
+
+    except WebSocketDisconnect:
+        logger.info(
+            f"WebSocket disconnected: thread={_thread_id} "
+            f"client={client_id[:8]} (loop continues)"
+        )
+    except Exception as e:
+        logger.exception(f"WebSocket error: {e}")
+    finally:
+        # Headless keystone: WS close only unsubscribes. The loop keeps
+        # running until _loop_completion_handler routes its natural exit,
+        # or out-of-band _terminate_session intervenes. We do NOT cancel
+        # _loop_task here, and we do NOT schedule pod exit.
+        _unsubscribe(client_id)
+        if not pump_task.done():
+            pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass
+        logger.info(
+            f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
+        )
 
 
 # --- Helpers ---
 
 
 async def _ws_send(ws: WebSocket, method: str, params: Dict[str, Any]) -> None:
-    """Send a JSON message over WebSocket. Silently drops if connection is closed."""
+    """Send a JSON message over WebSocket. Silently drops if connection is closed.
+
+    Used by WS-handler-direct sends (the receive-loop's acks, the welcome frame,
+    fire-and-forget handler tasks that hold a ws reference). Loop-driven sends
+    use _broadcast() instead, so a closed WS doesn't kill the loop's output.
+    """
     try:
         await ws.send_json({"method": method, "params": params})
     except Exception:
         pass  # Connection already closed
+
+
+def _subscribe(client_id: str) -> asyncio.Queue:
+    """Register a new subscriber and return its outbound queue.
+
+    Each WebSocket connection (and later, each SSE consumer) gets its own
+    bounded queue. _broadcast() enqueues onto every registered queue;
+    _run_subscriber_pump drains one queue into one WS.
+
+    Phase 5: if this is the first subscriber after an untethered pause,
+    schedule a status revert to 'active' so the attention-sleep watchdog
+    disarms. Fire-and-forget — a failed status write doesn't block the
+    attach.
+    """
+    was_empty = not _subscribers
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_MAXSIZE)
+    _subscribers[client_id] = queue
+    if was_empty and _orchestrator_client is not None and _thread_id is not None:
+        asyncio.create_task(
+            _safe_set_thread_status("active"), name="phase5-revert-active"
+        )
+    return queue
+
+
+def _unsubscribe(client_id: str) -> None:
+    """Remove a subscriber. Cheap — does not touch the loop or session state.
+
+    This is what WS close calls. The loop keeps running with one fewer audience.
+    """
+    _subscribers.pop(client_id, None)
+
+
+async def _safe_set_thread_status(status: str) -> None:
+    """Best-effort wrapper around _update_thread_status for fire-and-forget
+    Phase 5 transitions (awaiting_user / active revert). A transient failure
+    here is acceptable — the next natural-pause or subscriber attach will
+    retry.
+    """
+    try:
+        await _update_thread_status(status)
+    except Exception as e:
+        logger.warning("Failed to set thread status to %s: %s", status, e)
+
+
+def _broadcast(method: str, params: Dict[str, Any]) -> None:
+    """Enqueue a frame onto every subscriber queue, persist to event log.
+
+    Non-blocking. On a full subscriber queue, drops the oldest frame to make
+    room for the new one — token-stream pacing semantics. We'd rather lose an
+    old chunk than block the loop on a stuck consumer.
+
+    Phase 2 (event log): allocates the next seq synchronously and stamps
+    `(_events_epoch, seq)` into the frame's params under `_seq`. The actual
+    DB write is scheduled via asyncio.create_task and is best-effort — a
+    failed DB write doesn't block the loop or cancel the in-pod broadcast.
+    Reconnecting SSE clients replay from this log; failed writes produce a
+    cursor gap that GONE_BEYOND_HORIZON catches on the next mismatch.
+    """
+    global _next_seq
+    _next_seq += 1
+    seq = _next_seq
+    epoch = _events_epoch
+    # Stamp the cursor onto the frame so existing WS subscribers see the
+    # same (epoch, seq) the event log records — keeps WS and SSE paths
+    # consistent under reconnect.
+    params_with_cursor = {**params, "_seq": [epoch, seq]}
+    frame = {"method": method, "params": params_with_cursor}
+
+    for client_id, queue in list(_subscribers.items()):
+        try:
+            queue.put_nowait(frame)
+        except asyncio.QueueFull:
+            # Drop oldest, retry. If the retry still fails (shouldn't — we just
+            # made room), drop the new frame and move on.
+            try:
+                queue.get_nowait()
+                queue.put_nowait(frame)
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                logger.warning(
+                    "Subscriber %s queue overflow — dropping frame %s",
+                    client_id,
+                    method,
+                )
+
+    # Fire-and-forget DB write. Doesn't block the broadcast — if persistence
+    # fails the live subscribers still received the frame; only the SSE
+    # replay path loses a row.
+    if _session is not None and _session.postgres_conn is not None:
+        asyncio.create_task(
+            _persist_event(epoch, seq, method, params),
+            name=f"persist-event-{seq}",
+        )
+
+
+async def _persist_event(
+    epoch: int, seq: int, kind: str, payload: Dict[str, Any]
+) -> None:
+    """Insert one row into thread_events. Best-effort; failures are logged.
+
+    Called fire-and-forget from _broadcast. Captures the postgres_conn at
+    task start so a concurrent _terminate_session can null _session
+    without blowing up this in-flight write.
+    """
+    if _session is None or _thread_id is None:
+        return
+    postgres_conn = _session.postgres_conn
+    if postgres_conn is None:
+        return
+    try:
+        # Serialize payload defensively — frames carry tool args, etc.
+        safe_payload = _safe_serialize(payload)
+        async with postgres_conn.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO thread_events "
+                "(thread_id, epoch, seq, kind, payload) "
+                "VALUES ($1, $2, $3, $4, $5::jsonb)",
+                _thread_id,
+                epoch,
+                seq,
+                kind,
+                json.dumps(safe_payload),
+            )
+    except Exception as e:
+        # Best-effort: log and drop. The frame already reached live
+        # subscribers; only SSE replay for this seq is lost.
+        logger.warning(
+            "thread_events write failed (thread=%s epoch=%d seq=%d kind=%s): %s",
+            _thread_id,
+            epoch,
+            seq,
+            kind,
+            e,
+        )
+
+
+async def _run_subscriber_pump(
+    ws: WebSocket, client_id: str, queue: asyncio.Queue
+) -> None:
+    """Drain a subscriber's queue into its WebSocket. Exits on send failure.
+
+    One pump task per connected WebSocket. Cancelled by the ws_chat finally
+    block when the WS closes; the queue is then garbage-collected after
+    _unsubscribe removes the dict entry.
+    """
+    try:
+        while True:
+            frame = await queue.get()
+            try:
+                await ws.send_json(frame)
+            except Exception:
+                # WS is dead — let the receive loop's exception path clean up.
+                return
+    except asyncio.CancelledError:
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Persistent-loop callbacks (module-level under headless semantics).
+#
+# These used to be closures inside ws_chat. They've been hoisted so the loop
+# can outlive any single WebSocket connection: callbacks reference module
+# globals (_session, _loop_user_queue, _loop_interrupt_flag,
+# _loop_last_user_content, _orchestrator_client, _thread_id) and emit via
+# _broadcast() rather than writing to one ws.
+# ---------------------------------------------------------------------------
+
+
+async def _loop_get_user_input() -> str:
+    """Wait for the next user input. Honors session idle timeout.
+
+    On idle timeout, broadcasts session.idle_timeout to every subscriber and
+    raises IdleTimeoutError — the loop unwinds, _loop_completion_handler
+    routes it to _handle_idle_archive() + _terminate_session("idle_timeout").
+    """
+    queue = _loop_user_queue
+    if queue is None:
+        # _attach_session always initializes this. If we hit None here the
+        # session is being torn down — fail loudly so the loop unwinds.
+        raise RuntimeError("_loop_user_queue not initialized — session torn down?")
+
+    _broadcast("ready", {})
+
+    # Phase 5/6: natural-pause transition to 'awaiting_user'. Eager mode
+    # (default) only flips when untethered — the agent is presumed to be
+    # working in the background and we only need to flag-and-notify when
+    # the user has nobody watching. Polite mode flips at every turn boundary
+    # regardless of subscribers — the user has explicitly opted in to a
+    # review-heavy "see every step" workflow and wants notification + an
+    # explicit reply gate after each completed turn. Idempotent on the
+    # orchestrator side: repeated writes preserve awaiting_user_since.
+    headless_mode = "eager"
+    if _session is not None:
+        headless_cfg = getattr(_session.config, "headless", None)
+        if headless_cfg is not None:
+            headless_mode = getattr(headless_cfg, "mode", "eager") or "eager"
+    should_flip = (
+        _session is not None
+        and _session.turn_count > 0
+        and _orchestrator_client is not None
+        and _thread_id is not None
+        and (headless_mode == "polite" or not _subscribers)
+    )
+    if should_flip:
+        asyncio.create_task(
+            _safe_set_thread_status("awaiting_user"),
+            name="phase5-flip-awaiting-user",
+        )
+
+    if _session is None:
+        return await queue.get()
+
+    idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
+    if idle_timeout_minutes and idle_timeout_minutes > 0:
+        idle_timeout_seconds = idle_timeout_minutes * 60
+        try:
+            return await asyncio.wait_for(queue.get(), timeout=idle_timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.info(
+                "Idle timeout (%dmin) for thread %s",
+                idle_timeout_minutes,
+                _thread_id,
+            )
+            _broadcast(
+                "session.idle_timeout",
+                {
+                    "thread_id": _thread_id,
+                    "message": (
+                        "Session paused due to inactivity. Your work has been saved."
+                    ),
+                    "timeout_minutes": idle_timeout_minutes,
+                },
+            )
+            raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
+    return await queue.get()
+
+
+def _loop_check_interrupt() -> Optional[str]:
+    """One-shot read of the interrupt flag. Returns the mode or None.
+
+    Returns:
+        None when no interrupt is pending.
+        "hard" to cancel the in-flight LLM stream immediately and drop the
+            partial AIMessage (set when interrupt fires with no tool active).
+        "graceful" to stop after the current tool call completes (set when
+            interrupt fires with a tool mid-`ainvoke`).
+
+    Consumed by persistent_graph at three checkpoints. A `bool(result)`
+    check preserves the legacy "any interrupt → stop" semantics for sites
+    that don't yet branch on the mode.
+    """
+    global _loop_interrupt_flag
+    mode = _loop_interrupt_flag
+    if mode is not None:
+        _loop_interrupt_flag = None
+        return mode
+    return None
+
+
+async def _loop_on_token(token: str) -> None:
+    _broadcast("token", {"content": token})
+
+
+async def _loop_on_thinking(content: str) -> None:
+    _broadcast("thinking", {"content": content})
+
+
+async def _loop_on_tool_start(
+    tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+) -> None:
+    global _tool_inflight
+    _tool_inflight = True
+    meta = TOOL_REGISTRY.get(tool_name, {})
+    _broadcast(
+        "tool.started",
+        {
+            "tool": tool_name,
+            "args": _safe_serialize(tool_args),
+            "id": tool_call_id,
+            "category": meta.get("category", ""),
+        },
+    )
+
+
+async def _loop_on_tool_result(
+    tool_name: str,
+    result: str,
+    tool_call_id: str,
+    is_error: bool = False,
+) -> None:
+    global _tool_inflight
+    _tool_inflight = False
+    # Truncate large results for transport (full result is in message history)
+    display_result = result[:2000] + "..." if len(result) > 2000 else result
+    _broadcast(
+        "tool.completed",
+        {
+            "tool": tool_name,
+            "result": display_result,
+            "id": tool_call_id,
+            "is_error": is_error,
+        },
+    )
+
+    # Notify frontend of file checkpoint availability after writes
+    if tool_name in ("write_file", "edit_file") and _session is not None:
+        _broadcast(
+            "file.checkpoint",
+            {"turn_id": _session.turn_count},
+        )
+
+    # Broadcast task state after task tool calls
+    if (
+        tool_name in ("task_add", "task_complete", "task_list")
+        and _session is not None
+        and _session.session_task_manager
+    ):
+        _broadcast(
+            "tasks.updated",
+            {"tasks": _session.session_task_manager.to_dict_list()},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: DB-backed permission gates (LISTEN/NOTIFY on thread_permission_requests)
+# ---------------------------------------------------------------------------
+#
+# The agent INSERTs a pending row when permission_check fires, then waits for
+# UPDATE → trigger → NOTIFY. Approval can arrive from any path (WS-attached
+# cockpit, REST POST from MCP/cockpit, future email magic-link) — all converge
+# on the same UPDATE statement. The agent never blocks on an in-memory queue
+# anymore; the queue path is still in place for non-permission user input.
+#
+# Channel: thread_permission_updates (global). Payload carries the request id;
+# the listener filters by it to match its own pending wait.
+
+_PERMISSION_TIMEOUT_S: float = 300.0
+_PERMISSION_NOTIFY_CHANNEL: str = "thread_permission_updates"
+
+
+async def _insert_permission_request(
+    tool_call_id: str, tool_name: str, tool_args: Dict[str, Any]
+) -> Optional[str]:
+    """INSERT a pending row and return its UUID. None on failure."""
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return None
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            row_id = await conn.fetchval(
+                "INSERT INTO thread_permission_requests "
+                "(thread_id, tool_call_id, tool_name, tool_args) "
+                "VALUES ($1, $2, $3, $4::jsonb) "
+                "RETURNING id",
+                _thread_id,
+                tool_call_id,
+                tool_name,
+                json.dumps(_safe_serialize(tool_args)),
+            )
+        return str(row_id) if row_id is not None else None
+    except Exception as e:
+        logger.warning(
+            "thread_permission_requests INSERT failed (tool=%s): %s",
+            tool_name,
+            e,
+        )
+        return None
+
+
+async def _wait_for_permission_resolution(
+    request_id: str, timeout: float = _PERMISSION_TIMEOUT_S
+) -> str:
+    """Block until the row's status flips from pending. Returns the final
+    status string ('approved'/'denied'/'expired'). On any failure, returns
+    'denied' as the conservative default.
+
+    Uses asyncpg's connection-scoped add_listener on the global NOTIFY
+    channel; filters by row id. After registering the listener, re-SELECTs
+    the row's status to close the race window between INSERT and listen
+    setup. On timeout, atomically marks the row 'expired' (only if it's
+    still 'pending') before reading the canonical final status back.
+    """
+    if _session is None or _session.postgres_conn is None:
+        return "denied"
+
+    resolved = asyncio.Event()
+
+    def _on_notify(_conn, _pid, _channel, payload):
+        try:
+            data = json.loads(payload)
+        except Exception:
+            return
+        if str(data.get("id")) == request_id:
+            resolved.set()
+
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            await conn.add_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
+            try:
+                # Race-safe: an UPDATE between INSERT and add_listener
+                # would have fired NOTIFY into the void; check the row's
+                # current status before settling in to wait.
+                current = await conn.fetchval(
+                    "SELECT status FROM thread_permission_requests WHERE id = $1",
+                    request_id,
+                )
+                if current in ("approved", "denied", "expired"):
+                    return str(current)
+
+                try:
+                    await asyncio.wait_for(resolved.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    # CAS-style expire: only if nobody beat us to it.
+                    await conn.execute(
+                        "UPDATE thread_permission_requests "
+                        "SET status = 'expired', decided_at = now(), "
+                        "    decided_by = 'system' "
+                        "WHERE id = $1 AND status = 'pending'",
+                        request_id,
+                    )
+
+                final = await conn.fetchval(
+                    "SELECT status FROM thread_permission_requests WHERE id = $1",
+                    request_id,
+                )
+                return str(final) if final is not None else "denied"
+            finally:
+                try:
+                    await conn.remove_listener(_PERMISSION_NOTIFY_CHANNEL, _on_notify)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("Permission resolution wait failed (id=%s): %s", request_id, e)
+        return "denied"
+
+
+async def _resolve_pending_permission(
+    decision: str,
+    approval_id: Optional[str] = None,
+    decided_by: str = "ws_client",
+) -> Optional[Dict[str, Any]]:
+    """UPDATE a pending permission row by id, or the most-recent-pending if
+    no id given. Returns the resolved row dict or None if not found / no
+    pending request matched."""
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        return None
+    if decision not in ("approved", "denied"):
+        return None
+    try:
+        async with _session.postgres_conn.acquire() as conn:
+            if approval_id is not None:
+                row = await conn.fetchrow(
+                    "UPDATE thread_permission_requests "
+                    "SET status = $2, decided_at = now(), decided_by = $3 "
+                    "WHERE id = $1 AND status = 'pending' "
+                    "RETURNING id, status, tool_call_id, thread_id",
+                    approval_id,
+                    decision,
+                    decided_by,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE thread_permission_requests "
+                    "SET status = $2, decided_at = now(), decided_by = $3 "
+                    "WHERE id = ("
+                    "  SELECT id FROM thread_permission_requests "
+                    "  WHERE thread_id = $1 AND status = 'pending' "
+                    "  ORDER BY requested_at DESC LIMIT 1"
+                    ") "
+                    "RETURNING id, status, tool_call_id, thread_id",
+                    _thread_id,
+                    decision,
+                    decided_by,
+                )
+        return dict(row) if row else None
+    except Exception as e:
+        logger.warning("Resolve pending permission failed: %s", e)
+        return None
+
+
+async def _loop_permission_check(
+    tool_name: str, tool_args: Dict[str, Any], tool_call_id: str
+) -> bool:
+    """Check whether a tool call is approved. INSERTs a pending row, waits
+    for the DB to flip via LISTEN/NOTIFY, returns True iff approved.
+
+    The race-fix from commit 3a1d265: if _terminate_session nulled _session
+    while permission_check was being scheduled, this returns False — the
+    session is gone, the tool result has nowhere to land.
+    """
+    if _session is None:
+        logger.warning(
+            "permission_check fired with _session=None for tool %s — denying",
+            tool_name,
+        )
+        return False
+
+    mode = _session.permission_mode
+
+    if mode == "autonomous":
+        return True
+
+    if mode == "auto_accept":
+        # Auto-accept reads and writes; still ask for shell commands.
+        shell_tools = {"run_command", "shell_execute", "shell_read"}
+        if tool_name not in shell_tools:
+            return True
+
+    # Phase 5 wake path: if this tool_call_id was already resolved (typical
+    # case: user clicked the magic-link approve/deny while the agent was
+    # suspended; on wake LangGraph restores the same tool_call_id from
+    # checkpoint), reuse that decision instead of inserting a fresh
+    # request. We only honor terminal 'approved'/'denied' here — 'expired'
+    # means the prior request timed out without a user response, so the
+    # new attempt deserves a fresh prompt.
+    if _session.postgres_conn is not None and _thread_id is not None:
+        try:
+            async with _session.postgres_conn.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT status FROM thread_permission_requests "
+                    "WHERE thread_id = $1 AND tool_call_id = $2 "
+                    "  AND status IN ('approved', 'denied') "
+                    "ORDER BY decided_at DESC NULLS LAST LIMIT 1",
+                    _thread_id,
+                    tool_call_id,
+                )
+            if existing is not None:
+                decision = existing["status"]
+                _session.tool_decisions[tool_call_id] = decision
+                logger.info(
+                    "Phase 5 wake: reusing prior %s decision for tool_call %s "
+                    "(tool=%s)",
+                    decision,
+                    tool_call_id,
+                    tool_name,
+                )
+                return decision == "approved"
+        except Exception as e:
+            # Soft-fail: fall through to the regular INSERT-and-wait path.
+            logger.warning(
+                "Wake-path SELECT for tool_call %s failed (%s); falling back",
+                tool_call_id,
+                e,
+            )
+
+    # Supervised mode (or shell under auto_accept): ask user via the
+    # durable permission table, then wait on LISTEN/NOTIFY.
+    request_id = await _insert_permission_request(tool_call_id, tool_name, tool_args)
+    if request_id is None:
+        # DB unavailable — conservative deny rather than risk silent
+        # auto-approval. Logged at WARNING by the insert helper.
+        if _session is not None:
+            _session.tool_decisions[tool_call_id] = "denied"
+        return False
+
+    # Broadcast carries both ids so clients can refer back via either.
+    _broadcast(
+        "permission.request",
+        {
+            "id": tool_call_id,
+            "approval_id": request_id,
+            "tool": tool_name,
+            "args": _safe_serialize(tool_args),
+        },
+    )
+
+    # Phase 5: sudo gate hit untethered is the second natural-pause site.
+    # Flip the thread so the attention-sleep watchdog can fire after the
+    # configured TTL. Idempotent against the _loop_get_user_input write.
+    if not _subscribers and _orchestrator_client is not None and _thread_id is not None:
+        asyncio.create_task(
+            _safe_set_thread_status("awaiting_user"),
+            name="phase5-flip-awaiting-user-sudo",
+        )
+
+    final_status = await _wait_for_permission_resolution(request_id)
+    approved = final_status == "approved"
+    if _session is not None:
+        _session.tool_decisions[tool_call_id] = final_status
+    return approved
+
+
+async def _loop_on_turn_start(turn_id: int) -> None:
+    if _session is None:
+        return
+    _session.turn_count = turn_id
+    _broadcast("turn.started", {"turn_id": turn_id})
+    # Save user message to DB (bounded await — no messages lost on crash)
+    if _orchestrator_client and _loop_last_user_content[0]:
+        try:
+            await asyncio.wait_for(
+                _save_message(
+                    _orchestrator_client,
+                    _thread_id,
+                    "user",
+                    _loop_last_user_content[0],
+                    None,
+                    turn_id,
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("User message save timed out (5s) — proceeding")
+
+
+async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -> None:
+    if _session is None:
+        return
+    _broadcast("turn.completed", {"turn_id": turn_id})
+    # Save AI messages from this turn to DB (bounded await)
+    if _orchestrator_client:
+        try:
+            await asyncio.wait_for(
+                _save_turn_ai_messages(
+                    _orchestrator_client,
+                    _thread_id,
+                    _session.messages,
+                    turn_id,
+                    metrics=metrics,
+                    tool_decisions=dict(_session.tool_decisions),
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("AI message save timed out (5s) — proceeding")
+    _session.tool_decisions.clear()
+
+    # Auto-generate title after first few turns (fire-and-forget).
+    # Retry on turns 1-3 in case the LLM is transiently unreachable.
+    if turn_id <= 3 and _session.postgres_conn:
+        asyncio.create_task(_auto_title_after_first_turn())
+
+    # Push workspace changes to Nextcloud (fire-and-forget)
+    if _session.workspace_sync:
+        asyncio.create_task(_session.workspace_sync.push())
+
+
+async def _loop_on_error(message: str) -> None:
+    _broadcast("error", {"message": message})
+
+
+async def _loop_on_vm_upgrade_needed(freeze_data: Dict[str, Any]) -> None:
+    """Notify subscribers that sudo was detected and VM upgrade is available."""
+    _broadcast(
+        "vm_upgrade.needed",
+        {
+            "reason": freeze_data.get("reason", "sudo detected"),
+            "command": freeze_data.get("command"),
+        },
+    )
+
+
+async def _loop_completion_handler(loop_task: asyncio.Task) -> None:
+    """Wait for the persistent loop to finish, then run reason-appropriate cleanup.
+
+    Under headless semantics the WS handler no longer cleans up after the loop
+    in its finally block — the loop outlives the WS. So we attach this
+    completion handler when the loop is spawned, and it routes the exit path:
+
+    - IdleTimeoutError → archive + terminate as "idle_timeout"
+    - Other exceptions → terminate as "loop_crash"
+    - Clean exit → terminate as "loop_complete"
+    - CancelledError → already inside _terminate_session, do nothing
+    """
+    try:
+        await loop_task
+    except IdleTimeoutError:
+        logger.info("Persistent loop exited via idle timeout")
+        try:
+            await _handle_idle_archive()
+        except Exception as e:
+            logger.warning(f"Idle archive failed: {e}")
+        await _terminate_session("idle_timeout")
+    except asyncio.CancelledError:
+        # Cancellation came from _terminate_session itself — don't re-enter.
+        # Re-raise so the wrapper task surfaces as cancelled.
+        raise
+    except Exception as e:
+        logger.warning(f"Persistent loop crashed: {e}", exc_info=True)
+        await _terminate_session("loop_crash")
+    else:
+        logger.info("Persistent loop completed cleanly")
+        await _terminate_session("loop_complete")
 
 
 def _safe_serialize(obj: Any) -> Any:
@@ -1559,6 +2470,8 @@ async def _save_message(
     content: Optional[str],
     tool_calls: Optional[Any],
     turn_number: int,
+    tool_call_id: Optional[str] = None,
+    thinking: Optional[str] = None,
 ) -> None:
     """Fire-and-forget: save a single message via orchestrator REST."""
     try:
@@ -1568,9 +2481,35 @@ async def _save_message(
             content=content,
             tool_calls=tool_calls,
             turn_number=turn_number,
+            tool_call_id=tool_call_id,
+            thinking=thinking,
         )
     except Exception as e:
         logger.warning(f"Failed to save message (non-fatal): {e}")
+
+
+def _extract_thinking(msg: Any) -> Optional[str]:
+    """Pull reasoning content out of an AIMessage for persistence.
+
+    Two sources depending on the provider:
+      - Anthropic: ``content`` is a list of blocks, thinking blocks carry
+        ``{"type": "thinking", "thinking": "..."}``.
+      - Other reasoning models (DeepSeek, GPT-5, etc.): ``additional_kwargs.
+        reasoning_content`` carries a plain string.
+    Returns None when the model didn't emit a visible reasoning channel.
+    """
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        parts = [
+            b.get("thinking", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+    rc = getattr(msg, "additional_kwargs", {}).get("reasoning_content")
+    return rc or None
 
 
 async def _save_turn_ai_messages(
@@ -1625,6 +2564,13 @@ async def _save_turn_ai_messages(
                     if decision:
                         entry["decision"] = decision
                     tc.append(entry)
+            # Extract reasoning content + tool-call back-reference BEFORE we
+            # flatten Anthropic's list-of-dicts content (which drops the
+            # thinking blocks).
+            thinking = _extract_thinking(msg) if role == "ai" else None
+            tool_call_id = (
+                getattr(msg, "tool_call_id", None) if role == "tool" else None
+            )
             # Normalize content for Anthropic list-of-dicts format
             if isinstance(content, list):
                 content = " ".join(
@@ -1640,6 +2586,8 @@ async def _save_turn_ai_messages(
                 tool_calls=tc,
                 turn_number=turn_number,
                 metrics=msg_metrics,
+                tool_call_id=tool_call_id,
+                thinking=thinking,
             )
     except Exception as e:
         logger.warning(f"Failed to save turn messages (non-fatal): {e}")
@@ -1838,7 +2786,12 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 ),
             )
 
-        # Update permission mode if included
+        # Update permission mode if included.
+        # _session may have been detached concurrently — bail out cleanly
+        # instead of AttributeError'ing on assignment.
+        if _session is None:
+            await _ws_send(ws, "error", {"message": "Session no longer active"})
+            return
         pm = (config_override.get("interactive") or {}).get("permission_mode")
         if pm and pm in ("supervised", "auto_accept", "autonomous"):
             _session.permission_mode = pm
@@ -1858,6 +2811,8 @@ async def _handle_config_update(ws: WebSocket, config_override: Dict[str, Any]) 
                 logger.warning("Config persistence to orchestrator failed (non-fatal)")
 
         # Acknowledge with resolved values
+        if _session is None:
+            return
         await _ws_send(
             ws,
             "config.changed",
@@ -1962,17 +2917,21 @@ async def _update_thread_status(status: str) -> None:
             logger.warning(f"Failed to update thread status to {status}: {e}")
 
 
-async def _handle_idle_archive(ws: WebSocket) -> None:
-    """Handle idle timeout — archive session state, set thread to ended."""
+async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
+    """Handle idle timeout — archive session state, set thread to ended.
+
+    `ws` is optional under headless semantics — when called from the loop's
+    completion handler there's no single WS in scope; we broadcast to every
+    subscriber instead. The argument is kept for back-compat with any callers
+    still holding a ws reference; the broadcast reaches them too.
+    """
     try:
         if not _session:
             return
 
-        # 0. Tell any still-connected client that the session is ending so the
-        # UI can flip to the resume card without waiting for a refresh.
-        await _ws_send(
-            ws, "session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"}
-        )
+        # 0. Tell every still-connected client that the session is ending so
+        # the UI can flip to the resume card without waiting for a refresh.
+        _broadcast("session.ended", {"thread_id": _thread_id, "reason": "idle_timeout"})
 
         # 1. Extract memories
         recall_store = (
@@ -2273,8 +3232,12 @@ async def _generate_title(messages: List[Any], auxiliary_llm: Any) -> Optional[s
         return None
 
 
-async def _auto_title_after_first_turn(ws: WebSocket) -> None:
-    """Generate and push a title after the first assistant turn (fire-and-forget)."""
+async def _auto_title_after_first_turn() -> None:
+    """Generate and push a title after the first assistant turn (fire-and-forget).
+
+    Loop-driven (fired from _loop_on_turn_complete), broadcasts to every
+    subscriber so each attached client sees the new title.
+    """
     try:
         if not _session or not _session.postgres_conn or not _thread_id:
             return
@@ -2296,7 +3259,7 @@ async def _auto_title_after_first_turn(ws: WebSocket) -> None:
                 _thread_id,
                 title,
             )
-        await _ws_send(ws, "title.updated", {"title": title})
+        _broadcast("title.updated", {"title": title})
         logger.info(f"Auto-titled thread {_thread_id}: {title}")
     except Exception as e:
         logger.warning(f"Auto-title generation failed (non-fatal): {e}")

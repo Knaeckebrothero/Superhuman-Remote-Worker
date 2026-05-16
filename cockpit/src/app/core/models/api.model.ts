@@ -137,6 +137,17 @@ export interface DatasourceTestResult {
   message: string;
 }
 
+/**
+ * Response from POST /api/datasources/ssh-keys/generate.
+ *
+ * `private_key` is dropped into the SSH key textarea, `public_key` is shown
+ * to the user so they can add it as a deploy key on their provider.
+ */
+export interface SSHKeyGenerateResponse {
+  private_key: string;
+  public_key: string;
+}
+
 // =============================================================================
 // User Models
 // =============================================================================
@@ -448,6 +459,12 @@ export interface PersistentAgentSettings {
     greeting?: string | null;
     idle_timeout_minutes?: number | null;
     command_allowlist?: string[] | null;
+    // Phase 6 headless controls. Backend reads these as direct children of
+    // users.settings.persistent_agent (see orchestrator/main.py create_thread
+    // merge + attention_sleep_sweeper COALESCE).
+    headless_mode?: 'eager' | 'polite' | null;
+    headless_attention_sleep_minutes?: number | null;
+    notification_channels?: string[] | null;
 }
 
 /**

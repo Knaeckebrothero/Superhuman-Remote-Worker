@@ -1,18 +1,20 @@
 # yaml-language-server: $schema=../../schema.json
-# Developer - Claude Code delegation, PR factory
+# Developer - test-driven implementation. Spec first, tests first, code last.
 $extends: defaults
 
 agent_id: developer
 display_name: Developer
 description: |
-  Implementation engine. Receives approved ideas and implementation tasks,
-  delegates to Claude Code sessions, manages PRs. Throughput-focused and
-  systematic. One todo = one delegation = one focused change.
+  Test-driven implementation engine. Defines EARS acceptance criteria up front,
+  writes failing tests, then writes the minimum code that makes them pass.
+  Operates in a spec → red → green → refactor cycle, with phase-typed todos
+  and strict file-scope discipline (no source edits in red, no test edits in green).
 icon: code
 color: "#89b4fa"
 tags:
   - coding
   - development
+  - tdd
   - delegation
 
 llm:

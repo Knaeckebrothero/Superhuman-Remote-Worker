@@ -1,0 +1,46 @@
+// Primitive design tokens emitted as CSS custom properties.
+//
+// These are the runtime contract for shape and typography across the cockpit.
+// Default values mirror the Sass scalars in _variables.scss; theme files
+// override individual tokens under their scoped selectors (e.g. Roman themes
+// flatten --radius-sm to 0 in _shape-overrides.scss).
+//
+// Components should not read these directly. They consume role tokens from
+// _semantic-tokens.scss (--radius-control, --font-primary, etc.), which alias
+// these primitives. That way a theme can rebind the role independently of the
+// scale.
+
+:root {
+  // --- Radii ---
+  --radius-sm:   0.25rem; //  4px
+  --radius-md:   0.5rem;  //  8px
+  --radius-lg:   0.75rem; // 12px
+  --radius-xl:   1.5rem;  // 24px
+  --radius-full: 999px;   // pill / functional circles
+
+  // --- Typography families ---
+  // Inter + JetBrains Mono are loaded via index.html alongside Cinzel; the
+  // system stack stays as a fallback for first paint and offline.
+  --font-family-base:
+    'Inter',
+    -apple-system,
+    blinkmacsystemfont,
+    'Segoe UI',
+    roboto,
+    oxygen,
+    ubuntu,
+    sans-serif;
+
+  // Display family defaults to the base; Roman themes override to Cinzel via
+  // _shape-overrides.scss. Loaded in cockpit/src/index.html.
+  --font-family-display: var(--font-family-base);
+  --font-family-mono:
+    'JetBrains Mono',
+    ui-monospace,
+    'SFMono-Regular',
+    menlo,
+    monaco,
+    'Cascadia Mono',
+    consolas,
+    monospace;
+}

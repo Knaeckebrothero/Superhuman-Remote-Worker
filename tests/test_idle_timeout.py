@@ -335,7 +335,7 @@ class TestUpdateThreadStatus:
 async def mark_orphaned_threads_ended(db):
     """Replicated from postgres.py."""
     async with db.acquire() as conn:
-        result = await conn.execute(
+        rows = await conn.fetch(
             """
             UPDATE threads
             SET status        = 'ended',
@@ -346,44 +346,47 @@ async def mark_orphaned_threads_ended(db):
               AND agent_id IN (SELECT id
                                FROM agents
                                WHERE status = 'offline')
+            RETURNING id
             """
         )
-    if result.startswith("UPDATE "):
-        return int(result.split()[1])
-    return 0
+    return [str(row["id"]) for row in rows]
 
 
 class TestMarkOrphanedThreadsEnded:
     @pytest.mark.asyncio
-    async def test_returns_count_from_update(self):
+    async def test_returns_ids_from_update(self):
         conn = AsyncMock()
-        conn.execute.return_value = "UPDATE 3"
+        conn.fetch.return_value = [
+            {"id": "t-1"},
+            {"id": "t-2"},
+            {"id": "t-3"},
+        ]
         db = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire.return_value = ctx
 
-        count = await mark_orphaned_threads_ended(db)
-        assert count == 3
+        ids = await mark_orphaned_threads_ended(db)
+        assert ids == ["t-1", "t-2", "t-3"]
 
     @pytest.mark.asyncio
-    async def test_returns_zero_when_none_affected(self):
+    async def test_returns_empty_when_none_affected(self):
         conn = AsyncMock()
-        conn.execute.return_value = "UPDATE 0"
+        conn.fetch.return_value = []
         db = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
         db.acquire.return_value = ctx
 
-        count = await mark_orphaned_threads_ended(db)
-        assert count == 0
+        ids = await mark_orphaned_threads_ended(db)
+        assert ids == []
 
     @pytest.mark.asyncio
     async def test_sql_filters_created_and_active(self):
         conn = AsyncMock()
-        conn.execute.return_value = "UPDATE 0"
+        conn.fetch.return_value = []
         db = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -391,7 +394,7 @@ class TestMarkOrphanedThreadsEnded:
         db.acquire.return_value = ctx
 
         await mark_orphaned_threads_ended(db)
-        sql = conn.execute.call_args[0][0]
+        sql = conn.fetch.call_args[0][0]
         assert "'created'" in sql
         assert "'active'" in sql
         assert "'ended'" in sql
@@ -401,6 +404,9 @@ class TestMarkOrphanedThreadsEnded:
         assert "agent_id IS NOT NULL" in sql
         assert "agent_id IS NULL" not in sql
         assert "'offline'" in sql
+        # The caller needs the affected IDs to drive workspace + agent-pod
+        # teardown — otherwise resources leak even when the row flips ended.
+        assert "RETURNING id" in sql
 
 
 # =============================================================================
@@ -469,14 +475,14 @@ async def stale_detector_sweep(db):
     count = await db.mark_stale_agents_offline(timeout_minutes=3)
     stuck_working = await db.mark_stuck_working_agents_ready()
     stuck_session = await db.mark_stuck_session_agents_ready()
-    ended_count = await db.mark_orphaned_threads_ended()
+    ended_ids = await db.mark_orphaned_threads_ended()
     recovered = await db.recover_orphaned_jobs()
     gc_count = await db.gc_offline_agents(retention_hours=24)
     return {
         "stale_agents": count,
         "stuck_working": stuck_working,
         "stuck_session": stuck_session,
-        "ended_threads": ended_count,
+        "ended_threads": ended_ids,
         "recovered_jobs": recovered,
         "gc_offline": gc_count,
     }
@@ -489,13 +495,13 @@ class TestStaleDetectorSweep:
         db.mark_stale_agents_offline.return_value = 2
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
-        db.mark_orphaned_threads_ended.return_value = 1
+        db.mark_orphaned_threads_ended.return_value = ["thread-a"]
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
         result = await stale_detector_sweep(db)
         assert result["stale_agents"] == 2
-        assert result["ended_threads"] == 1
+        assert result["ended_threads"] == ["thread-a"]
 
         # Ensure thread sweep is called AFTER agent marking
         calls = db.method_calls
@@ -513,12 +519,12 @@ class TestStaleDetectorSweep:
         db.mark_stale_agents_offline.return_value = 0
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
-        db.mark_orphaned_threads_ended.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
         result = await stale_detector_sweep(db)
-        assert result["ended_threads"] == 0
+        assert result["ended_threads"] == []
 
     @pytest.mark.asyncio
     async def test_consistency_sweeps_run_before_propagation(self):
@@ -529,7 +535,7 @@ class TestStaleDetectorSweep:
         db.mark_stale_agents_offline.return_value = 0
         db.mark_stuck_working_agents_ready.return_value = 1
         db.mark_stuck_session_agents_ready.return_value = 1
-        db.mark_orphaned_threads_ended.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 0
 
@@ -550,7 +556,7 @@ class TestStaleDetectorSweep:
         db.mark_stale_agents_offline.return_value = 0
         db.mark_stuck_working_agents_ready.return_value = 0
         db.mark_stuck_session_agents_ready.return_value = 0
-        db.mark_orphaned_threads_ended.return_value = 0
+        db.mark_orphaned_threads_ended.return_value = []
         db.recover_orphaned_jobs.return_value = 0
         db.gc_offline_agents.return_value = 3
 

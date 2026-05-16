@@ -63,6 +63,14 @@ $travertine-theme: (
   'info-tint':    rgba(63, 94, 140, 0.15),
   'danger-tint':  rgba(156, 40, 50, 0.15),
 
+  // Foreground on solid-fill variants (WCAG-AA-tuned)
+  // Warning fill (gold ochre L≈53) wants dark text; the rest pass with white.
+  'on-accent':  #fff,
+  'on-warning': #2a1d12,
+  'on-success': #fff,
+  'on-danger':  #fff,
+  'on-info':    #fff,
+
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(42, 29, 18, 0.06)',
   'shadow-md':   '0 1px 2px rgba(42,29,18,0.05), 0 12px 28px rgba(42,29,18,0.08)',
@@ -121,6 +129,15 @@ $senate-theme: (
   'alert-tint':   rgba(212, 138, 77, 0.18),
   'info-tint':    rgba(122, 155, 198, 0.18),
   'danger-tint':  rgba(204, 70, 71, 0.20),
+
+  // Foreground on solid-fill variants (WCAG-AA-tuned)
+  // Senate's semantic fills are light (L≈68-73) so warning/success/info want
+  // dark text; accent and danger sit at L≈58 where white still wins.
+  'on-accent':  #fff,
+  'on-warning': #1c1c22,
+  'on-success': #1c1c22,
+  'on-danger':  #fff,
+  'on-info':    #1c1c22,
 
   // Shadows
   'shadow-sm':   '0 1px 2px 0 rgba(0, 0, 0, 0.5)',

@@ -18,6 +18,7 @@ import {AppTextareaComponent} from '../../ui/textarea';
 import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
+import {AppDialogComponent} from '../../ui/dialog';
 
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
@@ -37,6 +38,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
     AppIconComponent,
     AppSpinnerComponent,
     AppFormFieldComponent,
+    AppDialogComponent,
   ],
   template: `
     <div class="ds-container">
@@ -296,9 +298,47 @@ import {AppFormFieldComponent} from '../../ui/form-field';
                     (valueChange)="gitSshKey = $event"
                     placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
                     [rows]="5"
-                    [disabled]="isSaving()"
+                    [disabled]="isSaving() || isGeneratingKey()"
                   />
                 </app-form-field>
+                <div class="ssh-key-actions">
+                  @if (!showGenerateConfirm()) {
+                    <app-button
+                      size="sm"
+                      variant="secondary"
+                      type="button"
+                      [disabled]="isSaving() || isGeneratingKey()"
+                      (clicked)="onGenerateSshKeyClick()"
+                    >
+                      @if (isGeneratingKey()) {
+                        <app-spinner size="sm" />
+                        {{ 'datasources.form.sshGenerateBusy' | transloco }}
+                      } @else {
+                        {{ 'datasources.form.sshGenerate' | transloco }}
+                      }
+                    </app-button>
+                  } @else {
+                    <span class="confirm-text">
+                      {{ 'datasources.form.sshGenerateConfirm' | transloco }}
+                    </span>
+                    <app-button
+                      size="sm"
+                      variant="primary"
+                      type="button"
+                      (clicked)="confirmGenerateSshKey()"
+                    >
+                      {{ 'datasources.form.sshGenerateReplace' | transloco }}
+                    </app-button>
+                    <app-button
+                      size="sm"
+                      variant="secondary"
+                      type="button"
+                      (clicked)="cancelGenerateSshKey()"
+                    >
+                      {{ 'datasources.form.cancel' | transloco }}
+                    </app-button>
+                  }
+                </div>
               }
               <div class="form-hint">
                 {{ 'datasources.form.repoHint' | transloco }}
@@ -484,6 +524,69 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         </div>
       }
     </div>
+
+    <!-- Generated SSH public-key dialog -->
+    <app-dialog
+      [open]="showPublicKeyDialog()"
+      size="md"
+      [title]="'datasources.sshKeyDialog.title' | transloco"
+      (closed)="closePublicKeyDialog()"
+    >
+      <p class="public-key-intro">
+        {{ 'datasources.sshKeyDialog.intro' | transloco }}
+      </p>
+      <div class="public-key-wrap">
+        <pre class="public-key-block">{{ generatedPublicKey() }}</pre>
+        <app-icon-button
+          class="public-key-copy"
+          size="sm"
+          variant="ghost"
+          [ariaLabel]="
+            (publicKeyCopied()
+              ? 'datasources.sshKeyDialog.copied'
+              : 'datasources.sshKeyDialog.copy'
+            ) | transloco
+          "
+          [tooltip]="
+            (publicKeyCopied()
+              ? 'datasources.sshKeyDialog.copied'
+              : 'datasources.sshKeyDialog.copy'
+            ) | transloco
+          "
+          (clicked)="copyPublicKey()"
+        >
+          <app-icon size="sm">{{
+            publicKeyCopied() ? 'check' : 'content_copy'
+          }}</app-icon>
+        </app-icon-button>
+      </div>
+      <p class="public-key-hint">
+        {{ 'datasources.sshKeyDialog.privateNote' | transloco }}
+      </p>
+      <ng-container appDialogActions>
+        <app-button
+          size="sm"
+          [variant]="publicKeyCopied() ? 'success' : 'primary'"
+          type="button"
+          (clicked)="copyPublicKey()"
+        >
+          {{
+            (publicKeyCopied()
+              ? 'datasources.sshKeyDialog.copied'
+              : 'datasources.sshKeyDialog.copy'
+            ) | transloco
+          }}
+        </app-button>
+        <app-button
+          size="sm"
+          variant="secondary"
+          type="button"
+          (clicked)="closePublicKeyDialog()"
+        >
+          {{ 'datasources.sshKeyDialog.done' | transloco }}
+        </app-button>
+      </ng-container>
+    </app-dialog>
   `,
   styles: [
     `
@@ -536,7 +639,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         justify-content: space-between;
         padding: 8px 12px;
         margin: 8px 12px 0;
-        border-radius: 6px;
+        border-radius: var(--radius-control);
         font-size: 12px;
         flex-shrink: 0;
       }
@@ -557,7 +660,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
       .form-panel {
         margin: 8px 12px 0;
         border: 1px solid var(--border-color, var(--surface-1));
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         background: rgba(0, 0, 0, 0.2);
         flex-shrink: 0;
       }
@@ -614,7 +717,7 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         padding: 8px 10px;
         background: var(--info-tint);
         border: 1px solid var(--info-tint);
-        border-radius: 4px;
+        border-radius: var(--radius-tag);
         font-size: 11px;
         color: var(--text-secondary, var(--text-secondary));
         line-height: 1.5;
@@ -670,13 +773,63 @@ import {AppFormFieldComponent} from '../../ui/form-field';
         align-items: center;
       }
 
+      /* SSH key generation */
+      .ssh-key-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        flex-wrap: wrap;
+      }
+
+      .ssh-key-actions .confirm-text {
+        font-size: 12px;
+        color: var(--warning, var(--text-primary));
+      }
+
+      .public-key-intro,
+      .public-key-hint {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .public-key-hint {
+        margin-top: 10px;
+        margin-bottom: 0;
+        color: var(--text-muted, #6c7086);
+      }
+
+      .public-key-wrap {
+        position: relative;
+      }
+
+      .public-key-block {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        padding: 10px 36px 10px 12px;
+        margin: 0;
+        background: rgba(0, 0, 0, 0.25);
+        border: 1px solid var(--border-color, var(--surface-1));
+        border-radius: var(--radius-tag);
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+
+      .public-key-copy {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+      }
+
       .test-result {
         display: flex;
         align-items: center;
         gap: 6px;
         padding: 8px 12px;
         margin-top: 8px;
-        border-radius: 5px;
+        border-radius: var(--radius-control);
         font-size: 12px;
       }
 
@@ -830,6 +983,14 @@ export class DatasourceListComponent implements OnInit {
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
 
+  // SSH key generation state
+  readonly isGeneratingKey = signal(false);
+  readonly showGenerateConfirm = signal(false);
+  readonly showPublicKeyDialog = signal(false);
+  readonly generatedPublicKey = signal<string>('');
+  readonly publicKeyCopied = signal(false);
+  private copiedResetTimer: ReturnType<typeof setTimeout> | null = null;
+
   // Filter options
   readonly typeFilters = [
     { labelKey: 'datasources.filter.all', value: 'all' },
@@ -919,6 +1080,8 @@ export class DatasourceListComponent implements OnInit {
     this.editingId.set(null);
     this.showForm.set(true);
     this.formTestResult.set(null);
+    this.cancelGenerateSshKey();
+    this.closePublicKeyDialog();
   }
 
   openEditForm(ds: Datasource): void {
@@ -953,13 +1116,108 @@ export class DatasourceListComponent implements OnInit {
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
+    this.cancelGenerateSshKey();
+    this.closePublicKeyDialog();
   }
 
   closeForm(): void {
     this.showForm.set(false);
     this.editingId.set(null);
     this.formTestResult.set(null);
+    this.cancelGenerateSshKey();
+    this.closePublicKeyDialog();
     this.resetFormData();
+  }
+
+  // ===== SSH Key Generation =====
+
+  /**
+   * Entry point for the Generate button. Asks for confirmation if the
+   * textarea already has content (so a hand-pasted key in progress isn't
+   * silently wiped); otherwise generates immediately.
+   */
+  onGenerateSshKeyClick(): void {
+    if (this.isGeneratingKey()) return;
+    if (this.gitSshKey.trim()) {
+      this.showGenerateConfirm.set(true);
+      return;
+    }
+    void this.runGenerateSshKey();
+  }
+
+  confirmGenerateSshKey(): void {
+    this.showGenerateConfirm.set(false);
+    void this.runGenerateSshKey();
+  }
+
+  cancelGenerateSshKey(): void {
+    this.showGenerateConfirm.set(false);
+  }
+
+  closePublicKeyDialog(): void {
+    this.showPublicKeyDialog.set(false);
+    this.publicKeyCopied.set(false);
+    if (this.copiedResetTimer) {
+      clearTimeout(this.copiedResetTimer);
+      this.copiedResetTimer = null;
+    }
+  }
+
+  copyPublicKey(): void {
+    const text = this.generatedPublicKey();
+    if (!text) return;
+    const finish = () => {
+      this.publicKeyCopied.set(true);
+      if (this.copiedResetTimer) clearTimeout(this.copiedResetTimer);
+      this.copiedResetTimer = setTimeout(() => this.publicKeyCopied.set(false), 2500);
+    };
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(finish).catch((err) => {
+        console.error('Clipboard write failed:', err);
+      });
+    } else {
+      // Fallback for environments without the async clipboard API
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        finish();
+      } catch (err) {
+        console.error('Clipboard fallback failed:', err);
+      }
+    }
+  }
+
+  private runGenerateSshKey(): Promise<void> {
+    this.isGeneratingKey.set(true);
+    const comment = this.buildSshKeyComment();
+    return new Promise((resolve) => {
+      this.api.generateSshKey(comment).subscribe((result) => {
+        this.isGeneratingKey.set(false);
+        if (!result) {
+          this.errorMessage.set(
+            this.transloco.translate('datasources.sshKeyDialog.generateFailed'),
+          );
+          resolve();
+          return;
+        }
+        this.gitSshKey = result.private_key;
+        this.generatedPublicKey.set(result.public_key);
+        this.publicKeyCopied.set(false);
+        this.showPublicKeyDialog.set(true);
+        resolve();
+      });
+    });
+  }
+
+  private buildSshKeyComment(): string {
+    const name = (this.formData.name || '').trim();
+    return name ? `${name} (srw)` : 'srw';
   }
 
   onTypeChange(): void {

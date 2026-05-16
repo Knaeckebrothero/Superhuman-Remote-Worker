@@ -19,6 +19,19 @@ import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ChatAttachment, PermissionRequest, PersistentChatService, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {
+    AssistantTurn,
+    countEvents,
+    isAssistantTurn,
+    isSystemTurn,
+    isUserTurn,
+    lastTextOf,
+    TextEvent,
+    ThoughtEvent,
+    ToolCallEvent,
+    Turn,
+    TurnEvent,
+} from '../../core/models/turn.model';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
 import {ModelService} from '../../core/services/model.service';
 import {I18nService} from '../../core/services/i18n.service';
@@ -396,44 +409,44 @@ const CATEGORY_LABELS: Record<string, string> = {
         </div>
       </ng-template>
 
+      <!-- Per-event card templates (referenced by the turn loop below). -->
+      <ng-template #thoughtCard let-event>
+        <details class="thinking-block event-thought"
+                 [attr.open]="event.status === 'streaming' || chat.narrationMode() === 'verbose' ? '' : null">
+          <summary class="thinking-header">
+            <app-icon size="sm" class="thinking-icon">psychology</app-icon>
+            <span class="thinking-label">
+              {{ (event.status === 'streaming' ? 'chat.thinking.now' : 'chat.thinking.past') | transloco }}
+            </span>
+          </summary>
+          <div class="thinking-content">{{ event.content }}</div>
+        </details>
+      </ng-template>
+
       <!-- Messages -->
       <div class="messages" #messagesContainer (scroll)="onMessagesScroll()">
-        @for (msg of chat.messages(); track $index) {
-          <div class="message" [class]="'message-' + msg.role"
-               [class.historical]="msg.historical"
-               [class.tool-only]="msg.role === 'assistant' && !msg.content && msg.toolCalls?.length"
-               [class.dimmed]="isShowingReconnectBanner() && $index === chat.messages().length - 1">
-            @if (msg.role === 'system') {
-              <div class="system-message">
-                <app-icon size="sm" class="system-icon">info</app-icon>
-                {{ msg.content }}
+        @for (turn of chat.turns(); track turn.id; let isLast = $last) {
+          @switch (turn.kind) {
+            @case ('system') {
+              <div class="message message-system">
+                <div class="system-message">
+                  <app-icon size="sm" class="system-icon">info</app-icon>
+                  {{ turn.content }}
+                </div>
               </div>
-            } @else if (msg.role === 'assistant' && !msg.content && msg.toolCalls?.length) {
-              <!-- Tool-only message: compact inline indicator, expandable to show args/results -->
-              <details
-                class="tool-summary tool-only-summary"
-                [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null"
-              >
-                <summary class="tool-only-row">
-                  <app-icon size="sm" class="tool-summary-chevron tool-only-chevron">chevron_right</app-icon>
-                  <app-icon size="sm" class="tool-only-icon">{{ toolIcon(msg.toolCalls![0].tool) }}</app-icon>
-                  <span class="tool-only-label">{{ toolSummaryLabel(msg.toolCalls!) }}</span>
-                  <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
-                </summary>
-                <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
-              </details>
-            } @else {
-              <div class="avatar">
-                <app-icon size="sm" class="avatar-icon">{{ msg.role === 'user' ? 'person' : 'smart_toy' }}</app-icon>
-              </div>
-              <div class="message-body">
-                @if (msg.role === 'user') {
-                  @if (msg.content) {
-                    <div class="user-text">{{ msg.content }}</div>
+            }
+            @case ('user') {
+              <div class="message message-user" [class.historical]="turn.historical">
+                <div class="avatar">
+                  <app-icon size="sm" class="avatar-icon">person</app-icon>
+                </div>
+                <div class="message-body">
+                  @if (turn.content) {
+                    <div class="user-text">{{ turn.content }}</div>
                   }
-                  @if (msg.attachments?.length) {
+                  @if (turn.attachments?.length) {
                     <div class="user-attachments">
-                      @for (att of msg.attachments; track att.path) {
+                      @for (att of turn.attachments; track att.path) {
                         <span class="user-attachment-chip" [title]="att.path">
                           <app-icon size="sm">{{
                             att.mimeType.startsWith('image/') ? 'image' :
@@ -446,21 +459,99 @@ const CATEGORY_LABELS: Record<string, string> = {
                       }
                     </div>
                   }
-                } @else {
-                  @if (msg.thinking && chat.narrationMode() !== 'silent') {
-                    <details class="thinking-block" [attr.open]="chat.narrationMode() === 'verbose' ? '' : null">
-                      <summary class="thinking-header">
-                        <app-icon size="sm" class="thinking-icon">psychology</app-icon>
-                        <span class="thinking-label">{{ 'chat.thinking.past' | transloco }}</span>
-                      </summary>
-                      <div class="thinking-content">{{ msg.thinking }}</div>
-                    </details>
+                </div>
+              </div>
+            }
+            @case ('assistant') {
+              @let isCollapsed = isTurnCollapsed(turn);
+              @let counts = turnEventCounts(turn);
+              @let last = lastTextEvent(turn);
+              @let streaming = turn.status === 'streaming';
+              @let ttsKey = 'turn:' + turn.id;
+              @let ttsS = ttsStateFor(ttsKey);
+              <div class="message message-assistant turn-bubble"
+                   [class.historical]="turn.historical"
+                   [class.streaming]="streaming"
+                   [class.collapsed]="isCollapsed"
+                   [class.dimmed]="isShowingReconnectBanner() && isLast">
+                <div class="avatar">
+                  <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
+                </div>
+                <div class="message-body turn-body">
+                  <!-- Whole-turn chevron: collapses every event into the
+                       per-type badge summary + last-text headline. Hidden
+                       when the turn has 0–1 events (nothing to collapse). -->
+                  @if (turn.events.length > 1) {
+                    <button type="button"
+                            class="turn-chevron"
+                            [attr.aria-expanded]="!isCollapsed"
+                            (click)="toggleTurnCollapse(turn)">
+                      <app-icon size="sm" class="turn-chevron-icon">{{ isCollapsed ? 'chevron_right' : 'expand_more' }}</app-icon>
+                      <span class="turn-chevron-badge">
+                        @if (counts.thoughts > 0) {
+                          <span class="badge-thought" [title]="('chat.turn.thoughtCount' | transloco:{count: counts.thoughts})">◐ {{ counts.thoughts }}</span>
+                        }
+                        @if (counts.texts > 0 && !isCollapsed) {
+                          <span class="badge-text" [title]="('chat.turn.textCount' | transloco:{count: counts.texts})">✎ {{ counts.texts }}</span>
+                        }
+                        @if (counts.tools > 0) {
+                          <span class="badge-tool" [title]="('chat.turn.toolCount' | transloco:{count: counts.tools})">▶ {{ counts.tools }}</span>
+                        }
+                      </span>
+                    </button>
                   }
-                  @if (msg.content) {
-                    <markdown [data]="msg.content"></markdown>
+
+                  @if (isCollapsed) {
+                    <!-- Collapsed: single-line preview of the final text
+                         event. Plain text (not <markdown>) so the truncate
+                         mixin works — markdown emits inner block elements
+                         that defeat nowrap. -->
+                    @if (last) {
+                      <span class="turn-headline">{{ last.content }}</span>
+                    } @else {
+                      <span class="turn-headline-empty">{{ 'chat.turn.collapsedEmpty' | transloco }}</span>
+                    }
+                  } @else {
+                    <!-- Expanded: every event rendered as its own card. -->
+                    @for (event of turn.events; track event.id) {
+                      @switch (event.kind) {
+                        @case ('thought') {
+                          @if (chat.narrationMode() !== 'silent') {
+                            <ng-container [ngTemplateOutlet]="thoughtCard" [ngTemplateOutletContext]="{ $implicit: event }"></ng-container>
+                          }
+                        }
+                        @case ('text') {
+                          <div class="event-text">
+                            <markdown [data]="event.content"></markdown>
+                          </div>
+                        }
+                        @case ('tool_call') {
+                          <div class="event-tool">
+                            <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: [event] }"></ng-container>
+                            @if (event.decision; as d) {
+                              <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
+                                <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
+                                <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
+                                <span class="resolved-title">{{ event.tool }}</span>
+                              </div>
+                            }
+                          </div>
+                        }
+                      }
+                    }
+
+                    <!-- Streaming pulse while the turn is in flight with nothing yet. -->
+                    @if (streaming && turn.events.length === 0 && !chat.pendingPermission()) {
+                      <div class="thinking">
+                        <span class="thinking-dot"></span>
+                        <span class="thinking-dot"></span>
+                        <span class="thinking-dot"></span>
+                      </div>
+                    }
                   }
-                  @if (msg.content) {
-                    @let ttsS = ttsStateFor($index);
+
+                  <!-- TTS button on the turn's final text. -->
+                  @if (last && !streaming) {
                     <div class="message-actions">
                       <button
                         type="button"
@@ -474,7 +565,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                           ttsS.error ? 'chat.tts.error' :
                           'chat.tts.play'
                         ) | transloco"
-                        (click)="toggleTts($index, msg.content)"
+                        (click)="toggleTts(ttsKey, last.content)"
                       >
                         @if (ttsS.isGenerating) {
                           <span class="action-spinner-sm"></span>
@@ -488,34 +579,12 @@ const CATEGORY_LABELS: Record<string, string> = {
                       </button>
                     </div>
                   }
-                  @if (msg.toolCalls?.length) {
-                    <details class="tool-summary" [attr.open]="hasDeniedTools(msg.toolCalls!) || chat.narrationMode() === 'verbose' ? '' : null">
-                      <summary class="tool-summary-line">
-                        <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
-                        <span class="tool-summary-text">
-                          {{ (msg.toolCalls!.length === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: msg.toolCalls!.length } }}
-                          {{ toolSummaryLabel(msg.toolCalls!) }}
-                        </span>
-                        <span class="tool-summary-dot" [class]="toolSummaryStatus(msg.toolCalls!)"></span>
-                      </summary>
-                      <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: msg.toolCalls }"></ng-container>
-                    </details>
-                    @for (tc of msg.toolCalls; track tc.id) {
-                      @if (tc.decision; as d) {
-                        <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                          <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                          <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                          <span class="resolved-title">{{ tc.tool }}</span>
-                          <time class="resolved-time">{{ formatTime(msg.timestamp) }}</time>
-                        </div>
-                      }
-                    }
-                  }
-                }
+                </div>
               </div>
             }
-          </div>
-          @if (msg.historical && chat.messages()[$index + 1] && !chat.messages()[$index + 1].historical) {
+          }
+          <!-- Divider between historical-loaded turns and the live session. -->
+          @if (showSessionDividerAfter(turn, $index)) {
             <div class="session-divider">
               <span class="divider-line"></span>
               <span class="divider-text">{{ 'chat.system.sessionResumed' | transloco }}</span>
@@ -554,7 +623,7 @@ const CATEGORY_LABELS: Record<string, string> = {
         <!-- Startup/resume card: shown when history exists but session not yet ready.
              Suppressed for ended threads — the F3 resume card below is the call-to-action
              there, and there's no actual provisioning in flight until the user opts in. -->
-        @if (chat.messages().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
+        @if (chat.turns().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
           <div class="startup-wrapper resume">
             <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
@@ -565,7 +634,7 @@ const CATEGORY_LABELS: Record<string, string> = {
             <div class="startup-card-head">
               <span class="startup-card-spinner"></span>
               <span class="startup-card-title">
-                {{ (chat.messages().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
+                {{ (chat.turns().length > 0 ? 'chat.startup.titleResume' : 'chat.startup.title') | transloco }}
               </span>
             </div>
             <div class="startup-steps">
@@ -583,66 +652,6 @@ const CATEGORY_LABELS: Record<string, string> = {
             </div>
           </div>
         </ng-template>
-
-        <!-- Streaming response -->
-        @if (chat.isStreaming()) {
-          <div class="message message-assistant">
-            <div class="avatar">
-              <app-icon size="sm" class="avatar-icon">smart_toy</app-icon>
-            </div>
-            <div class="message-body">
-              @if (chat.streamingThinking() && chat.narrationMode() !== 'silent') {
-                <details class="thinking-block" open>
-                  <summary class="thinking-header">
-                    <app-icon size="sm" class="thinking-icon">psychology</app-icon>
-                    <span class="thinking-label">{{ 'chat.thinking.now' | transloco }}</span>
-                  </summary>
-                  <div class="thinking-content">{{ chat.streamingThinking() }}</div>
-                </details>
-              }
-              @if (chat.streamingText()) {
-                <markdown [data]="chat.streamingText()"></markdown>
-              }
-              @if (chat.currentToolCalls().length) {
-                @if (hasRunningTools(chat.currentToolCalls())) {
-                  <div class="tool-progress">
-                    <span class="tool-progress-spinner"></span>
-                    <span class="tool-progress-text">{{ currentToolLabelHuman(chat.currentToolCalls()) }}...</span>
-                  </div>
-                }
-                @if (hasCompletedTools(chat.currentToolCalls())) {
-                  <details class="tool-summary" open>
-                    <summary class="tool-summary-line">
-                      <app-icon size="sm" class="tool-summary-chevron">chevron_right</app-icon>
-                      <span class="tool-summary-text">
-                        {{ (completedToolCount(chat.currentToolCalls()) === 1 ? 'chat.tools.usedOne' : 'chat.tools.usedMany') | transloco:{ count: completedToolCount(chat.currentToolCalls()) } }}
-                        {{ toolSummaryLabel(completedOnly(chat.currentToolCalls())) }}
-                      </span>
-                      <span class="tool-summary-dot completed"></span>
-                    </summary>
-                    <ng-container [ngTemplateOutlet]="toolDetails" [ngTemplateOutletContext]="{ $implicit: completedOnly(chat.currentToolCalls()) }"></ng-container>
-                  </details>
-                }
-                @for (tc of chat.currentToolCalls(); track tc.id) {
-                  @if (tc.decision; as d) {
-                    <div class="mile-resolved" [class.approved]="d === 'approved'" [class.rejected]="d === 'denied'">
-                      <app-icon size="sm" class="mile-resolved-icon">{{ d === 'approved' ? 'check_circle' : 'block' }}</app-icon>
-                      <span class="resolved-label">{{ ('chat.approval.badge.' + d) | transloco }}</span>
-                      <span class="resolved-title">{{ tc.tool }}</span>
-                    </div>
-                  }
-                }
-              }
-              @if (!chat.streamingText() && !chat.currentToolCalls().length && !chat.pendingPermission()) {
-                <div class="thinking">
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                  <span class="thinking-dot"></span>
-                </div>
-              }
-            </div>
-          </div>
-        }
 
         <!-- Inline approval card (mile marker) — anchored to the live turn,
              not gated on streaming state so it stays visible across edge cases. -->
@@ -980,1988 +989,7 @@ const CATEGORY_LABELS: Record<string, string> = {
       </app-dialog>
     </div>
   `,
-    styles: [
-        `
-      :host {
-        display: flex;
-        flex-direction: column;
-        height: 100%;
-        background: var(--app-bg, #1e1e2e);
-      }
-
-      .chat-container {
-        display: flex;
-        flex-direction: column;
-        height: 100%;
-        position: relative;
-      }
-
-      /* Drag-and-drop overlay shown while files are dragged over the chat */
-      .drop-overlay {
-        position: absolute;
-        inset: 0;
-        z-index: 50;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: color-mix(in srgb, var(--accent-color, #3399D6) 18%, transparent);
-        backdrop-filter: blur(2px);
-        pointer-events: none;
-        animation: drop-overlay-fade 0.12s ease-out;
-      }
-
-      @keyframes drop-overlay-fade {
-        from { opacity: 0; }
-        to   { opacity: 1; }
-      }
-
-      .drop-overlay-card {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 12px;
-        padding: 28px 36px;
-        background: var(--panel-bg, var(--panel-bg));
-        border: 2px dashed var(--accent-color, #3399D6);
-        border-radius: 8px;
-        color: var(--text-primary, var(--text-primary));
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
-      }
-
-      .drop-overlay-icon {
-        font-size: 36px;
-        color: var(--accent-color, #3399D6);
-      }
-
-      .drop-overlay-text {
-        font-size: 14px;
-        font-weight: 500;
-      }
-
-      /* Header */
-
-      .chat-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 16px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-bg, var(--panel-bg));
-        flex-shrink: 0;
-      }
-
-      .header-left {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .back-link {
-        display: flex;
-        align-items: center;
-        color: var(--text-muted, var(--text-muted));
-        text-decoration: none;
-        margin-right: 4px;
-      }
-
-      .back-link:hover { color: var(--text-primary, var(--text-primary)); }
-
-      .header-icon, .error-icon {
-        color: var(--accent-color, var(--accent-color));
-      }
-
-      .header-title {
-        font-size: 14px;
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .header-session-id {
-        font-family: var(--font-mono, monospace);
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .status-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        flex-shrink: 0;
-      }
-
-      .status-dot.connected { background: var(--success); }
-      .status-dot.connecting { background: var(--warning); animation: pulse 1s infinite; }
-      .status-dot.disconnected { background: var(--surface-2, #585b70); }
-      .status-dot.error { background: var(--danger); }
-
-      @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.4; }
-      }
-
-      .status-label {
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      /* Status bar */
-
-      .status-bar {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 16px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-bg, var(--panel-bg));
-        flex-shrink: 0;
-      }
-
-      .status-bar > app-badge {
-        flex-shrink: 0;
-      }
-
-      /* Task bar */
-      .task-bar {
-        padding: 6px 16px;
-        border-bottom: 1px solid var(--surface-0);
-        background: var(--panel-bg);
-        flex-shrink: 0;
-      }
-      .task-header {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 11px;
-        color: var(--text-muted);
-        margin-bottom: 4px;
-      }
-      .task-list {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-      .task-item {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 11px;
-        color: var(--text-primary);
-      }
-      .task-item .task-check {
-        color: var(--text-muted);
-      }
-      .task-completed {
-        color: var(--text-muted);
-        text-decoration: line-through;
-      }
-      .task-completed .task-check {
-        color: var(--success);
-      }
-      .task-header-clickable {
-        cursor: pointer;
-        user-select: none;
-        border-radius: 4px;
-        transition: background 0.15s;
-      }
-      .task-header-clickable:hover {
-        background: rgba(255, 255, 255, 0.04);
-      }
-      .task-chevron {
-        margin-left: auto;
-        transition: transform 0.2s ease;
-      }
-      .task-chevron-open {
-        transform: rotate(180deg);
-      }
-
-      .header-right {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .settings-btn {
-        display: flex;
-        align-items: center;
-        padding: 4px 8px;
-        border-radius: 4px;
-        border: 1px solid var(--border-color, var(--surface-0));
-        background: transparent;
-        color: var(--text-muted, var(--text-muted));
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-      .settings-btn:hover, .settings-btn.active {
-        color: var(--accent-color, var(--accent-color));
-        border-color: var(--accent-color, var(--accent-color));
-      }
-
-      .settings-panel {
-        padding: 10px 16px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        background: var(--panel-bg, var(--panel-bg));
-        display: flex;
-        flex-wrap: wrap;
-        gap: 12px;
-        align-items: center;
-        flex-shrink: 0;
-      }
-      .settings-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .settings-label {
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-        white-space: nowrap;
-      }
-      .settings-slider {
-        width: 100px;
-        accent-color: var(--accent-color, var(--accent-color));
-      }
-
-      .ide-btn {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        padding: 4px 12px;
-        border-radius: 4px;
-        border: 1px solid var(--info);
-        background: transparent;
-        color: var(--info);
-        font-size: 11px;
-        font-family: inherit;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .ide-btn:hover {
-        background: var(--info-tint);
-      }
-
-      .ide-btn:disabled {
-        opacity: 0.6;
-        cursor: default;
-      }
-
-      .gitea-btn {
-        border-color: var(--success);
-        color: var(--success);
-      }
-
-      .gitea-btn:hover {
-        background: var(--success-tint);
-      }
-
-
-      .ide-spinner {
-        width: 12px;
-        height: 12px;
-        border: 2px solid var(--info-tint);
-        border-top-color: var(--info);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      /* Messages */
-
-      .messages {
-        flex: 1;
-        overflow-y: auto;
-        padding: 16px;
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-        scrollbar-width: thin;
-      }
-
-      .empty-state {
-        flex: 1;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-
-      .empty-inner {
-        text-align: center;
-        max-width: 850px;
-        padding: 72px 48px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-      }
-
-      .empty-mark {
-        width: 144px;
-        height: 144px;
-        margin-bottom: 30px;
-        opacity: 0.95;
-      }
-
-      .empty-title {
-        font-family: var(--font-display, inherit);
-        font-size: 32px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-primary, var(--text-primary));
-        margin: 0 0 16px;
-        line-height: 1.15;
-      }
-
-      .empty-subtitle {
-        font-size: 17px;
-        line-height: 1.55;
-        color: var(--text-muted, var(--text-muted));
-        margin: 0 0 38px;
-        max-width: 620px;
-      }
-
-      .suggestion-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 10px;
-        width: 100%;
-        max-width: 760px;
-      }
-
-      .suggestion-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 10px;
-        padding: 16px 22px;
-        background: var(--surface-0, var(--surface-0));
-        border: 1px solid var(--border-color, var(--surface-0));
-        color: var(--text-secondary, var(--text-secondary));
-        font-family: inherit;
-        font-size: 16px;
-        font-weight: 500;
-        text-align: left;
-        cursor: pointer;
-        border-radius: 0;
-        transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
-      }
-
-      .suggestion-chip:hover {
-        border-color: var(--accent-color, var(--accent-color));
-        color: var(--text-primary, var(--text-primary));
-        background: var(--hover, rgba(255, 255, 255, 0.04));
-      }
-
-      .suggestion-icon {
-        color: var(--accent-color, var(--accent-color));
-        flex-shrink: 0;
-      }
-
-      .suggestion-text {
-        flex: 1;
-      }
-
-      @media (max-width: 600px) {
-        .suggestion-grid {
-          grid-template-columns: 1fr;
-        }
-      }
-
-      .startup-wrapper {
-        display: flex;
-        justify-content: center;
-        width: 100%;
-        padding: 48px 0 24px;
-      }
-
-      .startup-wrapper.resume {
-        padding: 24px 0;
-      }
-
-      .startup-card {
-        width: min(560px, 100%);
-        background: var(--panel-bg, var(--panel-bg));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 4px solid var(--accent-color, var(--accent-color));
-      }
-
-      .startup-card-head {
-        display: flex;
-        align-items: center;
-        gap: 16px;
-        padding: 20px 22px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-      }
-
-      .startup-card-spinner {
-        width: 22px;
-        height: 22px;
-        border: 3px solid var(--surface-2, var(--surface-1));
-        border-top-color: var(--accent-color, var(--accent-color));
-        animation: spin 0.7s linear infinite;
-        flex-shrink: 0;
-      }
-
-      .startup-card-title {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-weight: 600;
-        font-size: 15px;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .startup-steps {
-        padding: 14px 22px 22px;
-        display: flex;
-        flex-direction: column;
-        gap: 11px;
-      }
-
-      .startup-step {
-        display: grid;
-        grid-template-columns: 24px 1fr auto;
-        align-items: center;
-        column-gap: 14px;
-        font-size: 18px;
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .startup-step .step-spinner {
-        width: 18px;
-        height: 18px;
-        border: 2px solid var(--surface-2, var(--surface-1));
-        border-top-color: var(--accent-color, var(--accent-color));
-        animation: spin 0.7s linear infinite;
-        display: inline-block;
-        flex-shrink: 0;
-        justify-self: center;
-      }
-
-      .startup-step .step-time {
-        font-family: var(--font-mono, monospace);
-        font-size: 13px;
-        color: var(--text-muted, var(--text-muted));
-        font-variant-numeric: tabular-nums;
-      }
-
-      .startup-step.state-active .step-time {
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .startup-step .step-icon {
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .startup-step.state-done {
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .startup-step.state-done .step-icon {
-        color: var(--success);
-      }
-
-      .startup-step.state-active {
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .startup-step.state-active .step-icon {
-        color: var(--accent-color, var(--accent-color));
-        animation: pulseSoft 1.4s ease-in-out infinite;
-      }
-
-      .startup-step.state-todo .step-icon {
-        color: var(--surface-2, var(--surface-1));
-      }
-
-      @keyframes pulseSoft {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.5; }
-      }
-
-      .message {
-        display: flex;
-        gap: 10px;
-        max-width: 90%;
-      }
-
-      .message-user {
-        align-self: flex-end;
-        flex-direction: row-reverse;
-      }
-
-      .message-assistant, .message-system {
-        align-self: flex-start;
-      }
-
-      .avatar {
-        width: 30px;
-        height: 30px;
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      .message-user .avatar {
-        background: var(--accent-color, var(--accent-color));
-      }
-
-      .avatar-icon {
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .message-user .avatar-icon {
-        color: var(--timeline-bg, var(--timeline-bg));
-      }
-
-      .message-body {
-        font-size: 13px;
-        line-height: 1.5;
-        min-width: 0;
-      }
-
-      /* User: speech bubble — soft tinted background using the theme's
-         user-bubble token, with an accent-derived hairline border. */
-      .message-user .message-body {
-        padding: 10px 14px;
-        border-radius: 12px;
-        border-top-right-radius: 4px;
-        background: var(--user-bubble, var(--surface-0));
-        color: var(--user-bubble-text, var(--text-primary));
-        border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
-      }
-
-      /* Assistant: no bubble — flush text aligned with the avatar gutter. */
-      .message-assistant .message-body {
-        padding: 4px 0;
-        background: transparent;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .user-text {
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-
-      /* historical messages use session divider instead of dimming */
-
-      .system-message {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-        padding: 4px 12px;
-        background: var(--surface-0, var(--surface-0));
-        border-radius: 6px;
-        width: fit-content;
-        margin: 0 auto;
-      }
-
-
-      .resume-icon {
-        margin-right: 4px;
-        vertical-align: middle;
-      }
-
-      /* Tool-only messages: compact inline indicators (no avatar/bubble) */
-
-      .message.tool-only {
-        max-width: none;
-        gap: 0;
-      }
-
-      .tool-only-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 2px 8px 2px 40px;  /* indent to align with message body (avatar 30px + gap 10px) */
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-        cursor: pointer;
-        list-style: none;
-        border-radius: 4px;
-        transition: background 0.15s;
-      }
-
-      .tool-only-row::-webkit-details-marker { display: none; }
-      .tool-only-row:hover { background: rgba(255, 255, 255, 0.04); }
-
-      .tool-only-chevron {
-        font-size: 14px;
-        transition: transform 0.15s;
-      }
-
-      details[open] > .tool-only-row .tool-only-chevron {
-        transform: rotate(90deg);
-      }
-
-      .tool-only-icon {
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .tool-only-label {
-        white-space: nowrap;
-      }
-
-      /* Tool-only details body: align with the row, give the cards a bit of breathing room */
-      .tool-only-summary > .tool-detail-list {
-        padding: 4px 8px 4px 60px;
-      }
-
-      /* Tool summary (collapsed by default) */
-
-      .tool-summary {
-        margin-top: 8px;
-        font-size: 12px;
-      }
-
-      .tool-summary-line {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 8px;
-        cursor: pointer;
-        border-radius: 6px;
-        color: var(--text-muted, var(--text-muted));
-        transition: background 0.15s;
-        list-style: none;
-      }
-
-      .tool-summary-line::-webkit-details-marker { display: none; }
-      .tool-summary-line:hover { background: rgba(255, 255, 255, 0.04); }
-
-      .tool-summary-chevron {
-        transition: transform 0.15s;
-      }
-
-      details[open] > .tool-summary-line .tool-summary-chevron {
-        transform: rotate(90deg);
-      }
-
-      .tool-summary-text { flex: 1; }
-
-      .tool-summary-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        flex-shrink: 0;
-      }
-
-      .tool-summary-dot.completed { background: var(--success); }
-      .tool-summary-dot.running { background: var(--warning); animation: pulse 1s infinite; }
-      .tool-summary-dot.denied { background: var(--danger); }
-      .tool-summary-dot.mixed { background: var(--warning); }
-
-      /* Tool detail list (level 2) — F6 card visual */
-
-      .tool-detail-list {
-        padding: 6px 0 4px 20px;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-
-      .tool-card {
-        font-size: 11px;
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 0;
-        background: var(--surface-0);
-        overflow: hidden;
-      }
-
-      .tool-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 10px;
-        cursor: pointer;
-        list-style: none;
-        background: var(--panel-bg, var(--panel-bg));
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 11px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .tool-card[open] > .tool-head {
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-      }
-
-      .tool-head::-webkit-details-marker { display: none; }
-      .tool-head:hover { background: var(--surface-1, rgba(255, 255, 255, 0.04)); }
-
-      .tool-icon {
-        color: var(--accent-color, var(--accent-color));
-        width: 16px;
-        text-align: center;
-        flex-shrink: 0;
-      }
-
-      .tool-name {
-        color: var(--accent-color, var(--accent-color));
-        font-weight: 600;
-        flex-shrink: 0;
-      }
-
-      .tool-args {
-        color: var(--text-muted, var(--text-muted));
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        flex: 1;
-        min-width: 0;
-      }
-
-      .tool-status {
-        margin-left: auto;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.16em;
-        font-size: 9.5px;
-        font-weight: 600;
-        flex-shrink: 0;
-      }
-
-      .tool-status .tool-status-icon { font-size: 13px; }
-
-      .tool-status.status-completed,
-      .tool-status.status-completed .tool-status-icon { color: var(--success); }
-      .tool-status.status-running,
-      .tool-status.status-running .tool-status-icon { color: var(--warning); }
-      .tool-status.status-running .tool-status-icon { animation: spin 0.7s linear infinite; }
-      .tool-status.status-denied,
-      .tool-status.status-denied .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
-      .tool-status.status-pending,
-      .tool-status.status-pending .tool-status-icon { color: var(--text-muted, var(--text-muted)); }
-      .tool-status.status-error,
-      .tool-status.status-error .tool-status-icon { color: var(--danger); }
-
-      /* Error tool card — danger left accent + tinted body so errored calls
-         are visible at a glance, even when the card is collapsed. */
-      .tool-card.tool-error { border-left: 3px solid var(--danger); }
-      .tool-card.tool-error > .tool-head .tool-name { color: var(--danger); }
-      .tool-card.tool-error > .tool-body { background: color-mix(in srgb, var(--danger) 6%, var(--surface-0)); }
-
-      .tool-body {
-        padding: 10px 12px;
-        background: var(--surface-0);
-      }
-
-      .tool-result {
-        margin: 0;
-        padding: 0;
-        background: transparent;
-        font-size: 11px;
-        max-height: 240px;
-        overflow: auto;
-        white-space: pre-wrap;
-        word-break: break-word;
-        font-family: 'JetBrains Mono', monospace;
-        line-height: 1.4;
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      /* Inline tool progress (streaming) */
-
-      .tool-progress {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 4px 8px;
-        font-size: 12px;
-        color: var(--text-muted, var(--text-muted));
-        margin-top: 6px;
-      }
-
-      .tool-progress-spinner {
-        width: 12px;
-        height: 12px;
-        border: 2px solid var(--border-color, var(--surface-0));
-        border-top-color: var(--warning);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-        flex-shrink: 0;
-      }
-
-      .tool-progress-text {
-        font-style: italic;
-      }
-
-      /* Session divider */
-
-      .session-divider {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 8px 0;
-      }
-
-      .divider-line {
-        flex: 1;
-        height: 1px;
-        background: var(--border-color, var(--surface-0));
-      }
-
-      .divider-text {
-        font-size: 10px;
-        color: var(--text-muted, var(--text-muted));
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        white-space: nowrap;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
-
-      /* Thinking/reasoning block */
-
-      .thinking-block {
-        margin: 4px 0 8px;
-        border-left: 2px solid var(--border, var(--surface-1));
-        border-radius: 4px;
-      }
-
-      .thinking-block > .thinking-header {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 10px;
-        cursor: pointer;
-        font-size: 12px;
-        color: var(--text-muted, var(--text-muted));
-        list-style: none;
-        user-select: none;
-      }
-
-      .thinking-block > .thinking-header::-webkit-details-marker {
-        display: none;
-      }
-
-      .thinking-block > .thinking-header:hover {
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-
-      .thinking-label {
-        font-style: italic;
-      }
-
-      .thinking-content {
-        padding: 4px 10px 10px;
-        font-size: 12px;
-        line-height: 1.5;
-        color: var(--text-muted, var(--text-muted));
-        white-space: pre-wrap;
-        max-height: 300px;
-        overflow-y: auto;
-      }
-
-      .thinking-block[open] > .thinking-header {
-        padding-bottom: 2px;
-      }
-
-      /* Thinking dots */
-
-      .thinking {
-        display: flex;
-        gap: 4px;
-        padding: 4px 0;
-      }
-
-      .thinking-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: var(--text-muted, var(--text-muted));
-        animation: bounce 1.4s infinite ease-in-out;
-      }
-
-      .thinking-dot:nth-child(1) { animation-delay: 0s; }
-      .thinking-dot:nth-child(2) { animation-delay: 0.2s; }
-      .thinking-dot:nth-child(3) { animation-delay: 0.4s; }
-
-      @keyframes bounce {
-        0%, 80%, 100% { transform: translateY(0); }
-        40% { transform: translateY(-6px); }
-      }
-
-      /* Approval — pending mile marker and resolved trail strips.
-         Pending: sharp-cornered card with accent-color left border.
-         Resolved: single-line trail strip in the message stream
-         (in addition to the small badge inside the tool-card head). */
-
-      .mile {
-        align-self: flex-start;
-        margin: 10px 0 10px 40px;
-        width: min(720px, calc(100% - 40px));
-        padding: 14px 16px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 3px solid var(--accent-color);
-        border-radius: 0;
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-      }
-
-      .mile-label {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.20em;
-        font-weight: 600;
-        font-size: 10px;
-        color: var(--accent-color);
-      }
-
-      .mile-title {
-        font-weight: 600;
-        font-size: 14px;
-        color: var(--text-primary);
-      }
-
-      .mile-detail {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        color: var(--text-muted);
-        margin-bottom: 6px;
-        min-width: 0;
-      }
-
-      .mile-detail-icon { color: var(--text-muted); flex-shrink: 0; }
-
-      .mile-tool {
-        background: transparent;
-        color: var(--accent-color);
-        font-weight: 600;
-        flex-shrink: 0;
-      }
-
-      .mile-args {
-        background: transparent;
-        color: var(--text-muted);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        min-width: 0;
-      }
-
-      .mile-actions {
-        display: flex;
-        gap: 8px;
-      }
-
-      .mile-resolved {
-        align-self: flex-start;
-        margin: 6px 0 6px 40px;
-        width: min(720px, calc(100% - 40px));
-        padding: 8px 14px;
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        background: var(--surface-0);
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 3px solid var(--text-muted);
-        border-radius: 0;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .mile-resolved.approved { border-left-color: var(--success); }
-      .mile-resolved.rejected { border-left-color: var(--text-muted); opacity: 0.85; }
-
-      .mile-resolved-icon { font-size: 16px; flex-shrink: 0; color: var(--text-muted); }
-      .mile-resolved.approved .mile-resolved-icon { color: var(--success); }
-      .mile-resolved.rejected .mile-resolved-icon { color: var(--text-muted); }
-
-      .mile-resolved .resolved-label {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-size: 10px;
-        font-weight: 600;
-        color: var(--text-primary);
-        flex-shrink: 0;
-      }
-
-      .mile-resolved.approved .resolved-label { color: var(--success); }
-
-      .mile-resolved .resolved-title {
-        color: var(--text-primary);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        min-width: 0;
-        flex: 1;
-      }
-
-      .mile-resolved .resolved-time {
-        margin-left: auto;
-        font-size: 11px;
-        color: var(--text-muted);
-        flex-shrink: 0;
-      }
-
-      .approval-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 3px;
-        padding: 1px 6px;
-        border-radius: 4px;
-        font-size: 10px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        flex-shrink: 0;
-      }
-
-      .approval-badge.approval-approved {
-        background: var(--success-tint);
-        color: var(--success);
-      }
-
-      .approval-badge.approval-denied {
-        background: var(--danger-tint);
-        color: var(--danger);
-      }
-
-      .approval-badge-icon { font-size: 12px; }
-
-      /* Error banner */
-
-      .error-banner {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 16px;
-        background: var(--danger-tint);
-        border-top: 1px solid var(--danger);
-        font-size: 12px;
-        color: var(--danger);
-      }
-
-      .error-dismiss {
-        margin-left: auto;
-        background: transparent;
-        border: none;
-        color: var(--danger);
-        font-size: 11px;
-        cursor: pointer;
-        font-family: inherit;
-        text-decoration: underline;
-      }
-
-      /* Reconnect banner (F4) — shown inline at the bottom of the message
-         stream when the WS dropped on a still-active thread. */
-
-      .reconnect-banner {
-        margin: 14px 0 0;
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 12px 14px;
-        background: var(--danger-tint);
-        border: 1px solid var(--danger);
-        border-left: 3px solid var(--danger);
-      }
-
-      .reconnect-banner .rb-icon {
-        color: var(--danger);
-        animation: pulseSoft 1.4s ease-in-out infinite;
-      }
-
-      .reconnect-banner .rb-body {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        min-width: 0;
-        flex: 1;
-      }
-
-      .reconnect-banner .rb-body strong {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-weight: 600;
-        font-size: 11px;
-        color: var(--danger);
-      }
-
-      .reconnect-banner .rb-body span {
-        font-family: var(--font-mono, inherit);
-        font-size: 11.5px;
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .message.dimmed {
-        opacity: 0.5;
-        filter: saturate(0.6);
-      }
-
-      /* Jump-to-latest pill (F5) — sticks to the bottom of the messages
-         scroll container when the user has scrolled up while new messages
-         arrive. Sharp corners + uppercase display font match the rest of
-         the visual refresh. */
-
-      .jump-latest {
-        position: sticky;
-        bottom: 16px;
-        align-self: center;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 14px;
-        background: var(--accent-color);
-        color: #fff;
-        border: 0;
-        cursor: pointer;
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.18em;
-        font-weight: 600;
-        font-size: 10.5px;
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
-        transition: filter 0.15s ease, transform 0.15s ease;
-        z-index: 5;
-      }
-
-      .jump-latest:hover {
-        filter: brightness(1.1);
-      }
-
-      .jump-latest:active {
-        transform: translateY(1px);
-      }
-
-      .jump-latest app-icon {
-        color: inherit;
-      }
-
-      /* Ended-session end-marker + resume card */
-
-      .end-marker {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        margin: 24px 0 8px;
-      }
-
-      .end-line {
-        flex: 1;
-        height: 1px;
-        background: var(--border-color, var(--surface-0));
-      }
-
-      .end-tag {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        background: var(--surface-0, var(--surface-0));
-        border: 1px solid var(--border-color, var(--surface-0));
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.20em;
-        font-weight: 600;
-        font-size: 10px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .end-icon {
-        color: var(--accent-color, var(--accent-color));
-      }
-
-      .resume-card {
-        margin-top: 8px;
-        display: grid;
-        grid-template-columns: 1fr auto;
-        align-items: center;
-        gap: 16px;
-        padding: 18px 20px;
-        background: var(--panel-bg, var(--panel-bg));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-left: 3px solid var(--accent-color, var(--accent-color));
-      }
-
-      .resume-eyebrow {
-        font-family: var(--font-display, inherit);
-        text-transform: uppercase;
-        letter-spacing: 0.28em;
-        font-weight: 600;
-        font-size: 9.5px;
-        color: var(--accent-color, var(--accent-color));
-        margin-bottom: 4px;
-      }
-
-      .resume-title {
-        margin: 0 0 4px;
-        font-family: var(--font-base, inherit);
-        font-size: 16px;
-        font-weight: 600;
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .resume-text {
-        margin: 0;
-        font-size: 13px;
-        color: var(--text-secondary, var(--text-secondary));
-        line-height: 1.5;
-      }
-
-      .resume-actions {
-        display: flex;
-        gap: 8px;
-      }
-
-      @media (max-width: 600px) {
-        .resume-card {
-          grid-template-columns: 1fr;
-        }
-      }
-
-      /* Composer */
-
-      .composer-wrap {
-        padding: 14px 36px 18px;
-        background: transparent;
-        flex-shrink: 0;
-      }
-
-      .composer {
-        position: relative;
-        max-width: 880px;
-        margin: 0 auto;
-        background: var(--panel-bg, var(--panel-bg));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 0;
-        transition: outline-color 0.15s ease, border-color 0.15s ease;
-      }
-
-      .composer.focused {
-        outline: 2px solid var(--accent-color, var(--accent-color));
-        outline-offset: 1px;
-        border-color: var(--accent-color, var(--accent-color));
-      }
-
-      .composer.disabled {
-        opacity: 0.6;
-      }
-
-      .chat-input {
-        width: 100%;
-        min-height: 56px;
-        max-height: 180px;
-        padding: 12px 14px;
-        background: transparent;
-        border: 0;
-        outline: 0;
-        color: var(--text-primary, var(--text-primary));
-        font-family: inherit;
-        font-size: 14px;
-        line-height: 1.55;
-        resize: none;
-        display: block;
-      }
-
-      .chat-input:focus,
-      .chat-input:focus-visible {
-        outline: none;
-        border: none;
-        box-shadow: none;
-      }
-
-      .chat-input:disabled {
-        cursor: not-allowed;
-      }
-
-      .chat-input::placeholder {
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .composer-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 8px 8px;
-        border-top: 1px solid var(--border-color, var(--surface-0));
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      .composer-row .spacer {
-        flex: 1;
-      }
-
-      .ctrl {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        height: 26px;
-        padding: 0 10px;
-        background: transparent;
-        border: 1px solid transparent;
-        border-radius: 0;
-        color: var(--text-muted, var(--text-muted));
-        font-family: inherit;
-        font-size: 11px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-      }
-
-      .ctrl:hover:not(:disabled) {
-        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .ctrl:disabled {
-        cursor: not-allowed;
-        opacity: 0.5;
-      }
-
-      .ctrl-icon {
-        font-size: 14px;
-      }
-
-      /* Send button — round, morphs to stop/spinner during streaming */
-
-      .send {
-        width: 30px;
-        height: 30px;
-        display: grid;
-        place-items: center;
-        background: var(--accent-color, var(--accent-color));
-        color: var(--timeline-bg, var(--timeline-bg));
-        border: 0;
-        border-radius: 50%;
-        cursor: pointer;
-        flex-shrink: 0;
-        transition: background 0.15s ease, opacity 0.15s ease;
-      }
-
-      .send:disabled {
-        background: var(--surface-1, var(--surface-0));
-        color: var(--text-muted, var(--text-muted));
-        cursor: not-allowed;
-      }
-
-      .send:not(:disabled):hover {
-        background: var(--accent-hover, var(--accent-color));
-      }
-
-      .send.stop {
-        background: var(--danger);
-        opacity: 1;
-      }
-
-      .send.pending,
-      .send.interrupting {
-        opacity: 0.7;
-        cursor: wait;
-      }
-
-      .send.interrupting {
-        background: var(--danger);
-      }
-
-      .action-spinner {
-        width: 14px;
-        height: 14px;
-        border: 2px solid var(--timeline-bg, var(--timeline-bg));
-        border-top-color: transparent;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      @keyframes spin {
-        to { transform: rotate(360deg); }
-      }
-
-      /* Composer attachments — chips, error banner, recording strip, attach menu */
-
-      .attachment-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        padding: 10px 10px 0;
-      }
-
-      .attachment-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-        padding: 4px 4px 4px 8px;
-        max-width: 240px;
-        background: var(--surface-0, var(--surface-0));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 6px;
-        position: relative;
-      }
-
-      .attachment-chip.is-image {
-        padding: 4px;
-      }
-
-      .attachment-thumb {
-        display: block;
-        padding: 0;
-        border: 0;
-        background: transparent;
-        cursor: pointer;
-        line-height: 0;
-      }
-
-      .attachment-thumb img {
-        width: 56px;
-        height: 56px;
-        object-fit: cover;
-        border-radius: 4px;
-      }
-
-      .attachment-icon {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 28px;
-        height: 28px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .attachment-meta {
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-        flex: 1;
-      }
-
-      .attachment-name {
-        font-size: 12px;
-        color: var(--text-primary, var(--text-primary));
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
-      .attachment-size {
-        font-size: 10px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .attachment-remove {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 22px;
-        height: 22px;
-        background: transparent;
-        border: 0;
-        border-radius: 4px;
-        color: var(--text-muted, var(--text-muted));
-        cursor: pointer;
-      }
-
-      .attachment-remove:hover {
-        background: var(--hover, color-mix(in srgb, var(--text-primary) 6%, transparent));
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .attachment-error {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 12px;
-        margin: 8px 10px 0;
-        background: color-mix(in srgb, var(--danger, #c44) 12%, transparent);
-        color: var(--danger, #c44);
-        font-size: 12px;
-        border-radius: 4px;
-      }
-
-      /* Recording strip — replaces the textarea while recording. */
-      .recording-strip {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 12px;
-        min-height: 64px;
-      }
-
-      .recording-canvas {
-        flex: 1;
-        height: 56px;
-        border-radius: 4px;
-        background: transparent;
-      }
-
-      .recording-time {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-variant-numeric: tabular-nums;
-        font-size: 13px;
-        color: var(--text-primary, var(--text-primary));
-        min-width: 50px;
-      }
-
-      .recording-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--danger, #c44);
-        animation: chat-recording-pulse 1.2s ease-in-out infinite;
-      }
-
-      @keyframes chat-recording-pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.35; }
-      }
-
-      .recording-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 32px;
-        height: 32px;
-        background: transparent;
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 50%;
-        color: var(--text-muted, var(--text-muted));
-        cursor: pointer;
-      }
-
-      .recording-btn.cancel:hover {
-        color: var(--danger, #c44);
-        border-color: var(--danger, #c44);
-      }
-
-      .recording-btn.confirm {
-        background: var(--accent-color, var(--accent-color));
-        color: var(--timeline-bg, var(--timeline-bg));
-        border-color: transparent;
-      }
-
-      /* Attach menu */
-      .attach-wrap {
-        position: relative;
-      }
-
-      .ctrl.active {
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-      }
-
-      .attach-menu {
-        position: absolute;
-        bottom: 100%;
-        left: 0;
-        margin-bottom: 6px;
-        min-width: 180px;
-        background: var(--panel-bg, var(--panel-bg));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 8px;
-        padding: 4px;
-        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
-        z-index: 11;
-      }
-
-      .attach-menu-backdrop {
-        position: fixed;
-        inset: 0;
-        z-index: 10;
-      }
-
-      .attach-menu-item {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        width: 100%;
-        padding: 8px 10px;
-        background: transparent;
-        border: 0;
-        border-radius: 6px;
-        color: var(--text-primary, var(--text-primary));
-        font-family: inherit;
-        font-size: 13px;
-        text-align: left;
-        cursor: pointer;
-      }
-
-      .attach-menu-item:hover {
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      /* Mic button styled the same as other ctrl buttons */
-      .ctrl.mic .ctrl-icon {
-        font-size: 16px;
-      }
-
-      /* Image preview dialog body */
-      .image-preview-img {
-        display: block;
-        max-width: 100%;
-        max-height: 70vh;
-        margin: 0 auto;
-        object-fit: contain;
-      }
-
-      /* Per-message action row (TTS button etc.) */
-      .message-actions {
-        display: flex;
-        gap: 4px;
-        margin-top: 6px;
-        opacity: 0.55;
-        transition: opacity 0.15s ease;
-      }
-
-      .message-actions:hover,
-      .message-actions:focus-within {
-        opacity: 1;
-      }
-
-      .msg-action-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 26px;
-        height: 26px;
-        background: transparent;
-        border: 1px solid transparent;
-        border-radius: 4px;
-        color: var(--text-muted, var(--text-muted));
-        cursor: pointer;
-        transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-      }
-
-      .msg-action-btn:hover:not(:disabled) {
-        background: var(--surface-0, var(--surface-0));
-        color: var(--text-primary, var(--text-primary));
-        border-color: var(--border-color, var(--surface-0));
-      }
-
-      .msg-action-btn:disabled {
-        cursor: wait;
-      }
-
-      .tts-btn.is-playing {
-        color: var(--accent-color, var(--accent-color));
-        border-color: var(--accent-color, var(--accent-color));
-      }
-
-      .tts-btn.is-error {
-        color: var(--danger, #c44);
-      }
-
-      .action-spinner-sm {
-        width: 12px;
-        height: 12px;
-        border: 2px solid currentColor;
-        border-top-color: transparent;
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-      }
-
-      /* User-message attachment chips (rendered alongside their text) */
-      .user-attachments {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 6px;
-        margin-top: 6px;
-      }
-
-      .user-attachment-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 3px 8px;
-        background: var(--surface-0, var(--surface-0));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 4px;
-        font-size: 12px;
-        color: var(--text-muted, var(--text-muted));
-        max-width: 240px;
-      }
-
-      .user-attachment-name {
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
-      /* Slash command autocomplete */
-
-      .slash-menu {
-        position: absolute;
-        bottom: 100%;
-        left: 0;
-        right: 0;
-        margin-bottom: 8px;
-        background: var(--panel-bg, var(--panel-bg));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 12px;
-        padding: 4px;
-        box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.4);
-        z-index: 10;
-      }
-
-      .slash-item {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 8px 12px;
-        border-radius: 8px;
-        cursor: pointer;
-        transition: background 0.1s ease;
-      }
-
-      .slash-item:hover, .slash-item.selected {
-        background: var(--surface-0, var(--surface-0));
-      }
-
-      .slash-cmd {
-        font-weight: 600;
-        font-size: 13px;
-        color: var(--accent-color, var(--accent-color));
-        min-width: 100px;
-      }
-
-      .slash-desc {
-        font-size: 12px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      /* Markdown content styling */
-
-      .message-body ::ng-deep pre {
-        background: var(--panel-bg, var(--panel-bg));
-        border-radius: 8px;
-        padding: 12px 16px;
-        overflow-x: auto;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 12px;
-        line-height: 1.5;
-        border: 1px solid var(--border-color, var(--surface-0));
-        margin: 8px 0;
-      }
-
-      .message-body ::ng-deep pre code {
-        background: transparent;
-        padding: 0;
-      }
-
-      .message-body ::ng-deep .code-copy-btn {
-        position: absolute;
-        top: 6px;
-        right: 6px;
-        background: var(--surface-0, var(--surface-0));
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 4px;
-        padding: 2px 4px;
-        cursor: pointer;
-        opacity: 0;
-        transition: opacity 0.15s;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-      }
-
-      .message-body ::ng-deep pre:hover .code-copy-btn {
-        opacity: 1;
-      }
-
-      .message-body ::ng-deep .code-copy-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
-        color: var(--text-muted, var(--text-muted));
-      }
-
-      .message-body ::ng-deep code {
-        background: color-mix(in srgb, var(--accent-color) 20%, transparent);
-        padding: 1px 5px;
-        border-radius: 4px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.9em;
-      }
-
-      /* Collapsible code blocks */
-      .message-body ::ng-deep .code-collapse {
-        border: 1px solid var(--border-color, var(--surface-0));
-        border-radius: 8px;
-        margin: 8px 0;
-        overflow: hidden;
-      }
-
-      .message-body ::ng-deep .code-collapse > pre {
-        margin: 0;
-        border: none;
-        border-radius: 0;
-      }
-
-      .message-body ::ng-deep .code-collapse:not([open]) > pre {
-        display: none;
-      }
-
-      .message-body ::ng-deep .code-collapse-summary {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 12px;
-        background: var(--panel-bg, var(--panel-bg));
-        cursor: pointer;
-        font-size: 12px;
-        color: var(--text-muted, var(--text-muted));
-        user-select: none;
-        list-style: none;
-      }
-
-      .message-body ::ng-deep .code-collapse-summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .message-body ::ng-deep .code-collapse-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        color: var(--accent-color, var(--accent-color));
-      }
-
-      .message-body ::ng-deep .code-collapse-label {
-        font-family: 'JetBrains Mono', monospace;
-        font-weight: 600;
-        color: var(--text-color, var(--text-primary));
-      }
-
-      .message-body ::ng-deep .code-collapse-hint {
-        margin-left: auto;
-        font-size: 11px;
-        opacity: 0.6;
-      }
-
-      .message-body ::ng-deep .code-collapse[open] .code-collapse-hint {
-        display: none;
-      }
-
-      .message-body ::ng-deep table {
-        border-collapse: collapse;
-        width: 100%;
-        margin: 8px 0;
-        font-size: 12px;
-      }
-
-      .message-body ::ng-deep th,
-      .message-body ::ng-deep td {
-        padding: 6px 12px;
-        border-bottom: 1px solid var(--border-color, var(--surface-0));
-        text-align: left;
-      }
-
-      .message-body ::ng-deep th {
-        font-weight: 600;
-        color: var(--accent-color, var(--accent-color));
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-      }
-
-      .message-body ::ng-deep tr:hover {
-        background: rgba(255, 255, 255, 0.03);
-      }
-
-      .message-body ::ng-deep a {
-        color: var(--info);
-        text-decoration: none;
-      }
-
-      .message-body ::ng-deep a:hover {
-        text-decoration: underline;
-      }
-
-      .message-body ::ng-deep blockquote {
-        border-left: 3px solid var(--accent-color, var(--accent-color));
-        margin: 8px 0;
-        padding: 4px 12px;
-        color: var(--text-secondary, var(--text-secondary));
-      }
-
-      .message-body ::ng-deep ul,
-      .message-body ::ng-deep ol {
-        margin: 6px 0;
-        padding-left: 20px;
-      }
-
-      .message-body ::ng-deep ul {
-        list-style-type: disc;
-      }
-
-      .message-body ::ng-deep ol {
-        list-style-type: decimal;
-      }
-
-      .message-body ::ng-deep li {
-        margin: 3px 0;
-        line-height: 1.5;
-      }
-
-      .message-body ::ng-deep li > ul,
-      .message-body ::ng-deep li > ol {
-        margin: 2px 0;
-      }
-
-      .message-body ::ng-deep .citation-web {
-        color: var(--accent-color, var(--accent-color));
-        text-decoration: underline dotted;
-        text-underline-offset: 2px;
-      }
-
-      .message-body ::ng-deep .citation-web:hover {
-        text-decoration-style: solid;
-      }
-
-      .message-body ::ng-deep .citation-doc {
-        color: var(--info);
-        font-style: italic;
-        cursor: help;
-        border-bottom: 1px dashed var(--info);
-      }
-
-      @media (max-width: 768px) {
-        .chat-header {
-          flex-wrap: wrap;
-          gap: 4px;
-          padding: 6px 8px;
-        }
-
-        .messages {
-          padding: 10px;
-        }
-
-        .message {
-          max-width: 98%;
-        }
-
-        .chat-input {
-          font-size: 16px;
-        }
-
-        .composer-wrap {
-          padding: 10px 12px 14px;
-          padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
-        }
-
-        .composer-row {
-          padding: 4px 6px 6px;
-        }
-
-        .ctrl-label {
-          display: none;
-        }
-      }
-    `,
-    ],
+    styleUrls: ['./persistent-chat.component.scss'],
 })
 export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDestroy {
     readonly chat = inject(PersistentChatService);
@@ -3010,12 +1038,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private capabilitiesSub?: Subscription;
     private recordingStateSub?: Subscription;
 
-    // Per-assistant-message TTS state. Keyed by the message index in
-    // chat.messages(). Indices are stable in practice — the messages
-    // array only ever appends.
-    readonly ttsState = signal<Record<number, TtsMessageState>>({});
+    // Per-turn TTS state. Keyed by a stable string ("turn:<id>") so playback
+    // state survives across re-renders even if the turn list is reordered.
+    readonly ttsState = signal<Record<string, TtsMessageState>>({});
     private currentTtsAudio: HTMLAudioElement | null = null;
-    private currentTtsIndex: number | null = null;
+    private currentTtsKey: string | null = null;
     // Tracks blob URLs we've created so we can revoke them on destroy.
     private readonly ttsBlobUrls = new Set<string>();
 
@@ -3065,7 +1092,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly startupSteps = computed(() => {
         const order = this.STARTUP_PHASE_ORDER;
         const phase = this.chat.startupPhase();
-        const isResuming = this.chat.messages().length > 0;
+        const isResuming = this.chat.turns().length > 0;
         // Subscribe to phase tracking changes and to the live tick.
         this.phaseRevision();
         const now = this.nowTick();
@@ -3075,7 +1102,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         } else if (phase && (order as readonly string[]).includes(phase)) {
             activeIdx = (order as readonly string[]).indexOf(phase);
         } else {
-            activeIdx = isResuming ? 1 : 0;
+            // No live phase signal. Phases arrive in two batches: 'creating'
+            // is set client-side and cleared in disconnect() before the
+            // server-emitted 'provisioning' status frame arrives over the
+            // control WS. During that gap, the previous fallback (`isResuming
+            // ? 1 : 0`) regressed step 0 back to 'active', wiping the just-
+            // recorded "2.0s" with a fresh spinner. Use the completed-count
+            // as the floor so a step that finished stays done.
+            const completedCount = order.filter(k => this.phaseDurations[k] != null).length;
+            activeIdx = Math.max(completedCount, isResuming ? 1 : 0);
         }
         return order.map((key, idx) => {
             const state: 'done' | 'active' | 'todo' =
@@ -3138,11 +1173,13 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             error: () => this.pickedSuggestions.set([]),
         });
 
-        // Auto-scroll when messages, streaming, or tool calls change
+        // Auto-scroll when turns or in-flight events change. Reading both the
+        // turn list and the in-flight turn's events array keeps the effect
+        // subscribed to deltas on the active streaming turn.
         effect(() => {
-            this.chat.messages();
-            this.chat.streamingText();
-            this.chat.currentToolCalls();
+            this.chat.turns();
+            const active = this.chat.currentStreamingTurn();
+            if (active) active.events.length;
             this.chat.pendingPermission();
 
             if (this.autoScroll) {
@@ -3153,7 +1190,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // Track new messages that arrive while the user has scrolled up.
         // Drives the "Jump to latest · N new" pill (F5).
         effect(() => {
-            const len = this.chat.messages().length;
+            const len = this.chat.turns().length;
             const away = this.scrolledAway();
             if (len < this.lastSeenMessageCount) {
                 // Thread switch or messages cleared — start fresh.
@@ -3257,7 +1294,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.chat.connectionState() === 'disconnected'
         && this.chat.threadStatus() === 'active'
         && this.chat.sessionReady()
-        && this.chat.messages().length > 0,
+        && this.chat.turns().length > 0,
     );
 
     readonly scrolledAway = signal(false);
@@ -3330,7 +1367,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 // ignore
             }
             this.currentTtsAudio = null;
-            this.currentTtsIndex = null;
+            this.currentTtsKey = null;
         }
         this.ttsBlobUrls.forEach((url) => URL.revokeObjectURL(url));
         this.ttsBlobUrls.clear();
@@ -3541,35 +1578,35 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // ===== TTS playback =====
 
-    /** Read state for a given message index (always returns a defaulted object). */
-    ttsStateFor(index: number): TtsMessageState {
+    /** Read state for a given turn key (always returns a defaulted object). */
+    ttsStateFor(key: string): TtsMessageState {
         return (
-            this.ttsState()[index] ?? {isGenerating: false, isPlaying: false, error: false}
+            this.ttsState()[key] ?? {isGenerating: false, isPlaying: false, error: false}
         );
     }
 
-    /** Mutate state for one message index. */
-    private setTtsState(index: number, patch: Partial<TtsMessageState>): void {
+    /** Mutate state for one turn key. */
+    private setTtsState(key: string, patch: Partial<TtsMessageState>): void {
         this.ttsState.update((cur) => ({
             ...cur,
-            [index]: {...this.ttsStateFor(index), ...patch},
+            [key]: {...this.ttsStateFor(key), ...patch},
         }));
     }
 
     /**
-     * Play, pause, or generate-then-play TTS for an assistant message.
+     * Play, pause, or generate-then-play TTS for an assistant turn's final text.
      *
      * - First click: fetch the audio (formulation + synthesis on the server),
      *   then start playback.
      * - Subsequent clicks: toggle play/pause on the cached blob.
      */
-    async toggleTts(index: number, content: string): Promise<void> {
-        const state = this.ttsStateFor(index);
+    async toggleTts(key: string, content: string): Promise<void> {
+        const state = this.ttsStateFor(key);
         const threadId = this.chat.threadId();
         if (!threadId || !content.trim()) return;
 
-        // Stop any other message that's playing.
-        if (this.currentTtsIndex !== null && this.currentTtsIndex !== index) {
+        // Stop any other turn that's playing.
+        if (this.currentTtsKey !== null && this.currentTtsKey !== key) {
             this.stopCurrentTts();
         }
 
@@ -3579,12 +1616,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
 
         if (state.audioUrl) {
-            this.playCachedTts(index, state.audioUrl);
+            this.playCachedTts(key, state.audioUrl);
             return;
         }
 
         // Need to fetch the audio first.
-        this.setTtsState(index, {isGenerating: true, error: false});
+        this.setTtsState(key, {isGenerating: true, error: false});
         const lang = this.i18n.activeLang().startsWith('de') ? 'de' : 'en';
         let result;
         try {
@@ -3593,28 +1630,23 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             );
         } catch (e) {
             console.error('TTS generate threw', e);
-            this.setTtsState(index, {isGenerating: false, error: true});
+            this.setTtsState(key, {isGenerating: false, error: true});
             return;
         }
         if (result === null || result === 'unavailable') {
-            this.setTtsState(index, {
+            this.setTtsState(key, {
                 isGenerating: false,
                 error: result === null,
             });
-            // 'unavailable' (204) is silent — server told us TTS isn't
-            // configured; the button stays in idle, the user can click
-            // again but nothing more useful will happen.
             return;
         }
         const url = URL.createObjectURL(result);
         this.ttsBlobUrls.add(url);
-        this.setTtsState(index, {isGenerating: false, audioUrl: url, error: false});
-        this.playCachedTts(index, url);
+        this.setTtsState(key, {isGenerating: false, audioUrl: url, error: false});
+        this.playCachedTts(key, url);
     }
 
-    private playCachedTts(index: number, url: string): void {
-        // Reuse a single Audio instance so memory stays bounded across
-        // many messages.
+    private playCachedTts(key: string, url: string): void {
         if (!this.currentTtsAudio) {
             this.currentTtsAudio = new Audio();
             this.currentTtsAudio.addEventListener('ended', () => this.onTtsEnded());
@@ -3622,51 +1654,48 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.currentTtsAudio.addEventListener('error', () => this.onTtsError());
         }
         this.currentTtsAudio.src = url;
-        this.currentTtsIndex = index;
-        this.setTtsState(index, {isPlaying: true});
+        this.currentTtsKey = key;
+        this.setTtsState(key, {isPlaying: true});
         this.currentTtsAudio.play().catch((e) => {
             console.error('TTS playback failed', e);
-            this.setTtsState(index, {isPlaying: false, error: true});
-            this.currentTtsIndex = null;
+            this.setTtsState(key, {isPlaying: false, error: true});
+            this.currentTtsKey = null;
         });
     }
 
     private stopCurrentTts(): void {
-        if (!this.currentTtsAudio || this.currentTtsIndex === null) return;
+        if (!this.currentTtsAudio || this.currentTtsKey === null) return;
         try {
             this.currentTtsAudio.pause();
             this.currentTtsAudio.currentTime = 0;
         } catch {
             // ignore
         }
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false});
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsEnded(): void {
-        if (this.currentTtsIndex === null) return;
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false});
+        if (this.currentTtsKey === null) return;
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsPaused(): void {
-        // The 'pause' event also fires when src changes or when stop()
-        // pauses the element. Only react when the audio is *user-paused*
-        // mid-track (currentTime > 0 and not at end).
-        if (this.currentTtsIndex === null || !this.currentTtsAudio) return;
+        if (this.currentTtsKey === null || !this.currentTtsAudio) return;
         const a = this.currentTtsAudio;
         if (a.ended || a.currentTime === 0) return;
-        const idx = this.currentTtsIndex;
-        this.setTtsState(idx, {isPlaying: false});
+        const k = this.currentTtsKey;
+        this.setTtsState(k, {isPlaying: false});
     }
 
     private onTtsError(): void {
-        if (this.currentTtsIndex === null) return;
-        const idx = this.currentTtsIndex;
-        this.currentTtsIndex = null;
-        this.setTtsState(idx, {isPlaying: false, error: true});
+        if (this.currentTtsKey === null) return;
+        const k = this.currentTtsKey;
+        this.currentTtsKey = null;
+        this.setTtsState(k, {isPlaying: false, error: true});
     }
 
     // ===== Drag-and-drop file handling =====
@@ -3752,7 +1781,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.autoScroll = true;
         this.scrolledAway.set(false);
         this.newMessageCount.set(0);
-        this.lastSeenMessageCount = this.chat.messages().length;
+        this.lastSeenMessageCount = this.chat.turns().length;
         this.scrollToBottom();
     }
 
@@ -3949,6 +1978,59 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             pre.style.position = 'relative';
             pre.appendChild(btn);
         }
+    }
+
+    // ===== Turn-bubble helpers =====
+
+    /**
+     * Auto-collapse threshold: assistant turns with more than this many events
+     * collapse to the headline-only view by default once they're done. Streaming
+     * turns are never auto-collapsed. The user can override either way via the
+     * chevron, in which case userTurnCollapsed wins.
+     */
+    private readonly AUTO_COLLAPSE_THRESHOLD = 8;
+
+    /**
+     * Per-turn user override for collapse state. Keyed by turn id. Value is
+     * `true` when the user explicitly collapsed it, `false` when they explicitly
+     * expanded it. Absent = use the auto rule.
+     */
+    private readonly userTurnCollapsed = signal<Record<string, boolean>>({});
+
+    /** Whether the given assistant turn should render in collapsed mode. */
+    isTurnCollapsed(turn: AssistantTurn): boolean {
+        const explicit = this.userTurnCollapsed()[turn.id];
+        if (explicit !== undefined) return explicit;
+        if (turn.status === 'streaming') return false;
+        return turn.events.length > this.AUTO_COLLAPSE_THRESHOLD;
+    }
+
+    /** Toggle the user-explicit collapse state for a turn. */
+    toggleTurnCollapse(turn: AssistantTurn): void {
+        const wasCollapsed = this.isTurnCollapsed(turn);
+        this.userTurnCollapsed.update((cur) => ({...cur, [turn.id]: !wasCollapsed}));
+    }
+
+    /** Per-type event counts for the chevron badge. */
+    turnEventCounts(turn: AssistantTurn) {
+        return countEvents(turn);
+    }
+
+    /** Last text event in a turn — used as the collapsed-view headline. */
+    lastTextEvent(turn: AssistantTurn): TextEvent | undefined {
+        return lastTextOf(turn);
+    }
+
+    /**
+     * True when the current turn is historical and the next turn isn't —
+     * the boundary between session reload and live activity.
+     */
+    showSessionDividerAfter(turn: Turn, index: number): boolean {
+        const next = this.chat.turns()[index + 1];
+        if (!next) return false;
+        const turnHistorical = (turn.kind === 'assistant' || turn.kind === 'user') && !!turn.historical;
+        const nextHistorical = (next.kind === 'assistant' || next.kind === 'user') && !!next.historical;
+        return turnHistorical && !nextHistorical;
     }
 
     // Tool call display helpers

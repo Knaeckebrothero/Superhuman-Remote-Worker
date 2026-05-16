@@ -8,6 +8,7 @@ _check_empty_response_streak, _check_no_tool_call_streak.
 from unittest.mock import MagicMock
 
 from src.graph import (
+    _classify_llm_error,
     _extract_rate_limit_delay,
     _extract_tool_use_failed,
     _build_tool_use_failed_feedback,
@@ -485,3 +486,127 @@ class TestCheckNoToolCallStreak:
         s2, _, h2 = _check_no_tool_call_streak(umlaut, 0, s1, h1)
         assert s2 == 2
         assert h1 == h2
+
+
+# =============================================================================
+# _classify_llm_error
+# =============================================================================
+
+
+def _make_sdk_error(class_name: str, status_code, *, body=None, message=""):
+    """Build a duck-typed SDK error.
+
+    The classifier inspects ``type(exc).__name__`` and ``exc.status_code`` /
+    ``exc.body`` rather than isinstance-checking the openai/anthropic SDK
+    types, so we don't need to import them here.
+    """
+    cls = type(class_name, (Exception,), {})
+    err = cls(message)
+    err.status_code = status_code
+    if body is not None:
+        err.body = body
+    return err
+
+
+class TestClassifyLlmError:
+    """Tests for the permanent/rate_limit/transient classifier that gates
+    the inner retry loop in create_execute_node. Regression coverage for
+    the 2026-05-12 cluster outage where a 404 model-not-found looped 70+
+    iterations against a guaranteed-failure endpoint."""
+
+    def test_404_model_not_found_is_permanent(self):
+        err = _make_sdk_error(
+            "NotFoundError",
+            404,
+            body={
+                "error": {
+                    "message": "Model 'x' not found",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_401_auth_is_permanent(self):
+        err = _make_sdk_error("AuthenticationError", 401)
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_403_permission_denied_is_permanent(self):
+        err = _make_sdk_error("PermissionDeniedError", 403)
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_400_invalid_request_is_permanent(self):
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={"error": {"type": "invalid_request_error", "code": "schema_error"}},
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_400_tool_use_failed_is_transient(self):
+        """Groq's tool_use_failed (400 with code=tool_use_failed) must
+        retry — it's a recoverable token-budget overrun, not a config bug."""
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={
+                "error": {"type": "invalid_request_error", "code": "tool_use_failed"}
+            },
+        )
+        assert _classify_llm_error(err) == "transient"
+
+    def test_400_rate_limit_disguised_is_rate_limit(self):
+        """Some providers return rate-limit info under a 400 with a
+        rate-related code — must NOT be permanent."""
+        err = _make_sdk_error(
+            "BadRequestError",
+            400,
+            body={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "rate_limit_exceeded",
+                }
+            },
+        )
+        assert _classify_llm_error(err) == "rate_limit"
+
+    def test_429_is_rate_limit(self):
+        err = _make_sdk_error("RateLimitError", 429)
+        assert _classify_llm_error(err) == "rate_limit"
+
+    def test_503_is_transient(self):
+        err = _make_sdk_error("APIStatusError", 503)
+        assert _classify_llm_error(err) == "transient"
+
+    def test_connection_error_is_transient(self):
+        """No status_code, no recognizable class — default to transient
+        so we don't aggressively fail jobs on truly transient network
+        flakes."""
+        assert _classify_llm_error(ConnectionError("connect refused")) == "transient"
+
+    def test_walks_cause_chain(self):
+        """LangChain wraps provider exceptions — classifier must unwrap."""
+        inner = _make_sdk_error("NotFoundError", 404)
+        outer = Exception("LangChain wrapper")
+        outer.__cause__ = inner
+        assert _classify_llm_error(outer) == "permanent"
+
+    def test_message_text_fallback_for_404_model(self):
+        """When status_code/class are stripped (logs, re-raised as plain
+        Exception), the stringified message is the last-resort signal —
+        this is exactly the shape that surfaced in the 2026-05-12 logs."""
+        err = Exception(
+            "Error code: 404 - {'error': {'message': \"Model 'gpt-5.3' not found\"}}"
+        )
+        assert _classify_llm_error(err) == "permanent"
+
+    def test_400_without_parseable_body_is_transient(self):
+        """A bare 400 without a body we can interpret — be conservative
+        and retry. Aggressive permanent-classification of all 400s would
+        misfire on provider-specific edge cases."""
+        err = _make_sdk_error("APIStatusError", 400)
+        assert _classify_llm_error(err) == "transient"
+
+    def test_no_status_no_class_no_keyword_is_transient(self):
+        """Catch-all: unknown exception → retry as today's behaviour."""
+        assert _classify_llm_error(RuntimeError("something weird")) == "transient"

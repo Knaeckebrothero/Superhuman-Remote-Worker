@@ -84,7 +84,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       min-height: 200px;
       padding: 12px 14px;
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-primary, var(--text-primary));
       font-family: 'JetBrains Mono', monospace;

@@ -132,7 +132,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
     .admin-section {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
       padding: 24px;
       margin-bottom: 24px;
     }
@@ -166,7 +166,7 @@ import {AppBadgeComponent} from '../../../ui/badge';
     }
     .user-table {
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       overflow: hidden;
     }
     .user-header,

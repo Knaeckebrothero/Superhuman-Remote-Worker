@@ -2,7 +2,7 @@ import {Component, effect, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {UserService} from '../../core/services/user.service';
-import {KeycloakService} from '../../core/services/keycloak.service';
+import {SessionService} from '../../core/services/session.service';
 import {Project} from '../../core/models/api.model';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe} from '@jsverse/transloco';
@@ -143,7 +143,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
     .btn {
       padding: 8px 16px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-size: 13px;
       font-family: inherit;
       cursor: pointer;
@@ -153,7 +153,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
     .btn-primary {
       background: var(--accent-color, var(--accent-color));
-      color: var(--timeline-bg, var(--timeline-bg));
+      color: var(--on-accent, var(--timeline-bg, #11111b));
       border-color: var(--accent-color, var(--accent-color));
       font-weight: 600;
     }
@@ -172,7 +172,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .create-form {
       background: var(--panel-bg, var(--panel-bg));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 16px;
       margin-bottom: 20px;
     }
@@ -184,7 +184,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
       padding: 10px 12px;
       background: var(--surface-0, var(--surface-0));
       border: 1px solid var(--border-color, var(--surface-1));
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary, var(--text-primary));
       font-size: 13px;
       font-family: inherit;
@@ -220,7 +220,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .project-card {
       background: var(--panel-bg, var(--panel-bg));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 16px;
       cursor: pointer;
       transition: border-color 0.15s ease, transform 0.1s ease;
@@ -249,7 +249,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 
     .badge {
       padding: 2px 8px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 10px;
       font-weight: 500;
       text-transform: capitalize;
@@ -272,7 +272,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
     .chip {
       padding: 3px 8px;
       background: var(--surface-0, var(--surface-0));
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
       color: var(--text-muted, var(--text-muted));
     }
@@ -286,7 +286,7 @@ import {AppSpinnerComponent} from '../../ui/spinner';
 export class ProjectListPageComponent implements OnInit {
   private readonly api = inject(ApiService);
   private readonly userService = inject(UserService);
-  private readonly keycloak = inject(KeycloakService);
+  private readonly session = inject(SessionService);
   private readonly router = inject(Router);
 
   readonly projects = signal<Project[]>([]);
@@ -347,10 +347,11 @@ export class ProjectListPageComponent implements OnInit {
         this.formName.set('');
         this.formDescription.set('');
         this.formGoal.set('');
-        // Refresh the Keycloak token so the new `project-{id}` group claim
-        // reaches OpenCloud on the next request — otherwise the Space stays
-        // invisible until the session expires.
-        this.keycloak.forceRefreshToken();
+        // Refresh the server-side access token so the new `project-{id}`
+        // group claim propagates — otherwise downstream services that read
+        // groups from the JWT stay out of sync until the next natural
+        // refresh.
+        void this.session.forceRefresh();
         this.refresh();
       }
     });

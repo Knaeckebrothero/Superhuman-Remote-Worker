@@ -1,121 +1,82 @@
 # Strategic todos for developer job initialization (first strategic phase)
-# These todos guide the developer agent through repo exploration,
-# codebase understanding, plan creation, and first phase todo generation.
-#
-# Developer-specific: Focuses on repo/ exploration, conventions discovery,
-# test framework identification, and delegation-ready planning.
+# These todos bootstrap a TDD job: read the brief, explore the repo (so the
+# spec can reference real test paths and test commands), review prior knowledge,
+# outline the plan, then create the first tactical phase — a `spec` phase that
+# will produce spec.yaml before any red/green work begins.
 todos:
   - id: 1
     content: >-
-      EXPLORE: Understand the task and the repository before doing anything else.
+      EXPLORE: Read the task brief and instructions before doing anything else.
 
       Steps:
       (1) Use read_file to read task_brief.md — this is the task description and opening message.
       (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
-          Pay attention to: required deliverables, coding conventions, test expectations,
-          and any constraints on how to implement.
+          Pay attention to: required deliverables, the TDD discipline (spec → red → green → refactor),
+          forbidden test patterns, and the abort token rules (BLOCKED / ABORT).
       (3) Use list_files on the tools/ directory to understand your available capabilities.
       (4) Use list_files on documents/ to inventory all input materials.
-      (5) Use list_files on reference/ to check for domain-specific reference material.
 
       Then persist critical rules as knowledge notes using kb_write:
       - Required deliverables (exact output paths and formats) → kb_write with type="goal", tag="deliverable"
-      - Coding conventions and constraints (style, patterns, frameworks) → kb_write with type="decision", tag="convention"
-      - Test requirements (what tests to run, what coverage is expected) → kb_write with type="decision", tag="testing"
-      - Hard rules (things explicitly forbidden or required) → kb_write with type="decision", tag="pinned"
+      - Hard rules (forbidden test patterns, phase-type discipline) → kb_write with type="decision", tag="pinned"
       - Delivery expectations (PRs, branches, commit conventions) → kb_write with type="goal", tag="acceptance-criteria"
 
       These knowledge notes persist across context compaction AND across future jobs
       in the same project. Search existing notes first (kb_search) to avoid duplicates.
 
-      COMPLETION CRITERIA: Knowledge notes created for all five categories above
-      (verify with kb_list). instructions.md and task_brief.md have been read in full.
+      COMPLETION CRITERIA: Knowledge notes created for deliverables, pinned rules, and
+      delivery expectations (verify with kb_list). instructions.md and task_brief.md
+      have been read in full.
 
-      INSTEAD OF: Starting to write code or call claude_code — this phase is read-only.
-      Instead of skimming instructions.md — read every line, since every task failure
-      starts with skipping this step.
+      INSTEAD OF: Starting to write or modify code — this is the bootstrap strategic phase.
+      Instead of skipping the abort-token and forbidden-pattern rules — these are the
+      TDD discipline that makes this expert different.
 
   - id: 2
     content: >-
-      EXPLORE REPOSITORY: Map the codebase structure, conventions, and test framework.
+      EXPLORE REPOSITORY: Map the codebase so the spec can reference real paths.
+
+      You cannot write a meaningful spec.yaml without knowing the test framework, the test
+      command, and where tests live in this repo. Spend this todo discovering those facts.
 
       Steps:
       (1) Use list_files on repo/ to see the top-level structure.
       (2) Read repo/README.md (or equivalent) for project overview.
-      (3) Read repo/package.json, repo/requirements.txt, repo/pyproject.toml, or
-          equivalent dependency file to understand the tech stack.
+      (3) Read repo/package.json, repo/requirements.txt, repo/pyproject.toml, or equivalent
+          dependency file to understand the tech stack.
       (4) Use list_files on the main source directory (repo/src/, repo/app/, repo/lib/,
-          or whatever the convention is) to map the module structure.
-      (5) Read 2-3 key source files to understand coding conventions:
-          - An entry point (main.py, index.ts, app.py)
-          - A representative module that's similar to what you'll be building
-          - A test file to understand the test framework and patterns
-      (6) Check for CI config (repo/.github/workflows/, repo/.gitlab-ci.yml, etc.)
-          to understand the build/test/lint pipeline.
+          or whatever convention this repo uses) to map the module structure.
+      (5) Use list_files on the test directory (repo/tests/, repo/test/, repo/spec/) to map
+          the test layout.
+      (6) Read 2-3 representative test files to understand:
+          - Test framework (pytest, vitest, jest, go test, etc.)
+          - Test command (e.g., "pytest tests/ -x -v", "npm test")
+          - Test naming conventions (test_*.py vs *.test.ts vs *_test.go)
+          - Fixture style and imports
+      (7) Check for CI config (repo/.github/workflows/, repo/.gitlab-ci.yml, etc.) to see
+          how tests are run on the pipeline.
 
-      Record your findings as knowledge notes using kb_write tool (type=learning, tag=repository):
+      Record findings as knowledge notes via kb_write (type=learning, tag=repository):
       - Framework and language version
-      - Project structure (key directories and their purposes)
-      - Naming conventions observed (file naming, function naming, class naming)
-      - Test framework and test command (e.g., "pytest tests/ -v", "npm test")
-      - Linter/formatter config (e.g., ruff, eslint, prettier)
-      - Entry points and key modules relevant to the task
+      - Test framework + exact test command
+      - Source directory layout (where src/ lives, what it's called)
+      - Test directory layout (where tests/ lives, what it's called, naming convention)
+      - Linter/formatter command (e.g., ruff, eslint, prettier)
       - Branch and commit conventions (if discoverable from git_log)
 
-      COMPLETION CRITERIA: Knowledge notes created for repository structure, conventions,
-      and test framework (verify with kb_list). You can describe the project structure
-      and conventions from memory.
+      COMPLETION CRITERIA: Knowledge notes created for test framework, test command,
+      source dir, and test dir. You can name the path under which the next tactical
+      phase will write tests and source.
 
-      INSTEAD OF: Trying to read the entire codebase — focus on structure, conventions,
-      and the specific area you'll be working in. Instead of guessing conventions —
-      read actual code to discover them.
+      INSTEAD OF: Trying to read the entire codebase — focus on test infrastructure,
+      conventions, and the specific area touched by the task. Instead of guessing
+      conventions — read actual code.
 
   - id: 3
     content: >-
-      PLAN: Create plan.md with a phased delegation strategy.
+      REVIEW PROJECT KNOWLEDGE: Check the knowledge base for existing context.
 
-      Start with a "## Deliverables" section listing every required output:
-      - Exact output description (feature, bug fix, PR, etc.)
-      - Files that will be created or modified
-      - Quality criteria (what "done" looks like — tests pass, linter clean, etc.)
-
-      Then structure the rest of the plan as a phase table where each phase has:
-      - Phase name and description
-      - Phase type: exploration, implementation, testing, refactoring, pr, or bug-fix
-      - Expected outcome: which deliverable(s) this phase advances
-      - Estimated delegation count: how many claude_code calls this phase needs
-
-      PHASE SIZING: Target 5-10 delegation-ready todos per tactical phase. Prefer
-      many short phases over few long ones. Each phase should be one coherent unit
-      of work (e.g., "implement the auth module," "add user API tests," "fix login bug").
-
-      PHASE ORDERING:
-      1. Exploration first (if codebase is unfamiliar — already done in todo 2)
-      2. Implementation phases (build the feature, module by module)
-      3. Testing phases (add/verify tests for each module)
-      4. Integration/PR phase (clean up, commit, push)
-
-      Focus on the first 2-3 phases in detail. Later phases can be sketches — they
-      WILL be adapted as you learn from Claude Code's actual output. Every phase must
-      map to a concrete deliverable from instructions.md.
-
-      PLAN VERIFICATION: After creating the plan, cross-check it against instructions.md.
-      For each requirement, confirm at least one phase addresses it.
-
-      COMPLETION CRITERIA: plan.md exists with at least 2 phases defined, each with
-      expected deliverables that trace back to instructions.md.
-
-      INSTEAD OF: Planning "cleanup", "archiving", or "final packaging" phases —
-      git versioning handles history and Gitea handles delivery. Instead of creating
-      phases that produce nothing listed in instructions.md. Instead of over-planning —
-      you will adapt the plan after every tactical phase based on what Claude Code
-      actually produces.
-
-  - id: 4
-    content: >-
-      REVIEW PROJECT KNOWLEDGE: Check the project knowledge base for existing context.
-
-      Search the knowledge base for existing notes from prior jobs in this project:
+      Steps:
       (1) Use kb_list to see all existing notes (filter by status="active").
       (2) Use kb_search with key terms from the task description to find relevant prior knowledge.
       (3) Review any existing decision notes — they may constrain your approach.
@@ -126,43 +87,111 @@ todos:
 
       Create initial state notes if they don't exist:
       - A "goal" note summarizing the current job's objective
-      - A "state" note tracking deliverable status (what's done, what's pending)
-      - Any facts discovered during exploration (IDs, paths, configurations) as "learning" notes
+      - A "state" note tracking AC progress (one note per AC, updated as work proceeds)
 
-      COMPLETION CRITERIA: kb_list or kb_search called at least once. If prior knowledge
-      exists, it has been reviewed. Initial state notes created for this job.
+      COMPLETION CRITERIA: kb_list or kb_search called at least once. Prior knowledge,
+      if any, has been reviewed. Initial state notes created for this job.
 
       INSTEAD OF: Skipping this step — prior knowledge from the same project can save
       significant work. Instead of creating notes that duplicate existing ones — search first.
+
+  - id: 4
+    content: >-
+      PLAN: Create plan.md with a TDD-phased implementation strategy.
+
+      The plan must follow the TDD lifecycle. Every non-trivial task is shaped as:
+
+      1. **Spec phase** — Produce spec.yaml with EARS acceptance criteria. Lock it into
+         workspace.md's PROTECTED `## Acceptance Criteria` section.
+      2. **Red phase(s)** — For each batch of related AC, write failing tests. Each test
+         must fail with AssertionError (not ImportError) before the green phase begins.
+      3. **Green phase(s)** — Minimum implementation to make the red tests pass. No
+         speculative features. No edits under `tests/`.
+      4. **Refactor phase(s)** — Optional. Only when green and structure genuinely needs work.
+      5. **Integration phase** — PR / commit prep.
+
+      Phase plan structure in plan.md:
+
+      ```
+      ## Deliverables
+      - <exact output description>
+      - Files that will be created or modified
+      - Quality criteria (from spec.yaml done_when)
+
+      ## Phases
+      | # | tdd_phase   | Scope                                     | AC IDs       |
+      |---|--------------|-------------------------------------------|--------------|
+      | 1 | spec         | Produce spec.yaml + lock to workspace.md  | (defines)    |
+      | 2 | red          | Tests for happy-path AC                   | AC-1, AC-2   |
+      | 3 | green        | Implementation for happy-path AC          | AC-1, AC-2   |
+      | 4 | red          | Tests for edge/error-case AC              | AC-3, AC-4   |
+      | 5 | green        | Implementation for edge/error AC          | AC-3, AC-4   |
+      | 6 | refactor     | (optional)                                | -            |
+      | 7 | integration  | Commit + PR                               | -            |
+      ```
+
+      PHASE SIZING: Target 5-10 todos per tactical phase. Each phase is one coherent
+      slice of TDD work. Prefer many short phases over few long ones.
+
+      AC GROUPING: A red phase + the matching green phase covers ~2-4 AC at a time. Smaller
+      AC batches mean tighter feedback loops; larger batches mean more risk of partial green.
+
+      Focus on the first 2-3 phases in detail. Later phases can be sketches — they WILL be
+      adapted as you learn what actually lands.
+
+      PLAN VERIFICATION: Cross-check the plan against instructions.md. Every required
+      deliverable must trace to at least one green-or-later phase.
+
+      COMPLETION CRITERIA: plan.md exists with at least 3 phases (spec, red, green at
+      minimum). Each phase has tdd_phase, scope, and (for red/green) AC IDs.
+
+      INSTEAD OF: Planning "cleanup", "archiving", or "final packaging" phases — git
+      versioning handles history. Instead of creating phases that produce nothing listed
+      in instructions.md. Instead of over-planning — you will adapt the plan after every
+      tactical phase based on the actual diff.
 
   - id: 5
     content: >-
       CREATE first phase todos using the next_phase_todos tool.
 
-      IMPORTANT: You MUST invoke the read_file tool on `todo_guide.md` BEFORE calling next_phase_todos.
-      The tool will reject your call if you haven't read the guide. The guide contains
-      critical rules on delegation-ready todo specificity, phase design patterns for
-      code work, and verification discipline.
+      IMPORTANT: You MUST invoke read_file on `todo_guide.md` BEFORE calling
+      next_phase_todos. The tool will reject your call if you haven't. The guide contains
+      the TDD phase types, exit gates, and forbidden test patterns.
 
-      After reading the guide, create 5-10 todos for the first tactical phase.
-      Each todo must be:
-      - A concrete delegation completable in one claude_code call
-      - Specific: names exact files, the change to make, the pattern to follow,
-        and the verification command
-      - Directly advancing a deliverable from instructions.md
-      - Clear on what "done" looks like (test passes, file exists, etc.)
+      The FIRST tactical phase has `tdd_phase: spec`. Create 3-5 todos that will produce
+      spec.yaml and lock it into workspace.md. Each todo must reference tdd_phase=spec
+      and may not touch `src/` or `tests/`.
 
-      For the FIRST tactical phase, choose based on your plan:
-      - If the task is a new feature: start with the core module implementation
-      - If the task is a bug fix: start with reproducing the bug and diagnosing the root cause
-      - If the task is a refactoring: start with running the full test suite as a baseline
+      Suggested first-phase (spec) todos:
 
-      Include at least one verification todo at the end (e.g., "Run full test suite
-      and verify no regressions: pytest tests/ -v").
+      1. "Search kb_search for prior decisions related to this feature. Compile findings
+          via kb_write (type=learning, tag=spec-input)."
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with 5-10 todos.
+      2. "Write spec.yaml in the workspace root. Format:
+          - feature: <kebab-case-id>
+          - intent: <one-sentence purpose>
+          - acceptance_criteria: list of {id, ears, test_oracle}
+          - not_included: explicit scope boundaries
+          - done_when: exact commands that must pass
+          Each AC must use one of the EARS templates (Ubiquitous / Event-driven / State-driven /
+          Unwanted-behavior / Optional) and name a test_oracle path that matches this repo's
+          test layout (recorded in kb during todo 2 above)."
 
-      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead
-      of vague todos like "implement the feature" — name exact files, patterns, and
-      test commands. Instead of meta-todos about workspace management or status
-      updates — every todo must advance the actual implementation.
+      3. "Lock spec into workspace.md's PROTECTED `## Acceptance Criteria` section. Copy
+          the AC block verbatim. Initialize the traceability matrix table with each AC at
+          status `not_started`."
+
+      4. "Verify the spec against instructions.md: every required deliverable must be covered
+          by >= 1 AC. If anything is missing, add the AC; if anything is over-scoped, add
+          it to `not_included`. Confirm done_when commands exist and are runnable."
+
+      Then the SECOND strategic phase will (after reading the locked spec) set `tdd_phase: red`
+      and create todos to write the failing tests for the first AC batch.
+
+      COMPLETION CRITERIA: next_phase_todos called successfully with 3-5 todos, each
+      stamped with tdd_phase=spec.
+
+      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead of
+      creating red or green todos in the first phase — the spec must exist first. Instead
+      of writing the spec yourself in this strategic phase — strategic plans, tactical
+      writes files.

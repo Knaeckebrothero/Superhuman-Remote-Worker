@@ -18,10 +18,10 @@ data:
       window['env']['mcpUrl'] = '{{ include "srw.mcpUrl" . }}/mcp';
       window['env']['cloudUrl'] = '{{ include "srw.cloudUrl" . }}';
 
-      // OIDC SSO (works with Keycloak or any OIDC-compliant provider)
-      window['env']['keycloakUrl'] = '{{ include "srw.authUrl" . }}';
-      window['env']['keycloakRealm'] = '{{ .Values.keycloak.realm }}';
-      window['env']['keycloakClientId'] = '{{ .Values.keycloak.cockpitClientId }}';
+      // OIDC SSO is brokered by the orchestrator cookie BFF — the cockpit no
+      // longer talks to Keycloak directly. The /auth/login redirect on the
+      // API origin handles the PKCE handshake server-side. Keycloak URLs are
+      // therefore no longer surfaced to the SPA.
 
       // Model catalog is sourced from GET /api/models (system_api_keys +
       // llm_endpoints). Do not seed window.env.models here — an empty

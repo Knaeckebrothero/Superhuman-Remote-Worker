@@ -466,6 +466,36 @@ const EXPIRY_OPTIONS = [
                 />
               </app-form-field>
             </div>
+            <div class="form-row two-col">
+              <app-form-field [label]="'settings.persistent.headlessMode' | transloco">
+                <app-select
+                  [value]="paHeadlessMode() ?? ''"
+                  (changed)="paHeadlessMode.set($any($event || null))"
+                >
+                  <option value="">{{ 'settings.persistent.headlessModeDefault' | transloco }}</option>
+                  <option value="eager">{{ 'settings.persistent.headlessModeEager' | transloco }}</option>
+                  <option value="polite">{{ 'settings.persistent.headlessModePolite' | transloco }}</option>
+                </app-select>
+              </app-form-field>
+              <app-form-field
+                [label]="'settings.persistent.attentionSleep' | transloco"
+                [hint]="'settings.persistent.attentionSleepHint' | transloco"
+              >
+                <app-input
+                  type="number"
+                  [value]="paAttentionSleepText()"
+                  placeholder="60"
+                  (changed)="onPaAttentionSleepChange($event)"
+                />
+              </app-form-field>
+            </div>
+            <app-form-field [label]="'settings.persistent.notificationChannels' | transloco">
+              <div class="channel-list">
+                <app-checkbox size="sm" [checked]="paNotifEmail()" (changed)="paNotifEmail.set($event)">
+                  {{ 'settings.persistent.notificationChannelEmail' | transloco }}
+                </app-checkbox>
+              </div>
+            </app-form-field>
             <div class="actions-row">
               <app-button
                 variant="primary"
@@ -693,6 +723,15 @@ const EXPIRY_OPTIONS = [
             </div>
             <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
           </div>
+        </section>
+
+        <!-- API Keys (PATs) link card — separate page per design doc §3.4 -->
+        <section class="settings-section section-spacer">
+          <h2 class="section-title">{{ 'settings.apiKeys.linkTitle' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.apiKeys.linkDesc' | transloco }}</p>
+          <app-button variant="primary" size="md" (clicked)="goToApiKeys()">
+            {{ 'settings.apiKeys.linkManage' | transloco }}
+          </app-button>
         </section>
 
         <!-- Codex Proxy Section (Admin Only) -->
@@ -1010,7 +1049,7 @@ const EXPIRY_OPTIONS = [
     .settings-section {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
       padding: 24px;
     }
 
@@ -1032,7 +1071,7 @@ const EXPIRY_OPTIONS = [
     .section-desc code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 12px;
     }
 
@@ -1040,7 +1079,7 @@ const EXPIRY_OPTIONS = [
     .key-table, .token-table {
       margin-bottom: 20px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       overflow: hidden;
     }
 
@@ -1093,7 +1132,7 @@ const EXPIRY_OPTIONS = [
     .new-token-banner {
       background: var(--success-tint);
       border: 1px solid var(--success);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 14px;
       margin-bottom: 20px;
     }
@@ -1116,7 +1155,7 @@ const EXPIRY_OPTIONS = [
       padding: 8px 12px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary);
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
       font-size: 12px;
@@ -1174,7 +1213,7 @@ const EXPIRY_OPTIONS = [
       padding: 8px 12px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary);
       font-family: inherit;
       font-size: 13px;
@@ -1185,7 +1224,7 @@ const EXPIRY_OPTIONS = [
     /* LLM Endpoints */
     .endpoint-card {
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       padding: 12px;
       margin-bottom: 12px;
       background: var(--surface-0);
@@ -1230,7 +1269,7 @@ const EXPIRY_OPTIONS = [
     .test-result {
       font-size: 12px;
       padding: 6px 10px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       margin-bottom: 10px;
     }
 
@@ -1281,7 +1320,7 @@ const EXPIRY_OPTIONS = [
     .code-block {
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-tag);
       padding: 14px;
       padding-right: 80px;
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
@@ -1318,7 +1357,7 @@ const EXPIRY_OPTIONS = [
       padding: 12px 16px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 16px;
     }
 
@@ -1352,7 +1391,7 @@ const EXPIRY_OPTIONS = [
       gap: 12px;
       padding: 8px 14px;
       border: 1px solid var(--border-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 6px;
     }
 
@@ -1378,7 +1417,7 @@ const EXPIRY_OPTIONS = [
       padding: 4px 10px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-family: 'JetBrains Mono', 'Fira Code', monospace;
       font-size: 12px;
       color: var(--text-secondary);
@@ -1390,7 +1429,7 @@ const EXPIRY_OPTIONS = [
       padding: 16px;
       background: var(--surface-0);
       border: 1px solid var(--accent-color);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
     }
 
     .codex-callback-title {
@@ -1411,7 +1450,7 @@ const EXPIRY_OPTIONS = [
     .codex-callback-steps code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 12px;
     }
 
@@ -1438,7 +1477,7 @@ const EXPIRY_OPTIONS = [
     .codex-callback-hint code {
       background: var(--surface-0);
       padding: 2px 6px;
-      border-radius: 4px;
+      border-radius: var(--radius-tag);
       font-size: 11px;
     }
 
@@ -1523,6 +1562,15 @@ export class SettingsComponent implements OnInit {
     return v == null ? '' : String(v);
   });
   readonly paCommandAllowlist = signal('');
+  // Phase 6 headless controls. null = user has not overridden, fall back to
+  // the framework default at the agent loader / sweeper layer.
+  readonly paHeadlessMode = signal<'eager' | 'polite' | null>(null);
+  readonly paAttentionSleepMinutes = signal<number | null>(null);
+  readonly paAttentionSleepText = computed(() => {
+    const v = this.paAttentionSleepMinutes();
+    return v == null ? '' : String(v);
+  });
+  readonly paNotifEmail = signal(true);
   readonly savingPA = signal(false);
   readonly paSaved = signal(false);
 
@@ -1609,6 +1657,12 @@ export class SettingsComponent implements OnInit {
           this.paGreeting.set(pa.greeting || '');
           this.paIdleTimeout.set(pa.idle_timeout_minutes ?? null);
           this.paCommandAllowlist.set((pa.command_allowlist || []).join(', '));
+          this.paHeadlessMode.set(pa.headless_mode ?? null);
+          this.paAttentionSleepMinutes.set(pa.headless_attention_sleep_minutes ?? null);
+          // Absence ⇒ email on (matches backend default ["email"]); explicit
+          // empty array (user opted out) ⇒ off.
+          const channels = pa.notification_channels;
+          this.paNotifEmail.set(channels == null ? true : channels.includes('email'));
         }
 
         // Sync communication preferences
@@ -1702,6 +1756,10 @@ export class SettingsComponent implements OnInit {
     if (diffMs < 3600_000) return this.transloco.translate('settings.helpers.timeMinutesAgo', {n: Math.floor(diffMs / 60_000)});
     if (diffMs < 86400_000) return this.transloco.translate('settings.helpers.timeHoursAgo', {n: Math.floor(diffMs / 3600_000)});
     return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
+  }
+
+  goToApiKeys(): void {
+    this.router.navigateByUrl('/settings/api-keys');
   }
 
   mcpJsonSnippet = () => {
@@ -1918,6 +1976,15 @@ export class SettingsComponent implements OnInit {
     this.paIdleTimeout.set(Number.isFinite(n) ? n : null);
   }
 
+  onPaAttentionSleepChange(text: string): void {
+    if (text === '' || text == null) {
+      this.paAttentionSleepMinutes.set(null);
+      return;
+    }
+    const n = Number(text);
+    this.paAttentionSleepMinutes.set(Number.isFinite(n) && n >= 0 ? n : null);
+  }
+
   savePersistentAgent(): void {
     this.savingPA.set(true);
     this.paSaved.set(false);
@@ -1927,6 +1994,11 @@ export class SettingsComponent implements OnInit {
         ? allowlistText.split(',').map(s => s.trim()).filter(Boolean)
         : null;
 
+    // notification_channels: v1 only ships email. We always send an explicit
+    // list (never null) so the user's choice round-trips cleanly even when
+    // they opt out of every channel.
+    const channels: string[] = this.paNotifEmail() ? ['email'] : [];
+
     const settings: Record<string, unknown> = {
       persistent_agent: {
         model: this.paModel()?.trim() || null,
@@ -1935,6 +2007,9 @@ export class SettingsComponent implements OnInit {
         greeting: this.paGreeting().trim() || null,
         idle_timeout_minutes: this.paIdleTimeout() || null,
         command_allowlist: allowlist,
+        headless_mode: this.paHeadlessMode() || null,
+        headless_attention_sleep_minutes: this.paAttentionSleepMinutes(),
+        notification_channels: channels,
       },
     };
 

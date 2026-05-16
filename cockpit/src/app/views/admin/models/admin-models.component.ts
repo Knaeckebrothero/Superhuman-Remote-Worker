@@ -365,7 +365,7 @@ function hintsToCapabilities(
     }
     .model-row {
       background: var(--surface-0);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       color: var(--text-primary);
     }
     .mono { font-family: ui-monospace, monospace; font-size: 12px; }
@@ -374,7 +374,7 @@ function hintsToCapabilities(
       text-align: center;
       color: var(--text-muted);
       background: var(--surface-0);
-      border-radius: 6px;
+      border-radius: var(--radius-surface);
     }
     .muted { color: var(--text-muted); }
     .col-actions {
@@ -394,7 +394,7 @@ function hintsToCapabilities(
       gap: 8px 14px;
       padding: 6px 8px;
       border: 1px solid var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       background: var(--surface-0);
     }
     .cap-fieldset[disabled] { opacity: 0.6; pointer-events: none; }
@@ -410,7 +410,7 @@ function hintsToCapabilities(
     .create-form {
       padding: 16px;
       background: var(--surface-0);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
     }
     .form-row {
       display: flex;
@@ -428,7 +428,7 @@ function hintsToCapabilities(
       padding: 10px 12px;
       background: var(--app-bg);
       border: 1px dashed var(--border-color);
-      border-radius: 6px;
+      border-radius: var(--radius-surface);
     }
     .discover-actions {
       display: flex;
@@ -449,7 +449,7 @@ function hintsToCapabilities(
       padding: 4px 10px;
       background: var(--surface-0);
       border: 1px solid var(--border-color);
-      border-radius: 14px;
+      border-radius: var(--radius-pill);
       font-size: 12px;
       color: var(--text-primary);
       cursor: pointer;
@@ -468,7 +468,7 @@ function hintsToCapabilities(
     .codex-status {
       margin-bottom: 10px;
       padding: 6px 10px;
-      border-radius: 6px;
+      border-radius: var(--radius-control);
       font-size: 12px;
       line-height: 1.4;
     }

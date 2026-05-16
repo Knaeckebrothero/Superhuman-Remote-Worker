@@ -1,0 +1,41 @@
+// Typography recipes — the consumption API for primitives.
+//
+// Each mixin owns a typographic decision: which font family + casing + spacing
+// to apply for a given role. Tokens own values; recipes own decisions.
+//
+// Roman themes set the optional --letter-spacing-display and
+// --text-transform-display tokens; the recipes fall back to no-op for
+// non-Roman themes, so the same primitive renders sentence-case Inter or
+// uppercase Cinzel depending only on the active theme.
+//
+// Usage in a primitive:
+//
+//   @use '../../../styles/typography-recipes' as type;
+//
+//   .app-button[data-variant='primary'] { @include type.display; }
+//   .section-label                      { @include type.eyebrow; }
+//   .tool-args                          { @include type.mono; }
+
+// Display — primary buttons, brand surfaces. Roman themes: Cinzel + uppercase
+// + letterspaced. Non-Roman: inherits the base font, sentence case.
+@mixin display {
+  font-family: var(--font-primary);
+  letter-spacing: var(--letter-spacing-display, normal);
+  text-transform: var(--text-transform-display, none);
+  font-weight: 600;
+}
+
+// Eyebrow — section labels, kicker text above a heading. Structurally always
+// uppercase + heavily letterspaced; theme controls the font family.
+@mixin eyebrow {
+  font-family: var(--font-primary);
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+// Mono — code, tool args, debug surfaces. Theme-invariant.
+@mixin mono {
+  font-family: var(--font-mono);
+}

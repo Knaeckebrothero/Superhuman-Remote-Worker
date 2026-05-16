@@ -375,7 +375,7 @@ interface ShellPane {
       /* Messages */
       .message {
         margin-bottom: 8px;
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         overflow: hidden;
       }
 
@@ -502,7 +502,7 @@ interface ShellPane {
         margin: 8px 40px 8px 0;
         background: var(--warning-tint);
         border-left: 3px solid var(--warning);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         overflow: hidden;
       }
 
@@ -573,7 +573,7 @@ interface ShellPane {
         margin: 8px 0;
         background: var(--timeline-bg);
         border: 1px solid var(--surface-0);
-        border-radius: 8px;
+        border-radius: var(--radius-surface);
         overflow: hidden;
       }
 

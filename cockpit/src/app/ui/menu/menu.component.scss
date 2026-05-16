@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: contents;
@@ -17,8 +18,10 @@
     padding: v.$space-xs;
     background: var(--surface-2, var(--surface-1));
     border: 1px solid var(--border-color);
-    border-radius: v.$radius-md;
-    box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
+
+    @include shape.surface;
+
+    box-shadow: var(--shadow-md, 0 8px 24px rgb(0, 0, 0, 0.3));
     animation: app-menu-fade 0.12s ease-out;
   }
 }

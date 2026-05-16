@@ -11,15 +11,51 @@
 // =============================================================================
 .theme-travertine,
 .theme-senate {
-  // Display font for headings, panel titles, brand mark
+  // Display font for headings, panel titles, brand mark.
+  // --font-display is the legacy alias; new code reads --font-family-display.
   --font-display: 'Cinzel', 'Cormorant Garamond', 'Times New Roman', serif;
+  --font-family-display: var(--font-display);
 
-  // Sharp Roman radii — overrides the global radius variables when components
-  // consume CSS variables. Components using SCSS values from _variables.scss
-  // need explicit per-class overrides below.
-  --radius-sm: 0;
-  --radius-md: 0;
-  --radius-lg: 2px;
+  // Sharp Roman radii — override the primitive scale declared in
+  // _root-tokens.scss.
+  --radius-sm:   0;
+  --radius-md:   0;
+  --radius-lg:   2px;
+  --radius-xl:   0;
+
+  // --radius-full stays at the primitive default (999px) — functional circles
+  // (radio dots, switch knobs, spinners, avatars) keep their semantic shape.
+
+  // Role tokens must be re-declared here. Their var() references are resolved
+  // at computed-value time against the cascade *of the declaring element*.
+  // The :root declarations match <html> only, so var(--radius-md) there
+  // resolves against <html>'s --radius-md (the unflattened 8px) and inherits
+  // down to <body> as a pre-resolved 8px. Re-declaring under .theme-* makes
+  // the var() resolve against <body>'s cascade where the flatten lives.
+  --radius-control: var(--radius-md);
+  --radius-surface: var(--radius-md);
+  --radius-tag:     var(--radius-sm);
+  // --radius-pill aliases --radius-full (not overridden), so the :root
+  // declaration is correct everywhere — no re-decl needed.
+
+  // Typography aliases — primary surfaces pick up the display font in Roman
+  // themes. Consumed by the typography recipe mixins (Phase 2).
+  --font-primary:            var(--font-family-display);
+  --letter-spacing-display:  0.16em;
+  --text-transform-display:  uppercase;
+
+  // Inset Stamp shadow stack — the Roman primary-button treatment.
+  // Consumed by shape-recipes.scss::shape-stamp() in Phase 2.
+  //   - highlight: top inner highlight (1px, subtle warm)
+  //   - shadow:    bottom inner shadow (1px, depth)
+  //   - drop:      bottom outer accent drop (1px, "stamped" feeling)
+  //   - press:     translateY on :active (1px)
+  //   - press-shadow: inner shadow on :active (replaces the drop)
+  --stamp-highlight:    color-mix(in srgb, var(--text-primary) 8%, transparent);
+  --stamp-shadow:       color-mix(in srgb, #000 18%, transparent);
+  --stamp-drop:         color-mix(in srgb, var(--accent-color) 18%, transparent);
+  --stamp-press:        1px;
+  --stamp-press-shadow: color-mix(in srgb, #000 30%, transparent);
 
   // Brand display treatments
   .app-brand,
@@ -87,15 +123,18 @@
     border: 1px solid var(--border-color);
     background: var(--surface-0);
     color: var(--text-primary);
+
     // Top inner highlight + bottom inner shadow = pressed-into-surface look
     box-shadow:
       inset 0 1px 0 0 color-mix(in srgb, var(--text-primary) 8%, transparent),
       inset 0 -1px 0 0 color-mix(in srgb, #000 18%, transparent),
       0 1px 0 0 color-mix(in srgb, var(--accent-color) 18%, transparent);
   }
+
   .btn:hover {
     background: var(--surface-1);
   }
+
   .btn:active {
     transform: translateY(1px);
     box-shadow:
@@ -117,15 +156,9 @@
       inset 0 -1px 0 0 color-mix(in srgb, #000 28%, transparent),
       0 1px 0 0 color-mix(in srgb, var(--accent-color) 35%, transparent);
   }
+
   .btn-primary:hover {
     background: var(--accent-hover);
-  }
-
-  // Avatars — square not round
-  .avatar,
-  .agent-avatar,
-  .user-avatar {
-    border-radius: 0;
   }
 }
 

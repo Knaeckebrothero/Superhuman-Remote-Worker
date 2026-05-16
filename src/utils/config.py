@@ -271,21 +271,6 @@ def get_max_requirement_retries() -> int:
 # =============================================================================
 
 
-def get_workspace_base_path() -> str:
-    """Get base path for agent workspaces.
-
-    Priority: ENV > config file > default
-
-    Returns:
-        Base path string (empty string means use auto-detection)
-    """
-    return get_env_str(
-        "WORKSPACE_PATH",
-        ["workspace", "base_path"],
-        "",  # Empty means auto-detect in WorkspaceManager
-    )
-
-
 def get_workspace_structure() -> list[str]:
     """Get default workspace directory structure."""
     config = _get_llm_config()

@@ -9,10 +9,11 @@ import {
   CachedChatEntry,
   CachedGraphDelta,
   JobCacheMetadata,
+  ThreadCursor,
 } from '../models/cache.model';
 
 /** Current cache schema version */
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 
 /**
  * Dexie database class for cockpit cache.
@@ -23,6 +24,7 @@ class CockpitDatabase extends Dexie {
   chatEntries!: Table<CachedChatEntry>;
   graphDeltas!: Table<CachedGraphDelta>;
   jobMetadata!: Table<JobCacheMetadata>;
+  threadCursors!: Table<ThreadCursor>;
 
   constructor() {
     super('cockpit-cache');
@@ -41,6 +43,15 @@ class CockpitDatabase extends Dexie {
       graphDeltas: 'id, jobId, [jobId+index]',
       // Primary key: jobId
       jobMetadata: 'jobId',
+    });
+    this.version(3).stores({
+      // v2 tables unchanged.
+      auditEntries: 'id, jobId, [jobId+index], [jobId+stepType+index]',
+      chatEntries: 'id, jobId, [jobId+timestamp]',
+      graphDeltas: 'id, jobId, [jobId+index]',
+      jobMetadata: 'jobId',
+      // New: SSE replay cursors keyed by threadId, used by PersistentChatService.
+      threadCursors: 'threadId',
     });
   }
 }
@@ -357,6 +368,45 @@ export class IndexedDbService {
     await this.db.jobMetadata.put(metadata);
   }
 
+  // ===== Thread Cursors (SSE replay) =====
+
+  /**
+   * Look up the SSE replay cursor for a thread. Returns `null` when the
+   * cockpit hasn't seen this thread yet — caller should open the SSE stream
+   * without a `Last-Event-ID` header in that case.
+   */
+  async getThreadCursor(threadId: string): Promise<ThreadCursor | null> {
+    if (!this.db) return null;
+    const row = await this.db.threadCursors.get(threadId);
+    return row ?? null;
+  }
+
+  /**
+   * Upsert the cursor. Called for every event yielded by the SSE stream;
+   * cheap on Dexie (single-row put) and keyed by threadId so we never
+   * grow the table beyond the number of distinct threads the user has
+   * viewed.
+   */
+  async setThreadCursor(threadId: string, epoch: number, seq: number): Promise<void> {
+    if (!this.db) return;
+    await this.db.threadCursors.put({
+      threadId,
+      epoch,
+      seq,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Drop the cursor. Used when the server emits `gone_beyond_horizon` —
+   * the cockpit must reload via REST snapshot and re-subscribe with a
+   * fresh stream rather than insist on the stale cursor.
+   */
+  async deleteThreadCursor(threadId: string): Promise<void> {
+    if (!this.db) return;
+    await this.db.threadCursors.delete(threadId);
+  }
+
   // ===== Cache Management =====
 
   /**
@@ -382,6 +432,7 @@ export class IndexedDbService {
       this.db.chatEntries.clear(),
       this.db.graphDeltas.clear(),
       this.db.jobMetadata.clear(),
+      this.db.threadCursors.clear(),
     ]);
   }
 

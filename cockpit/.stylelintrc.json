@@ -1,0 +1,33 @@
+{
+  "extends": ["stylelint-config-standard-scss"],
+  "rules": {
+    "declaration-property-value-disallowed-list": {
+      "border-radius": ["/\\d+px/"],
+      "border-top-left-radius": ["/\\d+px/"],
+      "border-top-right-radius": ["/\\d+px/"],
+      "border-bottom-left-radius": ["/\\d+px/"],
+      "border-bottom-right-radius": ["/\\d+px/"]
+    },
+    "selector-class-pattern": null,
+    "scss/dollar-variable-pattern": null,
+    "scss/at-mixin-pattern": null,
+    "scss/percent-placeholder-pattern": null,
+    "scss/comment-no-empty": null,
+    "scss/no-global-function-names": null,
+    "no-descending-specificity": null,
+    "alpha-value-notation": null,
+    "color-function-notation": null,
+    "color-function-alias-notation": null,
+    "color-hex-length": null,
+    "value-keyword-case": null,
+    "font-family-no-missing-generic-family-keyword": null,
+    "declaration-block-single-line-max-declarations": null,
+    "declaration-block-no-redundant-longhand-properties": null,
+    "selector-pseudo-element-no-unknown": [true, {
+      "ignorePseudoElements": ["ng-deep"]
+    }],
+    "selector-pseudo-class-no-unknown": [true, {
+      "ignorePseudoClasses": ["host", "host-context", "ng-deep"]
+    }]
+  }
+}

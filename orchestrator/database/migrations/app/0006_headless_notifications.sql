@@ -1,0 +1,121 @@
+-- migration:     0006_headless_notifications.sql
+-- description:   Magic-link tokens + per-thread notification log for headless
+--                persistent sessions.
+--
+--                Phase 4 of headless persistent sessions
+--                (docs/features/headless_persistent_sessions.md). When the
+--                agent's permission_check fires and no client is attached
+--                (or hasn't been for >30s), the permission-pending
+--                watcher emits an email with two magic-links: approve
+--                and deny. Clicking either lands on a confirmation page
+--                (GET) that POSTs back to consume the token and UPDATE
+--                the thread_permission_requests row.
+--
+--                Two tables:
+--                  magic_link_tokens — opaque random tokens (hashed in
+--                    DB), bound to a specific approval_id, single-use,
+--                    30-min TTL. Stored as SHA-256 hashes — the plaintext
+--                    is only visible inside the email body.
+--                  thread_notifications — dedup + rate-limit log. Coalesce
+--                    by (thread_id, request_id) so the same approval
+--                    isn't emailed twice in quick succession; rate-limit
+--                    per thread to avoid spam (5/hr, 1/5min).
+-- depends-on:    0005_thread_permission_requests.sql
+-- expected:      < 1s. Two CREATE TABLE, four indexes. All metadata-only.
+-- locks:         AccessExclusiveLock briefly per CREATE TABLE.
+-- transactional: yes
+
+BEGIN;
+SET LOCAL lock_timeout                        = '2s';
+SET LOCAL statement_timeout                   = '15min';
+SET LOCAL idle_in_transaction_session_timeout = '5min';
+
+-- Magic-link tokens. The user receives the raw token inside an email
+-- href; the database only ever stores its SHA-256 hash. On click the
+-- handler hashes the incoming token and looks it up. Single-use is
+-- enforced via CAS UPDATE used_at IS NULL.
+CREATE TABLE IF NOT EXISTS magic_link_tokens (
+    id                 UUID         PRIMARY KEY DEFAULT uuid_generate_v4(),
+    token_hash         TEXT         NOT NULL UNIQUE,
+    purpose            TEXT         NOT NULL,
+    user_id            UUID         REFERENCES users(id) ON DELETE CASCADE,
+    approval_id        UUID         REFERENCES thread_permission_requests(id)
+                                    ON DELETE CASCADE,
+    thread_id          UUID         REFERENCES threads(id) ON DELETE CASCADE,
+    intended_decision  TEXT         CHECK (
+                                        intended_decision IS NULL
+                                        OR intended_decision IN ('approved', 'denied')
+                                    ),
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    expires_at         TIMESTAMPTZ  NOT NULL,
+    used_at            TIMESTAMPTZ,
+    consumed_decision  TEXT
+);
+
+-- Hot path: GET / POST /magic/approve/{token} hashes the incoming token
+-- and looks up by token_hash. Unique already enforced via constraint;
+-- explicit index for clarity.
+CREATE INDEX IF NOT EXISTS idx_mlt_token_hash
+    ON magic_link_tokens (token_hash);
+
+-- Expiry sweep: find unused tokens past their TTL.
+CREATE INDEX IF NOT EXISTS idx_mlt_unused_expiry
+    ON magic_link_tokens (expires_at)
+    WHERE used_at IS NULL;
+
+-- All-tokens-for-a-request view (debugging / "find the approval link I
+-- sent" recovery flow).
+CREATE INDEX IF NOT EXISTS idx_mlt_approval
+    ON magic_link_tokens (approval_id, created_at DESC)
+    WHERE approval_id IS NOT NULL;
+
+COMMENT ON TABLE magic_link_tokens IS
+    'Opaque single-use tokens for email magic-links. Plaintext lives only '
+    'in the email body; DB stores SHA-256 hashes. See '
+    'docs/features/headless_persistent_sessions.md §4.';
+COMMENT ON COLUMN magic_link_tokens.token_hash IS
+    'SHA-256 of the raw token bytes (hex-encoded).';
+COMMENT ON COLUMN magic_link_tokens.intended_decision IS
+    'For approve/deny links: the action this specific token authorizes. '
+    'Some flows emit one token per decision, others ask the user to pick '
+    'on the confirmation page.';
+COMMENT ON COLUMN magic_link_tokens.used_at IS
+    'Single-use enforcement: CAS UPDATE ... WHERE used_at IS NULL.';
+
+-- Per-thread notification audit + dedup log. Every outbound email from
+-- the headless notification watcher writes a row here. The watcher
+-- consults this table to decide whether to (a) skip a request that
+-- already has an email out (dedup on thread_id, request_id) and (b)
+-- respect the per-thread rate limit (5/hr, 1/5min).
+CREATE TABLE IF NOT EXISTS thread_notifications (
+    id               BIGSERIAL    PRIMARY KEY,
+    thread_id        UUID         NOT NULL REFERENCES threads(id)
+                                  ON DELETE CASCADE,
+    request_id       UUID         REFERENCES thread_permission_requests(id)
+                                  ON DELETE SET NULL,
+    kind             TEXT         NOT NULL,
+    sent_at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    delivery_status  TEXT,
+    email_to         TEXT,
+    metadata         JSONB        NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- Dedup hot path: "has this (thread, request) already been emailed?"
+CREATE INDEX IF NOT EXISTS idx_tn_thread_request
+    ON thread_notifications (thread_id, request_id)
+    WHERE request_id IS NOT NULL;
+
+-- Rate-limit hot path: "how many emails to this thread in the last N?"
+CREATE INDEX IF NOT EXISTS idx_tn_thread_sent
+    ON thread_notifications (thread_id, sent_at DESC);
+
+COMMENT ON TABLE thread_notifications IS
+    'Audit + dedup + rate-limit log for headless-session emails. One row '
+    'per outbound email regardless of delivery status.';
+COMMENT ON COLUMN thread_notifications.kind IS
+    'Notification kind: permission_pending, agent_paused, error, etc.';
+COMMENT ON COLUMN thread_notifications.delivery_status IS
+    'sent | failed | skipped_rate_limit | skipped_dedup. Skipped rows '
+    'are still recorded for observability.';
+
+COMMIT;

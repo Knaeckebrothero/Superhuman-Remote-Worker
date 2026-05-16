@@ -257,7 +257,7 @@ interface Project {
       padding: 10px 14px;
       background: var(--success-tint);
       border: 1px solid var(--success);
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 16px;
       cursor: pointer;
       font-size: 13px;
@@ -297,7 +297,7 @@ interface Project {
       padding: 16px;
       background: var(--panel-bg, var(--panel-bg));
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       margin-bottom: 16px;
     }
 
@@ -337,7 +337,7 @@ interface Project {
       align-items: center;
       padding: 12px;
       border: 1px solid var(--border-color, var(--surface-0));
-      border-radius: 8px;
+      border-radius: var(--radius-surface);
       background: var(--panel-bg, var(--panel-bg));
       margin-bottom: 8px;
       transition: border-color 0.15s ease;
@@ -381,7 +381,7 @@ interface Project {
     .session-config {
       font-size: 10px;
       padding: 1px 6px;
-      border-radius: 3px;
+      border-radius: var(--radius-tag);
       background: var(--surface-0, var(--surface-0));
       color: var(--text-muted, #6c7086);
       flex-shrink: 0;

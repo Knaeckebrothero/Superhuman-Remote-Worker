@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: contents;
@@ -8,7 +9,7 @@
   position: fixed;
   inset: 0;
   z-index: v.$z-modal;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgb(0, 0, 0, 0.55);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -21,9 +22,12 @@
 
 .app-dialog__container {
   position: relative;
+
+  --dialog-radius: var(--radius-lg);  // Dialogs keep the larger primitive — feels more "important" than other surfaces. Roman themes flatten via --radius-lg = 2px.
+
   background: var(--panel-bg);
   border: 1px solid var(--border-color);
-  border-radius: v.$radius-lg;
+  border-radius: var(--dialog-radius);
   box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
@@ -72,7 +76,9 @@
   cursor: pointer;
   width: 28px;
   height: 28px;
-  border-radius: v.$radius-sm;
+
+  @include shape.control;
+
   font-size: 22px;
   line-height: 1;
   display: inline-flex;
@@ -87,6 +93,7 @@
   }
 
   &:focus { outline: none; }
+
   &:focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 2px;
@@ -126,6 +133,7 @@
     opacity: 0;
     transform: translateY(8px) scale(0.98);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);

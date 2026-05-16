@@ -1,4 +1,6 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
+@use '../../../styles/typography-recipes' as type;
 
 :host {
   display: inline-block;
@@ -16,6 +18,11 @@
   justify-content: center;
   gap: v.$space-xs;
   position: relative;
+
+  // Shape — component-local override surface, defaults to the control role.
+  --btn-radius: var(--radius-control);
+
+  border-radius: var(--btn-radius);
 
   // Reset / typography
   appearance: none;
@@ -48,35 +55,41 @@
     opacity: 0.5;
   }
 
-  // --- Sizes ---
+  // --- Sizes (radius unified via --btn-radius above) ---
   &[data-size='sm'] {
     height: 28px;
     padding: 0 v.$space-sm;
     font-size: v.$font-size-xs;
-    border-radius: v.$radius-sm;
   }
 
   &[data-size='md'] {
     height: 36px;
     padding: 0 v.$space-md;
     font-size: v.$font-size-sm;
-    border-radius: v.$radius-md;
   }
 
   &[data-size='lg'] {
     height: 44px;
     padding: 0 v.$space-lg;
     font-size: v.$font-size-base;
-    border-radius: v.$radius-md;
   }
 
   // Full-width takes the host's width.
   :host[data-full-width] & { width: 100%; }
 
   // --- Variants ---
+  // The shape.stamp mixin renders to no-op under non-Roman themes (tokens
+  // unset → transparent shadows). Roman themes set --stamp-* in
+  // _shape-overrides.scss and the visual fires. Tinted variants get the
+  // 'soft' variant because the dark inner shadow muddies on translucent
+  // fills. Ghost has no stamp — transparent button doesn't carry a stamp.
+
   &[data-variant='primary'] {
+    @include shape.stamp;
+    @include type.display;
+
     background: var(--accent-color);
-    color: var(--timeline-bg);
+    color: var(--on-accent);
     border-color: var(--accent-color);
 
     &:hover:not(:disabled) {
@@ -90,6 +103,8 @@
   }
 
   &[data-variant='secondary'] {
+    @include shape.stamp;
+
     background: var(--surface-0);
     color: var(--text-primary);
     border-color: var(--border-color);
@@ -119,8 +134,10 @@
   }
 
   &[data-variant='danger'] {
+    @include shape.stamp;
+
     background: var(--danger);
-    color: var(--timeline-bg);
+    color: var(--on-danger);
     border-color: var(--danger);
 
     &:hover:not(:disabled) {
@@ -133,8 +150,10 @@
   }
 
   &[data-variant='success'] {
+    @include shape.stamp;
+
     background: var(--success);
-    color: var(--timeline-bg);
+    color: var(--on-success);
     border-color: var(--success);
 
     &:hover:not(:disabled) {
@@ -147,6 +166,8 @@
   }
 
   &[data-variant='warning'] {
+    @include shape.stamp('soft');
+
     background: var(--warning-tint);
     color: var(--warning);
     border-color: var(--warning-tint);
@@ -161,8 +182,10 @@
   }
 
   &[data-variant='info'] {
+    @include shape.stamp;
+
     background: var(--info);
-    color: var(--timeline-bg);
+    color: var(--on-info);
     border-color: var(--info);
 
     &:hover:not(:disabled) {
@@ -195,9 +218,11 @@
   position: absolute;
   width: 14px;
   height: 14px;
-  border: 2px solid currentColor;
+  border: 2px solid currentcolor;
   border-right-color: transparent;
-  border-radius: 50%;
+
+  @include shape.circle;
+
   animation: app-button-spin 0.7s linear infinite;
 }
 

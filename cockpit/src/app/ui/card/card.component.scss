@@ -1,8 +1,13 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: block;
-  border-radius: v.$radius-md;
+
+  --card-radius: var(--radius-surface);
+
+  @include shape.surface;
+
   border: 1px solid var(--border-color);
   background: var(--surface-0);
   color: var(--text-primary);

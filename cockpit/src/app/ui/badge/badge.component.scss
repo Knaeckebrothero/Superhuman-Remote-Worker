@@ -1,10 +1,10 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-flex;
   align-items: center;
   gap: v.$space-xs;
-
   font-family: inherit;
   font-weight: v.$font-weight-bold;
   line-height: 1;
@@ -31,8 +31,8 @@
   }
 
   // --- Shape ---
-  &[data-shape='rounded'] { border-radius: v.$radius-sm; }
-  &[data-shape='pill']    { border-radius: v.$radius-xl; }
+  &[data-shape='rounded'] { @include shape.tag; }
+  &[data-shape='pill']    { @include shape.pill; }
 
   // --- Uppercase modifier ---
   &[data-uppercase] {
@@ -49,6 +49,7 @@
       background: var(--surface-0);
       color: var(--text-muted);
     }
+
     &[data-appearance='solid'] {
       background: var(--surface-2);
       color: var(--text-primary);
@@ -60,9 +61,10 @@
       background: var(--hover);
       color: var(--accent-color);
     }
+
     &[data-appearance='solid'] {
       background: var(--accent-color);
-      color: var(--timeline-bg);
+      color: var(--on-accent);
     }
   }
 
@@ -71,9 +73,10 @@
       background: var(--success-tint);
       color: var(--success);
     }
+
     &[data-appearance='solid'] {
       background: var(--success);
-      color: var(--timeline-bg);
+      color: var(--on-success);
     }
   }
 
@@ -82,9 +85,10 @@
       background: var(--warning-tint);
       color: var(--warning);
     }
+
     &[data-appearance='solid'] {
       background: var(--warning);
-      color: var(--timeline-bg);
+      color: var(--on-warning);
     }
   }
 
@@ -93,6 +97,7 @@
       background: var(--alert-tint);
       color: var(--alert);
     }
+
     &[data-appearance='solid'] {
       background: var(--alert);
       color: var(--timeline-bg);
@@ -104,9 +109,10 @@
       background: var(--info-tint);
       color: var(--info);
     }
+
     &[data-appearance='solid'] {
       background: var(--info);
-      color: var(--timeline-bg);
+      color: var(--on-info);
     }
   }
 
@@ -115,9 +121,10 @@
       background: var(--danger-tint);
       color: var(--danger);
     }
+
     &[data-appearance='solid'] {
       background: var(--danger);
-      color: var(--timeline-bg);
+      color: var(--on-danger);
     }
   }
 }

@@ -1,53 +1,216 @@
 """Authentication for the orchestrator API.
 
-Three auth paths:
-1. Bearer token (OIDC) — Keycloak access token from the cockpit
-2. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged)
-3. X-MCP-User-Id + X-Internal-Key — forwarded by the MCP server after
+Four auth paths, tried in this order:
+1. ``srw_session`` cookie — cookie BFF; mid-stream access-token refresh is
+   transparent. See docs/features/auth_bff_and_api_tokens.md.
+2. Bearer token (OIDC) — Keycloak access token. Transitional during the
+   cockpit cutover; will remain for direct API consumers and for tests.
+3. X-MCP-Token — API tokens for Claude Code / CLI clients (unchanged).
+4. X-MCP-User-Id + X-Internal-Key — forwarded by the MCP server after
    it has already authenticated the caller via OAuth or API token.
 
-Session-based auth has been replaced by Keycloak OIDC (Phase 2).
+Cookie-path additions are purely additive — the function signature and
+the ~86 inline ``await require_approved_user(request, db)`` call sites
+do not change.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
+from datetime import datetime, timedelta, UTC
 
 from fastapi import HTTPException, Request
+from security.kc_client import KeycloakClientError, kc_bff_client
 from security.oidc import oidc_validator
 
 logger = logging.getLogger(__name__)
 
+SESSION_COOKIE = "srw_session"
+
+
+# Knobs read fresh on each request (so the orchestrator picks up env edits
+# without restart). Caller cost is one os.getenv per request which is
+# trivially cheap.
+def _idle_timeout() -> timedelta:
+    return timedelta(seconds=int(os.getenv("SRW_SESSION_IDLE_TIMEOUT_S", "1800")))
+
+
+def _refresh_skew() -> timedelta:
+    return timedelta(seconds=int(os.getenv("SRW_ACCESS_TOKEN_REFRESH_SKEW_S", "60")))
+
+
+# Identity claims that live in the id token (per OIDC spec). When the access
+# token's mappers don't include them — KC 24+ default for `sub` — we lift them
+# from id token claims into the dict passed to `_resolve_user_from_claims`.
+_ID_TOKEN_IDENTITY_FIELDS = (
+    "sub",
+    "email",
+    "preferred_username",
+    "name",
+    "email_verified",
+)
+
+
+def _merge_identity_claims(access_claims: dict, id_claims: dict | None) -> dict:
+    """Return access_claims augmented with id-token identity fields.
+
+    Existing access_claims values win on overlap. Used by both the BFF
+    callback and the per-request cookie validator so the rest of the
+    auth code (e.g. `_resolve_user_from_claims`) can keep reading a
+    single dict regardless of which client's mappers ran.
+    """
+    if not id_claims:
+        return access_claims
+    merged = dict(access_claims)
+    for key in _ID_TOKEN_IDENTITY_FIELDS:
+        if key not in merged and key in id_claims:
+            merged[key] = id_claims[key]
+    return merged
+
 
 async def get_current_user(request: Request, db) -> dict:
-    """FastAPI dependency: extract current user from Bearer token.
+    """FastAPI dependency: resolve the current user.
 
-    Validates the Keycloak access token from the Authorization header,
-    then looks up (or JIT-provisions) the local user row.
+    Order of attempts:
+      1. ``srw_session`` cookie (BFF) — server-side refresh of the stored
+         access token when it's within the refresh skew window.
+      2. ``Authorization: Bearer <jwt>`` — Keycloak access token directly.
+      3. MCP internal header auth (X-MCP-User-Id + X-Internal-Key).
 
     Returns the full user record (id, display_name, avatar_color, email,
     default_project_id, is_admin, is_approved, keycloak_sub, created_at).
-
-    The ``is_approved`` flag is derived from the Keycloak token's realm roles
-    (``user`` or ``admin``).  It is NOT stored in the database — it is
-    recomputed on every request so that granting/revoking the role in Keycloak
-    takes effect immediately.
+    The ``is_approved`` flag is derived from the access token's realm
+    roles on every request, so granting/revoking the role in Keycloak
+    takes effect immediately (cookie path: at most one ``access_token``
+    refresh later).
 
     Raises:
-        HTTPException 401 if not authenticated or token is invalid
+        HTTPException 401 if not authenticated or all paths fail.
     """
+    # Path 1: cookie BFF.
+    session_id = request.cookies.get(SESSION_COOKIE)
+    if session_id:
+        user = await _resolve_from_cookie(session_id, db)
+        if user is not None:
+            return user
+        # Invalid/expired cookie: fall through. The cookie itself will be
+        # cleared on the next /auth/me response (the SPA refreshes via the
+        # interceptor's 401 handler).
+
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
-        # Fallback: MCP internal header auth (the MCP server has already
-        # authenticated the caller and forwards the resolved user ID).
+        # Path 3: MCP internal header auth.
         return await _get_user_from_mcp_headers(request, db)
 
+    # Path 2: Bearer dispatch — PAT / legacy MCP / Keycloak JWT all share
+    # this header. Shape-based: three-dot tokens are JWTs; ak_ are PATs;
+    # srw_ are MCP tokens (now landing in auth_tokens with kind='mcp');
+    # anything else is a malformed credential.
     token = auth_header[7:]
-    claims = oidc_validator.validate_token(token)
-    if not claims:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if token.startswith("ak_"):
+        return await _resolve_pat(token, request, db)
+    if token.startswith("srw_"):
+        return await _resolve_legacy_mcp_token(token, request, db)
+    if token.count(".") == 2:
+        claims = oidc_validator.validate_token(token)
+        if not claims:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        return await _resolve_user_from_claims(claims, db)
+    raise HTTPException(status_code=401, detail="Unrecognized token format")
 
-    # JIT provision: find or create local user from Keycloak sub
+
+async def _resolve_from_cookie(session_id: str, db) -> dict | None:
+    """Validate a BFF session cookie. Returns user dict or None.
+
+    None signals "fall through to other auth paths"; we don't raise here
+    so that legacy Bearer clients with a stale cookie still work. The
+    cookie gets cleared via the standard /auth/me round-trip.
+
+    Refreshes the stored access token mid-session when it's within
+    ``SRW_ACCESS_TOKEN_REFRESH_SKEW_S`` of expiry. A refresh failure
+    (KC down, refresh token revoked) deletes the session row and
+    returns None.
+    """
+    sess = await db.get_srw_session(session_id)
+    if not sess:
+        return None
+    now = datetime.now(UTC)
+    if sess["absolute_expires_at"] <= now:
+        # Past absolute lifetime — refresh attempts would just bounce.
+        await db.delete_srw_session(session_id)
+        return None
+    if sess["last_seen_at"] + _idle_timeout() <= now:
+        await db.delete_srw_session(session_id)
+        return None
+
+    access_token = sess["access_token"]
+    if sess["access_expires_at"] - now <= _refresh_skew():
+        access_token = await _refresh_session_in_place(sess, db)
+        if access_token is None:
+            return None
+
+    claims = oidc_validator.validate_token(access_token)
+    if not claims:
+        # Stored access token won't validate (signing key rotated?). Kill
+        # the session so the user re-authenticates cleanly.
+        await db.delete_srw_session(session_id)
+        return None
+
+    # KC 24+ default doesn't put `sub` in the access token unless a client-
+    # local mapper enables it; the id token always carries `sub` per OIDC.
+    # Merge identity fields from the stored id_token so downstream user
+    # resolution works regardless of the client's mapper config.
+    id_claims = oidc_validator.decode_id_token(sess["id_token"]) or {}
+    claims = _merge_identity_claims(claims, id_claims)
+    if "sub" not in claims:
+        logger.warning("Session %s tokens have no sub claim — killing", session_id)
+        await db.delete_srw_session(session_id)
+        return None
+
+    # Bump idle anchor. Fire-and-forget — this is a hot path and the next
+    # request's view of last_seen_at is allowed to lag by a few ms.
+    asyncio.create_task(db.touch_srw_session_last_seen(session_id))
+
+    return await _resolve_user_from_claims(claims, db)
+
+
+async def _refresh_session_in_place(sess: dict, db) -> str | None:
+    """Refresh KC tokens and write them back to the session row.
+
+    Returns the new access token on success; None if the refresh fails
+    (and the caller should treat the session as dead).
+    """
+    try:
+        tokens = await kc_bff_client.refresh(sess["refresh_token"])
+    except KeycloakClientError as e:
+        logger.info("Session %s refresh failed (%s) — deleting", sess["id"], e)
+        await db.delete_srw_session(sess["id"])
+        return None
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token") or sess["refresh_token"]
+    expires_in = tokens.get("expires_in")
+    if not access_token or not expires_in:
+        logger.warning("Session %s refresh returned malformed payload", sess["id"])
+        await db.delete_srw_session(sess["id"])
+        return None
+    new_access_expires_at = datetime.now(UTC) + timedelta(seconds=int(expires_in))
+    await db.refresh_srw_session_tokens(
+        sess["id"],
+        access_token=access_token,
+        refresh_token=refresh_token,
+        access_expires_at=new_access_expires_at,
+        id_token=tokens.get("id_token"),
+    )
+    return access_token
+
+
+async def _resolve_user_from_claims(claims: dict, db) -> dict:
+    """JIT-provision (or sync) the local user row from Keycloak claims.
+
+    Shared between cookie and Bearer paths. ``is_approved`` and
+    ``preferred_username`` are attached as transient fields (not in DB).
+    """
     sub = claims["sub"]
     email = claims.get("email", "")
     display_name = (
@@ -62,7 +225,6 @@ async def get_current_user(request: Request, db) -> dict:
 
     user = await db.get_user_by_keycloak_sub(sub)
     if user:
-        # Sync fields that may have changed in Keycloak (e.g. email added later)
         needs_update = {}
         if email and (not user.get("email") or user["email"] != email):
             needs_update["email"] = email
@@ -84,12 +246,11 @@ async def get_current_user(request: Request, db) -> dict:
             logger.info(
                 "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
             )
-        # Attach transient approval flag + preferred_username (not stored in DB)
         user["is_approved"] = is_approved
         user["preferred_username"] = claims.get("preferred_username")
         return user
 
-    # First login — create local user row
+    # First login — create local user row + seed cloud/Gitea in the background.
     user = await db.upsert_user_from_oidc(
         sub=sub,
         email=email,
@@ -103,10 +264,6 @@ async def get_current_user(request: Request, db) -> dict:
         is_admin,
         is_approved,
     )
-    # Seed the main-cloud user record so the first session folder share
-    # doesn't race the user's first browser login to the cloud. Fire-and-
-    # forget: cloud reachability must not gate SSO, and the share path
-    # still falls back to lazy resolution if this misses.
     asyncio.create_task(
         _ensure_cloud_user(
             sub=sub,
@@ -116,11 +273,6 @@ async def get_current_user(request: Request, db) -> dict:
             preferred_username=claims.get("preferred_username"),
         )
     )
-    # Same treatment for Gitea — without this, the first thread created
-    # immediately after cockpit login hits a race where grant_user_repo_access
-    # can't find the user in Gitea yet (OIDC auto-registration only happens
-    # on first direct Gitea visit), leaving the thread repo invisible
-    # behind Gitea's 404-for-private-repos-you-can't-see behavior.
     asyncio.create_task(
         _ensure_gitea_user(
             sub=sub,
@@ -129,12 +281,89 @@ async def get_current_user(request: Request, db) -> dict:
             display_name=display_name,
         )
     )
-    # Attach transient approval flag (not stored in DB) plus preferred_username
-    # from the claim — downstream handlers (e.g. thread creation) pass this to
-    # Gitea so ensure_user can provision with the correct login_name.
     user["is_approved"] = is_approved
     user["preferred_username"] = claims.get("preferred_username")
     return user
+
+
+async def _resolve_pat(token: str, request: Request, db) -> dict:
+    """Resolve a `ak_<…>` Personal Access Token against ``auth_tokens``.
+
+    Hashes the token, checks the kind matches the prefix (so a hash that
+    somehow showed up against a kind='mcp' row cannot impersonate a PAT),
+    enforces revocation/expiry, and fires a non-blocking touch to update
+    ``last_used_at`` + ``last_used_ip`` for audit/UX.
+
+    Returns the user dict with ``auth_method='pat'``, ``scopes`` (the
+    PAT's action scopes from the row), and ``token_id`` for downstream
+    introspection. ``is_approved`` is forced True — a PAT could only have
+    been issued by an already-approved user via the cockpit, so role
+    revocation that follows would need to revoke the token, not silently
+    leave it usable.
+    """
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    row = await db.get_auth_token_by_hash(digest)
+    if not row or row["kind"] != "api":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.get_user(str(row["user_id"]))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    asyncio.create_task(
+        db.touch_auth_token(str(row["id"]), _client_ip(request)),
+    )
+    user["auth_method"] = "pat"
+    user["scopes"] = list(row.get("scopes") or [])
+    user["token_id"] = str(row["id"])
+    user["is_approved"] = True
+    return user
+
+
+async def _resolve_legacy_mcp_token(token: str, request: Request, db) -> dict:
+    """Resolve a legacy `srw_<…>` MCP token directly against ``auth_tokens``.
+
+    The MCP server's own TokenVerifier still routes through
+    ``/api/internal/mcp-token-verify`` which calls
+    ``get_mcp_token_by_hash`` + ``update_mcp_token_last_used``. This path
+    is for callers that hit the orchestrator API *directly* with an MCP
+    token in the Authorization header — the consolidated auth surface
+    advertised in the design doc.
+
+    Forces ``is_approved=True`` for the same reason as ``_resolve_pat``.
+    """
+    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    row = await db.get_auth_token_by_hash(digest)
+    if not row or row["kind"] != "mcp":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user = await db.get_user(str(row["user_id"]))
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    asyncio.create_task(
+        db.touch_auth_token(str(row["id"]), _client_ip(request)),
+    )
+    user["auth_method"] = "mcp"
+    # MCP scope semantics differ from PAT scopes — `scope` is a single
+    # string ('user'/'all'/'project:<uuid>'). Surface as a single-element
+    # list so downstream scope-aware code can treat both kinds uniformly.
+    legacy_scope = row.get("scope") or ""
+    user["scopes"] = [legacy_scope] if legacy_scope else []
+    user["token_id"] = str(row["id"])
+    user["is_approved"] = True
+    return user
+
+
+def _client_ip(request: Request) -> str | None:
+    """Best-effort client IP for audit logging.
+
+    Behind ingress, ``request.client.host`` is the ingress pod IP; the
+    real client lives in ``X-Forwarded-For``'s leftmost entry. We accept
+    a single forwarded hop because that's what our nginx ingress sets.
+    Multi-hop XFF chains are out of scope.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or None
+    client = getattr(request, "client", None)
+    return client.host if client else None
 
 
 async def _ensure_cloud_user(
@@ -246,6 +475,22 @@ async def require_approved_user(request: Request, db) -> dict:
     return user
 
 
+async def resolve_ws_user(ws, db) -> dict | None:
+    """WebSocket auth: resolve the user from the ``srw_session`` cookie.
+
+    WebSockets can't carry custom Authorization headers in browsers, so the
+    cookie BFF is the only practical path for cockpit-initiated WS. Returns
+    the user dict on success (with ``is_approved`` set), or None if the
+    cookie is missing/invalid. The caller is expected to ``ws.close(4401)``
+    on None — we don't take the WS state here, callers vary in whether
+    they've already accepted.
+    """
+    session_id = ws.cookies.get(SESSION_COOKIE)
+    if not session_id:
+        return None
+    return await _resolve_from_cookie(session_id, db)
+
+
 async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:
     """Background task that cleans up expired MCP tokens every hour."""
     logger.info("Token cleanup task started")
@@ -263,3 +508,28 @@ async def cleanup_expired_tokens(db, shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Token cleanup task stopped")
+
+
+async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
+    """Background task: prune dead BFF session rows and consumed pre-auth state.
+
+    Hourly cadence matches cleanup_expired_tokens. Idle-timeout enforcement
+    is handled by the per-request validator; this loop only removes rows
+    past absolute lifetime / 7-day revocation tail.
+    """
+    logger.info("BFF session cleanup task started")
+    while not shutdown_event.is_set():
+        try:
+            await db.cleanup_expired_srw_sessions()
+            await db.cleanup_expired_srw_pre_auth()
+            logger.debug("Expired BFF sessions / pre-auth state cleanup completed")
+        except Exception as e:
+            logger.error("Error cleaning up BFF sessions: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=3600.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("BFF session cleanup task stopped")

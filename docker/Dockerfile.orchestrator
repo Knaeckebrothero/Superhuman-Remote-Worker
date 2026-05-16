@@ -44,10 +44,13 @@ RUN groupadd -r srw && useradd -r -g srw srw
 
 WORKDIR /app
 
-# Install runtime dependencies only
+# Install runtime dependencies only.
+# openssh-client is required by services/snapshot_service.py to capture
+# workspace tarballs from agent VMs over SSH before pod teardown.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder (system-owned, read-only is fine)

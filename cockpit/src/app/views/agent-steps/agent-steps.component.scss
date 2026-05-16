@@ -1,6 +1,8 @@
 // Agent Steps Component — collapsible thinking panel
 // Uses cockpit Catppuccin Mocha variables directly
 
+@use '../../../styles/shape-recipes' as shape;
+
 :host {
   display: block;
   margin-bottom: 4px;
@@ -11,7 +13,9 @@
   height: 16px;
   border: 2px solid color-mix(in srgb, var(--accent-color) 20%, transparent);
   border-top-color: var(--accent-color, #cba6f7);
-  border-radius: 50%;
+
+  @include shape.circle;
+
   animation: spin 0.7s linear infinite;
   flex-shrink: 0;
 }
@@ -21,9 +25,11 @@
 }
 
 .agent-steps-panel {
-  background: rgba(139, 92, 246, 0.06);
-  border: 1px solid rgba(139, 92, 246, 0.15);
-  border-radius: 8px;
+  background: rgb(139, 92, 246, 0.06);
+  border: 1px solid rgb(139, 92, 246, 0.15);
+
+  @include shape.surface;
+
   overflow: hidden;
 
   &.is-processing {
@@ -51,7 +57,7 @@
     }
 
     &:hover {
-      background: rgba(139, 92, 246, 0.08);
+      background: rgb(139, 92, 246, 0.08);
     }
   }
 
@@ -109,7 +115,8 @@
   overflow-y: auto;
 
   .step-item {
-    border-radius: 6px;
+    @include shape.surface;
+
     overflow: hidden;
 
     &.step-current {
@@ -134,7 +141,9 @@
       cursor: pointer;
       user-select: none;
       list-style: none;
-      border-radius: 6px;
+
+      @include shape.control;
+
       color: var(--text-primary, #cdd6f4);
       font-size: 11px;
 
@@ -143,13 +152,15 @@
       }
 
       &:hover {
-        background: rgba(255, 255, 255, 0.04);
+        background: rgb(255, 255, 255, 0.04);
       }
 
       .step-icon-wrapper {
         width: 22px;
         height: 22px;
-        border-radius: 6px;
+
+        @include shape.tag;
+
         display: flex;
         align-items: center;
         justify-content: center;
@@ -186,23 +197,24 @@
       line-height: 1.4;
       color: var(--text-muted, #6c7086);
       white-space: pre-wrap;
-      word-break: break-word;
+      overflow-wrap: break-word;
       max-height: 200px;
       overflow-y: auto;
 
       .step-code {
         background: var(--timeline-bg, #11111b);
         padding: 8px;
-        border-radius: 6px;
-        overflow-x: auto;
+
+        @include shape.tag;
+
+        overflow: auto;
         font-size: 11px;
         font-family: 'JetBrains Mono', 'Fira Code', monospace;
         margin: 0;
         white-space: pre-wrap;
-        word-break: break-word;
+        overflow-wrap: break-word;
         border: 1px solid var(--border-color, #313244);
         max-height: 200px;
-        overflow-y: auto;
       }
 
       .step-text {

@@ -1,4 +1,5 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: contents;
@@ -24,10 +25,12 @@
   min-width: 240px;
   max-width: 400px;
   padding: 10px 12px;
-  border-radius: v.$radius-md;
+
+  @include shape.surface;
+
   background: var(--surface-2, var(--surface-1));
   border: 1px solid var(--border-color);
-  box-shadow: var(--shadow-md, 0 8px 24px rgba(0, 0, 0, 0.3));
+  box-shadow: var(--shadow-md, 0 8px 24px rgb(0, 0, 0, 0.3));
   font-size: v.$font-size-sm;
   line-height: v.$line-height-base;
   color: var(--text-primary);
@@ -35,25 +38,28 @@
 
   &[data-tone='success'] {
     border-color: var(--success, #a6e3a1);
-    background: var(--success-tint, rgba(166, 227, 161, 0.12));
+    background: var(--success-tint, rgb(166, 227, 161, 0.12));
   }
+
   &[data-tone='warning'] {
     border-color: var(--warning, #f9e2af);
-    background: var(--warning-tint, rgba(249, 226, 175, 0.12));
+    background: var(--warning-tint, rgb(249, 226, 175, 0.12));
   }
+
   &[data-tone='danger'] {
     border-color: var(--danger, #f38ba8);
-    background: var(--danger-tint, rgba(243, 139, 168, 0.12));
+    background: var(--danger-tint, rgb(243, 139, 168, 0.12));
   }
+
   &[data-tone='info'] {
     border-color: var(--info, #89b4fa);
-    background: var(--info-tint, rgba(137, 180, 250, 0.12));
+    background: var(--info-tint, rgb(137, 180, 250, 0.12));
   }
 }
 
 .app-toast__message {
   flex: 1;
-  word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 
 .app-toast__close {
@@ -65,9 +71,11 @@
   font-size: 18px;
   line-height: 1;
   padding: 0 4px;
-  border-radius: v.$radius-sm;
+
+  @include shape.control;
 
   &:hover { color: var(--text-primary); }
+
   &:focus-visible {
     outline: 2px solid var(--accent-color);
     outline-offset: 1px;
@@ -89,6 +97,7 @@
     right: v.$space-sm;
     left: v.$space-sm;
   }
+
   .app-toast {
     min-width: 0;
     max-width: 100%;

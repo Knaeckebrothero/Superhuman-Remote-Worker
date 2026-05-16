@@ -91,7 +91,7 @@ import {AppFormFieldComponent} from '../../../ui/form-field';
     .admin-section {
       background: var(--panel-bg);
       border: 1px solid var(--border-color);
-      border-radius: 12px;
+      border-radius: var(--radius-lg);
       padding: 24px;
     }
     .section-title {

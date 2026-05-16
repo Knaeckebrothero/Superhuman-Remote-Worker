@@ -112,7 +112,7 @@ import {AppIconComponent} from './ui/icon';
         text-align: center;
         max-width: 480px;
         padding: 3rem 2.5rem;
-        border-radius: 16px;
+        border-radius: var(--radius-surface);
         background: var(--bg-secondary, #313244);
         border: 1px solid var(--border-color, #45475a);
       }
@@ -146,7 +146,7 @@ import {AppIconComponent} from './ui/icon';
         margin-top: 1.5rem;
         padding: 0.625rem 2rem;
         border: 1px solid var(--border-color, #45475a);
-        border-radius: 8px;
+        border-radius: var(--radius-control);
         background: transparent;
         color: var(--text-secondary, #bac2de);
         font-size: 0.875rem;

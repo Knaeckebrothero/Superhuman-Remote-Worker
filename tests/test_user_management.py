@@ -706,9 +706,13 @@ class TestPostgresDBMcpTokens:
         conn = self._mock_conn(db)
 
         await db.cleanup_expired_mcp_tokens()
-        conn.execute.assert_called_once()
-        query = conn.execute.call_args[0][0]
-        assert "DELETE FROM mcp_tokens" in query
+        # Two statements: DELETE expired/long-revoked tokens (both kinds),
+        # then the rotation-grace UPDATE that revokes superseded PAT rows
+        # older than 24h. See postgres.py — auth_tokens consolidation.
+        assert conn.execute.await_count == 2
+        queries = [call.args[0] for call in conn.execute.await_args_list]
+        assert any("DELETE FROM auth_tokens" in q for q in queries)
+        assert any("UPDATE auth_tokens" in q and "superseded_by" in q for q in queries)
 
 
 # ============================================================================

@@ -1,14 +1,16 @@
 @use '../../../styles/variables' as v;
+@use '../../../styles/shape-recipes' as shape;
 
 :host {
   display: inline-flex;
 }
 
 .app-chip__btn {
+  @include shape.pill;
+
   display: inline-flex;
   align-items: center;
   gap: v.$space-xs;
-
   appearance: none;
   border: 1px solid var(--border-color);
   background: transparent;
@@ -18,7 +20,6 @@
   line-height: v.$line-height-tight;
   cursor: pointer;
   white-space: nowrap;
-
   transition:
     background-color 0.15s ease,
     color 0.15s ease,
@@ -37,18 +38,16 @@
     height: 24px;
     padding: 0 v.$space-sm;
     font-size: v.$font-size-xs;
-    border-radius: v.$radius-xl; // pill
   }
 
   &[data-size='md'] {
     height: 32px;
     padding: 0 v.$space-md;
     font-size: v.$font-size-sm;
-    border-radius: v.$radius-xl; // pill
   }
 
   // --- Hover (only when selectable & enabled) ---
-  &[data-selectable]:hover:not(:disabled):not([data-selected]) {
+  &[data-selectable]:hover:not(:disabled, [data-selected]) {
     border-color: var(--text-primary);
     color: var(--text-primary);
   }
@@ -57,7 +56,7 @@
   &[data-variant='default'][data-selected] {
     background: var(--accent-color);
     border-color: var(--accent-color);
-    color: var(--timeline-bg);
+    color: var(--on-accent);
   }
 
   &[data-variant='accent'] {
@@ -66,7 +65,7 @@
 
     &[data-selected] {
       background: var(--accent-color);
-      color: var(--timeline-bg);
+      color: var(--on-accent);
     }
   }
 
@@ -76,7 +75,7 @@
 
     &[data-selected] {
       background: var(--danger);
-      color: var(--timeline-bg);
+      color: var(--on-danger);
     }
   }
 }
@@ -90,6 +89,7 @@
   .app-chip__btn[data-size='sm'] {
     min-height: 32px;
   }
+
   .app-chip__btn[data-size='md'] {
     min-height: v.$touch-target-min;
   }
