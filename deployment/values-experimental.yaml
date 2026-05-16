@@ -18,8 +18,11 @@ license:
 fullnameOverride: srw
 global:
   domain: "superhuman-remote-worker.com"
-  imagePullSecrets:
-    - name: ghcr-pull-secret
+  # No imagePullSecrets — all images pulled by this chart are public
+  # (SRW images on ghcr.io/knaeckebrothero/superhuman-remote-worker-* +
+  # upstream Docker Hub for the admin UIs). Re-add a `ghcr-pull-secret`
+  # entry here (and create the matching Secret in-namespace) only if a
+  # package is ever flipped back to private.
 # -----------------------------------------------------------------------------
 # Image tags — updated by CI on every push to develop
 # -----------------------------------------------------------------------------
@@ -69,6 +72,10 @@ codexProxy:
 # -----------------------------------------------------------------------------
 opencloud:
   enabled: true
+  # Chart default is 64Gi (sized for prod's TUS upload buffer); Longhorn
+  # on the homelab can't schedule replicas that large right now, so cap
+  # the experimental cluster at 16Gi until disk capacity is sorted.
+  dataStorageSize: "16Gi"
 nextcloud:
   enabled: false
 # -----------------------------------------------------------------------------

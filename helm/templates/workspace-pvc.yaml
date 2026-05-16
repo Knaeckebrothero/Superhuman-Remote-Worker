@@ -8,7 +8,7 @@ metadata:
     "helm.sh/resource-policy": keep
 spec:
   accessModes:
-    - ReadWriteMany
+    - {{ .Values.workspace.accessMode | default "ReadWriteMany" }}
   {{- if .Values.workspace.storageClass }}
   storageClassName: {{ .Values.workspace.storageClass | quote }}
   {{- end }}
