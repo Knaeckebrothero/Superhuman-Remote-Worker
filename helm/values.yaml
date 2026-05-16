@@ -657,6 +657,10 @@ cloud:
 workspace:
   storageClass: ""
   storageSize: "20Gi"
+  # -- Access mode for the shared workspace PVC. Production uses
+  # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
+  # (k3s local-path) can override to "ReadWriteOnce".
+  accessMode: "ReadWriteMany"
   # -- Storage class for ephemeral per-job workspace PVCs
   ephemeralStorageClass: ""
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
