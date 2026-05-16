@@ -179,11 +179,21 @@ auth:
     # cockpit SPA's public client (keycloak.cockpitClientId). They share
     # the realm + the user identity; only the auth model differs.
     clientId: "cockpit-bff"
-    # -- Cookie Domain attribute. Empty string ("") = host-only (right for
-    # localhost dev). Default at render time = ".{{ global.domain }}".
-    cookieDomain: ""
+    # -- Cookie Domain attribute. Sentinel-based:
+    #     "auto"        → ".{{ global.domain }}" (the prod default — rides on
+    #                     api.* and cockpit subdomains under one base domain)
+    #     "" (empty)    → host-only (right for localhost dev; browsers reject
+    #                     Domain=.localhost as a public-suffix edge case)
+    #     "foo.example" → literal
+    cookieDomain: "auto"
     # -- "1"=Secure flag set (production), "0"=cleartext for HTTP-only dev.
     cookieSecure: "1"
+    # -- SameSite attribute. "lax" is right when cockpit + api share a base
+    # domain (production: both under superhuman-remote-worker.com → same-site).
+    # Set to "none" for split-host local dev (cockpit on `localhost`, api on
+    # `api.localhost` — Chrome treats those as cross-site, so Lax blocks the
+    # session cookie on the cockpit's XHR to the API). "none" requires Secure.
+    cookieSamesite: "lax"
     # -- Idle session expiry (seconds). Validator rejects a session whose
     # last_seen_at is older than now() - this.
     sessionIdleTimeoutSeconds: 1800

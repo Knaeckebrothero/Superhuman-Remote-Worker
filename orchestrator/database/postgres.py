@@ -6111,7 +6111,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, job_id, expert_id, created_at, updated_at, summary, title
+                SELECT id, job_id, expert_id, user_id, created_at, updated_at,
+                       summary, title
                 FROM builder_sessions
                 WHERE id = $1
                 """,
