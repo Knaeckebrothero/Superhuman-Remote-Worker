@@ -254,6 +254,118 @@ async def test_project_ids_from_mounts_includes_project_default():
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 — session-folder skip predicate
+# ---------------------------------------------------------------------------
+
+
+def test_should_skip_session_folder_with_project_default_mount():
+    """A ``project_default`` row with webdav_url means the user's cloud
+    home is mounted at workspace root — session folder is redundant.
+    (Phase 2 behavior, preserved by Phase 4.)
+    """
+    from main import _should_skip_session_folder
+
+    rows = [
+        {
+            "mount_kind": "project_default",
+            "target_path": "",
+            "webdav_url": "https://oc.test/dav/spaces/drive-xyz/",
+        }
+    ]
+    assert _should_skip_session_folder(rows) is True
+
+
+def test_should_skip_session_folder_with_non_default_project_mount():
+    """Phase 4: a regular ``project`` mount (non-default, under
+    ``projects/<name>/``) also counts as a user-visible cloud surface
+    — session folder is redundant for it too. This is the new Phase 4
+    behavior; pre-Phase-4 this returned False and the session folder
+    was unnecessarily provisioned alongside.
+    """
+    from main import _should_skip_session_folder
+
+    rows = [
+        {
+            "mount_kind": "project",
+            "target_path": "projects/alpha",
+            "webdav_url": "https://oc.test/dav/spaces/drive-abc/",
+        }
+    ]
+    assert _should_skip_session_folder(rows) is True
+
+
+def test_should_skip_session_folder_with_repo_mount():
+    """Forward-compatibility: a ``repo`` row with a transport URL
+    is also a user-visible surface (Phase 3b territory). The predicate
+    is mount-kind-agnostic — any mount with a working webdav_url
+    short-circuits the session folder.
+    """
+    from main import _should_skip_session_folder
+
+    rows = [
+        {
+            "mount_kind": "repo",
+            "target_path": "repos/alpha",
+            "webdav_url": "https://gitea.test/some/repo",
+        }
+    ]
+    assert _should_skip_session_folder(rows) is True
+
+
+def test_should_skip_session_folder_empty_mounts():
+    """No mounts → fall back to legacy session folder so the thread
+    isn't left with zero cloud surfaces. This is the fallback case
+    Phase 4 deliberately preserves (unattached sessions still get a
+    folder).
+    """
+    from main import _should_skip_session_folder
+
+    assert _should_skip_session_folder([]) is False
+
+
+def test_should_skip_session_folder_mount_without_webdav_url():
+    """A mount row exists but its ``webdav_url`` is None — e.g.
+    backend wasn't initialized when the row was built, or
+    user-home resolution failed transiently. The row is not a usable
+    sync target, so don't skip the fallback. (Same observable-state
+    safety net Phase 2 introduced.)
+    """
+    from main import _should_skip_session_folder
+
+    rows = [
+        {
+            "mount_kind": "project_default",
+            "target_path": "",
+            "webdav_url": None,
+        },
+        {
+            "mount_kind": "project",
+            "target_path": "projects/alpha",
+            "webdav_url": "",  # empty string is also falsy
+        },
+    ]
+    assert _should_skip_session_folder(rows) is False
+
+
+def test_should_skip_session_folder_returns_true_on_first_usable_mount():
+    """At least one usable row is enough — predicate is short-circuit
+    OR semantics. Verifies a mix of failed + working rows still
+    skips the session folder.
+    """
+    from main import _should_skip_session_folder
+
+    rows = [
+        {"mount_kind": "project", "target_path": "projects/a", "webdav_url": None},
+        {
+            "mount_kind": "project",
+            "target_path": "projects/b",
+            "webdav_url": "https://oc.test/dav/spaces/drive-b/",
+        },
+    ]
+    assert _should_skip_session_folder(rows) is True
+
+
+# ---------------------------------------------------------------------------
 # Phase 3a — multi-project mount path collision handling
 # ---------------------------------------------------------------------------
 

@@ -9931,6 +9931,28 @@ def _slugify_mount_name(name: str) -> str:
     return out or "project"
 
 
+def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
+    """Phase 4 (cloud_collaboration_model.md §9): is the legacy per-session
+    cloud folder redundant for this thread?
+
+    If at least one ``thread_mounts`` row has a working ``webdav_url`` —
+    any kind (``project``, ``project_default``, ``repo``) — the thread
+    already has a user-visible cloud surface. Provisioning a per-session
+    folder on top would create a parallel sync target the user has no
+    reason to use.
+
+    Returns False when no mount can be observed (no rows, or every row
+    failed to resolve a transport). That falls through to legacy
+    session-folder provisioning so the thread never ends up with zero
+    cloud surfaces — important for unattached sessions and for transient
+    backend failures during mount resolution.
+    """
+    for m in mounts:
+        if m.get("webdav_url"):
+            return True
+    return False
+
+
 def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
     """Pick out project ``source_ref``s from a list of mount rows.
 
@@ -10974,14 +10996,14 @@ async def create_thread(
             if not backend.is_initialized:
                 return
 
-            # Phase 2 (cloud_collaboration_model.md §9): if the thread
-            # already has a working ``project_default`` mount at workspace
-            # root (the user's cloud home), the legacy session folder
-            # would be a redundant second sync target at the same location.
-            # Skip provisioning it. The gate is observable-state — a
-            # transient user-home resolution failure leaves no
-            # ``project_default`` row, the legacy folder is still
-            # provisioned, the thread never ends up with zero mounts.
+            # Phase 4 (cloud_collaboration_model.md §9): if the thread
+            # already has any mount with a working webdav_url — project,
+            # project_default, or repo — the legacy session folder would
+            # be a redundant second sync target. Skip provisioning it.
+            # The gate is observable-state: failed mount resolution
+            # leaves no usable row, the legacy folder is still
+            # provisioned as fallback, the thread never ends up with
+            # zero cloud surfaces.
             try:
                 existing_mounts = await postgres_db.list_thread_mounts(thread_id)
             except Exception as e:
@@ -10992,14 +11014,13 @@ async def create_thread(
                     thread_id,
                     e,
                 )
-            for m in existing_mounts:
-                if m.get("mount_kind") == "project_default" and m.get("webdav_url"):
-                    logger.info(
-                        "Thread %s: skipping legacy session folder — workspace "
-                        "root is mounted via the default-project user-home.",
-                        thread_id,
-                    )
-                    return
+            if _should_skip_session_folder(existing_mounts):
+                logger.info(
+                    "Thread %s: skipping legacy session folder — at least "
+                    "one mount with a working webdav_url is observable.",
+                    thread_id,
+                )
+                return
 
             try:
                 session_handle = await backend.ensure_session_folder(
@@ -11493,8 +11514,26 @@ async def resume_thread(
     needs_share_only = bool(existing_session_handle) and not thread.get(
         "main_cloud_share_handle"
     )
-    needs_full_provision = not existing_session_handle and not thread.get(
-        "nc_session_folder"
+    # Phase 4: if the thread already has a working mount, skip the
+    # late-provision branch — the mount is the user-visible cloud surface
+    # and a session folder on top would be redundant. The share-retry
+    # branch is untouched: it only fires on existing folders, so it
+    # remains the recovery path for old session folders that lost their
+    # share record.
+    try:
+        existing_mounts = await postgres_db.list_thread_mounts(thread_id)
+    except Exception as e:
+        existing_mounts = []
+        logger.warning(
+            "Thread %s: failed to read thread_mounts during resume late-provision "
+            "check (%s); proceeding with default policy.",
+            thread_id,
+            e,
+        )
+    needs_full_provision = (
+        not existing_session_handle
+        and not thread.get("nc_session_folder")
+        and not _should_skip_session_folder(existing_mounts)
     )
 
     if needs_full_provision or needs_share_only:
