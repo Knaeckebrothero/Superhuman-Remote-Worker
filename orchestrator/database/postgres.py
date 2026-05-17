@@ -68,6 +68,93 @@ def _decrypt_stored(value: str | None, *, field: str) -> str | None:
         return None
 
 
+def _encrypt_credentials_dict(creds: Dict[str, Any] | None) -> str:
+    """Encrypt a credentials dict for insertion into a JSONB column.
+
+    Returns a JSON string ready to pass as a JSONB parameter. Empty/None
+    becomes JSONB ``'{}'`` (no encryption needed — empty has no secret to
+    protect, and the schema default is ``'{}'``).
+
+    A non-empty dict is JSON-serialized, encrypted with :func:`encrypt`,
+    then wrapped again with :func:`json.dumps` so the JSONB column receives
+    a valid JSON string value (e.g. ``"v1:<nonce>:<ct>"``).
+    """
+    if not creds:
+        return "{}"
+    return json.dumps(encrypt(json.dumps(creds)))
+
+
+def _decrypt_credentials_field(
+    raw: Any, *, field: str = "datasources.credentials"
+) -> Dict[str, Any]:
+    """Decrypt a credentials JSONB value, returning the plaintext dict.
+
+    asyncpg returns JSONB as a raw JSON string here (no codec registered).
+    This helper parses the JSON and handles three cases:
+
+    1. **Legacy plaintext** — JSON object (pre-encryption rows). Returned
+       as-is with a warning so operators can re-save to upgrade.
+    2. **Encrypted** — JSON string with ``v1:`` prefix. Decrypted and
+       JSON-parsed back into a dict.
+    3. **Other / malformed** — empty dict, logged.
+
+    Always returns a dict (possibly empty) so callers never have to handle
+    None, string, or dict variants.
+    """
+    if raw is None:
+        return {}
+
+    if isinstance(raw, str):
+        try:
+            parsed: Any = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to parse %s JSON: %s", field, exc)
+            return {}
+    else:
+        parsed = raw  # asyncpg with a JSON codec would land here
+
+    if isinstance(parsed, dict):
+        if parsed:
+            logger.warning(
+                "Legacy plaintext credentials in %s; re-save the datasource to encrypt.",
+                field,
+            )
+        return parsed
+
+    if isinstance(parsed, str):
+        if not is_encrypted(parsed):
+            logger.warning(
+                "Non-encrypted credential string in %s; treating as empty.", field
+            )
+            return {}
+        try:
+            plaintext = decrypt(parsed)
+            return json.loads(plaintext)
+        except (DecryptionError, json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to decrypt %s: %s", field, exc)
+            return {}
+
+    logger.warning(
+        "Unexpected credentials type %s in %s; treating as empty.",
+        type(parsed).__name__,
+        field,
+    )
+    return {}
+
+
+def _datasource_row_to_dict(row, *, field: str = "datasources.credentials") -> Dict[str, Any]:
+    """Convert a datasource asyncpg Record to a dict with decrypted credentials.
+
+    Use anywhere a SELECT returns a datasource row. The ``credentials`` field
+    is replaced with its decrypted plaintext dict (always a dict, never the
+    raw JSONB string).
+    """
+    d = dict(row)
+    if "credentials" in d:
+        d["credentials"] = _decrypt_credentials_field(d["credentials"], field=field)
+    return d
+
+
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
 # Frozen schema reference (no longer applied at runtime — see migrate.py).
@@ -2857,7 +2944,7 @@ class PostgresDB:
                 *values,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
         """Get a single datasource by ID.
@@ -2885,7 +2972,7 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        return _datasource_row_to_dict(row) if row else None
 
     async def create_datasource(
         self,
@@ -2942,7 +3029,7 @@ class PostgresDB:
                 description,
                 ds_type,
                 connection_url,
-                json.dumps(credentials) if credentials else "{}",
+                _encrypt_credentials_dict(credentials),
                 job_uuid,
                 cli_hint,
                 default_branch,
@@ -2950,7 +3037,7 @@ class PostgresDB:
                 is_global,
             )
 
-        return dict(row)
+        return _datasource_row_to_dict(row)
 
     async def update_datasource(
         self,
@@ -3003,7 +3090,7 @@ class PostgresDB:
         if credentials is not None:
             param_count += 1
             updates.append(f"credentials = ${param_count}")
-            values.append(json.dumps(credentials))
+            values.append(_encrypt_credentials_dict(credentials))
 
         if cli_hint is not None:
             param_count += 1
@@ -3098,6 +3185,7 @@ class PostgresDB:
                     """,
                     project_uuid,
                 )
+                return [_datasource_row_to_dict(row) for row in rows]
             else:
                 rows = await conn.fetch(
                     """
@@ -3115,7 +3203,7 @@ class PostgresDB:
                     """,
                 )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def resolve_datasources_for_thread(
         self,
@@ -3177,7 +3265,7 @@ class PostgresDB:
                 proj_uuids,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 
@@ -3267,7 +3355,7 @@ class PostgresDB:
                 p_uuid,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def update_project_datasource(
         self,
@@ -3330,6 +3418,84 @@ class PostgresDB:
 
         return [str(row["project_id"]) for row in rows]
 
+    async def backfill_encrypt_datasource_credentials(self) -> Dict[str, int]:
+        """One-shot migration: encrypt any plaintext ``credentials`` JSONB values.
+
+        Idempotent — rows whose credentials column already contains a v1
+        ciphertext string are skipped. Empty/null credentials are also
+        skipped. Legacy plaintext dicts are re-serialized and encrypted via
+        :func:`_encrypt_credentials_dict`.
+
+        Returns counts: ``{"encrypted": N, "skipped": M, "errors": K}``.
+        """
+        encrypted = 0
+        skipped = 0
+        errors = 0
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch("SELECT id, credentials FROM datasources")
+
+            for row in rows:
+                ds_id = row["id"]
+                raw = row["credentials"]
+
+                if raw is None:
+                    skipped += 1
+                    continue
+
+                # asyncpg returns JSONB as a raw JSON string here.
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.error(
+                        "Backfill: failed to parse credentials JSON for "
+                        "datasource %s: %s",
+                        ds_id,
+                        exc,
+                    )
+                    errors += 1
+                    continue
+
+                # Already encrypted (JSON-string form with v1: prefix).
+                if isinstance(parsed, str) and is_encrypted(parsed):
+                    skipped += 1
+                    continue
+
+                # Empty dict — nothing to encrypt, schema default applies.
+                if isinstance(parsed, dict) and not parsed:
+                    skipped += 1
+                    continue
+
+                # Legacy plaintext dict — encrypt in place.
+                if isinstance(parsed, dict):
+                    try:
+                        new_value = _encrypt_credentials_dict(parsed)
+                        await conn.execute(
+                            "UPDATE datasources SET credentials = $1 WHERE id = $2",
+                            new_value,
+                            ds_id,
+                        )
+                        encrypted += 1
+                    except Exception as exc:
+                        logger.error(
+                            "Backfill: encryption failed for datasource %s: %s",
+                            ds_id,
+                            exc,
+                        )
+                        errors += 1
+                    continue
+
+                # Anything else — bare string without v1: prefix, etc.
+                logger.warning(
+                    "Backfill: unexpected credentials value for datasource %s "
+                    "(type=%s); leaving untouched",
+                    ds_id,
+                    type(parsed).__name__,
+                )
+                errors += 1
+
+        return {"encrypted": encrypted, "skipped": skipped, "errors": errors}
+
     async def upsert_default_datasource(
         self,
         name: str,
@@ -3351,7 +3517,7 @@ class PostgresDB:
         Returns:
             Created or updated datasource dict
         """
-        creds_json = json.dumps(credentials) if credentials else "{}"
+        creds_json = _encrypt_credentials_dict(credentials)
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -3373,7 +3539,7 @@ class PostgresDB:
                 creds_json,
             )
 
-        return dict(row)
+        return _datasource_row_to_dict(row)
 
     # =========================================================================
     # SESSION OPERATIONS
