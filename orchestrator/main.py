@@ -124,6 +124,11 @@ from security.access import (  # noqa: E402
     user_can_access_job,
     user_visible_project_ids,
 )
+from security.credential_files import (  # noqa: E402
+    CREDENTIAL_FILE_TYPES,
+    CredentialFileValidationError,
+    normalize_credential_files,
+)
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
@@ -2348,7 +2353,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav",
+        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -8844,7 +8849,17 @@ async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]
 @app.post("/api/datasources")
 async def create_datasource(body: DatasourceCreate, request: Request) -> dict[str, Any]:
     """Create a new datasource owned by the current user."""
-    valid_types = {"generic", "repository", "postgresql", "neo4j", "mongodb", "webdav"}
+    valid_types = {
+        "generic",
+        "repository",
+        "postgresql",
+        "neo4j",
+        "mongodb",
+        "webdav",
+        "kubeconfig",
+        "ssh_key",
+        "generic_file",
+    }
     if body.type not in valid_types:
         raise HTTPException(
             status_code=400,
@@ -8855,6 +8870,10 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
     user_id = str(user["id"])
 
     credentials = _normalize_datasource_credentials(body.credentials)
+    try:
+        credentials = normalize_credential_files(body.type, body.name, credentials)
+    except CredentialFileValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         created = await postgres_db.create_datasource(
@@ -8887,12 +8906,21 @@ async def update_datasource(
     request: Request, datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
     """Update a datasource. F3: creator/admin only; null/empty credentials preserved."""
-    await require_datasource_owner(request, postgres_db, datasource_id)
+    _, existing_ds = await require_datasource_owner(request, postgres_db, datasource_id)
     # F3: if body.credentials is None or {}, do NOT touch the stored value.
     # The cockpit's edit form sends an empty creds dict when the user
     # didn't re-enter; passing that through would clobber the secret.
     raw_creds = _normalize_datasource_credentials(body.credentials)
     credentials = raw_creds if raw_creds else None
+    if credentials is not None and existing_ds.get("type") in CREDENTIAL_FILE_TYPES:
+        try:
+            credentials = normalize_credential_files(
+                existing_ds["type"],
+                body.name or existing_ds.get("name", ""),
+                credentials,
+            )
+        except CredentialFileValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
