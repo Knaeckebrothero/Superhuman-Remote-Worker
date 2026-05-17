@@ -441,6 +441,63 @@ def _legacy_nc_cloud_cfg(nc_folder: str) -> Dict[str, Any]:
     }
 
 
+def _build_sync_coordinator(
+    *,
+    workspace_path,
+    workspace_backend,
+    cloud_cfg: Optional[Dict[str, Any]],
+):
+    """Construct a ``WorkspaceSyncCoordinator`` from the orchestrator's payload.
+
+    Handles both v1 (flat ``{backend, webdav_url, auth}``) and v2
+    (``{version: 2, session_folder, mounts: [...]}``). Phase 1 of
+    ``docs/features/cloud_collaboration_model.md`` §9.
+
+    The legacy session folder (v2 ``session_folder``, or the whole v1
+    payload) is mounted at the workspace root. Project mounts (and, in
+    Phase 3+, user-home and repo mounts) attach under their
+    ``target_path`` via the base class's ``mount_subdir``.
+
+    Returns ``None`` when nothing resolvable was provided.
+    """
+    if not cloud_cfg:
+        return None
+
+    from src.services.cloud_sync import (
+        MountSync,
+        WorkspaceSyncCoordinator,
+        build_workspace_sync,
+    )
+
+    coordinator = WorkspaceSyncCoordinator()
+
+    def _attach(cfg: Dict[str, Any], *, mount_id: str, target_path: str) -> None:
+        sync = build_workspace_sync(
+            workspace_path=workspace_path,
+            cloud_cfg=cfg,
+            workspace_backend=workspace_backend,
+            mount_subdir=target_path,
+        )
+        if sync is not None:
+            coordinator.add(
+                MountSync(mount_id=mount_id, target_path=target_path, sync=sync)
+            )
+
+    if cloud_cfg.get("version") == 2:
+        session_folder = cloud_cfg.get("session_folder")
+        if session_folder:
+            _attach(session_folder, mount_id="legacy-session", target_path="")
+        for m in cloud_cfg.get("mounts") or []:
+            mid = str(m.get("mount_id") or "")
+            tp = m.get("target_path") or ""
+            _attach(m, mount_id=mid, target_path=tp)
+    else:
+        # v1 flat shape — single session-folder mount at workspace root.
+        _attach(cloud_cfg, mount_id="legacy-session", target_path="")
+
+    return coordinator if len(coordinator) > 0 else None
+
+
 async def _attach_session(
     thread_id: str,
     config_override: Optional[Dict[str, Any]] = None,
@@ -904,23 +961,26 @@ async def _attach_session(
         cloud_cfg = _legacy_nc_cloud_cfg(nc_folder)
     if cloud_cfg:
         try:
-            from src.services.cloud_sync import build_workspace_sync
-
-            _session.workspace_sync = build_workspace_sync(
+            _session.workspace_sync = _build_sync_coordinator(
                 workspace_path=_session.workspace_manager.path,
-                cloud_cfg=cloud_cfg,
                 workspace_backend=_session.workspace_manager.backend,
+                cloud_cfg=cloud_cfg,
             )
             if _session.workspace_sync:
-                # Initial push of existing workspace files, then background pull
-                await _session.workspace_sync.push()
-                await _session.workspace_sync.start_background_poll()
+                # Phase 1 of cloud_collaboration_model.md: turn-boundary sync,
+                # not background polling. Do one blocking initial pull to
+                # seed the workspace with current cloud-side contents before
+                # the agent starts its first turn — and raise immediately if
+                # any mount is broken, so the operator sees it before any
+                # actual work is committed.
+                await _session.workspace_sync.pull_all()
                 logger.info(
-                    "Cloud workspace sync started (backend=%s)",
-                    cloud_cfg.get("backend"),
+                    "Cloud workspace sync coordinator started (%d mount(s))",
+                    len(_session.workspace_sync),
                 )
         except Exception as e:
             logger.warning(f"Failed to start cloud workspace sync: {e}")
+            _session.workspace_sync = None
 
     # Restore message history from DB (for session resume)
     await _restore_session_messages()
@@ -1052,14 +1112,18 @@ async def _terminate_session(reason: str) -> None:
     # Mark thread as ended (still resumable — `ended` is the only inactive state).
     await _update_thread_status("ended")
 
-    # Final cloud sync + stop polling + drop secrets
+    # Final cloud sync + drop secrets. No more background polling to stop:
+    # Phase 1 moved sync to turn boundaries via the coordinator.
     if _session.workspace_sync:
         try:
-            await _session.workspace_sync.full_sync()
-            await _session.workspace_sync.stop()
-            await _session.workspace_sync.aclose()
+            await _session.workspace_sync.push_all()
+            await _session.workspace_sync.pull_all()
         except Exception as e:
             logger.warning(f"Final cloud sync failed (non-fatal): {e}")
+        try:
+            await _session.workspace_sync.aclose()
+        except Exception as e:
+            logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
     # Final git commit + push
     if _session.workspace_manager:
@@ -2269,6 +2333,17 @@ async def _loop_on_turn_start(turn_id: int) -> None:
         return
     _session.turn_count = turn_id
     _broadcast("turn.started", {"turn_id": turn_id})
+
+    # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
+    # before the turn runs so the agent sees the latest user-side state.
+    # raise-and-block: if any mount fails, the exception propagates up to
+    # the loop and the next turn won't accept input until the operator
+    # resolves the underlying issue.
+    if _session.workspace_sync:
+        _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
+        await _session.workspace_sync.pull_all()
+        _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+
     # Save user message to DB (bounded await — no messages lost on crash)
     if _orchestrator_client and _loop_last_user_content[0]:
         try:
@@ -2314,9 +2389,15 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
     if turn_id <= 3 and _session.postgres_conn:
         asyncio.create_task(_auto_title_after_first_turn())
 
-    # Push workspace changes to Nextcloud (fire-and-forget)
+    # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits
+    # to every mounted cloud surface BEFORE the next turn can accept
+    # input. Awaited (not fire-and-forget) so the loop's idle state
+    # accurately reflects when files are durable to the cloud, and so
+    # failures block the next turn (raise-and-block).
     if _session.workspace_sync:
-        asyncio.create_task(_session.workspace_sync.push())
+        _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
+        await _session.workspace_sync.push_all()
+        _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
 
 
 async def _loop_on_error(message: str) -> None:
@@ -2835,14 +2916,17 @@ async def _handle_archive(ws: WebSocket) -> None:
             await _ws_send(ws, "error", {"message": "Session not ready"})
             return
 
-        # 0. Final cloud sync
+        # 0. Final cloud sync. No background poll to stop after Phase 1.
         if _session.workspace_sync:
             try:
-                await _session.workspace_sync.full_sync()
-                await _session.workspace_sync.stop()
-                await _session.workspace_sync.aclose()
+                await _session.workspace_sync.push_all()
+                await _session.workspace_sync.pull_all()
             except Exception as e:
                 logger.warning(f"Final cloud sync failed (non-fatal): {e}")
+            try:
+                await _session.workspace_sync.aclose()
+            except Exception as e:
+                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
         # 1. Extract final memories
         recall_store = (

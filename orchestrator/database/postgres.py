@@ -2410,6 +2410,118 @@ class PostgresDB:
                 legacy_share_id,
             )
 
+    # --------------------------------------------------------------- thread_mounts
+    # Canonical store for which cloud surfaces are attached to a thread.
+    # Replaces the legacy ``threads.metadata.project_ids`` JSONB key as
+    # source of truth for project attachment (Phase 1 of
+    # docs/features/cloud_collaboration_model.md). The runtime
+    # ``project_ids: list[str]`` contract for downstream consumers is
+    # derived from these rows at payload-build time.
+
+    async def add_thread_mount(
+        self,
+        thread_id: str,
+        *,
+        mount_kind: str,
+        target_path: str,
+        source_kind: str,
+        source_ref: str | None = None,
+        backend_id: str | None = None,
+        cloud_handle: str | None = None,
+        webdav_url: str | None = None,
+    ) -> str:
+        """Insert one mount row and return its UUID."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO thread_mounts (
+                    thread_id, mount_kind, target_path,
+                    source_kind, source_ref,
+                    backend_id, cloud_handle, webdav_url
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id
+                """,
+                UUID(thread_id),
+                mount_kind,
+                target_path,
+                source_kind,
+                UUID(source_ref) if source_ref else None,
+                backend_id,
+                cloud_handle,
+                webdav_url,
+            )
+        return str(row["id"])
+
+    async def list_thread_mounts(self, thread_id: str) -> list[Dict[str, Any]]:
+        """Return all mounts attached to a thread, ordered by ``target_path``."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, mount_kind, target_path,
+                       source_kind, source_ref,
+                       backend_id, cloud_handle, webdav_url,
+                       created_at
+                FROM thread_mounts
+                WHERE thread_id = $1
+                ORDER BY target_path
+                """,
+                UUID(thread_id),
+            )
+        return [dict(row) for row in rows]
+
+    async def remove_thread_mount(self, mount_id: str) -> bool:
+        """Delete a single mount by id. Returns True if a row was removed."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM thread_mounts WHERE id = $1",
+                UUID(mount_id),
+            )
+        return result.endswith(" 1")
+
+    async def replace_thread_mounts(
+        self,
+        thread_id: str,
+        mounts: list[Dict[str, Any]],
+    ) -> list[str]:
+        """Atomically replace a thread's mount set.
+
+        Each entry in ``mounts`` must carry ``mount_kind``, ``target_path``,
+        ``source_kind``; ``source_ref`` / ``backend_id`` / ``cloud_handle``
+        / ``webdav_url`` are optional. Returns the list of new mount IDs in
+        the order they were inserted.
+        """
+        new_ids: list[str] = []
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM thread_mounts WHERE thread_id = $1",
+                    UUID(thread_id),
+                )
+                for entry in mounts:
+                    src_ref = entry.get("source_ref")
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO thread_mounts (
+                            thread_id, mount_kind, target_path,
+                            source_kind, source_ref,
+                            backend_id, cloud_handle, webdav_url
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        RETURNING id
+                        """,
+                        UUID(thread_id),
+                        entry["mount_kind"],
+                        entry["target_path"],
+                        entry["source_kind"],
+                        UUID(src_ref) if src_ref else None,
+                        entry.get("backend_id"),
+                        entry.get("cloud_handle"),
+                        entry.get("webdav_url"),
+                    )
+                    new_ids.append(str(row["id"]))
+        return new_ids
+
     async def mark_orphaned_threads_ended(self) -> list[str]:
         """Mark threads as ended when their bound agent is offline.
 

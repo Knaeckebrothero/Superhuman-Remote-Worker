@@ -181,8 +181,12 @@ class TestFormatPersistentThreadDetail:
         result = self.fmt(thread)
         assert "Ended: 2026-03-15T14:00:00Z" in result
 
-    def test_shows_metadata_project_ids(self):
-        thread = _make_thread(metadata={"project_ids": ["p1", "p2", "p3"]})
+    def test_shows_project_ids(self):
+        # Phase 1 of cloud_collaboration_model.md §9: project_ids now lives
+        # at the top level of the thread response (derived from
+        # thread_mounts by the orchestrator), not under metadata.
+        thread = _make_thread()
+        thread["project_ids"] = ["p1", "p2", "p3"]
         result = self.fmt(thread)
         assert "p1" in result
         assert "p2" in result
@@ -212,9 +216,14 @@ class TestFormatPersistentThreadDetail:
         import json
 
         thread = _make_thread()
-        thread["metadata"] = json.dumps({"project_ids": ["p1"]})
+        # config_override still flows through metadata after the Phase 1
+        # cloud-collaboration refactor (only project_ids moved out), so it's
+        # the right field to exercise the JSON-string parsing path with.
+        thread["metadata"] = json.dumps(
+            {"config_override": {"llm": {"model": "gpt-4"}}}
+        )
         result = self.fmt(thread)
-        assert "p1" in result
+        assert "gpt-4" in result
 
     def test_metadata_none(self):
         thread = _make_thread()
