@@ -65,3 +65,65 @@ def test_factory_returns_none_missing_fields(tmp_path: Path, caplog):
         )
         is None
     )
+
+
+def test_factory_builds_opencloud_impersonation(tmp_path: Path):
+    """Phase 2: ``keycloak_user_impersonation`` builds an OpenCloud sync
+    primed to do RFC 8693 token-exchange for the target user.
+    """
+    cfg = {
+        "backend": "opencloud",
+        "webdav_url": "http://oc/dav/spaces/drive$home-of-alice/",
+        "auth": {
+            "type": "keycloak_user_impersonation",
+            "issuer": "http://kc/realms/srw",
+            "client_id": "srw-orch",
+            "client_secret": "shh",
+            "target_user_sub": "alice-keycloak-sub",
+        },
+    }
+    sync = build_workspace_sync(workspace_path=tmp_path, cloud_cfg=cfg)
+    assert isinstance(sync, OpenCloudWorkspaceSync)
+    assert sync._target_user_sub == "alice-keycloak-sub"
+
+
+def test_factory_rejects_impersonation_without_target_sub(tmp_path: Path, caplog):
+    """A user-impersonation payload that forgot the ``target_user_sub``
+    must not silently fall back to service-account mode — that would
+    expose the bug Phase 2 was meant to fix.
+    """
+    caplog.set_level(logging.WARNING, logger="src.services.cloud_sync")
+    cfg = {
+        "backend": "opencloud",
+        "webdav_url": "http://oc/dav/spaces/drive$home/",
+        "auth": {
+            "type": "keycloak_user_impersonation",
+            "issuer": "http://kc/realms/srw",
+            "client_id": "srw-orch",
+            "client_secret": "shh",
+            # target_user_sub deliberately omitted
+        },
+    }
+    out = build_workspace_sync(workspace_path=tmp_path, cloud_cfg=cfg)
+    assert out is None
+    assert "missing target_user_sub" in caplog.text
+
+
+def test_factory_opencloud_client_credentials_has_no_target_sub(tmp_path: Path):
+    """Phase 1 client_credentials mounts must NOT carry a target_user_sub
+    on the resulting sync object — the agent should hit WebDAV as the
+    service account.
+    """
+    cfg = {
+        "backend": "opencloud",
+        "webdav_url": "http://oc/dav/spaces/drive$proj-alpha/",
+        "auth": {
+            "type": "keycloak_client_credentials",
+            "issuer": "http://kc/realms/srw",
+            "client_id": "srw-orch",
+            "client_secret": "shh",
+        },
+    }
+    sync = build_workspace_sync(workspace_path=tmp_path, cloud_cfg=cfg)
+    assert isinstance(sync, OpenCloudWorkspaceSync)
+    assert sync._target_user_sub is None

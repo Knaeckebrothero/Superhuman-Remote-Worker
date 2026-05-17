@@ -10019,11 +10019,17 @@ async def _build_default_project_mount_row(
     = ""``) — the agent's workspace and the user's cloud home become two
     views of the same surface. Phase 2 of cloud_collaboration_model.md §9.
 
+    Also stashes the owner's Keycloak ``sub`` on the row (``target_user_sub``)
+    so the agent can mint a user-scoped token via RFC 8693 token-exchange
+    at WebDAV-call time. Without that, the agent's service-account
+    bearer token gets a 404 on PROPFIND against the user's Personal Space
+    (owned by exactly one user, not shared with the service account).
+
     Returns ``None`` when the user-home can't be resolved (no owner, owner
-    missing from the cloud backend, no webdav URL, backend down). The
-    caller treats ``None`` as "fall back to the legacy session folder" so
-    a transient resolution failure never leaves the thread with zero
-    mounts. The next thread-create attempt retries from scratch.
+    missing from the cloud backend, no webdav URL, no keycloak_sub on the
+    owner, backend down). The caller treats ``None`` as "fall back to the
+    legacy session folder" so a transient resolution failure never leaves
+    the thread with zero mounts.
     """
     backend = main_cloud_router.for_project(project)
     if not backend.is_initialized:
@@ -10034,6 +10040,13 @@ async def _build_default_project_mount_row(
         return None
     owner_email = owner.get("email")
     if not owner_email:
+        return None
+    owner_user = await postgres_db.get_user(str(owner["user_id"]))
+    target_user_sub = (owner_user or {}).get("keycloak_sub")
+    if not target_user_sub:
+        # Owner has never completed an SSO login, so we don't have their
+        # Keycloak sub yet. Token-exchange impersonation needs a real sub —
+        # bail out and let the caller fall back to the legacy session folder.
         return None
     owner_display = (owner.get("display_name") or "").lower()
     resolved = await backend.resolve_user_identity(owner_email, owner_display)
@@ -10050,6 +10063,7 @@ async def _build_default_project_mount_row(
         "backend_id": backend.backend_id,
         "cloud_handle": home.handle.to_db(),
         "webdav_url": home.webdav_url,
+        "target_user_sub": target_user_sub,
     }
 
 
@@ -11161,12 +11175,26 @@ def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _backend_cloud_cfg(backend, webdav_url: str) -> Optional[dict[str, Any]]:
+def _backend_cloud_cfg(
+    backend,
+    webdav_url: str,
+    *,
+    target_user_sub: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     """Build a single ``{backend, webdav_url, auth}`` cfg for the agent.
 
     Shape matches ``src/services/cloud_sync/__init__.py::build_workspace_sync``'s
     expected payload. Returns ``None`` when credentials aren't resolvable.
     Never logs the auth payload.
+
+    When ``target_user_sub`` is set (Phase 2 user-home mount, only on
+    OpenCloud), the auth shape becomes ``keycloak_user_impersonation``: the
+    agent first fetches its service-account token via client_credentials,
+    then exchanges it for a user-scoped token impersonating the target
+    user (their Keycloak ``sub``) via RFC 8693 token-exchange. The exchanged
+    token is what authenticates WebDAV calls — required because OpenCloud
+    Personal Spaces are owned by exactly one user and the service account
+    has no WebDAV access of its own to them.
     """
     if backend.backend_id == "nextcloud":
         creds = backend.webdav_credentials or {}
@@ -11189,15 +11217,20 @@ def _backend_cloud_cfg(backend, webdav_url: str) -> Optional[dict[str, Any]]:
             client_secret = settings.keycloak_client_secret.get_secret_value()
         except Exception:
             return None
+        auth: dict[str, Any] = {
+            "issuer": str(settings.keycloak_issuer).rstrip("/"),
+            "client_id": settings.keycloak_client_id,
+            "client_secret": client_secret,
+        }
+        if target_user_sub:
+            auth["type"] = "keycloak_user_impersonation"
+            auth["target_user_sub"] = target_user_sub
+        else:
+            auth["type"] = "keycloak_client_credentials"
         return {
             "backend": "opencloud",
             "webdav_url": webdav_url,
-            "auth": {
-                "type": "keycloak_client_credentials",
-                "issuer": str(settings.keycloak_issuer).rstrip("/"),
-                "client_id": settings.keycloak_client_id,
-                "client_secret": client_secret,
-            },
+            "auth": auth,
         }
     return None
 
@@ -11260,7 +11293,11 @@ def _build_agent_cloud_sync(
         backend = main_cloud_router.for_backend(row_backend_id)
         if not backend.is_initialized:
             continue
-        cfg = _backend_cloud_cfg(backend, webdav_url)
+        cfg = _backend_cloud_cfg(
+            backend,
+            webdav_url,
+            target_user_sub=row.get("target_user_sub"),
+        )
         if not cfg:
             continue
         mounts_out.append(
