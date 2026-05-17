@@ -2,6 +2,7 @@ import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
 import {
+    CredentialFileEntry,
     Datasource,
     DatasourceCreateRequest,
     DatasourceTestResult,
@@ -138,12 +139,17 @@ import {AppDialogComponent} from '../../ui/dialog';
                     <option value="mongodb">{{ 'datasources.form.optMongodb' | transloco }}</option>
                     <option value="webdav">{{ 'datasources.form.optWebdav' | transloco }}</option>
                   </optgroup>
+                  <optgroup [label]="'datasources.form.typeGroupCredentialFiles' | transloco">
+                    <option value="kubeconfig">{{ 'datasources.form.optKubeconfig' | transloco }}</option>
+                    <option value="ssh_key">{{ 'datasources.form.optSshKey' | transloco }}</option>
+                    <option value="generic_file">{{ 'datasources.form.optGenericFile' | transloco }}</option>
+                  </optgroup>
                 </app-select>
               </app-form-field>
             </div>
 
-            <!-- Connection URL (required for non-generic types) -->
-            @if (formData.type !== 'generic') {
+            <!-- Connection URL (required for non-generic, non-credential-file types) -->
+            @if (hasConnectionUrl() && formData.type !== 'generic') {
               <app-form-field
                 [label]="(formData.type === 'repository' ? 'datasources.form.repoUrlLabel' : 'datasources.form.connectionUrlLabel') | transloco"
                 [required]="true"
@@ -370,9 +376,190 @@ import {AppDialogComponent} from '../../ui/dialog';
               </div>
             }
 
+            <!-- Kubeconfig: paste/upload YAML -->
+            @if (formData.type === 'kubeconfig') {
+              <app-form-field [label]="'datasources.form.kubeconfigLabel' | transloco" [required]="!editingId()">
+                <app-textarea
+                  size="sm"
+                  class="mono"
+                  [value]="kubeconfigContent"
+                  (valueChange)="kubeconfigContent = $event"
+                  [placeholder]="'datasources.form.kubeconfigPlaceholder' | transloco"
+                  [rows]="8"
+                  [disabled]="isSaving()"
+                />
+              </app-form-field>
+              <div class="cred-file-actions">
+                <input #kubeFileInput type="file" hidden accept=".yaml,.yml,.conf,application/x-yaml,text/yaml" (change)="onUploadFile($event, 'kubeconfig')" />
+                <app-button size="sm" variant="secondary" type="button" [disabled]="isSaving()" (clicked)="kubeFileInput.click()">
+                  <app-icon size="sm">attach_file</app-icon> {{ 'datasources.form.uploadFile' | transloco }}
+                </app-button>
+              </div>
+              <div class="form-hint">{{ 'datasources.form.kubeconfigHint' | transloco }}</div>
+              <div class="trust-notice">
+                <app-icon size="sm">shield</app-icon>
+                <div>
+                  <strong>{{ 'datasources.form.trustNoticeTitle' | transloco }}.</strong>
+                  {{ 'datasources.form.trustNotice' | transloco }}
+                </div>
+              </div>
+            }
+
+            <!-- SSH key: paste or generate -->
+            @if (formData.type === 'ssh_key') {
+              <app-form-field [label]="'datasources.form.sshKeyContentLabel' | transloco" [required]="!editingId()">
+                <app-textarea
+                  size="sm"
+                  class="mono"
+                  [value]="gitSshKey"
+                  (valueChange)="gitSshKey = $event"
+                  [placeholder]="'datasources.form.sshKeyContentPlaceholder' | transloco"
+                  [rows]="6"
+                  [disabled]="isSaving() || isGeneratingKey()"
+                />
+              </app-form-field>
+              <div class="cred-file-actions ssh-key-actions">
+                <input #sshFileInput type="file" hidden (change)="onUploadFile($event, 'ssh_key')" />
+                <app-button size="sm" variant="secondary" type="button" [disabled]="isSaving() || isGeneratingKey()" (clicked)="sshFileInput.click()">
+                  <app-icon size="sm">attach_file</app-icon> {{ 'datasources.form.uploadFile' | transloco }}
+                </app-button>
+                @if (!showGenerateConfirm()) {
+                  <app-button
+                    size="sm"
+                    variant="secondary"
+                    type="button"
+                    [disabled]="isSaving() || isGeneratingKey()"
+                    (clicked)="onGenerateSshKeyClick()"
+                  >
+                    @if (isGeneratingKey()) {
+                      <app-spinner size="sm" />
+                      {{ 'datasources.form.sshGenerateBusy' | transloco }}
+                    } @else {
+                      {{ 'datasources.form.sshGenerate' | transloco }}
+                    }
+                  </app-button>
+                } @else {
+                  <span class="confirm-text">{{ 'datasources.form.sshGenerateConfirm' | transloco }}</span>
+                  <app-button size="sm" variant="primary" type="button" (clicked)="confirmGenerateSshKey()">
+                    {{ 'datasources.form.sshGenerateReplace' | transloco }}
+                  </app-button>
+                  <app-button size="sm" variant="secondary" type="button" (clicked)="cancelGenerateSshKey()">
+                    {{ 'datasources.form.cancel' | transloco }}
+                  </app-button>
+                }
+              </div>
+              <div class="form-hint">{{ 'datasources.form.sshKeyHint' | transloco }}</div>
+              <div class="trust-notice">
+                <app-icon size="sm">shield</app-icon>
+                <div>
+                  <strong>{{ 'datasources.form.trustNoticeTitle' | transloco }}.</strong>
+                  {{ 'datasources.form.trustNotice' | transloco }}
+                </div>
+              </div>
+            }
+
+            <!-- Generic file: repeatable editor -->
+            @if (formData.type === 'generic_file') {
+              <app-form-field [label]="'datasources.form.credFilesLabel' | transloco">
+                <div class="generic-files-editor">
+                  @for (gf of genericFiles; track $index) {
+                    <div class="generic-file-card">
+                      <div class="form-row">
+                        <app-form-field class="flex-1" [label]="'datasources.form.credFileNameLabel' | transloco">
+                          <app-input
+                            size="sm"
+                            [value]="gf.name"
+                            (valueChange)="gf.name = $event"
+                            [placeholder]="'datasources.form.credFileNamePlaceholder' | transloco"
+                            [disabled]="isSaving()"
+                          />
+                        </app-form-field>
+                        <app-form-field class="flex-1" [label]="'datasources.form.credFileTargetPathLabel' | transloco" [required]="true">
+                          <app-input
+                            size="sm"
+                            class="mono"
+                            [value]="gf.target_path"
+                            (valueChange)="gf.target_path = $event"
+                            [placeholder]="'datasources.form.credFileTargetPathPlaceholder' | transloco"
+                            [disabled]="isSaving()"
+                          />
+                        </app-form-field>
+                      </div>
+                      <app-form-field [label]="'datasources.form.credFileContentsLabel' | transloco" [required]="true">
+                        <app-textarea
+                          size="sm"
+                          class="mono"
+                          [value]="gf.contents"
+                          (valueChange)="gf.contents = $event"
+                          [placeholder]="'datasources.form.credFileContentsPlaceholder' | transloco"
+                          [rows]="5"
+                          [disabled]="isSaving()"
+                        />
+                      </app-form-field>
+                      <div class="form-row">
+                        <app-form-field [label]="'datasources.form.credFileModeLabel' | transloco">
+                          <app-input
+                            size="sm"
+                            class="mono"
+                            [value]="gf.mode"
+                            (valueChange)="gf.mode = $event"
+                            [placeholder]="'datasources.form.credFileModePlaceholder' | transloco"
+                            [disabled]="isSaving()"
+                          />
+                        </app-form-field>
+                        <app-form-field class="flex-1" [label]="'datasources.form.credFileEnvVarLabel' | transloco" [optional]="'datasources.form.optional' | transloco">
+                          <app-input
+                            size="sm"
+                            class="mono"
+                            [value]="gf.env_var"
+                            (valueChange)="gf.env_var = $event"
+                            [placeholder]="'datasources.form.credFileEnvVarPlaceholder' | transloco"
+                            [disabled]="isSaving()"
+                          />
+                        </app-form-field>
+                        <div class="generic-file-card-actions">
+                          <input #gfFileInput type="file" hidden (change)="onUploadFile($event, { file: $index })" />
+                          <app-button size="sm" variant="ghost" type="button" [disabled]="isSaving()" (clicked)="gfFileInput.click()">
+                            <app-icon size="sm">attach_file</app-icon> {{ 'datasources.form.uploadFile' | transloco }}
+                          </app-button>
+                          <app-icon-button
+                            variant="danger"
+                            size="sm"
+                            [ariaLabel]="'datasources.form.credFileRemoveTooltip' | transloco"
+                            [tooltip]="'datasources.form.credFileRemoveTooltip' | transloco"
+                            [disabled]="isSaving()"
+                            (clicked)="removeGenericFile($index)"
+                          >
+                            <app-icon size="sm">close</app-icon>
+                          </app-icon-button>
+                        </div>
+                      </div>
+                    </div>
+                  }
+                  <app-button
+                    size="sm"
+                    variant="ghost"
+                    class="btn-add-env"
+                    [disabled]="isSaving() || genericFiles.length >= 5"
+                    (clicked)="addGenericFile()"
+                  >
+                    <app-icon size="sm">add</app-icon> {{ 'datasources.form.credFilesAdd' | transloco }}
+                  </app-button>
+                </div>
+              </app-form-field>
+              <div class="form-hint">{{ 'datasources.form.credFileGenericHint' | transloco }}</div>
+              <div class="trust-notice">
+                <app-icon size="sm">shield</app-icon>
+                <div>
+                  <strong>{{ 'datasources.form.trustNoticeTitle' | transloco }}.</strong>
+                  {{ 'datasources.form.trustNotice' | transloco }}
+                </div>
+              </div>
+            }
+
             <div class="form-row form-footer">
               <div class="form-actions">
-                @if (formData.type !== 'generic' && formData.type !== 'repository') {
+                @if (formData.type !== 'generic' && formData.type !== 'repository' && !isCredentialFileType()) {
                   <app-button
                     variant="secondary"
                     size="sm"
@@ -787,6 +974,61 @@ import {AppDialogComponent} from '../../ui/dialog';
         color: var(--warning, var(--text-primary));
       }
 
+      /* Credential-file actions row (upload, generate) */
+      .cred-file-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        flex-wrap: wrap;
+      }
+
+      /* Posture-1 trust notice — warning-tinted, slightly more prominent
+         than .form-hint because it carries security-relevant copy. */
+      .trust-notice {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin-top: 8px;
+        padding: 10px 12px;
+        background: var(--warning-tint, var(--info-tint));
+        border: 1px solid var(--warning-border, var(--info-tint));
+        border-radius: var(--radius-tag);
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-primary, var(--text-primary));
+      }
+
+      .trust-notice app-icon {
+        flex-shrink: 0;
+        margin-top: 1px;
+        color: var(--warning, var(--text-primary));
+      }
+
+      /* Repeatable file editor for generic_file type */
+      .generic-files-editor {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .generic-file-card {
+        padding: 10px;
+        border: 1px solid var(--border-color, var(--surface-0));
+        border-radius: var(--radius-tag);
+        background: var(--surface-1, transparent);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .generic-file-card-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        align-self: flex-end;
+      }
+
       .public-key-intro,
       .public-key-hint {
         margin: 0 0 10px;
@@ -1000,7 +1242,23 @@ export class DatasourceListComponent implements OnInit {
     { labelKey: 'datasources.filter.neo4j', value: 'neo4j' },
     { labelKey: 'datasources.filter.mongodb', value: 'mongodb' },
     { labelKey: 'datasources.filter.webdav', value: 'webdav' },
+    { labelKey: 'datasources.filter.kubeconfig', value: 'kubeconfig' },
+    { labelKey: 'datasources.filter.ssh_key', value: 'ssh_key' },
+    { labelKey: 'datasources.filter.generic_file', value: 'generic_file' },
   ];
+
+  // Types whose credentials are materialized as files on the agent (rather
+  // than env vars or live connections). No connection URL, no test button.
+  readonly credentialFileTypes: DatasourceType[] = ['kubeconfig', 'ssh_key', 'generic_file'];
+
+  isCredentialFileType(type: DatasourceType | string = this.formData.type): boolean {
+    return this.credentialFileTypes.includes(type as DatasourceType);
+  }
+
+  /** True for types that connect to something with a URL (everything except credential-files). */
+  hasConnectionUrl(): boolean {
+    return !this.isCredentialFileType();
+  }
 
   // Computed filtered list
   readonly filteredDatasources = computed(() => {
@@ -1023,11 +1281,37 @@ export class DatasourceListComponent implements OnInit {
     return placeholders[this.formData.type] || '';
   });
 
+  // Credential-file form state. Reused for editing too: when the user opens
+  // an edit form, the contents stay blank (credentials never come back from
+  // the API), so the user re-pastes if they want to replace the stored value.
+  kubeconfigContent = '';
+  genericFiles: Array<{
+    name: string;
+    target_path: string;
+    contents: string;
+    mode: string;
+    env_var: string;
+  }> = [];
+
   // Whether the form can be saved (method, not computed, because formData is a plain object)
   canSave(): boolean {
     if (!this.formData.name) return false;
     if (this.formData.type === 'generic') {
       return !!(this.formData.description);
+    }
+    if (this.formData.type === 'kubeconfig') {
+      // On edit, leaving contents blank means "keep existing".
+      return this.editingId() !== null || !!this.kubeconfigContent.trim();
+    }
+    if (this.formData.type === 'ssh_key') {
+      return this.editingId() !== null || !!this.gitSshKey.trim();
+    }
+    if (this.formData.type === 'generic_file') {
+      if (this.editingId() !== null) return true;
+      // At least one file with both target_path and contents.
+      return this.genericFiles.some(
+        (f) => f.target_path.trim() && f.contents.length > 0,
+      );
     }
     return !!this.formData.connection_url;
   }
@@ -1109,6 +1393,11 @@ export class DatasourceListComponent implements OnInit {
     }
     // Generic env vars also live in credentials; keep editing UX consistent.
     this.envVars = [];
+    // Credential-file types: contents never come back from the API (F3
+    // redaction), so the textareas stay blank. The user re-pastes only
+    // if they want to replace the stored value.
+    this.kubeconfigContent = '';
+    this.genericFiles = [];
     this.editingId.set(ds.id);
     this.showForm.set(true);
     this.formTestResult.set(null);
@@ -1245,6 +1534,11 @@ export class DatasourceListComponent implements OnInit {
         return 'warning';
       case 'mongodb':
         return 'neutral';
+      case 'kubeconfig':
+      case 'ssh_key':
+      case 'generic_file':
+        // Credential-file types share a tone so the table groups them visually.
+        return 'warning';
       default:
         return 'neutral';
     }
@@ -1434,6 +1728,9 @@ export class DatasourceListComponent implements OnInit {
       neo4j: 'hub',
       mongodb: 'eco',
       webdav: 'cloud',
+      kubeconfig: 'rocket_launch',
+      ssh_key: 'key',
+      generic_file: 'description',
     };
     return icons[type] || 'storage';
   }
@@ -1482,6 +1779,34 @@ export class DatasourceListComponent implements OnInit {
         return { auth_method: 'token', token: this.formCredentials.password };
       }
     }
+    if (this.formData.type === 'kubeconfig') {
+      const contents = this.kubeconfigContent;
+      if (!contents.trim()) return isEditing ? undefined : { files: [] };
+      const file: CredentialFileEntry = { contents };
+      return { files: [file] };
+    }
+    if (this.formData.type === 'ssh_key') {
+      const contents = this.gitSshKey;
+      if (!contents.trim()) return isEditing ? undefined : { files: [] };
+      const file: CredentialFileEntry = { contents };
+      return { files: [file] };
+    }
+    if (this.formData.type === 'generic_file') {
+      const entries: CredentialFileEntry[] = [];
+      for (const f of this.genericFiles) {
+        if (!f.target_path.trim() || f.contents.length === 0) continue;
+        const entry: CredentialFileEntry = {
+          contents: f.contents,
+          target_path: f.target_path.trim(),
+        };
+        if (f.name.trim()) entry.name = f.name.trim();
+        if (f.mode.trim()) entry.mode = f.mode.trim();
+        if (f.env_var.trim()) entry.env_var = f.env_var.trim();
+        entries.push(entry);
+      }
+      if (entries.length === 0) return isEditing ? undefined : { files: [] };
+      return { files: entries };
+    }
     if (!this.formCredentials.username && !this.formCredentials.password) return undefined;
     return {
       username: this.formCredentials.username || undefined,
@@ -1502,6 +1827,66 @@ export class DatasourceListComponent implements OnInit {
     this.gitAuthMethod = 'token';
     this.gitSshKey = '';
     this.envVars = [];
+    this.kubeconfigContent = '';
+    this.genericFiles = [];
+  }
+
+  // ===== Generic file editor =====
+
+  addGenericFile(): void {
+    if (this.genericFiles.length >= 5) return;
+    this.genericFiles.push({
+      name: '',
+      target_path: '',
+      contents: '',
+      mode: '0600',
+      env_var: '',
+    });
+  }
+
+  removeGenericFile(index: number): void {
+    this.genericFiles.splice(index, 1);
+  }
+
+  // ===== File upload (reads selected file into a textarea client-side) =====
+
+  /** Read a user-selected file into the target text variable. No multipart upload. */
+  onUploadFile(evt: Event, target: 'kubeconfig' | 'ssh_key' | { file: number }): void {
+    const input = evt.target as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    // Hard-cap at 64KB to match the backend validator; surface a clear error otherwise.
+    if (file.size > 64 * 1024) {
+      this.errorMessage.set(
+        this.transloco.translate('datasources.messages.fileTooLarge') ||
+          'File exceeds 64 KB',
+      );
+      input.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = typeof reader.result === 'string' ? reader.result : '';
+      if (target === 'kubeconfig') {
+        this.kubeconfigContent = text;
+      } else if (target === 'ssh_key') {
+        this.gitSshKey = text;
+      } else if (typeof target === 'object' && 'file' in target) {
+        const idx = target.file;
+        if (this.genericFiles[idx]) {
+          this.genericFiles[idx].contents = text;
+          if (!this.genericFiles[idx].name) {
+            this.genericFiles[idx].name = file.name;
+          }
+        }
+      }
+      input.value = '';
+    };
+    reader.onerror = () => {
+      this.errorMessage.set('Failed to read file');
+      input.value = '';
+    };
+    reader.readAsText(file);
   }
 
   private clearMessages(): void {

@@ -972,7 +972,10 @@
       "postgresql": "PostgreSQL",
       "neo4j": "Neo4j",
       "mongodb": "MongoDB",
-      "webdav": "WebDAV"
+      "webdav": "WebDAV",
+      "kubeconfig": "Kubeconfig",
+      "ssh_key": "SSH-Schlüssel",
+      "generic_file": "Datei"
     },
     "form": {
       "editTitle": "Datenquelle bearbeiten",
@@ -982,12 +985,16 @@
       "typeLabel": "Typ",
       "typeGroupCli": "CLI-basiert",
       "typeGroupManaged": "Verwaltet",
+      "typeGroupCredentialFiles": "Anmeldedaten-Dateien",
       "optGeneric": "Generisch",
       "optRepository": "Repository",
       "optPostgresql": "PostgreSQL",
       "optNeo4j": "Neo4j",
       "optMongodb": "MongoDB",
       "optWebdav": "WebDAV",
+      "optKubeconfig": "Kubeconfig (kubectl)",
+      "optSshKey": "SSH-Schlüssel",
+      "optGenericFile": "Generische Datei",
       "connectionUrlLabel": "Verbindungs-URL",
       "repoUrlLabel": "Repository-URL",
       "optional": "(optional)",
@@ -1025,7 +1032,30 @@
       "cancel": "Abbrechen",
       "saving": "Wird gespeichert...",
       "update": "Aktualisieren",
-      "create": "Erstellen"
+      "create": "Erstellen",
+      "kubeconfigLabel": "Kubeconfig-YAML",
+      "kubeconfigPlaceholder": "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n    cluster:\n      server: https://...",
+      "kubeconfigHint": "Cluster-, Benutzer- und Kontext-Namen werden zur Laufzeit mit dem Slug der Datenquelle präfixiert, damit mehrere Kubeconfigs ohne Kollisionen zusammengeführt werden können. Mit `kubectl config get-contexts` im Agenten lässt sich die zusammengeführte Sicht prüfen.",
+      "sshKeyContentLabel": "Privater SSH-Schlüssel",
+      "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+      "sshKeyHint": "Der Schlüssel wird unter ~/.ssh/<slug> mit Modus 0600 materialisiert. Konfigurieren Sie im Agenten einen Host-Block in ~/.ssh/config, um ihn für bestimmte Hosts zu verwenden.",
+      "uploadFile": "Datei hochladen",
+      "trustNoticeTitle": "Vom Agenten lesbares Geheimnis",
+      "trustNotice": "Diese Datei wird im Dateisystem des Agenten materialisiert und ist vom Agenten-Prozess lesbar. Verwenden Sie ein eng zugeschnittenes Geheimnis — ein nur-lesendes Kubeconfig, einen projektgebundenen Deploy-Key — wenn der Job keinen weitergehenden Zugriff benötigt.",
+      "credFilesLabel": "Dateien",
+      "credFilesAdd": "Datei hinzufügen",
+      "credFileNameLabel": "Name",
+      "credFileNamePlaceholder": "config.json",
+      "credFileTargetPathLabel": "Zielpfad",
+      "credFileTargetPathPlaceholder": "~/.config/myapp/config.json",
+      "credFileContentsLabel": "Inhalt",
+      "credFileContentsPlaceholder": "Dateiinhalt (nur Text, max. 64 KB)",
+      "credFileModeLabel": "Modus",
+      "credFileModePlaceholder": "0600",
+      "credFileEnvVarLabel": "Env-Variable",
+      "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
+      "credFileRemoveTooltip": "Datei entfernen",
+      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben. Ist eine \"Env-Variable\" gesetzt, erhält der Agent-Prozess diese Variable mit dem absoluten Pfad. Pfade müssen unter /home/srw, /tmp, /run oder /workspace liegen."
     },
     "sshKeyDialog": {
       "title": "Fügen Sie diesen SSH-Schlüssel zu Ihrem Repository hinzu",
@@ -1064,7 +1094,8 @@
       "deleteFailed": "Löschen der Datenquelle fehlgeschlagen",
       "deleteError": "Fehler beim Löschen der Datenquelle",
       "testFailed": "Anfrage fehlgeschlagen",
-      "testRequestFailed": "Testanfrage fehlgeschlagen"
+      "testRequestFailed": "Testanfrage fehlgeschlagen",
+      "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
     }
   },
   "inbox": {
