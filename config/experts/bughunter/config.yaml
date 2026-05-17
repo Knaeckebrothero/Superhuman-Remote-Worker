@@ -1,0 +1,86 @@
+# yaml-language-server: $schema=../../schema.json
+# Bug Hunter - Adversarial, exploratory testing of an existing target surface.
+$extends: defaults
+
+agent_id: bughunter
+display_name: Bug Hunter
+description: |
+  Adversarial QA. Picks a target surface (module, endpoint family, feature
+  flag, tenant boundary) and tries to break it. Probes inputs, races,
+  permissions, and assumptions. Every finding ships with a reproduction —
+  a failing test, curl, SQL query, or browser trace. Hunts; does not fix.
+icon: bug_report
+color: "#fab387"
+tags:
+  - testing
+  - security
+  - audit
+  - reliability
+
+llm:
+  reasoning_level: high
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/findings/
+    - output/repros/
+    - notes/
+  git_versioning: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - search_files
+    - file_exists
+    - get_document_info
+    - create_directory
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  shell:
+    - run_command
+    - shell_execute
+    - shell_read
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Read-only DB probes — write tools (sql_execute, mongo_insert/update) are
+  # NOT listed here. If a hunt mission genuinely needs writes (e.g. fuzzing
+  # a write path against an ephemeral DB), inject them per-job via
+  # config_override at dispatch time.
+  sql: []
+  mongodb: []
+  # Browser for UI/SSE/WebSocket probes — high signal for the kinds of bugs
+  # surface-level review misses (auth flows, race conditions in streams).
+  browser_direct:
+    - browser_navigate
+    - browser_snapshot
+    - browser_click
+    - browser_type
+    - browser_select
+    - browser_scroll
+    - browser_screenshot
+    - browser_back
+    - browser_close
+  # Web search for known CVEs / advisories in dependencies the hunt touches.
+  research:
+    - web_search
+    - extract_webpage
+  # No delegation — bug hunting is a single focused investigator. Add later
+  # if hunt missions grow large enough to parallelize.
+  delegation: []
+  # Not needed
+  citation: []
+  graph: []

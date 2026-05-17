@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from .base import SYNC_IGNORE_PATTERNS, WorkspaceSyncBase
+from .coordinator import CloudSyncError, MountSync, WorkspaceSyncCoordinator
 from .nextcloud import NextcloudWorkspaceSync
 from .opencloud import OpenCloudWorkspaceSync
 
@@ -28,6 +29,7 @@ def build_workspace_sync(
     cloud_cfg: Optional[dict[str, Any]],
     workspace_backend: Optional["WorkspaceBackend"] = None,
     poll_interval: int = 15,
+    mount_subdir: str = "",
 ) -> Optional[WorkspaceSyncBase]:
     """Construct the right sync implementation for a session, or None.
 
@@ -70,6 +72,7 @@ def build_workspace_sync(
             webdav_password=auth["password"],
             poll_interval=poll_interval,
             workspace_backend=workspace_backend,
+            mount_subdir=mount_subdir,
         )
     if backend == "opencloud" and auth_type == "keycloak_client_credentials":
         return OpenCloudWorkspaceSync(
@@ -80,6 +83,7 @@ def build_workspace_sync(
             client_secret=auth["client_secret"],
             poll_interval=poll_interval,
             workspace_backend=workspace_backend,
+            mount_subdir=mount_subdir,
         )
     logger.warning(
         "cloud_sync: unsupported backend/auth combo (backend=%s auth.type=%s)",
@@ -94,5 +98,8 @@ __all__ = [
     "WorkspaceSyncBase",
     "NextcloudWorkspaceSync",
     "OpenCloudWorkspaceSync",
+    "MountSync",
+    "WorkspaceSyncCoordinator",
+    "CloudSyncError",
     "build_workspace_sync",
 ]

@@ -28,11 +28,13 @@ class NextcloudWorkspaceSync(WorkspaceSyncBase):
         webdav_password: str,
         poll_interval: int = 15,
         workspace_backend: Optional["WorkspaceBackend"] = None,
+        mount_subdir: str = "",
     ) -> None:
         super().__init__(
             workspace_path,
             poll_interval=poll_interval,
             workspace_backend=workspace_backend,
+            mount_subdir=mount_subdir,
         )
         self._webdav_url = webdav_url
         self._webdav_user = webdav_user
