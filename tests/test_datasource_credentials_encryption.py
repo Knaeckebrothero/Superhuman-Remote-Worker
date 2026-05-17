@@ -177,4 +177,7 @@ class TestBackfillLogicShape:
         parsed = json.loads(legacy_raw)
         assert isinstance(parsed, dict)
         new_value = _encrypt_credentials_dict(parsed)
-        assert _decrypt_credentials_field(new_value) == {"username": "u", "password": "p"}
+        assert _decrypt_credentials_field(new_value) == {
+            "username": "u",
+            "password": "p",
+        }

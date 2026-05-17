@@ -142,7 +142,9 @@ def _decrypt_credentials_field(
     return {}
 
 
-def _datasource_row_to_dict(row, *, field: str = "datasources.credentials") -> Dict[str, Any]:
+def _datasource_row_to_dict(
+    row, *, field: str = "datasources.credentials"
+) -> Dict[str, Any]:
     """Convert a datasource asyncpg Record to a dict with decrypted credentials.
 
     Use anywhere a SELECT returns a datasource row. The ``credentials`` field
