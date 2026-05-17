@@ -171,6 +171,11 @@ async def init_postgres(force_reset: bool = False) -> bool:
             if not exists:
                 all_exist = False
 
+        # Backfill: encrypt any plaintext credentials JSONB values left over
+        # from before the encryption-at-rest migration. Idempotent — no-op
+        # on already-encrypted rows.
+        await _backfill_encrypt_datasource_credentials(db)
+
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
 
@@ -629,6 +634,49 @@ async def _reset_postgres_schema():
         await db.reset_schema()
     finally:
         await db.close()
+
+
+# =============================================================================
+# Datasource Credentials Encryption Backfill
+# =============================================================================
+
+
+async def _backfill_encrypt_datasource_credentials(db) -> None:
+    """Encrypt any legacy plaintext credentials in the datasources table.
+
+    Idempotent: rows already encrypted (v1 ciphertext) or empty are skipped.
+    Logged so operators can confirm the one-shot migration ran on first boot
+    after the encryption-at-rest change.
+    """
+    try:
+        counts = await db.backfill_encrypt_datasource_credentials()
+    except Exception as exc:
+        logger.error("  Backfill of datasource credentials failed: %s", exc)
+        return
+
+    encrypted = counts["encrypted"]
+    skipped = counts["skipped"]
+    errors = counts["errors"]
+
+    if encrypted > 0:
+        logger.info(
+            "  Encrypted %d legacy plaintext datasource credentials "
+            "(%d skipped, %d errors)",
+            encrypted,
+            skipped,
+            errors,
+        )
+    elif errors > 0:
+        logger.warning(
+            "  Datasource credentials backfill: %d errors (%d skipped)",
+            errors,
+            skipped,
+        )
+    else:
+        logger.debug(
+            "  Datasource credentials backfill: nothing to encrypt (%d skipped)",
+            skipped,
+        )
 
 
 # =============================================================================
