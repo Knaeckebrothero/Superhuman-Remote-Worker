@@ -613,6 +613,13 @@ spec:
             - --import-realm
             - --health-enabled=true
             - --tls-hostname-verifier=ANY
+            # Legacy V1 token-exchange enabled alongside V2 so the
+            # ``requested_subject`` impersonation parameter works (RFC 8693
+            # standard V2 doesn't support it). Required by Phase 2.1 of
+            # docs/features/cloud_collaboration_model.md §9 so the agent
+            # can mint user-scoped WebDAV tokens for default-project
+            # (user-home) mounts on OpenCloud Personal Spaces.
+            - --features=token-exchange,token-exchange-v2
           ports:
             - containerPort: 8080
           env:
