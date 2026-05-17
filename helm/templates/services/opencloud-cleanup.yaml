@@ -1,0 +1,101 @@
+{{- if and .Values.opencloud.enabled .Values.opencloud.cleanup.enabled }}
+# Periodic cleanup of expired TUS upload sessions on the opencloud-data PVC.
+#
+# OpenCloud's decomposeds3 driver stages every upload on the local PVC before
+# promoting to S3. Expired sessions (per STORAGE_USERS_UPLOAD_EXPIRATION) are
+# NOT auto-deleted — see opencloud-eu/opencloud#2208. Without periodic cleanup,
+# a misbehaving sync client (e.g. one that pushes .git/objects/* or .venv/) can
+# fill the staging PVC within hours and trigger a disk-full cascade.
+#
+# We exec the cleanup CLI inside the running opencloud pod (PVC is RWO and
+# can't be mounted twice), which needs pods/exec RBAC scoped to the namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "srw.fullname" . }}-opencloud-cleanup
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "opencloud-cleanup") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.fullname" . }}-opencloud-cleanup
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "opencloud-cleanup") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-opencloud-cleanup
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "opencloud-cleanup") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.fullname" . }}-opencloud-cleanup
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "srw.fullname" . }}-opencloud-cleanup
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "srw.fullname" . }}-opencloud-cleanup
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "opencloud-cleanup") | nindent 4 }}
+spec:
+  schedule: {{ .Values.opencloud.cleanup.schedule | quote }}
+  timeZone: "UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "srw.componentSelectorLabels" (dict "context" . "component" "opencloud-cleanup") | nindent 12 }}
+        spec:
+          serviceAccountName: {{ include "srw.fullname" . }}-opencloud-cleanup
+          restartPolicy: Never
+          {{- with .Values.global.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: cleanup
+              # bitnami/kubectl on Docker Hub uses suffixed tags like
+              # `1.33.5-debian-12-r0` — there are no plain semver minor/patch
+              # tags. Default to `latest`; the cleanup is a stateless one-shot
+              # so version drift is harmless. Override if you want pinning.
+              image: {{ .Values.opencloud.cleanup.image | quote }}
+              imagePullPolicy: IfNotPresent
+              command: [sh, -c]
+              args:
+                - |
+                  set -eu
+                  POD=$(kubectl -n {{ .Release.Namespace }} get pod \
+                    -l app.kubernetes.io/name={{ include "srw.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=opencloud \
+                    --field-selector=status.phase=Running \
+                    -o jsonpath='{.items[0].metadata.name}')
+                  if [ -z "$POD" ]; then
+                    echo "no running opencloud pod, skipping"
+                    exit 0
+                  fi
+                  echo "exec into $POD"
+                  kubectl -n {{ .Release.Namespace }} exec "$POD" -- \
+                    opencloud storage-users uploads sessions --expired=true --clean
+              resources:
+                {{- toYaml .Values.opencloud.cleanup.resources | nindent 16 }}
+{{- end }}
