@@ -111,7 +111,12 @@ metadata:
 spec:
   # An IP allow-list with a single non-routable address effectively denies all
   # real clients while keeping the resource valid. Traefik returns 403.
-  ipAllowList:
+  #
+  # Field name: ``ipWhiteList`` works on both Traefik v2 (only known name) and
+  # Traefik v3 (deprecated alias, still accepted). The newer ``ipAllowList``
+  # spelling is v3-only and silently no-ops on v2 — which is what we saw in
+  # the first push.
+  ipWhiteList:
     sourceRange:
       - 127.0.0.99/32
 ---
