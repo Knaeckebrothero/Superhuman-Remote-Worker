@@ -3083,6 +3083,30 @@ async def lifespan(app: FastAPI):
     await vector_db.apply_migrations()
     logger.info("Database migrations applied")
 
+    # Encrypt any legacy plaintext datasource credentials. Idempotent — once
+    # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
+    # (not init.py) for the same reason mongodb.ensure_indexes does: init.py
+    # is not reliably invoked at deploy time, and this is data-integrity
+    # critical for the encryption-at-rest guarantee.
+    try:
+        _bf = await postgres_db.backfill_encrypt_datasource_credentials()
+        if _bf["encrypted"] > 0:
+            logger.info(
+                "Encrypted %d legacy plaintext datasource credentials "
+                "(%d skipped, %d errors)",
+                _bf["encrypted"],
+                _bf["skipped"],
+                _bf["errors"],
+            )
+        elif _bf["errors"] > 0:
+            logger.warning(
+                "Datasource credentials backfill: %d errors (%d skipped)",
+                _bf["errors"],
+                _bf["skipped"],
+            )
+    except Exception as _e:
+        logger.error("Datasource credentials backfill failed: %s", _e)
+
     # Wire the model registry's catalog lookup to the DB. The registry lives
     # in src/core/ and must not import orchestrator/, so the hook is injected
     # here (and unset on shutdown below). custom/system lookups were retired
