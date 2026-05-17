@@ -237,6 +237,25 @@ ingress:
   # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
   cors:
     enabled: true
+  # -- Layer 1 (P4b): block /api/agents/* and /api/internal/* at the public
+  # API ingress so agent-internal paths can't be probed externally. Renders
+  # a Traefik IPWhiteList middleware + a high-priority Ingress that 403s
+  # those prefixes; the in-cluster Service stays reachable for the agent.
+  #
+  # Layer 2 (app-layer X-Internal-Key gate via require_internal) is always
+  # on regardless of this toggle — every agent-internal endpoint also
+  # refuses anonymous external callers at the application level.
+  #
+  # When to enable: you front the orchestrator with Traefik (or another
+  # ingress controller that honors the same Middleware CRD) and want a
+  # network-layer block before the request reaches the app.
+  # When to leave off: you use a tunnel/edge that bypasses Traefik
+  # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.) — Traefik never
+  # sees the request, so the middleware would be dead code. Add the
+  # equivalent path rule at your tunnel/edge instead. See
+  # docs/multi_tenancy.md for the cloudflared example.
+  internalPathBlock:
+    enabled: false
 
 # =============================================================================
 # Secrets — three modes (pick one)

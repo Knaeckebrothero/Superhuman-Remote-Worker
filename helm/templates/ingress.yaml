@@ -92,16 +92,24 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- if .Values.ingress.internalPathBlock.enabled }}
 ---
-# Track B (P4b) — agent-internal paths must not be reachable from the public
-# API ingress. The orchestrator's app-layer X-Internal-Key gate (require_internal)
-# is the primary defense; this Middleware + Ingress pair is the network-layer
-# second defense, blocking external HTTP traffic at the edge so attackers can't
-# even probe the agent surface.
+# Track B (P4b) — Layer 1 (opt-in). Block /api/agents/* and /api/internal/*
+# at the public API ingress so agent-internal paths can't be probed from
+# outside. This is OPT-IN because it only works when the orchestrator is
+# fronted by Traefik (or another ingress controller that honors this CRD).
 #
-# Cluster-internal callers (the agent reaching the orchestrator via the in-
-# cluster Service DNS http://srw-orchestrator:8085) bypass the ingress entirely,
-# so the agent's traffic is unaffected.
+# If you use a tunnel/edge that bypasses your ingress controller
+# (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.), Traefik never sees
+# the request and this middleware never fires — leave the toggle off and
+# put the equivalent path rule at your tunnel/edge instead. See
+# `docs/multi_tenancy.md` for the cloudflared example.
+#
+# Layer 2 (app-layer ``require_internal`` checking the ``X-Internal-Key``
+# header) is the primary defense and is always on regardless of this toggle.
+# Cluster-internal callers (the agent reaching the orchestrator via the
+# in-cluster Service DNS http://srw-orchestrator:8085) always bypass the
+# ingress, so the agent's traffic is unaffected whether or not Layer 1 is on.
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -114,8 +122,7 @@ spec:
   #
   # Field name: ``ipWhiteList`` works on both Traefik v2 (only known name) and
   # Traefik v3 (deprecated alias, still accepted). The newer ``ipAllowList``
-  # spelling is v3-only and silently no-ops on v2 — which is what we saw in
-  # the first push.
+  # spelling is v3-only and silently no-ops on v2.
   ipWhiteList:
     sourceRange:
       - 127.0.0.99/32
@@ -169,6 +176,7 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- end }}
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
 ---
 # Keycloak SSO (browser must reach this for login flow). Skipped when using external OIDC.
