@@ -262,7 +262,7 @@ Foundation first, then incremental additions. Each phase is independently shippa
 
 The simplest case: a session attached to one regular (non-default) project mounts that project's cloud folder into the workspace at `projects/<name>/`. Bidirectional sync at turn boundaries, reusing the existing `cloud_sync` machinery retargeted from session folders to project folders.
 
-Per-session cloud folder continues to be created in parallel for back-compat — Phase 4 deprecates it.
+Per-session cloud folder continues to be created in parallel for back-compat — Phase 4 narrows it to a fallback (only created when no mount exists).
 
 - **Deliverable:** a session attached to project X has X's files in `projects/X/`; agent edits flow back to X's cloud folder. **✅ Live-verified on dev cluster 2026-05-17.**
 - **Acceptance:** drop a file into project X via OpenCloud → agent reads it next turn. Agent writes a file → user sees it in OpenCloud. **✅ Both directions confirmed end-to-end** (project `Create chatbot for Sadur Süd`, OpenCloud Space, agent's `write_file` of marker text appeared in the user-visible cloud folder; user's marker file dropped beforehand was read by the agent on turn 1).
@@ -274,7 +274,7 @@ Per-session cloud folder continues to be created in parallel for back-compat —
 
 - **`metadata.project_ids` deprecated.** Phase 1 stops writing this JSONB key and removes its three readers (`orchestrator/main.py:9933`, `:9982`, `orchestrator/services/formatters.py:2419`) plus the writer at `orchestrator/main.py:10615`. **`thread_mounts` becomes the source of truth.** Runtime `project_ids: list[str]` continues to flow to downstream consumers (RAG scoping in `src/persistent_graph.py`, tool context in `src/tools/context.py`, knowledge tools in `src/tools/knowledge/knowledge_tools.py`, etc.) — but it is **derived from `thread_mounts` rows at payload-build time**, not read from metadata JSONB. The list-of-strings shape stays the contract for runtime; only the persistence layer changes. `visible_project_ids` (multi-tenancy access control) is a separate concept and is **not** affected by this deprecation.
 
-- **Agent payload contract: `cloud_sync` bumped to `version: 2`.** `_build_agent_cloud_sync()` returns `{version: 2, session_folder: {...legacy single-folder cfg...}, mounts: [{mount_id, target_path, backend, webdav_url, auth}, ...]}`. v1 payloads (no `mounts` key) remain supported until Phase 4 deletes the legacy session-folder path. The orchestrator also continues sending a derived `project_ids` list alongside for runtime consumers (until they're all migrated to consume from `mounts` directly — Phase 4 territory).
+- **Agent payload contract: `cloud_sync` bumped to `version: 2`.** `_build_agent_cloud_sync()` returns `{version: 2, session_folder: {...legacy single-folder cfg...}, mounts: [{mount_id, target_path, backend, webdav_url, auth}, ...]}`. v1 payloads (no `mounts` key) remain supported indefinitely — Phase 4's narrowed scope keeps the legacy session-folder path live as a fallback. Runtime consumers that still read `project_ids` will migrate to `mounts` opportunistically; the dual contract stays.
 
 - **Integration: Option A — transport-level callbacks** (`_loop_on_turn_start` / `_loop_on_turn_complete` in `src/api/persistent_app.py`). `await coordinator.pull_all()` inside turn-start, `await coordinator.push_all()` inside turn-complete (replacing the fire-and-forget `asyncio.create_task` at `persistent_app.py:2319`). Session-start `start_background_poll()` call at `persistent_app.py:917` becomes a single blocking initial pull. **Zero changes to `src/persistent_graph.py`** — the callbacks pattern already awaits, blocking semantics emerge from the await.
 
@@ -427,14 +427,37 @@ A session can have multiple attached projects + repos. Default project (if attac
 - **Deliverable:** a session with the default project + two other projects + a repo has all four mounted correctly and visible to the agent.
 - **Acceptance:** end-to-end test with four attachments; mount paths match the documented rule; agent can read/write each surface.
 
-### Phase 4 — Per-session cloud folder deprecation
+### Phase 4 — Per-session cloud folder becomes fallback-only
 
-New sessions no longer call `ensure_session_folder()`. The per-thread Gitea repo (`thread-<id>`) is repurposed as a snapshot store (Phase 7); it no longer carries the working files.
+**Revised 2026-05-17.** Earlier framing said "deprecate session folders entirely" — that was wrong. The session folder remains a valid surface; it just shouldn't be created when the session already has a user-visible cloud surface via Phase 1/2/3 mounts. This phase formalizes the *fallback* policy and removes the unconditional eager creation.
 
-Existing session folders remain readable during a grace period (~3 months) so in-flight users aren't disrupted.
+#### Why the framing changed
 
-- **Deliverable:** new sessions create zero per-session cloud folders; old sessions still load.
-- **Risk:** anyone with bookmarks into old session folders. Acceptable cost.
+Not every session has a mount. Real cases that need a cloud surface but have none from mounts:
+
+- A user starts a thread without attaching any project, and doesn't have a default project (legacy account, default not yet auto-provisioned).
+- A user explicitly detaches their default project for throwaway work and doesn't attach anything else.
+- Default-project user-home resolution fails (Keycloak hiccup, owner not yet SSO-onboarded, backend down at the moment of provisioning) — Phase 2's observable-state gate already routes to session folder in this case.
+
+Without a session-folder fallback, those sessions end up with zero cloud surfaces and the agent's output is invisible to the user. So keep the fallback.
+
+#### Policy
+
+- **No mounts observable** → provision session folder. Identical to today's fallback path inside `_setup_main_cloud()`, just generalized.
+- **Any mount observable** (Phase 1 `project`, Phase 2 `project_default`, or Phase 3 `repo`) → skip `ensure_session_folder()`. The mount(s) are the user-visible surface.
+- **User-controlled override (future, opt-in):** a per-thread "always create a session folder for this thread" toggle in the new-thread dialog, for the throwaway-work case where the user wants a clean per-session surface even though a project is attached. Not blocking on Phase 4 — can land as a follow-up if real demand surfaces.
+
+#### Code changes
+
+- `_setup_main_cloud()` short-circuit gate (currently keyed on `project_default` only at `orchestrator/main.py:10978`) widens to: skip when *any* observable mount row has a non-null `webdav_url`. The fallback branch (provision session folder when nothing is observable) stays intact.
+- No removal of `ensure_session_folder()` or the legacy `nc_session_folder` columns. Cleanup of *orphaned* old session folders is deferred to Phase 8.
+
+#### Per-thread Gitea repo (separate concern)
+
+The per-thread Gitea repo (`thread-<id>`) was previously paired with the session folder. Phase 7 repurposes it as a snapshot store independently. Whether we still provision it eagerly for every thread or only for sessions that want snapshots is a Phase 7 question, not a Phase 4 one. Phase 4 doesn't touch the Gitea side.
+
+- **Deliverable:** new sessions skip the session folder when any mount exists; sessions with no mounts still get a fallback folder as today; existing session folders unchanged.
+- **Acceptance:** start a session attached to a project → no session folder created. Start a session with nothing attached → session folder created exactly like today.
 
 ### Phase 5 — Job staging clone
 
@@ -454,16 +477,18 @@ New endpoint `POST /api/jobs/{id}/accept` (sibling to existing `/promote`, which
 
 ### Phase 7 — Per-turn snapshots + session timeline
 
-The repurposed per-thread Gitea repo (Phase 4) commits workspace state after each sync-back. Cockpit's session UI gains a timeline showing what changed between turns. Rollback verb: "revert this session to turn N" restores files from snapshot into the cloud folders.
+The per-thread Gitea repo (`thread-<id>`) is repurposed here as a snapshot store. It commits workspace state after each sync-back. Cockpit's session UI gains a timeline showing what changed between turns. Rollback verb: "revert this session to turn N" restores files from snapshot into the cloud folders.
 
 - **Deliverable:** a session has a visible turn-by-turn history; user can roll back to any turn.
 - **Acceptance:** make an agent edit; roll back; verify the cloud folder reverted.
 
 ### Phase 8 — Cleanup
 
-Remove deprecated per-session cloud folder code paths entirely (post grace period). One-time migration script archives surviving old session folders into the user's drafts area for retention.
+**Scope narrowed 2026-05-17.** Since Phase 4 keeps the session folder as a fallback (rather than removing it), this phase no longer kills the code path — it just sweeps orphaned cloud folders that the old eager-creation policy left behind.
 
-- **Deliverable:** single code path; the parallel session-folder lifecycle is gone.
+- **One-time archive sweep:** identify session folders for closed threads that no longer have a live thread referencing them; offer to archive them into the user's drafts area (or leave them in place behind a "show archived sessions" filter). Decision deferred to when we actually run the sweep — it depends on how many orphans exist by then.
+- **No code-path removal:** `ensure_session_folder()` and the `nc_session_folder` columns stay. They remain the fallback for unattached sessions and the recovery path for transient mount-resolution failures (Phase 2 / Phase 4).
+- **Deliverable:** orphaned session folders from pre-Phase-1 eager creation are catalogued and dispositioned. The active code path is unchanged.
 
 ### Phase 9+ — V2 extensions (deferred)
 
