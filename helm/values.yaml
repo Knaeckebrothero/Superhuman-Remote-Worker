@@ -663,6 +663,27 @@ opencloud:
   # not — once bumped, you can't go back without copy-swap.
   dataStorageSize: "16Gi"
   configStorageSize: "1Gi"
+  # TTL for incomplete/abandoned TUS upload sessions. The decomposeds3
+  # driver doesn't auto-purge expired sessions (opencloud-eu/opencloud#2208) —
+  # this only marks them eligible for the cleanup CronJob below. Short
+  # values (4h) cap the worst-case staging working set when a sync client
+  # misbehaves; legitimate slow uploads renew the lease per chunk.
+  uploadExpiration: "4h"
+  # Periodic cleanup of expired TUS sessions. Runs `opencloud storage-users
+  # uploads sessions --expired=true --clean` inside the running pod via
+  # pods/exec RBAC. Without this, expired entries accumulate forever and
+  # eventually fill the data PVC.
+  cleanup:
+    enabled: true
+    schedule: "0 * * * *"   # hourly
+    image: "docker.io/bitnami/kubectl:latest"
+    resources:
+      requests:
+        cpu: "10m"
+        memory: "32Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
   resources:
     requests:
       memory: "256Mi"
