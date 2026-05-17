@@ -9925,16 +9925,150 @@ async def agent_create_thread(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _slugify_mount_name(name: str) -> str:
+    """Workspace-safe slug for a mount's target_path."""
+    out = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
+    return out or "project"
+
+
+def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
+    """Pick out project ``source_ref``s from a list of mount rows."""
+    out: list[str] = []
+    for m in mounts:
+        if m.get("mount_kind") != "project":
+            continue
+        ref = m.get("source_ref")
+        if ref:
+            out.append(str(ref))
+    return out
+
+
+async def _thread_project_ids(thread_id: str) -> list[str]:
+    """Derive the project-attachment list for a thread from ``thread_mounts``.
+
+    Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
+    of cloud_collaboration_model.md §9. Only ``mount_kind='project'`` rows
+    contribute — ``project_default`` and ``repo`` rows are different shapes
+    on the agent side.
+
+    **Lazy backfill (transitional):** threads that predate the migration
+    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. When
+    we see that combination we materialize the missing rows on the spot,
+    so the rest of the codebase observes ``thread_mounts`` as the single
+    source of truth from the first access onwards. Remove this fallback
+    one release after Phase 1 ships — by then every active thread has
+    been touched at least once and the JSONB key is dead.
+    """
+    mounts = await postgres_db.list_thread_mounts(thread_id)
+    ids = _project_ids_from_mounts(mounts)
+    if ids:
+        return ids
+
+    # ---- lazy backfill from metadata.project_ids ----
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        return []
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    legacy_ids = metadata.get("project_ids") or []
+    if not legacy_ids:
+        return []
+    try:
+        rows = await _build_thread_mount_rows([str(p) for p in legacy_ids])
+        if rows:
+            await postgres_db.replace_thread_mounts(thread_id, rows)
+            logger.info(
+                "Thread %s: backfilled %d thread_mounts row(s) from "
+                "legacy metadata.project_ids",
+                thread_id,
+                len(rows),
+            )
+            return _project_ids_from_mounts(
+                await postgres_db.list_thread_mounts(thread_id)
+            )
+    except Exception as e:
+        # Don't let a backfill failure prevent the caller from getting the
+        # project_ids — fall back to the legacy list so behavior matches
+        # the pre-migration era. The next access retries the backfill.
+        logger.warning(
+            "Thread %s: thread_mounts backfill failed (%s); "
+            "returning legacy project_ids",
+            thread_id,
+            e,
+        )
+    return [str(p) for p in legacy_ids]
+
+
+async def _build_thread_mount_rows(
+    project_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Resolve mount-row payloads for the given project_ids.
+
+    Each row carries everything ``replace_thread_mounts`` needs. Skips
+    default projects (Phase 1 scope is non-default projects mounted under
+    ``projects/<slug>/``) and projects without an attached cloud folder.
+    """
+    rows: list[dict[str, Any]] = []
+    for project_id in project_ids:
+        project = await postgres_db.get_project(project_id)
+        if not project:
+            continue
+        if project.get("is_default"):
+            # Default project becomes a project_default mount at workspace
+            # root in Phase 2 — handled by a separate code path then.
+            continue
+        backend_id = project.get("main_cloud_backend")
+        handle_str = project.get("main_cloud_folder_handle")
+        webdav_url: str | None = None
+        if backend_id and handle_str:
+            try:
+                backend = main_cloud_router.for_backend(backend_id)
+                if backend.is_initialized:
+                    handle = ProjectFolderHandle.from_db(
+                        handle_str, backend=backend.backend_id
+                    )
+                    webdav_url = backend.get_project_folder_webdav_url(handle)
+            except Exception as e:
+                logger.warning(
+                    "Project %s: failed to resolve webdav URL for thread mount: %s",
+                    project_id,
+                    e,
+                )
+        target_path = f"projects/{_slugify_mount_name(project.get('name', ''))}"
+        rows.append(
+            {
+                "mount_kind": "project",
+                "target_path": target_path,
+                "source_kind": "project_folder",
+                "source_ref": project_id,
+                "backend_id": backend_id,
+                "cloud_handle": handle_str,
+                "webdav_url": webdav_url,
+            }
+        )
+    return rows
+
+
 async def _resolve_thread_datasources(
     metadata: dict[str, Any],
+    *,
+    project_ids: list[str] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Resolve and build datasource payload from thread metadata."""
+    """Resolve and build datasource payload for a thread.
+
+    ``project_ids`` is the canonical input — derived from ``thread_mounts``
+    by the caller. ``metadata`` still carries the explicit ``datasource_ids``
+    list.
+    """
     ds_ids = metadata.get("datasource_ids")
-    p_ids = metadata.get("project_ids")
-    if not ds_ids and not p_ids:
+    if not ds_ids and not project_ids:
         return None
     resolved = await postgres_db.resolve_datasources_for_thread(
-        datasource_ids=ds_ids, project_ids=p_ids
+        datasource_ids=ds_ids, project_ids=project_ids
     )
     return _build_datasources_payload(resolved)
 
@@ -9961,6 +10095,9 @@ async def agent_get_thread_workspace(
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
+    # Phase 1: project attachment + cloud mounts now live on thread_mounts.
+    project_ids = await _thread_project_ids(thread_id)
+    mount_rows = await postgres_db.list_thread_mounts(thread_id)
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -9979,14 +10116,16 @@ async def agent_get_thread_workspace(
         # Config overrides (model, temperature, etc.)
         "config_override": metadata.get("config_override"),
         # Project scoping
-        "project_ids": metadata.get("project_ids"),
+        "project_ids": project_ids,
         # Resolved datasources for the thread
-        "datasources": await _resolve_thread_datasources(metadata),
+        "datasources": await _resolve_thread_datasources(
+            metadata, project_ids=project_ids
+        ),
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": thread.get("nc_session_folder"),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
-        "cloud_sync": _build_agent_cloud_sync(thread),
+        "cloud_sync": _build_agent_cloud_sync(thread, mount_rows=mount_rows),
     }
 
 
@@ -10607,12 +10746,13 @@ async def create_thread(
             title=request_body.title,
         )
 
-        # Store config_override and project_ids in thread metadata
+        # Store config_override + datasource_ids in thread metadata. Project
+        # attachment is the canonical concern of ``thread_mounts`` (Phase 1
+        # of cloud_collaboration_model.md §9) — the legacy
+        # ``metadata.project_ids`` JSONB key is no longer written.
         metadata_patch = {}
         if config_override:
             metadata_patch["config_override"] = config_override
-        if effective_project_ids:
-            metadata_patch["project_ids"] = effective_project_ids
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
         if metadata_patch:
@@ -10625,6 +10765,17 @@ async def create_thread(
                     """,
                     thread_id,
                     json.dumps(metadata_patch),
+                )
+
+        # Seed thread_mounts for the attached projects.
+        if effective_project_ids:
+            try:
+                mount_rows = await _build_thread_mount_rows(effective_project_ids)
+                if mount_rows:
+                    await postgres_db.replace_thread_mounts(thread_id, mount_rows)
+            except Exception as e:
+                logger.warning(
+                    "Thread %s: failed to seed thread_mounts: %s", thread_id, e
                 )
 
         # Provision workspace container + agent pod FIRST (non-blocking).
@@ -10918,30 +11069,13 @@ def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
         return None
 
 
-def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Build the ``cloud_sync`` payload the agent uses to push/pull session files.
+def _backend_cloud_cfg(backend, webdav_url: str) -> Optional[dict[str, Any]]:
+    """Build a single ``{backend, webdav_url, auth}`` cfg for the agent.
 
-    Shape mirrors ``src/services/cloud_sync/__init__.py::build_workspace_sync``.
-    Returns ``None`` when there's no session folder or the backend is offline.
+    Shape matches ``src/services/cloud_sync/__init__.py::build_workspace_sync``'s
+    expected payload. Returns ``None`` when credentials aren't resolvable.
     Never logs the auth payload.
     """
-    handle_str = thread.get("main_cloud_session_handle") or thread.get(
-        "nc_session_folder"
-    )
-    if not handle_str:
-        return None
-    backend_id = thread.get("main_cloud_backend") or None
-    backend = main_cloud_router.for_backend(backend_id)
-    if not backend.is_initialized:
-        return None
-    try:
-        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        webdav_url = backend.get_session_folder_webdav_url(handle)
-    except Exception:
-        return None
-    if not webdav_url:
-        return None
-
     if backend.backend_id == "nextcloud":
         creds = backend.webdav_credentials or {}
         if not creds.get("username") or not creds.get("password"):
@@ -10976,12 +11110,115 @@ def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
     return None
 
 
+def _build_agent_cloud_sync(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None = None,
+) -> Optional[dict[str, Any]]:
+    """Build the ``cloud_sync`` payload the agent uses to push/pull workspace files.
+
+    Phase 1 of ``docs/features/cloud_collaboration_model.md`` §9 introduces the
+    multi-mount model. Payload shape is now ``version: 2``::
+
+        {
+          "version": 2,
+          "session_folder": {backend, webdav_url, auth} | None,
+          "mounts": [
+              {mount_id, mount_kind, target_path, backend, webdav_url, auth},
+              ...
+          ],
+        }
+
+    ``session_folder`` is the legacy per-thread session folder cfg (kept in
+    parallel for back-compat until Phase 4). ``mounts`` are the project /
+    user-home / repo mounts derived from ``thread_mounts``. Returns ``None``
+    when neither a session folder nor any mount could be resolved — in that
+    case there's nothing for the agent to sync. Never logs auth payloads.
+    """
+    # ---- legacy session folder (still provisioned in v1)
+    session_folder_cfg: Optional[dict[str, Any]] = None
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if handle_str:
+        backend_id = thread.get("main_cloud_backend") or None
+        backend = main_cloud_router.for_backend(backend_id)
+        if backend.is_initialized:
+            try:
+                handle = SessionFolderHandle.from_db(
+                    handle_str, backend=backend.backend_id
+                )
+                webdav_url = backend.get_session_folder_webdav_url(handle)
+                if webdav_url:
+                    session_folder_cfg = _backend_cloud_cfg(backend, webdav_url)
+            except Exception:
+                session_folder_cfg = None
+
+    # ---- new-style mounts from thread_mounts
+    mounts_out: list[dict[str, Any]] = []
+    for row in mount_rows or []:
+        row_backend_id = row.get("backend_id")
+        webdav_url = row.get("webdav_url")
+        if not row_backend_id or not webdav_url:
+            # The orchestrator couldn't resolve this mount's transport
+            # details — skip rather than ship a half-built entry. Agent
+            # will surface "no mount available" via the raise-and-block
+            # policy at the next turn boundary if anything depended on it.
+            continue
+        backend = main_cloud_router.for_backend(row_backend_id)
+        if not backend.is_initialized:
+            continue
+        cfg = _backend_cloud_cfg(backend, webdav_url)
+        if not cfg:
+            continue
+        mounts_out.append(
+            {
+                "mount_id": str(row.get("id", "")),
+                "mount_kind": row.get("mount_kind"),
+                "target_path": row.get("target_path", ""),
+                **cfg,
+            }
+        )
+
+    if not session_folder_cfg and not mounts_out:
+        return None
+
+    return {
+        "version": 2,
+        "session_folder": session_folder_cfg,
+        "mounts": mounts_out,
+    }
+
+
 @app.get("/api/persistent/threads/{thread_id}")
 async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
-    """Get thread status and metadata (auth: owner only)."""
+    """Get thread status and metadata (auth: owner only).
+
+    Phase 1 of cloud_collaboration_model.md §9 surfaces the thread's
+    attached mounts here so the Cockpit "Project files" panel can render
+    them without a second round-trip. ``project_ids`` is the derived
+    list-of-strings view kept stable for callers that only need scoping.
+    """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = dict(thread)
     result["cloud_session_url"] = _resolve_cloud_session_url(thread)
+    mounts = await postgres_db.list_thread_mounts(thread_id)
+    result["mounts"] = [
+        {
+            "id": str(m["id"]),
+            "mount_kind": m["mount_kind"],
+            "target_path": m["target_path"],
+            "source_kind": m["source_kind"],
+            "source_ref": str(m["source_ref"]) if m.get("source_ref") else None,
+            "backend_id": m.get("backend_id"),
+        }
+        for m in mounts
+    ]
+    result["project_ids"] = [
+        str(m["source_ref"])
+        for m in mounts
+        if m.get("mount_kind") == "project" and m.get("source_ref")
+    ]
     return result
 
 
