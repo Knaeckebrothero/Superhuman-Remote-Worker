@@ -119,7 +119,9 @@ class TestKubeconfig:
                 ]
             },
         )
-        assert out["files"][0]["target_path"] == f"{AGENT_HOME}/.kube/custom-config.yaml"
+        assert (
+            out["files"][0]["target_path"] == f"{AGENT_HOME}/.kube/custom-config.yaml"
+        )
 
 
 # =============================================================================
@@ -185,7 +187,7 @@ class TestGenericFile:
             {
                 "files": [
                     {
-                        "contents": "{\"type\":\"service_account\"}",
+                        "contents": '{"type":"service_account"}',
                         "target_path": "~/.config/gcloud/creds.json",
                     }
                 ]
@@ -325,7 +327,9 @@ def test_allowed_paths(good_path):
         {"files": [{"contents": "x", "target_path": good_path}]},
     )
     # No exception means the path resolved to a writable root.
-    assert out["files"][0]["target_path"].startswith(("/home/srw", "/tmp", "/run", "/workspace"))
+    assert out["files"][0]["target_path"].startswith(
+        ("/home/srw", "/tmp", "/run", "/workspace")
+    )
 
 
 def test_etcd_not_treated_as_etc():
@@ -412,11 +416,7 @@ def test_empty_env_var_dropped():
     out = normalize_credential_files(
         "generic_file",
         "x",
-        {
-            "files": [
-                {"contents": "x", "target_path": "/tmp/x", "env_var": ""}
-            ]
-        },
+        {"files": [{"contents": "x", "target_path": "/tmp/x", "env_var": ""}]},
     )
     assert "env_var" not in out["files"][0]
 

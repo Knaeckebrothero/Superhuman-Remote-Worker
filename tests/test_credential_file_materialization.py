@@ -182,10 +182,7 @@ class TestProcessCredentialFiles:
         manifest = process_credential_files([ds], home_dir=str(tmp_path))
         written = tmp_path / ".config" / "gcloud" / "creds.json"
         assert written.exists()
-        assert (
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-            == str(written)
-        )
+        assert os.environ["GOOGLE_APPLICATION_CREDENTIALS"] == str(written)
         assert "GOOGLE_APPLICATION_CREDENTIALS" in manifest["env_vars"]
 
     def test_non_credential_types_skipped(self, tmp_path: Path):
@@ -321,7 +318,7 @@ def fake_kubectl(tmp_path: Path, monkeypatch):
         '  echo "merged-from:"\n'
         '  for p in "${paths[@]}"; do\n'
         '    echo "  - $p"\n'
-        '  done\n'
+        "  done\n"
         "fi\n"
     )
     fake.chmod(0o755)
@@ -408,9 +405,7 @@ class TestKubeconfigMerge:
         assert not eu_path.exists()
         assert not merged.exists()
 
-    def test_falls_back_when_kubectl_missing(
-        self, tmp_path: Path, monkeypatch
-    ):
+    def test_falls_back_when_kubectl_missing(self, tmp_path: Path, monkeypatch):
         # Strip PATH so kubectl can't be found.
         monkeypatch.setenv("PATH", "/nonexistent-dir")
         monkeypatch.delenv("KUBECONFIG", raising=False)
