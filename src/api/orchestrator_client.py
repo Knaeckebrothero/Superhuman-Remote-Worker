@@ -109,9 +109,22 @@ class OrchestratorClient:
         self._stop_heartbeat = asyncio.Event()
 
     async def connect(self) -> None:
-        """Initialize the HTTP client."""
+        """Initialize the HTTP client.
+
+        Attaches ``X-Internal-Key`` to every request when ``MCP_INTERNAL_KEY``
+        is set in the agent's env. The orchestrator's Track B (P4b) gates
+        check this header on agent-internal endpoints (register, heartbeat,
+        job-complete, etc.) and on the dual-callable job mutation paths
+        (cancel/pause/resume/approve/subjob-merge/messages-send). Without
+        the key the agent's calls would be rejected as anonymous external
+        traffic.
+        """
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            headers: dict[str, str] = {}
+            internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+            if internal_key:
+                headers["X-Internal-Key"] = internal_key
+            self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
 
     async def close(self) -> None:
         """Close the HTTP client."""

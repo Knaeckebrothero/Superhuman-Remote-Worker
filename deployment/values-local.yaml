@@ -1,0 +1,198 @@
+# =============================================================================
+# Local development overlay — GITIGNORED, contains credentials
+# =============================================================================
+# Purpose: run the production helm chart on a local k3d cluster.
+# Only overrides what's genuinely different locally:
+#   - Secrets (no Vault — chart-managed from this file)
+#   - Domain (srw.localdev, not the real prod domain)
+#   - TLS off (Stage 1; Stage 2 adds mkcert + cert-manager CAIssuer)
+#   - Agent pool: no warm/buffer slots (spin up on demand, dev-only)
+#   - Slightly trimmed resource limits (single-dev cluster, not serving 50 users)
+#
+# Install:
+#   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
+# Upgrade after edits:
+#   helm upgrade srw ./helm -n srw -f deployment/values-local.yaml
+# =============================================================================
+
+license:
+  acceptTerms: true
+
+fullnameOverride: srw
+
+global:
+  domain: "localhost"
+  # imagePullSecrets:
+  #   - name: ghcr-pull-secret   # uncomment if your GHCR packages are private
+
+# -----------------------------------------------------------------------------
+# Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
+# empty = host-only cookies on `api.localhost`. Browsers reject `Domain=.localhost`
+# as a "public suffix"-ish edge case; host-only works fine here because cockpit
+# fetches the API with credentials:'include' which sends host-only cookies on
+# cross-origin XHR to `api.localhost` anyway.
+# -----------------------------------------------------------------------------
+auth:
+  bff:
+    cookieSecure: "1"
+    cookieDomain: ""
+    cookieSamesite: "none"
+
+# -----------------------------------------------------------------------------
+# Secrets — chart-managed (dev only). APP_ENCRYPTION_KEY is set explicitly so
+# encrypted DB data survives across `helm upgrade` cycles even if `lookup` misbehaves.
+# Generated with: openssl rand -base64 32
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: false
+
+secrets:
+  create: true
+  values:
+    # --- Crypto root — DO NOT regenerate without re-seeding DBs ---
+    APP_ENCRYPTION_KEY: "B9THPyad3JGXoycrYu4vn90FUogTP+URXFQxPQLB3CU="
+
+    # --- LLM provider keys (fill in at least one for the agent to work) ---
+    OPENAI_API_KEY: ""
+    ANTHROPIC_API_KEY: ""
+    GROQ_API_KEY: ""
+
+    # --- App DBs ---
+    POSTGRES_USER: "srw"
+    POSTGRES_PASSWORD: "dev_pg_password"
+    VECTOR_POSTGRES_USER: "srw"
+    VECTOR_POSTGRES_PASSWORD: "dev_pgvector_password"
+    NEO4J_USERNAME: "neo4j"
+    NEO4J_PASSWORD: "dev_neo4j_password_noslash"
+
+    # --- Keycloak ---
+    KEYCLOAK_ADMIN_USER: "admin"
+    KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_ADMIN_USER: "admin"
+    KC_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_DB_PASSWORD: "dev_kc_db_password"
+    # The Keycloak postStart hook sets the `test` user's password to this
+    # value on every pod restart. Use "test" so devs can log in with test/test
+    # straight after `helm install` with no further setup.
+    KC_REALM_ADMIN_PASSWORD: "test"
+    KC_CLIENT_SECRET: "dev_kc_client_secret"
+
+    # --- Gitea admin (bootstrapped on first start) ---
+    GITEA_ADMIN_USER: "srw-admin"
+    GITEA_ADMIN_PASSWORD: "dev_gitea_admin"
+
+    # --- OIDC client secrets — realm-export references ALL of these
+    #     regardless of which services are enabled. Stubs required. ---
+    GITEA_OIDC_CLIENT_SECRET: "dev_gitea_oidc_secret"
+    NEXTCLOUD_OIDC_CLIENT_SECRET: "dev_nextcloud_oidc_secret"
+    PGADMIN_OIDC_CLIENT_SECRET: "dev_pgadmin_oidc_secret"
+    MCP_OIDC_CLIENT_SECRET: "dev_mcp_oidc_secret"
+    OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "dev_opencloud_oidc"
+
+    # --- OpenCloud service account (agent's cloud user) ---
+    CLOUD_SERVICE_USER: "agent"
+    CLOUD_SERVICE_PASSWORD: "dev_cloud_password"
+
+    # --- Nextcloud (disabled but chart still wires the keys) ---
+    NEXTCLOUD_ADMIN_PASSWORD: "stub"
+    NEXTCLOUD_AGENT_PASSWORD: "stub"
+    NEXTCLOUD_S3_ACCESS_KEY: "stub"
+    NEXTCLOUD_S3_SECRET_KEY: "stub"
+
+    # --- S3 (snapshot service — no real S3 yet, stubs) ---
+    S3_ACCESS_KEY: "minioadmin"
+    S3_SECRET_KEY: "minioadmin_secret"
+
+    # --- Email (disabled but Keycloak references SMTP env vars unconditionally) ---
+    SMTP_USER: "stub"
+    SMTP_PASSWORD: "stub"
+    IMAP_USER: "stub"
+    IMAP_PASSWORD: "stub"
+
+    # --- Notifications (disabled, stubs) ---
+    DISCORD_WEBHOOK_URL: ""
+    SLACK_WEBHOOK_URL: ""
+    NTFY_TOKEN: ""
+
+    # --- Default WebDAV datasource (off by default, stubs) ---
+    DEFAULT_DS_WEBDAV_USERNAME: ""
+    DEFAULT_DS_WEBDAV_PASSWORD: ""
+
+    # --- Codex proxy (disabled, stub) ---
+    CODEX_MANAGEMENT_KEY: "dev_codex_key"
+
+    # --- Internal API keys ---
+    MCP_INTERNAL_KEY: "dev_mcp_internal_key"
+
+# -----------------------------------------------------------------------------
+# Ingress — Stage 1: TLS off (access via port-forward). Stage 2 flips to true
+# with `ingress.tls.issuerName: mkcert-issuer`.
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    issuerName: mkcert-issuer
+
+# -----------------------------------------------------------------------------
+# Agent pool — no warm/buffer slots. Agents spin up on demand only.
+# Cap maxAgents so a runaway provisioner can't eat the dev box.
+# -----------------------------------------------------------------------------
+agent:
+  pool:
+    minAgents: "0"
+    buffer: "0"
+    reservedSessionSlots: "0"
+    reservedJobSlots: "0"
+    maxAgents: "3"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# -----------------------------------------------------------------------------
+# Resource trims — only the components that meaningfully oversize for one dev
+# Everything else keeps chart defaults.
+# -----------------------------------------------------------------------------
+orchestrator:
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+databases:
+  postgres:
+    storageSize: "5Gi"
+  vector:
+    storageSize: "5Gi"
+  mongodb:
+    storageSize: "2Gi"
+  neo4j:
+    storageSize: "5Gi"
+  keycloak:
+    storageSize: "2Gi"
+
+# -----------------------------------------------------------------------------
+# Workspace PVC — single-node local-path is RWO-only, override the prod default
+# -----------------------------------------------------------------------------
+workspace:
+  accessMode: "ReadWriteOnce"
+  storageSize: "10Gi"
+
+# -----------------------------------------------------------------------------
+# OpenCloud — pin storage to match existing PVC (K8s rejects shrinks)
+# -----------------------------------------------------------------------------
+opencloud:
+  dataStorageSize: "64Gi"
+
+# -----------------------------------------------------------------------------
+# Logging — verbose during local dev
+# -----------------------------------------------------------------------------
+logLevel: "DEBUG"
