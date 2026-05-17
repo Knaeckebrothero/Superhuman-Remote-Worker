@@ -51,10 +51,29 @@ def _backend(*, initialized: bool = True, backend_id: str = "opencloud"):
     return backend
 
 
+def _owner_member(
+    *,
+    user_id: str = "owner-uuid",
+    email: str = "alice@example.com",
+    display_name: str = "Alice",
+) -> dict:
+    return {
+        "role": "owner",
+        "user_id": user_id,
+        "email": email,
+        "display_name": display_name,
+    }
+
+
+def _owner_user_record(*, keycloak_sub: str = "alice-keycloak-sub") -> dict:
+    return {"id": "owner-uuid", "keycloak_sub": keycloak_sub}
+
+
 @pytest.mark.asyncio
 async def test_default_project_emits_user_home_row():
     """Default project → ``project_default`` row with target_path='' and
-    the owner's home Space's webdav URL.
+    the owner's home Space's webdav URL. ``target_user_sub`` carries the
+    Keycloak ``sub`` of the owner so the agent can do RFC 8693 exchange.
     """
     from main import _build_default_project_mount_row
 
@@ -62,11 +81,8 @@ async def test_default_project_emits_user_home_row():
     backend = _backend()
 
     fake_db = MagicMock()
-    fake_db.get_project_members = AsyncMock(
-        return_value=[
-            {"role": "owner", "email": "alice@example.com", "display_name": "Alice"}
-        ]
-    )
+    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
+    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
     router.for_project.return_value = backend
 
@@ -84,6 +100,7 @@ async def test_default_project_emits_user_home_row():
     assert row["backend_id"] == "opencloud"
     assert row["webdav_url"] == "https://oc.test/dav/spaces/drive-xyz/"
     assert row["cloud_handle"] == "opencloud:drive-xyz:user_home"
+    assert row["target_user_sub"] == "alice-keycloak-sub"
     backend.resolve_user_identity.assert_awaited_once_with("alice@example.com", "alice")
     backend.get_user_home.assert_awaited_once_with("user-xyz")
 
@@ -96,6 +113,32 @@ async def test_default_project_no_owner_returns_none():
     project = _project(project_id="p", is_default=True)
     fake_db = MagicMock()
     fake_db.get_project_members = AsyncMock(return_value=[])
+    fake_db.get_user = AsyncMock(return_value=None)
+    router = MagicMock()
+    router.for_project.return_value = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", router),
+    ):
+        row = await _build_default_project_mount_row("p", project)
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_default_project_owner_missing_keycloak_sub_returns_none():
+    """Owner exists but has never SSO'd, so we don't have their Keycloak
+    sub yet → can't do token-exchange → no row. Caller falls back to
+    legacy session folder so the thread still has SOMETHING.
+    """
+    from main import _build_default_project_mount_row
+
+    project = _project(project_id="p", is_default=True)
+    fake_db = MagicMock()
+    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
+    fake_db.get_user = AsyncMock(
+        return_value={"id": "owner-uuid", "keycloak_sub": None}
+    )
     router = MagicMock()
     router.for_project.return_value = _backend()
 
@@ -120,10 +163,9 @@ async def test_default_project_user_home_unresolvable_returns_none():
 
     fake_db = MagicMock()
     fake_db.get_project_members = AsyncMock(
-        return_value=[
-            {"role": "owner", "email": "bob@example.com", "display_name": "Bob"}
-        ]
+        return_value=[_owner_member(email="bob@example.com", display_name="Bob")]
     )
+    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
     router = MagicMock()
     router.for_project.return_value = backend
 
@@ -143,6 +185,7 @@ async def test_default_project_backend_uninitialized_returns_none():
     backend = _backend(initialized=False)
     fake_db = MagicMock()
     fake_db.get_project_members = AsyncMock(return_value=[])
+    fake_db.get_user = AsyncMock(return_value=None)
     router = MagicMock()
     router.for_project.return_value = backend
 
@@ -171,9 +214,10 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
 
     fake_db.get_project = AsyncMock(side_effect=get_project)
     fake_db.get_project_members = AsyncMock(
-        return_value=[
-            {"role": "owner", "email": "carol@example.com", "display_name": "Carol"}
-        ]
+        return_value=[_owner_member(email="carol@example.com", display_name="Carol")]
+    )
+    fake_db.get_user = AsyncMock(
+        return_value=_owner_user_record(keycloak_sub="carol-sub")
     )
     backend = _backend()
     router = MagicMock()

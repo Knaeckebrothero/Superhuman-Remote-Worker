@@ -2429,6 +2429,7 @@ class PostgresDB:
         backend_id: str | None = None,
         cloud_handle: str | None = None,
         webdav_url: str | None = None,
+        target_user_sub: str | None = None,
     ) -> str:
         """Insert one mount row and return its UUID."""
         async with self.acquire() as conn:
@@ -2437,9 +2438,10 @@ class PostgresDB:
                 INSERT INTO thread_mounts (
                     thread_id, mount_kind, target_path,
                     source_kind, source_ref,
-                    backend_id, cloud_handle, webdav_url
+                    backend_id, cloud_handle, webdav_url,
+                    target_user_sub
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id
                 """,
                 UUID(thread_id),
@@ -2450,6 +2452,7 @@ class PostgresDB:
                 backend_id,
                 cloud_handle,
                 webdav_url,
+                target_user_sub,
             )
         return str(row["id"])
 
@@ -2461,7 +2464,7 @@ class PostgresDB:
                 SELECT id, thread_id, mount_kind, target_path,
                        source_kind, source_ref,
                        backend_id, cloud_handle, webdav_url,
-                       created_at
+                       target_user_sub, created_at
                 FROM thread_mounts
                 WHERE thread_id = $1
                 ORDER BY target_path
@@ -2505,9 +2508,10 @@ class PostgresDB:
                         INSERT INTO thread_mounts (
                             thread_id, mount_kind, target_path,
                             source_kind, source_ref,
-                            backend_id, cloud_handle, webdav_url
+                            backend_id, cloud_handle, webdav_url,
+                            target_user_sub
                         )
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                         RETURNING id
                         """,
                         UUID(thread_id),
@@ -2518,6 +2522,7 @@ class PostgresDB:
                         entry.get("backend_id"),
                         entry.get("cloud_handle"),
                         entry.get("webdav_url"),
+                        entry.get("target_user_sub"),
                     )
                     new_ids.append(str(row["id"]))
         return new_ids
