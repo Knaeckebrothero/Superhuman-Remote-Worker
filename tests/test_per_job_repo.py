@@ -545,7 +545,12 @@ class TestDeleteJobGiteaCleanup:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(
                 "security.access.require_approved_user",
-                AsyncMock(return_value={"id": "00000000-0000-0000-0000-000000000099", "is_admin": True}),
+                AsyncMock(
+                    return_value={
+                        "id": "00000000-0000-0000-0000-000000000099",
+                        "is_admin": True,
+                    }
+                ),
             ),
         ):
             mock_db.get_job = AsyncMock(return_value=None)
