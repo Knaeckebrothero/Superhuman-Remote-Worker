@@ -177,6 +177,10 @@ class UniversalAgent:
         self._datasource_clients: Dict[
             str, Any
         ] = {}  # Parent clients for cleanup (e.g. MongoClient)
+        # Manifest of materialized credential files (kubeconfig / ssh_key /
+        # generic_file). Populated by process_credential_files() at job start;
+        # consumed by cleanup_credential_files() at job end.
+        self._datasource_files_manifest: Optional[Dict[str, Any]] = None
 
         # Orchestrator client (injected by app layer for delegation/reporting)
         self._orchestrator_client = None
@@ -1621,6 +1625,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Process datasources from job metadata (sent by orchestrator)
         from src.core.datasource_setup import (
             inject_datasource_index,
+            process_credential_files,
             process_datasources,
         )
 
@@ -1636,6 +1641,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Track connections for cleanup
         self._datasource_connections.update(datasources_dict)
         self._datasource_clients.update(client_registry)
+
+        # Materialize credential files (kubeconfig, ssh_key, generic_file).
+        # Tracked in a manifest so _close_datasource_connections() can undo it.
+        try:
+            self._datasource_files_manifest = process_credential_files(ds_configs)
+        except Exception as e:
+            logger.warning("Failed to materialize credential files: %s", e)
+            self._datasource_files_manifest = None
 
         if ds_configs:
             inject_datasource_index(ds_configs, ws)
@@ -2381,6 +2394,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Error closing {ds_type} datasource client: {e}")
         self._datasource_clients = {}
+
+        # Remove credential files materialized for this job (best-effort).
+        if self._datasource_files_manifest:
+            try:
+                from src.core.datasource_setup import cleanup_credential_files
+
+                cleanup_credential_files(self._datasource_files_manifest)
+            except Exception as e:
+                logger.warning(f"Error cleaning up credential files: {e}")
+            self._datasource_files_manifest = None
 
     async def _resume_from_checkpoint(
         self,
