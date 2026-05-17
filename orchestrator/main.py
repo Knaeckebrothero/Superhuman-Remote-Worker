@@ -11149,7 +11149,12 @@ async def list_threads(
             status=status,
         )
         for t in threads:
-            t["cloud_session_url"] = _resolve_cloud_session_url(t)
+            # Phase 2: default-project threads have no legacy session folder,
+            # so the cloud-button URL has to come from the project_default
+            # mount row instead. Per-thread mounts lookup is N+1 but the
+            # list endpoint is bounded by the user's own thread count.
+            mount_rows = await postgres_db.list_thread_mounts(str(t["id"]))
+            t["cloud_session_url"] = _resolve_cloud_session_url(t, mount_rows)
         return {"threads": threads}
     except HTTPException:
         raise
@@ -11157,22 +11162,54 @@ async def list_threads(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
-    """Compute a backend-agnostic browser URL for a thread's cloud folder."""
+def _resolve_cloud_session_url(
+    thread: dict[str, Any],
+    mount_rows: list[dict[str, Any]] | None = None,
+) -> Optional[str]:
+    """Compute a backend-agnostic browser URL for a thread's cloud folder.
+
+    Looks at the legacy session-folder handle first (Phase 1 and earlier).
+    When that's empty — as happens for Phase 2 default-project threads
+    where the session folder is intentionally skipped in favor of the
+    user-home mount — fall back to the first ``project_default`` mount
+    row's cloud handle. The Cockpit's "Cloud" button (sessions-page line
+    179: ``thread.cloud_session_url || thread.nc_session_folder``) depends
+    on this; without the fallback, default-project threads show no
+    button even though sync is working fine.
+    """
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    if not handle_str:
-        return None
-    backend_id = thread.get("main_cloud_backend") or None
-    backend = main_cloud_router.for_backend(backend_id)
-    if not backend.is_initialized:
-        return None
-    try:
-        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        return backend.get_session_folder_browser_url(handle)
-    except Exception:
-        return None
+    if handle_str:
+        backend_id = thread.get("main_cloud_backend") or None
+        backend = main_cloud_router.for_backend(backend_id)
+        if not backend.is_initialized:
+            return None
+        try:
+            handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+            return backend.get_session_folder_browser_url(handle)
+        except Exception:
+            return None
+
+    # No legacy folder — try the project_default mount.
+    for m in mount_rows or []:
+        if m.get("mount_kind") != "project_default":
+            continue
+        row_backend_id = m.get("backend_id")
+        row_handle_str = m.get("cloud_handle")
+        if not row_backend_id or not row_handle_str:
+            continue
+        backend = main_cloud_router.for_backend(row_backend_id)
+        if not backend.is_initialized:
+            continue
+        try:
+            handle = ProjectFolderHandle.from_db(
+                row_handle_str, backend=backend.backend_id
+            )
+            return backend.get_project_folder_browser_url(handle)
+        except Exception:
+            continue
+    return None
 
 
 def _backend_cloud_cfg(
@@ -11330,8 +11367,8 @@ async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = dict(thread)
-    result["cloud_session_url"] = _resolve_cloud_session_url(thread)
     mounts = await postgres_db.list_thread_mounts(thread_id)
+    result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
     result["mounts"] = [
         {
             "id": str(m["id"]),
