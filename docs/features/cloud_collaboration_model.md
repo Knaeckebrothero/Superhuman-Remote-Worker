@@ -31,9 +31,9 @@ related:
 
 > The agent's workspace is a synced mirror of the user's cloud surfaces — their default project mounts at the workspace root; other attached projects and repos mount under `projects/` and `repos/`. The cloud folder is canonical. Repositories run alongside as **temporary scaffolding** for diff viewing and recovery — not as the primary collaboration surface. Branches and PR-style review are valuable but ship as **v2+ opt-in extensions**, not the v1 foundation. The v1 product story is: "the AI sees what you see, edits where you edit, and any agent run can be diffed or rolled back."
 
-**Status:** Concept. Filed 2026-05-16.
+**Status:** In flight. Phases 1, 2, 2.1, 2.2 shipped + live-verified 2026-05-17. Phase 3+ pending.
 **Filed:** 2026-05-16
-**Last updated:** 2026-05-16
+**Last updated:** 2026-05-17
 **Depends on:** [[project_cloud_folders]] (current per-project + per-session folder lifecycle), [[main_cloud_abstraction]] (`MainCloudBackend` Protocol + OpenCloud default).
 
 ## 1. Motivation
@@ -258,17 +258,52 @@ For jobs the question doesn't arise: jobs operate on isolated staging clones, so
 
 Foundation first, then incremental additions. Each phase is independently shippable and delivers user-visible value. The ordering puts the simplest validation case before the asymmetric ones, and defers cleanup until the new code path has stabilized.
 
-### Phase 1 — Single-project cloud mount (the keystone)
+### Phase 1 — Single-project cloud mount (the keystone) — ✅ shipped 2026-05-17
 
 The simplest case: a session attached to one regular (non-default) project mounts that project's cloud folder into the workspace at `projects/<name>/`. Bidirectional sync at turn boundaries, reusing the existing `cloud_sync` machinery retargeted from session folders to project folders.
 
 Per-session cloud folder continues to be created in parallel for back-compat — Phase 4 deprecates it.
 
-- **Deliverable:** a session attached to project X has X's files in `projects/X/`; agent edits flow back to X's cloud folder.
-- **Acceptance:** drop a file into project X via OpenCloud → agent reads it next turn. Agent writes a file → user sees it in OpenCloud.
+- **Deliverable:** a session attached to project X has X's files in `projects/X/`; agent edits flow back to X's cloud folder. **✅ Live-verified on dev cluster 2026-05-17.**
+- **Acceptance:** drop a file into project X via OpenCloud → agent reads it next turn. Agent writes a file → user sees it in OpenCloud. **✅ Both directions confirmed end-to-end** (project `Create chatbot for Sadur Süd`, OpenCloud Space, agent's `write_file` of marker text appeared in the user-visible cloud folder; user's marker file dropped beforehand was read by the agent on turn 1).
 - **Risk:** sync collisions when a turn fires before the previous turn's sync completes. Mitigation: serialize sync per session.
 
-### Phase 2 — Default-project = user-home mount
+#### Locked design decisions (planning pass 2026-05-17)
+
+- **Schema: new `thread_mounts` table is the canonical store for project attachments.** Migration `0013_thread_mounts.sql` (transactional, `app/`). Fields: `id`, `thread_id` (FK → threads, `ON DELETE CASCADE`), `mount_kind` ('project' | 'project_default' | 'repo'), `target_path` (relative, e.g. `projects/alpha`), `source_kind` ('project_folder' | 'user_home'), `source_ref` (UUID → projects.id when applicable), `backend_id`, `cloud_handle`, `webdav_url`, `created_at`. Indexes on `thread_id`; unique constraint on `(thread_id, target_path)`. UUIDs use `uuid_generate_v4()` (codebase convention; `pgcrypto` is not loaded — only `uuid-ossp` per `0001_initial.sql:40`).
+
+- **`metadata.project_ids` deprecated.** Phase 1 stops writing this JSONB key and removes its three readers (`orchestrator/main.py:9933`, `:9982`, `orchestrator/services/formatters.py:2419`) plus the writer at `orchestrator/main.py:10615`. **`thread_mounts` becomes the source of truth.** Runtime `project_ids: list[str]` continues to flow to downstream consumers (RAG scoping in `src/persistent_graph.py`, tool context in `src/tools/context.py`, knowledge tools in `src/tools/knowledge/knowledge_tools.py`, etc.) — but it is **derived from `thread_mounts` rows at payload-build time**, not read from metadata JSONB. The list-of-strings shape stays the contract for runtime; only the persistence layer changes. `visible_project_ids` (multi-tenancy access control) is a separate concept and is **not** affected by this deprecation.
+
+- **Agent payload contract: `cloud_sync` bumped to `version: 2`.** `_build_agent_cloud_sync()` returns `{version: 2, session_folder: {...legacy single-folder cfg...}, mounts: [{mount_id, target_path, backend, webdav_url, auth}, ...]}`. v1 payloads (no `mounts` key) remain supported until Phase 4 deletes the legacy session-folder path. The orchestrator also continues sending a derived `project_ids` list alongside for runtime consumers (until they're all migrated to consume from `mounts` directly — Phase 4 territory).
+
+- **Integration: Option A — transport-level callbacks** (`_loop_on_turn_start` / `_loop_on_turn_complete` in `src/api/persistent_app.py`). `await coordinator.pull_all()` inside turn-start, `await coordinator.push_all()` inside turn-complete (replacing the fire-and-forget `asyncio.create_task` at `persistent_app.py:2319`). Session-start `start_background_poll()` call at `persistent_app.py:917` becomes a single blocking initial pull. **Zero changes to `src/persistent_graph.py`** — the callbacks pattern already awaits, blocking semantics emerge from the await.
+
+- **Failure policy: raise-and-block.** A failed `pull_all()` or `push_all()` at a turn boundary raises and blocks the next turn from accepting input until resolved. Loud signal during early dogfood — broken backends surface fast instead of silently corrupting state. Reconsider for v2 after observed behaviour shows whether this is too aggressive in practice.
+
+- **Cockpit hook: `mounts: [...]` field exposed on `GET /api/persistent/threads/{id}`.** Cockpit reads it to render a "Project files" panel showing which surfaces are mounted, with deep links to each in OpenCloud. UI design out of scope here; the event/field contracts are stable.
+
+- **Sync coordinator:** new `src/services/cloud_sync/coordinator.py` holding a `WorkspaceSyncCoordinator` that wraps N `WorkspaceSyncBase` instances. `pull_all()` / `push_all()` run them via `asyncio.gather(..., return_exceptions=True)`. Per-mount error policy: aggregate exceptions, raise if any pull/push failed (per the failure policy above).
+
+- **Coexistence with legacy per-session folder:** new project mount under `projects/<name>/`, legacy session folder stays at workspace root. `projects/` added to the legacy sync's `SYNC_IGNORE_PATTERNS` (`src/services/cloud_sync/base.py`) so the two don't shadow each other.
+
+- **Estimated scope:** ~850 LoC across 4 new files + 5 modified, including unit tests in `tests/cloud_sync/` and a `LocalFsWorkspaceSync` test double so integration tests don't need a live WebDAV server.
+
+#### Shipped (implementation pass 2026-05-17)
+
+Landed under develop, deployed to the dev cluster, live-verified end-to-end:
+
+- **New files:** `orchestrator/database/migrations/app/0013_thread_mounts.sql`, `src/services/cloud_sync/coordinator.py` (`WorkspaceSyncCoordinator` + `CloudSyncError`), `tests/cloud_sync/_local_fs.py` (`LocalFsWorkspaceSync` test double), `tests/cloud_sync/test_coordinator.py`, `tests/cloud_sync/test_payload_routing.py`.
+- **Modified:** `orchestrator/database/postgres.py` (`add_thread_mount` / `list_thread_mounts` / `remove_thread_mount` / `replace_thread_mounts`), `orchestrator/main.py` (`_build_agent_cloud_sync` → v2 + mounts, `_thread_project_ids` w/ lazy backfill from legacy `metadata.project_ids`, `_build_thread_mount_rows`, `_slugify_mount_name`, GET `/api/persistent/threads/{id}` returns `mounts` + derived `project_ids`), `orchestrator/services/formatters.py`, `src/services/cloud_sync/__init__.py` + `base.py` (added `mount_subdir` + `strict` mode; `projects/` added to `SYNC_IGNORE_PATTERNS`), `src/services/cloud_sync/{opencloud,nextcloud}.py` (forwarding `mount_subdir`), `src/api/persistent_app.py` (`_build_sync_coordinator`, blocking `pull_all()` at session start replaces `start_background_poll()`, awaited `pull_all()` at turn-start and `push_all()` at turn-complete, no more background polling). Test fixture: `tests/test_mcp.py` updated to assert `project_ids` at top level rather than under metadata.
+- **Lazy backfill:** `_thread_project_ids()` materializes missing `thread_mounts` rows on first read for pre-migration threads. Self-healing; designed to be removed one release after Phase 1.
+- **Tests:** 45 cloud_sync tests pass (14 new + 31 existing). Broader suite unchanged. Lint clean.
+- **Live verification on dev cluster (2026-05-17):**
+  - Cloud → agent: marker file `phase1_test_input.md` dropped in OpenCloud was read by the agent on turn 1 and quoted back verbatim — confirms `pull_all()` at turn-start runs before the agent's first response.
+  - Agent → cloud: agent's `write_file(projects/create_chatbot_for_sadur_süd/phase1_test_output.md)` with content `AGENT-WROTE-THIS-IS-PUSH-TEST-XYZ123` propagated to OpenCloud within ~30s of the turn ending — confirms `push_all()` at turn-complete fires.
+  - `thread_mounts` row inspected via `GET /api/persistent/threads/{id}`: one row with `mount_kind=project`, `target_path=projects/create_chatbot_for_sadur_süd`, `source_kind=project_folder`, `source_ref=<project uuid>`, `backend_id=opencloud`. `metadata.project_ids` absent from the response — confirms the JSONB write is gone.
+  - Slugifier preserved `ü` in `süd` — non-ASCII project names mount and sync correctly over OpenCloud Spaces and the SSH workspace path.
+- **Known unrelated issue observed during testing:** mid-turn WebSocket disconnect (the `persistent_chat_silent_disconnect` issue from prior memory). A fresh session on the same project completed without recurrence; not introduced by Phase 1.
+
+### Phase 2 — Default-project = user-home mount — ✅ shipped 2026-05-17 (superseded auth path by Phase 2.1)
 
 The first asymmetric case. When the default project is attached, resolve via `get_user_home()` instead of `ensure_project_folder()` and mount at the workspace **root** instead of under `projects/`.
 
@@ -277,6 +312,113 @@ This is the case the entire investigation started from. It ships after Phase 1 b
 - **Deliverable:** a session on the default project sees the user's home folder at workspace root.
 - **Acceptance:** drop a file into the OpenCloud home root → agent reads it. Agent writes a file → user sees it in OpenCloud home.
 - **Risk:** user home can be very large. May need a size cap or a top-level scope filter ("only sync these subfolders"). Permission scope is broad — agent has full read/write on the user's home; the UX needs to make this deliberate.
+
+#### First implementation pass — broken (2026-05-17)
+
+First Phase 2 pass landed (commit `b984968`). End-to-end live test failed: the agent received the `project_default` mount but `PROPFIND /dav/spaces/<personal-space>/` returned 404 from OpenCloud. Diagnosis via cluster logs (`srw-opencloud` access log + `authprovider.go` line showing `type:USER_TYPE_SERVICE authenticated`): **OpenCloud Personal Spaces are single-owner**, the agent's service-account bearer token has no WebDAV access to them. My earlier claim that "both backends authenticate as service accounts, so they can read/write any user's home Space" was wrong — service accounts get LibreGraph admin reads (which is why `get_user_home()` returned a valid Space ID) but NOT WebDAV data access on user-owned Spaces.
+
+This invalidated the user-home mount approach as built. Phase 2.1 (below) replaces the auth path.
+
+### Phase 2.1 — User-scoped tokens via Keycloak token-exchange (RFC 8693) — ✅ shipped + live-verified 2026-05-17
+
+Replaces the broken service-account auth path. The agent obtains its own client_credentials token as before, then exchanges it for a **user-scoped** token impersonating the owner of the default project. WebDAV calls then run as the user, who naturally has access to their own Personal Space.
+
+#### Keycloak prereq (manual admin step, one-time)
+
+Token-exchange requires:
+
+1. **Realm feature flag.** Already advertised in `grant_types_supported` on this cluster's `srw` realm — verified via `/realms/srw/.well-known/openid-configuration` against `srw-keycloak`. Nothing more to do at the realm level.
+2. **Impersonation role on the agent's service-account user.** In the Keycloak admin console:
+   - Realm `srw` → Clients → `<the client the agent uses to talk to OpenCloud>` → "Service accounts roles" tab
+   - Assign realm-management role `impersonation`
+   - Save
+
+#### Manual verification recipe (run before agent code rollout)
+
+After granting the role, verify the flow with curl. From inside the orchestrator pod (which has `httpx`):
+
+```python
+import httpx
+ISSUER = "http://srw-keycloak:8080/realms/srw"
+CLIENT_ID = "<srw oidc client>"
+CLIENT_SECRET = "<from helm values / secret>"
+TARGET_SUB = "<keycloak sub of a real user>"
+
+# Step 1: service-account token
+svc = httpx.post(
+    f"{ISSUER}/protocol/openid-connect/token",
+    data={"grant_type": "client_credentials", "client_id": CLIENT_ID,
+          "client_secret": CLIENT_SECRET, "scope": "openid"},
+).json()["access_token"]
+
+# Step 2: exchange for user-scoped token
+user = httpx.post(
+    f"{ISSUER}/protocol/openid-connect/token",
+    data={"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
+          "subject_token": svc,
+          "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+          "requested_subject": TARGET_SUB,
+          "scope": "openid"},
+).json()
+
+# `user["access_token"]` should now decode (jwt.io) with `sub = TARGET_SUB`.
+```
+
+If Keycloak returns `403` with `Client not allowed to exchange`, the impersonation role isn't applied to the right service account. If it returns `400 invalid_request`, double-check the `requested_subject` value matches the user's Keycloak ID.
+
+#### Implementation details
+
+- **DB schema:** migration `0014_thread_mounts_target_user_sub.sql` adds nullable `target_user_sub TEXT` to `thread_mounts`. Only populated for `mount_kind='project_default'`. Phase 1 rows stay NULL and continue using service-account auth.
+- **Orchestrator (`orchestrator/main.py`):** `_build_default_project_mount_row` looks up the project owner's `keycloak_sub` via `postgres_db.get_user(owner.user_id)`. If the owner hasn't completed an SSO login yet (no `keycloak_sub`), the function returns `None` and the caller falls back to the legacy session folder — same lenient policy as the rest of Phase 2.
+- **Agent payload:** `_backend_cloud_cfg` emits a new `auth.type = "keycloak_user_impersonation"` shape carrying `issuer + client_id + client_secret + target_user_sub` when `target_user_sub` is set on the row. Other mounts keep the existing `keycloak_client_credentials` shape.
+- **Agent sync (`src/services/cloud_sync/opencloud.py`):** `OpenCloudWorkspaceSync` accepts `target_user_sub`. `_get_token` becomes a two-step flow when set — `_fetch_service_token()` + `_exchange_for_user_token()`. The cached `_access_token` is the *exchanged* user-scoped token. 401-retry path forces a full re-fetch + re-exchange.
+- **Factory (`src/services/cloud_sync/__init__.py`):** `build_workspace_sync` recognizes the new `keycloak_user_impersonation` auth type and routes `target_user_sub` to the OpenCloud sync constructor. A payload of that type without `target_user_sub` is rejected (returns `None` with a warning) rather than silently falling back to service-account mode — that fallback would re-introduce the 404 this whole phase is fixing.
+
+#### Tests
+
+- `tests/cloud_sync/test_opencloud.py` — 7 new cases covering impersonation: exchange request shape (verifies all RFC 8693 params), token caching across the two-step flow, refresh-after-expiry re-does both steps, 401-retry re-does the full chain, repr marks the mode, service-account mode unaffected.
+- `tests/cloud_sync/test_factory.py` — 3 new cases: factory builds OpenCloud sync in impersonation mode, rejects impersonation payloads missing `target_user_sub`, client_credentials mode leaves `target_user_sub=None`.
+- `tests/test_thread_mount_rows.py` — extended fixtures to include `user_id` on owner records and mock `postgres_db.get_user(...)` returning a `keycloak_sub`. New case asserts the row carries `target_user_sub`. New case covers "owner has no keycloak_sub → row not produced."
+
+#### Phase 2 locked decisions (implementation pass 2026-05-17)
+
+- **Row shape:** default-project attachment → `mount_kind='project_default'`, `source_kind='user_home'`, `target_path=''` (workspace root), `webdav_url` from `MainCloudBackend.get_user_home(resolve_user_identity(owner_email))`. Both Nextcloud and OpenCloud backends authenticate as a service account (admin basic-auth / Keycloak client-credentials), so they can read/write any user's home Space without per-user share grants.
+- **Owner discovery:** `postgres_db.get_project_members(project_id)` → pick the first row with `role == 'owner'`; resolve `owner_email + owner_display_name.lower()` through `MainCloudBackend.resolve_user_identity()`. This mirrors the existing user-home URL resolution at `orchestrator/main.py:get_project`.
+- **Session-folder collision policy: observable-state gate, not "default-project attached".** `_setup_main_cloud()` reads `thread_mounts` and skips `ensure_session_folder()` only when a `project_default` row with a non-null `webdav_url` is already present. If user-home resolution failed (transient backend hiccup, owner not yet provisioned, etc.) the legacy session folder is provisioned as a fallback so the thread never ends up with zero sync targets. This is the safer of the two policies I considered — strict gating on attachment would risk an empty workspace on a flaky backend.
+- **`_project_ids_from_mounts()` accepts `project_default`** alongside `project`, so the derived `project_ids` list stays consistent for datasource resolution and visibility checks. A default project is still a project attachment for downstream purposes.
+- **Lazy backfill continues to work:** the Phase 1 `_thread_project_ids()` backfill calls `_build_thread_mount_rows()`, which now handles defaults. Pre-Phase-2 threads with a default project in `metadata.project_ids` will materialize a `project_default` row on first access — no separate migration needed.
+- **`SYNC_IGNORE_PATTERNS` already correct:** the default-project mount at root would otherwise upload `projects/`, `repos/`, `archive/`, `workspace.md`, `plan.md`, `todos.yaml`, `tools/` back into the user's home — but those patterns are already in the ignore list from Phase 1.
+
+#### Shipped (Phase 2 implementation pass 2026-05-17)
+
+- **Modified:** `orchestrator/main.py` — new `_build_default_project_mount_row()`; `_build_thread_mount_rows()` handles `is_default` projects instead of skipping; `_project_ids_from_mounts()` includes `project_default`; `_setup_main_cloud()` short-circuits session-folder provisioning when `project_default` mount is observable.
+- **New tests:** `tests/test_thread_mount_rows.py` (6 cases — happy-path default-project row, no-owner / unresolvable-user-home / uninitialized-backend fallbacks, mixed default + non-default thread, `_project_ids_from_mounts` includes `project_default`); extended `tests/cloud_sync/test_payload_routing.py` with `test_v2_project_default_at_workspace_root`.
+- **Tests:** all 6 new + 5 extended Phase 2 cases pass; 52-test cloud_sync suite green; 99-test thread/project/MCP suite green. Lint + format clean.
+- **Live verification on dev cluster (2026-05-17, via Phase 2.1 auth path):**
+  - Cloud → agent: file dropped into the user's OpenCloud Personal Space root appeared in the agent's workspace at root within ~30s of session start. Confirms `pull_all()` runs the impersonation token-exchange, hits the user's Personal Space (not the service account's empty home), and stages files at workspace root rather than under `projects/`.
+  - Agent's WebDAV calls authenticated as the user, not the service account — verified via `srw-opencloud` access logs showing `user_id=<owner-keycloak-sub>` on PROPFIND.
+  - `thread_mounts` row carried `mount_kind='project_default'`, `target_path=''`, `target_user_sub=<owner-sub>`, `webdav_url` resolving to the owner's home Space ID.
+
+### Phase 2.2 — Cloud button URL synthesis for default-project threads — ✅ shipped + live-verified 2026-05-17
+
+After Phase 2.1 fixed end-to-end file sync, Cockpit's session header was still missing the cloud-folder button for default-project threads. Root cause: `_resolve_cloud_session_url` only knew how to derive a URL from the **legacy** `nc_session_folder` / `main_cloud_session_handle` columns. Default-project threads have no session folder (correctly — Phase 2 short-circuits provisioning), so both fields are null and the helper returned `None`. The `cloud_session_url` field on the thread API response was therefore null, and Cockpit's `openSessionFiles(thread)` handler suppresses the button when the field is missing.
+
+#### Fix (orchestrator-only, no Cockpit changes)
+
+- **`orchestrator/main.py:_resolve_cloud_session_url`** now accepts an optional `mount_rows: list[dict]` argument. When the legacy session-folder fields are empty, it walks the rows looking for `mount_kind='project_default'` and synthesizes a URL from that row's `backend_id` + `cloud_handle` via `backend.get_project_folder_browser_url(ProjectFolderHandle.from_db(handle, backend=backend_id))`. Returns the first usable URL or `None` if nothing resolves.
+- **`get_thread`** already loaded mounts via `_build_thread_mount_rows`; just threads them into the helper call.
+- **`list_persistent_threads`** had to start fetching mount rows per thread (an N+1 vs. the legacy bulk query). Acceptable cost for the per-user thread list — the list is short and per-user, not per-tenant, and the lookup is a single indexed query on `thread_id`. If the list grows large enough to matter we can batch-fetch all rows in one query keyed on `thread_id IN (...)` later.
+
+#### Tests
+
+- 129 existing tests covering `cloud_session_url` resolution still green. No new tests added — the change is a passthrough fallback with no new state; the existing "thread has no cloud session URL" and "thread has a session folder → URL is folder browser URL" tests still apply, and the new path is exercised end-to-end by manual cluster verification.
+
+#### Live verification on dev cluster (2026-05-17)
+
+- `GET /api/persistent/threads/<thread-id>` for a default-project thread now returns a non-null `cloud_session_url` pointing to the user's OpenCloud Personal Space (Spaces UI route).
+- Cockpit's cloud-folder button appears in the session header for default-project threads, and clicking it opens the user's Personal Space in a new tab.
+- Legacy non-default-project threads (still using the session-folder code path) continue to return the session-folder URL as before — no regression.
 
 ### Phase 3 — Multi-surface mounting
 

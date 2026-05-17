@@ -1,6 +1,6 @@
 # Multi-User Isolation (and Future Multi-Tenancy)
 
-**Status:** **Phase 1 (Track A) fully done 2026-05-16. P4 follow-up + Track B (P4b) fully done 2026-05-17.** Inventory now **0 unscoped** (was 55). All 6 P4 bundles shipped; all 21 P4b agent-internal endpoints now have either `require_internal` (16 pure) or `require_internal_or_job_access` (5 dual-callable). Agent's HTTP clients send `X-Internal-Key` from the `MCP_INTERNAL_KEY` secret. Traefik adds a second defense layer by path-stripping `/api/agents/*` and `/api/internal/*` from the public API ingress. Live verification of P4b still pending (requires `helm upgrade` + agent restart + smoke test). Earlier P1 live-verified on `sha-74709d8`; G1-G5 live-verified on `sha-811a8e9`.
+**Status:** **Phase 1 (Track A) fully done 2026-05-16. P4 follow-up + Track B (P4b) fully done + live-verified 2026-05-17.** Inventory now **0 unscoped** (was 55). All 6 P4 bundles shipped; all 21 P4b agent-internal endpoints now have either `require_internal` (16 pure) or `require_internal_or_job_access` (5 dual-callable). Agent's HTTP clients send `X-Internal-Key` from the `MCP_INTERNAL_KEY` secret. Layer 1 (edge-layer path-strip) is **per-deployment** — opt-in Helm toggle for Traefik-edge users, configured at the tunnel for tunnel-edge users (cloudflared in our cluster). Earlier P1 live-verified on `sha-74709d8`; G1-G5 on `sha-811a8e9`; P4b Layer 2 verified live on `sha-464ad18`; Layer 1 verified live via cloudflared edge after the topology audit found that Cloudflare Tunnel bypasses Traefik on this cluster.
 
 **Unscoped-endpoint backlog (surfaced by C2 — fully closed):** the new lint catalogued 55 endpoints with no detectable gate. All 6 bundles shipped 2026-05-17: ~~P4a annotations (4)~~ ✓, ~~P4b Track-B agent ↔ orchestrator boundary (21 endpoints, two-layer defense: app-layer `X-Internal-Key` + Traefik ingress strip)~~ ✓, ~~P4c job mutation gates (14 of 22, 8 reclassified to P4b)~~ ✓, ~~P4d admin-only infra (8)~~ ✓, ~~P4e expert/misc reads (5, incl. per-user filter on `/api/actions/pending`)~~ ✓, ~~P4f VM lifecycle (3)~~ ✓. **Inventory now 0 unscoped (was 55)**. Snapshot test still enforces "no new unscoped" going forward.
 **German context:** "Mandantenfähigkeit" — but Phase 1 covers per-user isolation in a single-tenant deployment, which is a prerequisite for it.
@@ -24,6 +24,41 @@ The full work is organized below as a severity-ordered roadmap (P0 → P1 → P2
 
 ---
 
+## Where we are now (2026-05-17)
+
+**API auth surface: fully closed.** Every HTTP endpoint (232 total) and every WebSocket endpoint (2 total) has an explicit gate. The endpoint inventory at `docs/security/endpoint_inventory.txt` reports **0 unscoped** (down from 55 at the C2 baseline). The snapshot test (`tests/test_endpoint_inventory.py`) enforces this going forward — no new endpoint can ship without a gate.
+
+**Coverage map:**
+
+| Surface | Status | Where |
+|---|---|---|
+| REST `/api/*` (232 endpoints) | All gated | `docs/security/endpoint_inventory.txt` |
+| WebSocket `/api/ide/{job}/proxy/*` | `resolve_ws_user` (BFF cookie) | `orchestrator/main.py:7742` |
+| WebSocket `/ws/persistent/{thread}` | `resolve_ws_user` (BFF cookie) | `orchestrator/main.py:12710` |
+| SSE `/api/sudo/events` | Per-user filter (F6) | F6 implementation |
+| SSE `/api/notifications/events` | Per-user feed | pre-existing |
+| MCP tools (97 of 99 previously ignored scope) | Scope plumbed via `user['scopes']` everywhere (F7) | `security/access.py` scope helpers |
+| Agent ↔ orchestrator (Track B) | `X-Internal-Key` shared secret (Layer 2) + opt-in edge path strip (Layer 1) | P4b |
+| Datasource credentials | Always redacted on REST (F3) | `redact_datasource[s]` helpers |
+| Job/project/thread/source/citation/sudo/stats/admin reads | Per-user OR project-member OR admin visibility | P2 G1-G5 |
+
+**Sharing model:** Project membership is the share unit. `project_members(project_id, user_id, role)` with `viewer/editor/owner` roles. Adding user B to project A (via `POST /api/projects/{id}/members`, owner-gated) gives them visibility into every job, file, datasource, knowledge note, and citation in that project. **No per-resource or public-link sharing today** — those would be product features, not auth gaps.
+
+**What still leaks (cross-cutting infrastructure, not the API):**
+
+| # | Gap | Severity | Lives in |
+|---|---|---|---|
+| 1 | **Cloud storage uses one shared service account** (OpenCloud/Nextcloud). The orchestrator authenticates as a single user for everyone — a path-scoping bug could expose user A's files via user B's session. | **High** (largest hosted-product blocker) | `src/services/cloud_sync/`, OpenCloud admin token in `srw` secret |
+| 2 | **Chromium profile is per-agent, not per-job** (`/tmp/agent-chromium-cdp-profile` in `src/tools/research/browser.py:101`). Logged-in cookies/sessions from job A persist into job B if both land on the same agent pod. | Medium | Browser tool config |
+| 3 | **MongoDB has no retention/TTL** on `llm_requests` and `agent_audit`. Not a leak today (REST gates filter on read), but stale data hoarding is a privacy risk one bug away from exposure. | Low | MongoDB indices |
+| 4 | **Keycloak self-registration broken** — `VERIFY_EMAIL` fires with no SMTP, and `default-roles-srw` doesn't carry the `user` role. Can't provision real non-admin test users → cross-user negative paths are unit-tested against the helpers but not live-verified against the running cluster. | Test gap | Keycloak realm config |
+
+**Observability gap (nice-to-have):** no audit log of cross-user 403 attempts. Today an attacker hitting `/api/jobs/{guessed}/cancel` 1000 times just gets 1000 403s with no alert.
+
+See [Next steps](#next-steps) for prioritized follow-ups.
+
+---
+
 ## Why per-user isolation first
 
 The previous assumption was that cross-organization isolation didn't matter because the system is open source and each client self-hosts. That's still mostly true. But **even in a single-org deployment, users still need to be isolated from one another**:
@@ -38,7 +73,9 @@ A hypothetical subscription product has the same requirement plus the org wrappe
 
 ---
 
-## Current state
+## Original audit (2026-05-15, historical)
+
+> Preserved verbatim from the deep audit that motivated this whole effort. **Every leak listed below has been closed** — see [Where we are now](#where-we-are-now-2026-05-17) for the post-implementation state and the per-PR fix references in the [Severity-ordered roadmap](#severity-ordered-roadmap). This section is kept for context: it documents what was broken pre-Track A so future readers can understand the design choices.
 
 ### Authentication is in good shape
 
@@ -463,8 +500,8 @@ The C2 inventory grandfathered **55 endpoints** with no detectable gate (see `do
 - P4d ✓ shipped (37 → 29 unscoped: 8 admin-only infra endpoints gated with `_require_admin`).
 - P4e ✓ shipped (29 → 24 unscoped: 4 plain `require_approved_user` + 1 `user_can_access_any_job` for citations. Pending-actions also now per-user-filtered at the DB layer, closing a global-counts + sudo-command-leak hole).
 - P4f ✓ shipped (24 → 21 unscoped: 3 VM lifecycle endpoints gated via `require_job_access`; DELETE adds inline owner-or-admin check).
-- **P4b ✓ shipped (21 → 0 unscoped):** Track B agent ↔ orchestrator boundary. Two-layer defense — `X-Internal-Key` shared secret at the app layer (new helpers `require_internal` / `require_internal_or_job_access`) + Traefik `IPAllowList` middleware on a high-priority Ingress that path-strips `/api/agents/*` and `/api/internal/*` from the public API host. 16 pure-internal endpoints gated with `require_internal`; 5 dual-callable endpoints (`POST /api/jobs` + cancel/pause/resume/approve) use the hybrid helper that bypasses user auth on valid internal-key, falls through to `require_job_access` otherwise. Agent's `_get_client()` in `src/api/orchestrator_client.py`, `src/tools/orchestrator/jobs.py`, and `src/tools/communication/messaging.py` all now attach the header. 20 new tests in `tests/test_internal_auth.py`.
-- **Total today: 55 → 0 unscoped, 55 endpoints actually gated, 6 of 6 P4 bundles shipped. Track A + P4 follow-up both done.**
+- **P4b ✓ shipped (21 → 0 unscoped):** Track B agent ↔ orchestrator boundary. **Layer 2 (app-layer, always on):** new helpers `is_internal_call` / `require_internal` / `require_internal_or_job_access` in `orchestrator/security/access.py`, gating 16 pure-internal endpoints (register, heartbeat, threads + 7 sub-routes, jobs/{id}/{complete,agent-release,subjob-merge,messages/send}, internal/mcp-token-*) and 5 dual-callable endpoints (POST /api/jobs + cancel/pause/resume/approve — hybrid: key bypasses user auth, falls through to `require_job_access` otherwise). Agent's 3 HTTP clients send `X-Internal-Key` from `MCP_INTERNAL_KEY`. **Layer 1 (edge-layer, per-deployment):** Helm chart ships an opt-in Traefik middleware behind `ingress.internalPathBlock.enabled` (default `false`); deployments behind a tunnel that bypasses the ingress (like ours, with Cloudflare Tunnel) configure the equivalent at the tunnel — the cloudflared ConfigMap in `HomeLab/deployments_managed/cloudflare-tunnel/cloudflare-tunnel_configmap.yaml` returns 403 for `/api/(agents|internal)/.*` before the request ever reaches the cluster. 20 new tests in `tests/test_internal_auth.py`.
+- **Total today: 55 → 0 unscoped, 55 endpoints actually gated, 6 of 6 P4 bundles shipped. Track A + P4 follow-up both done.** Live-verified Layer 1 (cloudflared edge → 403) + Layer 2 (orchestrator → 401) on the dev cluster.
 
 #### ~~P4a~~ — Annotate public-by-design endpoints (~5 min) — **Implemented 2026-05-17 ✓**
 
@@ -479,19 +516,38 @@ The C2 inventory grandfathered **55 endpoints** with no detectable gate (see `do
 
 #### ~~P4b~~ — Track B agent ↔ orchestrator boundary — **Implemented 2026-05-17 ✓**
 
-**Two-layer defense shipped** (combining the doc's original "option 1: NetworkPolicy + bootstrap secret" approach, adapted for our Traefik ingress and the in-cluster Service DNS the agent already uses):
+**Two-layer defense shipped — but Layer 1 is now per-deployment** after a topology audit found that the dev cluster's Cloudflare Tunnel bypasses Traefik entirely (cloudflared routes `api.superhuman-remote-worker.com` straight to the orchestrator Service, never through the Ingress controller). The framing below reflects what landed in the chart vs. what's deployment-specific.
 
-1. **App-layer (`X-Internal-Key` shared secret)** — new helpers in `orchestrator/security/access.py`:
-   - `is_internal_call(request)` — bool predicate on the header
-   - `require_internal(request)` — raises 401 without a valid key (pure-internal endpoints)
-   - `require_internal_or_job_access(request, db, job_id)` — hybrid: returns `(None, job)` for internal callers, falls through to `require_job_access` otherwise (dual-callable endpoints)
-   - Key reads from `MCP_INTERNAL_KEY` env (already wired to orchestrator + MCP + agent pods via the `srw` secret).
-   - Fail-closed: if `MCP_INTERNAL_KEY` is empty, every internal call fails 401 — a misconfigured cluster breaks loudly instead of letting traffic through.
+**Layer 2 — application-layer, always on, shipped in the chart's code.**
+New helpers in `orchestrator/security/access.py`:
+- `is_internal_call(request)` — bool predicate on the `X-Internal-Key` header
+- `require_internal(request)` — raises 401 without a valid key (pure-internal endpoints)
+- `require_internal_or_job_access(request, db, job_id)` — hybrid: returns `(None, job)` for internal callers, falls through to `require_job_access` otherwise (dual-callable endpoints)
+- Key reads from `MCP_INTERNAL_KEY` env (already wired to orchestrator + MCP + agent pods via the `srw` secret).
+- Fail-closed: if `MCP_INTERNAL_KEY` is empty, every internal call fails 401 — a misconfigured cluster breaks loudly instead of letting traffic through.
 
-2. **Network-layer (Traefik path strip)** — `helm/templates/ingress.yaml`:
-   - New `Middleware` `srw-block-external` with an `IPAllowList` containing a single non-routable address (`127.0.0.99/32`) — Traefik 403s every real client.
-   - New high-priority `Ingress` `srw-api-ingress-blocked-internal` matches `/api/agents/*` and `/api/internal/*` on the public API host and applies the block middleware. The orchestrator Service stays reachable via in-cluster DNS (`http://srw-orchestrator:8085`), so the agent's traffic is unaffected.
-   - Per-path mutations under `/api/jobs/{id}/{complete,agent-release,subjob-merge,messages/send}` can't be stripped at the ingress (cockpit uses other `/api/jobs/{id}/*` paths) — those rely on the app-layer gate alone.
+This is the canonical defense and works for **every** deployment regardless of edge topology.
+
+**Layer 1 — edge-layer, opt-in per deployment.** Three setups:
+
+1. **Tunnel/edge that bypasses the ingress controller (this cluster, with Cloudflare Tunnel).** Configure the path block at the tunnel. For cloudflared, add a path-filtered rule **before** the catch-all in the tunnel ConfigMap:
+
+   ```yaml
+   ingress:
+     - hostname: api.superhuman-remote-worker.com
+       path: ^/api/(agents|internal)(/.*)?$
+       service: http_status:403
+     - hostname: api.superhuman-remote-worker.com
+       service: http://srw-orchestrator.superhuman-remote-worker.svc.cluster.local:8085
+   ```
+
+   Live on this cluster via `HomeLab/deployments_managed/cloudflare-tunnel/cloudflare-tunnel_configmap.yaml`. Verified: `POST /api/agents/register` returns 403 from cloudflared, never reaches the orchestrator.
+
+2. **Traefik (or compatible) at the edge.** Set `ingress.internalPathBlock.enabled: true` in your values. The chart renders a Traefik `IPWhiteList` middleware + a high-priority `Ingress` matching `/api/agents/*` and `/api/internal/*` that 403s every external client. The orchestrator Service stays reachable via in-cluster DNS, so agent traffic is unaffected. Default is `false` because most deployments either use a tunnel or want to configure their ingress controller their own way.
+
+3. **Other ingress controllers (nginx-ingress, Istio, Envoy Gateway, etc.).** Translate the same intent: deny `/api/agents/*` and `/api/internal/*` from external clients at your edge. The chart doesn't ship templates for every ingress controller — pull-requests welcome.
+
+**Why per-path mutations stay Layer-2-only.** Paths under `/api/jobs/{id}/{complete,agent-release,subjob-merge,messages/send}` can't be stripped at the edge because the cockpit uses sibling `/api/jobs/{id}/*` paths that must remain reachable. The app-layer `require_internal` covers them.
 
 **Agent client wiring** — added to all three places that talk to the orchestrator:
 - `src/api/orchestrator_client.py:connect()` — `httpx.AsyncClient` carries `X-Internal-Key` headers
@@ -632,31 +688,51 @@ A pragmatic landing order:
 
 ## Phase 2 sketch (deferred)
 
+Phase 2 has two distinct tracks: the **organizations layer** (a schema-and-helper change that's cheap because Phase 1 centralized visibility) and **cross-cutting infrastructure isolation** (concrete shared-resource fixes that the API gates can't solve).
+
+### Organizations layer (cheap because Phase 1 centralized visibility)
+
 - New table `organizations(id, name, created_at, ...)`.
 - `projects.organization_id` FK, `NOT NULL` after backfill.
 - New table `organization_members(org_id, user_id, role)`.
 - `user_visible_project_ids(user)` augments to include projects in orgs the user is a member of.
 - Keycloak: groups in the existing realm; realm-per-tenant only if hard identity isolation is required.
-- **Cloud storage:** revisit the shared-service-account model. Per-user OAuth (against OpenCloud or Nextcloud) is the right answer for multi-tenant but a sizeable refactor.
 
-The reason this stays cheap is that **Phase 1 centralizes visibility in `access.py`**. Adding org membership becomes a single change to one helper.
+This stays cheap because **Phase 1 centralized visibility in `access.py`** — adding org membership is a single change to one helper.
+
+### Cross-cutting infrastructure isolation (the real remaining work)
+
+The API gates close the application-layer leaks. The following still share state across users in ways the API can't fix:
+
+| # | Gap | Estimated effort | Notes |
+|---|---|---|---|
+| 1 | **Cloud storage per-user OAuth.** Replace the single OpenCloud/Nextcloud service account with per-user OAuth tokens. Largest single blast-radius issue. | 1-2 weeks | Touches `src/services/cloud_sync/*`, OpenCloud OIDC, token storage. Hosted-product blocker. |
+| 2 | **Chromium profile per-job, not per-agent.** Use `--user-data-dir=/tmp/agent-chromium-cdp-profile-{job_id}` (or a tmpfs mount per job) and tear down at job end. | ~2h | One-line change in `src/tools/research/browser.py:101` plus a teardown hook. |
+| 3 | **MongoDB TTL on `llm_requests` and `agent_audit`.** Add a TTL index (90 days? 1 year?) so old prompts/responses age out automatically. | ~1h | Config-only; pick a retention window first. |
+| 4 | **Audit log of cross-user 403s.** Emit a structured log line (or a Mongo `security_audit` entry) when any gate raises 403. Enables forensics and rate-based alerting. | ~3h | Centralize in the access helpers so it's one log per failed gate. |
+
+### Test gap (blocking proof, not code)
+
+| | Gap | Effort |
+|---|---|---|
+| 5 | **Keycloak self-registration fixes** — wire SMTP for `VERIFY_EMAIL` (or skip it for dev) and add the realm-level `user` role to `default-roles-srw` so registrants land approved by default. Without this, we can't provision real non-admin test users for E2E cross-user verification of everything Track A + P4 + Track B shipped. | ~2h | Two Keycloak realm-config edits. |
 
 ---
 
 ## Open questions
 
-1. **404 vs 403** for "you don't own this resource". *Recommend* 404 for `get_*` on guessed IDs (prevents enumeration), 403 when the project is visible but the role is insufficient.
+1. ~~**404 vs 403** for "you don't own this resource"~~ — **Decided in practice 2026-05-17:** mixed policy reflecting probe-resistance value. Read endpoints that could leak existence (e.g., `GET /api/citations/{id}`) return **404** when the caller can't see the linked job. Action endpoints with explicit ownership checks (`require_job_access`, `require_*`) return **404 if the resource doesn't exist, 403 if it exists but the caller lacks access** — the existence signal is acceptable on action paths because the caller already has a UUID they likely got from a legitimate channel. Centralized in `access.py` helpers.
 2. ~~**Datasource credentials in the response**~~ — **Decided 2026-05-16: strip always.** No `?include_credentials=true` flag, no separate `/credentials` endpoint. The orchestrator never returns credentials over REST; the agent reads them via internal dispatch. The cockpit edit form uses a "leave blank to keep existing" UX and the orchestrator preserves stored credentials when `body.credentials` is null/empty. Industry-standard pattern (matches Stripe, GitHub, GCP secrets).
 3. ~~**`scope='all'`**~~ — **Decided 2026-05-16: admin-equivalent for the user, not a global override.** A non-admin holding an `'all'` token still sees only their own data — the `'all'` semantic doesn't grant admin powers. Implemented as a no-op at the access.py layer: admin status comes from the realm role, not from the scope. See `_scope_permits_project` / `_scope_project_id` in `security/access.py`.
-4. **Track B scope** — option 1 (network policy + bootstrap secret), 2 (per-job tokens), or 3 (mTLS)? Does the current self-hosted use case warrant any of it now, or is it a Phase 2 prerequisite?
-5. **Sudo approval** — caller must be `owner` of the related project, or any project member, or any admin only? (Recommend project owner OR admin.)
+4. ~~**Track B scope**~~ — **Decided + implemented 2026-05-17 (P4b):** option 1 (shared bootstrap secret) at the app layer (`require_internal` / `require_internal_or_job_access` checking `X-Internal-Key`), plus optional edge-layer path strip (Helm toggle for Traefik-edge users, cloudflared path rule for tunnel-edge users). Defers per-agent tokens (option 2) and mTLS (option 3) to hosted-product readiness; they're additive on top of the current design.
+5. ~~**Sudo approval**~~ — **Decided + implemented 2026-05-16 (H4):** project owner OR admin. Job owners cannot self-approve their own sudo requests — that would defeat the gate. Orphan requests (no job or no project) are admin-only. Implemented in `require_sudo_request_authority` at `orchestrator/security/access.py:451`.
 6. ~~**Builder session `active_job_id` / `active_project_id`**~~ — **Decided 2026-05-16: fail closed (403).** Implemented in F2: `send_builder_message` now calls `require_job_access` / `require_project_member` for each non-null active_* before constructing the system prompt. The fields end up in the LLM prompt and steer inspection tools, so silently scoping was rejected as a data-leak surface.
 7. ~~**Agents API for non-admin users**~~ — **Decided 2026-05-16 (G4): admin-only + stripped per-user projection.** The four `/api/agents*` read/delete endpoints require `_require_admin`. New `GET /api/me/active-jobs` returns the caller's in-flight jobs (no pod IPs / hostnames / agent metadata) so non-admin UIs can show "what's running for me."
 8. ~~**Stats endpoints**~~ — **Decided 2026-05-16 (G5): scope-to-user for job-derived stats; admin-only for infra.** `GET /api/stats/jobs`, `/daily`, `/stuck` use the G1 visibility OR-clause (admin sees all, non-admin sees own + project-member). `GET /api/stats/agents` and `GET /api/snapshots/stats` admin-only (infra metrics with no per-user shape). No separate `/api/admin/stats/*` routes — same endpoints, dispatched server-side via `_visibility_kwargs_for_stats(user)`.
-9. **Sources metadata sharing across users** — accept that user A's source title/description is visible to user B when they ingest the same content (current behavior, due to dedupe by `content_hash`)? Recommend yes, document it.
-10. **Cloud storage per-user OAuth** — Phase 2 or later? It's the largest blast-radius issue but also the biggest refactor.
+9. **Sources metadata sharing across users** — accept that user A's source title/description is visible to user B when they ingest the same content (current behavior, due to dedupe by `content_hash`)? Recommend yes, document it. *Status: still open — low-priority, accept-as-designed candidate.*
+10. **Cloud storage per-user OAuth** — Phase 2 or later? *Still open as a scheduling question;* the design is enumerated under [Phase 2 sketch §Cross-cutting infrastructure isolation](#phase-2-sketch-deferred) (~1-2 weeks). It's the largest blast-radius issue but also the biggest refactor; gates Phase 2 / hosted-product readiness.
 11. ~~**Orphan handling**~~ — **Decided 2026-05-16 (G3): admin-only by default.** Thread `require_thread_owner` fails closed for `user_id IS NULL` (only admins pass). Source `get_source_detail` fails closed for sources with zero linked jobs (only admins pass). No "orphans" project — leave for an explicit cleanup tool if needed.
-12. **MongoDB retention** — add a TTL on `llm_requests` and `agent_audit`? How long?
+12. **MongoDB retention** — add a TTL on `llm_requests` and `agent_audit`? How long? *Still open;* listed as Phase 2 cross-cutting gap #3 (~1h once retention window is picked).
 
 ---
 
@@ -674,9 +750,13 @@ The reason this stays cheap is that **Phase 1 centralizes visibility in `access.
 
 ## Next steps
 
-1. **This week:** ship the P0 hotfixes H1-H5 as five small independent PRs (~2d total).
-2. **Decide the open questions** above before F1 lands — especially #1 (404 vs 403), #2 (credential redaction model), #3 (`scope='all'` semantics), #4 (Track B option), #5 (sudo approval scope).
-3. **Next week:** land F1 (the `access.py` foundation). Once merged, F2-F7 can fan out in parallel.
-4. **Following sprint:** G1-G5 in parallel; close out with C1, C2.
-5. **Track B decision** — pick option 1, 2, or 3, and either start B1 in parallel with Track A or formally defer with a date tied to hosted-product readiness.
-6. While Track A is in flight, sketch the Phase 2 schema migration to confirm `access.py` is in fact org-shaped.
+**Phase 1 + P4 + Track B are all done as of 2026-05-17.** The remaining work is post-implementation hardening, ordered by cost-to-value:
+
+1. **Keycloak self-registration fixes (~2h).** Wire SMTP for `VERIFY_EMAIL` (or skip-verification for dev), add the `user` role to `default-roles-srw`. Unblocks E2E cross-user verification of everything Track A + P4 + Track B shipped — without it, we can only test via admin accounts and unit-test mocks. **Smallest fix, biggest unblock.** See [`project_keycloak_self_registration_broken`](../.. memory).
+2. **Chromium profile per-job (~2h).** `/tmp/agent-chromium-cdp-profile` → `/tmp/agent-chromium-cdp-profile-{job_id}` plus a teardown hook. Stops cookie/session leakage between jobs on the same agent pod.
+3. **MongoDB TTL (~1h).** Pick a retention window (90d? 1y?), add a TTL index on `llm_requests` and `agent_audit`. Closes Phase 2 cross-cutting gap #3.
+4. **Audit log of cross-user 403s (~3h).** Emit a structured log line (or a Mongo `security_audit` entry) when any access helper raises 403. Enables forensics + rate-based alerting.
+5. **Cloud storage per-user OAuth (~1-2 weeks).** Replace the shared OpenCloud/Nextcloud service account with per-user OAuth tokens. The actual hosted-product blocker. Phase 2 gating work.
+6. **Phase 2 organizations layer.** Cheap to add once #5 lands — see [Phase 2 sketch §Organizations layer](#phase-2-sketch-deferred).
+
+**Items 1-3 are quick wins (under 1 day total).** Item 5 is the big one and the natural gate for hosted-product readiness. Item 6 stays cheap because Phase 1 centralized visibility in `access.py`.
