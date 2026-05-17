@@ -1,13 +1,26 @@
-"""OpenCloud workspace sync — WebDAV + Keycloak client_credentials bearer token.
+"""OpenCloud workspace sync — WebDAV + Keycloak bearer token.
 
-The token is minted from Keycloak via the service account client_credentials
-flow (mirrors ``orchestrator/services/cloud/opencloud.py:_get_service_token``),
-cached in memory, and refreshed ~30s before expiry. The underlying webdav3
-client is rebuilt each time the token rotates.
+Two auth modes:
 
-If a primitive gets a 401 mid-call (e.g. Keycloak rotated the signing key),
-the wrapper clears the cached token, forces a refresh, and retries once. A
-persistent 401 indicates a real config error and surfaces to the caller.
+* **Service-account (default).** Token minted via Keycloak ``client_credentials``
+  flow (mirrors ``orchestrator/services/cloud/opencloud.py:_get_service_token``).
+  Used by Phase 1 project / repo mounts where the service account is invited
+  to the Space and can read/write directly.
+
+* **User impersonation** (set ``target_user_sub``). Token minted via RFC 8693
+  token-exchange: first get the service-account token as before, then POST
+  to the token endpoint with ``grant_type=urn:ietf:params:oauth:grant-type:
+  token-exchange``, ``subject_token=<service token>``, ``requested_subject=
+  <target sub>``. The exchanged token authenticates the agent as the target
+  user. Required for Phase 2 user-home mounts (OpenCloud Personal Spaces are
+  owned by exactly one user; the service account has no WebDAV access of its
+  own to them).
+
+In both modes the resulting bearer token is cached in memory, refreshed ~30s
+before expiry, and the underlying webdav3 client is rebuilt when the token
+rotates. If a primitive gets a 401 mid-call, the wrapper clears the cached
+token, forces a fresh fetch (and re-exchange in impersonation mode), and
+retries once. A persistent 401 surfaces as a real config error.
 """
 
 from __future__ import annotations
@@ -55,6 +68,7 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
         keycloak_issuer: str,
         client_id: str,
         client_secret: str,
+        target_user_sub: Optional[str] = None,
         poll_interval: int = 15,
         workspace_backend: Optional["WorkspaceBackend"] = None,
         mount_subdir: str = "",
@@ -69,6 +83,10 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
         self._keycloak_issuer = keycloak_issuer.rstrip("/")
         self._client_id = client_id
         self._client_secret = client_secret
+        # When set, ``_get_token`` returns a user-scoped token obtained by
+        # exchanging the service-account token for an impersonation token
+        # naming this Keycloak ``sub``. None = legacy service-account mode.
+        self._target_user_sub = target_user_sub
 
         self._webdav_base_path = urlparse(self._webdav_base_url).path.rstrip("/") + "/"
 
@@ -81,11 +99,17 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
         self._current_client_token: Optional[str] = None
 
     def __repr__(self) -> str:
+        mode = (
+            f"impersonate_sub={self._target_user_sub}"
+            if self._target_user_sub
+            else "service-account"
+        )
         return (
             "<OpenCloudWorkspaceSync "
             f"issuer={self._keycloak_issuer} "
             f"client_id={self._client_id} "
             "secret=*** "
+            f"{mode} "
             f"webdav={self._webdav_base_url}>"
         )
 
@@ -96,8 +120,82 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
             self._httpx = httpx.AsyncClient(timeout=30.0)
         return self._httpx
 
+    async def _fetch_service_token(self) -> tuple[str, float]:
+        """Mint a fresh service-account token via client_credentials.
+
+        Returns ``(access_token, expires_in)``. Caller decides whether to
+        cache it (legacy mode) or feed it into a token-exchange (impersonation
+        mode).
+        """
+        client = self._httpx_client()
+        resp = await client.post(
+            f"{self._keycloak_issuer}/protocol/openid-connect/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                # openid scope required so OpenCloud's OIDC middleware
+                # can call Keycloak userinfo. Mirrors the orchestrator
+                # backend (orchestrator/services/cloud/opencloud.py).
+                "scope": "openid",
+            },
+            headers={"Accept": "application/json"},
+        )
+        # Don't log resp.text on failure — it may echo request body.
+        resp.raise_for_status()
+        payload = resp.json()
+        token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        if not token or not isinstance(expires_in, (int, float)):
+            raise RuntimeError(
+                "Keycloak token response missing access_token/expires_in"
+            )
+        return str(token), float(expires_in)
+
+    async def _exchange_for_user_token(
+        self, subject_token: str, target_sub: str
+    ) -> tuple[str, float]:
+        """Exchange the service token for a user-scoped one via RFC 8693.
+
+        Keycloak's ``requested_subject`` parameter triggers impersonation:
+        the issued token's ``sub`` claim is ``target_sub`` instead of the
+        service-account user. The calling client (us) must hold the realm
+        ``impersonation`` role for Keycloak to honor this.
+        """
+        client = self._httpx_client()
+        resp = await client.post(
+            f"{self._keycloak_issuer}/protocol/openid-connect/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "subject_token": subject_token,
+                "subject_token_type": ("urn:ietf:params:oauth:token-type:access_token"),
+                "requested_subject": target_sub,
+                # openid scope keeps OpenCloud's OIDC middleware happy
+                # when it validates the exchanged token; same as the
+                # client_credentials path above.
+                "scope": "openid",
+            },
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        token = payload.get("access_token")
+        expires_in = payload.get("expires_in")
+        if not token or not isinstance(expires_in, (int, float)):
+            raise RuntimeError(
+                "Keycloak token-exchange response missing access_token/expires_in"
+            )
+        return str(token), float(expires_in)
+
     async def _get_token(self, force_refresh: bool = False) -> str:
-        """Return a cached or freshly-minted Keycloak service-account token."""
+        """Return the current bearer token, refreshing if needed.
+
+        For service-account mode this is just the client_credentials token.
+        For impersonation mode it's the user-scoped token from the
+        token-exchange — minted from a fresh service token each refresh.
+        """
         now = time.monotonic()
         if not force_refresh and self._access_token and now < self._token_expires_at:
             return self._access_token
@@ -109,33 +207,18 @@ class OpenCloudWorkspaceSync(WorkspaceSyncBase):
                 and now < self._token_expires_at
             ):
                 return self._access_token
-            client = self._httpx_client()
-            resp = await client.post(
-                f"{self._keycloak_issuer}/protocol/openid-connect/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    # openid scope required so OpenCloud's OIDC middleware
-                    # can call Keycloak userinfo. Mirrors the orchestrator
-                    # backend (orchestrator/services/cloud/opencloud.py).
-                    "scope": "openid",
-                },
-                headers={"Accept": "application/json"},
-            )
-            # Don't log resp.text on failure — it may echo request body.
-            resp.raise_for_status()
-            payload = resp.json()
-            token = payload.get("access_token")
-            expires_in = payload.get("expires_in")
-            if not token or not isinstance(expires_in, (int, float)):
-                raise RuntimeError(
-                    "Keycloak token response missing access_token/expires_in"
+
+            service_token, service_ttl = await self._fetch_service_token()
+            if self._target_user_sub:
+                user_token, user_ttl = await self._exchange_for_user_token(
+                    service_token, self._target_user_sub
                 )
-            self._access_token = str(token)
-            self._token_expires_at = (
-                time.monotonic() + float(expires_in) - _TOKEN_CLOCK_SKEW_SECONDS
-            )
+                self._access_token = user_token
+                ttl = user_ttl
+            else:
+                self._access_token = service_token
+                ttl = service_ttl
+            self._token_expires_at = time.monotonic() + ttl - _TOKEN_CLOCK_SKEW_SECONDS
             return self._access_token
 
     async def _dav(self):

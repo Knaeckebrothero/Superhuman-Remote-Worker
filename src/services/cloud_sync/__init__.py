@@ -44,6 +44,10 @@ def build_workspace_sync(
           } | {
             "type": "keycloak_client_credentials",
             "issuer": str, "client_id": str, "client_secret": str,
+          } | {
+            "type": "keycloak_user_impersonation",
+            "issuer": str, "client_id": str, "client_secret": str,
+            "target_user_sub": str,     # Keycloak sub of the user to impersonate
           },
         }
 
@@ -74,13 +78,28 @@ def build_workspace_sync(
             workspace_backend=workspace_backend,
             mount_subdir=mount_subdir,
         )
-    if backend == "opencloud" and auth_type == "keycloak_client_credentials":
+    if backend == "opencloud" and auth_type in (
+        "keycloak_client_credentials",
+        "keycloak_user_impersonation",
+    ):
+        target_user_sub = (
+            auth.get("target_user_sub")
+            if auth_type == "keycloak_user_impersonation"
+            else None
+        )
+        if auth_type == "keycloak_user_impersonation" and not target_user_sub:
+            logger.warning(
+                "cloud_sync: keycloak_user_impersonation auth missing "
+                "target_user_sub — skipping mount"
+            )
+            return None
         return OpenCloudWorkspaceSync(
             workspace_path=workspace_path,
             webdav_base_url=webdav_url,
             keycloak_issuer=auth["issuer"],
             client_id=auth["client_id"],
             client_secret=auth["client_secret"],
+            target_user_sub=target_user_sub,
             poll_interval=poll_interval,
             workspace_backend=workspace_backend,
             mount_subdir=mount_subdir,
