@@ -120,3 +120,30 @@ def test_v2_with_no_resolvable_mounts_returns_none(
         workspace_path=tmp_path, workspace_backend=None, cloud_cfg=cfg
     )
     assert coord is None
+
+
+def test_v2_project_default_at_workspace_root(tmp_path: Path, build_sync_coordinator):
+    """Phase 2: a ``project_default`` mount at ``target_path=''`` is routed
+    as a root-level workspace mirror — the user's cloud home becomes the
+    workspace. No legacy session folder is needed in this shape.
+    """
+    cfg = {
+        "version": 2,
+        "session_folder": None,
+        "mounts": [
+            {
+                "mount_id": "m_home",
+                "mount_kind": "project_default",
+                "target_path": "",
+                **_nc_cfg("home-of-alice"),
+            }
+        ],
+    }
+    coord = build_sync_coordinator(
+        workspace_path=tmp_path, workspace_backend=None, cloud_cfg=cfg
+    )
+    assert coord is not None
+    assert len(coord) == 1
+    [m] = coord.mounts
+    assert m.target_path == ""
+    assert m.mount_id == "m_home"

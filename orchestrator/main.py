@@ -9932,10 +9932,16 @@ def _slugify_mount_name(name: str) -> str:
 
 
 def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
-    """Pick out project ``source_ref``s from a list of mount rows."""
+    """Pick out project ``source_ref``s from a list of mount rows.
+
+    Both ``project`` (non-default, mounted under ``projects/<slug>/``) and
+    ``project_default`` (default project, mounted at workspace root via the
+    user's cloud home) rows contribute — the default project is still a
+    project attachment for datasource resolution and visibility.
+    """
     out: list[str] = []
     for m in mounts:
-        if m.get("mount_kind") != "project":
+        if m.get("mount_kind") not in {"project", "project_default"}:
             continue
         ref = m.get("source_ref")
         if ref:
@@ -10003,14 +10009,61 @@ async def _thread_project_ids(thread_id: str) -> list[str]:
     return [str(p) for p in legacy_ids]
 
 
+async def _build_default_project_mount_row(
+    project_id: str, project: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Shape a ``project_default`` mount row for a default project.
+
+    Resolves the project's owner on the cloud backend and queries their
+    personal home Space. The mount targets the workspace root (``target_path
+    = ""``) — the agent's workspace and the user's cloud home become two
+    views of the same surface. Phase 2 of cloud_collaboration_model.md §9.
+
+    Returns ``None`` when the user-home can't be resolved (no owner, owner
+    missing from the cloud backend, no webdav URL, backend down). The
+    caller treats ``None`` as "fall back to the legacy session folder" so
+    a transient resolution failure never leaves the thread with zero
+    mounts. The next thread-create attempt retries from scratch.
+    """
+    backend = main_cloud_router.for_project(project)
+    if not backend.is_initialized:
+        return None
+    members = await postgres_db.get_project_members(project_id)
+    owner = next((m for m in members if m.get("role") == "owner"), None)
+    if not owner:
+        return None
+    owner_email = owner.get("email")
+    if not owner_email:
+        return None
+    owner_display = (owner.get("display_name") or "").lower()
+    resolved = await backend.resolve_user_identity(owner_email, owner_display)
+    if not resolved:
+        return None
+    home = await backend.get_user_home(resolved)
+    if not home or not home.webdav_url:
+        return None
+    return {
+        "mount_kind": "project_default",
+        "target_path": "",
+        "source_kind": "user_home",
+        "source_ref": project_id,
+        "backend_id": backend.backend_id,
+        "cloud_handle": home.handle.to_db(),
+        "webdav_url": home.webdav_url,
+    }
+
+
 async def _build_thread_mount_rows(
     project_ids: list[str],
 ) -> list[dict[str, Any]]:
     """Resolve mount-row payloads for the given project_ids.
 
-    Each row carries everything ``replace_thread_mounts`` needs. Skips
-    default projects (Phase 1 scope is non-default projects mounted under
-    ``projects/<slug>/``) and projects without an attached cloud folder.
+    Each row carries everything ``replace_thread_mounts`` needs. Default
+    projects (Phase 2) produce a ``project_default`` row that mounts the
+    owner's cloud home at the workspace root; non-default projects produce
+    a ``project`` row that mounts at ``projects/<slug>/``. Projects whose
+    cloud transport can't be resolved are skipped — the mount-row entry is
+    not partially filled, the caller observes a missing row.
     """
     rows: list[dict[str, Any]] = []
     for project_id in project_ids:
@@ -10018,8 +10071,19 @@ async def _build_thread_mount_rows(
         if not project:
             continue
         if project.get("is_default"):
-            # Default project becomes a project_default mount at workspace
-            # root in Phase 2 — handled by a separate code path then.
+            try:
+                default_row = await _build_default_project_mount_row(
+                    project_id, project
+                )
+            except Exception as e:
+                logger.warning(
+                    "Project %s (default): failed to resolve user-home mount row: %s",
+                    project_id,
+                    e,
+                )
+                continue
+            if default_row:
+                rows.append(default_row)
             continue
         backend_id = project.get("main_cloud_backend")
         handle_str = project.get("main_cloud_folder_handle")
@@ -10877,6 +10941,34 @@ async def create_thread(
                 await backend.ensure_initialized()
             if not backend.is_initialized:
                 return
+
+            # Phase 2 (cloud_collaboration_model.md §9): if the thread
+            # already has a working ``project_default`` mount at workspace
+            # root (the user's cloud home), the legacy session folder
+            # would be a redundant second sync target at the same location.
+            # Skip provisioning it. The gate is observable-state — a
+            # transient user-home resolution failure leaves no
+            # ``project_default`` row, the legacy folder is still
+            # provisioned, the thread never ends up with zero mounts.
+            try:
+                existing_mounts = await postgres_db.list_thread_mounts(thread_id)
+            except Exception as e:
+                existing_mounts = []
+                logger.warning(
+                    "Thread %s: failed to read thread_mounts before session "
+                    "folder provisioning (%s); proceeding with legacy folder.",
+                    thread_id,
+                    e,
+                )
+            for m in existing_mounts:
+                if m.get("mount_kind") == "project_default" and m.get("webdav_url"):
+                    logger.info(
+                        "Thread %s: skipping legacy session folder — workspace "
+                        "root is mounted via the default-project user-home.",
+                        thread_id,
+                    )
+                    return
+
             try:
                 session_handle = await backend.ensure_session_folder(
                     session_id=thread_id[:8]
