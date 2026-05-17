@@ -31,10 +31,16 @@ MANIFEST = REPO_ROOT / "docs" / "security" / "endpoint_inventory.txt"
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 
 # Functions that gate access. `_require_admin` and `require_approved_user`
-# are also gates — even an auth-only gate beats no gate.
+# are also gates — even an auth-only gate beats no gate. P4b added
+# ``require_internal`` (shared-secret bootstrap for agent ↔ orchestrator)
+# and ``require_internal_or_job_access`` (hybrid: agent key bypasses user
+# auth, otherwise normal job access check).
 GATE_NAMES = {
     "_require_admin",
+    "is_internal_call",
     "require_approved_user",
+    "require_internal",
+    "require_internal_or_job_access",
     "require_job_access",
     "require_project_member",
     "require_project_owner",
@@ -136,6 +142,7 @@ def _classify(
     # endpoint also exposes a per-resource path. Endpoints that ONLY check
     # admin still get labeled "admin:_require_admin".
     priority = {
+        "require_internal_or_job_access": 0,
         "require_job_access": 0,
         "require_project_owner": 0,
         "require_project_member": 0,
@@ -149,11 +156,15 @@ def _classify(
         "user_can_access_datasource": 1,
         "user_can_access_ide_entity": 1,
         "_require_admin": 2,
+        "require_internal": 2,
+        "is_internal_call": 2,
         "require_approved_user": 3,
     }
     primary = sorted(gates, key=lambda g: priority.get(g, 99))[0]
     if primary == "_require_admin":
         return f"admin:{primary}"
+    if primary in ("require_internal", "is_internal_call"):
+        return f"internal:{primary}"
     return f"gated:{primary}"
 
 
@@ -216,6 +227,7 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"
         "#   admin:_require_admin   — admin-only\n"
+        "#   internal:<helper>      — P4b shared-secret (X-Internal-Key) — agent ↔ orchestrator\n"
         "#   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator\n"
         "#   unscoped               — no gate detected; CI snapshot test will fail\n"
         "\n"

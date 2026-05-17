@@ -641,3 +641,365 @@ class TestGatedReadEndpointsHappyPath:
         with _patch_caller_and_db(user_admin, fake_db):
             result = await get_job_progress(fake_request, str(job_a["id"]))
         assert result == {"status": "ok"}
+
+
+# =============================================================================
+# P4c — job mutation gates
+# =============================================================================
+# Each test calls a P4c-gated mutation with a cross-user caller; the gate
+# raises 403 before the downstream service is touched. Endpoints called by
+# the agent (cancel/pause/resume/approve/subjob-merge/agent-release/
+# messages/send and POST /api/jobs itself) are NOT in scope here — they move
+# to P4b alongside the other Track-B agent-internal endpoints.
+
+
+class TestJobMutationGates:
+    @pytest.mark.asyncio
+    async def test_delete_job_snapshot_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import delete_job_snapshot
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.snapshot_service", _make_dud("snapshot_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_job_snapshot(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_toggle_snapshot_pin_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import toggle_snapshot_pin
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.snapshot_service", _make_dud("snapshot_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await toggle_snapshot_pin(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_start_ide_session_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import start_ide_session
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.ide_session_service", _make_dud("ide_session_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await start_ide_session(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_ide_session_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_ide_session
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.ide_session_service", _make_dud("ide_session_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_ide_session(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_stop_ide_session_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import stop_ide_session
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.ide_session_service", _make_dud("ide_session_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await stop_ide_session(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_write_workspace_file_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import write_workspace_file
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.workspace_service", _make_dud("workspace_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await write_workspace_file(
+                    fake_request, str(job_a["id"]), "foo.md", {"content": "x"}
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_source_annotations_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_source_annotations
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_source_annotations(fake_request, str(job_a["id"]), 1)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_source_tags_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_source_tags
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_source_tags(fake_request, str(job_a["id"]), 1)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_job_logs_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_job_logs
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.workspace_service", _make_dud("workspace_service")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_job_logs(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_upgrade_job_to_vm_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import upgrade_job_to_vm
+
+        # The gate runs before the body, so no downstream service patch needed —
+        # the in-body postgres_db.get_job() call would itself fail the dud test
+        # if we patched it. Just rely on the gate to fire first.
+        with _patch_caller_and_db(user_b, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await upgrade_job_to_vm(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_promote_job_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import PromoteRequest, promote_job
+
+        body = PromoteRequest(
+            name="hijack",
+            description=None,
+            goal=None,
+            user_id=str(user_b["id"]),
+        )
+        with _patch_caller_and_db(user_b, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await promote_job(fake_request, str(job_a["id"]), body)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_promote_job_forces_caller_user_id(
+        self, user_a, user_b, job_a, fake_db, fake_request
+    ):
+        """Owner promotes their own job; the gate accepts user_a, and the
+        handler must overwrite body.user_id with caller.id so a malicious body
+        can't grant ownership of the new project to someone else."""
+        from main import PromoteRequest, promote_job
+
+        body = PromoteRequest(
+            name="hijack-attempt",
+            description=None,
+            goal=None,
+            user_id=str(user_b["id"]),  # malicious — caller is user_a
+        )
+        # job_a has status "created"; promote_job requires "completed" and
+        # raises 400 before any project-creation work happens. That natural
+        # 400 means we passed the gate AND the body mutation ran — we then
+        # assert body.user_id was forced.
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await promote_job(fake_request, str(job_a["id"]), body)
+        assert exc.value.status_code == 400
+        assert str(body.user_id) == str(user_a["id"])
+
+    @pytest.mark.asyncio
+    async def test_reply_to_agent_message_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import MessageReplyRequest, reply_to_agent_message
+
+        body = MessageReplyRequest(message="hi", urgent=False)
+        with _patch_caller_and_db(user_b, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await reply_to_agent_message(
+                    fake_request, str(job_a["id"]), "thread-x", body
+                )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_delete_job_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import delete_job
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_job(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_delete_job_blocked_for_non_owner_member(
+        self, user_a, user_b, job_a, fake_db, fake_request
+    ):
+        """Plain project membership isn't enough — must be job owner OR
+        project owner OR admin. user_b is a member of project_a here but
+        only as 'editor', so the gate-pass should still be denied."""
+        from main import delete_job
+
+        # Make user_b a non-owner member of project_a so require_job_access
+        # passes but the secondary role check fails.
+        original_role = fake_db.get_user_role_in_project
+
+        async def role_lookup(pid, uid):
+            if str(uid) == str(user_b["id"]) and str(pid) == str(job_a["project_id"]):
+                return "editor"
+            return await original_role(pid, uid)
+
+        fake_db.get_user_role_in_project = role_lookup
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.gitea_client", _make_dud("gitea_client")),
+            patch("main.vector_db", _make_dud("vector_db")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_job(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+        assert "owner" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_assign_job_to_agent_blocked_non_admin(
+        self, user_a, job_a, fake_db, fake_request
+    ):
+        """Even the job owner can't manually assign — admin-only override."""
+        from main import assign_job_to_agent
+
+        with _patch_caller_and_db(user_a, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await assign_job_to_agent(fake_request, str(job_a["id"]), "some-agent")
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_assign_job_to_agent_admin_passes_gate(
+        self, user_admin, job_a, fake_db, fake_request
+    ):
+        """Admin clears the gate; the in-body failure is a 500 (not a 403),
+        proving the gate didn't fire."""
+        from main import assign_job_to_agent
+
+        fake_db.get_job = AsyncMock(side_effect=RuntimeError("past gate ok"))
+        with _patch_caller_and_db(user_admin, fake_db):
+            with pytest.raises(HTTPException) as exc:
+                await assign_job_to_agent(fake_request, str(job_a["id"]), "some-agent")
+        assert exc.value.status_code == 500
+        assert "past gate ok" in exc.value.detail
+
+
+# =============================================================================
+# P4f — VM lifecycle gates
+# =============================================================================
+# VMs are per-job, so they follow job visibility. The 3 endpoints all gate
+# on `body.job_id` / path `job_id` via `require_job_access`. DELETE adds the
+# destructive owner-or-admin check (mirrors DELETE /api/jobs/{id} from P4c).
+
+
+class TestVmLifecycleGates:
+    @pytest.mark.asyncio
+    async def test_create_vm_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import VMCreateRequest, create_vm
+
+        body = VMCreateRequest(
+            job_id=str(job_a["id"]),
+            agent_config="scholar",
+        )
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await create_vm(fake_request, body)
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_get_vm_status_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import get_vm_status
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await get_vm_status(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_delete_vm_blocked_cross_user(
+        self, user_b, job_a, fake_db, fake_request
+    ):
+        from main import delete_vm
+
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_vm(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_delete_vm_blocked_for_non_owner_member(
+        self, user_a, user_b, job_a, fake_db, fake_request
+    ):
+        """Same shape as `delete_job` — plain editor membership must not
+        be enough to delete the VM."""
+        from main import delete_vm
+
+        original_role = fake_db.get_user_role_in_project
+
+        async def role_lookup(pid, uid):
+            if str(uid) == str(user_b["id"]) and str(pid) == str(job_a["project_id"]):
+                return "editor"
+            return await original_role(pid, uid)
+
+        fake_db.get_user_role_in_project = role_lookup
+        with (
+            _patch_caller_and_db(user_b, fake_db),
+            patch("main.vm_provisioner", _make_dud("vm_provisioner")),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await delete_vm(fake_request, str(job_a["id"]))
+        assert exc.value.status_code == 403
+        assert "owner" in exc.value.detail.lower()

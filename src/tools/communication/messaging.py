@@ -197,8 +197,16 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
         orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
         api_url = f"{orchestrator_url}/api/jobs/{job_id}/messages/send"
 
+        # P4b: send X-Internal-Key so the orchestrator's require_internal gate
+        # accepts the call. Without the key the endpoint 401s (it's pure
+        # agent-internal — no cockpit caller).
+        headers: dict[str, str] = {}
+        internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+        if internal_key:
+            headers["X-Internal-Key"] = internal_key
+
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
                 resp = await client.post(
                     api_url,
                     json={

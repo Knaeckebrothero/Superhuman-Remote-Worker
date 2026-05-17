@@ -6921,44 +6921,101 @@ class PostgresDB:
             "messages": messages,
         }
 
-    async def get_pending_action_counts(self) -> Dict[str, Any]:
+    async def get_pending_action_counts(
+        self,
+        owner_user_id: Optional[str] = None,
+        visible_project_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Get counts of pending actions across all types.
+
+        Visibility (P4e): when ``owner_user_id`` is provided, counts and the
+        ``most_urgent`` sudo are restricted to jobs the caller can see
+        (their own jobs OR jobs in projects they're a member of). Pass
+        ``None`` for the admin view (counts across all jobs). Jobs with no
+        owner are admin-only — they don't appear in any user's view.
 
         Returns:
             Dict with sudo, messages, reviews counts and most_urgent info.
         """
+        admin_view = owner_user_id is None
+        project_ids = visible_project_ids or []
+
         async with self.acquire() as conn:
-            sudo_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM sudo_approval_requests WHERE status = 'pending'"
+            if admin_view:
+                sudo_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM sudo_approval_requests "
+                        "WHERE status = 'pending'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            message_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+                message_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            review_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+                review_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            # Find most urgent sudo request (lowest TTL)
-            most_urgent_sudo = await conn.fetchrow(
-                """
-                SELECT id, command, expires_at
-                FROM sudo_approval_requests
-                WHERE status = 'pending' AND expires_at > NOW()
-                ORDER BY expires_at ASC
-                LIMIT 1
-                """
-            )
+                most_urgent_sudo = await conn.fetchrow(
+                    """
+                    SELECT id, command, expires_at
+                    FROM sudo_approval_requests
+                    WHERE status = 'pending' AND expires_at > NOW()
+                    ORDER BY expires_at ASC
+                    LIMIT 1
+                    """
+                )
+            else:
+                # Visibility OR-clause: caller's own jobs ∪ project jobs.
+                # Empty project_ids → ANY($2::uuid[]) on an empty array
+                # yields false, so we still return own-jobs-only.
+                sudo_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM sudo_approval_requests s
+                        JOIN jobs j ON s.job_id = j.id
+                        WHERE s.status = 'pending'
+                          AND (j.user_id = $1 OR j.project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                message_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM jobs
+                        WHERE status = 'waiting_for_reply'
+                          AND (user_id = $1 OR project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                review_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM jobs
+                        WHERE status = 'pending_review'
+                          AND (user_id = $1 OR project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                most_urgent_sudo = await conn.fetchrow(
+                    """SELECT s.id, s.command, s.expires_at
+                    FROM sudo_approval_requests s
+                    JOIN jobs j ON s.job_id = j.id
+                    WHERE s.status = 'pending' AND s.expires_at > NOW()
+                      AND (j.user_id = $1 OR j.project_id = ANY($2::uuid[]))
+                    ORDER BY s.expires_at ASC
+                    LIMIT 1""",
+                    owner_user_id,
+                    project_ids,
+                )
 
         total = sudo_count + message_count + review_count
 

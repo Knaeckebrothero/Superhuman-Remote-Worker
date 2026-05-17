@@ -383,10 +383,14 @@ async def logout(request: Request) -> JSONResponse:
             # from logging out locally; KC's session expires naturally
             # within the refresh-token TTL even if this misses.
             await kc_bff_client.logout_kc_side(sess["refresh_token"])
+            # Trailing slash matters: KC's post.logout.redirect.uris pattern is
+            # `{cockpit_url}/*`, and bare `https://localhost` doesn't reliably
+            # match `https://localhost/*` across KC versions. Send `.../` so
+            # the wildcard `*` matches the empty path explicitly.
             qs = urlencode(
                 {
                     "id_token_hint": sess["id_token"],
-                    "post_logout_redirect_uri": _spa_base(),
+                    "post_logout_redirect_uri": _spa_base() + "/",
                 }
             )
             kc_logout_url = f"{kc_bff_client.end_session_endpoint}?{qs}"

@@ -28,12 +28,19 @@ just the home for the next four bundles of work.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import HTTPException, Request
 
 from security.auth import require_approved_user
+
+# Shared bootstrap secret for agent ↔ orchestrator and MCP-bridge ↔ orchestrator
+# traffic. Distributed via Helm as the ``MCP_INTERNAL_KEY`` env var (already
+# set on orchestrator + MCP pods; P4b adds it to agent pods too). Read once at
+# import time — the env doesn't change between requests.
+_INTERNAL_KEY = os.environ.get("MCP_INTERNAL_KEY", "")
 
 
 Role = Literal["viewer", "editor", "owner"]
@@ -675,3 +682,77 @@ def apply_mcp_scope(
             scope_project_param: project_uuid,
         }
     return "", {}
+
+
+# =============================================================================
+# Track B (P4b) — agent ↔ orchestrator shared-secret authentication
+# =============================================================================
+#
+# The agent runs in the same cluster as the orchestrator and reaches it via
+# the in-cluster Service DNS (no ingress). Public ingress traffic, however,
+# was routing every path to the orchestrator without any auth on these
+# agent-internal endpoints. Two complementary defenses:
+#
+#   1. Ingress path strip (helm/templates/ingress.yaml) — pure-agent paths
+#      return 403 at the edge so external attackers can't even reach the
+#      handler. In-cluster Service calls bypass the ingress and so bypass
+#      the strip.
+#   2. ``X-Internal-Key`` header — the agent reads ``MCP_INTERNAL_KEY``
+#      from its env and sends it on every call. The helpers below check
+#      it. This closes the in-cluster lateral-movement vector (a
+#      compromised pod in the same namespace can reach the Service but
+#      can't forge the key).
+#
+# For pure-internal endpoints (``require_internal``) the key is mandatory.
+# For dual-callable endpoints (``require_internal_or_job_access``) the key
+# acts as an agent-side bypass: with key → skip user auth; without key →
+# normal ``require_job_access``. Cockpit Bearer flows keep working.
+
+
+def is_internal_call(request: Request) -> bool:
+    """True iff the caller presented a valid ``X-Internal-Key`` header.
+
+    Returns False when no key is configured (``MCP_INTERNAL_KEY`` empty)
+    so a misconfigured cluster fails closed — better to break in-cluster
+    agent traffic loudly than to silently let anyone through.
+    """
+    if not _INTERNAL_KEY:
+        return False
+    return request.headers.get("X-Internal-Key", "") == _INTERNAL_KEY
+
+
+async def require_internal(request: Request) -> None:
+    """Pure-internal endpoint guard. Raises 401 without a valid X-Internal-Key.
+
+    Use for endpoints with zero legitimate external/cockpit caller (agent
+    bootstrap, heartbeat, job-complete callback, internal MCP token
+    bridge, persistent-thread bookkeeping called from the agent runtime).
+    """
+    if not is_internal_call(request):
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+
+
+async def require_internal_or_job_access(
+    request: Request,
+    db,
+    job_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Dual-callable endpoint guard. Returns ``(user, job)`` for user calls,
+    ``(None, job)`` for internal calls (job still loaded for the handler).
+
+    Internal calls skip the user resolution entirely (the agent runtime
+    has no Keycloak session) but still get the job dict — handlers
+    frequently use it to look up project_id, status, etc. We pay the
+    extra ``get_job`` cost (one query) to keep handler bodies identical
+    across the two paths.
+
+    Raises 404 if the job doesn't exist (both paths).
+    """
+    if is_internal_call(request):
+        job = await db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+        return None, job
+    # Local import to avoid the forward-reference dance — require_job_access
+    # is defined earlier in this module.
+    return await require_job_access(request, db, job_id)
