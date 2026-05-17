@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +19,33 @@ os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 import main as orch_main  # noqa: E402
 
 MODULE = "main"
+
+
+def _stub_request() -> MagicMock:
+    """A minimal Request stub for endpoints whose Track A/B gates need one.
+    Gates are patched separately to bypass auth — this just lets the
+    handler signature line up."""
+    req = MagicMock()
+    req.headers = {}
+    req.cookies = {}
+    return req
+
+
+def _bypass_job_access_gate(job: dict):
+    """Patch `require_job_access` to return (admin_caller, job) so the
+    destructive owner-or-admin check in delete_job is satisfied without
+    standing up the full auth stack."""
+    admin = {"id": "00000000-0000-0000-0000-000000000099", "is_admin": True}
+    return patch(
+        f"{MODULE}.require_job_access",
+        AsyncMock(return_value=(admin, job)),
+    )
+
+
+def _bypass_require_internal():
+    """Patch `require_internal` to pass through. P4b agent-internal
+    endpoints (subjob_merge etc.) gate on this."""
+    return patch(f"{MODULE}.require_internal", AsyncMock(return_value=None))
 
 
 # ===========================================================================
@@ -420,14 +447,14 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
         ):
-            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_gitea.is_initialized = True
             mock_gitea.delete_repo = AsyncMock()
             mock_gitea.delete_branch = AsyncMock()
 
-            result = await orch_main.delete_job("abcd1234-xxxx")
+            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
             assert result == {"status": "deleted"}
             mock_gitea.delete_repo.assert_awaited_once_with("job-abcd1234")
@@ -446,14 +473,14 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
         ):
-            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_gitea.is_initialized = True
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job("abcd1234-xxxx")
+            result = await orch_main.delete_job(_stub_request(), "abcd1234-xxxx")
 
             assert result == {"status": "deleted"}
             mock_gitea.delete_branch.assert_awaited_once_with(
@@ -474,8 +501,8 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
         ):
-            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_db.get_project_repositories = AsyncMock(
                 return_value=[{"name": "project-jobs-repo"}]
@@ -484,7 +511,7 @@ class TestDeleteJobGiteaCleanup:
             mock_gitea.delete_branch = AsyncMock()
             mock_gitea.delete_repo = AsyncMock()
 
-            result = await orch_main.delete_job("legacy-id")
+            result = await orch_main.delete_job(_stub_request(), "legacy-id")
 
             assert result == {"status": "deleted"}
             mock_gitea.delete_branch.assert_awaited_once_with(
@@ -499,12 +526,12 @@ class TestDeleteJobGiteaCleanup:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_job_access_gate(job),
         ):
-            mock_db.get_job = AsyncMock(return_value=job)
             mock_db.delete_job = AsyncMock(return_value=True)
             mock_gitea.is_initialized = False
 
-            result = await orch_main.delete_job("some-id")
+            result = await orch_main.delete_job(_stub_request(), "some-id")
 
             assert result == {"status": "deleted"}
             mock_gitea.delete_repo.assert_not_called()
@@ -512,11 +539,19 @@ class TestDeleteJobGiteaCleanup:
 
     @pytest.mark.asyncio
     async def test_job_not_found_raises_404(self):
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        # The gate (`require_job_access`) is what raises 404 for missing
+        # jobs now — let the real helper run with a patched db that returns None.
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            patch(
+                "security.access.require_approved_user",
+                AsyncMock(return_value={"id": "00000000-0000-0000-0000-000000000099", "is_admin": True}),
+            ),
+        ):
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.delete_job("missing-id")
+                await orch_main.delete_job(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
 
@@ -533,20 +568,26 @@ class TestSubjobMergeEndpoint:
         """Root jobs (no parent_job_id) should be rejected with 400."""
         job = {"parent_job_id": None}
 
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            _bypass_require_internal(),
+        ):
             mock_db.get_job = AsyncMock(return_value=job)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge("root-job-id")
+                await orch_main.subjob_merge(_stub_request(), "root-job-id")
             assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_returns_404_for_missing_job(self):
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with (
+            patch(f"{MODULE}.postgres_db") as mock_db,
+            _bypass_require_internal(),
+        ):
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
-                await orch_main.subjob_merge("missing-id")
+                await orch_main.subjob_merge(_stub_request(), "missing-id")
             assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
@@ -557,11 +598,12 @@ class TestSubjobMergeEndpoint:
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
             mock_gitea.is_initialized = True
 
-            result = await orch_main.subjob_merge("subjob-id")
+            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "skipped"
 
     @pytest.mark.asyncio
@@ -578,6 +620,7 @@ class TestSubjobMergeEndpoint:
             patch(
                 f"{MODULE}._squash_merge_subjob", new_callable=AsyncMock
             ) as mock_merge,
+            _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
             mock_merge.return_value = {
@@ -586,7 +629,7 @@ class TestSubjobMergeEndpoint:
                 "base_branch": "main",
             }
 
-            result = await orch_main.subjob_merge("subjob-id")
+            result = await orch_main.subjob_merge(_stub_request(), "subjob-id")
             assert result["status"] == "merged"
             assert result["job_id"] == "subjob-id"
             assert result["pr_number"] == 42

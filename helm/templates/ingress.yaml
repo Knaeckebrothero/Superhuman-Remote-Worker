@@ -92,6 +92,78 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+---
+# Track B (P4b) — agent-internal paths must not be reachable from the public
+# API ingress. The orchestrator's app-layer X-Internal-Key gate (require_internal)
+# is the primary defense; this Middleware + Ingress pair is the network-layer
+# second defense, blocking external HTTP traffic at the edge so attackers can't
+# even probe the agent surface.
+#
+# Cluster-internal callers (the agent reaching the orchestrator via the in-
+# cluster Service DNS http://srw-orchestrator:8085) bypass the ingress entirely,
+# so the agent's traffic is unaffected.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-block-external
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  # An IP allow-list with a single non-routable address effectively denies all
+  # real clients while keeping the resource valid. Traefik returns 403.
+  ipAllowList:
+    sourceRange:
+      - 127.0.0.99/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-blocked-internal
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    # Higher priority than the main API ingress so these path matches win.
+    # Without this, Traefik may evaluate the shorter `/` prefix first.
+    traefik.ingress.kubernetes.io/router.priority: "100"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-external@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          # Pure-agent paths (P4b ingress strip — agent ↔ orchestrator only).
+          # These are still served on the in-cluster Service DNS; only the
+          # public host blocks them.
+          - path: /api/agents
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+          - path: /api/internal
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
 ---
 # Keycloak SSO (browser must reach this for login flow). Skipped when using external OIDC.

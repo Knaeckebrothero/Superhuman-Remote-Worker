@@ -119,8 +119,17 @@ def _get_orchestrator_url() -> str:
 
 
 def _get_client() -> httpx.AsyncClient:
-    """Create an httpx client for orchestrator calls."""
-    return httpx.AsyncClient(timeout=30.0)
+    """Create an httpx client for orchestrator calls.
+
+    Attaches ``X-Internal-Key`` when ``MCP_INTERNAL_KEY`` is set so the
+    orchestrator's Track B (P4b) gates accept these agent-tool calls
+    (cancel/pause/resume/approve and POST /api/jobs for delegation).
+    """
+    headers: dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+    return httpx.AsyncClient(timeout=30.0, headers=headers)
 
 
 def _format_job_summary(job: Dict[str, Any]) -> str:
