@@ -22,7 +22,9 @@ import os
 import re
 from typing import Any
 
-CREDENTIAL_FILE_TYPES: frozenset[str] = frozenset({"kubeconfig", "ssh_key", "generic_file"})
+CREDENTIAL_FILE_TYPES: frozenset[str] = frozenset(
+    {"kubeconfig", "ssh_key", "generic_file"}
+)
 
 MAX_FILES_PER_DATASOURCE = 5
 MAX_FILE_BYTES = 64 * 1024  # 64 KB UTF-8
@@ -84,7 +86,9 @@ def _resolve_target_path(path: str) -> str:
 def _validate_target_path(path: str) -> str:
     """Return the resolved absolute path; raise if it points anywhere unsafe."""
     if not isinstance(path, str) or not path:
-        raise CredentialFileValidationError("target_path is required and must be a string")
+        raise CredentialFileValidationError(
+            "target_path is required and must be a string"
+        )
     resolved = _resolve_target_path(path)
 
     for blocked in BLOCKED_ROOTS:
@@ -161,7 +165,9 @@ def _normalize_one_file(
     mode_raw = entry.get("mode")
     mode = _validate_mode(mode_raw if mode_raw not in (None, "") else default_mode)
     env_raw = entry.get("env_var")
-    env_var = _validate_env_var(env_raw if env_raw not in (None, "") else default_env_var)
+    env_var = _validate_env_var(
+        env_raw if env_raw not in (None, "") else default_env_var
+    )
 
     out: dict[str, Any] = {
         "name": name,

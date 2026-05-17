@@ -279,9 +279,7 @@ def _merge_kubeconfigs(
             check=True,
         )
     except FileNotFoundError:
-        logger.warning(
-            "kubectl not installed; falling back to KUBECONFIG=<colon-list>"
-        )
+        logger.warning("kubectl not installed; falling back to KUBECONFIG=<colon-list>")
         return None
     except subprocess.CalledProcessError as e:
         logger.warning("kubectl config view failed: %s", e.stderr.strip())
@@ -356,7 +354,9 @@ def process_credential_files(
             target_path = entry.get("target_path") or ""
             absolute = _retarget(target_path, home_dir)
             if not absolute:
-                logger.warning("Skipping file entry with empty target_path on '%s'", ds_name)
+                logger.warning(
+                    "Skipping file entry with empty target_path on '%s'", ds_name
+                )
                 continue
             if os.path.exists(absolute):
                 logger.warning(
@@ -772,7 +772,9 @@ def inject_datasource_index(
                     f"Add a host block in `~/.ssh/config` to use it."
                 )
             else:  # generic_file
-                paths = ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"
+                paths = (
+                    ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"
+                )
                 lines.append(f"- **{name}** (file) — {paths}")
         lines.append("")
 
