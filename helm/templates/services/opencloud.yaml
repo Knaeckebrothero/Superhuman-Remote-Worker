@@ -190,6 +190,13 @@ spec:
             # on a different origin (auth.* vs cloud.*).
             - name: PROXY_CSP_CONFIG_FILE_OVERRIDE_LOCATION
               value: "/opt/opencloud-hooks/csp.yaml"
+            # TUS upload staging TTL. The decomposeds3 driver stages each
+            # upload on the local PVC; expired sessions don't auto-purge
+            # without the companion cleanup CronJob (see opencloud-cleanup.yaml).
+            # Short TTL bounds the worst-case staging working set when a sync
+            # client misbehaves. See docs/issues for the runaway-upload incident.
+            - name: STORAGE_USERS_UPLOAD_EXPIRATION
+              value: {{ .Values.opencloud.uploadExpiration | quote }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/opencloud
