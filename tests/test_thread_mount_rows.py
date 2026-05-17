@@ -251,3 +251,204 @@ async def test_project_ids_from_mounts_includes_project_default():
         {"mount_kind": "repo", "source_ref": "r-1"},
     ]
     assert _project_ids_from_mounts(rows) == ["p-default", "p-alpha"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3a — multi-project mount path collision handling
+# ---------------------------------------------------------------------------
+
+
+def _multi_project_db(projects: list[dict]) -> MagicMock:
+    """Build a fake postgres_db that resolves each project_id to a row."""
+    fake_db = MagicMock()
+    table = {p["id"]: p for p in projects}
+
+    async def get_project(pid: str):
+        return table.get(pid)
+
+    fake_db.get_project = AsyncMock(side_effect=get_project)
+    fake_db.get_project_members = AsyncMock(return_value=[_owner_member()])
+    fake_db.get_user = AsyncMock(return_value=_owner_user_record())
+    return fake_db
+
+
+def _router_for_backend(backend: MagicMock) -> MagicMock:
+    router = MagicMock()
+    router.for_project.return_value = backend
+    router.for_backend.return_value = backend
+    return router
+
+
+@pytest.mark.asyncio
+async def test_collision_two_same_named_projects_get_distinct_paths():
+    """Two non-default projects with the same name → first wins ``projects/alpha``,
+    second gets ``projects/alpha-2``. UNIQUE (thread_id, target_path) at
+    persistence time always holds.
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-1", name="Alpha"),
+            _project(project_id="p-2", name="Alpha"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-1", "p-2"])
+
+    assert len(rows) == 2
+    assert [r["target_path"] for r in rows] == [
+        "projects/alpha",
+        "projects/alpha-2",
+    ]
+    assert [r["source_ref"] for r in rows] == ["p-1", "p-2"]
+
+
+@pytest.mark.asyncio
+async def test_collision_case_insensitive():
+    """``_slugify_mount_name`` lowercases, so "Alpha" and "alpha" produce
+    the same slug. Collision logic must still dedup the second one.
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-1", name="Alpha"),
+            _project(project_id="p-2", name="alpha"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-1", "p-2"])
+
+    assert [r["target_path"] for r in rows] == [
+        "projects/alpha",
+        "projects/alpha-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_collision_three_same_named_projects():
+    """Three same-named → ``alpha``, ``alpha-2``, ``alpha-3``. The suffix
+    counter walks forward and doesn't reuse freed-up indices (none get
+    freed in this scenario anyway).
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-1", name="Alpha"),
+            _project(project_id="p-2", name="Alpha"),
+            _project(project_id="p-3", name="Alpha"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-1", "p-2", "p-3"])
+
+    assert [r["target_path"] for r in rows] == [
+        "projects/alpha",
+        "projects/alpha-2",
+        "projects/alpha-3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_collision_unique_names_unaffected():
+    """Sanity check: unique names don't acquire suffixes (regression guard
+    in case the suffix loop is ever rewritten with an off-by-one).
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-1", name="Alpha"),
+            _project(project_id="p-2", name="Beta"),
+            _project(project_id="p-3", name="Gamma"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-1", "p-2", "p-3"])
+
+    assert [r["target_path"] for r in rows] == [
+        "projects/alpha",
+        "projects/beta",
+        "projects/gamma",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dedupe_repeated_project_id():
+    """Same UUID twice in project_ids → one row, not two — and definitely
+    not a row at ``projects/alpha`` plus a phantom ``projects/alpha-2``
+    pointing at the same source_ref.
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-1", name="Alpha"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-1", "p-1", "p-1"])
+
+    assert len(rows) == 1
+    assert rows[0]["target_path"] == "projects/alpha"
+    assert rows[0]["source_ref"] == "p-1"
+
+
+@pytest.mark.asyncio
+async def test_collision_with_default_project_present():
+    """Default project at workspace root + two collision-named non-default
+    projects. The default's empty ``target_path`` doesn't share the
+    namespace with non-defaults (which live under ``projects/``), so the
+    suffix logic only fires between the non-defaults.
+    """
+    from main import _build_thread_mount_rows
+
+    fake_db = _multi_project_db(
+        [
+            _project(project_id="p-default", is_default=True, name="My Home"),
+            _project(project_id="p-1", name="Alpha"),
+            _project(project_id="p-2", name="Alpha"),
+        ]
+    )
+    backend = _backend()
+
+    with (
+        patch("main.postgres_db", fake_db),
+        patch("main.main_cloud_router", _router_for_backend(backend)),
+    ):
+        rows = await _build_thread_mount_rows(["p-default", "p-1", "p-2"])
+
+    assert len(rows) == 3
+    paths = [r["target_path"] for r in rows]
+    assert "" in paths  # default at root
+    assert "projects/alpha" in paths
+    assert "projects/alpha-2" in paths
+    # source_refs preserved in input order
+    assert [r["source_ref"] for r in rows] == ["p-default", "p-1", "p-2"]

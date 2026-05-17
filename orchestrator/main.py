@@ -10078,9 +10078,20 @@ async def _build_thread_mount_rows(
     a ``project`` row that mounts at ``projects/<slug>/``. Projects whose
     cloud transport can't be resolved are skipped — the mount-row entry is
     not partially filled, the caller observes a missing row.
+
+    Multi-project collisions (two attached projects whose slugified names
+    are identical, including case-insensitive matches since the slugifier
+    lowercases) are resolved by suffixing ``-2``, ``-3``, ... on the
+    target_path so the ``UNIQUE (thread_id, target_path)`` constraint at
+    persistence time always holds.
     """
     rows: list[dict[str, Any]] = []
+    used_paths: set[str] = set()
+    seen_project_ids: set[str] = set()
     for project_id in project_ids:
+        if project_id in seen_project_ids:
+            continue
+        seen_project_ids.add(project_id)
         project = await postgres_db.get_project(project_id)
         if not project:
             continue
@@ -10098,6 +10109,7 @@ async def _build_thread_mount_rows(
                 continue
             if default_row:
                 rows.append(default_row)
+                used_paths.add(default_row.get("target_path", ""))
             continue
         backend_id = project.get("main_cloud_backend")
         handle_str = project.get("main_cloud_folder_handle")
@@ -10116,7 +10128,13 @@ async def _build_thread_mount_rows(
                     project_id,
                     e,
                 )
-        target_path = f"projects/{_slugify_mount_name(project.get('name', ''))}"
+        base_path = f"projects/{_slugify_mount_name(project.get('name', ''))}"
+        target_path = base_path
+        suffix = 2
+        while target_path in used_paths:
+            target_path = f"{base_path}-{suffix}"
+            suffix += 1
+        used_paths.add(target_path)
         rows.append(
             {
                 "mount_kind": "project",
