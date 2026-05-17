@@ -56,6 +56,9 @@
       "active": "aktiv",
       "archived": "archiviert",
       "deleted": "gelöscht"
+    },
+    "error": {
+      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
     }
   },
   "sessions": {
@@ -122,7 +125,6 @@
     "colActions": "Aktionen",
     "filter": {
       "all": "Alle",
-      "mine": "Meine",
       "pending_review": "Prüfung",
       "reviewing": "In Prüfung",
       "waiting": "Wartend",
