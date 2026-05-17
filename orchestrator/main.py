@@ -7828,14 +7828,12 @@ async def get_job_audit(
 
 
 @app.get("/api/requests/{doc_id}")
-async def get_request(doc_id: str) -> dict[str, Any]:
+async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
     """Get a single LLM request by MongoDB document ID.
 
-    Args:
-        doc_id: MongoDB ObjectId as string (24 hex characters)
-
-    Returns:
-        Full LLM request document with messages and response
+    Gated by the caller's access to the request's underlying job — admins
+    pass; otherwise the embedded `job_id` is run through `require_job_access`.
+    Requests without a `job_id` (legacy) are admin-only.
     """
     if not mongodb.is_available:
         raise HTTPException(
@@ -7844,13 +7842,20 @@ async def get_request(doc_id: str) -> dict[str, Any]:
         )
 
     try:
-        request = await mongodb.get_request(doc_id)
-        if request is None:
+        llm_doc = await mongodb.get_request(doc_id)
+        if llm_doc is None:
+            # Auth before disclosing existence: any approved user may probe.
+            await require_approved_user(request, postgres_db)
             raise HTTPException(
                 status_code=404,
                 detail=f"Request '{doc_id}' not found",
             )
-        return request
+        job_id = llm_doc.get("job_id")
+        if job_id:
+            await require_job_access(request, postgres_db, str(job_id))
+        else:
+            await _require_admin(request)
+        return llm_doc
     except HTTPException:
         raise
     except Exception as e:
