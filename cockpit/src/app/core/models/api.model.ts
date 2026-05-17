@@ -74,8 +74,36 @@ export interface ExpertDetail extends Expert {
 
 /**
  * Supported datasource types.
+ *
+ * ``kubeconfig`` / ``ssh_key`` / ``generic_file`` are credential-file types whose
+ * ``credentials.files[]`` payload is materialized as files on the agent's
+ * filesystem at job start (see docs/features/credential_file_datasources.md).
  */
-export type DatasourceType = 'generic' | 'repository' | 'postgresql' | 'neo4j' | 'mongodb' | 'webdav';
+export type DatasourceType =
+  | 'generic'
+  | 'repository'
+  | 'postgresql'
+  | 'neo4j'
+  | 'mongodb'
+  | 'webdav'
+  | 'kubeconfig'
+  | 'ssh_key'
+  | 'generic_file';
+
+/**
+ * A single file entry inside ``credentials.files[]`` for credential-file types.
+ *
+ * The server applies type-specific defaults (target_path, mode, env_var) when
+ * the client omits them — the cockpit only needs to send ``contents`` for
+ * ``kubeconfig`` and ``ssh_key``. ``generic_file`` requires ``target_path``.
+ */
+export interface CredentialFileEntry {
+  name?: string;
+  contents: string;
+  target_path?: string;
+  mode?: string;
+  env_var?: string;
+}
 
 /**
  * Datasource configuration from the orchestrator.
