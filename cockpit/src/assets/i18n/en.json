@@ -972,7 +972,10 @@
       "postgresql": "PostgreSQL",
       "neo4j": "Neo4j",
       "mongodb": "MongoDB",
-      "webdav": "WebDAV"
+      "webdav": "WebDAV",
+      "kubeconfig": "Kubeconfig",
+      "ssh_key": "SSH Key",
+      "generic_file": "File"
     },
     "form": {
       "editTitle": "Edit Datasource",
@@ -982,12 +985,16 @@
       "typeLabel": "Type",
       "typeGroupCli": "CLI-based",
       "typeGroupManaged": "Managed",
+      "typeGroupCredentialFiles": "Credential files",
       "optGeneric": "Generic",
       "optRepository": "Repository",
       "optPostgresql": "PostgreSQL",
       "optNeo4j": "Neo4j",
       "optMongodb": "MongoDB",
       "optWebdav": "WebDAV",
+      "optKubeconfig": "Kubeconfig (kubectl)",
+      "optSshKey": "SSH Key",
+      "optGenericFile": "Generic file",
       "connectionUrlLabel": "Connection URL",
       "repoUrlLabel": "Repository URL",
       "optional": "(optional)",
@@ -1025,7 +1032,30 @@
       "cancel": "Cancel",
       "saving": "Saving...",
       "update": "Update",
-      "create": "Create"
+      "create": "Create",
+      "kubeconfigLabel": "Kubeconfig YAML",
+      "kubeconfigPlaceholder": "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n    cluster:\n      server: https://...",
+      "kubeconfigHint": "Cluster, user, and context names will be prefixed with the datasource slug at runtime so multiple kubeconfigs can be merged without collisions. Try `kubectl config get-contexts` inside the agent to see the merged view.",
+      "sshKeyContentLabel": "SSH Private Key",
+      "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+      "sshKeyHint": "The key is materialized at ~/.ssh/<slug> with mode 0600. Configure a host block in ~/.ssh/config inside the agent to use it for specific hosts.",
+      "uploadFile": "Upload file",
+      "trustNoticeTitle": "Agent-readable credential",
+      "trustNotice": "This file is materialized in the agent's filesystem and is readable by the agent process. Use a scoped, least-privilege credential — read-only kubeconfig, project-scoped deploy key — for jobs that don't need broader access.",
+      "credFilesLabel": "Files",
+      "credFilesAdd": "Add file",
+      "credFileNameLabel": "Name",
+      "credFileNamePlaceholder": "config.json",
+      "credFileTargetPathLabel": "Target path",
+      "credFileTargetPathPlaceholder": "~/.config/myapp/config.json",
+      "credFileContentsLabel": "Contents",
+      "credFileContentsPlaceholder": "File contents (text only, max 64 KB)",
+      "credFileModeLabel": "Mode",
+      "credFileModePlaceholder": "0600",
+      "credFileEnvVarLabel": "Env var",
+      "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
+      "credFileRemoveTooltip": "Remove file",
+      "credFileGenericHint": "Each file is written at the target path with the requested mode. If \"Env var\" is set, the agent's process gets that variable pointing at the absolute path. Paths must resolve under /home/srw, /tmp, /run, or /workspace."
     },
     "sshKeyDialog": {
       "title": "Add this SSH key to your repository",
@@ -1064,7 +1094,8 @@
       "deleteFailed": "Failed to delete datasource",
       "deleteError": "Error deleting datasource",
       "testFailed": "Request failed",
-      "testRequestFailed": "Test request failed"
+      "testRequestFailed": "Test request failed",
+      "fileTooLarge": "File exceeds 64 KB — credential files are capped at 64 KB."
     }
   },
   "inbox": {
