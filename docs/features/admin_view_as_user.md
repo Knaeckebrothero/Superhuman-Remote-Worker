@@ -19,9 +19,24 @@ related:
 
 > Admins currently see every user's jobs, projects, and datasources by default — including their own dogfooding output mixed in with other accounts' work. Add an opt-in **"View as: Me / Everyone"** toggle so admins default to a regular-user view (own resources + project memberships) and can flip to fleet-wide visibility when they actually need it.
 
-**Status:** Design locked (2026-05-18). Not yet implemented.
+**Status:** ✅ Shipped (PRs 1–3) and live-verified 2026-05-18. PR 4 (audit-log enrichment + remaining manual matrix walk-through) is the only slice still open.
 **Triggered by:** Post-P4b multi-tenancy review — `docs/multi_tenancy.md` "Where we are now (2026-05-17)" notes that admins are god-mode by default and the only constraint mechanism is a project-scoped MCP token. UX gap: admin doing their own work drowns in fleet rows.
 **Scope:** Cockpit list views (jobs / projects / datasources). Does **not** touch admin observability tools (agents, sudo queue, audit, LLM-request log, stats dashboards), which stay fleet-default.
+
+## Verification (2026-05-18, cluster `develop`)
+
+Live end-to-end on the deployed cluster after PRs 1–3 landed:
+
+| Check | Result |
+|---|---|
+| Sidebar toggle visible to admin | ✅ `[Admin · Viewing all]` button replaces the static `[ADMIN]` chip |
+| Toggle cycles `all` → `me` → `all` | ✅ Label / tooltip / `.is-narrowed` class all flip in sync |
+| Per-user `localStorage` persistence | ✅ Key `srw.viewMode.<userId>` |
+| Pill renders on `/jobs` in `me` mode | ✅ `● Viewing your data · Show all` next to title |
+| Pill auto-hides in `all` mode | ✅ |
+| "Show all" pill link → fleet view | ✅ |
+| **Backend actually narrows the response** | ✅ `GET /api/jobs?limit=500` returns **12** jobs with `X-Admin-View-As: user`, **42** without — sample IDs are disjoint |
+| Admin-only endpoints stay reachable while shadowed | ✅ `_require_admin` reads `real_is_admin`; `list_agents` returns the 66 agents in both modes |
 
 ## TL;DR
 
@@ -278,30 +293,31 @@ The pill is absent in `'all'` mode (no need to draw attention).
 
 ## Phased rollout
 
-### PR 1 — Backend dependency (~½ day)
-- Modify `require_approved_user` in `orchestrator/security/access.py` to recognize the header.
-- Add `require_admin` helper (or update existing one) to check `real_is_admin`.
-- Audit all existing `require_admin` / inline `is_admin` check sites; flip to the helper where appropriate.
-- Tests: `tests/test_view_as_user.py` covering (a) admin without header → admin-mode response, (b) admin with header → user-mode response, (c) non-admin with header → header ignored, (d) admin-only endpoint with header → still 200 (uses `real_is_admin`).
-- No frontend changes; header can be tested with curl.
+### ✅ PR 1 — Backend dependency (shipped 2026-05-18, commit `ddadad3c`)
+- `VIEW_AS_HEADER = "X-Admin-View-As"` added to `orchestrator/security/auth.py`; `require_approved_user` shadows admins to `is_admin=False, real_is_admin=True` when the header is `user`.
+- `_require_admin` in `main.py` switched from `is_admin` to `real_is_admin`.
+- Inline `is_admin` audit done: six visibility-style sites left as-is (list-jobs filter, create-project ownership forgery, VM gate, etc.) — under shadow they correctly narrow.
+- `tests/conftest.py:_make_user` updated so the 3-user fixture mirrors the new contract (`real_is_admin` alongside `is_admin`).
+- `tests/test_view_as_user.py`: 11 cases covering the design's coverage matrix (a–d) + edges (`user:<uuid>` reserved-no-op, mixed-case header, unapproved-bypass attempt, returned-dict-is-a-copy).
+- Smoke-tested live via MCP (`list_agents` 66 rows, `list_jobs` 5 rows) after deploy.
 
-### PR 2 — Frontend service + interceptor (~1 day)
-- New `ViewModeService` with signal + localStorage.
-- New `viewAsInterceptor` registered after auth interceptor.
-- Vitest unit tests for the service and the interceptor's request-header behavior.
-- No UI yet — feature is exercisable only via DevTools `localStorage.setItem`.
+### ✅ PR 2 — Frontend service + interceptor (shipped 2026-05-18, commit `13881289`)
+- `cockpit/src/app/core/services/view-mode.service.ts`: signal + per-user `localStorage.getItem('srw.viewMode.<userId>')`, `effect()` rehydrates when active user changes, `effectiveMode` computed for UI badges.
+- `cockpit/src/app/core/interceptors/view-as.interceptor.ts`: injects `X-Admin-View-As: user` for admin requests with `viewMode === 'me'`. Skips cross-origin, non-admin, and `'all'` mode requests. Registered AFTER `authInterceptor` in `app.config.ts`.
+- 11 service specs + 7 interceptor specs; full cockpit suite 291/291.
 
-### PR 3 — Toggle UI + per-page badges + i18n (~1 day)
-- Sidebar footer admin badge becomes a toggle button.
-- Pill badge on `job-list`, `project-list`, `datasource-list` pages in `'me'` mode.
-- Translation keys: `admin.viewMode.me`, `admin.viewMode.all`, `admin.viewMode.tooltip.me`, etc.
-- First-run toast (component already exists for similar nudges; reuse).
-- Mobile (`simple/`) shell: add toggle to profile sheet.
+### ✅ PR 3 — Toggle UI + per-page pill + i18n (shipped 2026-05-18, commit `d3c15ce6`)
+- `cockpit/src/app/shell/view-mode-toggle/`: standalone admin-only button in sidebar footer. Replaces the static `[ADMIN]` span. Label shifts between `Admin · Viewing all` and `Admin · Viewing my data`, gets `.is-narrowed` warn-toned style in `me` mode.
+- `cockpit/src/app/shell/view-mode-pill/`: per-page pill rendered next to `<h1>` on `/jobs`, `/projects`, `/datasources` only when admin AND `viewMode === 'me'`. "Show all" link flips back to `all`.
+- i18n: `admin.viewMode.{role,scopeAll,scopeMe,tooltip.*,pill.*}` in `en.json` + `de-DE.json` (parity check clean).
+- Skipped per locked decisions: first-run nudge (silent rollout), mobile/`simple/` shell parity (that shell doesn't exist yet).
 
-### PR 4 — Validation + audit (~½ day)
-- Manual run-through: log in as admin, toggle, navigate every list page, every deep link, every admin-only page. Confirm matrix above.
-- Confirm PAT path: send `X-Admin-View-As: user` with a PAT belonging to an admin user; verify list endpoints narrow.
-- Add `view_as_user` / `real_is_admin` to whatever request audit table is in use.
+### PR 4 — Validation + audit (~½ day, OPEN)
+- Sidebar + Jobs already verified live (see §"Verification" above). Still TODO:
+  - Click through Projects + Datasources list pages in both modes; confirm pill placement and that filtered lists narrow.
+  - Walk the admin-only pages (`/admin/llm`, `/admin/users`, Settings tabs) in `me` mode; confirm they all stay 200 (regression check on the `real_is_admin` flip).
+  - Send `X-Admin-View-As: user` with a PAT (curl) and verify list endpoints narrow — the cookie path is proven; PATs go through the same `require_approved_user`, but explicit confirmation is cheap.
+- Add `view_as_user: bool` + `real_is_admin: bool` to the audit table the orchestrator writes per-request (MongoDB `agent_audit` or whatever the BFF/api-token request log is using). One-line insert payload change.
 - No Helm default flip needed — default is `'all'` (locked).
 
 ## Future extensions (post-v1)
