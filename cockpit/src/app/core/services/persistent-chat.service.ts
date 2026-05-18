@@ -281,6 +281,14 @@ export class PersistentChatService {
      */
     async createAndConnect(body: Record<string, any>): Promise<string> {
         this.disconnect();
+        // Clear the conversation + threadId synchronously so the "Creating
+        // thread …" startup card isn't rendered on top of turns from the
+        // session the user just navigated away from. disconnect() intentionally
+        // keeps turns visible (the "Disconnect" button is a read-only state),
+        // so the create path has to do it explicitly. connect() will reset
+        // again with the real thread id once the POST resolves.
+        this.dispatch({type: 'reset', threadId: null});
+        this.threadId.set(null);
         this.isCreating.set(true);
         this.connectionState.set('connecting');
         this.startupPhase.set('creating');
