@@ -29,6 +29,7 @@ from langchain_core.messages import (
 )
 
 from .core.context import ContextManager
+from .llm.reasoning_chat import extract_reasoning_text_from_block
 from .services.image_content import extract_image_tags, make_multimodal_user_message
 
 logger = logging.getLogger(__name__)
@@ -551,6 +552,13 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "reasoning"
+                                ):
+                                    reasoning = extract_reasoning_text_from_block(block)
+                                    if reasoning:
+                                        await callbacks.on_thinking(reasoning)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -617,6 +625,13 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "reasoning"
+                                ):
+                                    reasoning = extract_reasoning_text_from_block(block)
+                                    if reasoning:
+                                        await callbacks.on_thinking(reasoning)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)
@@ -705,6 +720,13 @@ async def _execute_turn(
                                     thinking = block.get("thinking", "")
                                     if thinking:
                                         await callbacks.on_thinking(thinking)
+                                elif (
+                                    isinstance(block, dict)
+                                    and block.get("type") == "reasoning"
+                                ):
+                                    reasoning = extract_reasoning_text_from_block(block)
+                                    if reasoning:
+                                        await callbacks.on_thinking(reasoning)
                                 elif isinstance(block, str) and block:
                                     response_content += block
                                     await callbacks.on_token(block)

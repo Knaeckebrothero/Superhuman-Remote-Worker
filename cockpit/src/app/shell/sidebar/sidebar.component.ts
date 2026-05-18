@@ -79,6 +79,14 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
           </a>
           <a
             class="nav-link"
+            routerLink="/automations"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">schedule</app-icon>
+            {{ 'nav.automations' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/create"
             routerLinkActive="active"
           >

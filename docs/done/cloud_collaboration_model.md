@@ -31,10 +31,12 @@ related:
 
 > The agent's workspace is a synced mirror of the user's cloud surfaces — their default project mounts at the workspace root; other attached projects and repos mount under `projects/` and `repos/`. The cloud folder is canonical. Repositories run alongside as **temporary scaffolding** for diff viewing and recovery — not as the primary collaboration surface. Branches and PR-style review are valuable but ship as **v2+ opt-in extensions**, not the v1 foundation. The v1 product story is: "the AI sees what you see, edits where you edit, and any agent run can be diffed or rolled back."
 
-**Status:** In flight. Phases 1, 2, 2.1, 2.2 shipped + live-verified 2026-05-17. Phase 3+ pending.
+**Status:** ✅ Closed 2026-05-18. Phases 1, 2, 2.1, 2.2, 3, 4 shipped + verified (3b retired — covered by pre-existing `repository`-datasource flow).
 **Filed:** 2026-05-16
-**Last updated:** 2026-05-17
+**Last updated:** 2026-05-18
 **Depends on:** [[project_cloud_folders]] (current per-project + per-session folder lifecycle), [[main_cloud_abstraction]] (`MainCloudBackend` Protocol + OpenCloud default).
+
+> **Closure note (2026-05-18):** This doc covered the **session-side** cloud-mirror foundation. It shipped fully. Job-side cloud integration originally lived here as Phase 5 (staging clone) and Phase 6 (accept UI), but the framing changed: a much simpler "export job results to cloud" button is shipping instead, designed in `docs/features/job_cloud_export.md`. The bigger accept-UI / diff-view ambition is deferred to that doc as a follow-up. Phase 7 (per-turn snapshots + session timeline) and Phase 8 (orphan session-folder sweep) remain intentionally deferred — file separately if/when picked up.
 
 ## 1. Motivation
 
@@ -420,14 +422,48 @@ After Phase 2.1 fixed end-to-end file sync, Cockpit's session header was still m
 - Cockpit's cloud-folder button appears in the session header for default-project threads, and clicking it opens the user's Personal Space in a new tab.
 - Legacy non-default-project threads (still using the session-folder code path) continue to return the session-folder URL as before — no regression.
 
-### Phase 3 — Multi-surface mounting
+### Phase 3 — Multi-surface mounting — ✅ shipped + live-verified 2026-05-17
 
 A session can have multiple attached projects + repos. Default project (if attached) mounts at root; other projects under `projects/<name>/`; repos under `repos/<name>/`. Path-collision handling per §10.Q3.
 
-- **Deliverable:** a session with the default project + two other projects + a repo has all four mounted correctly and visible to the agent.
-- **Acceptance:** end-to-end test with four attachments; mount paths match the documented rule; agent can read/write each surface.
+Originally split into 3a (multi-project mount path collision fix) and 3b (repo mounts). 3a shipped today. **3b retired — repo attachment is already covered by the pre-existing `repository`-datasource flow** (see 3b section below). The doc earlier mis-framed repos as a future first-class `mount_kind`; the right framing is that they're first-class through a *different abstraction* (datasources), and that abstraction predates this design doc by enough to be invisible from inside it.
 
-### Phase 4 — Per-session cloud folder becomes fallback-only
+#### Phase 3a — Multi-project mount path collisions — ✅ shipped + live-verified 2026-05-17
+
+`_build_thread_mount_rows` was iterating multiple project_ids correctly but emitting `target_path = f"projects/{slug}"` with no collision handling — two attached projects whose names slugify identically (including case-insensitive, since the slugifier lowercases) would both get the same `target_path` and trip `UNIQUE (thread_id, target_path)` at `replace_thread_mounts` persistence time. Multi-project attachment was therefore a latent crash on a real but probably-rare input.
+
+- **Fix:** track a `used_paths: set[str]` across the row-building loop. On collision, suffix the candidate with `-2`, `-3`, ... until unique. Also dedupe input `project_ids` (same UUID appearing twice → one row, not a phantom suffix).
+- **Default project unaffected:** `project_default` rows mount at `target_path=''` (workspace root); the non-default `projects/*` namespace doesn't intersect, so the default row's empty path doesn't push non-defaults around.
+- **Modified:** `orchestrator/main.py:_build_thread_mount_rows` (+20/-1 LoC).
+- **New tests:** `tests/test_thread_mount_rows.py` — 6 cases (two same-named → `alpha`+`alpha-2`; case-insensitive Alpha/alpha → same; three same-named → `alpha`/`alpha-2`/`alpha-3`; unique names unaffected; repeated id dedup; default + two colliding non-defaults).
+- **Live verification on dev cluster:** exercised the deployed function (commit `4e038b7`, image `sha-4e038b7`) inside the orchestrator pod with synthetic project rows + mocked backend — all four expected behaviors confirmed (collision, case-insensitive, dedup, no-op for unique names). No real cluster data touched.
+
+#### Phase 3b — Retired: repo attachment already shipped via `repository` datasources
+
+This sub-phase as originally specified was fictional — it proposed building a new `mount_kind='repo'` row, a new `cloud_sync/gitea.py` transport, new attach-repo API endpoints, and a Cockpit repo picker. **All of that already exists, via the `repository`-type datasource abstraction.** The work shipped before this design doc was filed.
+
+**How it actually works:**
+
+- User-facing: Cockpit's session/job creation dialog has the datasource picker; user selects repos with `type='repository'`.
+- Datasources attach via the existing project_datasources / `link_datasource_to_project` plumbing.
+- Orchestrator delivers `repository` datasources in the agent's dispatch payload alongside other datasource types.
+- Agent-side auto-clone:
+  - `src/api/persistent_app.py:574-579` separates `type == "repository"` datasources from the rest at session start.
+  - `src/api/persistent_app.py:770-772` clones them via `GitManager.clone()` against the **remote workspace backend** (not the agent pod's local FS — relevant for cluster-mode workspaces).
+  - Per-repo clone logic: `src/core/datasource_setup.py:setup_repository_datasource` (line 308).
+  - Worker-job equivalent: `src/agent.py:_setup_repository_datasource` (line 2182).
+- Result: each attached repo at `repos/<slug>/` with `.git/` intact. **Real Git checkout** — agent runs branches, commits, pushes, opens PRs via existing shell tools. No new transport, no new mount type, no new orchestrator plumbing was needed.
+
+**Schema note:** Migration `0013_thread_mounts.sql` accepts `mount_kind='repo'` and `source_kind='repo'`, but no code path writes such rows today. These enum values are **reserved but currently dead** — kept in the schema for cheap future-namespace, not because anything reads them. Don't propose to populate them without first checking whether the datasource path already covers the new use case.
+
+**One genuinely-open question (deferred, not blocking Phase 3 done):** auto-fetch / auto-pull on attached repos at turn-start, so user-pushed commits upstream show up mid-session without the agent having to remember to `git fetch`. Today the agent pulls on demand. Could be added as opt-in if dogfood shows it matters. Not Phase 3b; not Phase 5; not even necessarily worth filing — log it as a TODO if a real user hits the pain.
+
+#### Phase 3 acceptance — closed ✅
+
+- **Deliverable:** a session with the default project + two other projects has both project surfaces mounted via `thread_mounts` rows at the documented paths (`projects/<name>/` with collision suffixing), plus any attached `repository` datasources auto-cloned into `repos/<slug>/`.
+- **Live verification on dev cluster (2026-05-17):** 3a's `_build_thread_mount_rows` collision logic verified inside the deployed pod with synthetic project rows. The repository-datasource flow has been in production for months and was the path the user used to clone repos through the whole Phase 1-4 dogfooding effort.
+
+### Phase 4 — Per-session cloud folder becomes fallback-only — ✅ shipped + live-verified 2026-05-17
 
 **Revised 2026-05-17.** Earlier framing said "deprecate session folders entirely" — that was wrong. The session folder remains a valid surface; it just shouldn't be created when the session already has a user-visible cloud surface via Phase 1/2/3 mounts. This phase formalizes the *fallback* policy and removes the unconditional eager creation.
 
@@ -459,36 +495,44 @@ The per-thread Gitea repo (`thread-<id>`) was previously paired with the session
 - **Deliverable:** new sessions skip the session folder when any mount exists; sessions with no mounts still get a fallback folder as today; existing session folders unchanged.
 - **Acceptance:** start a session attached to a project → no session folder created. Start a session with nothing attached → session folder created exactly like today.
 
-### Phase 5 — Job staging clone
+#### Shipped (implementation pass 2026-05-17, commit `7e6eb72`, image `sha-7e6eb72`)
 
-At job-start, clone attached cloud surfaces into a hidden per-user drafts area (per §10.Q2: e.g., `/Drafts/jobs/<id>/`). The job's workspace mounts the staging area, not the live project folders. Job writes go to staging.
+- **New helper:** `_should_skip_session_folder(mounts) -> bool` in `orchestrator/main.py`. Mount-kind agnostic — any row with a non-empty `webdav_url` short-circuits. Returns `False` on empty mounts or rows with failed transports, preserving the fallback semantics for unattached sessions and transient resolution failures.
+- **Two call-site rewires:**
+  - `_setup_main_cloud()` (create-time gate): previously hard-coded to `project_default + webdav_url`; now calls the helper. Threads attached to any non-default project now also skip the redundant session folder.
+  - `resume_thread`'s `needs_full_provision` calculation: also gated on the helper now. Closes a hole where a default-project thread that was ended and resumed grew a session folder on resume that it hadn't had at create-time. The `needs_share_only` branch is untouched — it only fires on existing folders, so it remains the recovery path for legacy folders that lost their share record.
+- **Tests:** 6 new cases in `tests/test_thread_mount_rows.py` covering each `mount_kind` × `webdav_url-present|absent` combo plus mixed-row short-circuit and empty-list fallback. Full suite: 174/174 pass.
+- **Live verification on dev cluster:**
+  - Predicate-level (2026-05-17): exercised the deployed helper inside the orchestrator pod with synthetic mount-row inputs — all 7 cases (including forward-compat `repo` rows) matched expected behavior. Both call sites confirmed wired via grep on `/app/main.py`.
+  - End-to-end (2026-05-18): user confirmed via Cockpit dogfood — a session attached to a non-default project receives the project's cloud folder mounted in the workspace and **no redundant `Sessions/<thread-id>/` folder is created in OpenCloud**. The fallback path still fires for unattached sessions (unchanged from pre-Phase-4 behavior).
 
-- **Deliverable:** a job runs without touching the live project folder.
-- **Acceptance:** start a job; while it runs, project folder is unchanged. Job completes; staging has the job's outputs.
+### Phase 5 — Job staging clone — superseded 2026-05-18
 
-### Phase 6 — Job accept UI + endpoint
+Original framing: clone attached cloud surfaces into a hidden per-user drafts area (`/Drafts/jobs/<id>/`) at job-start; job workspace mounts staging instead of live project folders.
 
-Cockpit's job-review tab gains a "Files Changed" view showing staged-vs-baseline diff. Accept → orchestrator applies the staged changes to project folders. Reject → discard staging. 30-day retention on un-acted-on staging clones (§10.Q5).
+**Superseded by a simpler approach:** a "export job results to cloud" button on the job review component (no live mounting, no per-turn sync — explicit user action puts job outputs into `<project>/job-<id>/` or the user's home Space for default-project jobs). Design lives in `docs/features/job_cloud_export.md`. The full staging-clone vision is preserved there as a deferred follow-up.
 
-New endpoint `POST /api/jobs/{id}/accept` (sibling to existing `/promote`, which retains its current "move to new project" verb).
+### Phase 6 — Job accept UI + endpoint — deferred 2026-05-18
 
-- **Deliverable:** end-to-end "review a job → click accept → files appear in project folder."
-- **Acceptance:** accept and reject both work. Per-file conflict UI (§10.Q4) handles cases where the project folder changed while the job ran.
+Diff view + `POST /api/jobs/{id}/accept` + per-file conflict UI. Deferred along with Phase 5 — listed in `docs/features/job_cloud_export.md` as the "v2" extension after the export button lands.
 
-### Phase 7 — Per-turn snapshots + session timeline
+### Phase 7 — Per-turn snapshots + session timeline — deferred (still relevant)
 
-The per-thread Gitea repo (`thread-<id>`) is repurposed here as a snapshot store. It commits workspace state after each sync-back. Cockpit's session UI gains a timeline showing what changed between turns. Rollback verb: "revert this session to turn N" restores files from snapshot into the cloud folders.
+Genuinely deferred — not retired, not superseded. The Gitea per-thread repo plumbing exists (`thread-<id>`); the missing pieces are the per-sync commit hook, the timeline UI, and the rollback verb.
 
+- **Plan:** per-thread Gitea repo commits workspace state after each sync-back. Cockpit's session UI gains a timeline showing what changed between turns. Rollback verb: "revert this session to turn N" restores files from snapshot into the cloud folders.
 - **Deliverable:** a session has a visible turn-by-turn history; user can roll back to any turn.
 - **Acceptance:** make an agent edit; roll back; verify the cloud folder reverted.
+- **Status:** no doc yet. File `docs/features/session_snapshots.md` when picked up.
 
-### Phase 8 — Cleanup
+### Phase 8 — Cleanup — deferred (small)
 
 **Scope narrowed 2026-05-17.** Since Phase 4 keeps the session folder as a fallback (rather than removing it), this phase no longer kills the code path — it just sweeps orphaned cloud folders that the old eager-creation policy left behind.
 
 - **One-time archive sweep:** identify session folders for closed threads that no longer have a live thread referencing them; offer to archive them into the user's drafts area (or leave them in place behind a "show archived sessions" filter). Decision deferred to when we actually run the sweep — it depends on how many orphans exist by then.
 - **No code-path removal:** `ensure_session_folder()` and the `nc_session_folder` columns stay. They remain the fallback for unattached sessions and the recovery path for transient mount-resolution failures (Phase 2 / Phase 4).
 - **Deliverable:** orphaned session folders from pre-Phase-1 eager creation are catalogued and dispositioned. The active code path is unchanged.
+- **Status:** small enough to be a scripted one-off; doesn't need its own design doc.
 
 ### Phase 9+ — V2 extensions (deferred)
 
@@ -505,35 +549,13 @@ Refocused on the foundation. The pre-rewrite questions about branch placement an
 
 **Recommendation:** turn-boundary for v1. Add intra-turn push only if user feedback shows it's painful.
 
-### Q2. Job staging clone location
+### Q2-Q5 — Migrated to job_cloud_export.md
 
-- **In-folder under `.srw/jobs/<id>/`:** visible to the user in their cloud listing, ugly.
-- **Per-user hidden drafts area (leaning):** `/Drafts/jobs/<id>/` or similar at the cloud root; not in any project folder. User can browse if they want, but it's not in the way.
-- **Cloud-side temporary space outside the user's view:** cleanest but requires admin-owned drives or similar; cross-cloud-backend uncertainty.
+Job-flavored questions (staging clone location, accept-time conflicts, per-job retention) moved to `docs/features/job_cloud_export.md` as pre-considered context for that doc's design.
 
-**Recommendation:** per-user hidden drafts area. Re-evaluate if a backend can't support it.
+### Q3. Mount path collisions — ✅ resolved by Phase 3a
 
-### Q3. Mount path collisions
-
-What if an attached project is named `repos`, or two attached projects share a name? Or a project shares a name with an attached repo?
-
-**Recommendation:** disambiguate at mount time (append a numeric suffix: `projects/foo/`, `projects/foo-2/`). Log the renaming so the agent's prompt context shows the actual mount paths. The agent never assumes; it reads its own workspace.
-
-### Q4. Job accept-time conflicts
-
-If a job ran while the user was editing the same file in the project folder, the staged version conflicts with the live version at accept time.
-
-- Show a per-file conflict indicator in the accept UI.
-- v1: offer "keep mine," "keep theirs," "view both side-by-side." Don't auto-merge.
-
-**Recommendation:** per-file three-state choice in the accept UI. Real merge tooling deferred.
-
-### Q5. Per-job staging clone retention
-
-- Default 30-day retention on staging clones that are neither accepted nor rejected; auto-archive after.
-- Open: where do archived clones go? Tag + delete the working copy? Keep indefinitely behind a "show archived jobs" filter?
-
-**Recommendation:** delete after 30 days; one configurable knob.
+Disambiguate at mount time with numeric suffixes (`projects/foo/`, `projects/foo-2/`). Implemented in `_build_thread_mount_rows`; case-insensitive (slugifier lowercases).
 
 ### Q6. Snapshot retention
 
