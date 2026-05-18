@@ -18,9 +18,102 @@ Focused, implementation-ready cut of the parent [Automations design](./automatio
 
 The parent doc remains the long-term reference; this doc is what gets built first.
 
-**Status:** Spec, ready to implement.
+**Status:** v0 backend + cockpit shipped 2026-05-18, live-verified on the experimental cluster (`superhuman-remote-worker.com`) the same day. One small UX race surfaced + fixed in tree, pending the next deploy. See [Implementation log](#implementation-log) and [Live verification](#live-verification-2026-05-18-superhuman-remote-workercom) below.
 
-**Estimated effort:** v0 ≈ 5–6 dev days. v0.5 ≈ 5–7 dev days on top.
+**Estimated effort:** v0 ≈ 5–6 dev days (came in at ~5 — the API Keys page line item was already done by the auth refactor PR 3). v0.5 ≈ 5–7 dev days on top.
+
+## Implementation log
+
+Landed in a single sweep on 2026-05-18 (after the auth refactor's `0010_auth_tokens_consolidation.sql` had made `auth_tokens` available). No per-PR split; everything below shipped together.
+
+### Backend
+
+| Concern | File(s) |
+|---|---|
+| Schema | `orchestrator/database/migrations/app/0015_create_automations.sql` — full cron + event-trigger columns, four indexes (cron-due partial, event-filter GIN partial, owner, project), CHECK constraints enforcing per-type required fields |
+| DB helpers | `orchestrator/database/postgres.py` — `create_automation`, `get_automation`, `list_automations`, `update_automation` (allowlist-validated kwargs), `delete_automation`, `list_automation_runs` (joins `jobs.context->>'automation_id'`), and dispatcher-side `fetch_next_due_cron_automation` / `advance_automation_after_fire` / `skip_automation_fire` / `auto_disable_automation` taking an explicit conn so they compose into one transaction |
+| Job materialization | `orchestrator/services/automations.py` — `create_job_from_automation(db, row, *, trigger_kind)`. Injects `autonomy` into `config_override` (jobs schema has no top-level autonomy column; dispatch reads it from `config_override.autonomy` at `main.py:933-935`). Stamps `context.automation_id`, `automation_name`, `automation_trigger` so the runs-view join works and the cockpit job-detail badge has the breadcrumb back |
+| Cron tick loop | `orchestrator/services/cron_dispatcher.py` — 60s tick (env-tunable via `AUTOMATIONS_TICK_SECONDS`). Per-row transaction: `SELECT … FOR UPDATE SKIP LOCKED` claim → croniter advance in row's `timezone` (zoneinfo, DST-aware) → fire (or skip if past `catchup_window_seconds`, or auto-disable if `fires_today_count >= max_fires_per_day`, or auto-disable if `croniter.is_valid(cron_expr)` now returns false on a stored row). Multi-replica safe by construction — concurrent ticks see disjoint subsets of due rows |
+| API surface | `orchestrator/routers/__init__.py` + `orchestrator/routers/automations.py` — **first `APIRouter` in the project**, starting the [main.py monolith refactor](../issues/orchestrator_main_py_monolith.md). 9 endpoints: CRUD + run-now + pause + resume + runs. Pattern: late `from main import postgres_db` inside each handler body to dodge circular import at module load time (same convention `orchestrator/auth/bff.py` set). ACL: caller-owned by default; project-scoped reads/writes via `require_project_member` (viewer for read, editor for create/update/delete). The `run-now` handler also late-imports `_trigger_dispatch` so the spawned job is picked up by auto-assign within a tick instead of waiting its 30s |
+| Wiring | `orchestrator/main.py` — `app.include_router(automations_router)` alongside `bff_router`/`graph_router`/`uploads_router`; `cron_dispatcher_loop(postgres_db, _shutdown_event, on_job_created=_trigger_dispatch)` mounted in the existing `asyncio.create_task` background lineup at `:3267`-ish, awaited on shutdown alongside the other sweepers |
+| Dep | `requirements.txt` + `orchestrator/requirements.txt` — `croniter>=2.0.0`. (The dep was already in `orchestrator/requirements.txt`; the top-level file got it added too per the codebase convention — `docker/Dockerfile.orchestrator` builds from `orchestrator/requirements.txt`, not the top-level one, so the orchestrator-side has to carry every orchestrator dep.) |
+
+### Cockpit
+
+| Concern | File(s) |
+|---|---|
+| HTTP service | `cockpit/src/app/core/services/automations.service.ts` — signal-based; `automations`/`isLoading` signals; full CRUD + run-now / pause / resume / runs; `loadMine()` and `loadByProject(id)` flavors |
+| Page | `cockpit/src/app/views/automations/automations-page.component.ts` (+ `.html` + `.scss`) — list + inline editor (sliding card pattern; list is replaced by editor when active). Preset chips: every day / every weekday / every Monday / first-of-month / every hour / custom. Time picker for non-custom presets; free-form input for custom. Timezone defaults to `Intl.DateTimeFormat().resolvedOptions().timeZone`. Advanced section (collapsed) for autonomy / priority / max_fires_per_day / catchup_window |
+| Cron preview | `cron-preview.component.ts` — uses `cronstrue` for humanization and `cron-parser` for the next-5-runs widget. Timezone disclaimer always shown. Invalid input renders `cron-preview--invalid` state with cronstrue's underlying error detail |
+| Escape-hatch | `escape-hatch-panel.component.ts` — three links: API documentation (`environment.apiUrl` → `/api/docs`), External API guide (GitHub blob URL to `docs/features/automations_api.md`), Create API key (`/settings/api-keys`). Always visible at bottom of the page |
+| Nav | `cockpit/src/app/app.routes.ts` — `/automations` route, `authGuard`. `cockpit/src/app/shell/sidebar/sidebar.component.ts` — "Automations" link with `schedule` icon, between Data Sources and Create |
+| Project cross-link | `cockpit/src/app/views/project-detail/project-detail.component.ts` — "Manage automations" ghost button in the overview tab's action row; navigates to `/automations?project=<id>`. The `/automations` page reads the query param and opens the editor pre-filled |
+| Deps | `cockpit/package.json` — `cron-parser ^4.9.0`, `cronstrue ^2.50.0` |
+| i18n | `cockpit/src/assets/i18n/{en,de-DE}.json` — 28 keys under `automations.*`, plus `nav.automations` and `projectDetail.overview.manageAutomations`. Parity check passes (1446 keys both sides) |
+
+### Tests
+
+| File | What it covers |
+|---|---|
+| `tests/test_cron_dispatcher.py` | 30 tests across DST-correctness (Europe/Berlin spring-forward + fall-back), cron/timezone validation, and the per-tick state machine paths (no-due → false, due → fires, catchup-window skip, max_fires_per_day auto-disable, yesterday's counter doesn't block, invalid stored cron auto-disables) |
+| `tests/test_automations_service.py` | 6 tests on the row→job translation: template fields map to `create_job` args, `context.automation_id`/`name`/`trigger` stamped, autonomy injected into `config_override`, template-level `config_override.autonomy` takes precedence over row-level default, trigger_kind propagates, project_id passes through |
+
+Full backend suite (5361 tests) re-ran clean after the changes (1 unrelated `test_database_phase1::test_connect_disconnect` skipped — env needs a live Postgres on `:5432`).
+
+### Docs
+
+- `docs/features/automations_api.md` — external integration guide linked from the escape-hatch panel. TL;DR + PAT setup + endpoint reference + n8n / Zapier / curl / Python recipes + rate-limit notes + roadmap callouts (outbound webhooks deferred, etc.)
+
+## Live verification (2026-05-18, `superhuman-remote-worker.com`)
+
+Playwright drive against the dev cluster using the owning user's cookie session. 11 of 12 probes passed end-to-end; the 12th surfaced a UX race that has since been fixed in tree (see next section).
+
+1. Sidebar **Automations** link with `schedule` icon, between Data Sources and Create — active state lights when on `/automations`. ✓
+2. Empty state renders `automations.list.empty` copy + escape-hatch panel below, all three links target the right URLs (`https://api.superhuman-remote-worker.com/api/docs`, GitHub blob URL for the API guide, `/settings/api-keys`). ✓
+3. "New automation" opens the editor inline; timezone defaults to the user's browser tz (Europe/Berlin in this case) via `Intl.DateTimeFormat`; expert dropdown populated with 7 entries from `/api/experts`. ✓
+4. Cron preview for `every day / 09:00 / Europe/Berlin` shows "At 09:00" + 5 future runs in local time + the timezone disclaimer. ✓
+5. Create → returned row persisted with `cron_expr: "0 9 * * *"`, `timezone: "Europe/Berlin"`, `next_run_at: "2026-05-19T07:00:00Z"` — **DST handling verified live**: 09:00 CEST = 07:00 UTC. ✓
+6. Run-now spawned job `6a002d2e-c364-4c60-9c32-b6d08a7c8b1a` with `status=processing` (auto-assign nudge worked — the `_trigger_dispatch` callback woke the dispatcher). The runs endpoint returned that job with `config_name=bughunter` and the prompt matching the template. ✓
+7. Pause → `enabled=false`, `next_run_at=null`, "Paused" badge visible on the row, "Next run" meta-item removed. ✓
+8. Resume → `enabled=true`, `next_run_at` recomputed via `compute_initial_next_run` and surfaced in the row. ✓
+9. Project list cross-link: "Manage automations" on a project's overview tab navigates to `/automations?project=<uuid>`. ✓
+10. Reverse cross-link: a project-scoped automation row renders an "Open project" link pointing back at the project detail page. ✓
+11. Backend validation: `POST /api/automations` with `cron_expr: "not a cron"` → 400 `Invalid cron expression: 'not a cron'`; with `timezone: "Europe/Atlantis"` → 400 `Unknown timezone: 'Europe/Atlantis'`. ✓
+12. UI cron preview validation: typing a bad expression in custom-cron mode renders the `cron-preview--invalid` state with the i18n'd error and cronstrue's underlying detail ("Expression contains invalid values: 'this'"). ✓
+
+Delete confirmed (204 + row gone) on cleanup; the test rows were removed before close.
+
+## Bug found + fixed: editor race on `?project=` cross-link
+
+**Symptom (probe 12 follow-up).** Opening `/automations?project=<uuid>` from a project's "Manage automations" button opened the editor with everything visually correct — Name field empty, Expert combobox showing "Bug Hunter" as the native default. Filling Name + Prompt + clicking Create surfaced the validation banner ("Name, expert, prompt, and a valid cron expression are required.") instead of saving the row. A direct `POST /api/automations` with the same body via `fetch` succeeded (201), proving the backend was fine.
+
+**Cause.** `ngOnInit` ran two unrelated subscriptions in parallel: one for `api.getExperts()` (async), and one for `route.queryParamMap.subscribe(...)` which called `openEditor(null, projectId)` synchronously the moment the page bound. The `openEditor` seed read `this.experts()[0]?.id ?? ''` — but `experts` was still `[]` at that point, so the editor signal got `expert: ''`. The DOM `<select>` then defaulted visually to its first option ("Bug Hunter") which masked the divergence. Save-time validation read the signal, saw `e.expert === ''`, and rejected.
+
+This affected any user with a slow `/api/experts` response opening the editor via the project cross-link — not just Playwright. Manually clicking "New automation" after the page settled was always fine because by then `experts` had loaded.
+
+**Fix** in `cockpit/src/app/views/automations/automations-page.component.ts` (build clean; pending the next deploy):
+
+```ts
+this.api.getExperts().subscribe({
+  next: (list) => {
+    this.experts.set(list);
+    const pending = this.route.snapshot.queryParamMap.get('project');
+    if (pending && !this.editor()) {
+      this.openEditor(null, pending);
+    }
+  },
+  error: () => this.experts.set([]),
+});
+```
+
+Two changes from the original: (a) the queryParam-driven `openEditor` moves inside the `next` callback so it can't fire before experts are ready; (b) reads from `route.snapshot.queryParamMap` instead of subscribing — we don't need to react to later URL changes, only the initial one. The `!this.editor()` guard keeps the same idempotency the subscription gave.
+
+## Open follow-ups (not blockers)
+
+- **Project-scoped list view.** `/automations?project=<id>` opens the editor with the project pre-filled, but after save it returns to `loadMine()` which doesn't filter by project. The just-created automation still appears (caller owns it) but the page header / context doesn't say "you're looking at Project X's automations." Acceptable for v0; revisit if users complain.
+- **Notification on auto-disable.** The dispatcher logs a WARNING when `max_fires_per_day` or invalid-cron triggers auto-disable, but no user-facing notification is sent. The disabled row state is the only signal the user sees today. Wire `services.notification_service` once the v0.5 work touches the dispatcher.
+- **Cockpit unit test coverage for the editor.** I shipped 36 backend tests but no vitest coverage for the new components. The existing 291-test cockpit suite still passes; new tests should land before any structural changes to the editor.
+- **`/api/automations/{id}/preview`** endpoint (deferred to v0.5 per the original spec). Today the cockpit computes the next-5-runs client-side via `cron-parser` — fine for cron, but an event-trigger preview needs server-side state.
 
 ## Why a Phased Cut
 
