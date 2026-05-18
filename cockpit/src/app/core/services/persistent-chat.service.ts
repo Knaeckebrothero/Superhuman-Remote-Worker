@@ -374,11 +374,20 @@ export class PersistentChatService {
 
         this.sse.onopen = () => {
             this.zone.run(() => {
+                const wasReconnecting = this.connectionState() !== 'connected';
                 this.connectionState.set('connected');
                 this.error.set(null);
                 this.reconnectAttempt.set(0);
                 this.reconnectGaveUp.set(false);
                 this._startSseWatchdog(threadId);
+                // On a reconnect (not the initial open), refetch thread meta
+                // so any title.updated / status frame that crossed the wire
+                // while we were disconnected is reconciled. Without this the
+                // header can stay stuck on "Untitled Session" after a backend
+                // loop_crash even though the title was generated and persisted.
+                if (wasReconnecting && this.threadId() === threadId) {
+                    void this.loadThreadMeta(threadId);
+                }
             });
         };
 
