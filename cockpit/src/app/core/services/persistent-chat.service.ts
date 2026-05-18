@@ -17,6 +17,7 @@ import {
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {reduce, ReducerAction} from './turn-reducer';
+import {AppToastService} from '../../ui/toast';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -119,6 +120,7 @@ export class PersistentChatService {
     private readonly api = inject(ApiService);
     private readonly cache = inject(IndexedDbService);
     private readonly zone = inject(NgZone);
+    private readonly toast = inject(AppToastService);
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
@@ -1164,6 +1166,16 @@ export class PersistentChatService {
                     `Restored ${(params['paths'] as string[])?.length || 0} file(s) to pre-edit state.`,
                 );
                 break;
+
+            case 'workspace_sync.error': {
+                const op = (params['op'] as string) || 'sync';
+                const turn = params['turn_id'] as number | undefined;
+                const turnLabel = turn != null ? ` on turn ${turn}` : '';
+                this.toast.warning(
+                    `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet in OpenCloud. Will retry on next turn.`,
+                );
+                break;
+            }
 
             case 'error':
                 this.error.set(this.sanitizeError(params['message'] as string));
