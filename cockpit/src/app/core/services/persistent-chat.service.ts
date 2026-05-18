@@ -1253,6 +1253,15 @@ export class PersistentChatService {
         if (this.sessionReady()) return;
         this.sessionReady.set(true);
 
+        // Clear any transient error left over from the WS reconnect storm
+        // during session attach: when the orchestrator polls /ready faster
+        // than the agent finishes attaching its session, the agent rejects
+        // each WS with an "Agent not ready" frame (persistent_app.py:1489)
+        // until attach completes. Those errors are stale the moment we get
+        // session.state — keep them on screen and the user sees a red
+        // banner contradicting a healthy session.
+        this.error.set(null);
+
         const pending = this.pendingMessage();
         if (pending) {
             this.pendingMessage.set(null);
