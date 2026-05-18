@@ -11,6 +11,7 @@ import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {ViewModePillComponent} from '../../shell/view-mode-pill/view-mode-pill.component';
 
 type StatusFilter = 'all' | JobStatus;
 
@@ -35,12 +36,14 @@ interface JobRow {
     AppChipComponent,
     AppInputComponent,
     AppSpinnerComponent,
+    ViewModePillComponent,
   ],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
         <span class="title">{{ 'jobs.title' | transloco }}</span>
+        <app-view-mode-pill />
         <div class="filter-chips">
           @for (filter of statusFilters; track filter.value) {
             <app-chip
