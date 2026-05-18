@@ -970,23 +970,53 @@ describe('PersistentChatService — control WS frame filtering', () => {
         expect(service.startupPhase()).toBe('connecting');
     });
 
-    it('drops non-status frames on the control WS to avoid double-dispatch with SSE', async () => {
+    it('drops _seq-stamped frames on the control WS to avoid double-dispatch with SSE', async () => {
         const {service, wsInstances} = await readySession();
         const turnsBefore = service.turns().length;
 
-        // turn.started would create a streaming turn if dispatched.
-        fireWsFrame(wsInstances[0], {method: 'turn.started', params: {turn_id: 99}});
+        // Broadcast events carry params._seq = [epoch, seq] from the agent's
+        // _broadcast() — SSE will redeliver them, so the WS copy is discarded.
+        fireWsFrame(wsInstances[0], {
+            method: 'turn.started',
+            params: {turn_id: 99, _seq: [0, 12]},
+        });
         expect(service.currentStreamingTurn()).toBeNull();
 
-        // token would attach text to the streaming turn if dispatched.
-        fireWsFrame(wsInstances[0], {method: 'token', params: {content: 'should-be-dropped'}});
+        fireWsFrame(wsInstances[0], {
+            method: 'token',
+            params: {content: 'should-be-dropped', _seq: [0, 13]},
+        });
         expect(service.currentStreamingTurn()).toBeNull();
 
-        // ready would flip sessionReady if dispatched — leave that to SSE.
-        fireWsFrame(wsInstances[0], {method: 'ready', params: {}});
+        fireWsFrame(wsInstances[0], {method: 'ready', params: {_seq: [0, 14]}});
         expect(service.sessionReady()).toBe(false);
 
         expect(service.turns().length).toBe(turnsBefore);
+    });
+
+    it('processes session.state from the control WS (WS-direct, no _seq)', async () => {
+        // Regression: reconnect to an idle session whose cached SSE cursor sits
+        // past the most recent `ready` event. The agent's session.state welcome
+        // frame is the only thing that arrives over the WS, and it must flip
+        // sessionReady so the UI clears the "Establishing connection" card.
+        const {service, wsInstances} = await readySession();
+        expect(service.sessionReady()).toBe(false);
+
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {
+                thread_id: 'thread-status',
+                permission_mode: 'manual',
+                narration_mode: 'verbose',
+                turn_count: 1,
+                model: 'claude-opus-4-7',
+                temperature: 0.5,
+            },
+        });
+
+        expect(service.sessionReady()).toBe(true);
+        expect(service.permissionMode()).toBe('manual');
+        expect(service.modelName()).toBe('claude-opus-4-7');
     });
 
     it('silently ignores malformed WS frames', async () => {
