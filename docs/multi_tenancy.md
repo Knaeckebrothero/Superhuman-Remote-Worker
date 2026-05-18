@@ -1,30 +1,26 @@
-# Multi-User Isolation (and Future Multi-Tenancy)
+# Multi-User Isolation, SaaS Readiness, and Multi-Tenancy
 
-**Status:** **Phase 1 (Track A) fully done 2026-05-16. P4 follow-up + Track B (P4b) fully done + live-verified 2026-05-17.** Inventory now **0 unscoped** (was 55). All 6 P4 bundles shipped; all 21 P4b agent-internal endpoints now have either `require_internal` (16 pure) or `require_internal_or_job_access` (5 dual-callable). Agent's HTTP clients send `X-Internal-Key` from the `MCP_INTERNAL_KEY` secret. Layer 1 (edge-layer path-strip) is **per-deployment** — opt-in Helm toggle for Traefik-edge users, configured at the tunnel for tunnel-edge users (cloudflared in our cluster). Earlier P1 live-verified on `sha-74709d8`; G1-G5 on `sha-811a8e9`; P4b Layer 2 verified live on `sha-464ad18`; Layer 1 verified live via cloudflared edge after the topology audit found that Cloudflare Tunnel bypasses Traefik on this cluster.
+**Status:** M1.A (API data isolation) is shipped end-to-end as of 2026-05-18 — Track A, P4 follow-up, P4b/Track B, and the admin "view as user" toggle (PRs 1–3) are all live with **0 unscoped endpoints** (was 55). What's left for **M1 (SaaS readiness)** is operational hygiene (~1 day), cloud storage per-user OAuth (~1–2 weeks, the actual hosted-product blocker), abuse-prevention primitives (rate limiting / pod quotas / workspace egress), and user account lifecycle (self-deletion + data export). **M2 (Organizations / multi-tenancy)** is deferred until M1 is solid and there's real demand.
 
-**Unscoped-endpoint backlog (surfaced by C2 — fully closed):** the new lint catalogued 55 endpoints with no detectable gate. All 6 bundles shipped 2026-05-17: ~~P4a annotations (4)~~ ✓, ~~P4b Track-B agent ↔ orchestrator boundary (21 endpoints, two-layer defense: app-layer `X-Internal-Key` + Traefik ingress strip)~~ ✓, ~~P4c job mutation gates (14 of 22, 8 reclassified to P4b)~~ ✓, ~~P4d admin-only infra (8)~~ ✓, ~~P4e expert/misc reads (5, incl. per-user filter on `/api/actions/pending`)~~ ✓, ~~P4f VM lifecycle (3)~~ ✓. **Inventory now 0 unscoped (was 55)**. Snapshot test still enforces "no new unscoped" going forward.
-**German context:** "Mandantenfähigkeit" — but Phase 1 covers per-user isolation in a single-tenant deployment, which is a prerequisite for it.
-**Related:** `docs/features/auth_bff_and_api_tokens.md` (auth foundation this builds on)
+**German context:** "Mandantenfähigkeit" = **M2**. M1 ("multi-user isolation") is the prerequisite.
+**Related:** [`docs/features/auth_bff_and_api_tokens.md`](features/auth_bff_and_api_tokens.md) (auth foundation), [`docs/features/admin_view_as_user.md`](features/admin_view_as_user.md) (admin UX, shipped 2026-05-18).
 
 ---
 
 ## TL;DR
 
-The orchestrator authenticates users correctly but does not consistently authorize them. The deep audit found three categories of issues:
+Two milestones, in order:
 
-1. **Data isolation gaps in the API (Track A).** ~25 leaking endpoints across REST, SSE, WebSocket, and MCP. The schema already carries everything we need (`jobs.user_id`, `jobs.project_id`, `project_members` with roles); application code just doesn't consult it.
-2. **Agent ↔ orchestrator infrastructure boundary (Track B).** Zero authentication between agents and the orchestrator: open agent registration, heartbeat spoofing, and credentials (API keys, datasource passwords, SSH details) shipped in plain JSON at job dispatch. The system assumes the cluster network is trusted — fine for a single-org self-host, but not for any subscription model.
-3. **Five P0 findings that warrant hotfixes ahead of the rest of Phase 1.** (a) `/api/ide/{job_id}/proxy/{path}` is an unauthenticated WebSocket+HTTP giving full IDE access (shell, file r/w, code exec) on any guessed UUID; (b) `DELETE /api/users/{id}` only requires "authenticated" so any approved user can delete any user including admins; (c) project-member mutation endpoints have zero auth, so anyone can make themselves owner of any project (foundational privilege escalation); (d) `POST /api/sudo/requests/{id}/{approve,deny,approve-upgrade,resume-without-vm}` has no caller check, so any authenticated user can approve any privileged shell command; (e) `POST /api/projects`, `PATCH /api/projects/{id}`, `DELETE /api/projects/{id}`, and `POST /api/users` all had zero or weak auth — discovered during H1-H4 verification, same vulnerability class. ~2d to fix all five.
+- **M1 — SaaS readiness.** Goal: deploy on AWS, open signups to strangers, and *no user data leaks to another user* — even under abuse. Includes data isolation (API + cloud storage), abuse prevention (rate limiting / pod quotas / egress controls), and user account lifecycle (self-deletion + data export). API isolation is fully shipped; the rest is the work this doc tracks.
+- **M2 — Organizations (multi-tenancy).** Goal: multiple organizations (teams of users) share a single deployment, fully isolated from each other — including from other tenants' admins. Deliberately deferred. Adding it stays cheap because M1.A centralized visibility in `orchestrator/security/access.py`.
 
-**Phase 1 (Track A)** closes the data isolation gap: every API call returns only what the caller can see, where "can see" means *I own the resource* OR *I'm a member of a project that owns it* OR *I'm an admin*. **Track B** is a separate workstream that needs its own design — it can be deferred for the current single-org self-hosted use case, but blocks any hosted/multi-tenant deployment.
+This doc previously framed the work as "Phase 1 (per-user) → Phase 2 (multi-tenant)". The rename to M1/M2 reflects the destination ("SaaS-ready") rather than the substrate, and surfaces operational items (rate limiting, pod quotas, egress) that the old framing parked in "out of scope".
 
-**Phase 2** introduces organizations above projects. Phase 1's primitives are deliberately org-shaped so Phase 2 is additive.
-
-The full work is organized below as a severity-ordered roadmap (P0 → P1 → P2 → P3, plus Track B and Phase 2). ~10.5 engineering days total for Track A.
+The historical Phase-1 audit and per-bundle implementation log are preserved under [Historical context](#historical-context) — every line of Track A still applies and is shipped. **No work is being re-scoped; only re-labelled.**
 
 ---
 
-## Where we are now (2026-05-17)
+## Where we are now (2026-05-18)
 
 **API auth surface: fully closed.** Every HTTP endpoint (232 total) and every WebSocket endpoint (2 total) has an explicit gate. The endpoint inventory at `docs/security/endpoint_inventory.txt` reports **0 unscoped** (down from 55 at the C2 baseline). The snapshot test (`tests/test_endpoint_inventory.py`) enforces this going forward — no new endpoint can ship without a gate.
 
@@ -41,37 +37,180 @@ The full work is organized below as a severity-ordered roadmap (P0 → P1 → P2
 | Agent ↔ orchestrator (Track B) | `X-Internal-Key` shared secret (Layer 2) + opt-in edge path strip (Layer 1) | P4b |
 | Datasource credentials | Always redacted on REST (F3) | `redact_datasource[s]` helpers |
 | Job/project/thread/source/citation/sudo/stats/admin reads | Per-user OR project-member OR admin visibility | P2 G1-G5 |
+| Admin "view as user" toggle | `X-Admin-View-As: user` shadow header in `require_approved_user`; cockpit toggle + per-page pill | [Admin view-as design](features/admin_view_as_user.md) — PRs 1–3 shipped 2026-05-18 |
 
 **Sharing model:** Project membership is the share unit. `project_members(project_id, user_id, role)` with `viewer/editor/owner` roles. Adding user B to project A (via `POST /api/projects/{id}/members`, owner-gated) gives them visibility into every job, file, datasource, knowledge note, and citation in that project. **No per-resource or public-link sharing today** — those would be product features, not auth gaps.
 
-**What still leaks (cross-cutting infrastructure, not the API):**
+**What still leaks (M1 work remaining — cross-cutting infrastructure the API gates can't reach):**
 
-| # | Gap | Severity | Lives in |
+| # | Gap | Severity | M1 slice | Lives in |
+|---|---|---|---|---|
+| 1 | **Cloud storage uses one shared service account** (OpenCloud/Nextcloud). A path-scoping bug → user A reads user B's files. | **High** (hosted-product blocker) | M1.C | `src/services/cloud_sync/`, OpenCloud admin token in `srw` secret |
+| 2 | **Chromium profile is per-agent, not per-job** (`/tmp/agent-chromium-cdp-profile`). Cookies/sessions persist across jobs on the same agent pod. | Medium | M1.B #2 | `src/tools/research/browser.py:101` |
+| 3 | **MongoDB has no retention/TTL** on `llm_requests` + `agent_audit`. Stale prompts/responses hoarded indefinitely. | Low | M1.B #3 | MongoDB indices |
+| 4 | **Keycloak self-registration broken** — `VERIFY_EMAIL` fires with no SMTP, and `default-roles-srw` doesn't carry the `user` role. Strangers can't sign up; also blocks live E2E cross-user verification. | **High** (onboarding broken) | M1.B #1 | Keycloak realm config |
+| 5 | **No audit log of cross-user 403 attempts.** 1000 probe attempts → 1000 silent 403s, no detection signal. | Medium | M1.B #4 | new — centralize in `access.py` |
+| 6 | **No per-user API rate limiting.** UUID enumeration / endpoint hammering / LLM-cost runaway are unprevented. | Medium (high for SaaS) | M1.D #1 | new — FastAPI middleware |
+| 7 | **No per-agent K8s `ResourceQuota` / `LimitRange`.** One user can OOM the cluster or saturate CPU. | Medium (high for SaaS) | M1.D #2 | new — Helm chart |
+| 8 | **Unrestricted workspace egress.** Agent pods can crypto-mine / port-scan / spam from your AWS IPs. | Medium (high for SaaS) | M1.D #3 | new — NetworkPolicy |
+| 9 | **No user self-deletion + data export.** GDPR-shaped, plus support workflows. | Low (table-stakes for SaaS) | M1.E | new — REST endpoints + cascade |
+| 10 | **View-as PR 4** — audit-log enrichment (`view_as_user` + `real_is_admin` on per-request audit row); remaining matrix walk. | Low | M1.B #5 | [view-as PR 4](features/admin_view_as_user.md#pr-4--validation--audit-d-open) |
+
+Items 1–5 are listed in [Historical context §Phase 2 sketch](#phase-2-sketch-historical) for traceability; this is the M1-shaped re-roll-up. See [Milestone 1](#milestone-1--saas-readiness) below for the prioritized plan.
+
+---
+
+## Why milestones, not phases
+
+The original framing was "Phase 1 (per-user isolation) → Phase 2 (multi-tenant)". That's still accurate but the gravity changed:
+
+- Solving Phase 1 was always a prerequisite for any hosted/subscription model — but the operational pieces (cloud storage isolation, abuse prevention, account lifecycle) needed parity work, and the old framing parked them as "out of scope" or "Phase 2".
+- Reframing the destination as "SaaS readiness" forces us to think about **strangers** as users, not colleagues. That mindset turns up rate limiting, pod quotas, workspace egress, and user self-deletion — none of which mattered for "single org, all users vetted".
+- Keeping the org wrapper as M2 (instead of folding it into "everything for hosted") prevents scope drift while we ship M1's deltas.
+
+We are not re-scoping. Every line of Track A still applies and is shipped; the historical Phase 1 plan is preserved verbatim in [Historical context](#historical-context) so the implementation log stays intact.
+
+---
+
+## Milestone 1 — SaaS readiness
+
+**Goal.** Deploy on AWS, open signups to individual subscribers, and accept that some of them will probe, abuse, or accidentally hammer the system. **No cross-user data leak. No "one user takes the cluster down". No GDPR-shaped landmines.**
+
+**Explicitly out of M1:** payments, billing, ToS, AUP, cookie banners, privacy policy text, marketing, support workflows. M1 is just the data-isolation + abuse-prevention layer beneath any product on top.
+
+**Readiness gate:** every item below either ✅ shipped or explicitly traced to a deferred ticket. Until then, do not open signups beyond invited beta users.
+
+### M1.A — API data isolation (✅ shipped)
+
+Every REST / WebSocket / SSE endpoint and every MCP tool gates on **per-user OR project-member OR admin**. Sharing primitive is `project_members(project_id, user_id, role)` with `viewer/editor/owner`. The endpoint inventory snapshot test (`tests/test_endpoint_inventory.py`) prevents regression.
+
+- **Track A** (data isolation, ~10.9d): all H1–H5, F1–F7, G1–G5, C1–C2 bundles shipped 2026-05-16 with 293 unit tests + live verification. Details in [Historical context §Track A](#track-a--data-isolation-roadmap-historical).
+- **P4 follow-up** (unscoped-endpoint backlog, ~3d): 6 bundles shipped 2026-05-17. Inventory: 55 → 0 unscoped.
+- **Track B / P4b** (agent ↔ orchestrator boundary): shared-secret `X-Internal-Key` (Layer 2, always on, in chart) + optional edge-layer path block (Layer 1, opt-in per deployment). Shipped + live-verified 2026-05-17.
+- **Admin view-as toggle** ([design](features/admin_view_as_user.md)): admins default to fleet-wide view but can flip to "view as me" to dogfood the regular-user UX (and to operate as a regular user when they're working on their own stuff). PRs 1–3 shipped + live-verified 2026-05-18 (12 jobs in `me` mode vs 42 in `all` mode on disjoint IDs).
+
+This entire layer is the "**no path-scoping bug in API code can leak user A's data to user B**" guarantee. The remaining M1 work is everything the API gates *cannot* reach.
+
+### M1.B — Cross-job infrastructure hygiene (quick wins, ~1 day total)
+
+Five operational items, each independently shippable. Together they're a single short sprint.
+
+| # | Item | Risk it closes | Effort | Status |
+|---|---|---|---|---|
+| 1 | **Keycloak self-registration fix** — wire SMTP for `VERIFY_EMAIL` (or skip-verify for dev); add the realm-level `user` role to `default-roles-srw` | Strangers literally can't sign up today; also blocks live E2E cross-user verification of the entire M1.A surface | ~2h | Open ([memory](../.claude/projects/-home-ghost-Repositories-Superhuman-Remote-Worker/memory/project_keycloak_self_registration_broken.md)) |
+| 2 | **Chromium profile per-job** — `/tmp/agent-chromium-cdp-profile` → `…-{job_id}` + teardown hook (`src/tools/research/browser.py:101`) | Cookies / logged-in sessions from job A persist into job B on the same agent pod | ~2h | Open |
+| 3 | **MongoDB TTL** on `llm_requests` + `agent_audit` (pick window: 90d? 1y?) | Prompts/responses hoarded indefinitely; privacy posture; GDPR retention story | ~1h | Open |
+| 4 | **Cross-user 403 audit log** — emit a structured event when any `security/access.py` helper raises 403 | Today 1000 probe attempts → 1000 silent 403s; no detection signal | ~3h | Open |
+| 5 | **View-as PR 4** — `view_as_user: bool` + `real_is_admin: bool` on the per-request audit row; remaining matrix walk-through across non-Jobs list pages | Investigators can't tell whether an admin action ran in fleet mode or shadow mode | ~½d | Open |
+
+**Recommended landing order:** **#1 first** (smallest fix, biggest test-unblock — every subsequent M1 item benefits from being able to provision a real second user), then #2 / #3 / #4 / #5 in any order.
+
+### M1.C — Cloud storage per-user OAuth (~1–2 weeks)
+
+**The actual hosted-product blocker.** `src/services/cloud_sync/` authenticates to OpenCloud (and BYO Nextcloud) as a single shared admin service account; every user's files live under that one identity, namespaced by path. A path-scoping bug → user A reads user B's files. This is the only remaining place in the system where a single bug in our code = cross-user file exposure.
+
+**Fix:** per-user OAuth.
+
+- Each cockpit login also mints an OpenCloud OAuth token (OpenCloud already supports OIDC against our Keycloak).
+- The orchestrator stores the user's refresh token in the consolidated `auth_tokens` table (or an `oauth_tokens` adjunct).
+- All cloud-storage reads use *that user's* token. The shared admin token is retained only for orchestrator-internal operations (provisioning a new user's home folder, etc.) and is never used to serve user-facing reads.
+- Refresh-token rotation handled at the BFF layer in the same shape as the Keycloak refresh.
+
+**Touches:** `src/services/cloud_sync/*`, OpenCloud OIDC config, `auth_tokens` schema, `auth/bff.py` (token persistence on login), cockpit (no UI change expected). Detailed design pending — flag this as the next big initiative after M1.B.
+
+**Do not open signups to strangers until this is done.** Every "fetch user file" call is otherwise one bug away from cross-tenant exposure.
+
+### M1.D — Abuse prevention (design pending, ~6–9d total)
+
+The previous "Out of scope (Phase 1)" line listed rate limiting as "not now". For strangers on AWS it's table stakes.
+
+| # | Item | What it prevents | Rough effort |
 |---|---|---|---|
-| 1 | **Cloud storage uses one shared service account** (OpenCloud/Nextcloud). The orchestrator authenticates as a single user for everyone — a path-scoping bug could expose user A's files via user B's session. | **High** (largest hosted-product blocker) | `src/services/cloud_sync/`, OpenCloud admin token in `srw` secret |
-| 2 | **Chromium profile is per-agent, not per-job** (`/tmp/agent-chromium-cdp-profile` in `src/tools/research/browser.py:101`). Logged-in cookies/sessions from job A persist into job B if both land on the same agent pod. | Medium | Browser tool config |
-| 3 | **MongoDB has no retention/TTL** on `llm_requests` and `agent_audit`. Not a leak today (REST gates filter on read), but stale data hoarding is a privacy risk one bug away from exposure. | Low | MongoDB indices |
-| 4 | **Keycloak self-registration broken** — `VERIFY_EMAIL` fires with no SMTP, and `default-roles-srw` doesn't carry the `user` role. Can't provision real non-admin test users → cross-user negative paths are unit-tested against the helpers but not live-verified against the running cluster. | Test gap | Keycloak realm config |
+| 1 | **Per-user API rate limiting** | UUID enumeration, endpoint hammering, LLM-cost runaway. Per-user (not per-IP) so paid-tier hooks attach later. | 2–3d (FastAPI middleware — slowapi or hand-rolled; per-route caps via decorator; Redis-backed counter to survive orchestrator restarts/scaling) |
+| 2 | **K8s `ResourceQuota` + `LimitRange` per agent pod** | One user OOM-ing the cluster, CPU saturation, accidentally-infinite agent loops | 2–3d (Helm chart: per-user namespace OR labels-based quota; container CPU/RAM caps already exist on the pool but per-user totals don't; concurrent-jobs-per-user enforcement at dispatch time) |
+| 3 | **Workspace egress `NetworkPolicy`** | Crypto-mining from your AWS IPs, port scanning, spam relay, ending up on an IP reputation list | 2–3d (default-deny egress + allowlist for LLM endpoints + Git + an opt-in per-user "permitted destinations" list; needs a CNI that supports egress policies — Cilium or Calico) |
 
-**Observability gap (nice-to-have):** no audit log of cross-user 403 attempts. Today an attacker hitting `/api/jobs/{guessed}/cancel` 1000 times just gets 1000 403s with no alert.
+Each needs a short design doc before implementation — these are new territory, not "wire up an existing primitive". Bundleable in parallel, but writing the designs is the bottleneck.
 
-See [Next steps](#next-steps) for prioritized follow-ups.
+### M1.E — User account lifecycle (design pending, ~3–5d total)
+
+Two flows SaaS needs that a single-org self-host doesn't.
+
+| # | Item | What it covers | Rough effort |
+|---|---|---|---|
+| 1 | **User self-deletion** — `DELETE /api/me` with a written cascade plan | Account cancellation; GDPR "right to be forgotten". The cascade matrix is the hard part: jobs (soft-delete? hard-delete? what about jobs in shared projects?), threads (own), datasources (creator-owned), `project_members` (remove; lockout-prevention for last-owner projects), cloud-storage files (delete via M1.C OAuth path), Keycloak account (via admin API). | 2–3d (the matrix decisions take longer than the code) |
+| 2 | **User data export** — `POST /api/me/export` returning a downloadable archive | GDPR data-portability; support workflows ("I want to see exactly what's stored about me"). Walks every resource that joins on `user_id` and serializes. Reuses the project knowledge-export pattern (F5). | 1–2d |
+
+Today `DELETE /api/users/{id}` is admin-only (H2). M1.E is the user-facing self-service version of the same operation.
+
+### M1.F — Admin UX hardening (✅ shipped, PR 4 open)
+
+Triggered by the post-P4b finding that admins were god-mode by default and couldn't dogfood the regular-user UX without juggling accounts. **PRs 1–3 shipped + live-verified 2026-05-18** ([design](features/admin_view_as_user.md)). PR 4 (audit enrichment + remaining matrix walk) is folded into [M1.B #5](#m1b--cross-job-infrastructure-hygiene-quick-wins-1-day-total) above.
+
+### M1 readiness gate
+
+Pre-launch checklist. **Every line must be ✅ before opening signups beyond invited beta users.**
+
+- [x] **M1.A** — every API endpoint gated; inventory test enforces; admin view-as toggle live
+- [ ] **M1.B** — Keycloak self-reg works for strangers; Chromium per-job; MongoDB TTL; 403 audit log; view-as PR 4
+- [ ] **M1.C** — cloud storage per-user OAuth (the actual blocker)
+- [ ] **M1.D** — rate limiting + pod quotas + workspace egress allowlist (designs written *and* implementations shipped)
+- [ ] **M1.E** — user self-deletion + data export
+
+When all five tick, **M1 is done** and you can open signups to strangers without burning either user data or your AWS bill.
 
 ---
 
-## Why per-user isolation first
+## Milestone 2 — Organizations (multi-tenancy)
 
-The previous assumption was that cross-organization isolation didn't matter because the system is open source and each client self-hosts. That's still mostly true. But **even in a single-org deployment, users still need to be isolated from one another**:
+**Goal.** Multiple organizations (teams of users) share one deployment, each fully isolated from the others — **including from administrators of other orgs.** *"Mandantenfähigkeit"* in the formal sense. A user can belong to multiple orgs; every resource belongs to exactly one org.
 
-- A supervisor shouldn't see a student's experimental scratch jobs.
-- A junior team member shouldn't see credentials in someone else's datasource detail.
-- A consultant given temporary access shouldn't be able to enumerate the entire history of the system.
-- An MCP token marked `scope='user'` shouldn't grant read access to other users' data (it currently does for 97 of 99 MCP tools).
-- An attacker who guesses a project UUID shouldn't be able to add themselves as owner (`add_project_member` has no auth check).
+**Trigger.** Real demand. Not yet — individual-subscriber use cases sit comfortably inside M1.
 
-A hypothetical subscription product has the same requirement plus the org wrapper. We're solving the same problem either way.
+**Why it stays cheap.** M1.A centralized visibility in `orchestrator/security/access.py`. Adding `organizations.id` as an additional constraint is a single change to `user_visible_project_ids` — every consumer (jobs / projects / datasources / threads / etc.) inherits the new restriction without a per-endpoint edit. The org wrapper is *additive*.
+
+### M2.A — Organizations schema (3–5 days)
+
+- New table `organizations(id, name, slug, created_at, …)`.
+- `projects.organization_id` FK, `NOT NULL` after backfill (existing rows → an implicit `default` org).
+- New table `organization_members(org_id, user_id, role)` with `owner/admin/member` roles.
+- `user_visible_project_ids(user)` augments to include projects in orgs the user is a member of.
+- Cockpit: org switcher (current org sets a per-session cookie), invite flow, org admin pane.
+
+Schema design is straightforward — `project_members` is the template.
+
+### M2.B — Per-tenant primitives
+
+Things M1's "single org, many users" model didn't need.
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | **Per-org quotas** | M1.D quotas are per-user. For paying tiers, per-org caps (concurrent jobs, monthly LLM spend, datasource count, storage GB) become the canonical unit. **Extends** M1.D rather than replacing it. |
+| 2 | **Per-org audit boundary** | An admin of org A must not see org B's audit log. The 403-audit primitive from M1.B needs `org_id` from day one or a retroactive backfill. |
+| 3 | **Per-org branding / settings** | Logo, default expert configs, SSO config (if M2.C goes the per-realm route). Not security-critical, but the natural shape once you have orgs. |
+| 4 | **Cross-org membership UX** | A user in multiple orgs needs a "which org am I working in right now" switcher. URL prefixing (`/o/{org-slug}/…`) is the conventional pattern. |
+
+### M2.C — Realm strategy decision
+
+| Approach | When to choose | Cost |
+|---|---|---|
+| **One Keycloak realm, org-as-group** | Different orgs share infrastructure (logins, MFA, OAuth providers). Same realm = same identity surface. | Cheap — add a Keycloak group per org. |
+| **Realm-per-tenant** | Hard identity isolation; per-org SSO/SAML; regulatory compliance (financial, healthcare). | Expensive — provisioning, BFF rewrite, per-realm OIDC discovery. |
+
+Default is "one realm" until a tenant requirement forces otherwise.
+
+### M2 readiness gate
+
+- [ ] **M1 fully done** (M2 builds on M1.A's centralized visibility *and* M1.D's quota plumbing)
+- [ ] Organizations schema + helpers (M2.A)
+- [ ] Per-org quota plumbing (extends M1.D, not parallel)
+- [ ] Per-org audit boundary (extends M1.B #4)
+- [ ] Realm decision made + implemented for chosen path (M2.C)
+- [ ] Cross-org membership UX (cockpit switcher + URL prefixing)
 
 ---
+
+> **Historical context (below).** The remaining sections preserve the original audit, Phase 1 plan, Track B design, severity-ordered roadmap, and Phase 2 sketch verbatim. They document **what M1.A delivered** and the design decisions behind it — kept for future readers who need to understand "why was this built this way" or "what was broken before this landed." Implementation status reflected in the strikethrough/checkmarks in each row.
 
 ## Original audit (2026-05-15, historical)
 
@@ -215,7 +354,7 @@ If a rogue agent registered with a controlled `pod_ip`, the orchestrator would P
 
 ---
 
-## Phase 1 plan (Track A: data isolation)
+## Phase 1 plan (Track A: data isolation) — historical (M1.A delivered this)
 
 ### Principles
 
@@ -316,7 +455,7 @@ See the consolidated **Severity-ordered roadmap** below — bundles P0-P3 cover 
 
 ---
 
-## Track B: Agent ↔ orchestrator boundary
+## Track B: Agent ↔ orchestrator boundary — historical (P4b delivered this, part of M1.A)
 
 Separate workstream. Doesn't block the current single-org self-hosted use case (the cluster network is trusted by design), but blocks any hosted/multi-tenant deployment because a compromised pod or a foothold on the cluster network = full credential exfiltration via dispatch interception.
 
@@ -349,7 +488,7 @@ See the consolidated **Severity-ordered roadmap** below — Track B is grouped t
 
 ---
 
-## Severity-ordered roadmap
+## Severity-ordered roadmap (M1.A implementation log — historical)
 
 Findings ranked by severity, then grouped into shippable bundles in dependency order. P0s are independent of each other and should land as soon as possible. P1+ depend on the `access.py` foundation (bundle F1).
 
@@ -686,9 +825,11 @@ A pragmatic landing order:
 5. **Decision point:** Track B option, or formally defer it with a date tied to hosted-product readiness.
 6. **Phase 2:** when organizations or hosted-product work actually starts.
 
-## Phase 2 sketch (deferred)
+## Phase 2 sketch (historical — superseded by M1.B-E + M2 above)
 
-Phase 2 has two distinct tracks: the **organizations layer** (a schema-and-helper change that's cheap because Phase 1 centralized visibility) and **cross-cutting infrastructure isolation** (concrete shared-resource fixes that the API gates can't solve).
+> The substance of this section was re-rolled into the new milestone structure: the **organizations layer** is now [M2.A](#m2a--organizations-schema-35-days), and the **cross-cutting infrastructure isolation** items are now [M1.B](#m1b--cross-job-infrastructure-hygiene-quick-wins-1-day-total) (quick-win hygiene) and [M1.C](#m1c--cloud-storage-per-user-oauth-12-weeks) (cloud storage). Kept here as a historical pointer.
+
+Phase 2 originally had two distinct tracks: the **organizations layer** (a schema-and-helper change that's cheap because Phase 1 centralized visibility) and **cross-cutting infrastructure isolation** (concrete shared-resource fixes that the API gates can't solve).
 
 ### Organizations layer (cheap because Phase 1 centralized visibility)
 
@@ -736,27 +877,34 @@ The API gates close the application-layer leaks. The following still share state
 
 ---
 
-## Out of scope (Phase 1)
+## Out of scope (this doc, both milestones)
 
-- Organizations (Phase 2).
-- Per-resource fine-grained ACLs ("share this specific thread with user X").
-- Per-user rate limiting / quotas.
-- UI for managing project memberships beyond what exists today.
-- Per-user OAuth for cloud storage (Phase 2 candidate).
-- Full mTLS rollout (Track B option 3, separate decision).
-- Replacing the Keycloak realm-roles approval flow with an in-app one.
+What this doc covers: **data isolation and abuse prevention** for individual subscribers (M1) and organizations (M2). Everything else is deliberately someone else's problem:
+
+- **Payments / billing / metering / Stripe integration.** Subscription product surface, not isolation.
+- **ToS, AUP, cookie banners, privacy-policy text.** Legal, not engineering.
+- **GDPR DPA, SOC2, ISO27001 paperwork.** The engineering primitives (user self-deletion, data export, retention, audit log) are in M1.E + M1.B; the paperwork around them is not.
+- **Marketing / pricing pages / signup funnel UI.** Cockpit's `/auth/login` flow is what we ship.
+- **Customer support workflows / "view as <specific user>" impersonation.** Architected for via `X-Admin-View-As: user:<uuid>` ([view-as design § Future extensions](features/admin_view_as_user.md#future-extensions-post-v1)), but actual implementation is post-M1.
+- **Per-resource fine-grained ACLs** ("share this specific thread with user X"). Project membership is the share unit — anything finer is a product feature, not an isolation gap.
+- **Per-user OAuth for non-cloud-storage services** (BYO LLM keys, BYO datasource OAuth). Existing patterns work; not a SaaS-readiness blocker. M1.C is specifically the OpenCloud/Nextcloud service-account replacement.
+- **Full mTLS between agents and orchestrator** (Track B option 3). The current Layer 2 shared-secret is sufficient until a real cluster-internal-adversary threat model emerges.
+- **Replacing the Keycloak realm-roles approval flow with an in-app one.** Current flow (admin assigns the `user` role) is fine; the broken-self-reg fix is M1.B #1.
 
 ---
 
 ## Next steps
 
-**Phase 1 + P4 + Track B are all done as of 2026-05-17.** The remaining work is post-implementation hardening, ordered by cost-to-value:
+**M1.A (API isolation) is done.** Everything else for M1 is the work this doc tracks. Concrete ordered plan:
 
-1. **Keycloak self-registration fixes (~2h).** Wire SMTP for `VERIFY_EMAIL` (or skip-verification for dev), add the `user` role to `default-roles-srw`. Unblocks E2E cross-user verification of everything Track A + P4 + Track B shipped — without it, we can only test via admin accounts and unit-test mocks. **Smallest fix, biggest unblock.** See [`project_keycloak_self_registration_broken`](../.. memory).
-2. **Chromium profile per-job (~2h).** `/tmp/agent-chromium-cdp-profile` → `/tmp/agent-chromium-cdp-profile-{job_id}` plus a teardown hook. Stops cookie/session leakage between jobs on the same agent pod.
-3. **MongoDB TTL (~1h).** Pick a retention window (90d? 1y?), add a TTL index on `llm_requests` and `agent_audit`. Closes Phase 2 cross-cutting gap #3.
-4. **Audit log of cross-user 403s (~3h).** Emit a structured log line (or a Mongo `security_audit` entry) when any access helper raises 403. Enables forensics + rate-based alerting.
-5. **Cloud storage per-user OAuth (~1-2 weeks).** Replace the shared OpenCloud/Nextcloud service account with per-user OAuth tokens. The actual hosted-product blocker. Phase 2 gating work.
-6. **Phase 2 organizations layer.** Cheap to add once #5 lands — see [Phase 2 sketch §Organizations layer](#phase-2-sketch-deferred).
+1. **M1.B #1 — Keycloak self-registration (~2h).** Smallest fix, biggest unblock. Wire SMTP for `VERIFY_EMAIL` (or skip-verify in dev) + add `user` to `default-roles-srw`. Every later step benefits from being able to provision a real second user.
+2. **M1.B #2–#5 — remaining quick-win hygiene (~5h).** Chromium per-job, MongoDB TTL, 403 audit log, view-as PR 4. Independent; parallelizable.
+3. **M1.C — Cloud storage per-user OAuth (~1–2 weeks).** The actual hosted-product blocker. Don't open signups beyond invited beta users until this lands.
+4. **M1.D — Abuse prevention designs + implementations (~6–9d).** Rate limiting, K8s ResourceQuota/LimitRange per pod, workspace egress NetworkPolicy. Three independent designs, parallelizable; writing the designs is the bottleneck.
+5. **M1.E — User account lifecycle (~3–5d).** Self-deletion + data export.
+6. **M1 readiness gate clears** — open signups to strangers.
+7. **M2 only when demand is real** — organizations layer, per-org primitives, realm strategy.
 
-**Items 1-3 are quick wins (under 1 day total).** Item 5 is the big one and the natural gate for hosted-product readiness. Item 6 stays cheap because Phase 1 centralized visibility in `access.py`.
+**Quickest credibility moves (today):** M1.B #1 + #2 + #3 + #4 + #5 are a single short sprint (~1 day total). Doing them now closes 5 of the 10 remaining-gap rows in [Where we are now](#where-we-are-now-2026-05-18) and unblocks live cross-user testing for everything else.
+
+**The big one:** M1.C (cloud storage per-user OAuth). Until that lands, every user-file read is one bug away from cross-tenant exposure. Plan it as the next initiative after M1.B.
