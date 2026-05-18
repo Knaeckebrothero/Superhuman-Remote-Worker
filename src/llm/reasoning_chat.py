@@ -16,9 +16,11 @@ import json
 import logging
 import os
 import sys
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Iterator, Optional
 
 import httpx
+from langchain_core.messages import AIMessageChunk
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
 
@@ -293,6 +295,124 @@ def _extract_reasoning_from_response(data: dict) -> Optional[str]:
     return None
 
 
+def _extract_reasoning_from_delta(delta: dict) -> Optional[str]:
+    """Pull reasoning text out of a Chat Completions streaming delta.
+
+    Mirrors :func:`_extract_reasoning_from_response` but operates on the
+    per-chunk ``delta`` object rather than a finished ``message``.
+    Returns ``None`` when the chunk carries no readable reasoning text.
+
+    OpenRouter's ``reasoning_details`` array is excluded here intentionally
+    — it only appears on full responses, not in streaming deltas.
+    """
+    if not isinstance(delta, dict):
+        return None
+    rc = delta.get("reasoning_content")
+    if isinstance(rc, str) and rc:
+        return rc
+    r = delta.get("reasoning")
+    if isinstance(r, str) and r:
+        return r
+    return None
+
+
+class _SSEReasoningTap:
+    """Tee an httpx streaming response to extract reasoning text from SSE deltas.
+
+    The OpenAI SDK consumes streaming Chat Completions responses by iterating
+    ``response.aiter_bytes()`` (or ``iter_bytes()`` in sync mode). This tap
+    intercepts that iteration: it forwards bytes to the SDK unchanged while
+    locally parsing ``data: {...}`` lines to harvest
+    ``choices[0].delta.reasoning_content`` (and ``.reasoning``). LangChain's
+    ``_convert_delta_to_message_chunk`` drops these non-standard fields, so
+    capture has to happen at the wire layer before LangChain converts.
+
+    The constructor snapshots the response's *original* iter methods so the
+    tap delegates to them rather than to whatever may later overwrite the
+    instance attributes (which is how :func:`_install_streaming_reasoning_tap`
+    installs the tap — by reassigning ``response.iter_bytes``).
+
+    After the stream is consumed, ``reasoning_content`` returns the
+    accumulated text or ``None``. The tap is single-use; install one per
+    streaming request.
+    """
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+        # Snapshot the originals so iter_bytes() / aiter_bytes() don't
+        # recurse into themselves after _install_streaming_reasoning_tap
+        # overwrites the response's attributes.
+        self._upstream_iter_bytes = response.iter_bytes
+        self._upstream_aiter_bytes = response.aiter_bytes
+        self._buffer = b""
+        self._parts: list[str] = []
+
+    @property
+    def reasoning_content(self) -> Optional[str]:
+        if not self._parts:
+            return None
+        return "".join(self._parts)
+
+    def iter_bytes(self, chunk_size: Optional[int] = None) -> Iterator[bytes]:
+        for chunk in self._upstream_iter_bytes(chunk_size):
+            self._consume(chunk)
+            yield chunk
+        self._flush()
+
+    async def aiter_bytes(
+        self, chunk_size: Optional[int] = None
+    ) -> AsyncIterator[bytes]:
+        async for chunk in self._upstream_aiter_bytes(chunk_size):
+            self._consume(chunk)
+            yield chunk
+        self._flush()
+
+    def _consume(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self._buffer += chunk
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            self._parse_line(line)
+
+    def _flush(self) -> None:
+        # Handle trailing line without newline (rare; some servers omit
+        # the final \n before the connection closes).
+        if self._buffer:
+            self._parse_line(self._buffer)
+            self._buffer = b""
+
+    def _parse_line(self, raw: bytes) -> None:
+        line = raw.strip()
+        if not line.startswith(b"data: ") or line == b"data: [DONE]":
+            return
+        try:
+            data = json.loads(line[6:])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not choices:
+            return
+        delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+        text = _extract_reasoning_from_delta(delta or {})
+        if text:
+            self._parts.append(text)
+
+
+def _install_streaming_reasoning_tap(response: httpx.Response) -> _SSEReasoningTap:
+    """Attach an :class:`_SSEReasoningTap` to a streaming response.
+
+    Replaces ``aiter_bytes``/``iter_bytes`` on the response instance so that
+    downstream consumers (the OpenAI SDK) get the tapped iterator. Returns
+    the tap so callers can read accumulated reasoning after the stream is
+    exhausted.
+    """
+    tap = _SSEReasoningTap(response)
+    response.iter_bytes = tap.iter_bytes  # type: ignore[method-assign]
+    response.aiter_bytes = tap.aiter_bytes  # type: ignore[method-assign]
+    return tap
+
+
 class ReasoningCapturingClient(httpx.Client):
     """HTTP client that captures reasoning_content and validates context limits.
 
@@ -319,6 +439,10 @@ class ReasoningCapturingClient(httpx.Client):
         super().__init__(*args, **kwargs)
 
         self._last_reasoning_content: Optional[str] = None
+        # Streaming tap for the most recent request; consumed by
+        # ReasoningChatOpenAI._astream / _stream after the SDK finishes
+        # iterating the response.
+        self._active_stream_tap: Optional[_SSEReasoningTap] = None
         self._model = model
         self._key_ring = key_ring
 
@@ -402,17 +526,38 @@ class ReasoningCapturingClient(httpx.Client):
             if rotated_response is not None:
                 response = rotated_response
 
-        # Capture reasoning_content from response (non-streaming only).
-        # When stream=True, httpx doesn't eagerly read the body, so
-        # response.content raises ResponseNotRead — skip capture in that case.
-        if is_chat and not kwargs.get("stream", False):
-            try:
-                data = json.loads(response.content)
-                self._last_reasoning_content = _extract_reasoning_from_response(data)
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass
+        # Capture reasoning_content from response.
+        # When stream=True, httpx doesn't eagerly read the body — install an
+        # SSE tap on the response so reasoning is harvested per-delta as the
+        # SDK iterates. The tap is consumed by ReasoningChatOpenAI._stream
+        # after the stream finishes. Non-streaming case parses the full
+        # body directly.
+        if is_chat:
+            if kwargs.get("stream", False):
+                self._active_stream_tap = _install_streaming_reasoning_tap(response)
+            else:
+                try:
+                    data = json.loads(response.content)
+                    self._last_reasoning_content = _extract_reasoning_from_response(
+                        data
+                    )
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
 
         return response
+
+    def consume_streamed_reasoning(self) -> Optional[str]:
+        """Return reasoning text captured by the most recent streaming response.
+
+        Single-shot: clears the tap once read. Returns ``None`` when no tap
+        was installed (non-streaming request) or the stream carried no
+        reasoning deltas.
+        """
+        tap = self._active_stream_tap
+        if tap is None:
+            return None
+        self._active_stream_tap = None
+        return tap.reasoning_content
 
     def _handle_key_rotation(
         self, request: httpx.Request, response: httpx.Response, **kwargs
@@ -513,6 +658,10 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         super().__init__(*args, **kwargs)
 
         self._last_reasoning_content: Optional[str] = None
+        # Streaming tap for the most recent request; consumed by
+        # ReasoningChatOpenAI._astream / _stream after the SDK finishes
+        # iterating the response.
+        self._active_stream_tap: Optional[_SSEReasoningTap] = None
         self._model = model
         self._key_ring = key_ring
 
@@ -588,15 +737,22 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
             if rotated_response is not None:
                 response = rotated_response
 
-        # Capture reasoning_content from response (non-streaming only).
-        # When stream=True, httpx doesn't eagerly read the body, so
-        # response.content raises ResponseNotRead — skip capture in that case.
-        if is_chat and not kwargs.get("stream", False):
-            try:
-                data = json.loads(response.content)
-                self._last_reasoning_content = _extract_reasoning_from_response(data)
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass
+        # Capture reasoning_content from response.
+        # Streaming path: install an SSE tap on the response so reasoning is
+        # harvested per-delta as the SDK iterates aiter_bytes. The tap is
+        # consumed by ReasoningChatOpenAI._astream once the stream finishes.
+        # Non-streaming path: parse the full body directly.
+        if is_chat:
+            if kwargs.get("stream", False):
+                self._active_stream_tap = _install_streaming_reasoning_tap(response)
+            else:
+                try:
+                    data = json.loads(response.content)
+                    self._last_reasoning_content = _extract_reasoning_from_response(
+                        data
+                    )
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
 
         # Diagnostic: dump raw /v1/responses payloads when DEBUG_CODEX_RAW_RESPONSE=1.
         # The codex proxy + openai SDK Pydantic deserialization path can produce
@@ -614,6 +770,19 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
             _dump_codex_raw_response(request, response)
 
         return response
+
+    def consume_streamed_reasoning(self) -> Optional[str]:
+        """Return reasoning text captured by the most recent streaming response.
+
+        Single-shot: clears the tap once read. Returns ``None`` when no tap
+        was installed (non-streaming request) or the stream carried no
+        reasoning deltas.
+        """
+        tap = self._active_stream_tap
+        if tap is None:
+            return None
+        self._active_stream_tap = None
+        return tap.reasoning_content
 
     async def _handle_key_rotation(
         self, request: httpx.Request, response: httpx.Response, **kwargs
@@ -817,3 +986,48 @@ class ReasoningChatOpenAI(ChatOpenAI):
     async def _agenerate(self, *args, **kwargs):
         result = await super()._agenerate(*args, **kwargs)
         return self._post_process_result(result)
+
+    def _stream(self, *args, **kwargs):
+        """Wrap the parent stream and emit a trailing reasoning chunk.
+
+        LangChain's ``_convert_delta_to_message_chunk`` discards the
+        non-standard ``reasoning_content`` field on Chat Completions deltas,
+        so the HTTP client taps it server-side instead. Once the SDK has
+        consumed the streaming response, the tap holds the accumulated
+        reasoning text; we surface it as a trailing synthetic chunk so the
+        merged AIMessage carries ``additional_kwargs.reasoning_content``,
+        matching the non-streaming code path's contract.
+        """
+        for chunk in super()._stream(*args, **kwargs):
+            yield chunk
+        rc = (
+            self._reasoning_client.consume_streamed_reasoning()
+            if self._reasoning_client
+            else None
+        )
+        if rc:
+            logger.debug(f"Captured reasoning_content from stream: {len(rc)} chars")
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    additional_kwargs={"reasoning_content": rc},
+                )
+            )
+
+    async def _astream(self, *args, **kwargs):
+        """Async counterpart of :meth:`_stream`."""
+        async for chunk in super()._astream(*args, **kwargs):
+            yield chunk
+        rc = (
+            self._async_reasoning_client.consume_streamed_reasoning()
+            if self._async_reasoning_client
+            else None
+        )
+        if rc:
+            logger.debug(f"Captured reasoning_content from astream: {len(rc)} chars")
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    additional_kwargs={"reasoning_content": rc},
+                )
+            )
