@@ -15905,9 +15905,16 @@ async def reload_model_catalog(request: Request) -> dict[str, str]:
 
 
 async def _require_admin(request: Request) -> dict[str, Any]:
-    """Require authenticated admin user."""
+    """Require authenticated admin user.
+
+    Checks ``real_is_admin`` (the un-shadowed privilege flag set by
+    ``require_approved_user``) so admin-only endpoints stay reachable when
+    the caller is in "view as user" mode. ``is_admin`` on the returned
+    dict still reflects the shadow, so any downstream visibility check
+    on the returned user dict honours the toggle.
+    """
     user = await require_approved_user(request, postgres_db)
-    if not user.get("is_admin", False):
+    if not user.get("real_is_admin", False):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
