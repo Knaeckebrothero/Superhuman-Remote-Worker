@@ -10,6 +10,8 @@ tags:
 
 Design document for adding credential-file-backed datasource types — initially `kubeconfig`, `ssh_key`, and `generic_file` — so users can attach credentials that need to be materialized as **files on disk** in the agent's workspace pod/VM (rather than injected as environment variables).
 
+> **Status (2026-05-17):** Phase 1 (backend) and Phase 2 (cockpit UI) are **shipped to dev** at `sha-f61113a`. Encryption-at-rest for the `credentials` JSONB column is **shipped** (PR `544254d` + lifespan fix `b1bb254`). Phase 3 (docs cross-references) is partially done — this section plus `repo_datasource.md`'s superseded markers. End-to-end verification against the live cluster: validator + DB round-trip confirmed; agent-side materialization on a real job has not yet been driven manually. See [Implementation roadmap](#implementation-roadmap) for the per-phase status.
+
 ## Motivation
 
 The existing datasource model covers three credential surfaces:
@@ -174,37 +176,59 @@ All three forms share the same submit handler that POSTs to `/api/datasources` w
 
 ## Implementation roadmap
 
-### Phase 1 — Backend (single PR)
+### Phase 1 — Backend ✅ Done (commit `544254d`, lifespan fix `b1bb254`)
 
-- Add `kubeconfig`, `ssh_key`, `generic_file` to the `type` allowlist in `DatasourceCreate.type` and the datasources table comment in `orchestrator/database/schema.sql:906`.
-- Add a `credentials.files[]` validator: size caps, path safety, mode parsing, env-var name validity.
-- Server-side defaults: when type is `kubeconfig` or `ssh_key`, fill in `target_path`/`mode`/`env_var` if the client didn't.
-- `src/core/datasource_setup.py` — add `process_credential_files()` and a cleanup hook. Track materialized files in `_datasource_files` on the agent runtime.
-- Tests: validators (path traversal, size limits, blocklist), materialization (file written, env var set, contents correct), cleanup (file removed, parent dirs not over-removed).
+- ✅ Added `kubeconfig`, `ssh_key`, `generic_file` to `valid_types` in `create_datasource` (`orchestrator/main.py:8847`), to the `DatasourceCreate.type` description, and to the schema comment in `orchestrator/database/schema.sql:906`. No CHECK constraint — enforcement stays at the API layer, matching the existing convention.
+- ✅ New validator module at `orchestrator/security/credential_files.py`:
+  - `normalize_credential_files(ds_type, ds_name, credentials)` — single entry point.
+  - Caps: ≤5 files per datasource, ≤64 KB per file.
+  - Path safety: writable-roots allowlist (`/home/srw`, `/tmp`, `/run`, `/workspace`), system-root blocklist (`/etc/`, `/proc/`, `/sys/`, `/dev/`, `/var/`, `/usr/`), reserved-file blocklist (`~/workspace.md`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`).
+  - Mode regex `^0[0-7]{3}$`; env-var regex `^[A-Za-z_][A-Za-z0-9_]*$`.
+  - Per-type defaults applied server-side: `kubeconfig` → `~/.kube/configs/<slug>.yaml` 0600; `ssh_key` → `~/.ssh/<slug>` 0600 (+ optional `.pub` 0644); `generic_file` requires user-supplied `target_path`.
+  - Wired into both `create_datasource` and `update_datasource` endpoints.
+- ✅ Agent-side materialization at `src/core/datasource_setup.py` — `process_credential_files()` + `cleanup_credential_files()`:
+  - mkdir-tracking so cleanup only removes dirs we created (pre-existing `~/.ssh` with `known_hosts` survives).
+  - Per-datasource kubeconfig YAML is name-prefixed (`<slug>-<context>`, `<slug>-<cluster>`, `<slug>-<user>`) via PyYAML before write to prevent collisions on merge.
+  - Multi-kubeconfig merge via `kubectl config view --flatten --merge`, with a graceful fall-back to colon-separated `KUBECONFIG` when kubectl isn't on PATH.
+  - Refuses to overwrite existing files at the target path.
+- ✅ Wired into the agent: `_datasource_files_manifest` field on `Agent`, populated after `process_datasources()`, drained by `_close_datasource_connections()` at job teardown (`src/agent.py`).
+- ✅ Tests: 85 new tests (64 validator + 21 materialization, including a fake-kubectl shim to pin the merge contract). 101/101 credential-related tests pass (16 PR #1 encryption + 64 validator + 21 materialization).
+- ✅ Live-cluster verification (2026-05-17): validator accepts all positive cases with correct defaults, rejects all 10 negative cases (oversize, too-many-files, blocked-root, traversal, blocked workspace.md, bad mode, bad env_var, kubeconfig 2-files, ssh_key 3-files, missing creds); DB round-trip writes `v1:<nonce>:<ct>` ciphertext via `jsonb_typeof=string` and decrypt-on-read restores the original `files[]` shape.
+- ⚠️ **Not yet verified live**: agent-side materialization on a real dispatched job (writing into `/home/srw/...`, `kubectl config get-contexts` working, env var injection). Unit tests cover it; the kubectl-merge path is fake-kubectl-tested.
 
-### Phase 2 — UI (single PR)
+### Phase 2 — Cockpit UI ✅ Done (commit `f61113a`)
 
-- New `credential-file-form.component.ts` with type-switch.
-- Reuse `POST /api/datasources/ssh-keys/generate` for the SSH key "generate for me" path.
-- Update the datasource list to render the three new types with appropriate icons/badges.
-- Trust-model notice copy.
+- ✅ `DatasourceType` extended in `cockpit/src/app/core/models/api.model.ts` with the three new variants; new `CredentialFileEntry` interface for the `files[]` payload shape.
+- ✅ New optgroup **Credential files** in the type dropdown of `datasource-list.component.ts`, with options Kubeconfig / SSH Key / Generic file.
+- ✅ Three type-specific form sections:
+  - **Kubeconfig**: paste-or-upload textarea, posture-1 trust notice, hint about runtime prefixing.
+  - **SSH key**: paste-or-upload textarea, reuses the existing `/api/datasources/ssh-keys/generate` endpoint and public-key dialog from the `repository` type, posture-1 trust notice.
+  - **Generic file**: repeatable file editor (≤5 entries) with name, target_path, contents, mode, optional env_var; per-entry upload button; posture-1 trust notice.
+- ✅ Type badge + icon: shared `warning` tone for credential-file types so they group visually in the table; icons `rocket_launch` (kubeconfig), `key` (ssh_key), `description` (generic_file).
+- ✅ Connection-URL field and Test-connection button suppressed for credential-file types via `hasConnectionUrl()` / `isCredentialFileType()` helpers.
+- ✅ `buildCredentials()` now produces the matching `{ files: [...] }` payload for each type; `canSave()`, `resetFormData()`, `openEditForm()` updated to handle the new state.
+- ✅ Client-side 64 KB upload cap mirrors the backend validator (friendly error before the request is sent).
+- ✅ i18n: 31 new keys in `en.json` + `de-DE.json` (parity check passes — 1388 keys both sides).
+- ✅ Build clean; 273/273 cockpit vitest tests pass.
+- ✅ Live-cluster verification (2026-05-17): both pods on `sha-f61113a`, deployed `en.json` contains all new keys, compiled `main-QLOC6TQ5.js` references all new template + class identifiers, validator accepts the exact payload shapes `buildCredentials()` produces.
+- ⚠️ **Not yet verified live**: human-driven browser click-through (dropdown opening, trust-notice rendering, end-to-end create flow).
 
-### Phase 3 — Docs and discoverability
+### Phase 3 — Docs and discoverability 🟡 In progress
 
-- Update `docs/datasources.md` to mention the three new types and link here.
-- Mark `repo_datasource.md`'s "Future: General Credentials Store" section as superseded by this doc.
-- Add a short "Working with credentials" section in `CLAUDE.md` so the agent knows the pattern.
+- ✅ This roadmap section updated with shipped status and commit refs.
+- ✅ `repo_datasource.md` "Future: General Credentials Store" + Phase 3 roadmap entry marked superseded.
+- ✅ `docs/datasources.md` Supported Types table extended; Credentials section updated to reflect encryption-at-rest.
+- ⬜ Short "Working with credentials" section in `CLAUDE.md` so the agent knows the materialization paths and env vars to expect — deferred until we've seen the first real agent run consume a credential file.
 
-### Encryption at rest (parallel, separate PR)
+### Encryption at rest ✅ Done (PR #1, commit `d8044f5` + lifespan fix `b1bb254`)
 
-Encrypting `datasources.credentials` JSONB at rest is recommended **before** turning on `kubeconfig` in any deployment that handles production credentials. The AES-256-GCM machinery already exists at `orchestrator/security/crypto.py` and is used for `user_api_keys.api_key` and `llm_endpoints.api_key`. The migration:
+The `datasources.credentials` JSONB column is encrypted at rest with AES-256-GCM via `orchestrator/security/crypto.py` (the same machinery used for `user_api_keys.api_key` and `llm_endpoints.api_key`). On disk: `jsonb_typeof = 'string'` with the canonical `v1:<nonce-b64>:<ct-b64>` prefix. The migration:
 
-- Encrypt on write in `create_datasource` / `update_datasource`.
-- Decrypt in `resolve_datasources_for_job` before `_build_datasources_payload`.
-- Backfill existing rows in a one-shot migration.
-- Redaction layer (`orchestrator/security/access.py:509` `redact_datasource`) is unchanged.
-
-This work is scoped narrowly to the column and is independently valuable for existing API-key-bearing datasources. It can ship before, after, or alongside Phase 1 without coupling.
+- Encrypt on write in `create_datasource` / `update_datasource` / `upsert_default_datasource` (three write sites in `orchestrator/database/postgres.py`).
+- Decrypt on read across seven read sites (`list_datasources`, `get_datasource`, `resolve_datasources_for_job`, `resolve_datasources_for_thread`, `list_project_datasources`, plus `RETURNING` clauses in create/upsert).
+- Legacy plaintext rows still readable with a warning, then migrated by `PostgresDB.backfill_encrypt_datasource_credentials()`.
+- Backfill runs from the FastAPI lifespan handler (`orchestrator/main.py`), **not** from `init.py` — `init.py` is not invoked by the cluster deploy pipeline (caused the 2026-05-12 MongoDB-index outage; documented at `main.py:3072-3074`).
+- Redaction layer at `orchestrator/security/access.py:509` (`redact_datasource`) is unchanged — credentials are stripped before any REST response.
 
 ## Future work
 
