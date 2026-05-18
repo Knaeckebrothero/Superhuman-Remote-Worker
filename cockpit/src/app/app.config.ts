@@ -6,6 +6,7 @@ import {registerLocaleData} from '@angular/common';
 import localeDe from '@angular/common/locales/de';
 import {firstValueFrom} from 'rxjs';
 import {authInterceptor} from './core/interceptors/auth.interceptor';
+import {viewAsInterceptor} from './core/interceptors/view-as.interceptor';
 import {MARKED_EXTENSIONS, MARKED_OPTIONS, provideMarkdown} from 'ngx-markdown';
 import {citationExtension} from './core/markdown/citation-extension';
 import {SessionService} from './core/services/session.service';
@@ -67,7 +68,7 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     provideRouter(routes, withViewTransitions()),
     provideClientHydration(withEventReplay()),
-    provideHttpClient(withFetch(), withInterceptors([authInterceptor])),
+    provideHttpClient(withFetch(), withInterceptors([authInterceptor, viewAsInterceptor])),
     provideTransloco({
       config: {
         availableLangs: [...SUPPORTED_LANGS],
