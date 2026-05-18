@@ -1019,6 +1019,28 @@ describe('PersistentChatService — control WS frame filtering', () => {
         expect(service.modelName()).toBe('claude-opus-4-7');
     });
 
+    it('clears a stale "Agent not ready" error once session.state arrives', async () => {
+        // Regression: during the WS reconnect storm at session attach the agent
+        // rejects each /ws/chat with an `error: Agent not ready` frame until
+        // attach completes. The eventual session.state must wipe the stale
+        // banner so the UI doesn't show a red error contradicting a healthy
+        // session.
+        const {service, wsInstances} = await readySession();
+
+        fireWsFrame(wsInstances[0], {
+            method: 'error',
+            params: {message: 'Agent not ready'},
+        });
+        expect(service.error()).toBe('Agent not ready');
+
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {thread_id: 'thread-status'},
+        });
+        expect(service.error()).toBeNull();
+        expect(service.sessionReady()).toBe(true);
+    });
+
     it('silently ignores malformed WS frames', async () => {
         const {service, wsInstances} = await readySession();
         wsInstances[0].onmessage?.({data: 'not-json{'} as MessageEvent);
