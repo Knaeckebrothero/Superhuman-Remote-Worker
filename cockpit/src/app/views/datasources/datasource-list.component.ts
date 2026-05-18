@@ -20,6 +20,7 @@ import {AppIconComponent} from '../../ui/icon';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {AppFormFieldComponent} from '../../ui/form-field';
 import {AppDialogComponent} from '../../ui/dialog';
+import {ViewModePillComponent} from '../../shell/view-mode-pill/view-mode-pill.component';
 
 /**
  * Datasource management panel with full CRUD, type filtering, and connection testing.
@@ -40,12 +41,14 @@ import {AppDialogComponent} from '../../ui/dialog';
     AppSpinnerComponent,
     AppFormFieldComponent,
     AppDialogComponent,
+    ViewModePillComponent,
   ],
   template: `
     <div class="ds-container">
       <!-- Header -->
       <div class="header-bar">
         <span class="title">{{ 'datasources.title' | transloco }}</span>
+        <app-view-mode-pill />
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {
             <app-chip

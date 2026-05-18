@@ -291,6 +291,20 @@
           "tts": "Text-to-speech"
         }
       }
+    },
+    "viewMode": {
+      "role": "Admin",
+      "scopeAll": "Viewing all",
+      "scopeMe": "Viewing my data",
+      "tooltip": {
+        "switchToMe": "Click to view only your own data",
+        "switchToAll": "Click to view fleet-wide data"
+      },
+      "pill": {
+        "label": "Viewing your data",
+        "showAll": "Show all",
+        "tooltip": "Switch back to fleet-wide view"
+      }
     }
   },
   "emptyCatalog": {
