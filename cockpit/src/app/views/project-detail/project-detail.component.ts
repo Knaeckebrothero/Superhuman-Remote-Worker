@@ -170,6 +170,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
                     {{ 'projectDetail.overview.edit' | transloco }}
                   </app-button>
+                  <app-button variant="ghost" size="md" (clicked)="openAutomationsForProject()">
+                    {{ 'projectDetail.overview.manageAutomations' | transloco }}
+                  </app-button>
                   @if (proj.cloud_storage_url) {
                     <a class="ghost-link" [href]="proj.cloud_storage_url" target="_blank" rel="noopener">
                       {{ 'projectDetail.overview.openFolder' | transloco }}
@@ -1789,6 +1792,15 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   createJobInProject(): void {
     this.router.navigate(['/'], { queryParams: { project: this.projectId } });
+  }
+
+  /** Cross-link to the Automations page with this project preselected.
+   *  The /automations page opens its editor when the ?project= query
+   *  param is present. */
+  openAutomationsForProject(): void {
+    this.router.navigate(['/automations'], {
+      queryParams: { project: this.projectId },
+    });
   }
 
   // Knowledge

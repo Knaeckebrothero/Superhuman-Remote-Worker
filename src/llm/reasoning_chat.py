@@ -184,6 +184,36 @@ def count_request_tokens(body: dict, model: str = "gpt-4") -> int:
     return total
 
 
+def extract_reasoning_text_from_block(block: dict) -> str:
+    """Pull plain reasoning text out of a Responses API reasoning content block.
+
+    Tolerates both the merged-full shape (``summary``/``content`` lists with
+    ``{"type": "...", "text": "..."}`` items) and the streaming-delta shapes
+    (an item with a bare ``text`` field, or the block carrying ``text``
+    directly). Returns an empty string when nothing text-shaped is present —
+    callers can use that to skip empty emissions.
+    """
+    parts: list[str] = []
+
+    direct = block.get("text")
+    if isinstance(direct, str):
+        parts.append(direct)
+
+    for item in block.get("summary") or []:
+        if isinstance(item, dict):
+            t = item.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+
+    for item in block.get("content") or []:
+        if isinstance(item, dict):
+            t = item.get("text")
+            if isinstance(t, str):
+                parts.append(t)
+
+    return "".join(parts)
+
+
 def _extract_responses_api_reasoning(message) -> None:
     """Extract reasoning from Responses API content blocks into additional_kwargs.
 
