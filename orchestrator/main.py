@@ -983,7 +983,14 @@ async def _inject_dispatch_credentials(
             if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
                 env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
             if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
-                env_keys_block["EMBEDDING_MODEL"] = embedding_model
+                await _inject_env_key_credentials(
+                    env_keys=env_keys_block,
+                    prefix="EMBEDDING",
+                    model_id=embedding_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                    capability="embedding",
+                )
             if (
                 embedding_provider == "openrouter"
                 and resolved_keys
@@ -1886,6 +1893,7 @@ async def _inject_env_key_credentials(
     model_id: str,
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
+    capability: str = "chat",
 ) -> None:
     """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
 
@@ -1901,7 +1909,7 @@ async def _inject_env_key_credentials(
 
     meta = None
     try:
-        meta = await _resolve_model(model_id, user_id=user_id)
+        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
 
@@ -10891,6 +10899,7 @@ async def create_thread(
                 model_id=embedding_model,
                 user_id=str(user["id"]),
                 resolved_keys=resolved_keys,
+                capability="embedding",
             )
             logger.info(
                 "Thread create: injected embedding: provider=%s, model=%s",
