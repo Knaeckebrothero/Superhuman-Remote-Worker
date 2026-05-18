@@ -2328,6 +2328,56 @@ async def _loop_permission_check(
     return approved
 
 
+async def _resilient_cloud_sync(op: str, runner, turn_id: int) -> bool:
+    """Run a cloud_sync op with retry+backoff; surface failure without crashing.
+
+    Retries the bound coroutine factory ``runner`` up to three times with
+    exponential backoff against transient ``CloudSyncError`` (e.g. Cloudflare
+    502 between agent and OpenCloud edge). On final failure broadcasts
+    ``workspace_sync.error`` so the cockpit can surface a retry affordance,
+    logs a warning, and returns False — the persistent loop keeps running
+    instead of terminating the entire session over a transient infra hiccup.
+    """
+    from src.services.cloud_sync import CloudSyncError
+
+    attempts = 3
+    delay = 1.0
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await runner()
+            return True
+        except CloudSyncError as e:
+            last_error = e
+            if attempt < attempts:
+                logger.warning(
+                    "workspace_sync %s attempt %d/%d failed; retrying in %.0fs: %s",
+                    op,
+                    attempt,
+                    attempts,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+    logger.warning(
+        "workspace_sync %s failed after %d attempts (turn %s): %s",
+        op,
+        attempts,
+        turn_id,
+        last_error,
+    )
+    _broadcast(
+        "workspace_sync.error",
+        {
+            "op": op,
+            "turn_id": turn_id,
+            "message": str(last_error) if last_error else "unknown error",
+        },
+    )
+    return False
+
+
 async def _loop_on_turn_start(turn_id: int) -> None:
     if _session is None:
         return
@@ -2336,13 +2386,14 @@ async def _loop_on_turn_start(turn_id: int) -> None:
 
     # Phase 1 of cloud_collaboration_model.md §9: pull cloud-side edits
     # before the turn runs so the agent sees the latest user-side state.
-    # raise-and-block: if any mount fails, the exception propagates up to
-    # the loop and the next turn won't accept input until the operator
-    # resolves the underlying issue.
+    # On transient failure (Cloudflare/edge hiccup) we retry+surface via
+    # workspace_sync.error rather than letting the exception kill the loop.
     if _session.workspace_sync:
         _broadcast("workspace_sync.pulling", {"turn_id": turn_id})
-        await _session.workspace_sync.pull_all()
-        _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
+        if await _resilient_cloud_sync(
+            "pull", _session.workspace_sync.pull_all, turn_id
+        ):
+            _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
     # Save user message to DB (bounded await — no messages lost on crash)
     if _orchestrator_client and _loop_last_user_content[0]:
@@ -2384,20 +2435,25 @@ async def _loop_on_turn_complete(turn_id: int, metrics: Optional[dict] = None) -
             logger.warning("AI message save timed out (5s) — proceeding")
     _session.tool_decisions.clear()
 
-    # Auto-generate title after first few turns (fire-and-forget).
-    # Retry on turns 1-3 in case the LLM is transiently unreachable.
+    # Auto-generate title after first few turns. Awaited (not fire-and-forget)
+    # so the title.updated broadcast is enqueued onto every subscriber's WS
+    # queue before this callback returns — otherwise a crash in the next
+    # turn-start hook (e.g. workspace_sync.error) can tear down the WS before
+    # the title frame is flushed, leaving the cockpit header stuck on
+    # "Untitled Session" until a manual refetch.
     if turn_id <= 3 and _session.postgres_conn:
-        asyncio.create_task(_auto_title_after_first_turn())
+        await _auto_title_after_first_turn()
 
     # Phase 1 of cloud_collaboration_model.md §9: push the agent's edits
-    # to every mounted cloud surface BEFORE the next turn can accept
-    # input. Awaited (not fire-and-forget) so the loop's idle state
-    # accurately reflects when files are durable to the cloud, and so
-    # failures block the next turn (raise-and-block).
+    # to every mounted cloud surface BEFORE the next turn can accept input.
+    # On transient failure we retry+surface via workspace_sync.error rather
+    # than letting the exception kill the loop.
     if _session.workspace_sync:
         _broadcast("workspace_sync.pushing", {"turn_id": turn_id})
-        await _session.workspace_sync.push_all()
-        _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
+        if await _resilient_cloud_sync(
+            "push", _session.workspace_sync.push_all, turn_id
+        ):
+            _broadcast("workspace_sync.pushed", {"turn_id": turn_id})
 
 
 async def _loop_on_error(message: str) -> None:
