@@ -13,11 +13,12 @@ import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
+import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.component';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, ViewModeToggleComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
@@ -175,9 +176,8 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
               [style.background]="user.avatar_color"
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
-            @if (user.is_admin) {
-              <span class="admin-badge">{{ 'nav.admin' | transloco }}</span>
-            }
+            <app-view-mode-toggle />
+
           </div>
           <div class="footer-actions">
             <app-notification-bell />
@@ -399,16 +399,6 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-      }
-
-      .admin-badge {
-        font-size: 9px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-        color: var(--accent-color, #cba6f7);
-        opacity: 0.7;
-        flex-shrink: 0;
       }
 
       .footer-actions {

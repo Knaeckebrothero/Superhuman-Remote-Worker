@@ -291,6 +291,20 @@
           "tts": "Sprachsynthese"
         }
       }
+    },
+    "viewMode": {
+      "role": "Admin",
+      "scopeAll": "Alle Daten",
+      "scopeMe": "Eigene Daten",
+      "tooltip": {
+        "switchToMe": "Wechseln, um nur eigene Daten zu sehen",
+        "switchToAll": "Wechseln zur flottenweiten Ansicht"
+      },
+      "pill": {
+        "label": "Nur eigene Daten",
+        "showAll": "Alle anzeigen",
+        "tooltip": "Zurück zur flottenweiten Ansicht"
+      }
     }
   },
   "emptyCatalog": {
