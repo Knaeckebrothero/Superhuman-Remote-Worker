@@ -5,6 +5,7 @@ import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {AppToastService} from '../../ui/toast';
 import {
     AssistantTurn,
     isAssistantTurn,
@@ -130,6 +131,16 @@ function createService(opts: {
         run: <T>(fn: () => T) => fn(),
     };
 
+    const mockToast: any = {
+        show: vi.fn(),
+        info: vi.fn(),
+        success: vi.fn(),
+        warning: vi.fn(),
+        danger: vi.fn(),
+        dismiss: vi.fn(),
+        dismissAll: vi.fn(),
+    };
+
     const sseInstances: MockEventSource[] = [];
 
     function MockEventSourceCtor(this: any, url: string, _init?: EventSourceInit) {
@@ -165,6 +176,7 @@ function createService(opts: {
             {provide: ApiService, useValue: mockApi},
             {provide: IndexedDbService, useValue: mockCache},
             {provide: NgZone, useValue: mockZone},
+            {provide: AppToastService, useValue: mockToast},
         ],
     });
 
