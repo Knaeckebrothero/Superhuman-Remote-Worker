@@ -357,6 +357,83 @@ describe('PersistentChatService — connect()', () => {
     });
 });
 
+describe('PersistentChatService — createAndConnect()', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('clears prior session turns + threadId synchronously, before the POST resolves', async () => {
+        const {service, mockHttp} = createService();
+
+        // Seed a prior session so the bug reproduces: connect to thread-A,
+        // then create a new thread. Without the synchronous reset in
+        // createAndConnect(), thread-A's turns would still be visible
+        // throughout the (potentially multi-second) POST + boot phase.
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) {
+                return of({
+                    messages: [
+                        {
+                            id: 'u-prev',
+                            role: 'human',
+                            content: 'Hello from thread A',
+                            tool_calls: null,
+                            turn_number: 1,
+                            created_at: '2026-05-15T08:00:00Z',
+                        },
+                    ],
+                    total: 1,
+                });
+            }
+            return of({status: 'active', title: 'Old session', total_turns: 1});
+        });
+        await service.connect('thread-A');
+        expect(service.turns().length).toBeGreaterThan(0);
+        expect(service.threadId()).toBe('thread-A');
+
+        // Make the POST hang so we can observe the state during the await.
+        let resolvePost: (v: any) => void = () => {};
+        mockHttp.post.mockReturnValue({
+            subscribe(observer: any) {
+                resolvePost = (v) => {
+                    observer.next(v);
+                    observer.complete();
+                };
+                return {unsubscribe: () => {}};
+            },
+        });
+
+        const promise = service.createAndConnect({config_name: 'scholar'});
+
+        // Synchronous part of createAndConnect must have already cleared
+        // the prior session's content. Without the fix, turns would still
+        // contain thread-A's user message.
+        expect(service.turns()).toEqual([]);
+        expect(service.threadId()).toBeNull();
+        expect(service.isCreating()).toBe(true);
+        expect(service.startupPhase()).toBe('creating');
+
+        // Let the POST resolve so the test cleans up.
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            return of({status: 'active', total_turns: 0});
+        });
+        resolvePost({thread_id: 'thread-new'});
+        await promise;
+        expect(service.threadId()).toBe('thread-new');
+    });
+});
+
 describe('PersistentChatService — SSE event dispatch', () => {
     let originalEs: any;
     let originalWs: any;
