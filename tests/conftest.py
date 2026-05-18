@@ -78,11 +78,18 @@ _DSID_GLOBAL = UUID("c9999999-9999-9999-9999-999999999999")
 
 
 def _make_user(uid: UUID, name: str, is_admin: bool = False) -> dict:
+    # ``real_is_admin`` mirrors the contract of
+    # ``security.auth.require_approved_user`` — it always sets the flag so
+    # downstream gates (``_require_admin``) can read it. Tests use the
+    # already-resolved user dict, so the flag matches ``is_admin`` here.
+    # The "view as user" shadow (X-Admin-View-As: user) is tested in
+    # tests/test_view_as_user.py against the auth resolver itself.
     return {
         "id": uid,
         "display_name": name,
         "email": f"{name}@example.test",
         "is_admin": is_admin,
+        "real_is_admin": is_admin,
         "is_approved": True,
         "auth_method": "cookie",
         "scopes": [],
