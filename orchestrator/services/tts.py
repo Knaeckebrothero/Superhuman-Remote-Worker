@@ -130,7 +130,7 @@ async def _resolve_capability_credentials(
 
     meta = None
     try:
-        meta = await _resolve_model(model_id, user_id=user_id)
+        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
 
