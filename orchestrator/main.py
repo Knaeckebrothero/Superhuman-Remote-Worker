@@ -840,10 +840,10 @@ async def _inject_dispatch_credentials(
     # further down catches the same hole for unpinned phases, so the two
     # blocks together cover both shapes: explicit job overrides (here) and
     # user-default fallback (below).
-    for _section_name, _parent in (
-        ("auxiliary", config_override),
-        ("strategic", llm_over),
-        ("tactical", llm_over),
+    for _section_name, _parent, _capability in (
+        ("auxiliary", config_override, "auxiliary"),
+        ("strategic", llm_over, "chat"),
+        ("tactical", llm_over, "chat"),
     ):
         _section = _parent.get(_section_name)
         if not isinstance(_section, dict):
@@ -856,6 +856,7 @@ async def _inject_dispatch_credentials(
             model_id=_section_model,
             user_id=user_id_str,
             resolved_keys=resolved_keys,
+            capability=_capability,
         )
         if "api_key" not in _section and "base_url" not in _section:
             logger.warning(
@@ -884,6 +885,7 @@ async def _inject_dispatch_credentials(
                     model_id=aux_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
+                    capability="auxiliary",
                 )
                 logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
 
@@ -942,11 +944,11 @@ async def _inject_dispatch_credentials(
                     f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                 )
 
-        for _kind, _prefix, _user_key in (
-            ("vision", "VISION", "default_vision_model"),
-            ("whisper", "WHISPER", "default_whisper_model"),
-            ("tts", "TTS", "default_tts_model"),
-            ("citation", "CITATION_LLM", "default_citation_model"),
+        for _kind, _prefix, _user_key, _capability in (
+            ("vision", "VISION", "default_vision_model", "vision"),
+            ("whisper", "WHISPER", "default_whisper_model", "whisper"),
+            ("tts", "TTS", "default_tts_model", "tts"),
+            ("citation", "CITATION_LLM", "default_citation_model", "chat"),
         ):
             _model = user_settings.get(_user_key)
             if not _model:
@@ -962,6 +964,7 @@ async def _inject_dispatch_credentials(
                 model_id=_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
+                capability=_capability,
             )
             # The citation_engine package reads CITATION_LLM_URL (not _BASE_URL)
             # and falls back to OPENAI_API_KEY for auth. Alias the URL key here
@@ -1838,6 +1841,7 @@ async def _inject_model_credentials(
     model_id: str,
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
+    capability: str = "chat",
 ) -> None:
     """Populate a config-override section with the right base_url + api_key
     for a given model ID.
@@ -1859,7 +1863,7 @@ async def _inject_model_credentials(
 
     meta = None
     try:
-        meta = await _resolve_model(model_id, user_id=user_id)
+        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
 
@@ -9934,6 +9938,7 @@ async def agent_create_thread(
                 model_id=aux_model,
                 user_id=None,
                 resolved_keys=None,
+                capability="auxiliary",
             )
             config_override["auxiliary"] = aux_section
         embedding_model = await postgres_db.resolve_default_for_capability("embedding")
@@ -9945,6 +9950,7 @@ async def agent_create_thread(
                 model_id=embedding_model,
                 user_id=None,
                 resolved_keys=None,
+                capability="embedding",
             )
             config_override["env_keys"] = env_keys_block
         if config_override:
@@ -10874,6 +10880,7 @@ async def create_thread(
                 model_id=aux_section["model"],
                 user_id=str(user["id"]),
                 resolved_keys=resolved_keys,
+                capability="auxiliary",
             )
             config_override["auxiliary"] = aux_section
 
