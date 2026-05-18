@@ -19,6 +19,7 @@
     "jobs": "Jobs",
     "projects": "Projects",
     "datasources": "Data Sources",
+    "automations": "Automations",
     "create": "Create",
     "debug": "Debug",
     "settings": "Settings",
@@ -59,6 +60,66 @@
     },
     "error": {
       "noAccess": "You don't have access to that project."
+    }
+  },
+  "automations": {
+    "title": "Automations",
+    "subtitle": "Run jobs on a schedule. Use the API for everything else.",
+    "new": "New automation",
+    "list": {
+      "empty": "No automations yet",
+      "emptyDetail": "Schedules let your agents run on their own — for example, draft Instagram posts every Monday morning.",
+      "enabled": "Enabled",
+      "disabled": "Paused",
+      "expert": "Expert",
+      "nextRun": "Next run",
+      "lastFired": "Last fired",
+      "lastStatus": "Last status",
+      "openProject": "Open project",
+      "runNow": "Run now",
+      "toggleAria": "Enable or pause this automation",
+      "confirmDelete": "Delete the automation \"{{name}}\"? This cannot be undone.",
+      "softCap": "You have {{count}} automations. The recommended limit is 20 — consider consolidating before adding more."
+    },
+    "editor": {
+      "titleCreate": "New automation",
+      "titleEdit": "Edit automation",
+      "name": "Name",
+      "namePlaceholder": "e.g. Monday Instagram drafts",
+      "description": "Description (optional)",
+      "descriptionPlaceholder": "What does this automation do?",
+      "preset": "Schedule",
+      "time": "Time",
+      "minute": "Minute past the hour",
+      "customCron": "Cron expression",
+      "timezone": "Timezone",
+      "preview": "Preview",
+      "expert": "Expert",
+      "prompt": "Prompt",
+      "promptPlaceholder": "What should the agent do each time this fires?",
+      "enabled": "Enabled",
+      "advanced": "Advanced options",
+      "autonomy": "Autonomy",
+      "priority": "Priority (0-10)",
+      "maxFiresPerDay": "Max fires per day",
+      "catchupHours": "Catchup window (hours)",
+      "create": "Create automation",
+      "save": "Save changes",
+      "requiredMissing": "Name, expert, prompt, and a valid cron expression are required."
+    },
+    "preview": {
+      "timezoneNote": "Times are shown in {{tz}}. The orchestrator stores schedules in UTC and applies DST automatically.",
+      "invalid": "That cron expression isn't valid."
+    },
+    "escapeHatch": {
+      "title": "Need more than schedules?",
+      "body": "Use the orchestrator API directly — from n8n, Zapier, your own scripts, or any HTTP client. Webhooks, branching workflows, and inbound email triggers all live there.",
+      "apiDocs": "API documentation",
+      "guide": "External API guide",
+      "createKey": "Create API key"
+    },
+    "errors": {
+      "generic": "Something went wrong. Please try again."
     }
   },
   "sessions": {
@@ -610,6 +671,7 @@
       "created": "Created",
       "edit": "Edit",
       "openFolder": "Open Project Folder",
+      "manageAutomations": "Manage automations",
       "save": "Save",
       "cancel": "Cancel"
     },

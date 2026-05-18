@@ -7681,6 +7681,353 @@ class PostgresDB:
             await conn.execute("SELECT pg_notify($1, $2)", channel, payload)
 
     # =========================================================================
+    # AUTOMATIONS (cron + event-trigger job templates; see
+    # docs/features/automations_v0.md and migration 0015_create_automations.sql)
+    # =========================================================================
+
+    async def create_automation(
+        self,
+        *,
+        owner_id: str,
+        name: str,
+        trigger_type: str,
+        expert: str,
+        prompt: str,
+        description: str | None = None,
+        project_id: str | None = None,
+        cron_expr: str | None = None,
+        timezone: str = "UTC",
+        catchup_window_seconds: int = 86400,
+        event_filter: Dict[str, Any] | None = None,
+        enabled: bool = True,
+        config_override: Dict[str, Any] | None = None,
+        autonomy: str = "review",
+        priority: int = 5,
+        max_chain_depth: int = 10,
+        max_fires_per_day: int = 100,
+        next_run_at: datetime | None = None,
+    ) -> Dict[str, Any]:
+        """Insert an automation row. Caller pre-computes ``next_run_at`` for
+        cron triggers (via croniter against the row's timezone) so the
+        dispatcher's first tick can pick it up without a recompute pass.
+
+        v0 only stores cron rows from the API; ``event_filter`` is accepted
+        here so the v0.5 event dispatcher can land without a schema change.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO automations (
+                    owner_id, project_id, name, description, trigger_type,
+                    cron_expr, timezone, catchup_window_seconds,
+                    event_filter, enabled,
+                    expert, prompt, config_override, autonomy, priority,
+                    max_chain_depth, max_fires_per_day,
+                    next_run_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6, $7, $8,
+                    $9::jsonb, $10,
+                    $11, $12, $13::jsonb, $14, $15,
+                    $16, $17,
+                    $18
+                )
+                RETURNING *
+                """,
+                UUID(owner_id),
+                UUID(project_id) if project_id else None,
+                name,
+                description,
+                trigger_type,
+                cron_expr,
+                timezone,
+                catchup_window_seconds,
+                json.dumps(event_filter) if event_filter else None,
+                enabled,
+                expert,
+                prompt,
+                json.dumps(config_override or {}),
+                autonomy,
+                priority,
+                max_chain_depth,
+                max_fires_per_day,
+                next_run_at,
+            )
+        return self._automation_row_to_dict(row)
+
+    async def get_automation(self, automation_id: str) -> Dict[str, Any] | None:
+        """Fetch one automation by id. Returns None if not found."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM automations WHERE id = $1",
+                UUID(automation_id),
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def list_automations(
+        self,
+        *,
+        owner_id: str | None = None,
+        project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List automations, newest first.
+
+        ``owner_id`` and ``project_id`` are both optional and additive:
+        passing both narrows to a single user's automations within one
+        project. Admin callers can pass neither to see everything.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if owner_id is not None:
+            params.append(UUID(owner_id))
+            clauses.append(f"owner_id = ${len(params)}")
+        if project_id is not None:
+            params.append(UUID(project_id))
+            clauses.append(f"project_id = ${len(params)}")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM automations {where} ORDER BY created_at DESC",
+                *params,
+            )
+        return [self._automation_row_to_dict(r) for r in rows]
+
+    # Fields the editor is allowed to mutate. Ownership, trigger_type,
+    # event_filter, and all *_at / run_count / fires_today_* state are
+    # locked. Renaming an automation must not require resending its prompt.
+    _AUTOMATION_UPDATABLE_FIELDS = frozenset(
+        {
+            "name",
+            "description",
+            "cron_expr",
+            "timezone",
+            "catchup_window_seconds",
+            "enabled",
+            "expert",
+            "prompt",
+            "config_override",
+            "autonomy",
+            "priority",
+            "max_chain_depth",
+            "max_fires_per_day",
+            "next_run_at",
+        }
+    )
+
+    async def update_automation(
+        self,
+        automation_id: str,
+        **fields: Any,
+    ) -> Dict[str, Any] | None:
+        """Partial update of an automation row.
+
+        Caller is responsible for recomputing ``next_run_at`` when changing
+        ``cron_expr`` / ``timezone`` / ``enabled`` and passing the new value
+        in the same call so a paused-then-resumed schedule lands atomically.
+
+        Unknown fields raise ValueError to catch typos at the boundary
+        rather than silently no-op.
+        """
+        unknown = set(fields) - self._AUTOMATION_UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"Cannot update automation fields: {sorted(unknown)}")
+        if not fields:
+            return await self.get_automation(automation_id)
+
+        sets: list[str] = []
+        params: list[Any] = []
+        for key, value in fields.items():
+            if key == "config_override":
+                params.append(json.dumps(value or {}))
+                sets.append(f"{key} = ${len(params)}::jsonb")
+            else:
+                params.append(value)
+                sets.append(f"{key} = ${len(params)}")
+
+        sets.append("updated_at = now()")
+        params.append(UUID(automation_id))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE automations SET {', '.join(sets)} WHERE id = ${len(params)} RETURNING *",
+                *params,
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def delete_automation(self, automation_id: str) -> bool:
+        """Hard-delete. Spawned jobs survive (FK is ON DELETE SET NULL on
+        ``last_job_id``); the link from job → automation lives in
+        ``jobs.context->>'automation_id'`` and stays valid as an audit hint.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM automations WHERE id = $1",
+                UUID(automation_id),
+            )
+        return result.endswith(" 1")
+
+    async def list_automation_runs(
+        self,
+        automation_id: str,
+        *,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return jobs spawned by this automation, newest first. Joins on the
+        ``context->>'automation_id'`` tag the dispatcher writes at fire time.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status, description, priority, created_at, updated_at,
+                       config_name, project_id, parent_job_id
+                FROM jobs
+                WHERE context->>'automation_id' = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                automation_id,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def fetch_next_due_cron_automation(self, conn) -> Dict[str, Any] | None:
+        """Pessimistically claim the next due cron automation under SKIP LOCKED.
+
+        Must be called inside an open transaction on ``conn``. The returned
+        row is locked until the transaction commits or rolls back — the
+        caller advances ``next_run_at`` via ``advance_automation_after_fire``
+        (or ``skip_automation_fire`` for a catchup-window skip) before
+        committing so concurrent dispatcher replicas don't re-pick the row.
+
+        Returns None when nothing is due. The dispatcher loops on this until
+        None to drain the backlog within one tick.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM automations
+            WHERE enabled = true
+              AND trigger_type = 'cron'
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= now()
+            ORDER BY next_run_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def advance_automation_after_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+        scheduled_for: datetime,
+        job_id: str,
+    ) -> None:
+        """Mark an automation as fired and advance its cron state.
+
+        Increments ``run_count`` and the daily ``fires_today_count`` counter
+        (rolled when ``fires_today_date`` < CURRENT_DATE). Called inside the
+        same transaction as ``fetch_next_due_cron_automation`` so the row
+        stays locked through the update.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_scheduled_at = $2,
+                last_dispatched_at = now(),
+                last_fired_at = now(),
+                last_job_id = $3,
+                run_count = run_count + 1,
+                fires_today_count = CASE
+                    WHEN fires_today_date = CURRENT_DATE
+                        THEN fires_today_count + 1
+                    ELSE 1
+                END,
+                fires_today_date = CURRENT_DATE,
+                updated_at = now()
+            WHERE id = $4
+            """,
+            next_run_at,
+            scheduled_for,
+            UUID(job_id),
+            UUID(automation_id),
+        )
+
+    async def skip_automation_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+    ) -> None:
+        """Advance ``next_run_at`` without firing a job — used when the
+        scheduled time is older than ``catchup_window_seconds`` (orchestrator
+        was down past the grace window). Does NOT touch ``last_fired_at`` /
+        ``run_count`` so the cockpit shows the gap honestly.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_dispatched_at = now(),
+                updated_at = now()
+            WHERE id = $2
+            """,
+            next_run_at,
+            UUID(automation_id),
+        )
+
+    async def auto_disable_automation(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Disable an automation in response to a safety guard (today the only
+        guard is ``max_fires_per_day``). Sets ``enabled=false`` and clears
+        ``next_run_at`` so the dispatcher stops considering it; the row stays
+        editable so the owner can fix the cron and re-enable.
+
+        ``reason`` is logged but not persisted — surface it through a
+        notification rather than a DB column to keep the schema tidy.
+        """
+        logger.warning("Auto-disabling automation %s: %s", automation_id, reason)
+        await conn.execute(
+            """
+            UPDATE automations
+            SET enabled = false,
+                next_run_at = NULL,
+                updated_at = now()
+            WHERE id = $1
+            """,
+            UUID(automation_id),
+        )
+
+    @staticmethod
+    def _automation_row_to_dict(row) -> Dict[str, Any] | None:
+        """Normalize an asyncpg ``Record`` into a JSON-serializable dict.
+
+        Decodes JSONB columns to dicts; everything else passes through.
+        Returns None on a None row so callers can chain ``or None``.
+        """
+        if row is None:
+            return None
+        out = dict(row)
+        for jsonb_field in ("config_override", "event_filter"):
+            value = out.get(jsonb_field)
+            if isinstance(value, str):
+                try:
+                    out[jsonb_field] = json.loads(value)
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)
     # =========================================================================
 

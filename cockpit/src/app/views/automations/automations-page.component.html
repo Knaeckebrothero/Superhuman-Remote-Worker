@@ -1,0 +1,299 @@
+<div class="automations-page">
+  <div class="automations-container">
+    <div class="page-header">
+      <app-sidebar-toggle />
+      <h1 class="page-title">{{ 'automations.title' | transloco }}</h1>
+      <span class="header-spacer"></span>
+      <app-button
+        variant="primary"
+        size="md"
+        (clicked)="openEditor(null)"
+        [disabled]="editor() !== null"
+      >
+        <app-icon size="inherit">add</app-icon>
+        {{ 'automations.new' | transloco }}
+      </app-button>
+    </div>
+
+    <p class="page-desc">{{ 'automations.subtitle' | transloco }}</p>
+
+    @if (errorMessage()) {
+      <div class="error-banner" role="alert">{{ errorMessage() }}</div>
+    }
+
+    @if (softCapHit()) {
+      <div class="warn-banner" role="status">
+        {{ 'automations.list.softCap' | transloco: {count: automations().length} }}
+      </div>
+    }
+
+    <!-- Editor (inline; replaces the list temporarily) -->
+    @if (editor(); as ed) {
+      <section class="editor-card">
+        <div class="editor-header">
+          <h2 class="editor-title">
+            @if (ed.mode === 'create') {
+              {{ 'automations.editor.titleCreate' | transloco }}
+            } @else {
+              {{ 'automations.editor.titleEdit' | transloco }}
+            }
+          </h2>
+          <app-button variant="ghost" size="sm" (clicked)="closeEditor()">
+            <app-icon size="inherit">close</app-icon>
+          </app-button>
+        </div>
+
+        <div class="editor-grid">
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.name' | transloco }}</span>
+            <app-input
+              [value]="ed.name"
+              (changed)="updateEditor('name', $event)"
+              [placeholder]="'automations.editor.namePlaceholder' | transloco"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.description' | transloco }}</span>
+            <app-input
+              [value]="ed.description"
+              (changed)="updateEditor('description', $event)"
+              [placeholder]="'automations.editor.descriptionPlaceholder' | transloco"
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.preset' | transloco }}</span>
+            <app-select
+              [value]="ed.preset"
+              (changed)="updateEditor('preset', $any($event))"
+            >
+              @for (opt of presetOptions; track opt.value) {
+                <option [value]="opt.value">{{ opt.label }}</option>
+              }
+            </app-select>
+          </label>
+
+          @if (ed.preset !== 'custom' && ed.preset !== 'every_hour') {
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.time' | transloco }}</span>
+              <input
+                type="time"
+                class="time-input"
+                [value]="ed.time"
+                (change)="updateEditor('time', $any($event.target).value)"
+              />
+            </label>
+          } @else if (ed.preset === 'every_hour') {
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.minute' | transloco }}</span>
+              <app-input
+                type="number"
+                [value]="ed.time"
+                (changed)="updateEditor('time', '00:' + (+$event).toString().padStart(2, '0'))"
+                [placeholder]="'0'"
+              />
+            </label>
+          } @else {
+            <label class="field field--full">
+              <span class="field-label">{{ 'automations.editor.customCron' | transloco }}</span>
+              <app-input
+                [value]="ed.customCron"
+                (changed)="updateEditor('customCron', $event)"
+                placeholder="0 9 * * *"
+              />
+            </label>
+          }
+
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.timezone' | transloco }}</span>
+            <app-select
+              [value]="ed.timezone"
+              (changed)="updateEditor('timezone', $any($event))"
+            >
+              @for (tz of timezoneOptions(); track tz.value) {
+                <option [value]="tz.value">{{ tz.label }}</option>
+              }
+            </app-select>
+          </label>
+
+          <div class="field field--full">
+            <span class="field-label">{{ 'automations.editor.preview' | transloco }}</span>
+            <app-cron-preview [cronExpr]="cronExpr()" [timezone]="ed.timezone" />
+          </div>
+
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.expert' | transloco }}</span>
+            <app-select
+              [value]="ed.expert"
+              (changed)="updateEditor('expert', $any($event))"
+            >
+              @for (opt of expertOptions(); track opt.value) {
+                <option [value]="opt.value">{{ opt.label }}</option>
+              }
+            </app-select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">{{ 'automations.editor.enabled' | transloco }}</span>
+            <div class="switch-row">
+              <app-switch
+                [checked]="ed.enabled"
+                (changed)="updateEditor('enabled', $event)"
+              />
+              <span class="switch-state">
+                {{ (ed.enabled ? 'automations.list.enabled' : 'automations.list.disabled') | transloco }}
+              </span>
+            </div>
+          </label>
+
+          <label class="field field--full">
+            <span class="field-label">{{ 'automations.editor.prompt' | transloco }}</span>
+            <app-textarea
+              [value]="ed.prompt"
+              (changed)="updateEditor('prompt', $event)"
+              [rows]="4"
+              [placeholder]="'automations.editor.promptPlaceholder' | transloco"
+            />
+          </label>
+
+          <button
+            type="button"
+            class="advanced-toggle"
+            (click)="updateEditor('showAdvanced', !ed.showAdvanced)"
+          >
+            <app-icon size="inherit">{{ ed.showAdvanced ? 'expand_less' : 'expand_more' }}</app-icon>
+            {{ 'automations.editor.advanced' | transloco }}
+          </button>
+
+          @if (ed.showAdvanced) {
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.autonomy' | transloco }}</span>
+              <app-select
+                [value]="ed.autonomy"
+                (changed)="updateEditor('autonomy', $any($event))"
+              >
+                @for (opt of autonomyOptions; track opt.value) {
+                  <option [value]="opt.value">{{ opt.label }}</option>
+                }
+              </app-select>
+            </label>
+
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.priority' | transloco }}</span>
+              <app-input
+                type="number"
+                [value]="ed.priority.toString()"
+                (changed)="updateEditor('priority', +$event)"
+              />
+            </label>
+
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.maxFiresPerDay' | transloco }}</span>
+              <app-input
+                type="number"
+                [value]="ed.maxFiresPerDay.toString()"
+                (changed)="updateEditor('maxFiresPerDay', +$event)"
+              />
+            </label>
+
+            <label class="field">
+              <span class="field-label">{{ 'automations.editor.catchupHours' | transloco }}</span>
+              <app-input
+                type="number"
+                [value]="ed.catchupWindowHours.toString()"
+                (changed)="updateEditor('catchupWindowHours', +$event)"
+              />
+            </label>
+          }
+        </div>
+
+        <div class="editor-actions">
+          <app-button variant="ghost" size="md" (clicked)="closeEditor()">
+            {{ 'common.cancel' | transloco }}
+          </app-button>
+          <app-button variant="primary" size="md" (clicked)="saveEditor()">
+            @if (ed.mode === 'create') {
+              {{ 'automations.editor.create' | transloco }}
+            } @else {
+              {{ 'automations.editor.save' | transloco }}
+            }
+          </app-button>
+        </div>
+      </section>
+    } @else {
+      <!-- List -->
+      @if (isLoading() && automations().length === 0) {
+        <div class="loading-row"><app-spinner size="md" /></div>
+      } @else if (automations().length === 0) {
+        <div class="empty-state">
+          <app-icon size="lg" class="empty-icon">schedule</app-icon>
+          <p class="empty-headline">{{ 'automations.list.empty' | transloco }}</p>
+          <p class="empty-detail">{{ 'automations.list.emptyDetail' | transloco }}</p>
+        </div>
+      } @else {
+        <section class="list">
+          @for (row of automations(); track row.id) {
+            <article class="row" [class.row--disabled]="!row.enabled">
+              <div class="row-main">
+                <div class="row-title-line">
+                  <h3 class="row-name">{{ row.name }}</h3>
+                  <app-badge [tone]="row.enabled ? 'success' : 'neutral'">
+                    {{ (row.enabled ? 'automations.list.enabled' : 'automations.list.disabled') | transloco }}
+                  </app-badge>
+                </div>
+                <div class="row-meta">
+                  <span class="meta-item mono">{{ row.cron_expr }}</span>
+                  <span class="meta-item">{{ row.timezone }}</span>
+                  <span class="meta-item">{{ 'automations.list.expert' | transloco }}: {{ row.expert }}</span>
+                  @if (row.next_run_at) {
+                    <span class="meta-item">
+                      {{ 'automations.list.nextRun' | transloco }}: {{ row.next_run_at | date: 'short' }}
+                    </span>
+                  }
+                  @if (row.last_fired_at) {
+                    <span class="meta-item">
+                      {{ 'automations.list.lastFired' | transloco }}: {{ row.last_fired_at | date: 'short' }}
+                    </span>
+                  }
+                  @if (row.last_status) {
+                    <span class="meta-item">
+                      {{ 'automations.list.lastStatus' | transloco }}: {{ row.last_status }}
+                    </span>
+                  }
+                  @if (row.project_id) {
+                    <a class="meta-link" [routerLink]="['/projects', row.project_id]">
+                      <app-icon size="inherit">folder_shared</app-icon>
+                      {{ 'automations.list.openProject' | transloco }}
+                    </a>
+                  }
+                </div>
+              </div>
+              <div class="row-actions">
+                <app-switch
+                  [checked]="row.enabled"
+                  (changed)="toggleEnabled(row)"
+                  [ariaLabel]="'automations.list.toggleAria' | transloco"
+                />
+                <app-button variant="ghost" size="sm" (clicked)="runNow(row)">
+                  <app-icon size="inherit">play_arrow</app-icon>
+                  {{ 'automations.list.runNow' | transloco }}
+                </app-button>
+                <app-button variant="ghost" size="sm" (clicked)="openEditor(row)">
+                  <app-icon size="inherit">edit</app-icon>
+                  {{ 'common.edit' | transloco }}
+                </app-button>
+                <app-button variant="ghost" size="sm" (clicked)="remove(row)">
+                  <app-icon size="inherit">delete</app-icon>
+                  {{ 'common.delete' | transloco }}
+                </app-button>
+              </div>
+            </article>
+          }
+        </section>
+      }
+    }
+
+    <app-escape-hatch-panel />
+  </div>
+</div>

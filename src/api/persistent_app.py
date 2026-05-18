@@ -22,6 +22,7 @@ from .orchestrator_client import OrchestratorClient, create_orchestrator_client_
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
 from ..agent import UniversalAgent
+from ..llm.reasoning_chat import extract_reasoning_text_from_block
 from ..persistent_graph import (
     IdleTimeoutError,
     PersistentLoopCallbacks,
@@ -2628,23 +2629,40 @@ async def _save_message(
 def _extract_thinking(msg: Any) -> Optional[str]:
     """Pull reasoning content out of an AIMessage for persistence.
 
-    Two sources depending on the provider:
+    Three sources, in order:
       - Anthropic: ``content`` is a list of blocks, thinking blocks carry
         ``{"type": "thinking", "thinking": "..."}``.
-      - Other reasoning models (DeepSeek, GPT-5, etc.): ``additional_kwargs.
-        reasoning_content`` carries a plain string.
+      - OpenAI Responses API (gpt-5, etc.): ``content`` is a list of blocks,
+        reasoning blocks carry ``{"type": "reasoning", "summary": [...],
+        "content": [...]}``. Streaming preserves these as-is, since
+        ``_extract_responses_api_reasoning`` only runs on the non-streaming
+        path. Persistent agent streams, so we extract here at save time.
+      - DeepSeek / OpenRouter / non-streaming Responses API:
+        ``additional_kwargs.reasoning_content`` carries a plain string,
+        populated by the HTTP layer or by ``_post_process_result``.
+
     Returns None when the model didn't emit a visible reasoning channel.
     """
     content = getattr(msg, "content", None)
     if isinstance(content, list):
-        parts = [
+        anthropic_parts = [
             b.get("thinking", "")
             for b in content
             if isinstance(b, dict) and b.get("type") == "thinking"
         ]
-        joined = "".join(parts).strip()
+        joined = "".join(anthropic_parts).strip()
         if joined:
             return joined
+
+        responses_parts = [
+            extract_reasoning_text_from_block(b)
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "reasoning"
+        ]
+        joined = "".join(responses_parts).strip()
+        if joined:
+            return joined
+
     rc = getattr(msg, "additional_kwargs", {}).get("reasoning_content")
     return rc or None
 

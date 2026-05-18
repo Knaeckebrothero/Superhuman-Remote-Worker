@@ -15,6 +15,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.api.persistent_app import (
+    _extract_thinking,
     _generate_title,
     _get_agent_metrics,
     _handle_archive,
@@ -290,6 +291,113 @@ class TestSaveTurnAiMessages:
 
         # Should not raise
         await _save_turn_ai_messages(client, "tid", messages, 1)
+
+
+# ---------------------------------------------------------------------------
+# 3.4b _extract_thinking()
+# ---------------------------------------------------------------------------
+
+
+class TestExtractThinking:
+    """Reasoning extraction for the save path — covers all three provider shapes."""
+
+    def test_returns_none_when_no_reasoning(self):
+        msg = AIMessage(content="Just an answer.")
+        assert _extract_thinking(msg) is None
+
+    def test_anthropic_thinking_block(self):
+        """Anthropic content list with {type:'thinking', thinking:'...'}."""
+        msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "Let me think..."},
+                {"type": "text", "text": "Answer."},
+            ]
+        )
+        assert _extract_thinking(msg) == "Let me think..."
+
+    def test_anthropic_multiple_thinking_blocks_concatenated(self):
+        msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "First. "},
+                {"type": "text", "text": "Mid."},
+                {"type": "thinking", "thinking": "Second."},
+            ]
+        )
+        assert _extract_thinking(msg) == "First. Second."
+
+    def test_responses_api_reasoning_from_summary(self):
+        """OpenAI Responses API: type='reasoning' with summary list."""
+        msg = AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Thinking step."}],
+                },
+                {"type": "output_text", "text": "Answer."},
+            ]
+        )
+        assert _extract_thinking(msg) == "Thinking step."
+
+    def test_responses_api_reasoning_from_content(self):
+        msg = AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": "Step A."},
+                        {"type": "reasoning_text", "text": "Step B."},
+                    ],
+                },
+            ]
+        )
+        # Streaming-style concatenation: no separator.
+        assert _extract_thinking(msg) == "Step A.Step B."
+
+    def test_responses_api_reasoning_multiple_blocks(self):
+        msg = AIMessage(
+            content=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Plan. "}],
+                },
+                {"type": "output_text", "text": "Result."},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Reflect."}],
+                },
+            ]
+        )
+        assert _extract_thinking(msg) == "Plan. Reflect."
+
+    def test_additional_kwargs_reasoning_content(self):
+        """DeepSeek / OpenRouter / non-streaming Responses API: plain string."""
+        msg = AIMessage(content="answer", additional_kwargs={"reasoning_content": "rc"})
+        assert _extract_thinking(msg) == "rc"
+
+    def test_anthropic_wins_over_responses_when_both_present(self):
+        """If both reasoning shapes coexist, the Anthropic branch wins (it runs first).
+
+        No real model emits both formats in one response — this just pins
+        ordering so a future refactor doesn't accidentally swap it.
+        """
+        msg = AIMessage(
+            content=[
+                {"type": "thinking", "thinking": "anthropic"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "responses"}],
+                },
+            ]
+        )
+        assert _extract_thinking(msg) == "anthropic"
+
+    def test_empty_reasoning_block_falls_back(self):
+        """Reasoning blocks with no extractable text shouldn't mask additional_kwargs."""
+        msg = AIMessage(
+            content=[{"type": "reasoning", "summary": [], "content": []}],
+            additional_kwargs={"reasoning_content": "fallback"},
+        )
+        assert _extract_thinking(msg) == "fallback"
 
 
 # ---------------------------------------------------------------------------

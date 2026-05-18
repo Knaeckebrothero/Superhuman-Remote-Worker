@@ -131,6 +131,8 @@ from security.credential_files import (  # noqa: E402
 )
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
+from routers import automations_router  # noqa: E402
+from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -3290,6 +3292,11 @@ async def lifespan(app: FastAPI):
         delegation_timeout_sweeper(_shutdown_event)
     )
     pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
+    automation_cron_task = asyncio.create_task(
+        cron_dispatcher_loop(
+            postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
+        )
+    )
 
     # Unified instance lifecycle reconciler (drift-based draining and,
     # in future phases, crash recovery + cross-kind primitives). Runs
@@ -3361,6 +3368,7 @@ async def lifespan(app: FastAPI):
     await pool_reconciler_task
     await lifecycle_reconciler_task
     await main_cloud_listen_task
+    await automation_cron_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -3500,6 +3508,7 @@ async def request_logging_middleware(request: Request, call_next):
 app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
+app.include_router(automations_router)
 
 
 @app.get("/api/tables")

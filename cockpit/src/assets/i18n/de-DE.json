@@ -19,6 +19,7 @@
     "jobs": "Aufträge",
     "projects": "Projekte",
     "datasources": "Datenquellen",
+    "automations": "Automationen",
     "create": "Erstellen",
     "debug": "Debug",
     "settings": "Einstellungen",
@@ -59,6 +60,66 @@
     },
     "error": {
       "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+    }
+  },
+  "automations": {
+    "title": "Automationen",
+    "subtitle": "Lasse Aufträge nach Zeitplan laufen. Alles andere geht über die API.",
+    "new": "Neue Automation",
+    "list": {
+      "empty": "Noch keine Automationen",
+      "emptyDetail": "Mit Zeitplänen laufen deine Agenten von selbst — zum Beispiel jeden Montagmorgen Instagram-Posts entwerfen.",
+      "enabled": "Aktiv",
+      "disabled": "Pausiert",
+      "expert": "Experte",
+      "nextRun": "Nächster Lauf",
+      "lastFired": "Zuletzt ausgelöst",
+      "lastStatus": "Letzter Status",
+      "openProject": "Projekt öffnen",
+      "runNow": "Jetzt ausführen",
+      "toggleAria": "Automation aktivieren oder pausieren",
+      "confirmDelete": "Die Automation \"{{name}}\" löschen? Das kann nicht rückgängig gemacht werden.",
+      "softCap": "Du hast {{count}} Automationen. Empfohlen sind höchstens 20 — überlege, vorhandene zusammenzuführen, bevor du weitere anlegst."
+    },
+    "editor": {
+      "titleCreate": "Neue Automation",
+      "titleEdit": "Automation bearbeiten",
+      "name": "Name",
+      "namePlaceholder": "z. B. Montag Instagram-Entwürfe",
+      "description": "Beschreibung (optional)",
+      "descriptionPlaceholder": "Was macht diese Automation?",
+      "preset": "Zeitplan",
+      "time": "Uhrzeit",
+      "minute": "Minute der Stunde",
+      "customCron": "Cron-Ausdruck",
+      "timezone": "Zeitzone",
+      "preview": "Vorschau",
+      "expert": "Experte",
+      "prompt": "Anweisung",
+      "promptPlaceholder": "Was soll der Agent tun, wenn die Automation auslöst?",
+      "enabled": "Aktiv",
+      "advanced": "Erweiterte Einstellungen",
+      "autonomy": "Autonomie",
+      "priority": "Priorität (0-10)",
+      "maxFiresPerDay": "Maximale Auslösungen pro Tag",
+      "catchupHours": "Nachholfenster (Stunden)",
+      "create": "Automation anlegen",
+      "save": "Änderungen speichern",
+      "requiredMissing": "Name, Experte, Anweisung und ein gültiger Cron-Ausdruck sind Pflicht."
+    },
+    "preview": {
+      "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",
+      "invalid": "Dieser Cron-Ausdruck ist ungültig."
+    },
+    "escapeHatch": {
+      "title": "Mehr als nur Zeitpläne?",
+      "body": "Nutze die Orchestrator-API direkt — aus n8n, Zapier, eigenen Skripten oder jedem HTTP-Client. Webhooks, verzweigte Workflows und E-Mail-Auslöser liegen dort.",
+      "apiDocs": "API-Dokumentation",
+      "guide": "Externer API-Leitfaden",
+      "createKey": "API-Schlüssel anlegen"
+    },
+    "errors": {
+      "generic": "Etwas ist schiefgegangen. Bitte erneut versuchen."
     }
   },
   "sessions": {
@@ -610,6 +671,7 @@
       "created": "Erstellt",
       "edit": "Bearbeiten",
       "openFolder": "Projektordner öffnen",
+      "manageAutomations": "Automationen verwalten",
       "save": "Speichern",
       "cancel": "Abbrechen"
     },
