@@ -61,7 +61,7 @@ def patched_main(monkeypatch):
     failing job's registry state.
     """
 
-    async def fake_resolve(model_id, user_id=None):
+    async def fake_resolve(model_id, user_id=None, capability="chat"):
         if model_id == "gpt-5.3-codex-spark":
             return ModelMeta(
                 model_id="gpt-5.3-codex-spark",
