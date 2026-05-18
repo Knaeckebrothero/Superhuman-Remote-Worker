@@ -150,19 +150,23 @@ export class AutomationsPageComponent implements OnInit {
 
   ngOnInit(): void {
     this.service.loadMine();
-    this.api.getExperts().subscribe({
-      next: (list) => this.experts.set(list),
-      error: () => this.experts.set([]),
-    });
 
     // Project pre-fill: /automations?project=<uuid> opens the editor with
     // the project preselected — driven by the "Create automation" button
-    // on a project's detail page.
-    this.route.queryParamMap.subscribe((params) => {
-      const projectId = params.get('project');
-      if (projectId) {
-        this.openEditor(null, projectId);
-      }
+    // on a project's detail page. We have to wait for the experts list
+    // before opening; otherwise the editor's `expert` field is seeded
+    // with '' (this.experts() is empty until the API resolves) and the
+    // save-time validation rejects the row even though the <select>
+    // shows the right native default.
+    this.api.getExperts().subscribe({
+      next: (list) => {
+        this.experts.set(list);
+        const pending = this.route.snapshot.queryParamMap.get('project');
+        if (pending && !this.editor()) {
+          this.openEditor(null, pending);
+        }
+      },
+      error: () => this.experts.set([]),
     });
   }
 
