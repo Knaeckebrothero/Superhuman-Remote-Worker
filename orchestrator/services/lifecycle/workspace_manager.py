@@ -165,7 +165,7 @@ class WorkspaceInstanceManager:
             ok = await self._snapshot.capture_vm_snapshot(
                 job_id=bound,
                 ssh_host=ssh_host,
-                ssh_port=22,
+                ssh_port=30022,
                 source_type="pod",
             )
             return bound if ok else None

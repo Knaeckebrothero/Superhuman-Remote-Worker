@@ -204,7 +204,7 @@ class ContainerProvisioner:
             if pod_ip:
                 await self._set_context(
                     job_id,
-                    {"status": "ready", "pod_ip": pod_ip},
+                    {"status": "ready", "pod_ip": pod_ip, "port": 30022},
                 )
                 logger.info(
                     "Workspace container ready: %s @ %s (job %s)",
@@ -834,7 +834,7 @@ class ContainerProvisioner:
             if pod_ip:
                 await self._set_thread_context(
                     thread_id,
-                    {"status": "ready", "pod_ip": pod_ip},
+                    {"status": "ready", "pod_ip": pod_ip, "port": 30022},
                 )
                 logger.info(
                     "Thread workspace ready: %s @ %s (thread %s)",
