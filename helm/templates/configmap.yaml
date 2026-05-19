@@ -211,6 +211,11 @@ data:
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
 
+  # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
+  # When set, orchestrator init flips this user's default project from
+  # the database default 'internet-only' to 'home-allowed' on first boot.
+  OPERATOR_HOME_ALLOWED_EMAIL: {{ .Values.workspace.networkPolicy.operatorHomeAllowedEmail | default "" | quote }}
+
   # Agent pods (on-demand via AgentProvisioner)
   AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}
   PERSISTENT_AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}

@@ -2941,6 +2941,8 @@ class ProjectUpdate(BaseModel):
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
     cloud_storage_read_only: bool | None = None
+    # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
+    network_tier: str | None = None
 
 
 class ProjectMemberAdd(BaseModel):
@@ -17070,6 +17072,13 @@ async def update_project(
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # network_tier is admin-gated: a tier change widens what the project's
+    # workspaces can reach at the pod-network layer (e.g. home-allowed
+    # exposes the homelab LAN). Letting any project owner choose their own
+    # tier defeats the operator-side control plane. See
+    # docs/features/workspace_network_isolation.md §3.
+    if body.network_tier is not None:
+        await _require_admin(request)
     success = await postgres_db.update_project(project_id, **kwargs)
     if not success:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")

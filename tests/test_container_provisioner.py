@@ -97,6 +97,29 @@ class TestPodManifest:
         assert labels["app"] == "srw-workspace"
         assert labels["srw/job-id"] == "abc123-full-uuid"
         assert labels["srw/component"] == "workspace"
+        # PR 3: default tier label always present so the network policy
+        # selector can match. Pods without a resolvable project tier fall
+        # back to internet-only.
+        assert labels["srw.io/network-tier"] == "internet-only"
+
+    def test_manifest_tier_label_home_allowed(self):
+        """Explicitly passing network_tier='home-allowed' propagates to the pod label."""
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="workspace-abc",
+            job_id="abc",
+            image="test:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+            network_tier="home-allowed",
+        )
+        assert manifest["metadata"]["labels"]["srw.io/network-tier"] == "home-allowed"
 
     def test_manifest_container_spec(self):
         """Container spec has correct ports, resources, and probes."""
@@ -262,6 +285,74 @@ class TestPodManifest:
         # allowPrivilegeEscalation must be true (SSHD setuid requirement)
         # but sudo is not installed, so agent-host cannot escalate
         assert container_sc["allowPrivilegeEscalation"] is True
+
+
+class TestNetworkTierResolution:
+    """Tests for _resolve_network_tier — the orchestrator → DB → pod label path."""
+
+    @pytest.mark.asyncio
+    async def test_returns_default_when_db_missing(self):
+        """No DB attached → falls back to the default tier (no exception)."""
+        from orchestrator.services.container_provisioner import (
+            DEFAULT_NETWORK_TIER,
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        # _db starts as None — no connect() call here
+        tier = await provisioner._resolve_network_tier("any-id", kind="job")
+        assert tier == DEFAULT_NETWORK_TIER
+
+    @pytest.mark.asyncio
+    async def test_returns_default_when_project_unmapped(self):
+        """DB returns None (job without project_id) → falls back to default."""
+        from orchestrator.services.container_provisioner import (
+            DEFAULT_NETWORK_TIER,
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        mock_db = MagicMock()
+        mock_db.get_workspace_network_tier = AsyncMock(return_value=None)
+        provisioner._db = mock_db
+
+        tier = await provisioner._resolve_network_tier("job-id", kind="job")
+        assert tier == DEFAULT_NETWORK_TIER
+        mock_db.get_workspace_network_tier.assert_awaited_once_with("job-id", "job")
+
+    @pytest.mark.asyncio
+    async def test_returns_resolved_tier(self):
+        """DB returns 'home-allowed' → that's the tier emitted to the pod label."""
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        mock_db = MagicMock()
+        mock_db.get_workspace_network_tier = AsyncMock(return_value="home-allowed")
+        provisioner._db = mock_db
+
+        tier = await provisioner._resolve_network_tier("thread-id", kind="thread")
+        assert tier == "home-allowed"
+        mock_db.get_workspace_network_tier.assert_awaited_once_with(
+            "thread-id", "thread"
+        )
+
+    @pytest.mark.asyncio
+    async def test_db_exception_is_swallowed(self):
+        """A DB error must not block pod creation — falls back to default."""
+        from orchestrator.services.container_provisioner import (
+            DEFAULT_NETWORK_TIER,
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        mock_db = MagicMock()
+        mock_db.get_workspace_network_tier = AsyncMock(
+            side_effect=RuntimeError("connection lost")
+        )
+        provisioner._db = mock_db
+
+        tier = await provisioner._resolve_network_tier("job-id", kind="job")
+        assert tier == DEFAULT_NETWORK_TIER
 
 
 class TestSecurityHardening:
