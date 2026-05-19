@@ -191,6 +191,10 @@ ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
 RUN mkdir -p /run/sshd \
     && tee /etc/ssh/sshd_config.d/agent.conf > /dev/null <<'SSHEOF'
 # Workspace container SSH config — optimized for RemoteBackend
+# Listener on 30022 (not 22): removes the egress/ingress port alias on
+# TCP/22 and is defense-in-depth against future NetworkPolicy drift.
+# See docs/features/workspace_network_isolation.md (PR 2).
+Port 30022
 PermitRootLogin no
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -235,7 +239,7 @@ RUN su -c 'git config --global init.defaultBranch main' agent-host \
 # ---------------------------------------------------------------------------
 RUN mkdir -p /home/agent-host/.config/code-server \
     && tee /home/agent-host/.config/code-server/config.yaml > /dev/null <<'CSEOF'
-bind-addr: 0.0.0.0:8080
+bind-addr: 0.0.0.0:38080
 auth: none
 cert: false
 disable-telemetry: true
@@ -277,6 +281,6 @@ RUN cp -a /home/agent-host /etc/skel.agent-host
 COPY docker/workspace-entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-EXPOSE 22 8080 9222
+EXPOSE 30022 38080 9222
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
