@@ -5969,6 +5969,7 @@ class PostgresDB:
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
                        main_cloud_backend, main_cloud_folder_handle,
+                       network_tier,
                        created_at, updated_at
                 FROM projects
                 WHERE id = $1
@@ -5977,6 +5978,45 @@ class PostgresDB:
             )
 
         return dict(row) if row else None
+
+    async def get_workspace_network_tier(
+        self, work_id: str, kind: str
+    ) -> Optional[str]:
+        """Resolve the network_tier of the project that owns a job/thread.
+
+        Returns the bare tier string (e.g. ``'internet-only'``,
+        ``'home-allowed'``) or ``None`` if no project mapping exists.
+        The caller is responsible for applying its own default when the
+        result is ``None`` — keeping the DB layer free of policy.
+
+        Args:
+            work_id: Job or thread UUID as string.
+            kind: ``'job'`` or ``'thread'``.
+        """
+        try:
+            uuid_val = UUID(work_id)
+        except ValueError:
+            return None
+
+        if kind == "job":
+            query = (
+                "SELECT p.network_tier "
+                "FROM projects p JOIN jobs j ON j.project_id = p.id "
+                "WHERE j.id = $1"
+            )
+        elif kind == "thread":
+            query = (
+                "SELECT p.network_tier "
+                "FROM projects p JOIN threads t ON t.project_id = p.id "
+                "WHERE t.id = $1"
+            )
+        else:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, uuid_val)
+
+        return row["network_tier"] if row else None
 
     async def get_projects_for_user(
         self, user_id: str, limit: int = 100
@@ -6048,6 +6088,9 @@ class PostgresDB:
             "cloud_storage_read_only",
             "main_cloud_backend",
             "main_cloud_folder_handle",
+            # Admin-only at the API layer (orchestrator/main.py update_project);
+            # listed here so the DB UPDATE path accepts it once authorized.
+            "network_tier",
         }
 
         updates = []
