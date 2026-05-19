@@ -565,7 +565,7 @@ class TestPollWorkspaceReady:
         assert result is not None
         assert result["backend"] == "sandbox"
         assert result["remote"]["host"] == "172.16.0.10"
-        assert result["remote"]["port"] == 22
+        assert result["remote"]["port"] == 30022
 
     @pytest.mark.asyncio
     async def test_returns_none_on_status_none_no_vm(self):

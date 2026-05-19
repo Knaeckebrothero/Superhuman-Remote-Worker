@@ -3204,7 +3204,7 @@ async def _poll_workspace_ready(
                 "backend": "sandbox",
                 "remote": {
                     "host": ws["pod_ip"],
-                    "port": ws.get("pod_port") or 22,
+                    "port": ws.get("pod_port") or 30022,
                     "username": "agent-host",
                     "key_path": ssh_key,
                     "workspace_path": "/home/agent-host/workspace",
