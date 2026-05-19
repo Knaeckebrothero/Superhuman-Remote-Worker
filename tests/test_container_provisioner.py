@@ -121,8 +121,8 @@ class TestPodManifest:
 
         # Ports
         ports = {p["name"]: p["containerPort"] for p in container["ports"]}
-        assert ports["ssh"] == 22
-        assert ports["code-server"] == 8080
+        assert ports["ssh"] == 30022
+        assert ports["code-server"] == 38080
 
         # Resources
         assert container["resources"]["requests"]["cpu"] == "1000m"
@@ -131,8 +131,8 @@ class TestPodManifest:
         assert container["resources"]["limits"]["memory"] == "8Gi"
 
         # Probes
-        assert container["readinessProbe"]["tcpSocket"]["port"] == 22
-        assert container["livenessProbe"]["tcpSocket"]["port"] == 22
+        assert container["readinessProbe"]["tcpSocket"]["port"] == 30022
+        assert container["livenessProbe"]["tcpSocket"]["port"] == 30022
 
     def test_manifest_volumes(self):
         """Pod has workspace emptyDir and SSH public key secret volumes."""
@@ -473,7 +473,7 @@ class TestDockerfileHardening:
         assert "/etc/ssh/authorized_keys/agent-host" in content
 
     def test_entrypoint_does_not_run_as_user(self):
-        """Entrypoint must run SSHD as root (required for port 22 + sessions).
+        """Entrypoint must run SSHD as root (required for user session management).
 
         code-server runs as agent-host via su -c.
         """
