@@ -22,7 +22,7 @@ related:
 
 > One AI "turn" in a persistent session can contain reasoning blocks, plain text, and 100+ tool calls — all interleaved. We need a rendering model that surfaces what's happening live, but collapses sanely once the turn is done.
 
-**Status:** Design — staged plan agreed; Phase 1 ready to implement.
+**Status:** Phase 1 shipped 2026-05-17 (turn data model + UI + tool-result durability via migration 0011). Streaming reasoning capture shipped 2026-05-18–19 (SSE tap in `ReasoningCapturingClient` + `ReasoningChatOpenAI._astream` trailing chunk). Phases 2 and 3 still on the design backlog.
 **Filed:** 2026-05-14
 
 ## Motivation
@@ -57,14 +57,17 @@ Once Phase 1 ships and we have lived with it, we'll experiment with merging a sh
 
 Important to internalize before designing the data model: what the providers actually emit.
 
-| Model class | Reasoning content | Where it appears |
-|---|---|---|
-| Claude 4.x with extended thinking, no interleaved | Visible `thinking` blocks | Once per API turn, at the start (so once after every tool_result the agent loop sends back) |
-| Claude 4.x with interleaved thinking | Visible `thinking` blocks | Can appear *between* tool calls within a single API response |
-| GPT-5 / 5.5 reasoning models | Hidden (summary only, if any) | Indicated as "thinking…" while streaming, then collapses to nothing renderable |
-| Non-thinking models (Haiku 4.5, older GPT, Sonnet without thinking) | None | No reasoning block at all |
+| Model class | Reasoning content | Where it appears | Captured by our stack |
+|---|---|---|---|
+| Claude 4.x with extended thinking, no interleaved | Visible `thinking` blocks | Once per API turn, at the start (so once after every tool_result the agent loop sends back) | ✅ Anthropic content-block stream → `persistent_graph.py` switch arm + `_extract_thinking` save |
+| Claude 4.x with interleaved thinking | Visible `thinking` blocks | Can appear *between* tool calls within a single API response | ✅ Same path as above |
+| GPT-5.4-mini, gpt-5.3-codex-spark (and other Chat Completions reasoning models — DeepSeek R1, OpenRouter, Groq reasoning) | Visible `reasoning_content` summary | Per-chunk via `delta.reasoning_content` SSE field on Chat Completions stream | ✅ HTTP-layer `_SSEReasoningTap` accumulates → trailing synthetic chunk emitted by `ReasoningChatOpenAI._astream` → `additional_kwargs.reasoning_content` → existing emit + save path. **Shipped 2026-05-19.** |
+| GPT-5.5 (and other flagship-tier OpenAI reasoning models) | Hidden by provider | OpenAI returns `reasoning_content: null` even via Responses API (`summary: []`, only `encrypted_content`) | ⛔ Not capturable. Mark as `hidden`; render as a duration-only marker card. Provider-side policy, no client fix possible. |
+| GPT-5 family via native Responses API (when LangChain streaming bug is fixed and we flip the toggle) | Visible `type='reasoning'` content blocks | Streaming list-of-blocks content | ✅ `persistent_graph.py` already has a `type='reasoning'` arm (shipped 2026-05-18). Inert today because `use_responses_api=False` is forced (see `src/core/loader.py:2015`). |
+| Gemma-4 (vLLM-served, current cluster) | Visible per model card, blank in practice | Should arrive as `reasoning_content`; arrives empty | ⚠️ Server-side gap: vLLM 0.19.1 isn't loading `chat_template.jinja` (see `project_gemma_reasoning_38855`). Code path is correct; the wire payload is empty. |
+| Non-thinking models (Haiku 4.5, older GPT, Sonnet without thinking) | None | No reasoning block at all | n/a |
 
-**Key consequence:** the renderer must treat "thought with content" and "thought present but content hidden" as distinct cases. The latter still gets a marker so the user sees that the model deliberated.
+**Key consequence:** the renderer must treat three cases distinctly — "thought with content," "thought present but content hidden" (GPT-5.5), and "no thought at all." The middle case still gets a marker so the user sees that the model deliberated even when the text is withheld.
 
 ### API turn vs. UI turn
 
@@ -151,11 +154,12 @@ The rule:
 
 ### Phase 3 — polish
 
-- **Thought titles in collapsed summary**: instead of just `◐ 3 thoughts`, show first-line snippets of each thought in the collapsed dropdown so the user can read the agent's narrative beats at a glance.
+- **Thought titles in collapsed summary**: instead of just `◐ 3 thoughts`, show first-line snippets of each thought in the collapsed dropdown so the user can read the agent's narrative beats at a glance. *Unblocked as of 2026-05-19* — reasoning now actually populates for Chat Completions reasoning models (gpt-5.4-mini, DeepSeek R1, etc.). gpt-5.5 still renders as a hidden-marker card with no titles available.
 - **First-text-as-subtitle**: when the turn is collapsed, the final text is the headline but the first text (the agent's plan, e.g. "I'll do this in 4 passes") appears as a small subtitle near the chevron.
 - **Keyboard shortcuts**: collapse all / expand all (`Ctrl+[` / `Ctrl+]`), navigate between turns, jump to last turn.
 - **Hover affordances**: hovering a collapsed turn previews the event list in a tooltip-like overlay without committing to expand.
 - **Per-turn metadata strip**: tokens used, cost, model, duration — folded into the header.
+- **Live-streamed reasoning deltas (Phase B of the SSE tap)**: today the tap emits a single trailing chunk carrying the full accumulated reasoning. Functionally correct, but the UI sees reasoning all at once after the model's text rather than streaming alongside it. Wire a per-delta callback through the tap to fire `on_thinking` for each SSE chunk as it lands. Pure UX polish; data path stays identical.
 
 ## Decisions deferred
 
@@ -164,7 +168,7 @@ These came up in design discussion and were intentionally not resolved:
 1. **First-text vs. last-text on collapse.** Final answer or initial plan as the headline? Tentative default: last text (outcome) as headline, first text as subtitle in Phase 3.
 2. **Merged-card length threshold.** What constitutes a "short" rationale that can fold into a tool header — 200 chars? 1 line? Decide empirically once Phase 1 ships.
 3. **Auto-collapse threshold.** How many events before a finished turn auto-collapses. Starting guess: 8. Revisit after Phase 1.
-4. **Visual treatment of hidden thoughts** (GPT-5 case). Do they render as a marker card, or get hidden entirely with a single "thought for Ns" annotation on the next event? Start with marker card, revisit.
+4. **Visual treatment of hidden thoughts** (GPT-5.5 case — provider-side withhold, confirmed via direct probe 2026-05-18: `reasoning_content: null` even on the Responses API). Do they render as a marker card, or get hidden entirely with a single "thought for Ns" annotation on the next event? Start with marker card, revisit.
 5. **Whether tool_result content gets its own collapse level inside the tool card** (current behavior) or is always visible. Out of scope for this doc; touched on by [[persistent_chat_ui_redesign]].
 
 ## Out of scope
