@@ -133,12 +133,18 @@ export class BuilderStreamService {
     }
 
     try {
+      // Mirror authInterceptor for raw fetch (which bypasses interceptors):
+      // - credentials: 'include' lets the HttpOnly srw_session cookie ride
+      //   the cross-origin POST to the orchestrator.
+      // - X-CSRF: '1' satisfies orchestrator/security/csrf.py for cookie-
+      //   authenticated state-changing requests.
       const response = await fetch(
         `${this.baseUrl}/builder/sessions/${sessionId}/message`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-CSRF': '1' },
           body: JSON.stringify(body),
+          credentials: 'include',
           signal: this.abortController.signal,
         },
       );
