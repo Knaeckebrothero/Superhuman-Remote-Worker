@@ -607,7 +607,7 @@ class IdeSessionService:
         code_server_url = _build_code_server_url(job_id)
 
         # Verify code-server is responding
-        ready = await self._wait_for_code_server(f"http://{pod_ip}:8080", timeout=15)
+        ready = await self._wait_for_code_server(f"http://{pod_ip}:38080", timeout=15)
         if not ready:
             logger.warning(
                 "code-server not responding on IDE pod %s — setting active anyway",

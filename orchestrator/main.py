@@ -7742,7 +7742,7 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
         raise HTTPException(status_code=503, detail="IDE session not active")
 
     # Build upstream URL (pod_ip may include port for Docker Compose, e.g. "localhost:8081")
-    host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
     upstream_url = f"http://{host}/{path}"
     if request.url.query:
         # Strip 'token' param (reserved for future auth) but forward the rest
@@ -7823,7 +7823,7 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     await ws.accept()
 
     # Build upstream WS URL (pod_ip may include port for Docker Compose)
-    ws_host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
     upstream_url = f"ws://{ws_host}/{path}"
     if ws.url.query:
         upstream_url += f"?{ws.url.query}"
