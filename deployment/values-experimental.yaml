@@ -112,6 +112,27 @@ agent:
   tailscale:
     enabled: true
 # -----------------------------------------------------------------------------
+# Workspace network policy — dev cluster lock-down
+#
+# Dev workspaces are intentionally restricted to public-internet egress only.
+# The home LAN (192.168.178.0/24), service CIDR (10.43.0.0/16), and cluster
+# host network (10.0.50.0/24) all stay in the `internet-only` tier's `except:`
+# list (chart default) and are therefore unreachable from any dev workspace.
+#
+# `operatorHomeAllowedEmail` is pinned empty here so that even if the chart's
+# default changes in a future release, the dev cluster does NOT auto-elevate
+# any operator project to `home-allowed`. Home-LAN reachability is tested
+# only on the private prod deployment (`srv-prod-private`), where the
+# corresponding values file sets this to the operator's email.
+#
+# Tier flips on dev projects are still possible by admin action through the
+# cockpit (admin-gated PATCH /api/projects/{id}), but that's intentional
+# manual override, not policy default.
+# -----------------------------------------------------------------------------
+workspace:
+  networkPolicy:
+    operatorHomeAllowedEmail: ""
+# -----------------------------------------------------------------------------
 # Email — routed through the shared ProtonMail Bridge in `protonmail-bridge` ns.
 # SMTP_USER / SMTP_PASSWORD come from Vault (srw-secrets). The bridgeCert init
 # container extracts the bridge's self-signed cert and adds it to Keycloak's

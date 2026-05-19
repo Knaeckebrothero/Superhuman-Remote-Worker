@@ -34,6 +34,61 @@ share the `srw.io/component=agent-workspace` selector and the basic
 policy shape; this doc tightens the egress and tiering, the
 unification doc extends coverage to virt-launcher pods.
 
+It is also **not** about user-managed external network access — that's
+`docs/features/user_vpn_networks.md`. Operator tiers (this doc) and
+user VPN Networks are siblings, not layers: operator tiers govern
+which networks the cluster itself permits workspace pods to reach;
+user VPN Networks let individual users tunnel their agents into
+external networks the *user* already controls. The two compose at
+runtime — a workspace sits on some operator tier *and* may have user
+VPN Networks attached — but they have separate control planes and
+audiences (operator/admin vs. end user).
+
+---
+
+## Status (2026-05-19)
+
+- **PR 1 — Egress hardening:** ✅ shipped and verified on the dev
+  cluster (`superhuman-remote-worker.com`). The new policy renders
+  with the six-CIDR `ipBlock except:` block and the three-port
+  consolidation; the chart-values comment and the unification doc's
+  CNI table were corrected alongside it.
+- **PR 2 — Listener port restructuring:** ✅ shipped and verified on
+  dev. Live confirmation on a freshly provisioned workspace pod
+  (`ws-thread-625e2e0c-c13`, image `sha-56ec68b`): `ss -tlnp` shows
+  sshd on `0.0.0.0:30022` and code-server on `0.0.0.0:38080` (no
+  listener on 22 or 8080); pod-spec `containerPort` entries and both
+  probes match the new ports; a new session reached "Connected"
+  status (proving agent → workspace SSH on 30022 end-to-end); the
+  IDE opened cleanly through the orchestrator proxy (proving the
+  `:38080` path through the proxy and the NetworkPolicy ingress
+  rules). Implementation surfaced several files the original PR 2
+  plan did not list — see "Discoveries beyond the original file
+  list" under PR 2 below.
+- **PR 3 — Per-tenant tiering:** ✅ shipped 2026-05-19 (unblocked by
+  multi-tenancy M1.A landing 2026-05-16, which delivered the project
+  scoping plumbing PR 3 needed). Migration `0016_project_network_tier.sql`
+  adds `network_tier` to projects with the closed `('internet-only',
+  'home-allowed')` check. The orchestrator's `ContainerProvisioner`
+  resolves the tier per workspace (job + IDE + thread paths) and emits
+  `srw.io/network-tier: <name>` on each pod; the helm chart renders one
+  NetworkPolicy per entry in `workspace.networkPolicy.tiers`, each
+  matched by both the existing `srw.io/component=agent-workspace`
+  selector and the new tier selector. The cockpit project-settings tab
+  gains an admin-gated tier selector; the orchestrator API enforces the
+  same gate on `PATCH /api/projects/{id}` so a project owner who isn't
+  also an admin cannot widen their own tier. Verified locally via
+  `pytest tests/test_container_provisioner.py` (4 new tests, all 55
+  pass) and `helm template -s` (2 NetworkPolicies render, `home-allowed`
+  drops `192.168.178.0/24` from the `except:` list as expected).
+- **PR 2b — docker-compose mode parity:** ⏳ not started. PR 2 left
+  docker-compose deployments broken — the workspace image listens on
+  30022/38080 but `docker-compose.{yaml,dev.yaml,local.yaml}` port
+  mappings, the in-compose healthchecks, and the
+  `docker_provisioner.py` default port are still 22/8080. K8s
+  deployments (dev + prod) work; compose deployments don't. See the
+  PR 2b subsection in the Plan below.
+
 ---
 
 ## Problem
@@ -283,6 +338,15 @@ Add a `network_tier TEXT NOT NULL DEFAULT 'internet-only'` column on
 the multi-tenancy work that just landed; cross-project access in the
 same tier composes cleanly with the family/visibility rules).
 
+This is the **operator-side** control plane — the cluster operator
+decides which networks workspaces in a tier can reach at the
+pod-network layer. The user-side counterpart — end users granting
+their agents access to external networks via VPN tunnels they
+control — lives in `docs/features/user_vpn_networks.md`. The two
+mechanisms compose at runtime (tier governs unencrypted pod-network
+egress; user VPNs are tunneled traffic riding over allowed UDP); see
+the sibling doc for the threat-model breakdown.
+
 Tiers initially:
 
 | Tier | TCP 80/443/22 `except:` list |
@@ -324,6 +388,9 @@ needed for direct TCP services on non-standard ports.
 
 ### PR 1 — Egress hardening (security hygiene, ships standalone)
 
+**Status:** ✅ shipped 2026-05-19; see the Status section above for
+verification details.
+
 Files:
 - `helm/templates/workspace-network-policy.yaml` — replace the three
   wildcard egress rules with the `ipBlock except` block above.
@@ -348,6 +415,11 @@ Verification:
 Estimated size: ~15 lines of YAML + 2 comment fixes. One PR.
 
 ### PR 2 — Listener port restructuring (architectural cleanup)
+
+**Status:** ✅ shipped 2026-05-19; see the Status section above for
+verification details. The list of files below is the *originally
+planned* set; the actually-changed set is larger — see "Discoveries
+beyond the original file list" at the end of this subsection.
 
 Files:
 - `docker/Dockerfile.workspace` — sshd `Port 30022` directive in the
@@ -380,20 +452,190 @@ Verification:
 
 Estimated size: ~30 lines across 4 files + image rebuild. One PR.
 
-### PR 3 — Per-tenant tiering (deferred, tracked separately)
+**Discoveries beyond the original file list:**
 
-Sequence after multi-tenancy P2 G2-G5 lands. Files:
-- `orchestrator/database/migrations/app/NNNN_project_network_tier.sql`
-  — column add.
-- `orchestrator/services/container_provisioner.py` — read the tier
-  from the job's project, emit `srw.io/network-tier: <value>`.
-- `helm/templates/workspace-network-policy.yaml` — split into one
-  policy per tier (or templatized via `range` over a values list).
-- `helm/values.yaml` — new `workspace.networkPolicy.tiers` structure
-  (list of `{name, except: [cidr...]}` objects).
-- Cockpit admin UI — surface the tier selector on project settings.
+The four-file plan above was incomplete. Implementation surfaced the
+following additional changes needed in the K8s/container path:
 
-Estimated size: ~150 lines + cockpit work. Separate PR.
+1. **`docker/workspace-entrypoint.sh:45`** — code-server's operational
+   `--bind-addr 0.0.0.0:8080` flag (in the entrypoint, which overrides
+   the `config.yaml` baked into the image) had to flip to `:38080`.
+   Just changing the config file in the Dockerfile was insufficient.
+2. **`orchestrator/main.py:7745, 7826`** — IDE HTTP proxy and
+   WebSocket proxy upstream URL construction also use `:8080` and had
+   to flip to `:38080`.
+3. **`orchestrator/services/container_provisioner.py:686, 691`** —
+   readinessProbe and livenessProbe `tcpSocket.port` had to flip from
+   22 to 30022 (separate from the `containerPort` entries already in
+   the plan).
+4. **Runtime gap in `src/api/persistent_app.py:3207`** — the agent's
+   workspace remote-config builder used `ws.get("pod_port") or 22`,
+   but `container_provisioner.py` never wrote any port field to the
+   workspace context at all. Without the fix, PR 2 would have created
+   pods with SSHD on 30022 and then handed the agent a remote config
+   with `port: 22` — and the SSH connection would have failed. Fix:
+   `container_provisioner` now writes `"port": 30022` to both the job
+   and thread workspace contexts (matching the field-name convention
+   `docker_provisioner` already uses — `orchestrator/main.py:10299`
+   normalizes `port` ↔ `pod_port` between provisioners on the read
+   side); the default in `persistent_app.py:3207` was also flipped to
+   30022 as defense-in-depth.
+5. **`orchestrator/services/lifecycle/workspace_manager.py:168`** —
+   `ssh_port=22` for `source_type="pod"` snapshot capture had to flip
+   to 30022. VM-path callers stay on 22.
+6. **Test updates:** `tests/test_container_provisioner.py` (the
+   port-assertion test `test_manifest_container_spec` + a docstring
+   that still claimed "required for port 22"), and
+   `tests/test_persistent_app.py` (the workspace-config default-port
+   assertion in `test_returns_container_config_when_ready`). The
+   container_provisioner test was the one CI caught on first push.
+7. **Cosmetic comment fixes in `container_provisioner.py`:** the
+   security-hardening comments claiming "(required for port 22 …)"
+   and "NET_BIND_SERVICE: bind to port 22" were reworded for accuracy
+   — running SSHD as root is still needed for session management, and
+   `NET_BIND_SERVICE` is now redundant on 30022. The capability is
+   kept for now; dropping it could be a separate one-line security
+   hardening PR.
+
+**Lesson:** The original PR 2 plan was scoped by code-search on
+`:22` / `:8080` literals in the four files I'd identified up front;
+it missed the entrypoint script, the IDE proxy URLs, the probes, the
+runtime-context publishing gap, and the lifecycle snapshot path. The
+test failure CI surfaced (`test_manifest_container_spec`) was useful
+not just as a stale-assertion fix but as a tripwire that exposed the
+deeper `persistent_app.py` gap. Always run the full test suite
+locally before declaring "mechanical" port-move work complete.
+
+### PR 2b — docker-compose mode parity (follow-up to PR 2)
+
+**Status:** ⏳ not started.
+
+PR 2 changed the workspace image (SSHD → 30022, code-server → 38080)
+and updated all the K8s/container provisioning paths. Docker-compose
+deployments were left untouched and are currently broken: the
+workspace container listens on 30022/38080 but the compose
+port-mappings, the in-compose healthchecks, and the
+`docker_provisioner.py` default port still assume 22/8080. K8s
+deployments (the dev cluster, prod) work fine; docker-compose
+deployments (single-host installs, local dev compose) do not.
+
+Files:
+- `docker-compose.yaml` — workspace service `ports:` block:
+  `"…:22"` → `"…:30022"`, `"…:8080"` → `"…:38080"`.
+- `docker-compose.dev.yaml` — same `ports:` flips on the five
+  `workspace-N` services, plus the `healthcheck:` command's
+  `/dev/tcp/localhost/22` → `/dev/tcp/localhost/30022`.
+- `docker-compose.local.yaml` — same as the dev compose file.
+- `orchestrator/services/docker_provisioner.py:161, 163` — the
+  default port applied when `WORKSPACE_HOSTS` entries have no
+  explicit `:port` suffix flips from 22 to 30022.
+- `tests/test_docker_provisioner.py` — assertion-style port
+  references on lines 145, 153, 164–166, 181 (and 269 for the same
+  default-port shape) flip from 22 to 30022. Tests that use explicit
+  `host:port` strings to verify the parser preserves the explicit
+  value can stay as-is (they test parser behavior, not the default).
+
+Estimated size: ~15 lines across 5 files + ~10 test-assertion
+updates. One PR.
+
+### PR 3 — Per-tenant tiering
+
+**Status:** ✅ shipped 2026-05-19 (single PR including cockpit UI).
+
+Tier names finalized as `internet-only` (default) and `home-allowed`
+— closing the bikeshed flagged in the original Open questions list.
+The set is closed at three layers (DB CHECK constraint, helm tier
+list, cockpit `ProjectNetworkTier` type) so adding a tier later
+requires a coordinated change across all three.
+
+Shipped files:
+- `orchestrator/database/migrations/app/0016_project_network_tier.sql`
+  — `network_tier TEXT NOT NULL DEFAULT 'internet-only'` with a
+  `NOT VALID` CHECK pattern that's validated separately to avoid
+  blocking concurrent writes during the scan.
+- `orchestrator/services/container_provisioner.py` — new module-level
+  `DEFAULT_NETWORK_TIER` constant; `_resolve_network_tier(work_id,
+  kind)` async helper joins through `projects` for jobs and threads
+  (returning the default on any failure — DB unavailable, project
+  unmapped, exception); `_build_workspace_labels` and
+  `_build_pod_manifest` now accept the tier and emit
+  `srw.io/network-tier`; all three call sites (workspace pod, IDE pod,
+  thread workspace pod) resolve their tier before manifest build.
+- `orchestrator/database/postgres.py` — `get_workspace_network_tier`
+  (the JOIN helper above); `network_tier` added to the
+  `get_project` SELECT and the `update_project` allowed-field set.
+- `orchestrator/main.py` — `ProjectUpdate` Pydantic model gains
+  `network_tier`; the `PATCH /api/projects/{id}` route requires
+  admin when the body contains a `network_tier` field (project
+  owners who aren't admins can edit other fields normally but
+  cannot widen their own tier).
+- `orchestrator/init.py` — new `_seed_operator_network_tier(db)`
+  reads `OPERATOR_HOME_ALLOWED_EMAIL` and flips the matching user's
+  default project to `home-allowed` if it's still at the migration
+  default. Idempotent across reboots; one-way (never demotes).
+- `helm/values.yaml` — new `workspace.networkPolicy.tiers` list of
+  `{name, except: [cidr...]}` objects; new
+  `workspace.networkPolicy.operatorHomeAllowedEmail` (empty default,
+  set to the operator's email on homelab installs).
+- `helm/templates/workspace-network-policy.yaml` — `{{- range }}`
+  over the tier list, emitting one `NetworkPolicy` per entry. Each
+  selects on both `srw.io/component=agent-workspace` and
+  `srw.io/network-tier=<name>`. Plus a fail-closed
+  `workspace-fallback-deny` policy targeting every workspace pod
+  with empty ingress/egress rule sets (see "Fail-closed fallback"
+  below).
+- `helm/templates/configmap.yaml` + `helm/templates/orchestrator/deployment.yaml`
+  — wire `OPERATOR_HOME_ALLOWED_EMAIL` from values into the
+  orchestrator pod env.
+- `cockpit/src/app/views/project-detail/project-detail.component.ts`
+  — admin-gated "Workspace Network" settings group with a select
+  bound to `settingsNetworkTier`; `onNetworkTierChange` PATCHes the
+  project and reverts the signal on API error.
+- `cockpit/src/app/core/models/api.model.ts` — new
+  `ProjectNetworkTier` type union; `Project.network_tier` +
+  `ProjectUpdateRequest.network_tier` fields.
+- `cockpit/src/assets/i18n/{en,de-DE}.json` — `workspaceNetwork`,
+  `networkTier`, `networkTier{InternetOnly,HomeAllowed}`,
+  `networkTierDesc` strings.
+- `tests/test_container_provisioner.py` — 4 new tests covering the
+  resolver fallback paths (no DB, unmapped project, DB exception,
+  happy path) plus a new pod-manifest test asserting the tier label
+  propagates correctly when `network_tier='home-allowed'` is set.
+
+Operator bootstrap. On homelab installs set
+`workspace.networkPolicy.operatorHomeAllowedEmail` in the chart override
+to the operator's email; the orchestrator's init step then flips that
+user's default project to `home-allowed` on first boot (idempotent).
+SaaS deployments leave it empty — every project starts and stays at
+`internet-only` until an admin elevates it through the cockpit.
+
+Fail-closed fallback. The chart also renders a single
+`workspace-fallback-deny` NetworkPolicy that targets every pod with
+`srw.io/component=agent-workspace`, regardless of tier label, with
+`policyTypes: [Ingress, Egress]` and no rules of its own. K8s
+NetworkPolicy union semantics: the tier-specific policies above keep
+contributing their allows when a pod's tier label matches one of
+them, so normal traffic is unaffected. The fallback only changes
+behavior for pods whose tier label *doesn't* match any rendered tier
+(DB ↔ helm-values drift, pre-PR-3 pod that survived an upgrade,
+label-stripping accident). Without the fallback, such a pod would be
+policy-less and therefore fully unrestricted by K8s default; with
+it, the pod is isolated in both directions instead. Closes the only
+real failure mode of the closed-tier design.
+
+Dev cluster lock-down. `deployment/values-experimental.yaml` (the
+dev cluster overlay) pins `workspace.networkPolicy.operatorHomeAllowedEmail`
+to the empty string explicitly, so a future chart-default change can't
+silently grant dev workspaces home-LAN access. Home-LAN reachability
+is exercised only on the private prod deployment, where the
+corresponding values overlay sets that field to the operator's email.
+
+Admin gate rationale. A project owner-only path would re-introduce
+the original problem: any user with project ownership could grant
+their own workspaces access to the homelab LAN, defeating the
+operator-side control plane. Admin-gating writes (while leaving
+reads open to anyone who can see the project) preserves the
+operator/user split the doc design intended.
 
 ---
 
@@ -412,9 +654,11 @@ Estimated size: ~150 lines + cockpit work. Separate PR.
   any agent workflow ever needs an outbound CDP-style connection on
   9222 to a non-workspace target (improbable), the listener should
   move at that point. Not preemptive.
-- **Tier naming.** `internet-only` vs `default`, `home-allowed` vs
-  `intranet-allowed` vs `lan-allowed` — bikeshed worth resolving
-  before PR 3.
+- ~~**Tier naming.**~~ Resolved 2026-05-19: `internet-only` (default)
+  and `home-allowed`. The set is closed in the DB CHECK constraint,
+  the helm `workspace.networkPolicy.tiers` list, and the cockpit
+  `ProjectNetworkTier` union — widening requires a coordinated
+  migration + helm + cockpit change.
 - **VM workspaces — same port restructuring?** PR 2 changes only
   container workspaces. VM workspaces have their own sshd inside the
   VM image; today they listen on 22. The unification doc
@@ -423,13 +667,17 @@ Estimated size: ~150 lines + cockpit work. Separate PR.
   applies to VMs unchanged. But the listener port move is a VM
   image change separate from this work; flag it for a follow-up if
   the VM path becomes load-bearing again.
-- **Tailscale-in-workspace consequence for tiering.** If a workspace
-  runs Tailscale (mesh VPN to a customer's intranet, for instance),
-  the WireGuard tunnel is opaque to pod-level NetworkPolicy — once
-  the tunnel is up, all traffic looks like UDP/41641 to a node IP.
-  Tiering at the pod-network layer therefore can't gate traffic
-  inside the tunnel; that's a Tailscale ACL concern. Same caveat as
-  the unification doc, repeated here for completeness.
+- **VPN-tunneled traffic is opaque to pod-level policy — by design.**
+  A wireguard, Tailscale, or OpenVPN tunnel running from inside a
+  workspace looks like UDP to a node IP from the NetworkPolicy's
+  perspective; whatever flows inside the tunnel is invisible to the
+  tier mechanism. This is intentional in the broader architecture —
+  it's the foundation of the user VPN Networks feature
+  (`docs/features/user_vpn_networks.md`), which formalizes
+  platform-managed VPN tunnels as a user-attachable primitive. Tier
+  policy and user VPN Networks compose at runtime: tier rules govern
+  pod-network egress, user VPNs ride over the tunnel-handshake UDP
+  that the tier already permits as part of basic internet egress.
 
 ---
 
@@ -440,18 +688,56 @@ Estimated size: ~150 lines + cockpit work. Separate PR.
 - `helm/values.yaml`
 - `docs/features/workspace_network_policy_unification.md` (comment fix)
 
-**PR 2 — listener port restructuring:**
+**PR 2 — listener port restructuring (as actually shipped, including
+post-plan discoveries):**
 - `docker/Dockerfile.workspace`
+- `docker/workspace-entrypoint.sh` *(not in original plan)*
 - `orchestrator/services/container_provisioner.py`
 - `orchestrator/services/ide_session.py`
+- `orchestrator/main.py` *(IDE proxy URLs — not in original plan)*
+- `orchestrator/services/lifecycle/workspace_manager.py` *(snapshot
+  ssh_port — not in original plan)*
+- `src/api/persistent_app.py` *(workspace-context port default — not in
+  original plan; closes runtime gap)*
 - `helm/templates/workspace-network-policy.yaml`
-- Image rebuild + chart tag bump
+- `tests/test_container_provisioner.py` *(port assertions + docstring)*
+- `tests/test_persistent_app.py` *(workspace-config default-port
+  assertion)*
+- Image rebuild + chart tag bump (handled by CI; verified on
+  `sha-56ec68b`)
 
-**PR 3 — tiering (deferred):**
-- `orchestrator/database/migrations/app/NNNN_project_network_tier.sql`
-- `orchestrator/services/container_provisioner.py`
-- `helm/templates/workspace-network-policy.yaml`
-- `helm/values.yaml`
+**PR 2b — docker-compose mode parity (pending):**
+- `docker-compose.yaml`
+- `docker-compose.dev.yaml`
+- `docker-compose.local.yaml`
+- `orchestrator/services/docker_provisioner.py`
+- `tests/test_docker_provisioner.py`
+
+**PR 3 — per-tenant tiering (as shipped):**
+- `orchestrator/database/migrations/app/0016_project_network_tier.sql`
+- `orchestrator/database/postgres.py` *(get_workspace_network_tier
+  helper + network_tier in get_project SELECT + update_project
+  allowed-fields set)*
+- `orchestrator/services/container_provisioner.py` *(tier resolver +
+  label propagation across all three pod-creation paths)*
+- `orchestrator/main.py` *(ProjectUpdate model + admin gate on
+  network_tier in the PATCH route)*
+- `orchestrator/init.py` *(_seed_operator_network_tier — homelab
+  bootstrap)*
+- `helm/values.yaml` *(workspace.networkPolicy.tiers list +
+  operatorHomeAllowedEmail)*
+- `helm/templates/workspace-network-policy.yaml` *(range over tiers,
+  one NetworkPolicy per tier)*
+- `helm/templates/configmap.yaml`
+- `helm/templates/orchestrator/deployment.yaml`
+- `cockpit/src/app/views/project-detail/project-detail.component.ts`
+- `cockpit/src/app/core/models/api.model.ts`
+- `cockpit/src/assets/i18n/en.json`
+- `cockpit/src/assets/i18n/de-DE.json`
+- `tests/test_container_provisioner.py` *(tier resolver + label
+  propagation tests)*
+- `deployment/values-experimental.yaml` *(dev-cluster lock-down:
+  explicit empty operatorHomeAllowedEmail with rationale)*
 - `cockpit/` (admin UI)
 
 ---
@@ -463,6 +749,8 @@ Estimated size: ~150 lines + cockpit work. Separate PR.
   `helm/templates/workspace-network-policy.yaml`
 - Policy unification (containers + VMs):
   `docs/features/workspace_network_policy_unification.md`
+- User-managed VPN networks (sibling feature, user-side control plane):
+  `docs/features/user_vpn_networks.md`
 - Multi-tenancy plumbing this composes with:
   `docs/multi_tenancy.md`
 - Auth BFF (related multi-tenant gating):

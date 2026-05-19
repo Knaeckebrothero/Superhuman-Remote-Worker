@@ -628,12 +628,20 @@ export interface Project {
   nextcloud_folder_id?: number | null;
   cloud_storage_read_only?: boolean;
   cloud_storage_url?: string | null;
+  network_tier?: ProjectNetworkTier;
   created_at: string;
   updated_at: string;
   job_count?: number;
   repo_count?: number;
   member_count?: number;
 }
+
+/**
+ * Workspace egress tier for a project. The set must stay in sync with
+ * the CHECK constraint in 0016_project_network_tier.sql and the
+ * `workspace.networkPolicy.tiers` list in helm values.
+ */
+export type ProjectNetworkTier = 'internet-only' | 'home-allowed';
 
 /**
  * Request body for creating a new project.
@@ -658,6 +666,7 @@ export interface ProjectUpdateRequest {
   default_config_name?: string;
   default_config_override?: Record<string, unknown>;
   cloud_storage_read_only?: boolean;
+  network_tier?: ProjectNetworkTier;
 }
 
 /**

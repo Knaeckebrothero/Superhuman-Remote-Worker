@@ -1,21 +1,32 @@
 {{- if .Values.workspace.networkPolicy.enabled }}
+{{- range $tier := .Values.workspace.networkPolicy.tiers }}
+---
 # Unified workspace NetworkPolicy — covers BOTH container workspaces (pods)
 # and VM workspaces (KubeVirt virt-launcher pods). KubeVirt propagates labels
 # from VMI.spec.template.metadata.labels to the virt-launcher pod, so a
 # single podSelector matches both implementations.
 #
+# PR 3: one NetworkPolicy per tier. Each policy selects pods that carry
+# *both* `srw.io/component=agent-workspace` AND the matching
+# `srw.io/network-tier=<name>` label (orchestrator-set, derived from
+# `projects.network_tier`). Tier `internet-only` is the default for pods
+# lacking the tier label; the other tiers are opted into per project.
+#
 # See docs/features/workspace_network_policy_unification.md for the full
-# design rationale, CNI compatibility caveats, and Tailscale-in-VM notes.
+# unification rationale, and docs/features/workspace_network_isolation.md §3
+# for the tier model.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "srw.fullname" . }}-workspace-policy
+  name: {{ include "srw.fullname" $ }}-workspace-policy-{{ $tier.name }}
   labels:
-    {{- include "srw.labels" . | nindent 4 }}
+    {{- include "srw.labels" $ | nindent 4 }}
+    srw.io/network-tier: {{ $tier.name }}
 spec:
   podSelector:
     matchLabels:
       srw.io/component: agent-workspace
+      srw.io/network-tier: {{ $tier.name }}
   policyTypes:
     - Ingress
     - Egress
@@ -42,7 +53,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 30022
@@ -50,7 +61,7 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "orchestrator") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "orchestrator") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 38080
@@ -75,13 +86,8 @@ spec:
     # HTTP/HTTPS for the public internet (browser automation via CDP,
     # Tailscale DERP-relay fallback when UDP is blocked) and SSH for git
     # clone of SSH-auth repository datasources (GitHub, GitLab, self-hosted
-    # Gitea-over-SSH, etc.). All three ports share a destination-bounded
-    # ipBlock so workspaces cannot reach cluster-internal hosts, MetalLB
-    # IPs, the home LAN, or link-local / cloud-metadata addresses on these
-    # ports. In-cluster services we *do* want reachable are added back via
-    # the specific podSelector rules below. Defaults are tuned for the
-    # homelab cluster; tier-configurable variants land in PR 3 — see
-    # docs/features/workspace_network_isolation.md.
+    # Gitea-over-SSH, etc.). The tier's `except` list controls which CIDRs
+    # are subtracted from the wildcard — see values.yaml workspace.networkPolicy.tiers.
     - ports:
         - protocol: TCP
           port: 80
@@ -93,12 +99,9 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              - 10.0.50.0/24       # K3s nodes
-              - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
-              - 10.42.0.0/16       # pod CIDR (cross-workspace, kubelet, system pods)
-              - 10.43.0.0/16       # service CIDR (force ClusterIP via podSelector rules)
-              - 192.168.178.0/24   # home LAN (default tier: locked out)
-              - 169.254.0.0/16     # link-local / cloud-metadata
+              {{- range $cidr := $tier.except }}
+              - {{ $cidr }}
+              {{- end }}
     # Tailscale mesh — direct WireGuard peer (UDP/41641) and STUN (UDP/3478).
     # If UDP is blocked end-to-end, Tailscale falls back to DERP-over-443
     # transparently (still works, just relayed). Applies equally to container
@@ -114,7 +117,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "gitea") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "gitea") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 3000
@@ -122,7 +125,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "postgres") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "postgres") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 5432
@@ -130,7 +133,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "pgvector") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "pgvector") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 5432
@@ -138,7 +141,7 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "neo4j") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "neo4j") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 7688
@@ -146,11 +149,37 @@ spec:
     - to:
         - podSelector:
             matchLabels:
-              {{- include "srw.componentSelectorLabels" (dict "context" . "component" "mongodb") | nindent 14 }}
+              {{- include "srw.componentSelectorLabels" (dict "context" $ "component" "mongodb") | nindent 14 }}
       ports:
         - protocol: TCP
           port: 27017
     # No general internet beyond TCP 80/443 + Tailscale UDP. Workspaces
     # cannot reach each other (no podSelector matchLabels srw.io/component:
     # agent-workspace in any allowed source).
+{{- end }}
+---
+# Fail-closed fallback for workspace pods. Targets every pod carrying
+# `srw.io/component=agent-workspace` regardless of tier label, with empty
+# ingress AND egress rule sets. K8s NetworkPolicy union semantics: each
+# policy's allows compose additively, so the tier-specific policies above
+# still grant their allows when their tier label matches. But a pod whose
+# tier label doesn't correspond to any rendered tier policy (DB ↔ helm
+# values drift, label-stripping accident, pre-PR-3 pod that survived the
+# upgrade, ...) would otherwise be policy-less for ingress/egress and
+# therefore fully unrestricted by K8s default. This fallback closes that
+# hole — such a pod is targeted by *this* policy with no allow rules, so
+# it ends up fully isolated.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "srw.fullname" . }}-workspace-fallback-deny
+  labels:
+    {{- include "srw.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      srw.io/component: agent-workspace
+  policyTypes:
+    - Ingress
+    - Egress
 {{- end }}

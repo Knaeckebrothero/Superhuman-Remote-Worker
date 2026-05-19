@@ -724,8 +724,49 @@ workspace:
   # enforce natively; K3s ships Flannel paired with the embedded kube-router
   # network-policy controller, which enforces by default (Flannel alone
   # does not). See docs/features/workspace_network_policy_unification.md.
+  #
+  # PR 3 (per-project tiering): one NetworkPolicy is rendered per entry
+  # in `tiers` below. Each policy selects pods carrying the matching
+  # `srw.io/network-tier: <name>` label (emitted by the orchestrator's
+  # ContainerProvisioner, derived from `projects.network_tier`). The
+  # default tier `internet-only` MUST exist — pre-PR-3 pods and pods
+  # whose project has no resolvable tier inherit it. See
+  # docs/features/workspace_network_isolation.md §3.
   networkPolicy:
     enabled: true
+    # If set, the orchestrator init seeder bumps this user's default
+    # project to `network_tier='home-allowed'` on first boot (idempotent,
+    # one-way: never moves a project off home-allowed). Intended for
+    # operator/homelab installs where the cluster admin needs their own
+    # workspaces to reach the home LAN. Leave empty in SaaS deployments.
+    operatorHomeAllowedEmail: ""
+    # The closed set of named tiers. Order is irrelevant; the orchestrator
+    # references each tier by name. The set must stay in sync with the
+    # CHECK constraint in 0016_project_network_tier.sql — widening here
+    # without a migration leaves stranded label values.
+    tiers:
+      - name: internet-only
+        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded),
+        # cluster CIDRs + home LAN + link-local denied. The orchestrator
+        # treats this as the implicit fallback for pods lacking the
+        # network-tier label (legacy/pre-migration).
+        except:
+          - 10.0.50.0/24       # K3s nodes
+          - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
+          - 10.42.0.0/16       # pod CIDR
+          - 10.43.0.0/16       # service CIDR
+          - 192.168.178.0/24   # home LAN
+          - 169.254.0.0/16     # link-local / cloud-metadata
+      - name: home-allowed
+        # Operator/homelab tier: home LAN added back to the allowlist.
+        # Cluster CIDRs + link-local stay denied (in-cluster services
+        # remain reachable only via the explicit podSelector rules below).
+        except:
+          - 10.0.50.0/24       # K3s nodes
+          - 10.0.51.0/24       # MetalLB IPs
+          - 10.42.0.0/16       # pod CIDR
+          - 10.43.0.0/16       # service CIDR
+          - 169.254.0.0/16     # link-local / cloud-metadata
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a
   # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first
   # session-attach (which would exceed the orchestrator/agent readiness

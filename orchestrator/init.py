@@ -211,6 +211,11 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # (handles JIT-provisioned users who lack a default project)
         await _seed_default_projects(db)
 
+        # PR 3: one-shot bump for the operator's default project to
+        # network_tier='home-allowed'. Runs every boot but only flips
+        # the row when it's still at the migration default — see fn doc.
+        await _seed_operator_network_tier(db)
+
         # Enforce NOT NULL constraint on default_project_id
         # (applied after seeding so existing users have projects first)
         await _enforce_default_project_constraint(db)
@@ -1171,6 +1176,49 @@ async def _seed_default_projects(db) -> None:
 
     except Exception as e:
         logger.warning(f"  Default project seeding failed: {e}")
+
+
+async def _seed_operator_network_tier(db) -> None:
+    """Bump the homelab operator's default project to home-allowed.
+
+    Reads OPERATOR_HOME_ALLOWED_EMAIL from env. When set, finds the
+    matching user's default project and flips its network_tier from
+    'internet-only' (the migration default) to 'home-allowed'. The
+    UPDATE is gated on the current value being 'internet-only' so the
+    seeder is idempotent and never overwrites an operator who's later
+    moved their project to a different tier through the cockpit.
+
+    Silent no-op when the env var is empty (SaaS deployments) or when
+    the user/project doesn't exist yet (e.g. first boot before
+    Keycloak has JIT-provisioned the user — a later boot picks it up).
+    """
+    operator_email = os.environ.get("OPERATOR_HOME_ALLOWED_EMAIL", "").strip()
+    if not operator_email:
+        return
+
+    try:
+        async with db.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE projects
+                SET network_tier = 'home-allowed'
+                WHERE id = (
+                    SELECT default_project_id FROM users WHERE email = $1
+                )
+                AND network_tier = 'internet-only'
+                """,
+                operator_email,
+            )
+        # asyncpg returns 'UPDATE <n>'; trailing token is the row count.
+        if isinstance(result, str) and result.startswith("UPDATE "):
+            count = result.rsplit(" ", 1)[-1]
+            if count != "0":
+                logger.info(
+                    f"  Operator project network_tier set to 'home-allowed' "
+                    f"(user={operator_email})"
+                )
+    except Exception as e:
+        logger.warning(f"  Operator network_tier seed failed: {e}")
 
 
 async def _enforce_default_project_constraint(db) -> None:

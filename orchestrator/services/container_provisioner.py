@@ -32,6 +32,13 @@ except ImportError:
     K8S_AVAILABLE = False
 
 
+# Pod-network egress tier applied to workspaces whose owning project has
+# no resolvable tier (no DB, no project, or pre-migration project rows).
+# Matches the projects.network_tier column default; the closed CHECK set
+# in 0016_project_network_tier.sql is the source of truth for valid names.
+DEFAULT_NETWORK_TIER = "internet-only"
+
+
 class ContainerProvisioner:
     """Workspace container provisioner using Kubernetes CoreV1Api.
 
@@ -170,6 +177,7 @@ class ContainerProvisioner:
 
         pod_name = f"workspace-{job_id[:12]}"
         workspace_image = image or self._workspace_image
+        network_tier = await self._resolve_network_tier(job_id, kind="job")
 
         # emptyDir by default — storage dies with the pod, no cleanup needed.
         # Each job gets a fresh container; isolation is the pod boundary.
@@ -181,6 +189,7 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            network_tier=network_tier,
         )
 
         try:
@@ -434,6 +443,7 @@ class ContainerProvisioner:
             return None
 
         pod_name = f"ide-{job_id[:12]}"
+        network_tier = await self._resolve_network_tier(job_id, kind="job")
 
         pod_manifest = self._build_pod_manifest(
             pod_name=pod_name,
@@ -443,6 +453,7 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            network_tier=network_tier,
         )
 
         # Override labels to distinguish IDE pods from workspace pods
@@ -573,7 +584,9 @@ class ContainerProvisioner:
             logger.error("Failed to delete PVC %s: %s", pvc_name, e)
             return False
 
-    def _build_workspace_labels(self, job_id: str) -> dict[str, str]:
+    def _build_workspace_labels(
+        self, job_id: str, network_tier: str = DEFAULT_NETWORK_TIER
+    ) -> dict[str, str]:
         labels = {
             "app": "srw-workspace",
             "srw/job-id": job_id,
@@ -581,6 +594,9 @@ class ContainerProvisioner:
             # Fleet-wide selector shared with KubeVirt VM workspaces.
             # See docs/features/workspace_network_policy_unification.md
             "srw.io/component": "agent-workspace",
+            # Per-project egress tier — selected by one NetworkPolicy per
+            # tier in helm. See docs/features/workspace_network_isolation.md §3.
+            "srw.io/network-tier": network_tier,
         }
         # Phase 2a: build SHA label parity with agent pods. Lets the
         # lifecycle reconciler enumerate stale workspaces by selector
@@ -588,6 +604,28 @@ class ContainerProvisioner:
         if ":sha-" in self._workspace_image:
             labels["srw/build-sha"] = self._workspace_image.rsplit(":sha-", 1)[-1]
         return labels
+
+    async def _resolve_network_tier(self, work_id: str, kind: str) -> str:
+        """Resolve the egress tier for a job/thread, falling back to the default.
+
+        DB-less environments (tests, local dev without a project linkage)
+        and pre-migration deployments both surface as a ``None`` row and
+        get the default tier. The helm chart always emits the default-tier
+        policy, so an unlabeled pod is never reachability-broken — it just
+        inherits the strictest policy.
+        """
+        if self._db is None:
+            return DEFAULT_NETWORK_TIER
+        try:
+            tier = await self._db.get_workspace_network_tier(work_id, kind)
+        except Exception:
+            logger.exception(
+                "Failed to resolve network_tier for %s=%s; using default",
+                kind,
+                work_id,
+            )
+            return DEFAULT_NETWORK_TIER
+        return tier or DEFAULT_NETWORK_TIER
 
     def _build_pod_manifest(
         self,
@@ -598,6 +636,7 @@ class ContainerProvisioner:
         memory: str,
         cpu_limit: str,
         memory_limit: str,
+        network_tier: str = DEFAULT_NETWORK_TIER,
         pvc_name: Optional[str] = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container."""
@@ -607,7 +646,7 @@ class ContainerProvisioner:
             "metadata": {
                 "name": pod_name,
                 "namespace": self._namespace,
-                "labels": self._build_workspace_labels(job_id),
+                "labels": self._build_workspace_labels(job_id, network_tier),
             },
             "spec": {
                 "restartPolicy": "Never",
@@ -797,6 +836,7 @@ class ContainerProvisioner:
 
         pod_name = f"ws-thread-{thread_id[:12]}"
         workspace_image = image or self._workspace_image
+        network_tier = await self._resolve_network_tier(thread_id, kind="thread")
 
         # emptyDir by default — storage dies with the pod, no cleanup needed.
         # Each session gets a fresh container; isolation is the pod boundary.
@@ -808,6 +848,7 @@ class ContainerProvisioner:
             memory=memory,
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
+            network_tier=network_tier,
         )
 
         # Override labels for thread identification
