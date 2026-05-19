@@ -719,9 +719,11 @@ workspace:
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
   # workspaces and same-cluster KubeVirt VM workspaces (selector
   # srw.io/component=agent-workspace matches both). Disabling removes the
-  # policy for both implementations. Requires a CNI that enforces
-  # NetworkPolicy (Calico, Cilium, OVN-Kubernetes, Antrea — Flannel does
-  # not enforce it). See docs/features/workspace_network_policy_unification.md.
+  # policy for both implementations. Requires a CNI or paired controller
+  # that enforces NetworkPolicy: Calico, Cilium, OVN-Kubernetes, and Antrea
+  # enforce natively; K3s ships Flannel paired with the embedded kube-router
+  # network-policy controller, which enforces by default (Flannel alone
+  # does not). See docs/features/workspace_network_policy_unification.md.
   networkPolicy:
     enabled: true
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a

@@ -42,7 +42,7 @@ fi
 #    explorer clean. Opens /home/agent-host/workspace as the workspace root.
 # ---------------------------------------------------------------------------
 su -c 'code-server \
-    --bind-addr 0.0.0.0:8080 \
+    --bind-addr 0.0.0.0:38080 \
     --user-data-dir /var/lib/code-server \
     --extensions-dir /var/lib/code-server/extensions \
     /home/agent-host/workspace' agent-host &

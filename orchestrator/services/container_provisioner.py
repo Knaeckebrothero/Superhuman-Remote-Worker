@@ -298,7 +298,7 @@ class ContainerProvisioner:
                 await self._snapshot_service.capture_vm_snapshot(
                     job_id=job_id,
                     ssh_host=status["pod_ip"],
-                    ssh_port=22,
+                    ssh_port=30022,
                     source_type="pod",
                 )
                 logger.info(
@@ -349,7 +349,7 @@ class ContainerProvisioner:
                 await self._snapshot_service.capture_vm_snapshot(
                     job_id=thread_id,
                     ssh_host=pod_ip,
-                    ssh_port=22,
+                    ssh_port=30022,
                     source_type="pod",
                     entity_type="threads",
                 )
@@ -623,8 +623,8 @@ class ContainerProvisioner:
                         "superhuman-remote-worker.svc.cluster.local",
                     ],
                 },
-                # Pod-level security: run SSHD as root (required for port 22
-                # and user session management), but restrict everything else.
+                # Pod-level security: run SSHD as root for user session
+                # management (su to agent-host), but restrict everything else.
                 "securityContext": {
                     "seccompProfile": {"type": "RuntimeDefault"},
                 },
@@ -633,8 +633,8 @@ class ContainerProvisioner:
                         "name": "workspace",
                         "image": image,
                         "ports": [
-                            {"containerPort": 22, "name": "ssh"},
-                            {"containerPort": 8080, "name": "code-server"},
+                            {"containerPort": 30022, "name": "ssh"},
+                            {"containerPort": 38080, "name": "code-server"},
                             {"containerPort": 9222, "name": "cdp"},
                         ],
                         "resources": {
@@ -647,7 +647,7 @@ class ContainerProvisioner:
                         # Container security hardening:
                         # - Drop all capabilities, add back only what SSHD needs
                         # - SETUID/SETGID: user session switching
-                        # - NET_BIND_SERVICE: bind to port 22
+                        # - NET_BIND_SERVICE: bind to privileged ports (<1024)
                         # - CHOWN/DAC_OVERRIDE/FOWNER: file ownership for sessions
                         # - SYS_CHROOT: SSHD privilege separation
                         # - KILL: signal management
@@ -683,12 +683,12 @@ class ContainerProvisioner:
                             },
                         ],
                         "readinessProbe": {
-                            "tcpSocket": {"port": 22},
+                            "tcpSocket": {"port": 30022},
                             "initialDelaySeconds": 3,
                             "periodSeconds": 5,
                         },
                         "livenessProbe": {
-                            "tcpSocket": {"port": 22},
+                            "tcpSocket": {"port": 30022},
                             "initialDelaySeconds": 10,
                             "periodSeconds": 30,
                         },
