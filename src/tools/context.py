@@ -109,6 +109,16 @@ class ToolContext:
         # owning user_id + project_id and applies their model preferences
         # during dispatch. Unset in worker-job mode.
     )
+    user_id: Optional[str] = (
+        None  # Originating user UUID. Set by persistent_session from the
+        # thread row's owner so agent-initiated calls to the orchestrator
+        # (jobs.py, messaging.py, orchestrator_client.py) can forward
+        # `X-MCP-User-Id` alongside `X-Internal-Key`. The orchestrator's
+        # `_get_user_from_mcp_headers` then resolves the user and the
+        # call is accepted by `require_approved_user` / `require_job_access`
+        # instead of 401-ing. Unset in worker-job mode (no user identity
+        # to forward; lifecycle calls still rely on the internal key alone).
+    )
     _job_metadata: Dict[str, Any] = field(
         default_factory=dict
     )  # job_id, project_id, priority, config_name, repo_name

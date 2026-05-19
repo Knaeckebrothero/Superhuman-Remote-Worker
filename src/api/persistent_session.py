@@ -87,6 +87,11 @@ class PersistentSession:
     knowledge_store: Optional[Any] = None
     _knowledge_graph: Optional[Any] = None
     project_ids: List[str] = field(default_factory=list)
+    # Owning user UUID (read from the threads row during setup). Plumbed
+    # into ToolContext so agent-initiated orchestrator calls (jobs.py,
+    # messaging.py) can forward X-MCP-User-Id and reach user-scoped
+    # endpoints like GET /api/jobs/{id} without 401-ing.
+    user_id: Optional[str] = None
 
     # Raw LLM (without tools bound, for summarization fallback)
     _llm: Optional[BaseChatModel] = None
@@ -157,6 +162,23 @@ class PersistentSession:
         # 3. Initialize knowledge base connections BEFORE tools so knowledge
         #    tools can detect them via ToolContext.has_knowledge()
         self._setup_knowledge(vector_conn)
+
+        # 3b. Resolve the owning user from the thread row so tools can forward
+        #     X-MCP-User-Id on orchestrator calls (fixes the agent's read-job
+        #     401 against require_approved_user / require_job_access endpoints).
+        if postgres_conn is not None and self.user_id is None:
+            try:
+                thread = await postgres_conn.get_thread(self.thread_id)
+                if thread and thread.get("user_id"):
+                    self.user_id = str(thread["user_id"])
+            except Exception as e:
+                # Non-fatal — tools that need user_id will fall back to the
+                # internal-only auth path. Lifecycle calls keep working.
+                logger.warning(
+                    "Could not resolve user_id for thread %s: %s",
+                    self.thread_id,
+                    e,
+                )
 
         # 4. Create tool context and load tools
         self._setup_tools(postgres_conn)
@@ -369,6 +391,7 @@ class PersistentSession:
             config=tool_config,
             _job_id=self.thread_id,
             _thread_id=self.thread_id,
+            user_id=self.user_id,
             _llm_config=self.config.llm,
             _instruction_files=self.config.instruction_files,
             shell_manager=self.shell_manager,  # Set before tool loading
