@@ -82,6 +82,56 @@ class TestOrchestratorClient:
         assert client._client is None
 
     @pytest.mark.asyncio
+    async def test_connect_includes_user_id_header_when_user_id_set(self):
+        """When the agent is operating on behalf of a known user (e.g. a
+        persistent-thread session), the orchestrator client must forward
+        X-MCP-User-Id alongside X-Internal-Key so the orchestrator's
+        _get_user_from_mcp_headers path can resolve the user. Without
+        this header the call is rejected as anonymous with a 401."""
+        with patch.dict(os.environ, {"MCP_INTERNAL_KEY": "test-internal-key"}):
+            client = OrchestratorClient(
+                orchestrator_url="http://localhost:8085",
+                pod_ip="10.0.0.5",
+                pod_port=8001,
+                hostname="test-agent",
+                config_name="creator",
+                pid=12345,
+                user_id="user-abc",
+            )
+            await client.connect()
+            try:
+                assert (
+                    client._client.headers.get("X-Internal-Key") == "test-internal-key"
+                )
+                assert client._client.headers.get("X-MCP-User-Id") == "user-abc"
+            finally:
+                await client.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_omits_user_id_header_when_not_set(self):
+        """Worker-mode clients (no user context) must continue to send
+        only X-Internal-Key. Adding an empty X-MCP-User-Id would still
+        fail the orchestrator's "if mcp_user_id and …" guard but it
+        could mask real bugs in tracing — keep the header absent."""
+        with patch.dict(os.environ, {"MCP_INTERNAL_KEY": "test-internal-key"}):
+            client = OrchestratorClient(
+                orchestrator_url="http://localhost:8085",
+                pod_ip="10.0.0.5",
+                pod_port=8001,
+                hostname="test-agent",
+                config_name="creator",
+                pid=12345,
+            )
+            await client.connect()
+            try:
+                assert (
+                    client._client.headers.get("X-Internal-Key") == "test-internal-key"
+                )
+                assert "X-MCP-User-Id" not in client._client.headers
+            finally:
+                await client.close()
+
+    @pytest.mark.asyncio
     async def test_register_success(self, client):
         """Test successful registration."""
         mock_response = MagicMock()

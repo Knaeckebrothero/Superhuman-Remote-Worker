@@ -199,11 +199,17 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
 
         # P4b: send X-Internal-Key so the orchestrator's require_internal gate
         # accepts the call. Without the key the endpoint 401s (it's pure
-        # agent-internal — no cockpit caller).
+        # agent-internal — no cockpit caller). When the calling session
+        # carries a user identity (persistent-thread sessions do; worker
+        # mode does not), also forward X-MCP-User-Id so the orchestrator's
+        # _get_user_from_mcp_headers can resolve the originating user for
+        # audit and any future user-scoped checks on this endpoint.
         headers: dict[str, str] = {}
         internal_key = os.getenv("MCP_INTERNAL_KEY", "")
         if internal_key:
             headers["X-Internal-Key"] = internal_key
+        if context.user_id:
+            headers["X-MCP-User-Id"] = context.user_id
 
         try:
             async with httpx.AsyncClient(timeout=30.0, headers=headers) as client:
