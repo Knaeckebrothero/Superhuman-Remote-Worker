@@ -692,11 +692,13 @@ class OpenCloudBackend:
         *,
         subpath: str = "",
     ) -> list[ProjectFolderEntry]:
-        """Recursive PROPFIND of a project folder Space.
+        """Recursive enumeration of a project folder Space, via repeated
+        ``PROPFIND`` with ``Depth: 1``.
 
-        Returns every descendant (files + directories). Order is the
-        order the server returned them — callers should sort by ``path``
-        if deterministic order matters.
+        OpenCloud (oCIS) rejects ``Depth: infinity`` with HTTP 400, so we
+        walk the tree breadth-first instead — one ``Depth: 1`` PROPFIND
+        per directory. Returns every descendant (files + directories);
+        order is breadth-first.
         """
         self._ensure_ready()
         drive_id = handle.native_id
@@ -708,9 +710,44 @@ class OpenCloudBackend:
                 retryable=False,
             )
         safe_drive = quote(drive_id, safe="")
-        safe_sub = quote(subpath.strip("/"), safe="/")
         base_path = f"/dav/spaces/{safe_drive}"
-        url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+        # Strip the leading prefix off of every href so callers get
+        # paths relative to the project root.
+        href_prefix = f"{base_path}/"
+
+        all_entries: list[ProjectFolderEntry] = []
+        # Breadth-first queue of subpaths to expand. Empty string = root.
+        queue: list[str] = [subpath.strip("/")]
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            safe_sub = quote(current, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            entries = await self._propfind_depth_one(url_path, href_prefix)
+            for entry in entries:
+                # Skip entries that fall outside ``subpath`` — Depth=1
+                # only returns immediate children, but defensive guard.
+                if current and not entry.path.startswith(current.rstrip("/") + "/"):
+                    if entry.path != current:
+                        continue
+                all_entries.append(entry)
+                if entry.is_dir and entry.path not in seen:
+                    queue.append(entry.path)
+        return all_entries
+
+    async def _propfind_depth_one(
+        self, url_path: str, href_prefix: str
+    ) -> list[ProjectFolderEntry]:
+        """Single ``Depth: 1`` PROPFIND that returns one folder's children.
+
+        Sent with no body — the server returns all known props by
+        default, same shape that ``_resolve_item_id`` (Depth=0) gets
+        back. Including a body XML had OpenCloud returning 400 in
+        testing.
+        """
         token = await self._get_service_token()
         try:
             resp = await self._client.request(
@@ -718,44 +755,26 @@ class OpenCloudBackend:
                 url_path,
                 headers={
                     "Authorization": f"Bearer {token}",
-                    "Depth": "infinity",
-                    "Content-Type": "application/xml",
+                    "Depth": "1",
                 },
-                content=(
-                    b'<?xml version="1.0"?>'
-                    b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
-                    b"<d:prop>"
-                    b"<d:resourcetype/>"
-                    b"<d:getcontentlength/>"
-                    b"<d:getetag/>"
-                    b"<d:getcontenttype/>"
-                    b"</d:prop>"
-                    b"</d:propfind>"
-                ),
             )
         except httpx.HTTPError as e:
             raise self._map_http_error(e) from e
         if resp.status_code == 404:
             raise CloudBackendError(
                 CloudBackendErrorKind.NOT_FOUND,
-                f"project folder {drive_id}/{subpath!r} not found",
+                f"path {url_path} not found",
                 backend=self.backend_id,
                 status_code=404,
             )
         if resp.status_code != 207:
             raise CloudBackendError(
                 CloudBackendErrorKind.UNKNOWN,
-                (
-                    f"unexpected PROPFIND status {resp.status_code} on "
-                    f"project folder {drive_id}"
-                ),
+                f"unexpected PROPFIND status {resp.status_code} for {url_path}",
                 backend=self.backend_id,
                 status_code=resp.status_code,
                 raw={"body": resp.text[:500]},
             )
-        # Strip the leading prefix so paths come out relative to the
-        # folder root. The href we get back is path-encoded ("a%20b").
-        href_prefix = f"{base_path}/"
         return _parse_propfind_entries(resp.text, href_prefix=href_prefix)
 
     @instrument_backend_op("get_project_folder_file_bytes")
