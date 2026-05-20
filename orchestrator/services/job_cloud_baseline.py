@@ -244,16 +244,15 @@ async def seed_project_folder_baseline(
 async def _read_head_commit(
     gitea_client: Any, repo_name: str, branch: str | None
 ) -> str | None:
-    """Return the SHA of HEAD on ``branch`` (or default branch if None)."""
-    commits = await gitea_client.get_commits(
-        repo_name,
-        sha=branch or "main",
-        page=1,
-        limit=1,
-    )
-    if not commits:
-        return None
-    return commits[0].get("sha")
+    """Return the SHA of HEAD on ``branch`` (or ``main`` if ``None``).
+
+    Uses Gitea's ``GET /branches/{branch}`` endpoint, which reliably
+    returns the head commit regardless of branch name (including names
+    containing ``/`` like ``job/abc123``). ``get_commits`` would NOT
+    work here — its ``git/commits`` endpoint is for specific commit
+    SHAs, not branch lookups, and returns 404 for branch names.
+    """
+    return await gitea_client.get_branch_head_sha(repo_name, branch or "main")
 
 
 def fire_baseline_seed(

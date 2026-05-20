@@ -490,15 +490,20 @@ class GiteaClient:
             if branch:
                 payload["branch"] = branch
 
+            contents_url = (
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/contents/{file_path}"
+            )
             if resp.status_code == 200:
-                # File exists — include SHA for update
+                # File exists — include SHA and PUT to update.
                 existing = resp.json()
                 payload["sha"] = existing["sha"]
-
-            resp = await client.put(
-                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                json=payload,
-            )
+                resp = await client.put(contents_url, json=payload)
+            else:
+                # File doesn't exist — POST to create. Gitea returns 422
+                # ``[SHA]: Required`` on PUT for non-existent files in some
+                # versions, so we must split the path.
+                resp = await client.post(contents_url, json=payload)
 
             if resp.status_code in (200, 201):
                 return True
@@ -942,6 +947,42 @@ class GiteaClient:
                 f"Failed to create branch '{new_branch}' in {repo_name}: {e}"
             )
             return False
+
+    async def get_branch_head_sha(self, repo_name: str, branch: str) -> str | None:
+        """Return the HEAD commit SHA for a branch.
+
+        Uses ``GET /repos/{owner}/{repo}/branches/{branch}``. ``branch``
+        may contain slashes (e.g. ``job/abc123``) — they're URL-encoded.
+
+        Returns:
+            Commit SHA on the branch's HEAD, or ``None`` if the branch
+            doesn't exist or the request fails.
+        """
+        if not self._initialized:
+            return None
+
+        from urllib.parse import quote as _q
+
+        client = self._get_client()
+        safe_branch = _q(branch, safe="")
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/branches/{safe_branch}",
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to read branch '{branch}' on {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+            data = resp.json()
+            return data.get("commit", {}).get("id")
+        except Exception as e:
+            logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
+            return None
 
     async def list_branches(self, repo_name: str) -> list[dict] | None:
         """List all branches in a repository.
