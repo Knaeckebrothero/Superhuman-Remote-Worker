@@ -301,6 +301,58 @@ def fire_baseline_seed(
     )
 
 
+async def _diff_files_by_tree(
+    *,
+    gitea_client: Any,
+    repo_name: str,
+    baseline: str,
+    head: str,
+) -> list[dict[str, str]] | None:
+    """Compute the file-level Mode A diff via Gitea tree comparison.
+
+    Gitea 1.22's ``compare/{base}...{head}.diff`` returns 404
+    ``BaseNotExist`` for raw commit SHAs (only branches/tags work
+    there — see gitea#19797 + linked issues). Tree comparison gives us
+    the same triage cheaply: list ``git/trees/{sha}?recursive=true`` at
+    both ends, build ``{path: blob_sha}`` maps, set-diff. Result is
+    scoped to ``projects/<slug>/*`` — anything outside isn't the
+    agent's project-folder edit.
+
+    Returns:
+        List of ``{path, status}`` (``added`` / ``modified`` /
+        ``deleted``), already filtered to ``projects/`` paths. ``None``
+        if a tree fetch failed.
+    """
+    base_tree = await gitea_client.list_tree(repo_name, baseline)
+    head_tree = await gitea_client.list_tree(repo_name, head)
+    if base_tree is None or head_tree is None:
+        return None
+
+    def _blobs(tree: list[dict[str, str]]) -> dict[str, str]:
+        return {
+            str(e.get("path", "")): str(e.get("sha", ""))
+            for e in tree
+            if e.get("type") == "blob" and e.get("path")
+        }
+
+    base_blobs = _blobs(base_tree)
+    head_blobs = _blobs(head_tree)
+    files: list[dict[str, str]] = []
+    for path in sorted(set(base_blobs.keys()) | set(head_blobs.keys())):
+        if not path.startswith("projects/"):
+            continue
+        in_base = path in base_blobs
+        in_head = path in head_blobs
+        if in_base and in_head:
+            if base_blobs[path] != head_blobs[path]:
+                files.append({"path": path, "status": "modified"})
+        elif in_head:
+            files.append({"path": path, "status": "added"})
+        else:
+            files.append({"path": path, "status": "deleted"})
+    return files
+
+
 async def capture_diff_for_mode_a_job(
     *,
     job: dict[str, Any],
@@ -310,9 +362,10 @@ async def capture_diff_for_mode_a_job(
     """At job completion, compute the Mode A diff.
 
     Reads the job's ``cloud_diff_baseline_commit`` and the current HEAD
-    of its branch, asks Gitea to compare them, and decides whether the
-    job should land in ``pending_review`` (diff non-empty) or proceed
-    to ``completed`` (diff empty / not a Mode A job).
+    of its branch, asks Gitea for tree listings at both ends, and
+    decides whether the job should land in ``pending_review`` (any
+    file under ``projects/`` changed) or proceed to ``completed``
+    (empty diff or not a Mode A job).
 
     Returns ``True`` if a non-empty diff was captured and
     ``jobs.diff_status`` was set to ``'pending'``; ``False`` otherwise.
@@ -337,35 +390,28 @@ async def capture_diff_for_mode_a_job(
         logger.warning("Mode A: job %s — couldn't read HEAD for diff capture", job_id)
         return False
     if head == baseline:
-        # No commits past the baseline → nothing to review.
         return False
-    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
-    if not diff_text or not diff_text.strip():
-        return False
-    # Scope check — does the diff touch projects/<slug>/?
-    # gitea's plain compare diff is unfiltered; we apply a path filter
-    # on the response. Format starts with "diff --git a/<path> b/<path>".
-    # The agent shouldn't be writing under projects/ outside its mounted
-    # slug, so any change under projects/ counts as a Mode A change.
-    has_project_change = False
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            # "diff --git a/projects/<slug>/file b/projects/<slug>/file"
-            parts = line.split(" ")
-            if len(parts) >= 3 and parts[2].startswith("a/projects/"):
-                has_project_change = True
-                break
-    if not has_project_change:
+    files = await _diff_files_by_tree(
+        gitea_client=gitea_client,
+        repo_name=repo_name,
+        baseline=baseline,
+        head=head,
+    )
+    if not files:
         logger.info(
-            "Mode A: job %s — diff is non-empty but contains no changes "
-            "under projects/; treating as no review",
+            "Mode A: job %s — no project-folder changes between baseline=%s "
+            "and head=%s; skipping diff capture",
             job_id,
+            baseline[:8],
+            head[:8],
         )
         return False
     await postgres_db.update_job_cloud_diff(job_id, diff_status="pending")
     logger.info(
-        "Mode A: job %s — captured diff baseline=%s head=%s; status -> pending_review",
+        "Mode A: job %s — captured %d-file diff baseline=%s head=%s; "
+        "status -> pending_review",
         job_id,
+        len(files),
         baseline[:8],
         head[:8],
     )
@@ -380,9 +426,9 @@ async def get_diff_summary(
     """Build a file-tree summary of the Mode A diff for a job.
 
     Returns ``{"baseline_commit": ..., "head_commit": ..., "files":
-    [{"path": ..., "status": "added"|"modified"|"deleted"}]}`` or ``None``
-    if the job has no baseline / no diff. Per-file diff content is
-    served lazily via the sibling endpoint.
+    [{"path": ..., "status": "added"|"modified"|"deleted"}]}`` or
+    ``None`` if the job has no baseline / no repo. Per-file diff
+    content is served lazily via the sibling endpoint.
     """
     baseline = job.get("cloud_diff_baseline_commit")
     if not baseline:
@@ -398,51 +444,17 @@ async def get_diff_summary(
             "head_commit": head or baseline,
             "files": [],
         }
-    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
-    if not diff_text:
-        return {
-            "baseline_commit": baseline,
-            "head_commit": head,
-            "files": [],
-        }
+    files = await _diff_files_by_tree(
+        gitea_client=gitea_client,
+        repo_name=repo_name,
+        baseline=baseline,
+        head=head,
+    )
     return {
         "baseline_commit": baseline,
         "head_commit": head,
-        "files": _parse_diff_file_list(diff_text),
+        "files": files or [],
     }
-
-
-def _parse_diff_file_list(diff_text: str) -> list[dict[str, str]]:
-    """Pull file-level statuses out of a unified diff blob.
-
-    Walks ``diff --git`` headers, classifies each file as ``added`` /
-    ``modified`` / ``deleted`` based on adjacent ``new file mode`` /
-    ``deleted file mode`` indicators. Only files under ``projects/``
-    are surfaced — the agent's own scratch files don't belong in the
-    Mode A diff.
-    """
-    files: list[dict[str, str]] = []
-    current: dict[str, str] | None = None
-    for raw in diff_text.splitlines():
-        if raw.startswith("diff --git "):
-            if current and current.get("path", "").startswith("projects/"):
-                files.append(current)
-            # New file block. "diff --git a/<path> b/<path>"
-            parts = raw.split(" ")
-            path = ""
-            for p in parts[2:]:
-                if p.startswith("a/"):
-                    path = p[len("a/") :]
-                    break
-            current = {"path": path, "status": "modified"}
-        elif current is not None:
-            if raw.startswith("new file mode"):
-                current["status"] = "added"
-            elif raw.startswith("deleted file mode"):
-                current["status"] = "deleted"
-    if current and current.get("path", "").startswith("projects/"):
-        files.append(current)
-    return files
 
 
 def _strip_project_prefix(gitea_path: str, slug: str) -> str | None:
@@ -573,8 +585,18 @@ async def apply_diff_to_cloud(
     if not head:
         return {"applied": 0, "deleted": 0, "errors": ["could not read HEAD"]}
 
-    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
-    files = _parse_diff_file_list(diff_text or "")
+    files = await _diff_files_by_tree(
+        gitea_client=gitea_client,
+        repo_name=repo_name,
+        baseline=baseline,
+        head=head,
+    )
+    if files is None:
+        return {
+            "applied": 0,
+            "deleted": 0,
+            "errors": ["could not read git tree at baseline or head"],
+        }
     applied = 0
     deleted = 0
     errors: list[str] = []
