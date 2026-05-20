@@ -25,7 +25,7 @@ import logging
 import re
 import time
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -34,6 +34,7 @@ from .config import OpenCloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -78,6 +79,62 @@ _FOLDER_EDITOR_ROLE_WEIGHT = 60  # "Can edit" — subfolder invite
 _FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
+
+
+# PROPFIND response patterns — module-level so they compile once. Used by
+# list_project_folder to walk a Space recursively. The XML matches the
+# existing regex-based approach in _resolve_item_id rather than pulling
+# in a full XML parser; OpenCloud's PROPFIND output is structurally
+# regular enough that this is safe.
+_PROPFIND_RESPONSE_RE = re.compile(
+    r"<d:response[^>]*>(.*?)</d:response>", re.DOTALL | re.IGNORECASE
+)
+_PROPFIND_HREF_RE = re.compile(r"<d:href[^>]*>([^<]+)</d:href>", re.IGNORECASE)
+_PROPFIND_COLLECTION_RE = re.compile(r"<d:collection\s*/>", re.IGNORECASE)
+_PROPFIND_CONTENTLENGTH_RE = re.compile(
+    r"<d:getcontentlength[^>]*>(\d+)</d:getcontentlength>", re.IGNORECASE
+)
+_PROPFIND_ETAG_RE = re.compile(r"<d:getetag[^>]*>([^<]+)</d:getetag>", re.IGNORECASE)
+_PROPFIND_CONTENTTYPE_RE = re.compile(
+    r"<d:getcontenttype[^>]*>([^<]+)</d:getcontenttype>", re.IGNORECASE
+)
+
+
+def _parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderEntry]:
+    """Pull file + directory entries out of a Depth=infinity PROPFIND body.
+
+    ``href_prefix`` is the URL path prefix to strip so returned paths are
+    relative to the folder root (no leading slash). Entries pointing at
+    the root itself (empty path after stripping) are dropped. The order
+    matches the server's response order — caller sorts if needed.
+    """
+    entries: list[ProjectFolderEntry] = []
+    for resp in _PROPFIND_RESPONSE_RE.finditer(xml):
+        block = resp.group(1)
+        href_match = _PROPFIND_HREF_RE.search(block)
+        if not href_match:
+            continue
+        href = href_match.group(1).strip()
+        if not href.startswith(href_prefix):
+            continue
+        rel_quoted = href[len(href_prefix) :].rstrip("/")
+        if not rel_quoted:
+            # The folder root itself shows up first; skip it.
+            continue
+        is_dir = bool(_PROPFIND_COLLECTION_RE.search(block))
+        size_match = _PROPFIND_CONTENTLENGTH_RE.search(block)
+        etag_match = _PROPFIND_ETAG_RE.search(block)
+        ctype_match = _PROPFIND_CONTENTTYPE_RE.search(block)
+        entries.append(
+            ProjectFolderEntry(
+                path=unquote(rel_quoted),
+                is_dir=is_dir,
+                size=int(size_match.group(1)) if size_match else 0,
+                etag=etag_match.group(1).strip().strip('"') if etag_match else "",
+                content_type=ctype_match.group(1).strip() if ctype_match else "",
+            )
+        )
+    return entries
 
 
 class OpenCloudBackend:
@@ -627,6 +684,131 @@ class OpenCloudBackend:
         # by default.
         safe_id = quote(drive_id, safe="")
         return f"{self._public_url}/files/spaces/{safe_id}"
+
+    @instrument_backend_op("list_project_folder")
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        """Recursive PROPFIND of a project folder Space.
+
+        Returns every descendant (files + directories). Order is the
+        order the server returned them — callers should sort by ``path``
+        if deterministic order matters.
+        """
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "list_project_folder: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        safe_sub = quote(subpath.strip("/"), safe="/")
+        base_path = f"/dav/spaces/{safe_drive}"
+        url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Depth": "infinity",
+                    "Content-Type": "application/xml",
+                },
+                content=(
+                    b'<?xml version="1.0"?>'
+                    b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+                    b"<d:prop>"
+                    b"<d:resourcetype/>"
+                    b"<d:getcontentlength/>"
+                    b"<d:getetag/>"
+                    b"<d:getcontenttype/>"
+                    b"</d:prop>"
+                    b"</d:propfind>"
+                ),
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"project folder {drive_id}/{subpath!r} not found",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 207:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                (
+                    f"unexpected PROPFIND status {resp.status_code} on "
+                    f"project folder {drive_id}"
+                ),
+                backend=self.backend_id,
+                status_code=resp.status_code,
+                raw={"body": resp.text[:500]},
+            )
+        # Strip the leading prefix so paths come out relative to the
+        # folder root. The href we get back is path-encoded ("a%20b").
+        href_prefix = f"{base_path}/"
+        return _parse_propfind_entries(resp.text, href_prefix=href_prefix)
+
+    @instrument_backend_op("get_project_folder_file_bytes")
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        """GET one file out of a project folder Space."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        rel = path.lstrip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_path = quote(rel, safe="/")
+        url = f"/dav/spaces/{safe_drive}/{safe_path}"
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in drive {drive_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 200:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"GET file {path!r}: unexpected status {resp.status_code}",
+                backend=self.backend_id,
+                status_code=resp.status_code,
+            )
+        return resp.content
 
     def get_project_folder_webdav_url(
         self, handle: ProjectFolderHandle

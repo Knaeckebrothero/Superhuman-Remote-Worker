@@ -22,6 +22,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -152,6 +153,38 @@ class MainCloudBackend(Protocol):
     def get_project_folder_webdav_url(
         self, handle: ProjectFolderHandle
     ) -> Optional[str]: ...
+
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        """Recursive inventory of a project folder via WebDAV ``PROPFIND``.
+
+        ``subpath`` is relative to the folder root (slash-separated, no
+        leading slash). Empty means "walk from root." Returned entries
+        list every descendant file and directory, sorted by ``path``.
+
+        Used by the job cloud-export Mode A baseline-seed
+        (docs/features/job_cloud_export.md §3.1) to enumerate what to
+        push into Gitea before the agent starts.
+        """
+        ...
+
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        """Read one file's raw bytes from a project folder.
+
+        ``path`` is relative to the folder root. Raises
+        ``CloudBackendError(NOT_FOUND)`` if the file is missing.
+        Returns the file body as-is so binary content survives.
+        """
+        ...
 
     # ------------------------------------------------------------- Session folders
     async def ensure_session_folder(

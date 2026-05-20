@@ -3948,6 +3948,34 @@ async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
                         f"Failed to grant Gitea access for job {job_id_str}: {e}"
                     )
 
+            # Mode A baseline seed (job_cloud_export.md §3.1). Fire-and-
+            # forget — runs in a background task that walks the project's
+            # cloud folder and pushes text files into the job's Gitea repo
+            # under projects/<slug>/. While it runs, the job carries
+            # context.cloud_baseline.state='seeding' and the dispatcher
+            # gate skips it. When done, it flips to 'ready' (or 'failed'
+            # on error — we still dispatch so the job doesn't deadlock).
+            # Only fires when the project actually has a cloud folder
+            # provisioned; loose jobs and projects without cloud_folder
+            # handle skip this path.
+            if project_id and result.get("repo_name") and gitea_client.is_initialized:
+                try:
+                    project_row = await postgres_db.get_project(project_id)
+                except Exception:
+                    project_row = None
+                if project_row and project_row.get("main_cloud_folder_handle"):
+                    from services.job_cloud_baseline import fire_baseline_seed
+
+                    fire_baseline_seed(
+                        job_id=job_id_str,
+                        project=project_row,
+                        repo_name=result["repo_name"],
+                        branch=result.get("branch_name"),
+                        postgres_db=postgres_db,
+                        gitea_client=gitea_client,
+                        main_cloud_router=main_cloud_router,
+                    )
+
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
             new_job_id = str(result["id"])
@@ -7350,6 +7378,35 @@ async def complete_job(
 
         # 1. Determine and set the new job status
         new_status, error_message = determine_job_status(job, result)
+
+        # 1a. Mode A diff capture (job_cloud_export.md §3.3). If this is a
+        # project-attached job that received a baseline at dispatch, see
+        # whether the agent made changes under projects/<slug>/. If so,
+        # override new_status to pending_review and stamp
+        # diff_status='pending'. Skipped for failed/cancelled exits — only
+        # an actually-completed run gets a diff review.
+        if (
+            job.get("cloud_diff_baseline_commit")
+            and new_status in ("completed", "pending_review")
+            and gitea_client.is_initialized
+        ):
+            try:
+                from services.job_cloud_baseline import capture_diff_for_mode_a_job
+
+                captured = await capture_diff_for_mode_a_job(
+                    job=job,
+                    postgres_db=postgres_db,
+                    gitea_client=gitea_client,
+                )
+                if captured and new_status == "completed":
+                    new_status = "pending_review"
+                    actions.append("mode A diff captured -> pending_review")
+            except Exception as e:
+                logger.warning(
+                    f"Mode A: diff capture failed for job {job_id} ({e}); "
+                    "proceeding with original status"
+                )
+
         if new_status:
             kwargs: dict[str, Any] = {"status": new_status}
             if error_message:
@@ -8349,6 +8406,112 @@ async def write_workspace_file(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+@app.get("/api/jobs/{job_id}/diff")
+async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
+    """Mode A diff summary for a project-attached job.
+
+    Returns ``{baseline_commit, head_commit, files: [{path, status}]}``
+    where each ``status`` is ``added`` / ``modified`` / ``deleted``.
+    Per-file diff content is served separately via the sibling
+    ``/diff/{path}`` endpoint.
+
+    Returns 404 when the job has no baseline (loose job, or a pre-Mode-A
+    project job). Empty ``files`` list means no changes under
+    ``projects/<slug>/`` — the agent didn't touch the mounted folder.
+
+    See docs/features/job_cloud_export.md §5.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    if not job.get("cloud_diff_baseline_commit"):
+        raise HTTPException(
+            status_code=404,
+            detail="Job has no Mode A diff baseline.",
+        )
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available.")
+    from services.job_cloud_baseline import get_diff_summary
+
+    summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    if summary is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Diff unavailable (no repo or no head).",
+        )
+    return {
+        "job_id": job_id,
+        "diff_status": job.get("diff_status"),
+        **summary,
+    }
+
+
+@app.get("/api/jobs/{job_id}/diff/{file_path:path}")
+async def get_job_diff_file(
+    request: Request, job_id: str, file_path: str
+) -> dict[str, Any]:
+    """Mode A per-file diff content.
+
+    Returns ``{path, status, old_content, new_content}`` for one file in
+    the diff. ``old_content`` is read from the baseline commit;
+    ``new_content`` from the head of the job's branch. Either side can
+    be ``None`` (added → no old, deleted → no new).
+
+    Only files under ``projects/`` are accepted — the Mode A diff is
+    scoped to the project-folder mount.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+    baseline = job.get("cloud_diff_baseline_commit")
+    if not baseline:
+        raise HTTPException(
+            status_code=404,
+            detail="Job has no Mode A diff baseline.",
+        )
+    if not file_path.startswith("projects/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Per-file diff is scoped to projects/<slug>/* paths.",
+        )
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available.")
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name") or "main"
+    if not repo_name:
+        raise HTTPException(status_code=404, detail="Job repo not found.")
+
+    # Pull the diff summary to learn the file's status (added/modified/deleted).
+    from services.job_cloud_baseline import get_diff_summary
+
+    summary = await get_diff_summary(job=job, gitea_client=gitea_client)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="Diff unavailable for this job.")
+    file_entry = next(
+        (f for f in summary.get("files", []) if f["path"] == file_path),
+        None,
+    )
+    if file_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Path '{file_path}' is not in the diff.",
+        )
+    status = file_entry["status"]
+    old_content = None
+    new_content = None
+    if status in ("modified", "deleted"):
+        old_content = await gitea_client.get_file_content(
+            repo_name, file_path, ref=baseline
+        )
+    if status in ("modified", "added"):
+        new_content = await gitea_client.get_file_content(
+            repo_name, file_path, ref=branch
+        )
+    return {
+        "job_id": job_id,
+        "path": file_path,
+        "status": status,
+        "old_content": old_content,
+        "new_content": new_content,
+    }
 
 
 @app.post("/api/jobs/{job_id}/export-to-shared-folder")

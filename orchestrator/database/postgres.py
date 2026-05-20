@@ -2388,6 +2388,13 @@ class PostgresDB:
                 WHERE j.status IN ('created', 'paused')
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
+                  -- Mode A: skip jobs whose cloud-folder baseline is still
+                  -- being seeded. The seed task flips this to 'ready' (or
+                  -- 'failed', in which case we still dispatch so the job
+                  -- doesn't deadlock; loss is just an empty diff).
+                  AND COALESCE(
+                      j.context->'cloud_baseline'->>'state', 'ready'
+                  ) <> 'seeding'
                   AND NOT EXISTS (
                       WITH RECURSIVE ancestors AS (
                           SELECT parent_job_id
