@@ -984,6 +984,64 @@ class GiteaClient:
             logger.warning(f"Failed to read branch '{branch}' on {repo_name}: {e}")
             return None
 
+    async def list_tree(self, repo_name: str, ref: str) -> list[dict[str, str]] | None:
+        """Recursive tree listing at a specific ref.
+
+        Returns one entry per blob/tree under the ref's root, each as
+        ``{path, type, sha}``. Used by Mode A diff capture as a
+        replacement for Gitea 1.22's ``compare/{base}...{head}.diff``
+        which returns 404 ``BaseNotExist`` for raw SHAs (only branches
+        and tags work there, per gitea#19797 et al.). Tree comparison
+        between baseline + head gives us the same ``added`` /
+        ``modified`` / ``deleted`` triage without depending on the
+        broken compare endpoint.
+
+        Args:
+            repo_name: Repository name
+            ref: Commit SHA, branch, or tag
+
+        Returns:
+            List of ``{path, type, sha}`` for every descendant, or
+            ``None`` on failure. Trees and blobs are both included;
+            callers typically filter ``type == 'blob'``.
+        """
+        if not self._initialized:
+            return None
+        from urllib.parse import quote as _q
+
+        client = self._get_client()
+        safe_ref = _q(ref, safe="")
+        out: list[dict[str, str]] = []
+        page = 1
+        per_page = 1000
+        try:
+            while True:
+                resp = await client.get(
+                    f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                    f"/git/trees/{safe_ref}",
+                    params={"recursive": "true", "per_page": per_page, "page": page},
+                )
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Failed to list tree {ref} on {repo_name} "
+                        f"(status {resp.status_code})"
+                    )
+                    return None
+                data = resp.json()
+                entries = data.get("tree") or []
+                out.extend(entries)
+                # Truncated trees: keep paging.
+                truncated = data.get("truncated")
+                if not truncated or not entries:
+                    break
+                page += 1
+            return out
+        except Exception as e:
+            logger.warning(f"Failed to list tree {ref} on {repo_name}: {e}")
+            return None
+
     async def list_branches(self, repo_name: str) -> list[dict] | None:
         """List all branches in a repository.
 
