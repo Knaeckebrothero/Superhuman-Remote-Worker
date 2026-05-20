@@ -3,6 +3,59 @@ import {TranslocoPipe} from '@jsverse/transloco';
 import cronstrue from 'cronstrue';
 import parser from 'cron-parser';
 
+export interface CronSummary {
+  valid: boolean;
+  humanized: string;
+  nextRuns: string[];
+  error: string | null;
+}
+
+/** Build the cron preview state for a given expression / timezone.
+ *
+ *  Exported as a pure function so unit tests can exercise it without
+ *  TestBed + template compilation. The component's `summary` computed
+ *  is a one-line wrapper that feeds the input signals into this. */
+export function computeCronSummary(
+  cronExpr: string,
+  timezone: string,
+  previewCount: number,
+  now: Date = new Date(),
+): CronSummary {
+  const expr = cronExpr.trim();
+  const tz = timezone || 'UTC';
+  if (!expr) {
+    return {valid: false, humanized: '', nextRuns: [], error: null};
+  }
+  let humanized: string;
+  try {
+    humanized = cronstrue.toString(expr, {use24HourTimeFormat: true});
+  } catch (err) {
+    return {
+      valid: false,
+      humanized: '',
+      nextRuns: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const runs: string[] = [];
+  try {
+    const it = parser.parseExpression(expr, {tz, currentDate: now});
+    for (let i = 0; i < previewCount; i++) {
+      runs.push(it.next().toDate().toLocaleString(undefined, {timeZone: tz}));
+    }
+  } catch (err) {
+    return {
+      valid: false,
+      humanized,
+      nextRuns: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  return {valid: true, humanized, nextRuns: runs, error: null};
+}
+
 /**
  * Renders a humanized cron description plus the next N firing times in
  * the user's chosen timezone.
@@ -90,39 +143,7 @@ export class CronPreviewComponent {
   /** How many future fires to show. */
   readonly previewCount = input<number>(5);
 
-  readonly summary = computed(() => {
-    const expr = this.cronExpr().trim();
-    const tz = this.timezone() || 'UTC';
-    if (!expr) {
-      return {valid: false, humanized: '', nextRuns: [] as string[], error: null};
-    }
-    let humanized: string;
-    try {
-      humanized = cronstrue.toString(expr, {use24HourTimeFormat: true});
-    } catch (err) {
-      return {
-        valid: false,
-        humanized: '',
-        nextRuns: [],
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-
-    const runs: string[] = [];
-    try {
-      const it = parser.parseExpression(expr, {tz, currentDate: new Date()});
-      for (let i = 0; i < this.previewCount(); i++) {
-        runs.push(it.next().toDate().toLocaleString(undefined, {timeZone: tz}));
-      }
-    } catch (err) {
-      return {
-        valid: false,
-        humanized,
-        nextRuns: [],
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-
-    return {valid: true, humanized, nextRuns: runs, error: null};
-  });
+  readonly summary = computed<CronSummary>(() =>
+    computeCronSummary(this.cronExpr(), this.timezone(), this.previewCount()),
+  );
 }
