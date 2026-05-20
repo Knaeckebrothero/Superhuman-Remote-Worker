@@ -101,24 +101,28 @@ _PROPFIND_CONTENTTYPE_RE = re.compile(
 
 
 def _parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderEntry]:
-    """Pull file + directory entries out of a Depth=infinity PROPFIND body.
+    """Pull file + directory entries out of a PROPFIND multistatus body.
 
     ``href_prefix`` is the URL path prefix to strip so returned paths are
-    relative to the folder root (no leading slash). Entries pointing at
-    the root itself (empty path after stripping) are dropped. The order
-    matches the server's response order — caller sorts if needed.
+    relative to the folder root (no leading slash). Both ``href_prefix``
+    and the ``<d:href>`` values are URL-decoded before comparison —
+    OpenCloud's response uses literal ``$`` in href even when the request
+    URL had it as ``%24``, which would otherwise break a naive
+    ``startswith`` check. Entries pointing at the root itself (empty path
+    after stripping) are dropped.
     """
+    decoded_prefix = unquote(href_prefix)
     entries: list[ProjectFolderEntry] = []
     for resp in _PROPFIND_RESPONSE_RE.finditer(xml):
         block = resp.group(1)
         href_match = _PROPFIND_HREF_RE.search(block)
         if not href_match:
             continue
-        href = href_match.group(1).strip()
-        if not href.startswith(href_prefix):
+        href = unquote(href_match.group(1).strip())
+        if not href.startswith(decoded_prefix):
             continue
-        rel_quoted = href[len(href_prefix) :].rstrip("/")
-        if not rel_quoted:
+        rel_path = href[len(decoded_prefix) :].rstrip("/")
+        if not rel_path:
             # The folder root itself shows up first; skip it.
             continue
         is_dir = bool(_PROPFIND_COLLECTION_RE.search(block))
@@ -127,7 +131,7 @@ def _parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolder
         ctype_match = _PROPFIND_CONTENTTYPE_RE.search(block)
         entries.append(
             ProjectFolderEntry(
-                path=unquote(rel_quoted),
+                path=rel_path,
                 is_dir=is_dir,
                 size=int(size_match.group(1)) if size_match else 0,
                 etag=etag_match.group(1).strip().strip('"') if etag_match else "",
