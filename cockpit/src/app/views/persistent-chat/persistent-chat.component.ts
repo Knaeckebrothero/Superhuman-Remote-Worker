@@ -14,7 +14,7 @@ import {
 import {NgTemplateOutlet, TitleCasePipe} from '@angular/common';
 import {HttpClient} from '@angular/common/http';
 import {FormsModule} from '@angular/forms';
-import {RouterLink} from '@angular/router';
+import {Router, RouterLink} from '@angular/router';
 import {firstValueFrom, Subscription} from 'rxjs';
 import {MarkdownComponent} from 'ngx-markdown';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -265,7 +265,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                 </button>
               }
             }
-            <app-button variant="ghost" size="sm" (clicked)="chat.disconnect()">
+            <app-button variant="ghost" size="sm" (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
           }
@@ -611,7 +611,7 @@ const CATEGORY_LABELS: Record<string, string> = {
                     </div>
                   }
                 </div>
-              } @else if (chat.threadStatus() !== 'ended') {
+              } @else if (chat.isStartingSession()) {
                 <div class="startup-wrapper">
                   <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
                 </div>
@@ -621,9 +621,11 @@ const CATEGORY_LABELS: Record<string, string> = {
         }
 
         <!-- Startup/resume card: shown when history exists but session not yet ready.
-             Suppressed for ended threads — the F3 resume card below is the call-to-action
-             there, and there's no actual provisioning in flight until the user opts in. -->
-        @if (chat.turns().length && !chat.sessionReady() && !chat.isStreaming() && chat.threadStatus() !== 'ended') {
+             Gated on isStartingSession so it only renders during an active start
+             (creating thread, handshaking, or waiting for the agent-ready
+             frame) — never after a user-initiated disconnect, which nulls
+             threadStatus and would otherwise leave the spinner running. -->
+        @if (chat.turns().length && !chat.isStreaming() && chat.isStartingSession()) {
           <div class="startup-wrapper resume">
             <ng-container *ngTemplateOutlet="startupCardTpl"></ng-container>
           </div>
@@ -1001,6 +1003,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly fileHandling = inject(FileHandlingService);
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
+    private readonly router = inject(Router);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
@@ -1893,6 +1896,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         } finally {
             this.isResuming.set(false);
         }
+    }
+
+    disconnectAndLeave(): void {
+        this.chat.disconnect();
+        this.router.navigate(['/sessions']);
     }
 
     private startIdePolling(threadId: string): void {

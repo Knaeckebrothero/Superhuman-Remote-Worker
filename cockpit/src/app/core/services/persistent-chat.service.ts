@@ -127,6 +127,21 @@ export class PersistentChatService {
     readonly isConnected = computed(() => this.connectionState() === 'connected');
     readonly threadId = signal<string | null>(null);
 
+    /**
+     * True iff a session start is *actively in flight* — POST creating a thread,
+     * SSE/WS handshaking, or connected-but-waiting-for-the-agent-ready frame.
+     * Gates the "Starting session" card so it never lingers after disconnect()
+     * (which nulls `threadStatus`, so a `threadStatus !== 'ended'` check alone
+     * would render a fake spinner indefinitely).
+     */
+    readonly isStartingSession = computed(() =>
+        !this.sessionReady() &&
+        this.threadStatus() !== 'ended' &&
+        (this.isCreating() ||
+            this.connectionState() === 'connecting' ||
+            this.connectionState() === 'connected'),
+    );
+
     // --- Reconnect surface (kept for back-compat with the resume banner UI).
     // EventSource handles reconnect natively, so these mostly stay quiet —
     // we only bump `reconnectAttempt` while the SSE is in CONNECTING after an
