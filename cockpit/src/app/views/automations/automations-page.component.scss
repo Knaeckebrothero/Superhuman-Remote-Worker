@@ -49,6 +49,39 @@
   border: 1px solid var(--border-warn, rgba(200, 140, 40, 0.3));
 }
 
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2, 0.5rem);
+  padding: var(--space-2, 0.5rem) var(--space-3, 0.75rem);
+  background: var(--surface-accent, rgba(64, 96, 192, 0.08));
+  border: 1px solid var(--border-accent, rgba(64, 96, 192, 0.3));
+  border-radius: var(--radius-tag, 999px);
+  font-size: 0.9rem;
+  align-self: flex-start;
+
+  &__label {
+    font-weight: 500;
+  }
+
+  &__clear {
+    margin-left: var(--space-2, 0.5rem);
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-accent, #4060c0);
+    font-weight: 500;
+    font-size: 0.9rem;
+    text-decoration: underline;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+      color: var(--text-accent-hover, #2848a8);
+    }
+  }
+}
+
 .loading-row {
   display: flex;
   justify-content: center;

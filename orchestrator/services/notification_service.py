@@ -210,6 +210,83 @@ class NotificationService:
 
         return results
 
+    async def notify_automation_auto_disabled(
+        self,
+        user_id: str,
+        automation_id: str,
+        automation_name: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Notify the owner that their automation was auto-disabled.
+
+        Called from ``cron_dispatcher`` after the dispatcher trips a safety
+        guard (max_fires_per_day or invalid cron expression). Sends an SSE
+        event for real-time cockpit updates plus an email if the user has
+        email notifications enabled. Does NOT respect quiet hours — system
+        safety events should reach the owner promptly so they can fix and
+        re-enable.
+
+        The disable itself is already committed when this is called; this
+        method is best-effort and its failures are non-fatal.
+        """
+        if not self._available:
+            return {"error": "NotificationService not initialized"}
+
+        results: dict[str, Any] = {}
+        user_channels = await self._get_user_channels(user_id)
+
+        display_name = automation_name or "(unnamed)"
+        subject = f"Automation '{display_name}' was auto-paused"
+        body_md = (
+            f"Your automation **{display_name}** was paused automatically "
+            f"because: {reason}\n\n"
+            f"Edit the automation in the cockpit to fix the underlying "
+            f"issue and re-enable it."
+        )
+
+        # SSE broadcast — real-time cockpit notification.
+        if self._notification_feed:
+            try:
+                self._notification_feed.broadcast(
+                    user_id=user_id,
+                    event_type="automation_auto_disabled",
+                    data={
+                        "automation_id": automation_id,
+                        "automation_name": automation_name,
+                        "reason": reason,
+                        "cockpit_url": f"{self._cockpit_url}/automations",
+                    },
+                )
+                results["sse"] = True
+            except Exception as e:
+                logger.warning("SSE broadcast failed for auto-disable: %s", e)
+                results["sse"] = False
+
+        # Email — if the user has the email channel enabled and we have
+        # SMTP configured. Failures are logged; the SSE event is the
+        # primary user-visible signal in the cockpit.
+        if user_channels.get("email", True) and self._email_service and self._db:
+            try:
+                user = await self._db.get_user(user_id)
+            except Exception:
+                user = None
+            if user and user.get("email"):
+                try:
+                    results[
+                        "email"
+                    ] = await self._email_service.send_system_notification(
+                        to=user["email"],
+                        to_name=user.get("display_name") or "User",
+                        subject=subject,
+                        body_md=body_md,
+                        cockpit_path="/automations",
+                    )
+                except Exception as e:
+                    logger.warning("Auto-disable email failed: %s", e)
+                    results["email"] = False
+
+        return results
+
     async def dispatch_digest(
         self,
         user_id: str,

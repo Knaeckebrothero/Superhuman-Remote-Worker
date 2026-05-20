@@ -36,6 +36,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 
 from services.automations import create_job_from_automation
+from services.notification_service import notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +120,17 @@ async def _tick(db: Any) -> int:
 async def _process_one_due_automation(db: Any) -> bool:
     """Atomically claim, fire, and advance one due automation.
 
-    Returns True if a row was processed (fired or skipped), False when
-    nothing is due. All DB writes for this automation share one
-    transaction so SKIP LOCKED can do its job — concurrent dispatcher
+    Returns True if a row was processed (fired, skipped, or disabled),
+    False when nothing is due. All DB writes for this automation share
+    one transaction so SKIP LOCKED can do its job — concurrent dispatcher
     replicas see disjoint sets of due rows.
+
+    Auto-disable notifications are deferred until after the transaction
+    commits so we don't notify the owner about a disable that got rolled
+    back by an unrelated failure.
     """
+    pending_disable: dict[str, str] | None = None
+
     async with db.acquire() as conn:
         async with conn.transaction():
             row = await db.fetch_next_due_cron_automation(conn)
@@ -153,61 +160,110 @@ async def _process_one_due_automation(db: Any) -> bool:
                     automation_id,
                     cron_expr,
                 )
+                reason = f"invalid cron expression: {exc}"
                 await db.auto_disable_automation(
                     conn,
                     automation_id,
-                    reason=f"invalid cron expression: {exc}",
+                    reason=reason,
                 )
-                return True
+                pending_disable = _build_disable_payload(row, reason)
+            else:
+                # Catchup-window skip: if the scheduled time is older than the
+                # grace window the orchestrator was down too long to honor it.
+                # Advance to the next future tick without firing.
+                lag = now_utc - scheduled_for
+                if lag > catchup_window:
+                    logger.warning(
+                        "Automation %s missed fire (scheduled %s, lag %.1fs > catchup %.1fs) — skipping",
+                        automation_id,
+                        scheduled_for.isoformat(),
+                        lag.total_seconds(),
+                        catchup_window.total_seconds(),
+                    )
+                    await db.skip_automation_fire(
+                        conn,
+                        automation_id,
+                        next_run_at=next_run,
+                    )
+                else:
+                    # max_fires_per_day guard. fires_today_* on the row is a
+                    # rolling counter — if today's date matches and we're at
+                    # the cap, disable the automation. The owner is
+                    # notified after commit (see _emit_auto_disable_notification).
+                    fires_today_date = row.get("fires_today_date")
+                    fires_today_count = int(row.get("fires_today_count") or 0)
+                    max_fires = int(row.get("max_fires_per_day") or 100)
+                    if (
+                        fires_today_date == now_utc.date()
+                        and fires_today_count >= max_fires
+                    ):
+                        reason = f"max_fires_per_day={max_fires} reached"
+                        await db.auto_disable_automation(
+                            conn,
+                            automation_id,
+                            reason=reason,
+                        )
+                        pending_disable = _build_disable_payload(row, reason)
+                    else:
+                        # Fire the job. If create_job_from_automation raises,
+                        # the transaction rolls back and the row stays
+                        # unfired; the next tick will re-claim it.
+                        # At-least-once semantics.
+                        job = await create_job_from_automation(
+                            db, row, trigger_kind="cron"
+                        )
+                        await db.advance_automation_after_fire(
+                            conn,
+                            automation_id,
+                            next_run_at=next_run,
+                            scheduled_for=scheduled_for,
+                            job_id=str(job["id"]),
+                        )
 
-            # Catchup-window skip: if the scheduled time is older than the
-            # grace window the orchestrator was down too long to honor it.
-            # Advance to the next future tick without firing.
-            lag = now_utc - scheduled_for
-            if lag > catchup_window:
-                logger.warning(
-                    "Automation %s missed fire (scheduled %s, lag %.1fs > catchup %.1fs) — skipping",
-                    automation_id,
-                    scheduled_for.isoformat(),
-                    lag.total_seconds(),
-                    catchup_window.total_seconds(),
-                )
-                await db.skip_automation_fire(
-                    conn,
-                    automation_id,
-                    next_run_at=next_run,
-                )
-                return True
+    # Post-commit side effects. Notification failures are logged but never
+    # re-raised — the auto-disable is the user-visible safety signal; the
+    # notification is the prompt.
+    if pending_disable is not None:
+        await _emit_auto_disable_notification(pending_disable)
 
-            # max_fires_per_day guard. fires_today_* on the row is a
-            # rolling counter — if today's date matches and we're at the
-            # cap, disable the automation and notify (notification path
-            # is owner_id → notification_service; not wired in v0 — the
-            # disabled row is the user-visible signal).
-            fires_today_date = row.get("fires_today_date")
-            fires_today_count = int(row.get("fires_today_count") or 0)
-            max_fires = int(row.get("max_fires_per_day") or 100)
-            if fires_today_date == now_utc.date() and fires_today_count >= max_fires:
-                await db.auto_disable_automation(
-                    conn,
-                    automation_id,
-                    reason=f"max_fires_per_day={max_fires} reached",
-                )
-                return True
+    return True
 
-            # Fire the job. If create_job_from_automation raises, the
-            # transaction rolls back and the row stays unfired; the next
-            # tick will re-claim it. At-least-once semantics.
-            job = await create_job_from_automation(db, row, trigger_kind="cron")
 
-            await db.advance_automation_after_fire(
-                conn,
-                automation_id,
-                next_run_at=next_run,
-                scheduled_for=scheduled_for,
-                job_id=str(job["id"]),
-            )
-            return True
+def _build_disable_payload(row: dict[str, Any], reason: str) -> dict[str, str]:
+    """Capture the fields needed for the auto-disable notification.
+
+    Built inside the transaction so the values are coherent with the
+    state being committed; the actual notification fires after commit.
+    """
+    return {
+        "user_id": str(row["owner_id"]),
+        "automation_id": str(row["id"]),
+        "automation_name": row.get("name") or "",
+        "reason": reason,
+    }
+
+
+async def _emit_auto_disable_notification(payload: dict[str, str]) -> None:
+    """Best-effort owner notification when an automation is auto-disabled.
+
+    Wraps :py:meth:`NotificationService.notify_automation_auto_disabled`
+    so a misconfigured notification path can't crash the dispatcher.
+    """
+    if not notification_service.is_available:
+        return
+    try:
+        await notification_service.notify_automation_auto_disabled(
+            user_id=payload["user_id"],
+            automation_id=payload["automation_id"],
+            automation_name=payload["automation_name"],
+            reason=payload["reason"],
+        )
+    except Exception:
+        logger.exception(
+            "Auto-disable notification failed for automation %s "
+            "(disable still applied)",
+            payload["automation_id"],
+        )
 
 
 def compute_next_run_after(

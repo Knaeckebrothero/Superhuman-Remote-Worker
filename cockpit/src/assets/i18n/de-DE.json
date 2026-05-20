@@ -79,7 +79,12 @@
       "runNow": "Jetzt ausführen",
       "toggleAria": "Automation aktivieren oder pausieren",
       "confirmDelete": "Die Automation \"{{name}}\" löschen? Das kann nicht rückgängig gemacht werden.",
-      "softCap": "Du hast {{count}} Automationen. Empfohlen sind höchstens 20 — überlege, vorhandene zusammenzuführen, bevor du weitere anlegst."
+      "softCap": "Du hast {{count}} Automationen. Empfohlen sind höchstens 20 — überlege, vorhandene zusammenzuführen, bevor du weitere anlegst.",
+      "projectFilter": {
+        "label": "Gefiltert auf {{name}} · {{count}} Automation(en)",
+        "fallbackName": "dieses Projekt",
+        "clear": "Alle anzeigen"
+      }
     },
     "editor": {
       "titleCreate": "Neue Automation",
