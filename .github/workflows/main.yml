@@ -119,12 +119,69 @@ jobs:
       - name: Install Python dependencies
         run: uv pip install --system -r requirements.txt
       - name: Audit Python dependencies
+        # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
+        # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
+        #   arxiv pins requests<2.33.0 so we can't upgrade until arxiv releases a fix
+        # CVE-2026-3219: pip treats concatenated tar+ZIP files as ZIP — no fix released;
+        #   requires a maliciously crafted package, not exposed via our install flow
+        # CVE-2026-44405: paramiko rsakey.py allows SHA-1 — no released fix yet (only on
+        #   master at commit a448945). Exploitation requires MITM on the SSH channel; our
+        #   connections are cluster-internal to controlled workspace pods/VMs.
+        #
+        # PYSEC-2024-277 (joblib): disputed by upstream; NumpyArrayWrapper is only used
+        #   while caching trusted content. No fix released.
+        # PYSEC-2024-278 (langchain-community): TFIDFRetriever.load_local SSRF — the
+        #   advisory itself says "Upgrading to version 0.0.27 is able to address this"
+        #   and we resolve to 0.4.1. OSV metadata lacks a fixed-version field so
+        #   pip-audit still flags it.
+        # PYSEC-2025-144/145/146/147, PYSEC-2026-101/102 (ollama): every advisory targets
+        #   the Ollama Go server (Modelfile parsing, /api/pull, fs/ggml/gguf.go). We use
+        #   the `ollama` PyPI package as a thin HTTP client against in-cluster endpoints;
+        #   the affected server binary isn't shipped by our images.
+        # PYSEC-2025-183 (pyjwt): disputed; the "weak encryption" claim depends on
+        #   caller-chosen key length, which is enforced by Keycloak in our deployment.
+        # PYSEC-2025-189..197, 210, PYSEC-2026-139 (torch): all require loading an
+        #   attacker-supplied checkpoint or running torch.jit on attacker code. Agents
+        #   only pull torch transitively via sentence-transformers against pinned,
+        #   vetted embedding models. Most have no fix released.
+        # PYSEC-2025-211..218 (transformers): deserialization of untrusted model files
+        #   (X-CLIP, GLM4, Perceiver, Transformer-XL, megatron_gpt2, SEW/SEW-D/HuBERT
+        #   convert_config). Same threat model — we don't convert or load attacker-
+        #   supplied checkpoints, and no fix versions are listed upstream.
         run: >-
           pip-audit --desc
           --ignore-vuln CVE-2026-4539
           --ignore-vuln CVE-2026-25645
           --ignore-vuln CVE-2026-3219
           --ignore-vuln CVE-2026-44405
+          --ignore-vuln PYSEC-2024-277
+          --ignore-vuln PYSEC-2024-278
+          --ignore-vuln PYSEC-2025-144
+          --ignore-vuln PYSEC-2025-145
+          --ignore-vuln PYSEC-2025-146
+          --ignore-vuln PYSEC-2025-147
+          --ignore-vuln PYSEC-2026-101
+          --ignore-vuln PYSEC-2026-102
+          --ignore-vuln PYSEC-2025-183
+          --ignore-vuln PYSEC-2025-189
+          --ignore-vuln PYSEC-2025-190
+          --ignore-vuln PYSEC-2025-191
+          --ignore-vuln PYSEC-2025-192
+          --ignore-vuln PYSEC-2025-193
+          --ignore-vuln PYSEC-2025-194
+          --ignore-vuln PYSEC-2025-195
+          --ignore-vuln PYSEC-2025-196
+          --ignore-vuln PYSEC-2025-197
+          --ignore-vuln PYSEC-2025-210
+          --ignore-vuln PYSEC-2026-139
+          --ignore-vuln PYSEC-2025-211
+          --ignore-vuln PYSEC-2025-212
+          --ignore-vuln PYSEC-2025-213
+          --ignore-vuln PYSEC-2025-214
+          --ignore-vuln PYSEC-2025-215
+          --ignore-vuln PYSEC-2025-216
+          --ignore-vuln PYSEC-2025-217
+          --ignore-vuln PYSEC-2025-218
       - name: Audit npm dependencies
         working-directory: cockpit
         run: |
