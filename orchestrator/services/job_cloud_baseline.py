@@ -80,12 +80,23 @@ async def seed_project_folder_baseline(
     slug = slugify_project_name(project_name)
     target_subpath = f"projects/{slug}"
 
-    async def _set_state(state: str, error: str | None = None) -> None:
-        ctx_update: dict[str, Any] = {"cloud_baseline": {"state": state}}
+    async def _set_state(
+        state: str,
+        *,
+        error: str | None = None,
+        entries: dict[str, str] | None = None,
+    ) -> None:
+        """Merge ``cloud_baseline`` state at the top level. The merge is
+        a JSONB ``||`` so we replace the whole ``cloud_baseline`` object
+        each call; pass ``entries`` to persist the path→etag map.
+        """
+        payload: dict[str, Any] = {"state": state}
         if error:
-            ctx_update["cloud_baseline"]["error"] = error
+            payload["error"] = error
+        if entries is not None:
+            payload["entries"] = entries
         try:
-            await postgres_db.merge_job_context(job_id, ctx_update)
+            await postgres_db.merge_job_context(job_id, {"cloud_baseline": payload})
         except Exception:
             logger.exception(
                 "Mode A: failed to update baseline state for job %s", job_id
@@ -152,6 +163,12 @@ async def seed_project_folder_baseline(
 
         # 2. Filter to text files only. Walk dirs are no-ops in git.
         files = [e for e in entries if not e.is_dir]
+        # Path → etag map of every file we observed in the cloud at seed
+        # time. Persisted into context so the accept-time external-mod
+        # check can compare against it. We capture ALL files here, not
+        # just the UTF-8 ones we seed into Gitea — a binary file the
+        # agent never sees can still be evidence of an external edit.
+        entries_map: dict[str, str] = {e.path: e.etag for e in files}
         if not files:
             logger.info(
                 "Mode A: job %s — project folder is empty; no baseline files",
@@ -165,7 +182,7 @@ async def seed_project_folder_baseline(
                 await postgres_db.update_job_cloud_diff(
                     job_id, baseline_commit=head_sha
                 )
-            await _set_state("ready")
+            await _set_state("ready", entries=entries_map)
             return
 
         seeded = 0
@@ -233,7 +250,7 @@ async def seed_project_folder_baseline(
             skipped_binary,
             baseline_sha[:8],
         )
-        await _set_state("ready")
+        await _set_state("ready", entries=entries_map)
     except Exception as e:
         logger.exception(
             "Mode A: job %s — baseline seed unexpectedly failed", job_short
@@ -426,3 +443,186 @@ def _parse_diff_file_list(diff_text: str) -> list[dict[str, str]]:
     if current and current.get("path", "").startswith("projects/"):
         files.append(current)
     return files
+
+
+def _strip_project_prefix(gitea_path: str, slug: str) -> str | None:
+    """``projects/<slug>/sub/file.md`` → ``sub/file.md``.
+
+    Returns ``None`` if the path is outside the slug — defensive guard
+    against a diff that somehow includes paths from a different slug.
+    """
+    prefix = f"projects/{slug}/"
+    if not gitea_path.startswith(prefix):
+        return None
+    return gitea_path[len(prefix) :]
+
+
+async def detect_external_mods(
+    *,
+    job: dict[str, Any],
+    project: dict[str, Any],
+    main_cloud_router: MainCloudRouter,
+) -> list[dict[str, str]]:
+    """Check whether the cloud folder has been modified since seed.
+
+    Compares the path→etag map persisted in
+    ``context.cloud_baseline.entries`` against a fresh PROPFIND of the
+    project folder, scoped to paths the agent's diff actually touches.
+    Files the user didn't ask the agent to change are deliberately not
+    checked — they can't conflict with the accept apply.
+
+    Returns a list of ``{path, kind}`` dicts (one per diverged path),
+    where ``kind`` is ``etag_mismatch`` / ``missing_at_cloud`` /
+    ``unexpected_at_cloud``. Empty list means the apply is safe.
+
+    Caller is responsible for fetching the diff summary and threading
+    the affected paths in via ``affected_cloud_paths``.
+    """
+    baseline_entries = (job.get("context") or {}).get("cloud_baseline", {}).get(
+        "entries"
+    ) or {}
+    handle_db = project.get("main_cloud_folder_handle")
+    backend_id = project.get("main_cloud_backend")
+    if not handle_db or not backend_id:
+        # No cloud folder → can't externally mod. Treat as clean.
+        return []
+    try:
+        backend = main_cloud_router.for_backend(backend_id)
+    except Exception:
+        return []
+    if not getattr(backend, "is_initialized", False):
+        # Backend unavailable — caller decides whether that's fatal.
+        # For external-mod detection we err on "we can't tell," so
+        # return an empty list. The apply call will fail loudly when
+        # it can't talk to the backend, which is the right place to
+        # surface that.
+        return []
+    handle = ProjectFolderHandle.from_db(str(handle_db), backend=backend_id)
+    try:
+        live_entries: list[ProjectFolderEntry] = await backend.list_project_folder(
+            handle
+        )
+    except CloudBackendError:
+        # Same logic as above — apply will fail with the real reason.
+        return []
+    live_map = {e.path: e.etag for e in live_entries if not e.is_dir}
+    diverged: list[dict[str, str]] = []
+    # 1. Every baseline path that's now missing OR mismatched.
+    for path, baseline_etag in baseline_entries.items():
+        live_etag = live_map.get(path)
+        if live_etag is None:
+            diverged.append({"path": path, "kind": "missing_at_cloud"})
+        elif live_etag != baseline_etag:
+            diverged.append({"path": path, "kind": "etag_mismatch"})
+    # 2. Paths that appeared in the cloud since seed.
+    for path in live_map.keys():
+        if path not in baseline_entries:
+            diverged.append({"path": path, "kind": "unexpected_at_cloud"})
+    return diverged
+
+
+async def apply_diff_to_cloud(
+    *,
+    job: dict[str, Any],
+    project: dict[str, Any],
+    gitea_client: Any,
+    main_cloud_router: MainCloudRouter,
+) -> dict[str, Any]:
+    """Walk the Mode A diff and write each change back to the cloud.
+
+    For each file in the diff under ``projects/<slug>/``:
+
+    * ``added`` / ``modified``: GET ``new_content`` from Gitea at HEAD
+      and PUT to the cloud folder (creating parents as needed).
+    * ``deleted``: DELETE from the cloud folder (``if_exists=True``).
+
+    Returns ``{applied: int, deleted: int, errors: [...]}`` — partial
+    failures don't abort the walk so the user can see which files made
+    it across and which didn't. v2 may want to be transactional, but
+    v1 fail-soft matches the "best-effort apply" semantics of WebDAV.
+    """
+    job_id = str(job["id"])
+    job_short = job_id[:8]
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name") or "main"
+    project_name = str(project.get("name") or "project")
+    slug = slugify_project_name(project_name)
+    if not repo_name:
+        return {"applied": 0, "deleted": 0, "errors": ["job has no repo_name"]}
+
+    handle_db = project.get("main_cloud_folder_handle")
+    backend_id = project.get("main_cloud_backend")
+    if not handle_db or not backend_id:
+        return {
+            "applied": 0,
+            "deleted": 0,
+            "errors": ["project has no cloud folder"],
+        }
+    try:
+        backend = main_cloud_router.for_backend(backend_id)
+    except Exception as e:
+        return {"applied": 0, "deleted": 0, "errors": [f"backend unavailable: {e}"]}
+    if not getattr(backend, "is_initialized", False):
+        return {"applied": 0, "deleted": 0, "errors": ["backend not initialized"]}
+
+    handle = ProjectFolderHandle.from_db(str(handle_db), backend=backend_id)
+    baseline = job.get("cloud_diff_baseline_commit")
+    if not baseline:
+        return {"applied": 0, "deleted": 0, "errors": ["job has no baseline commit"]}
+    head = await _read_head_commit(gitea_client, repo_name, branch)
+    if not head:
+        return {"applied": 0, "deleted": 0, "errors": ["could not read HEAD"]}
+
+    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
+    files = _parse_diff_file_list(diff_text or "")
+    applied = 0
+    deleted = 0
+    errors: list[str] = []
+    for entry in files:
+        gitea_path = entry["path"]
+        status = entry["status"]
+        rel = _strip_project_prefix(gitea_path, slug)
+        if rel is None:
+            # Skip paths outside the slug — shouldn't happen but log.
+            logger.info(
+                "Mode A: job %s — skipping diff path outside slug %r: %s",
+                job_short,
+                slug,
+                gitea_path,
+            )
+            continue
+        try:
+            if status == "deleted":
+                await backend.delete_project_folder_file(
+                    handle, path=rel, if_exists=True
+                )
+                deleted += 1
+            else:
+                # added or modified — fetch new content from Gitea HEAD.
+                new_content = await gitea_client.get_file_content(
+                    repo_name, gitea_path, ref=head
+                )
+                if new_content is None:
+                    errors.append(f"{gitea_path}: file missing in Gitea HEAD")
+                    continue
+                blob = (
+                    new_content.encode("utf-8")
+                    if isinstance(new_content, str)
+                    else new_content
+                )
+                await backend.put_project_folder_file_bytes(
+                    handle, path=rel, content=blob
+                )
+                applied += 1
+        except CloudBackendError as e:
+            errors.append(f"{gitea_path}: {e}")
+        except Exception as e:
+            errors.append(f"{gitea_path}: {e}")
+    logger.info(
+        "Mode A: job %s — applied %d, deleted %d, errors=%d",
+        job_short,
+        applied,
+        deleted,
+        len(errors),
+    )
+    return {"applied": applied, "deleted": deleted, "errors": errors}
