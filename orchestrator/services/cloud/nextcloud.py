@@ -38,6 +38,7 @@ from .base import HealthStatus, UserHome
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -492,6 +493,39 @@ class NextcloudBackend:
         return (
             f"{self._base_url}/remote.php/dav/groupfolders/"
             f"{self._agent_user}/{mountpoint}/"
+        )
+
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        """Not yet implemented for Nextcloud.
+
+        Mode A baseline-seed currently ships OpenCloud-only
+        (docs/features/job_cloud_export.md §0). Add Group Folders
+        PROPFIND walk when first Nextcloud user requests Mode A.
+        """
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "list_project_folder not implemented on the Nextcloud backend yet",
+            backend=self.backend_id,
+            retryable=False,
+        )
+
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        """Not yet implemented for Nextcloud — see list_project_folder."""
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "get_project_folder_file_bytes not implemented on the Nextcloud backend yet",
+            backend=self.backend_id,
+            retryable=False,
         )
 
     # ------------------------------------------------------------- Session folders
