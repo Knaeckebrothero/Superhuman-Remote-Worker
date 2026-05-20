@@ -609,13 +609,13 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         status = _agent.get_status()
         base_ready = status["initialized"] and status["connections"]["postgres"]
 
-        # When in SESSION state, also require the session to be fully set up
+        # When in SESSION state, the readiness gate is the three-way check
+        # in persistent_app._session_ready() — shared with /session/status
+        # and handle_persistent_websocket so probe and WS gate stay aligned.
         if _pod_state == PodState.SESSION:
             import src.api.persistent_app as pa
 
-            session_ready = (
-                pa._session is not None and pa._session.llm_with_tools is not None
-            )
+            session_ready = pa._session_ready()
             return ReadyResponse(
                 ready=session_ready,
                 message="Session ready" if session_ready else "Session initializing",
@@ -1022,26 +1022,18 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     async def session_status() -> JSONResponse:
         """Check if session is fully set up and ready for WebSocket.
 
-        Readiness gates on _loop_user_queue too — _attach_session sets
-        _session.llm_with_tools early (during PersistentSession.setup) but
-        the loop primitives are initialized later in the same coroutine.
-        Returning ready=True before the queue exists causes
-        handle_persistent_websocket to accept the WS and the loop to
-        crash on its first _loop_get_user_input call.
+        Delegates to ``persistent_app._session_ready()`` so /ready (SESSION
+        branch), this endpoint, and ``handle_persistent_websocket`` share one
+        definition of "ready for a WS" and can't drift.
         """
         import src.api.persistent_app as pa
 
         if _pod_state != PodState.SESSION:
             return JSONResponse({"ready": False, "state": _pod_state.value})
 
-        is_ready = (
-            pa._session is not None
-            and pa._session.llm_with_tools is not None
-            and pa._loop_user_queue is not None
-        )
         return JSONResponse(
             {
-                "ready": is_ready,
+                "ready": pa._session_ready(),
                 "thread_id": pa._thread_id,
                 "state": "session",
             }

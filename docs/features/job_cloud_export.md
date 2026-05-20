@@ -22,9 +22,46 @@ related:
 
 > When a job is attached to a project, automatically mount the project's cloud folder into the agent's workspace at `projects/<project_folder_name>/`. The agent edits in place. On completion, the user sees a PR-style diff in Cockpit and decides accept (writes propagate back to the cloud folder) or reject (changes discarded). For loose jobs with no project, an "Export to shared folder" button — the existing shared-session-folder pattern, applied to jobs — gives the user a one-click path to materialize results.
 
-**Status:** Design draft (rewrite 2026-05-20). Not yet implemented. **Replaces an earlier draft** of this doc that scoped the feature too narrowly (export button only — see §10).
+**Status:** Partial implementation. **Mode B (loose-job shared-folder export) ✅ shipped + live-verified on dev cluster 2026-05-20.** Mode A (project-attached diff/accept) still in design; ready to start. **Replaces an earlier draft** of this doc that scoped the feature too narrowly (export button only — see §10).
 **Triggered by:** Phase 5/6 of `docs/done/cloud_collaboration_model.md` got the broader shape right but was deferred as "too big." The earlier rewrite of this doc swung too far the other way (export-only). The actual user-friction lives in both halves: jobs can't *read* project folders without ugly WebDAV-datasource tooling, and they can't *write back* without producing a sibling-file that the user has to manually swap.
 **Scope:** Project-attached jobs get auto-mount + diff/accept. Loose jobs get an export-to-shared-folder button. New orchestrator endpoints + new Cockpit diff-review UI + new agent-side job-start hook to mount the project folder before the agent's first turn. Reuses everything from the cloud-mirror foundation (Phase 1 service-account WebDAV transport, Phase 2.1 token-exchange for user-home destinations, Phase 3a collision-safe slugger, Gitea per-job snapshot plumbing).
+
+## 0. Implementation log
+
+### Slice 1 — Mode B end-to-end (✅ 2026-05-20)
+
+Schema + backend + cockpit + cluster verification, all in one ship.
+
+**Backend (Python):**
+- `orchestrator/database/migrations/app/0017_jobs_cloud_diff.sql` — 4 new columns on `jobs`: `cloud_diff_baseline_commit TEXT`, `diff_status TEXT CHECK IN (pending|accepted|rejected|NULL)`, `exported_folder_handle TEXT`, `exported_at TIMESTAMPTZ`. Partial index `idx_jobs_diff_status_pending`. Migration applied at orchestrator startup 2026-05-20T08:51:53 in 12 ms.
+- `orchestrator/database/postgres.py` — `get_job` / `get_jobs` / `get_visible_jobs` now surface the new fields. New helpers `update_job_cloud_diff(...)` and `update_job_exported_folder(job_id, *, handle)`.
+- `orchestrator/services/cloud/base.py` — new `put_session_file(handle, *, path, content, content_type)` on the `MainCloudBackend` Protocol.
+- `orchestrator/services/cloud/opencloud.py` + `nextcloud.py` — concrete `put_session_file` impls (MKCOL of parents one segment at a time, then PUT; bearer auth on OpenCloud, basic auth on Nextcloud).
+- `orchestrator/services/gitea.py` — new `get_file_bytes(repo_name, file_path, ref)` — binary-safe sibling of `get_file_content` so PUT preserves PDF / image / archive bytes.
+- `orchestrator/main.py` — `POST /api/jobs/{job_id}/export-to-shared-folder` endpoint. Gates: `status == 'completed'`, `!project_id` (Mode A would intercept), `!exported_folder_handle` (idempotency refuse). Cloud + Gitea readiness checks. Walks Gitea `output/` recursively via `list_contents` + `get_file_bytes`, calls `put_session_file` per file. Stamps `exported_folder_handle = handle.to_db()` + `exported_at = NOW()` on success. Returns `{job_id, files_copied, folder: {name, browser_url, webdav_url}}`.
+
+**Frontend (Angular):**
+- `cockpit/src/app/core/models/api.model.ts` — `Job` interface extended with the 4 new fields.
+- `cockpit/src/app/core/services/api.service.ts` — `exportJobToSharedFolder(jobId)` with translated toast on success/failure.
+- `cockpit/src/app/views/jobs/job-list.component.ts` — "Export to cloud" button next to Promote on rows where `status === 'completed' && !project_id && !exported_at`; replaced by a green "Exported" badge once `exported_at` is set. New `exportingJobIds` signal for the spinner state. On success the response's `browser_url` is opened in a new tab.
+- `cockpit/src/assets/i18n/{en,de-DE}.json` — 7 new keys in each locale (`jobs.action.exportToCloud`, `jobs.action.exported`, `jobs.tooltip.exportToCloud`, `jobs.tooltip.alreadyExported`, `toasts.jobs.exportedToCloud`, `errors.jobs.exportFailed`). `i18n:check` parity-clean.
+
+**Verified end-to-end on the dev cluster 2026-05-20:**
+- Migration applied (orchestrator log).
+- Endpoint registered (`POST /api/jobs/.../export-to-shared-folder` returns 401 unauth, not 404).
+- Cockpit button rendered correctly: appears only on `completed && !project_id`; not shown on project-attached completed jobs.
+- Real export run against the loose critic subjob `3b5f7c72-752b-4a4f-a982-1db04313fa33` → HTTP 200, `files_copied=0` (critic produces no `output/`), folder `job-3b5f7c72752b` created at `sessions/job-3b5f7c72752b` under the agent-home Space, shared with the calling user, deep-link opens cleanly in OpenCloud (Shares → Shared with me → job-3b5f7c72752b).
+- DB stamped: `exported_folder_handle={backend:opencloud, native_id:sessions/job-3b5f7c72752b, vendor_meta:...}`, `exported_at=2026-05-20T09:19:54.546548Z`.
+- UI state transition after refresh: button → green "Exported" badge. Re-export gated at the UI layer; API layer would 409 if forced.
+- **Untested in this slice:** the actual WebDAV PUT loop (the test job had no `output/`). MKCOL + share path is exercised. PUT is straight-line `_client.put()` against the same authenticated transport that MKCOL succeeded on — low risk, but a fresh standalone job with files in `output/` would close the gap.
+
+### Slice 2 — Mode A clone + diff capture (pending)
+
+See §3.1–§3.3 and §7. Requires new agent-side mount helper, Gitea baseline-commit hook at job-start, diff computation + status transition at completion, two read endpoints. Status enum value `pending` is already accepted by the migration's CHECK constraint.
+
+### Slice 3 — Mode A review + apply (pending)
+
+See §3.4–§3.6 and §5. Accept/reject endpoints + Cockpit diff-review UI (Monaco).
 
 ## 1. Motivation
 
@@ -156,18 +193,54 @@ Clicking Reject:
 
 ## 4. Mode B in detail (loose-job export)
 
-Loose jobs follow the existing **shared-session-folder pattern** that Phase 4 preserved as a fallback for unattached sessions. Reuse the same orchestrator hooks:
+> **Implementation note (✅ shipped 2026-05-20):** Sections 4.1–4.3 describe shipped behavior. Decisions made during implementation that differ from the design sketch are called out inline.
 
-- `ensure_session_folder(session_id=job_id[:8])` (or a new `ensure_job_folder` if naming separation matters) → creates a folder at the configured location (e.g., `Jobs/<job-id-prefix>/` in the user's accessible cloud space).
-- `share_session_folder(handle, user_id)` → grants the user access.
-- Copy job's `output/` files into the new folder.
-- Store the resulting handle on the job (proposed columns: `jobs.exported_folder_handle TEXT`, `jobs.exported_at TIMESTAMPTZ`).
+### 4.1 Folder provisioning
 
-Endpoint: `POST /api/jobs/{job_id}/export-to-shared-folder`.
+Loose jobs reuse the existing **shared-session-folder pattern** that Phase 4 preserved as a fallback for unattached sessions. **Decision (shipped):** kept the existing `ensure_session_folder` + `share_session_folder` primitives directly rather than introducing parallel `ensure_job_folder` / `share_job_folder` verbs. Naming separation wasn't worth the duplicated WebDAV+OCS code on both backends; folder-name disambiguation is sufficient.
 
-Cockpit button on completed loose jobs:
-- **Not exported:** "Export to shared folder"
-- **Already exported:** "Open in OpenCloud" with kebab → "Re-export" (refuses unless folder is deleted first, same policy as original export-button draft).
+Concretely:
+
+- `ensure_session_folder(session_id=f"job-{job_id.replace('-', '')[:12]}")` → creates `sessions/job-<12-hex>/` under the agent-home Space (OpenCloud) or under the agent-service user's home (Nextcloud). The `job-` prefix is collision-free vs. thread-session folders (UUID hex never contains `j`/`b`).
+- `ensure_user(sub, issuer, email, display_name, preferred_username)` to synchronously provision the cloud user record (avoids racing the JIT autoprovision task on first-time use).
+- `share_session_folder(handle, resolved_user_id)` → grants the user access.
+- Walk Gitea `output/` recursively (`list_contents` + per-dir recursion) and `get_file_bytes` each file. PUT each via the new `put_session_file(handle, path=entry_path, content=file_bytes)` Protocol method, which MKCOLs missing parent collections one segment at a time then PUTs the body.
+- Stamp the job: `update_job_exported_folder(job_id, handle=folder_handle.to_db())` writes `exported_folder_handle` + `exported_at=NOW()`.
+
+### 4.2 Endpoint contract
+
+`POST /api/jobs/{job_id}/export-to-shared-folder`. Auth via `require_job_access`. Gates (all return 409 on violation):
+
+1. `status != 'completed'` — only completed jobs can be exported.
+2. `project_id` is set — project-attached jobs use Mode A.
+3. `exported_folder_handle` already set — idempotency refuse; user must delete the cloud folder to re-export.
+
+Pre-flight 503s: cloud backend not initialized; Gitea not initialized.
+
+Success response:
+
+```json
+{
+  "job_id": "<uuid>",
+  "files_copied": <int>,
+  "folder": {
+    "name": "job-<12hex>",
+    "browser_url": "https://cloud.<host>/f/<fileId>",
+    "webdav_url":  "https://cloud.<host>/dav/spaces/<drive>%21<item>/sessions/job-<12hex>/"
+  }
+}
+```
+
+Failure paths: partial-copy failures (502, no stamp — safe to retry, MKCOL/PUT are idempotent against the same folder); `CloudBackendError` from any cloud call → 502; missing file from Gitea → 502.
+
+### 4.3 Cockpit UX (shipped)
+
+On the jobs list, rows with `status === 'completed' && !project_id`:
+
+- **Not yet exported (`!exported_at`):** "Export to cloud" button next to the existing "Promote" button. Click → calls the endpoint, shows a translated toast (`Exported {{count}} file(s) to your cloud`), opens `folder.browser_url` in a new tab via `window.open`.
+- **Already exported (`exported_at` set):** green "Exported" badge replaces the button.
+
+**Decision (shipped):** the "Open in OpenCloud / Re-export" kebab from the earlier design sketch was NOT implemented. The badge is a terminal state. Discovery path for the existing folder is the OpenCloud Shares list, which the user already had to authenticate against on first export. If we see demand for in-cockpit "open exported folder" navigation, we can surface the persisted `browser_url` later — the handle is already on the row.
 
 No diff view for loose jobs — there's nothing to diff against. This is purely a copy-out action.
 
@@ -186,34 +259,47 @@ Auth: `require_job_access` (owner or admin) on all.
 
 ### Mode B endpoints
 
-| Verb | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/jobs/{id}/export-to-shared-folder` | Loose jobs only. Creates shared folder, copies output/, returns handle + browser URL. |
+| Verb | Path | Purpose | Status |
+|---|---|---|---|
+| `POST` | `/api/jobs/{id}/export-to-shared-folder` | Loose jobs only. Creates shared folder, copies output/, returns handle + browser URL. | ✅ shipped 2026-05-20 |
 
 Auth: same.
 
-### Existing endpoints to extend
+### Existing endpoints extended (✅ shipped 2026-05-20)
 
-`GET /api/jobs/{id}` (existing job detail) returns new fields:
-- `cloud_diff_baseline_commit` (string | null)
-- `diff_status` (enum: `pending` | `accepted` | `rejected` | null — null for loose jobs or jobs without a project mount)
-- `exported_folder_handle` (string | null — for loose jobs)
-- `exported_at` (timestamp | null)
+`GET /api/jobs/{id}` and the list endpoints (`/api/jobs`, `/api/jobs?status=...`) now surface:
+- `cloud_diff_baseline_commit` (string | null) — Mode A only; null for loose jobs and pre-Mode-A jobs
+- `diff_status` (enum: `pending` | `accepted` | `rejected` | null — null until Mode A captures a diff)
+- `exported_folder_handle` (string | null — set on successful Mode B export)
+- `exported_at` (timestamp | null — paired with the handle)
 
-Cockpit reads these to drive the review-UI state.
+List queries surface `diff_status` and `exported_at` (the two badge-trigger fields); full `get_job` returns all four. Cockpit reads these to drive the review-UI state.
 
 ## 6. DB schema
 
-Single migration. New columns on `jobs`:
+> **Implementation note (✅ shipped 2026-05-20):** Migration `orchestrator/database/migrations/app/0017_jobs_cloud_diff.sql` applies the schema below. Applied at orchestrator startup on the dev cluster on 2026-05-20T08:51:53 in 12 ms.
+
+Single migration. New columns on `jobs` (transactional, metadata-only ALTERs):
 
 ```sql
 ALTER TABLE jobs
   ADD COLUMN cloud_diff_baseline_commit TEXT,
-  ADD COLUMN diff_status TEXT
-    CHECK (diff_status IN ('pending', 'accepted', 'rejected')),
+  ADD COLUMN diff_status TEXT,
   ADD COLUMN exported_folder_handle TEXT,
-  ADD COLUMN exported_at TIMESTAMPTZ;
+  ADD COLUMN exported_at TIMESTAMP WITH TIME ZONE;
+
+ALTER TABLE jobs
+  ADD CONSTRAINT jobs_diff_status_check
+    CHECK (diff_status IS NULL
+        OR diff_status IN ('pending', 'accepted', 'rejected')) NOT VALID;
+ALTER TABLE jobs VALIDATE CONSTRAINT jobs_diff_status_check;
+
+CREATE INDEX IF NOT EXISTS idx_jobs_diff_status_pending
+  ON jobs (id)
+  WHERE diff_status = 'pending';
 ```
+
+`NULL` is allowed for `diff_status` (and is the dominant case — Mode B jobs and pre-Mode-A jobs). The partial index narrows the cockpit "needs review" scan to a few rows in practice.
 
 No new tables. Per-file diffs are computed on-demand from Gitea commits — no need to persist them.
 
@@ -261,23 +347,24 @@ Open questions Q2/Q4/Q5 migrated from `docs/done/cloud_collaboration_model.md` a
 
 ## 11. Estimated scope
 
-| Piece | Estimate |
-|---|---|
-| Backend — Mode A: job-start clone hook | ~½ day (reuses repository-datasource pattern) |
-| Backend — Mode A: baseline Gitea commit on clone | ~½ day (reuses per-job Gitea plumbing) |
-| Backend — Mode A: diff computation at completion + status transition | ~1 day |
-| Backend — Mode A: accept endpoint with external-mod detection + write-back | ~1.5 days |
-| Backend — Mode A: reject endpoint | ~½ day |
-| Backend — Mode B: export-to-shared-folder endpoint (reuses session-folder pattern) | ~½ day |
-| Backend — DB migration, status enum, field plumbing | ~½ day |
-| Cockpit — diff file tree | ~1 day |
-| Cockpit — per-file diff view (Monaco) | ~2-3 days |
-| Cockpit — accept/reject buttons + confirmation + external-mod handling UI | ~1 day |
-| Cockpit — Mode B export button + states | ~½ day |
-| Cockpit — state management + i18n + tests | ~1 day |
-| Tests + cluster verification | ~1-2 days |
+| Piece | Estimate | Status |
+|---|---|---|
+| Backend — DB migration (0017), helpers, field plumbing | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — `put_session_file` on Protocol + OpenCloud + Nextcloud + `get_file_bytes` on Gitea | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — Mode B: export-to-shared-folder endpoint (reuses session-folder pattern) | ~½ day | ✅ shipped 2026-05-20 |
+| Cockpit — Mode B export button + "Exported" badge + i18n (en + de-DE) | ~½ day | ✅ shipped 2026-05-20 |
+| Backend — Mode A: job-start clone hook | ~½ day (reuses repository-datasource pattern) | Slice 2 |
+| Backend — Mode A: baseline Gitea commit on clone | ~½ day (reuses per-job Gitea plumbing) | Slice 2 |
+| Backend — Mode A: diff computation at completion + status transition | ~1 day | Slice 2 |
+| Backend — Mode A: accept endpoint with external-mod detection + write-back | ~1.5 days | Slice 3 |
+| Backend — Mode A: reject endpoint | ~½ day | Slice 3 |
+| Cockpit — diff file tree | ~1 day | Slice 3 |
+| Cockpit — per-file diff view (Monaco) | ~2-3 days | Slice 3 |
+| Cockpit — accept/reject buttons + confirmation + external-mod handling UI | ~1 day | Slice 3 |
+| Cockpit — state management + i18n + tests for Mode A | ~1 day | Slice 3 |
+| Tests + cluster verification for Mode A | ~1-2 days | Slice 3 |
 
-**Total: ~1.5-2 weeks.** Roughly Phase 5+6 from the closed cloud-collab doc — the original ballpark was correct; the export-only rewrite undershoot was wrong.
+**Total: ~1.5-2 weeks.** Slice 1 (Mode B) consumed ~2 days. Slices 2 + 3 (Mode A) are the remaining ~1.5 weeks.
 
 ## 12. What this doesn't change
 

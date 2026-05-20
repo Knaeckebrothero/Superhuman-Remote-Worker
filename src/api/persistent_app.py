@@ -120,6 +120,26 @@ _events_epoch: int = 0
 _next_seq: int = 0
 
 
+def _session_ready() -> bool:
+    """True when the persistent session is fully attached and the loop
+    primitives are ready to accept a WS subscriber.
+
+    Three-way check: ``_session.llm_with_tools`` is set near the end of
+    ``PersistentSession.setup()``, but ``_loop_user_queue`` is initialized
+    later in ``_attach_session`` (after repo clone, cloud sync pull, message
+    restore, and the ``thread_status='active'`` DB update). Anything that
+    gates session readiness — the readiness probes (``/ready``,
+    ``/session/status``) and ``handle_persistent_websocket`` — must call
+    this so the WS isn't accepted in the mid-attach window where the loop's
+    get-user-input callback would crash on a ``None`` queue.
+    """
+    return (
+        _session is not None
+        and _session.llm_with_tools is not None
+        and _loop_user_queue is not None
+    )
+
+
 async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
     """Heartbeat-response callback: react to orchestrator-set intents.
 
@@ -1225,7 +1245,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.get("/ready")
     async def ready():
-        is_ready = _session is not None and _session.llm_with_tools is not None
+        is_ready = _session_ready()
         return JSONResponse(
             {"ready": is_ready, "mode": "persistent", "thread_id": _thread_id},
             status_code=200 if is_ready else 503,
@@ -1479,13 +1499,10 @@ async def handle_persistent_websocket(ws: WebSocket) -> None:
     # the user clearly came back, and a different error path applies.
     _signal_ws_connected()
 
-    # Readiness gates on the loop primitives, not just the session. In dual
-    # mode /session/attach returns immediately and _attach_session runs
-    # asynchronously: _session.llm_with_tools is set early (inside .setup()),
-    # but _loop_user_queue isn't initialized until much later in the same
-    # coroutine. The loop's _loop_get_user_input callback crashes hard if
-    # the queue is None, so we must wait for it.
-    if not _session or not _session.llm_with_tools or _loop_user_queue is None:
+    # Readiness gates on the loop primitives, not just the session — see
+    # _session_ready() for the why. Single source of truth shared with
+    # /ready and /session/status so the probe and the WS gate can't drift.
+    if not _session_ready():
         await _ws_send(ws, "error", {"message": "Agent not ready"})
         await ws.close(code=4503, reason="Agent not ready")
         return
