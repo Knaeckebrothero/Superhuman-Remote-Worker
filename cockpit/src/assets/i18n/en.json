@@ -79,7 +79,12 @@
       "runNow": "Run now",
       "toggleAria": "Enable or pause this automation",
       "confirmDelete": "Delete the automation \"{{name}}\"? This cannot be undone.",
-      "softCap": "You have {{count}} automations. The recommended limit is 20 — consider consolidating before adding more."
+      "softCap": "You have {{count}} automations. The recommended limit is 20 — consider consolidating before adding more.",
+      "projectFilter": {
+        "label": "Scoped to {{name}} · {{count}} automation(s)",
+        "fallbackName": "this project",
+        "clear": "Show all"
+      }
     },
     "editor": {
       "titleCreate": "New automation",

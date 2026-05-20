@@ -6,7 +6,7 @@ import {
   inject,
   signal,
 } from '@angular/core';
-import {ActivatedRoute, RouterLink} from '@angular/router';
+import {ActivatedRoute, Router, RouterLink} from '@angular/router';
 import {DatePipe} from '@angular/common';
 import {FormsModule} from '@angular/forms';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -32,7 +32,7 @@ import {
   AutomationsService,
   CreateAutomationRequest,
 } from '../../core/services/automations.service';
-import {Expert} from '../../core/models/api.model';
+import {Expert, Project} from '../../core/models/api.model';
 import {CronPreviewComponent} from './cron-preview.component';
 import {EscapeHatchPanelComponent} from './escape-hatch-panel.component';
 
@@ -94,6 +94,7 @@ export class AutomationsPageComponent implements OnInit {
   private readonly service = inject(AutomationsService);
   private readonly api = inject(ApiService);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
   private readonly transloco = inject(TranslocoService);
 
   readonly automations = this.service.automations;
@@ -101,6 +102,11 @@ export class AutomationsPageComponent implements OnInit {
   readonly experts = signal<Expert[]>([]);
   readonly errorMessage = signal<string | null>(null);
   readonly editor = signal<EditorState | null>(null);
+
+  /** Active project filter (from ?project=<uuid>). null when unscoped. */
+  readonly projectFilter = signal<string | null>(null);
+  /** Human-readable name of the filtered project. null while loading or on access denial. */
+  readonly projectFilterName = signal<string | null>(null);
 
   readonly expertOptions = computed<SelectOption[]>(() =>
     this.experts().map((e) => ({value: e.id, label: e.display_name})),
@@ -149,25 +155,75 @@ export class AutomationsPageComponent implements OnInit {
   readonly softCapHit = computed(() => this.automations().length >= SOFT_CAP);
 
   ngOnInit(): void {
-    this.service.loadMine();
+    // URL semantics: /automations?project=<uuid> scopes the page to that
+    // project. The header chip surfaces the filter; the New-automation
+    // button defaults to creating inside the scoped project; after-save
+    // refresh stays scoped via loadByProject.
+    const pending = this.route.snapshot.queryParamMap.get('project');
+    if (pending) {
+      this.projectFilter.set(pending);
+      this.service.loadByProject(pending);
+      // Fetch the project name for the header chip. Null on access denial
+      // (we still keep the filter — the API will already have rejected).
+      this.api.getProject(pending).subscribe({
+        next: (p: Project | null) => this.projectFilterName.set(p?.name ?? null),
+        error: () => this.projectFilterName.set(null),
+      });
+    } else {
+      this.service.loadMine();
+    }
 
-    // Project pre-fill: /automations?project=<uuid> opens the editor with
-    // the project preselected — driven by the "Create automation" button
-    // on a project's detail page. We have to wait for the experts list
-    // before opening; otherwise the editor's `expert` field is seeded
-    // with '' (this.experts() is empty until the API resolves) and the
-    // save-time validation rejects the row even though the <select>
-    // shows the right native default.
+    // Wait for the experts list before opening the editor on cross-link —
+    // otherwise the editor's `expert` field seeds to '' (this.experts() is
+    // empty until the API resolves) and save-time validation rejects the
+    // row even though the <select> shows the right native default.
     this.api.getExperts().subscribe({
       next: (list) => {
         this.experts.set(list);
-        const pending = this.route.snapshot.queryParamMap.get('project');
         if (pending && !this.editor()) {
           this.openEditor(null, pending);
         }
       },
       error: () => this.experts.set([]),
     });
+  }
+
+  /** Reload the visible list honoring the active project filter. */
+  private refreshList(): void {
+    const pid = this.projectFilter();
+    if (pid) {
+      this.service.loadByProject(pid);
+    } else {
+      this.service.loadMine();
+    }
+  }
+
+  /** Drop the project filter and reload the list with the caller's full set. */
+  clearProjectFilter(): void {
+    this.projectFilter.set(null);
+    this.projectFilterName.set(null);
+    // Replace the URL so the chip doesn't reappear on refresh.
+    this.router.navigate(['/automations'], {
+      queryParams: {},
+      replaceUrl: true,
+    });
+    this.service.loadMine();
+  }
+
+  /** Open the create editor; honors the active project filter when set. */
+  openNewEditor(): void {
+    this.openEditor(null, this.projectFilter());
+  }
+
+  /** Project name for the filter chip; falls back to a localized placeholder
+   *  when getProject() hasn't resolved or access was denied. Called from the
+   *  template inside a transloco pipe, so it stays reactive to lang changes
+   *  via the pipe's own subscription. */
+  projectFilterDisplayName(): string {
+    return (
+      this.projectFilterName() ??
+      this.transloco.translate('automations.list.projectFilter.fallbackName')
+    );
   }
 
   openEditor(automation: Automation | null, prefillProjectId: string | null = null): void {
@@ -256,7 +312,7 @@ export class AutomationsPageComponent implements OnInit {
     op$.subscribe({
       next: () => {
         this.closeEditor();
-        this.service.loadMine();
+        this.refreshList();
       },
       error: (err) => {
         this.errorMessage.set(this._formatError(err));
@@ -273,7 +329,7 @@ export class AutomationsPageComponent implements OnInit {
 
   runNow(row: Automation): void {
     this.service.runNow(row.id).subscribe({
-      next: () => this.service.loadMine(),
+      next: () => this.refreshList(),
       error: (err) => this.errorMessage.set(this._formatError(err)),
     });
   }

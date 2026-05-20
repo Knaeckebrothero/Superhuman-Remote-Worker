@@ -321,3 +321,130 @@ class TestProcessOneDueAutomation:
         db.auto_disable_automation.assert_awaited_once()
         kwargs = db.auto_disable_automation.await_args.kwargs
         assert "invalid cron" in kwargs["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Auto-disable owner notification — fires AFTER the txn commits, never on a
+# normal fire, never crashes the dispatcher on transport failure.
+# ---------------------------------------------------------------------------
+
+
+def _patch_notification_service(
+    monkeypatch, *, available: bool = True, side_effect=None
+):
+    """Swap the dispatcher's notification_service reference for a mock.
+
+    Returns the AsyncMock the dispatcher will call so the caller can
+    inspect arguments / await counts.
+    """
+    notify_mock = AsyncMock(side_effect=side_effect)
+    fake_service = MagicMock()
+    fake_service.is_available = available
+    fake_service.notify_automation_auto_disabled = notify_mock
+    monkeypatch.setattr(
+        "orchestrator.services.cron_dispatcher.notification_service",
+        fake_service,
+    )
+    return notify_mock
+
+
+class TestAutoDisableNotification:
+    @pytest.mark.asyncio
+    async def test_max_fires_disable_emits_notification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The owner gets notified when max_fires_per_day trips auto-disable."""
+        notify_mock = _patch_notification_service(monkeypatch)
+        now = datetime.now(timezone.utc)
+        row = _make_row(
+            next_run_at=now,
+            max_fires_per_day=5,
+            fires_today_count=5,
+            fires_today_date=now.date(),
+        )
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        notify_mock.assert_awaited_once()
+        kwargs = notify_mock.await_args.kwargs
+        assert kwargs["user_id"] == row["owner_id"]
+        assert kwargs["automation_id"] == row["id"]
+        assert kwargs["automation_name"] == row["name"]
+        assert "max_fires_per_day" in kwargs["reason"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_cron_disable_emits_notification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        notify_mock = _patch_notification_service(monkeypatch)
+        now = datetime.now(timezone.utc)
+        row = _make_row(next_run_at=now, cron_expr="not a cron")
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        notify_mock.assert_awaited_once()
+        kwargs = notify_mock.await_args.kwargs
+        assert "invalid cron" in kwargs["reason"].lower()
+
+    @pytest.mark.asyncio
+    async def test_normal_fire_does_not_emit_notification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A successful fire is not a safety event — no notification."""
+        notify_mock = _patch_notification_service(monkeypatch)
+        row = _make_row(next_run_at=datetime.now(timezone.utc))
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_catchup_skip_does_not_emit_notification(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Catchup-window skips are not auto-disables — no notification."""
+        notify_mock = _patch_notification_service(monkeypatch)
+        long_ago = datetime(2025, 1, 1, 0, 0, tzinfo=timezone.utc)
+        row = _make_row(next_run_at=long_ago, catchup_window_seconds=3600)
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+
+        notify_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_does_not_break_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transport failure on the notification path must not roll back
+        the auto-disable or crash the tick loop."""
+        _patch_notification_service(
+            monkeypatch, side_effect=RuntimeError("transport down")
+        )
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc),
+            cron_expr="not a cron",
+        )
+        db = _make_mock_db(due_row=row)
+
+        out = await _process_one_due_automation(db)
+        assert out is True
+
+    @pytest.mark.asyncio
+    async def test_notification_skipped_when_service_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the notification singleton is not connected (e.g., a test
+        env without SMTP/feed wiring), the dispatcher quietly skips."""
+        notify_mock = _patch_notification_service(monkeypatch, available=False)
+        row = _make_row(
+            next_run_at=datetime.now(timezone.utc),
+            cron_expr="not a cron",
+        )
+        db = _make_mock_db(due_row=row)
+
+        await _process_one_due_automation(db)
+        notify_mock.assert_not_awaited()
