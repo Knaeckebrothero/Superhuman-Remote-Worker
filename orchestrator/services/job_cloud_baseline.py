@@ -26,6 +26,7 @@ v1 limitations (deferred to v2):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -37,6 +38,26 @@ from .cloud import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _job_context(job: dict[str, Any]) -> dict[str, Any]:
+    """Return ``job['context']`` as a dict.
+
+    asyncpg returns JSONB columns as Python strings (no codec is
+    registered project-wide), so callers manually ``json.loads`` it.
+    Mirrors the pattern in ``orchestrator/main.py`` everywhere ``context``
+    is read.
+    """
+    raw = job.get("context")
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return raw if isinstance(raw, dict) else {}
 
 
 def slugify_project_name(name: str) -> str:
@@ -490,9 +511,7 @@ async def detect_external_mods(
     Caller is responsible for fetching the diff summary and threading
     the affected paths in via ``affected_cloud_paths``.
     """
-    baseline_entries = (job.get("context") or {}).get("cloud_baseline", {}).get(
-        "entries"
-    ) or {}
+    baseline_entries = _job_context(job).get("cloud_baseline", {}).get("entries") or {}
     handle_db = project.get("main_cloud_folder_handle")
     backend_id = project.get("main_cloud_backend")
     if not handle_db or not backend_id:
