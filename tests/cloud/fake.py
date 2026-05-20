@@ -49,6 +49,7 @@ class FakeMainCloudBackend:
         self._groups: dict[str, set[str]] = {}
         self._project_folders: dict[str, dict[str, object]] = {}
         self._session_folders: dict[str, dict[str, object]] = {}
+        self._session_files: dict[tuple[str, str], bytes] = {}
         self._shares: dict[str, dict[str, object]] = {}
         self._next_id = 1
         # Tracks every mutating call for assertion in tests.
@@ -329,3 +330,24 @@ class FakeMainCloudBackend:
         self, handle: SessionFolderHandle
     ) -> Optional[str]:
         return f"fake-dav://session/{handle.native_id}/"
+
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        self._ensure_ready()
+        self._fail_if_configured()
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_session_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        self._rec("put_session_file", handle.native_id, rel, content_type)
+        self._session_files[(handle.native_id, rel)] = content
