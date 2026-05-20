@@ -668,7 +668,8 @@ class PostgresDB:
                 SELECT id, description, status,
                        config_name, assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
-                       repo_name, branch_name, merge_status, created_at,
+                       repo_name, branch_name, merge_status,
+                       diff_status, exported_at, created_at,
                        context->'snapshot'->>'status' AS snapshot_status
                 FROM jobs
                 {where_clause}
@@ -741,7 +742,8 @@ class PostgresDB:
                 SELECT id, description, status,
                        config_name, assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
-                       repo_name, branch_name, merge_status, created_at,
+                       repo_name, branch_name, merge_status,
+                       diff_status, exported_at, created_at,
                        context->'snapshot'->>'status' AS snapshot_status
                 FROM jobs
                 {where_clause}
@@ -776,6 +778,8 @@ class PostgresDB:
                        project_id, parent_job_id, priority,
                        branch_name, repo_name, merge_status, repo_merge_statuses,
                        freeze_data,
+                       cloud_diff_baseline_commit, diff_status,
+                       exported_folder_handle, exported_at,
                        creation_order, worktree_path, delegation_context,
                        created_at, updated_at, description, context
                 FROM jobs
@@ -1049,6 +1053,117 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def update_job_cloud_diff(
+        self,
+        job_id: str,
+        *,
+        baseline_commit: str | None = None,
+        diff_status: str | None = None,
+        clear_diff_status: bool = False,
+    ) -> bool:
+        """Update the Mode A cloud-diff fields on a job.
+
+        Args:
+            job_id: Job UUID as string
+            baseline_commit: Gitea commit hash captured at job-start; set once
+                at dispatch, never overwritten.
+            diff_status: One of 'pending', 'accepted', 'rejected'. NULL is
+                only reachable via ``clear_diff_status=True`` (used by reject
+                paths that want to allow re-runs).
+            clear_diff_status: Explicit opt-in to set ``diff_status=NULL``.
+                Required because the default-None argument can't disambiguate
+                "leave alone" from "clear".
+
+        Returns:
+            True if updated, False if not found / nothing to update.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        updates = []
+        values = []
+        param_count = 0
+
+        if baseline_commit is not None:
+            param_count += 1
+            updates.append(f"cloud_diff_baseline_commit = ${param_count}")
+            values.append(baseline_commit)
+
+        if clear_diff_status:
+            updates.append("diff_status = NULL")
+        elif diff_status is not None:
+            param_count += 1
+            updates.append(f"diff_status = ${param_count}")
+            values.append(diff_status)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def update_job_exported_folder(
+        self,
+        job_id: str,
+        *,
+        handle: str | None,
+    ) -> bool:
+        """Set or clear the Mode B shared-folder export on a job.
+
+        Passing a non-None ``handle`` stamps both ``exported_folder_handle``
+        and ``exported_at = NOW()``. Passing ``None`` clears both (used if
+        we ever want to allow re-export after the user has deleted the
+        cloud folder; v1 just refuses re-export).
+
+        Args:
+            job_id: Job UUID as string
+            handle: Opaque cloud handle, or None to clear.
+
+        Returns:
+            True if updated, False if not found.
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            if handle is None:
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET exported_folder_handle = NULL,
+                           exported_at = NULL,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $1
+                    """,
+                    uuid_val,
+                )
+            else:
+                result = await conn.execute(
+                    """
+                    UPDATE jobs
+                       SET exported_folder_handle = $1,
+                           exported_at = CURRENT_TIMESTAMP,
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $2
+                    """,
+                    handle,
+                    uuid_val,
+                )
 
         return result == "UPDATE 1"
 

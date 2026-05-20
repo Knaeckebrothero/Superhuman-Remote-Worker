@@ -986,6 +986,13 @@ export interface Job {
   error_message?: string;
   audit_count?: number;
   context?: Record<string, any> | null;
+  /** Mode A diff-review state (job_cloud_export.md). NULL = no diff captured. */
+  diff_status?: 'pending' | 'accepted' | 'rejected' | null;
+  /** Mode A baseline commit hash for project-folder diff. Internal; only set if attached to project. */
+  cloud_diff_baseline_commit?: string | null;
+  /** Mode B export marker (set when "Export to shared folder" succeeds). */
+  exported_folder_handle?: string | null;
+  exported_at?: string | null;
 }
 
 /**

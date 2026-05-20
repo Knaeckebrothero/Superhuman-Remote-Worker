@@ -1443,6 +1443,41 @@ export class ApiService {
     ).pipe(catchError(() => of(null)));
   }
 
+  /**
+   * Mode B of the job cloud workflow — export a completed loose job's output/
+   * folder to a freshly-allocated shared cloud folder. Only valid for jobs
+   * that are completed AND have no project_id. Returns the folder's
+   * browser/WebDAV URLs and the number of files copied.
+   *
+   * See docs/features/job_cloud_export.md §3.2.
+   */
+  exportJobToSharedFolder(
+    jobId: string,
+  ): Observable<{
+    job_id: string;
+    files_copied: number;
+    folder: { name: string; browser_url: string | null; webdav_url: string | null };
+  } | null> {
+    return this.http
+      .post<{
+        job_id: string;
+        files_copied: number;
+        folder: { name: string; browser_url: string | null; webdav_url: string | null };
+      }>(`${this.baseUrl}/jobs/${jobId}/export-to-shared-folder`, {})
+      .pipe(
+        tap((result) =>
+          this.toast.success(
+            this.t('toasts.jobs.exportedToCloud', { count: result?.files_copied ?? 0 }),
+          ),
+        ),
+        catchError((error) => {
+          console.error(`Failed to export job ${jobId} to cloud:`, error);
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.exportFailed'));
+          return of(null);
+        }),
+      );
+  }
+
   // ===== Knowledge Base Endpoints =====
 
   getKnowledgeSummary(projectId: string): Observable<KnowledgeSummary | null> {

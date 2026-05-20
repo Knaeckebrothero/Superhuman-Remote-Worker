@@ -181,6 +181,27 @@ class MainCloudBackend(Protocol):
         self, handle: SessionFolderHandle
     ) -> Optional[str]: ...
 
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Upload one file into the session folder via WebDAV.
+
+        ``path`` is relative to the session folder root, slash-separated,
+        no leading slash. The implementation must MKCOL any missing
+        parent collections before issuing the PUT. ``content_type`` is
+        advisory; backends may pick a default if omitted.
+
+        Used by the job cloud-export endpoint (Mode B in
+        docs/features/job_cloud_export.md) to copy a completed job's
+        output files into a freshly-allocated shared folder.
+        """
+        ...
+
     # ------------------------------------------------------------- Credentials
     @property
     def webdav_credentials(self) -> dict[str, str]:

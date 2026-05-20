@@ -871,6 +871,68 @@ class OpenCloudBackend:
         safe_path = quote(handle.native_id, safe="/")
         return f"{self._base_url}/dav/spaces/{safe_id}/{safe_path}/"
 
+    @instrument_backend_op("put_session_file")
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """PUT one file into a session folder, MKCOL-ing parents on the way.
+
+        ``path`` is slash-separated, relative to the session folder root,
+        no leading slash. WebDAV PUT does not auto-create missing
+        intermediate collections, so we MKCOL each parent segment one
+        at a time first (idempotent — 405 means "already there").
+        """
+        self._ensure_ready()
+        if self._agent_home_webdav_base is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNAVAILABLE,
+                "agent-home Space WebDAV base not set",
+                backend=self.backend_id,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_session_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        token = await self._get_service_token()
+        folder_path = handle.native_id.strip("/")
+        full_segments = folder_path.split("/") + rel.split("/")
+        # MKCOL every parent collection of the target file.
+        parents = full_segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{self._agent_home_webdav_base}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = (
+                f"{self._agent_home_webdav_base}/"
+                f"{quote('/'.join(full_segments), safe='/')}"
+            )
+            headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(put_url, headers=headers, content=content)
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
     # ------------------------------------------------------------ Internal helpers
 
     def _ensure_ready(self) -> None:
