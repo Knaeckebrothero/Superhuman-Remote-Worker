@@ -111,4 +111,6 @@ export interface JobSummary {
   created_at: string;
   audit_count?: number | null;
   snapshot_status?: string | null;
+  /** Mode B export marker — set when "Export to shared folder" succeeds. */
+  exported_at?: string | null;
 }
