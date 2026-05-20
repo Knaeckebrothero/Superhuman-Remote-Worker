@@ -26,6 +26,7 @@ from .config import (
 from .errors import CloudBackendError, CloudBackendErrorKind, FeatureNotAvailable
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -262,6 +263,7 @@ __all__ = [
     "NextcloudSettings",
     "OpenCloudBackend",
     "OpenCloudSettings",
+    "ProjectFolderEntry",
     "ProjectFolderHandle",
     "SessionFolderHandle",
     "ShareHandle",

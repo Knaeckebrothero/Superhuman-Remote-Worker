@@ -1,0 +1,429 @@
+"""Mode A baseline seeding + diff capture for the job cloud workflow.
+
+See ``docs/features/job_cloud_export.md`` §3 for the design. This module
+owns the cloud→Gitea seed at job-start and the Gitea-diff capture at
+job-completion. Both run from the orchestrator side; the agent stays
+unchanged (it picks the seeded ``projects/<slug>/`` up via its existing
+clone-on-start of the job's Gitea repo).
+
+The seed is async via ``asyncio.create_task`` from the job-create
+handler. While it runs, the job carries
+``context.cloud_baseline = {state: 'seeding'}``; the dispatcher gate
+in ``get_dispatchable_jobs`` skips jobs in that state so the agent
+never starts on an incomplete baseline.
+
+v1 limitations (deferred to v2):
+
+* Text files only — anything that isn't UTF-8-decodable is logged and
+  skipped from the baseline. Binary files in the project folder will
+  not appear in the diff. Acceptable for the thesis/document workflows
+  this feature primarily targets; revisit when first user hits it.
+* OpenCloud-only — Nextcloud's ``list_project_folder`` /
+  ``get_project_folder_file_bytes`` are stubs that raise
+  ``NOT_SUPPORTED``. Adding Group Folders PROPFIND is a clean follow-up.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from .cloud import (
+    CloudBackendError,
+    MainCloudRouter,
+    ProjectFolderEntry,
+    ProjectFolderHandle,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def slugify_project_name(name: str) -> str:
+    """Same algorithm as ``main._slugify_mount_name`` — kept here to
+    avoid the circular import. Workspace-safe slug for a project name.
+    """
+    out = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
+    return out or "project"
+
+
+_BASELINE_COMMIT_MESSAGE = (
+    "Mode A baseline: seed project folder for job {job_short}\n\n"
+    "Seeded by orchestrator from project '{project_name}' cloud folder. "
+    "This is the diff baseline; agent edits on top become the diff at "
+    "job completion. See docs/features/job_cloud_export.md."
+)
+
+
+async def seed_project_folder_baseline(
+    *,
+    job_id: str,
+    project: dict[str, Any],
+    repo_name: str,
+    branch: str | None,
+    postgres_db: Any,
+    gitea_client: Any,
+    main_cloud_router: MainCloudRouter,
+) -> None:
+    """Walk the project's cloud folder, push files into Gitea, stamp baseline.
+
+    Sets ``jobs.cloud_diff_baseline_commit`` on success.
+    Updates ``jobs.context.cloud_baseline.state`` to ``'seeding'`` while
+    running, then ``'ready'`` or ``'failed'`` at termination. The
+    dispatcher gate watches that field.
+
+    Idempotency: if ``cloud_diff_baseline_commit`` is already set, this
+    is a no-op (already seeded). Safe to invoke twice (e.g. on a retry).
+    """
+    job_short = job_id[:8]
+    project_name = str(project.get("name") or "project")
+    slug = slugify_project_name(project_name)
+    target_subpath = f"projects/{slug}"
+
+    async def _set_state(state: str, error: str | None = None) -> None:
+        ctx_update: dict[str, Any] = {"cloud_baseline": {"state": state}}
+        if error:
+            ctx_update["cloud_baseline"]["error"] = error
+        try:
+            await postgres_db.merge_job_context(job_id, ctx_update)
+        except Exception:
+            logger.exception(
+                "Mode A: failed to update baseline state for job %s", job_id
+            )
+
+    try:
+        # Idempotency: a re-run after a successful seed should no-op.
+        existing = await postgres_db.get_job(job_id)
+        if existing and existing.get("cloud_diff_baseline_commit"):
+            await _set_state("ready")
+            return
+
+        await _set_state("seeding")
+
+        # Resolve the cloud handle.
+        handle_db = project.get("main_cloud_folder_handle")
+        backend_id = project.get("main_cloud_backend")
+        if not handle_db or not backend_id:
+            logger.info(
+                "Mode A: job %s — project %s has no cloud folder; "
+                "skipping baseline seed (will run as loose job).",
+                job_short,
+                project_name,
+            )
+            await _set_state("ready")
+            return
+
+        try:
+            backend = main_cloud_router.for_backend(backend_id)
+        except Exception as e:
+            logger.warning(
+                "Mode A: job %s — backend %s not available; skipping seed (%s)",
+                job_short,
+                backend_id,
+                e,
+            )
+            await _set_state("failed", error=f"backend unavailable: {e}")
+            return
+
+        if not getattr(backend, "is_initialized", False):
+            logger.warning(
+                "Mode A: job %s — backend %s not initialized; skipping seed",
+                job_short,
+                backend_id,
+            )
+            await _set_state("failed", error="backend not initialized")
+            return
+
+        handle = ProjectFolderHandle.from_db(str(handle_db), backend=backend_id)
+
+        # 1. Enumerate everything under the project folder.
+        try:
+            entries: list[ProjectFolderEntry] = await backend.list_project_folder(
+                handle
+            )
+        except CloudBackendError as e:
+            logger.warning(
+                "Mode A: job %s — list_project_folder failed (%s); skipping seed",
+                job_short,
+                e,
+            )
+            await _set_state("failed", error=f"list_project_folder: {e}")
+            return
+
+        # 2. Filter to text files only. Walk dirs are no-ops in git.
+        files = [e for e in entries if not e.is_dir]
+        if not files:
+            logger.info(
+                "Mode A: job %s — project folder is empty; no baseline files",
+                job_short,
+            )
+            # Still record a baseline commit hash so completion-time diff
+            # has something to diff against (the empty tree).
+            # We do this by capturing the current HEAD of the job branch.
+            head_sha = await _read_head_commit(gitea_client, repo_name, branch)
+            if head_sha:
+                await postgres_db.update_job_cloud_diff(
+                    job_id, baseline_commit=head_sha
+                )
+            await _set_state("ready")
+            return
+
+        seeded = 0
+        skipped_binary = 0
+        for entry in files:
+            try:
+                blob = await backend.get_project_folder_file_bytes(
+                    handle, path=entry.path
+                )
+            except CloudBackendError as e:
+                logger.warning(
+                    "Mode A: job %s — failed to fetch %s (%s); skipping",
+                    job_short,
+                    entry.path,
+                    e,
+                )
+                continue
+            # v1: text files only. Skip anything that isn't valid UTF-8.
+            try:
+                content_text = blob.decode("utf-8")
+            except UnicodeDecodeError:
+                skipped_binary += 1
+                logger.debug(
+                    "Mode A: job %s — skipping binary %s (%d bytes)",
+                    job_short,
+                    entry.path,
+                    len(blob),
+                )
+                continue
+            gitea_path = f"{target_subpath}/{entry.path}"
+            ok = await gitea_client.create_or_update_file(
+                repo_name,
+                gitea_path,
+                content_text,
+                _BASELINE_COMMIT_MESSAGE.format(
+                    job_short=job_short, project_name=project_name
+                ),
+                branch=branch,
+            )
+            if ok:
+                seeded += 1
+            else:
+                logger.warning(
+                    "Mode A: job %s — gitea write failed for %s",
+                    job_short,
+                    gitea_path,
+                )
+
+        # 3. Capture the head of the branch as the baseline commit.
+        baseline_sha = await _read_head_commit(gitea_client, repo_name, branch)
+        if not baseline_sha:
+            logger.warning(
+                "Mode A: job %s — could not read HEAD after seeding; "
+                "baseline commit hash not recorded",
+                job_short,
+            )
+            await _set_state("failed", error="could not read HEAD after seed")
+            return
+
+        await postgres_db.update_job_cloud_diff(job_id, baseline_commit=baseline_sha)
+        logger.info(
+            "Mode A: job %s — seeded %d file(s), skipped %d binary, baseline=%s",
+            job_short,
+            seeded,
+            skipped_binary,
+            baseline_sha[:8],
+        )
+        await _set_state("ready")
+    except Exception as e:
+        logger.exception(
+            "Mode A: job %s — baseline seed unexpectedly failed", job_short
+        )
+        await _set_state("failed", error=str(e))
+
+
+async def _read_head_commit(
+    gitea_client: Any, repo_name: str, branch: str | None
+) -> str | None:
+    """Return the SHA of HEAD on ``branch`` (or default branch if None)."""
+    commits = await gitea_client.get_commits(
+        repo_name,
+        sha=branch or "main",
+        page=1,
+        limit=1,
+    )
+    if not commits:
+        return None
+    return commits[0].get("sha")
+
+
+def fire_baseline_seed(
+    *,
+    job_id: str,
+    project: dict[str, Any],
+    repo_name: str,
+    branch: str | None,
+    postgres_db: Any,
+    gitea_client: Any,
+    main_cloud_router: MainCloudRouter,
+) -> asyncio.Task:
+    """Fire-and-forget wrapper around :func:`seed_project_folder_baseline`.
+
+    Used from the job-create endpoint where we don't want to block the
+    user's request while the cloud folder walk runs. Returns the task
+    so the caller can attach error logging or await in tests.
+    """
+    return asyncio.create_task(
+        seed_project_folder_baseline(
+            job_id=job_id,
+            project=project,
+            repo_name=repo_name,
+            branch=branch,
+            postgres_db=postgres_db,
+            gitea_client=gitea_client,
+            main_cloud_router=main_cloud_router,
+        )
+    )
+
+
+async def capture_diff_for_mode_a_job(
+    *,
+    job: dict[str, Any],
+    postgres_db: Any,
+    gitea_client: Any,
+) -> bool:
+    """At job completion, compute the Mode A diff.
+
+    Reads the job's ``cloud_diff_baseline_commit`` and the current HEAD
+    of its branch, asks Gitea to compare them, and decides whether the
+    job should land in ``pending_review`` (diff non-empty) or proceed
+    to ``completed`` (diff empty / not a Mode A job).
+
+    Returns ``True`` if a non-empty diff was captured and
+    ``jobs.diff_status`` was set to ``'pending'``; ``False`` otherwise.
+    The caller is responsible for the status transition itself — this
+    helper only flips the ``diff_status`` flag, which the caller uses
+    to override the new_status returned by ``determine_job_status``.
+    """
+    job_id = str(job["id"])
+    baseline = job.get("cloud_diff_baseline_commit")
+    if not baseline:
+        return False
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name")
+    if not repo_name:
+        logger.debug(
+            "Mode A: job %s has baseline but no repo_name; skipping diff capture",
+            job_id,
+        )
+        return False
+    head = await _read_head_commit(gitea_client, repo_name, branch)
+    if not head:
+        logger.warning("Mode A: job %s — couldn't read HEAD for diff capture", job_id)
+        return False
+    if head == baseline:
+        # No commits past the baseline → nothing to review.
+        return False
+    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
+    if not diff_text or not diff_text.strip():
+        return False
+    # Scope check — does the diff touch projects/<slug>/?
+    # gitea's plain compare diff is unfiltered; we apply a path filter
+    # on the response. Format starts with "diff --git a/<path> b/<path>".
+    # The agent shouldn't be writing under projects/ outside its mounted
+    # slug, so any change under projects/ counts as a Mode A change.
+    has_project_change = False
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            # "diff --git a/projects/<slug>/file b/projects/<slug>/file"
+            parts = line.split(" ")
+            if len(parts) >= 3 and parts[2].startswith("a/projects/"):
+                has_project_change = True
+                break
+    if not has_project_change:
+        logger.info(
+            "Mode A: job %s — diff is non-empty but contains no changes "
+            "under projects/; treating as no review",
+            job_id,
+        )
+        return False
+    await postgres_db.update_job_cloud_diff(job_id, diff_status="pending")
+    logger.info(
+        "Mode A: job %s — captured diff baseline=%s head=%s; status -> pending_review",
+        job_id,
+        baseline[:8],
+        head[:8],
+    )
+    return True
+
+
+async def get_diff_summary(
+    *,
+    job: dict[str, Any],
+    gitea_client: Any,
+) -> dict[str, Any] | None:
+    """Build a file-tree summary of the Mode A diff for a job.
+
+    Returns ``{"baseline_commit": ..., "head_commit": ..., "files":
+    [{"path": ..., "status": "added"|"modified"|"deleted"}]}`` or ``None``
+    if the job has no baseline / no diff. Per-file diff content is
+    served lazily via the sibling endpoint.
+    """
+    baseline = job.get("cloud_diff_baseline_commit")
+    if not baseline:
+        return None
+    repo_name = job.get("repo_name")
+    branch = job.get("branch_name")
+    if not repo_name:
+        return None
+    head = await _read_head_commit(gitea_client, repo_name, branch)
+    if not head or head == baseline:
+        return {
+            "baseline_commit": baseline,
+            "head_commit": head or baseline,
+            "files": [],
+        }
+    diff_text = await gitea_client.get_diff(repo_name, baseline, head)
+    if not diff_text:
+        return {
+            "baseline_commit": baseline,
+            "head_commit": head,
+            "files": [],
+        }
+    return {
+        "baseline_commit": baseline,
+        "head_commit": head,
+        "files": _parse_diff_file_list(diff_text),
+    }
+
+
+def _parse_diff_file_list(diff_text: str) -> list[dict[str, str]]:
+    """Pull file-level statuses out of a unified diff blob.
+
+    Walks ``diff --git`` headers, classifies each file as ``added`` /
+    ``modified`` / ``deleted`` based on adjacent ``new file mode`` /
+    ``deleted file mode`` indicators. Only files under ``projects/``
+    are surfaced — the agent's own scratch files don't belong in the
+    Mode A diff.
+    """
+    files: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            if current and current.get("path", "").startswith("projects/"):
+                files.append(current)
+            # New file block. "diff --git a/<path> b/<path>"
+            parts = raw.split(" ")
+            path = ""
+            for p in parts[2:]:
+                if p.startswith("a/"):
+                    path = p[len("a/") :]
+                    break
+            current = {"path": path, "status": "modified"}
+        elif current is not None:
+            if raw.startswith("new file mode"):
+                current["status"] = "added"
+            elif raw.startswith("deleted file mode"):
+                current["status"] = "deleted"
+    if current and current.get("path", "").startswith("projects/"):
+        files.append(current)
+    return files

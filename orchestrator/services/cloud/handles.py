@@ -97,3 +97,20 @@ class ShareHandle:
     def from_db(cls, s: str, *, backend: str) -> "ShareHandle":
         b, nid, meta = _deserialize(s, backend=backend)
         return cls(backend=b, native_id=nid, vendor_meta=meta)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectFolderEntry:
+    """One file or directory beneath a project folder, as returned by
+    ``MainCloudBackend.list_project_folder``.
+
+    ``path`` is slash-separated, relative to the folder root, no leading
+    slash, no trailing slash for directories. ``etag`` may be empty if
+    the backend does not expose one.
+    """
+
+    path: str
+    is_dir: bool
+    size: int = 0
+    etag: str = ""
+    content_type: str = ""
