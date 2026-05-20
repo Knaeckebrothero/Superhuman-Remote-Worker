@@ -186,6 +186,40 @@ class MainCloudBackend(Protocol):
         """
         ...
 
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Write one file into a project folder, creating parents as needed.
+
+        ``path`` is slash-separated, relative to the project folder root,
+        no leading slash. Parent collections are created on the way
+        (WebDAV ``MKCOL`` is idempotent against existing collections).
+        Used by the Mode A accept flow (job_cloud_export.md §3.5) to
+        write the agent's accepted edits back to the cloud.
+        """
+        ...
+
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        """Delete one file from a project folder.
+
+        ``path`` is relative to the folder root. With ``if_exists=True``
+        a missing file is treated as success (the goal state is "gone").
+        Used by the Mode A accept flow when the agent deleted a file
+        within the mounted project folder.
+        """
+        ...
+
     # ------------------------------------------------------------- Session folders
     async def ensure_session_folder(
         self, *, session_id: str

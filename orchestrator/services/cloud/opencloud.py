@@ -833,6 +833,120 @@ class OpenCloudBackend:
             )
         return resp.content
 
+    @instrument_backend_op("put_project_folder_file_bytes")
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """PUT one file into a project folder Space, MKCOL-ing parents.
+
+        Same MKCOL-each-segment-then-PUT idiom as ``put_session_file``.
+        Used by the Mode A accept flow (job_cloud_export.md §3.5) to
+        write the agent's edits back to the cloud folder.
+        """
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        base = f"/dav/spaces/{safe_drive}"
+        token = await self._get_service_token()
+        segments = rel.split("/")
+        parents = segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{base}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = f"{base}/{quote(rel, safe='/')}"
+            headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(put_url, headers=headers, content=content)
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    @instrument_backend_op("delete_project_folder_file")
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        """DELETE one file from a project folder Space."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        url = f"/dav/spaces/{safe_drive}/{quote(rel, safe='/')}"
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.delete(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code in (200, 204):
+            return
+        if resp.status_code == 404:
+            if if_exists:
+                return
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in drive {drive_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        raise CloudBackendError(
+            CloudBackendErrorKind.UNKNOWN,
+            f"DELETE file {path!r}: unexpected status {resp.status_code}",
+            backend=self.backend_id,
+            status_code=resp.status_code,
+        )
+
     def get_project_folder_webdav_url(
         self, handle: ProjectFolderHandle
     ) -> Optional[str]:

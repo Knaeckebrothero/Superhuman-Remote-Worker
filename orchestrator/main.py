@@ -8514,6 +8514,190 @@ async def get_job_diff_file(
     }
 
 
+@app.post("/api/jobs/{job_id}/accept")
+async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
+    """Mode A accept: apply the job's diff back to the project's cloud folder.
+
+    Gates:
+
+    * Job is ``pending_review`` and project-attached.
+    * ``diff_status`` is ``pending`` (the diff capture flagged changes).
+    * Backend + Gitea are reachable.
+    * No external modifications to the cloud folder since seed
+      (etag map captured at seed time vs. fresh PROPFIND at accept). On
+      divergence, returns 409 with the diverging path list — user must
+      resolve manually and re-accept.
+
+    On success, writes/deletes each diff path back via the cloud
+    backend, then transitions ``diff_status='accepted'`` and
+    ``status='completed'``.
+
+    See docs/features/job_cloud_export.md §3.5.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+
+    # --- Gates -------------------------------------------------------
+    if job.get("status") != "pending_review":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job is in status '{job.get('status')}'; "
+                "only pending_review jobs can be accepted."
+            ),
+        )
+    if not job.get("project_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="Job has no project attached; nothing to write back to.",
+        )
+    if job.get("diff_status") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job diff_status is '{job.get('diff_status')}'; "
+                "only pending diffs can be accepted."
+            ),
+        )
+    if not job.get("cloud_diff_baseline_commit"):
+        raise HTTPException(
+            status_code=409,
+            detail="Job has no Mode A baseline; nothing to compare against.",
+        )
+
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available.")
+
+    project = await postgres_db.get_project(str(job["project_id"]))
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    if not project.get("main_cloud_folder_handle"):
+        raise HTTPException(
+            status_code=409,
+            detail="Project has no cloud folder; cannot apply diff.",
+        )
+    backend_id = project.get("main_cloud_backend")
+    if not backend_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Project has no cloud backend; cannot apply diff.",
+        )
+    try:
+        backend = main_cloud_router.for_backend(backend_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cloud backend '{backend_id}' unavailable: {e}",
+        ) from e
+    if not backend.is_initialized:
+        raise HTTPException(status_code=503, detail="Cloud backend not initialized.")
+
+    # --- External-modification gate ---------------------------------
+    from services.job_cloud_baseline import (
+        apply_diff_to_cloud,
+        detect_external_mods,
+    )
+
+    diverged = await detect_external_mods(
+        job=job,
+        project=project,
+        main_cloud_router=main_cloud_router,
+    )
+    if diverged:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "external_modifications_detected",
+                "message": (
+                    "Cloud folder was modified externally since the job "
+                    "started. Resolve manually before accepting."
+                ),
+                "diverged": diverged,
+            },
+        )
+
+    # --- Apply -------------------------------------------------------
+    result = await apply_diff_to_cloud(
+        job=job,
+        project=project,
+        gitea_client=gitea_client,
+        main_cloud_router=main_cloud_router,
+    )
+    if result.get("errors"):
+        # Partial failure: cloud is now in a mixed state. Surface the
+        # errors so the user can see what missed; don't transition the
+        # job — user can retry.
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "partial_write_failure",
+                "applied": result.get("applied", 0),
+                "deleted": result.get("deleted", 0),
+                "errors": result.get("errors"),
+            },
+        )
+
+    # --- Status transition ------------------------------------------
+    await postgres_db.update_job_cloud_diff(job_id, diff_status="accepted")
+    await postgres_db.update_job_status(job_id, status="completed")
+    logger.info(
+        "Mode A: job %s — diff accepted (%d applied, %d deleted)",
+        job_id,
+        result.get("applied", 0),
+        result.get("deleted", 0),
+    )
+    return {
+        "job_id": job_id,
+        "diff_status": "accepted",
+        "status": "completed",
+        "applied": result.get("applied", 0),
+        "deleted": result.get("deleted", 0),
+    }
+
+
+@app.post("/api/jobs/{job_id}/reject")
+async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
+    """Mode A reject: discard the job's diff, no cloud write.
+
+    Stamps ``diff_status='rejected'`` and ``status='completed'``. The
+    Gitea commits stay around as the audit trail of what the agent
+    tried to do (cheap; see §3.6).
+
+    See docs/features/job_cloud_export.md §3.6.
+    """
+    _, job = await require_job_access(request, postgres_db, job_id)
+
+    if job.get("status") != "pending_review":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job is in status '{job.get('status')}'; "
+                "only pending_review jobs can be rejected."
+            ),
+        )
+    if not job.get("project_id"):
+        raise HTTPException(
+            status_code=409,
+            detail="Job has no project attached; no diff to reject.",
+        )
+    if job.get("diff_status") != "pending":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job diff_status is '{job.get('diff_status')}'; "
+                "only pending diffs can be rejected."
+            ),
+        )
+
+    await postgres_db.update_job_cloud_diff(job_id, diff_status="rejected")
+    await postgres_db.update_job_status(job_id, status="completed")
+    logger.info("Mode A: job %s — diff rejected", job_id)
+    return {
+        "job_id": job_id,
+        "diff_status": "rejected",
+        "status": "completed",
+    }
+
+
 @app.post("/api/jobs/{job_id}/export-to-shared-folder")
 async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str, Any]:
     """Mode B of the job cloud workflow — export a completed loose job to

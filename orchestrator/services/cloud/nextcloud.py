@@ -528,6 +528,37 @@ class NextcloudBackend:
             retryable=False,
         )
 
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Not yet implemented for Nextcloud — see list_project_folder."""
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "put_project_folder_file_bytes not implemented on the Nextcloud backend yet",
+            backend=self.backend_id,
+            retryable=False,
+        )
+
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        """Not yet implemented for Nextcloud — see list_project_folder."""
+        raise CloudBackendError(
+            CloudBackendErrorKind.NOT_SUPPORTED,
+            "delete_project_folder_file not implemented on the Nextcloud backend yet",
+            backend=self.backend_id,
+            retryable=False,
+        )
+
     # ------------------------------------------------------------- Session folders
 
     @instrument_backend_op("ensure_session_folder")
