@@ -221,7 +221,9 @@
       "delete": "Löschen",
       "confirmDelete": "Bestätigen?",
       "promote": "Heraufstufen",
-      "createProject": "Projekt erstellen"
+      "createProject": "Projekt erstellen",
+      "exportToCloud": "In Cloud exportieren",
+      "exported": "Exportiert"
     },
     "tooltip": {
       "collapse": "Unteraufträge einklappen",
@@ -240,6 +242,8 @@
       "confirmDelete": "Erneut klicken, um Löschung zu bestätigen",
       "deleteJob": "Auftrag löschen",
       "promoteJob": "Zu Projekt heraufstufen",
+      "exportToCloud": "Output-Ordner dieses Auftrags in einen geteilten Cloud-Ordner kopieren",
+      "alreadyExported": "Bereits exportiert. Cloud-Ordner löschen, um erneut zu exportieren.",
       "snapshotStats": "S3-Snapshot-Speicher",
       "snapshotAvailable": "Umgebungs-Snapshot verfügbar",
       "delegationWaiting": "Warte auf Abschluss der Delegations-Unteraufträge",
@@ -1786,7 +1790,8 @@
       "resumeFailed": "Job konnte nicht fortgesetzt werden.",
       "approveFailed": "Job konnte nicht freigegeben werden.",
       "upgradeVmFailed": "Upgrade auf VM-Workspace fehlgeschlagen.",
-      "replyFailed": "Antwort konnte nicht gesendet werden."
+      "replyFailed": "Antwort konnte nicht gesendet werden.",
+      "exportFailed": "Auftrag konnte nicht in deine Cloud exportiert werden."
     },
     "ide": {
       "startFailed": "IDE-Sitzung konnte nicht gestartet werden.",
@@ -1808,7 +1813,8 @@
       "resumed": "Job fortgesetzt",
       "approved": "Job freigegeben",
       "vmUpgradeStarted": "VM-Upgrade gestartet",
-      "replySent": "Antwort gesendet"
+      "replySent": "Antwort gesendet",
+      "exportedToCloud": "{{count}} Datei(en) in deine Cloud exportiert"
     },
     "ide": {
       "stopped": "IDE-Sitzung beendet"

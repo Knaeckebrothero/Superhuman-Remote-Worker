@@ -666,6 +666,49 @@ class GiteaClient:
             logger.warning(f"Failed to read {file_path} from {repo_name}: {e}")
             return None
 
+    async def get_file_bytes(
+        self, repo_name: str, file_path: str, ref: str | None = None
+    ) -> bytes | None:
+        """Read raw file content as bytes from a repository.
+
+        Use when the caller needs the file's original bytes (e.g. for an
+        image, PDF, or anything that ``get_file_content``'s UTF-8 decode
+        would corrupt). The Gitea contents API returns the file body
+        base64-encoded inside JSON; we decode that and return the result.
+
+        Returns:
+            File bytes, or ``None`` if not found / failed.
+        """
+        if not self._initialized:
+            return None
+
+        import base64
+
+        client = self._get_client()
+        params = {"ref": ref} if ref else {}
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                params=params,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to read {file_path} bytes from {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+            data = resp.json()
+            content_b64 = data.get("content", "")
+            if not content_b64:
+                return b""
+            return base64.b64decode(content_b64)
+        except Exception as e:
+            logger.warning(f"Failed to read {file_path} bytes from {repo_name}: {e}")
+            return None
+
     async def get_commits(
         self,
         repo_name: str,
