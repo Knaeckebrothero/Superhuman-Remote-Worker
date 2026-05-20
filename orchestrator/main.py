@@ -137,6 +137,7 @@ from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from services.cloud import (  # noqa: E402
+    CloudBackendError,
     MainCloudRouter,
     ProjectFolderHandle,
     SessionFolderHandle,
@@ -8348,6 +8349,156 @@ async def write_workspace_file(
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
+
+
+@app.post("/api/jobs/{job_id}/export-to-shared-folder")
+async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str, Any]:
+    """Mode B of the job cloud workflow — export a completed loose job to
+    a freshly-allocated shared cloud folder.
+
+    Only valid for completed jobs that are NOT attached to a project
+    (project-attached jobs go through the Mode A diff-review flow). Copies
+    the ``output/`` directory from the job's Gitea repo into a new
+    session-style cloud folder that is shared with the calling user.
+    Stamps ``exported_folder_handle`` + ``exported_at`` on the job;
+    re-export is refused while the handle is set (user must delete the
+    cloud folder to retry).
+
+    See docs/features/job_cloud_export.md §3.2.
+    """
+    user, job = await require_job_access(request, postgres_db, job_id)
+
+    # Status gate — completed only. Failed/cancelled/in-flight jobs can't
+    # export because there's no stable output.
+    if job.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Job is in status '{job.get('status')}'; "
+                "only completed jobs can be exported."
+            ),
+        )
+
+    # Routing gate — project-attached jobs use the diff flow, not Mode B.
+    if job.get("project_id"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Job is attached to a project — use the diff-review "
+                "(accept/reject) flow instead of shared-folder export."
+            ),
+        )
+
+    # Idempotency gate — refuse if we already wrote a handle. The user can
+    # delete the cloud folder if they want to redo this (v1 simplification).
+    if job.get("exported_folder_handle"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Job has already been exported. Delete the existing shared "
+                "folder in your cloud to re-export."
+            ),
+        )
+
+    backend = main_cloud_router.active
+    if not backend.is_initialized:
+        raise HTTPException(status_code=503, detail="Cloud backend not available.")
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available.")
+
+    repo_name, branch = await resolve_job_repo(job_id)
+
+    # 1) Provision shared folder. Short stable folder name from the job id
+    #    keeps it distinguishable in the user's cloud root.
+    folder_session_id = f"job-{job_id.replace('-', '')[:12]}"
+    try:
+        folder_handle = await backend.ensure_session_folder(
+            session_id=folder_session_id
+        )
+        resolved_user_id = await backend.ensure_user(
+            sub=user.get("keycloak_sub") or "",
+            issuer=getattr(backend, "_keycloak_issuer", "") or "",
+            email=user.get("email"),
+            display_name=user.get("display_name"),
+            preferred_username=user.get("preferred_username"),
+        )
+        if resolved_user_id:
+            await backend.share_session_folder(folder_handle, resolved_user_id)
+    except CloudBackendError as e:
+        logger.exception("Mode B export: folder provisioning failed for job %s", job_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cloud folder provisioning failed: {e}",
+        ) from e
+
+    # 2) Copy ``output/`` recursively from Gitea → cloud. Bytes-faithful via
+    #    get_file_bytes so binary outputs (PDFs, images) survive the round
+    #    trip. Per-file failures abort the export and surface 502; we do
+    #    NOT stamp exported_folder_handle so the user can retry (the
+    #    partially-filled folder is harmless and idempotent under retry).
+    files_copied = 0
+
+    async def _copy_tree(src_dir: str) -> None:
+        nonlocal files_copied
+        entries = await gitea_client.list_contents(repo_name, src_dir, ref=branch)
+        if not entries:
+            return
+        for entry in entries:
+            entry_path = entry["path"]
+            entry_type = entry.get("type")
+            if entry_type == "dir":
+                await _copy_tree(entry_path)
+                continue
+            if entry_type != "file":
+                continue
+            file_bytes = await gitea_client.get_file_bytes(
+                repo_name, entry_path, ref=branch
+            )
+            if file_bytes is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to read '{entry_path}' from Gitea.",
+                )
+            await backend.put_session_file(
+                folder_handle,
+                path=entry_path,
+                content=file_bytes,
+            )
+            files_copied += 1
+
+    try:
+        await _copy_tree("output")
+    except HTTPException:
+        raise
+    except CloudBackendError as e:
+        logger.exception(
+            "Mode B export: cloud upload failed for job %s (copied %d)",
+            job_id,
+            files_copied,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"File copy to cloud failed after {files_copied} files: {e}",
+        ) from e
+    except Exception as e:
+        logger.exception("Mode B export: unexpected failure for job %s", job_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Export failed: {e}",
+        ) from e
+
+    # 3) Stamp the job — only on success so retries are safe.
+    await postgres_db.update_job_exported_folder(job_id, handle=folder_handle.to_db())
+
+    return {
+        "job_id": job_id,
+        "files_copied": files_copied,
+        "folder": {
+            "name": folder_session_id,
+            "browser_url": backend.get_session_folder_browser_url(folder_handle),
+            "webdav_url": backend.get_session_folder_webdav_url(folder_handle),
+        },
+    }
 
 
 @app.get("/api/jobs/{job_id}/todos")

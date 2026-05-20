@@ -221,7 +221,9 @@
       "delete": "Delete",
       "confirmDelete": "Confirm?",
       "promote": "Promote",
-      "createProject": "Create Project"
+      "createProject": "Create Project",
+      "exportToCloud": "Export to cloud",
+      "exported": "Exported"
     },
     "tooltip": {
       "collapse": "Collapse sub-jobs",
@@ -240,6 +242,8 @@
       "confirmDelete": "Click again to confirm deletion",
       "deleteJob": "Delete job",
       "promoteJob": "Promote to project",
+      "exportToCloud": "Copy this job's output/ folder to a shared cloud folder",
+      "alreadyExported": "Already exported. Delete the cloud folder to re-export.",
       "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
       "delegationWaiting": "Waiting for delegation children to complete",
@@ -1786,7 +1790,8 @@
       "resumeFailed": "Couldn't resume the job.",
       "approveFailed": "Couldn't approve the job.",
       "upgradeVmFailed": "Couldn't upgrade to a VM workspace.",
-      "replyFailed": "Couldn't send the reply."
+      "replyFailed": "Couldn't send the reply.",
+      "exportFailed": "Couldn't export the job to your cloud."
     },
     "ide": {
       "startFailed": "Couldn't start the IDE session.",
@@ -1808,7 +1813,8 @@
       "resumed": "Job resumed",
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
-      "replySent": "Reply sent"
+      "replySent": "Reply sent",
+      "exportedToCloud": "Exported {{count}} file(s) to your cloud"
     },
     "ide": {
       "stopped": "IDE session stopped"

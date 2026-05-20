@@ -656,6 +656,62 @@ class NextcloudBackend:
             f"{self._agent_user}/{handle.native_id}/"
         )
 
+    @instrument_backend_op("put_session_file")
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """PUT one file into a session folder, MKCOL-ing parents on the way."""
+        self._ensure_ready()
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_session_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        folder_path = handle.native_id.strip("/")
+        full_segments = folder_path.split("/") + rel.split("/")
+        parents = full_segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = (
+                    f"/remote.php/dav/files/{self._agent_user}/"
+                    f"{quote(partial, safe='/')}"
+                )
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    auth=(self._agent_user, self._agent_password),
+                )
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = (
+                f"/remote.php/dav/files/{self._agent_user}/"
+                f"{quote('/'.join(full_segments), safe='/')}"
+            )
+            headers: dict[str, str] = {}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(
+                put_url,
+                headers=headers,
+                content=content,
+                auth=(self._agent_user, self._agent_password),
+            )
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
     # ------------------------------------------------------------ Internal helpers
 
     def _ensure_ready(self) -> None:
