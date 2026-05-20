@@ -1,0 +1,36 @@
+<strategic_phase>
+You are in STRATEGIC mode. Purpose: scope the hunt, build a threat model, and plan probes.
+
+Do NOT file findings during strategic phases. No writes to `output/findings/` until you have completed at least one tactical probe phase and have a reproduction. Strategic phases are for deciding what to attack and how, not for recording bugs.
+
+Hunt scoping protocol:
+1. Read the hunt mission from the task description. Identify the target surface explicitly — which module, endpoint family, feature flag, tenant boundary, data path. If the surface is vague, narrow it before proceeding; record the narrowing decision with the kb_write tool (type=decision, tag=hunt-scope).
+2. Read the contract before the code. What does the target promise? Read public interfaces, route definitions, schema constraints, docstrings, README sections, ADRs. Write the contract you extracted with the kb_write tool (type=goal, tag=hunt-contract).
+3. Build the threat model. For the target's contract, enumerate ways it could be violated. Use these vectors as the starting set (apply the ones that fit the target — do not mechanically enumerate all):
+   - **Inputs**: empty, null, oversized, malformed, wrong type, unicode/encoding edge cases, injection (SQL, command, path, template), out-of-range numbers, negative sizes
+   - **Authn/Authz**: missing token, wrong token, expired token, cross-tenant id substitution, privilege escalation (user → admin), object-level vs field-level access
+   - **State & concurrency**: races on shared writes, lost updates, double-submit, replay, ordering assumptions, partial failures, retries
+   - **Resources**: unbounded queries, unbounded loops, missing pagination, memory blow-up, connection leaks, file-handle leaks
+   - **Trust boundaries**: self-reported claims accepted as fact, client-side validation only, secrets in logs/responses, paths traversed across users
+   - **Failure modes**: what happens when DB is down, when upstream times out, when input is half-valid, when validation passes but constraint fails
+   - **Versioning / compatibility**: old clients hitting new contracts, migration in flight, feature flag mid-rollout
+4. Rank vectors. Score each by (likelihood it works) × (impact if it does). Pick the top 5-8 for this hunt. Record the ranking with the kb_write tool (type=decision, tag=hunt-plan).
+5. For each chosen vector, define the probe: which tool, which input, what response would constitute a finding vs. by-design behavior.
+6. Create todos for the next tactical phase, one per probe. Update plan.md with the hunt approach.
+
+Knowledge maintenance:
+- SEARCH FIRST: kb_search the knowledge base for prior hunts on the same target. If a prior hunt already filed a finding for a vector, do not re-file — extend or supersede.
+- Record the extracted contract with kb_write (type=goal, tag=hunt-contract). Future hunts on the same surface reuse this.
+- Record recurring vulnerability patterns with kb_write (type=learning, tag=vuln-pattern) — these compound across hunts.
+- Record out-of-scope observations with kb_write (type=state, tag=out-of-scope) and a one-line note in `notes/out_of_scope.md`.
+
+Decision criteria:
+- If the target surface is still vague → narrow it before planning probes.
+- If the contract is unread → read it before forming hypotheses.
+- If the threat model is missing or has fewer than 3 vectors → expand it.
+- If you have a ranked vector list and per-vector probe plans → transition to tactical.
+
+Action bias: Strategic hunting should be shorter than tactical probing. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Pick the top vectors and start probing — you can re-plan after the first wave of results.
+
+When the hunt plan is ready, transition to tactical with specific probes to run.
+</strategic_phase>

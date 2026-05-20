@@ -28,6 +28,15 @@ logger = logging.getLogger(__name__)
 
 SESSION_COOKIE = "srw_session"
 
+# Header opt-in for the admin "view as user" shadow. When an admin request
+# carries ``X-Admin-View-As: user``, ``require_approved_user`` returns a dict
+# with ``is_admin=False`` so visibility helpers narrow as if the caller were a
+# regular user. The un-shadowed privilege flag is preserved on
+# ``real_is_admin`` so ``_require_admin`` (and the eventual
+# ``security.access.require_admin``) keep admin-only endpoints reachable.
+# Design: docs/features/admin_view_as_user.md.
+VIEW_AS_HEADER = "X-Admin-View-As"
+
 
 # Knobs read fresh on each request (so the orchestrator picks up env edits
 # without restart). Caller cost is one os.getenv per request which is
@@ -442,8 +451,14 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
 
     The MCP server validates the caller (OAuth / API token) and then
     forwards requests to the orchestrator with X-MCP-User-Id and
-    X-Internal-Key headers.  We trust these headers only when the
+    X-Internal-Key headers. We trust these headers only when the
     internal key matches MCP_INTERNAL_KEY.
+
+    F7: ``X-MCP-Scope`` is captured into ``user['scopes']`` so the
+    access.py visibility helpers can narrow further. Legacy MCP scope
+    strings are ``'user'``, ``'all'`` (admin-equivalent for THIS user
+    — no extra grant if the user isn't admin) or ``'project:<uuid>'``
+    (restrict to one project). Anything else is treated as a no-op.
     """
     mcp_user_id = request.headers.get("X-MCP-User-Id")
     internal_key = request.headers.get("X-Internal-Key", "")
@@ -453,6 +468,9 @@ async def _get_user_from_mcp_headers(request: Request, db) -> dict:
         user = await db.get_user(mcp_user_id)
         if user:
             user["is_approved"] = True  # MCP tokens are pre-validated
+            user["auth_method"] = "mcp"
+            mcp_scope = request.headers.get("X-MCP-Scope")
+            user["scopes"] = [mcp_scope] if mcp_scope else []
             return user
         logger.warning("MCP header auth: user %s not found in DB", mcp_user_id)
 
@@ -465,6 +483,16 @@ async def require_approved_user(request: Request, db) -> dict:
     Use this for all endpoints that require an approved account.
     /api/auth/me should use get_current_user directly so the cockpit can
     display a "pending approval" message.
+
+    Admin shadow ("view as user"): when an admin request carries
+    ``X-Admin-View-As: user``, the returned dict has ``is_admin=False`` so
+    visibility helpers (``user_visible_project_ids``, ``get_visible_jobs``,
+    ``user_can_access_datasource``) narrow as if the caller were a regular
+    user. The un-shadowed privilege flag is preserved on ``real_is_admin``
+    so ``_require_admin`` keeps admin-only endpoints reachable while the
+    shadow is on. The header is a no-op for non-admin callers — they get
+    ``real_is_admin=False`` for parity. Design:
+    docs/features/admin_view_as_user.md.
     """
     user = await get_current_user(request, db)
     if not user.get("is_approved"):
@@ -472,7 +500,10 @@ async def require_approved_user(request: Request, db) -> dict:
             status_code=403,
             detail="Account pending approval. An administrator must assign you the 'user' role.",
         )
-    return user
+    view_as = request.headers.get(VIEW_AS_HEADER, "").lower()
+    if view_as == "user" and user.get("is_admin"):
+        return {**user, "is_admin": False, "real_is_admin": True}
+    return {**user, "real_is_admin": bool(user.get("is_admin"))}
 
 
 async def resolve_ws_user(ws, db) -> dict | None:

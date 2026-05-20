@@ -1,0 +1,181 @@
+# =============================================================================
+# Local development overlay — TEMPLATE
+# =============================================================================
+# This file is committed to git. Copy it to `values-local.yaml` (gitignored)
+# and fill in your LLM provider keys before installing.
+#
+#   cp deployment/values-local.example.yaml deployment/values-local.yaml
+#   $EDITOR deployment/values-local.yaml   # paste at least one LLM key
+#   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
+#
+# Everything else here is dev-only defaults that just work after `helm install`:
+#   - All credentials are stub/dev passwords (NOT for production)
+#   - APP_ENCRYPTION_KEY is a fixed dev key — local DB only, regenerate with
+#     `openssl rand -base64 32` if you want a unique one per machine
+#   - The Keycloak realm ships with a pre-seeded `test`/`test` user that has
+#     `admin` + `user` roles — log into the cockpit straight away with that
+#   - TLS via mkcert + cert-manager CAIssuer (set up out of band; see README)
+#   - Agent pool: no warm/buffer slots (spin up on demand)
+#   - Database storage trimmed for a single-dev cluster
+# =============================================================================
+
+license:
+  acceptTerms: true
+
+fullnameOverride: srw
+
+global:
+  domain: "localhost"
+  # Uncomment if your GHCR images are private:
+  # imagePullSecrets:
+  #   - name: ghcr-pull-secret
+
+# -----------------------------------------------------------------------------
+# Cockpit BFF — HTTPS via mkcert CAIssuer, cookies are Secure. Domain left
+# empty = host-only cookies. `Domain=.localhost` triggers a "public suffix"
+# rejection in some browsers; host-only avoids it and still works because the
+# cockpit's API calls go directly to api.localhost (no cross-host cookie share).
+# -----------------------------------------------------------------------------
+auth:
+  bff:
+    cookieSecure: "1"
+    cookieDomain: ""
+    cookieSamesite: "none"
+
+# -----------------------------------------------------------------------------
+# Secrets — chart-managed (dev only). Production uses ESO/Vault.
+# -----------------------------------------------------------------------------
+externalSecrets:
+  enabled: false
+
+secrets:
+  create: true
+  values:
+    # Crypto root — encrypts API keys at rest. Fixed dev key here is fine
+    # because nothing real is stored in your local DB. Regenerate if you want:
+    # openssl rand -base64 32
+    APP_ENCRYPTION_KEY: "B9THPyad3JGXoycrYu4vn90FUogTP+URXFQxPQLB3CU="
+
+    # LLM provider keys — paste at least one for the agent to actually work
+    OPENAI_API_KEY: ""
+    ANTHROPIC_API_KEY: ""
+    GROQ_API_KEY: ""
+
+    # App DBs (dev passwords, never rotate locally)
+    POSTGRES_USER: "srw"
+    POSTGRES_PASSWORD: "dev_pg_password"
+    VECTOR_POSTGRES_USER: "srw"
+    VECTOR_POSTGRES_PASSWORD: "dev_pgvector_password"
+    NEO4J_USERNAME: "neo4j"
+    NEO4J_PASSWORD: "dev_neo4j_password_noslash"
+
+    # Keycloak — KC_REALM_ADMIN_PASSWORD is set as the `test` user's password
+    # on every pod restart by the chart's postStart hook. Keeping it as "test"
+    # gives you the test/test login.
+    KEYCLOAK_ADMIN_USER: "admin"
+    KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_ADMIN_USER: "admin"
+    KC_ADMIN_PASSWORD: "dev_kc_admin"
+    KC_DB_PASSWORD: "dev_kc_db_password"
+    KC_REALM_ADMIN_PASSWORD: "test"
+    KC_CLIENT_SECRET: "dev_kc_client_secret"
+
+    # Gitea bootstrap admin
+    GITEA_ADMIN_USER: "srw-admin"
+    GITEA_ADMIN_PASSWORD: "dev_gitea_admin"
+
+    # OIDC client secrets — realm-export references ALL of these even for
+    # disabled services, so stubs are required.
+    GITEA_OIDC_CLIENT_SECRET: "dev_gitea_oidc_secret"
+    NEXTCLOUD_OIDC_CLIENT_SECRET: "dev_nextcloud_oidc_secret"
+    PGADMIN_OIDC_CLIENT_SECRET: "dev_pgadmin_oidc_secret"
+    MCP_OIDC_CLIENT_SECRET: "dev_mcp_oidc_secret"
+    OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "dev_opencloud_oidc"
+
+    # OpenCloud service account
+    CLOUD_SERVICE_USER: "agent"
+    CLOUD_SERVICE_PASSWORD: "dev_cloud_password"
+
+    # Nextcloud stubs (disabled but chart still wires the keys)
+    NEXTCLOUD_ADMIN_PASSWORD: "stub"
+    NEXTCLOUD_AGENT_PASSWORD: "stub"
+    NEXTCLOUD_S3_ACCESS_KEY: "stub"
+    NEXTCLOUD_S3_SECRET_KEY: "stub"
+
+    # S3 (snapshot service stubs)
+    S3_ACCESS_KEY: "minioadmin"
+    S3_SECRET_KEY: "minioadmin_secret"
+
+    # Email/notifications/integrations — all disabled, stubs to satisfy chart refs
+    SMTP_USER: "stub"
+    SMTP_PASSWORD: "stub"
+    IMAP_USER: "stub"
+    IMAP_PASSWORD: "stub"
+    DISCORD_WEBHOOK_URL: ""
+    SLACK_WEBHOOK_URL: ""
+    NTFY_TOKEN: ""
+    DEFAULT_DS_WEBDAV_USERNAME: ""
+    DEFAULT_DS_WEBDAV_PASSWORD: ""
+    CODEX_MANAGEMENT_KEY: "dev_codex_key"
+    MCP_INTERNAL_KEY: "dev_mcp_internal_key"
+
+# -----------------------------------------------------------------------------
+# Ingress — TLS via mkcert CAIssuer (must be created out of band first)
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: traefik
+  tls:
+    enabled: true
+    issuerName: mkcert-issuer
+
+# -----------------------------------------------------------------------------
+# Agent pool — no warm/buffer slots; agents spin up on demand only
+# -----------------------------------------------------------------------------
+agent:
+  pool:
+    minAgents: "0"
+    buffer: "0"
+    reservedSessionSlots: "0"
+    reservedJobSlots: "0"
+    maxAgents: "3"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+# -----------------------------------------------------------------------------
+# Resource trims — keep chart defaults for everything not listed
+# -----------------------------------------------------------------------------
+orchestrator:
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "500m"
+
+databases:
+  postgres:
+    storageSize: "5Gi"
+  vector:
+    storageSize: "5Gi"
+  mongodb:
+    storageSize: "2Gi"
+  neo4j:
+    storageSize: "5Gi"
+  keycloak:
+    storageSize: "2Gi"
+
+# -----------------------------------------------------------------------------
+# Workspace PVC — single-node k3d uses local-path, which is RWO-only
+# -----------------------------------------------------------------------------
+workspace:
+  accessMode: "ReadWriteOnce"
+  storageSize: "10Gi"
+
+logLevel: "DEBUG"

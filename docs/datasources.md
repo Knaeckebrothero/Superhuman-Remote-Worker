@@ -24,21 +24,28 @@ The goal is to replace the deep Neo4j integration with a generic **datasource co
 
 ## Supported Types
 
-Initial connector types:
+The connector model has grown beyond the original three managed-DB types into four broad categories:
 
-| Type | Tools Provided | Notes |
-|------|---------------|-------|
-| `postgresql` | SQL query, schema inspection | Read/write depending on flag |
-| `neo4j` | Cypher query, schema inspection | Read/write depending on flag |
-| `mongodb` | Collection query, aggregation | Read/write depending on flag |
+| Type | Category | What the agent gets | Notes |
+|------|----------|---------------------|-------|
+| `postgresql` | Managed connector | SQL query, schema inspection | Read/write depending on the project-level read-only flag |
+| `neo4j` | Managed connector | Cypher query, schema inspection | Read/write depending on the project-level read-only flag |
+| `mongodb` | Managed connector | Collection query, aggregation | Read/write depending on the project-level read-only flag |
+| `webdav` | Managed connector | WebDAV file ops | OpenCloud / Nextcloud / generic WebDAV |
+| `generic` | CLI / env vars | `credentials.env_vars` injected into the agent's process env | For tools that take connection info via `PGHOST`/`GH_TOKEN`/etc. |
+| `repository` | CLI / git | Pre-cloned repo + git pre-authenticated | SSH key or HTTPS token; per-repo `core.sshCommand` set so multiple repos don't collide |
+| `kubeconfig` | Credential file | `~/.kube/config` (merged across all attached kubeconfigs) | See [[credential_file_datasources]] |
+| `ssh_key` | Credential file | `~/.ssh/<slug>` (+ optional `.pub`) | Generate-keypair-for-me supported; see [[credential_file_datasources]] |
+| `generic_file` | Credential file | User-chosen path, mode, optional env var | Escape hatch for any credential that takes the form of a file |
 
-Future candidates: S3, Redis, SharePoint, Elasticsearch, etc.
+Future candidates: S3, Redis, SharePoint, Elasticsearch, gcloud/AWS/Azure credential files (the latter three would slot in as type-specific forms over the same credential-file mechanism).
 
 ## Storage Model
 
-A new `datasources` table in the orchestrator PostgreSQL database.
+The canonical schema lives in **`orchestrator/database/schema.sql`** (search for `CREATE TABLE IF NOT EXISTS datasources`). The block below is the **historical initial design**; the live schema has since grown to include `is_global`, `created_by`, `project_id`, dropped the table-level `read_only` flag (read-only is now project-scoped via `project_datasources`), and made `connection_url` nullable (credential-file types have no URL). Treat this section as design intent; trust `schema.sql` for the current shape.
 
 ```sql
+-- Initial design (historical — see orchestrator/database/schema.sql for the live schema):
 CREATE TABLE datasources (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,                    -- User-provided label (e.g. "Production Analytics DB")
@@ -68,7 +75,9 @@ Key design decisions:
 
 ### Credentials
 
-For now, credentials are stored in **plain text**. This is acceptable at the current stage of development. Encryption at rest will be added later when authentication and authorization are implemented. The connection URL contains inline credentials where possible (e.g. `postgres://user:pass@host/db`), with the `credentials` JSONB field available for cases that need separate auth tokens or certificate references.
+The `credentials` JSONB column is **AES-256-GCM encrypted at rest** (shipped 2026-05-17 — see [[credential_file_datasources]] § "Encryption at rest" for the migration story). On disk values look like `"v1:<nonce-b64>:<ct-b64>"`; the encrypt/decrypt happens transparently in `orchestrator/database/postgres.py` across all create/update/read paths. The redaction layer (`orchestrator/security/access.py` `redact_datasource`) strips the field before any REST response — credentials never leave the orchestrator process in plaintext.
+
+The connection URL contains inline credentials where possible (e.g. `postgres://user:pass@host/db`), with the `credentials` JSONB field available for cases that need separate auth tokens, certificate references, env-var dicts (`generic`), SSH keys (`repository`), or file payloads (`kubeconfig` / `ssh_key` / `generic_file`).
 
 ## Tool Loading (Hybrid Approach)
 

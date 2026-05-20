@@ -68,6 +68,95 @@ def _decrypt_stored(value: str | None, *, field: str) -> str | None:
         return None
 
 
+def _encrypt_credentials_dict(creds: Dict[str, Any] | None) -> str:
+    """Encrypt a credentials dict for insertion into a JSONB column.
+
+    Returns a JSON string ready to pass as a JSONB parameter. Empty/None
+    becomes JSONB ``'{}'`` (no encryption needed — empty has no secret to
+    protect, and the schema default is ``'{}'``).
+
+    A non-empty dict is JSON-serialized, encrypted with :func:`encrypt`,
+    then wrapped again with :func:`json.dumps` so the JSONB column receives
+    a valid JSON string value (e.g. ``"v1:<nonce>:<ct>"``).
+    """
+    if not creds:
+        return "{}"
+    return json.dumps(encrypt(json.dumps(creds)))
+
+
+def _decrypt_credentials_field(
+    raw: Any, *, field: str = "datasources.credentials"
+) -> Dict[str, Any]:
+    """Decrypt a credentials JSONB value, returning the plaintext dict.
+
+    asyncpg returns JSONB as a raw JSON string here (no codec registered).
+    This helper parses the JSON and handles three cases:
+
+    1. **Legacy plaintext** — JSON object (pre-encryption rows). Returned
+       as-is with a warning so operators can re-save to upgrade.
+    2. **Encrypted** — JSON string with ``v1:`` prefix. Decrypted and
+       JSON-parsed back into a dict.
+    3. **Other / malformed** — empty dict, logged.
+
+    Always returns a dict (possibly empty) so callers never have to handle
+    None, string, or dict variants.
+    """
+    if raw is None:
+        return {}
+
+    if isinstance(raw, str):
+        try:
+            parsed: Any = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to parse %s JSON: %s", field, exc)
+            return {}
+    else:
+        parsed = raw  # asyncpg with a JSON codec would land here
+
+    if isinstance(parsed, dict):
+        if parsed:
+            logger.warning(
+                "Legacy plaintext credentials in %s; re-save the datasource to encrypt.",
+                field,
+            )
+        return parsed
+
+    if isinstance(parsed, str):
+        if not is_encrypted(parsed):
+            logger.warning(
+                "Non-encrypted credential string in %s; treating as empty.", field
+            )
+            return {}
+        try:
+            plaintext = decrypt(parsed)
+            return json.loads(plaintext)
+        except (DecryptionError, json.JSONDecodeError, ValueError) as exc:
+            logger.error("Failed to decrypt %s: %s", field, exc)
+            return {}
+
+    logger.warning(
+        "Unexpected credentials type %s in %s; treating as empty.",
+        type(parsed).__name__,
+        field,
+    )
+    return {}
+
+
+def _datasource_row_to_dict(
+    row, *, field: str = "datasources.credentials"
+) -> Dict[str, Any]:
+    """Convert a datasource asyncpg Record to a dict with decrypted credentials.
+
+    Use anywhere a SELECT returns a datasource row. The ``credentials`` field
+    is replaced with its decrypted plaintext dict (always a dict, never the
+    raw JSONB string).
+    """
+    d = dict(row)
+    if "credentials" in d:
+        d["credentials"] = _decrypt_credentials_field(d["credentials"], field=field)
+    return d
+
+
 QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 
 # Frozen schema reference (no longer applied at runtime — see migrate.py).
@@ -530,13 +619,22 @@ class PostgresDB:
         status: str | None = None,
         user_id: str | None = None,
         limit: int = 100,
+        *,
+        scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
-        """Get list of jobs with optional status and user filter.
+        """Get list of jobs with optional status, owner, and scope filters.
+
+        AND-style filtering — used by the admin path (full fleet view, with
+        optional ``?user_id=`` and/or MCP ``project:<uuid>`` scope narrowing).
+        Non-admin callers must go through :meth:`get_visible_jobs` instead so
+        the visibility OR-clause is applied.
 
         Args:
             status: Optional status filter (e.g., 'completed', 'processing')
-            user_id: Optional user ID filter
+            user_id: Optional user ID filter (admin cross-user query)
             limit: Maximum number of jobs to return
+            scope_project_id: MCP token ``project:<uuid>`` narrowing. When
+                set, an additional ``project_id = $scope`` filter is appended.
 
         Returns:
             List of job dicts with id, description, status, config_name, created_at, user_id
@@ -555,7 +653,85 @@ class PostgresDB:
             conditions.append(f"user_id = ${param_count}")
             values.append(UUID(user_id))
 
+        if scope_project_id:
+            param_count += 1
+            conditions.append(f"project_id = ${param_count}")
+            values.append(UUID(scope_project_id))
+
         where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        param_count += 1
+        values.append(limit)
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, description, status,
+                       config_name, assigned_agent_id, user_id,
+                       project_id, parent_job_id, priority,
+                       repo_name, branch_name, merge_status, created_at,
+                       context->'snapshot'->>'status' AS snapshot_status
+                FROM jobs
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ${param_count}
+                """,
+                *values,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_visible_jobs(
+        self,
+        *,
+        owner_user_id: str,
+        visible_project_ids: list[str],
+        status: str | None = None,
+        scope_project_id: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Get list of jobs visible to a non-admin caller (G1 visibility OR).
+
+        Applies the user-visibility model: ``(user_id = $owner OR
+        project_id = ANY($projects))``. ``owner_user_id`` is the caller's own
+        id; ``visible_project_ids`` is the list of project ids the caller is a
+        member of (from
+        :func:`security.access.user_visible_project_ids`). An empty
+        ``visible_project_ids`` is fine — the OR-clause then just restricts to
+        the caller's own jobs.
+
+        ``scope_project_id`` is the MCP token's ``project:<uuid>`` narrowing
+        (if any); AND-combined on top, which intersects the visibility set
+        down to that one project.
+
+        Admin callers must NOT use this helper — they go through
+        :meth:`get_jobs` so the OR-clause isn't applied (admins see the full
+        fleet, possibly with explicit ``?user_id=`` or scope filters).
+        """
+        conditions: list[str] = []
+        values: list[Any] = []
+        param_count = 0
+
+        if status:
+            param_count += 1
+            conditions.append(f"status = ${param_count}")
+            values.append(status)
+
+        param_count += 1
+        user_idx = param_count
+        param_count += 1
+        projects_idx = param_count
+        conditions.append(
+            f"(user_id = ${user_idx} OR project_id = ANY(${projects_idx}::uuid[]))"
+        )
+        values.append(UUID(owner_user_id))
+        values.append([UUID(p) for p in visible_project_ids])
+
+        if scope_project_id:
+            param_count += 1
+            conditions.append(f"project_id = ${param_count}")
+            values.append(UUID(scope_project_id))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
         param_count += 1
         values.append(limit)
 
@@ -1474,18 +1650,84 @@ class PostgresDB:
             else None,
         }
 
-    async def get_daily_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
+    def _visibility_clause(
+        self,
+        *,
+        owner_user_id: str | None,
+        visible_project_ids: list[str] | None,
+        scope_project_id: str | None,
+        table_alias: str = "",
+        start_idx: int = 1,
+    ) -> tuple[str, list[Any], int]:
+        """Build the G1/G5 visibility WHERE fragment for the jobs table.
+
+        Returns (sql_fragment, values, next_idx). When all visibility
+        params are None, returns empty fragment (admin view). When
+        ``owner_user_id`` is set, emits the OR-clause
+        ``(user_id = $u OR project_id = ANY($p))``. ``scope_project_id``
+        is AND-combined on top to honour MCP token narrowing.
+
+        ``table_alias`` is the SQL alias for the jobs table (e.g. ``"j"``).
+        Empty string means no alias (raw column names).
+        """
+        prefix = f"{table_alias}." if table_alias else ""
+        values: list[Any] = []
+        idx = start_idx
+        conditions: list[str] = []
+
+        if owner_user_id is not None:
+            user_idx = idx
+            idx += 1
+            projects_idx = idx
+            idx += 1
+            conditions.append(
+                f"({prefix}user_id = ${user_idx} "
+                f"OR {prefix}project_id = ANY(${projects_idx}::uuid[]))"
+            )
+            values.append(UUID(owner_user_id))
+            values.append([UUID(p) for p in (visible_project_ids or [])])
+
+        if scope_project_id is not None:
+            conditions.append(f"{prefix}project_id = ${idx}")
+            values.append(UUID(scope_project_id))
+            idx += 1
+
+        fragment = " AND ".join(conditions)
+        return fragment, values, idx
+
+    async def get_daily_statistics(
+        self,
+        days: int = 7,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
         """Get daily job statistics for the past N days.
 
         Args:
             days: Number of days to include
+            owner_user_id: G5 visibility — when set, the result is restricted
+                via the OR-clause ``(user_id = $owner OR project_id ANY
+                $visible_project_ids)``. Admins pass ``None`` to see all.
+            visible_project_ids: caller's project memberships (only consulted
+                when ``owner_user_id`` is set).
+            scope_project_id: MCP ``project:<uuid>`` narrowing — AND-combined
+                on top.
 
         Returns:
             List of daily statistics dictionaries
         """
+        visibility, vis_vals, next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            start_idx=2,  # $1 is days
+        )
+        where_extra = f" AND {visibility}" if visibility else ""
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT
                     DATE(created_at) as date,
                     COUNT(*) as jobs_created,
@@ -1494,23 +1736,43 @@ class PostgresDB:
                     COUNT(*) FILTER (WHERE status = 'cancelled') as jobs_cancelled
                 FROM jobs
                 WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
+                {where_extra}
                 GROUP BY DATE(created_at)
                 ORDER BY date DESC
                 """,
                 days,
+                *vis_vals,
             )
 
         return [dict(row) for row in rows]
 
-    async def get_job_statistics(self) -> Dict[str, int]:
+    async def get_job_statistics(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
+    ) -> Dict[str, int]:
         """Get overall job statistics.
+
+        Args:
+            owner_user_id / visible_project_ids / scope_project_id:
+                G5 visibility — see :meth:`get_daily_statistics` for the
+                semantics. ``None`` on all three = full fleet (admin view).
 
         Returns:
             Dict with job counts by status
         """
+        visibility, vis_vals, _next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            start_idx=1,
+        )
+        where_clause = f"WHERE {visibility}" if visibility else ""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
-                """
+                f"""
                 SELECT
                     COUNT(*) as total_jobs,
                     COUNT(*) FILTER (WHERE status = 'created') as created,
@@ -1519,13 +1781,20 @@ class PostgresDB:
                     COUNT(*) FILTER (WHERE status = 'failed') as failed,
                     COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
                 FROM jobs
-                """
+                {where_clause}
+                """,
+                *vis_vals,
             )
 
         return dict(row) if row else {}
 
     async def detect_stuck_jobs(
-        self, threshold_minutes: int = 60
+        self,
+        threshold_minutes: int = 60,
+        *,
+        owner_user_id: str | None = None,
+        visible_project_ids: list[str] | None = None,
+        scope_project_id: str | None = None,
     ) -> List[Dict[str, Any]]:
         """Detect jobs that appear to be stuck.
 
@@ -1534,23 +1803,36 @@ class PostgresDB:
 
         Args:
             threshold_minutes: Minutes without activity to consider stuck
+            owner_user_id / visible_project_ids / scope_project_id:
+                G5 visibility — see :meth:`get_daily_statistics`.
 
         Returns:
             List of stuck job dictionaries with stuck reason
         """
         threshold = datetime.now(timezone.utc) - timedelta(minutes=threshold_minutes)
 
+        visibility, vis_vals, _next_idx = self._visibility_clause(
+            owner_user_id=owner_user_id,
+            visible_project_ids=visible_project_ids,
+            scope_project_id=scope_project_id,
+            table_alias="j",
+            start_idx=2,  # $1 is threshold
+        )
+        where_extra = f" AND {visibility}" if visibility else ""
+
         async with self.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT j.id, j.description, j.status,
                        j.config_name, j.assigned_agent_id, j.created_at, j.updated_at
                 FROM jobs j
                 WHERE j.status = 'processing'
                 AND j.updated_at < $1
+                {where_extra}
                 ORDER BY j.updated_at ASC
                 """,
                 threshold,
+                *vis_vals,
             )
 
         stuck_jobs = []
@@ -2217,6 +2499,123 @@ class PostgresDB:
                 legacy_share_id,
             )
 
+    # --------------------------------------------------------------- thread_mounts
+    # Canonical store for which cloud surfaces are attached to a thread.
+    # Replaces the legacy ``threads.metadata.project_ids`` JSONB key as
+    # source of truth for project attachment (Phase 1 of
+    # docs/features/cloud_collaboration_model.md). The runtime
+    # ``project_ids: list[str]`` contract for downstream consumers is
+    # derived from these rows at payload-build time.
+
+    async def add_thread_mount(
+        self,
+        thread_id: str,
+        *,
+        mount_kind: str,
+        target_path: str,
+        source_kind: str,
+        source_ref: str | None = None,
+        backend_id: str | None = None,
+        cloud_handle: str | None = None,
+        webdav_url: str | None = None,
+        target_user_sub: str | None = None,
+    ) -> str:
+        """Insert one mount row and return its UUID."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO thread_mounts (
+                    thread_id, mount_kind, target_path,
+                    source_kind, source_ref,
+                    backend_id, cloud_handle, webdav_url,
+                    target_user_sub
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                RETURNING id
+                """,
+                UUID(thread_id),
+                mount_kind,
+                target_path,
+                source_kind,
+                UUID(source_ref) if source_ref else None,
+                backend_id,
+                cloud_handle,
+                webdav_url,
+                target_user_sub,
+            )
+        return str(row["id"])
+
+    async def list_thread_mounts(self, thread_id: str) -> list[Dict[str, Any]]:
+        """Return all mounts attached to a thread, ordered by ``target_path``."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, thread_id, mount_kind, target_path,
+                       source_kind, source_ref,
+                       backend_id, cloud_handle, webdav_url,
+                       target_user_sub, created_at
+                FROM thread_mounts
+                WHERE thread_id = $1
+                ORDER BY target_path
+                """,
+                UUID(thread_id),
+            )
+        return [dict(row) for row in rows]
+
+    async def remove_thread_mount(self, mount_id: str) -> bool:
+        """Delete a single mount by id. Returns True if a row was removed."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM thread_mounts WHERE id = $1",
+                UUID(mount_id),
+            )
+        return result.endswith(" 1")
+
+    async def replace_thread_mounts(
+        self,
+        thread_id: str,
+        mounts: list[Dict[str, Any]],
+    ) -> list[str]:
+        """Atomically replace a thread's mount set.
+
+        Each entry in ``mounts`` must carry ``mount_kind``, ``target_path``,
+        ``source_kind``; ``source_ref`` / ``backend_id`` / ``cloud_handle``
+        / ``webdav_url`` are optional. Returns the list of new mount IDs in
+        the order they were inserted.
+        """
+        new_ids: list[str] = []
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM thread_mounts WHERE thread_id = $1",
+                    UUID(thread_id),
+                )
+                for entry in mounts:
+                    src_ref = entry.get("source_ref")
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO thread_mounts (
+                            thread_id, mount_kind, target_path,
+                            source_kind, source_ref,
+                            backend_id, cloud_handle, webdav_url,
+                            target_user_sub
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        RETURNING id
+                        """,
+                        UUID(thread_id),
+                        entry["mount_kind"],
+                        entry["target_path"],
+                        entry["source_kind"],
+                        UUID(src_ref) if src_ref else None,
+                        entry.get("backend_id"),
+                        entry.get("cloud_handle"),
+                        entry.get("webdav_url"),
+                        entry.get("target_user_sub"),
+                    )
+                    new_ids.append(str(row["id"]))
+        return new_ids
+
     async def mark_orphaned_threads_ended(self) -> list[str]:
         """Mark threads as ended when their bound agent is offline.
 
@@ -2547,7 +2946,7 @@ class PostgresDB:
                 *values,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
         """Get a single datasource by ID.
@@ -2575,7 +2974,7 @@ class PostgresDB:
                 uuid_val,
             )
 
-        return dict(row) if row else None
+        return _datasource_row_to_dict(row) if row else None
 
     async def create_datasource(
         self,
@@ -2632,7 +3031,7 @@ class PostgresDB:
                 description,
                 ds_type,
                 connection_url,
-                json.dumps(credentials) if credentials else "{}",
+                _encrypt_credentials_dict(credentials),
                 job_uuid,
                 cli_hint,
                 default_branch,
@@ -2640,7 +3039,7 @@ class PostgresDB:
                 is_global,
             )
 
-        return dict(row)
+        return _datasource_row_to_dict(row)
 
     async def update_datasource(
         self,
@@ -2693,7 +3092,7 @@ class PostgresDB:
         if credentials is not None:
             param_count += 1
             updates.append(f"credentials = ${param_count}")
-            values.append(json.dumps(credentials))
+            values.append(_encrypt_credentials_dict(credentials))
 
         if cli_hint is not None:
             param_count += 1
@@ -2788,6 +3187,7 @@ class PostgresDB:
                     """,
                     project_uuid,
                 )
+                return [_datasource_row_to_dict(row) for row in rows]
             else:
                 rows = await conn.fetch(
                     """
@@ -2805,7 +3205,7 @@ class PostgresDB:
                     """,
                 )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def resolve_datasources_for_thread(
         self,
@@ -2867,7 +3267,7 @@ class PostgresDB:
                 proj_uuids,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     # -- Project ↔ Datasource junction (N:M) ----------------------------------
 
@@ -2957,7 +3357,7 @@ class PostgresDB:
                 p_uuid,
             )
 
-        return [dict(row) for row in rows]
+        return [_datasource_row_to_dict(row) for row in rows]
 
     async def update_project_datasource(
         self,
@@ -3020,6 +3420,84 @@ class PostgresDB:
 
         return [str(row["project_id"]) for row in rows]
 
+    async def backfill_encrypt_datasource_credentials(self) -> Dict[str, int]:
+        """One-shot migration: encrypt any plaintext ``credentials`` JSONB values.
+
+        Idempotent — rows whose credentials column already contains a v1
+        ciphertext string are skipped. Empty/null credentials are also
+        skipped. Legacy plaintext dicts are re-serialized and encrypted via
+        :func:`_encrypt_credentials_dict`.
+
+        Returns counts: ``{"encrypted": N, "skipped": M, "errors": K}``.
+        """
+        encrypted = 0
+        skipped = 0
+        errors = 0
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch("SELECT id, credentials FROM datasources")
+
+            for row in rows:
+                ds_id = row["id"]
+                raw = row["credentials"]
+
+                if raw is None:
+                    skipped += 1
+                    continue
+
+                # asyncpg returns JSONB as a raw JSON string here.
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, ValueError) as exc:
+                    logger.error(
+                        "Backfill: failed to parse credentials JSON for "
+                        "datasource %s: %s",
+                        ds_id,
+                        exc,
+                    )
+                    errors += 1
+                    continue
+
+                # Already encrypted (JSON-string form with v1: prefix).
+                if isinstance(parsed, str) and is_encrypted(parsed):
+                    skipped += 1
+                    continue
+
+                # Empty dict — nothing to encrypt, schema default applies.
+                if isinstance(parsed, dict) and not parsed:
+                    skipped += 1
+                    continue
+
+                # Legacy plaintext dict — encrypt in place.
+                if isinstance(parsed, dict):
+                    try:
+                        new_value = _encrypt_credentials_dict(parsed)
+                        await conn.execute(
+                            "UPDATE datasources SET credentials = $1 WHERE id = $2",
+                            new_value,
+                            ds_id,
+                        )
+                        encrypted += 1
+                    except Exception as exc:
+                        logger.error(
+                            "Backfill: encryption failed for datasource %s: %s",
+                            ds_id,
+                            exc,
+                        )
+                        errors += 1
+                    continue
+
+                # Anything else — bare string without v1: prefix, etc.
+                logger.warning(
+                    "Backfill: unexpected credentials value for datasource %s "
+                    "(type=%s); leaving untouched",
+                    ds_id,
+                    type(parsed).__name__,
+                )
+                errors += 1
+
+        return {"encrypted": encrypted, "skipped": skipped, "errors": errors}
+
     async def upsert_default_datasource(
         self,
         name: str,
@@ -3041,7 +3519,7 @@ class PostgresDB:
         Returns:
             Created or updated datasource dict
         """
-        creds_json = json.dumps(credentials) if credentials else "{}"
+        creds_json = _encrypt_credentials_dict(credentials)
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -3063,7 +3541,7 @@ class PostgresDB:
                 creds_json,
             )
 
-        return dict(row)
+        return _datasource_row_to_dict(row)
 
     # =========================================================================
     # SESSION OPERATIONS
@@ -5491,6 +5969,7 @@ class PostgresDB:
                        default_config_name, default_config_override,
                        nextcloud_folder_id, cloud_storage_read_only,
                        main_cloud_backend, main_cloud_folder_handle,
+                       network_tier,
                        created_at, updated_at
                 FROM projects
                 WHERE id = $1
@@ -5499,6 +5978,45 @@ class PostgresDB:
             )
 
         return dict(row) if row else None
+
+    async def get_workspace_network_tier(
+        self, work_id: str, kind: str
+    ) -> Optional[str]:
+        """Resolve the network_tier of the project that owns a job/thread.
+
+        Returns the bare tier string (e.g. ``'internet-only'``,
+        ``'home-allowed'``) or ``None`` if no project mapping exists.
+        The caller is responsible for applying its own default when the
+        result is ``None`` — keeping the DB layer free of policy.
+
+        Args:
+            work_id: Job or thread UUID as string.
+            kind: ``'job'`` or ``'thread'``.
+        """
+        try:
+            uuid_val = UUID(work_id)
+        except ValueError:
+            return None
+
+        if kind == "job":
+            query = (
+                "SELECT p.network_tier "
+                "FROM projects p JOIN jobs j ON j.project_id = p.id "
+                "WHERE j.id = $1"
+            )
+        elif kind == "thread":
+            query = (
+                "SELECT p.network_tier "
+                "FROM projects p JOIN threads t ON t.project_id = p.id "
+                "WHERE t.id = $1"
+            )
+        else:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(query, uuid_val)
+
+        return row["network_tier"] if row else None
 
     async def get_projects_for_user(
         self, user_id: str, limit: int = 100
@@ -5570,6 +6088,9 @@ class PostgresDB:
             "cloud_storage_read_only",
             "main_cloud_backend",
             "main_cloud_folder_handle",
+            # Admin-only at the API layer (orchestrator/main.py update_project);
+            # listed here so the DB UPDATE path accepts it once authorized.
+            "network_tier",
         }
 
         updates = []
@@ -6111,7 +6632,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, job_id, expert_id, created_at, updated_at, summary, title
+                SELECT id, job_id, expert_id, user_id, created_at, updated_at,
+                       summary, title
                 FROM builder_sessions
                 WHERE id = $1
                 """,
@@ -6727,44 +7249,101 @@ class PostgresDB:
             "messages": messages,
         }
 
-    async def get_pending_action_counts(self) -> Dict[str, Any]:
+    async def get_pending_action_counts(
+        self,
+        owner_user_id: Optional[str] = None,
+        visible_project_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Get counts of pending actions across all types.
+
+        Visibility (P4e): when ``owner_user_id`` is provided, counts and the
+        ``most_urgent`` sudo are restricted to jobs the caller can see
+        (their own jobs OR jobs in projects they're a member of). Pass
+        ``None`` for the admin view (counts across all jobs). Jobs with no
+        owner are admin-only — they don't appear in any user's view.
 
         Returns:
             Dict with sudo, messages, reviews counts and most_urgent info.
         """
+        admin_view = owner_user_id is None
+        project_ids = visible_project_ids or []
+
         async with self.acquire() as conn:
-            sudo_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM sudo_approval_requests WHERE status = 'pending'"
+            if admin_view:
+                sudo_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM sudo_approval_requests "
+                        "WHERE status = 'pending'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            message_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+                message_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            review_count = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+                review_count = (
+                    await conn.fetchval(
+                        "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+                    )
+                    or 0
                 )
-                or 0
-            )
-
-            # Find most urgent sudo request (lowest TTL)
-            most_urgent_sudo = await conn.fetchrow(
-                """
-                SELECT id, command, expires_at
-                FROM sudo_approval_requests
-                WHERE status = 'pending' AND expires_at > NOW()
-                ORDER BY expires_at ASC
-                LIMIT 1
-                """
-            )
+                most_urgent_sudo = await conn.fetchrow(
+                    """
+                    SELECT id, command, expires_at
+                    FROM sudo_approval_requests
+                    WHERE status = 'pending' AND expires_at > NOW()
+                    ORDER BY expires_at ASC
+                    LIMIT 1
+                    """
+                )
+            else:
+                # Visibility OR-clause: caller's own jobs ∪ project jobs.
+                # Empty project_ids → ANY($2::uuid[]) on an empty array
+                # yields false, so we still return own-jobs-only.
+                sudo_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM sudo_approval_requests s
+                        JOIN jobs j ON s.job_id = j.id
+                        WHERE s.status = 'pending'
+                          AND (j.user_id = $1 OR j.project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                message_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM jobs
+                        WHERE status = 'waiting_for_reply'
+                          AND (user_id = $1 OR project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                review_count = (
+                    await conn.fetchval(
+                        """SELECT COUNT(*) FROM jobs
+                        WHERE status = 'pending_review'
+                          AND (user_id = $1 OR project_id = ANY($2::uuid[]))""",
+                        owner_user_id,
+                        project_ids,
+                    )
+                    or 0
+                )
+                most_urgent_sudo = await conn.fetchrow(
+                    """SELECT s.id, s.command, s.expires_at
+                    FROM sudo_approval_requests s
+                    JOIN jobs j ON s.job_id = j.id
+                    WHERE s.status = 'pending' AND s.expires_at > NOW()
+                      AND (j.user_id = $1 OR j.project_id = ANY($2::uuid[]))
+                    ORDER BY s.expires_at ASC
+                    LIMIT 1""",
+                    owner_user_id,
+                    project_ids,
+                )
 
         total = sudo_count + message_count + review_count
 
@@ -7143,6 +7722,353 @@ class PostgresDB:
             raise ValueError(f"invalid NOTIFY channel: {channel!r}")
         async with self.acquire() as conn:
             await conn.execute("SELECT pg_notify($1, $2)", channel, payload)
+
+    # =========================================================================
+    # AUTOMATIONS (cron + event-trigger job templates; see
+    # docs/features/automations_v0.md and migration 0015_create_automations.sql)
+    # =========================================================================
+
+    async def create_automation(
+        self,
+        *,
+        owner_id: str,
+        name: str,
+        trigger_type: str,
+        expert: str,
+        prompt: str,
+        description: str | None = None,
+        project_id: str | None = None,
+        cron_expr: str | None = None,
+        timezone: str = "UTC",
+        catchup_window_seconds: int = 86400,
+        event_filter: Dict[str, Any] | None = None,
+        enabled: bool = True,
+        config_override: Dict[str, Any] | None = None,
+        autonomy: str = "review",
+        priority: int = 5,
+        max_chain_depth: int = 10,
+        max_fires_per_day: int = 100,
+        next_run_at: datetime | None = None,
+    ) -> Dict[str, Any]:
+        """Insert an automation row. Caller pre-computes ``next_run_at`` for
+        cron triggers (via croniter against the row's timezone) so the
+        dispatcher's first tick can pick it up without a recompute pass.
+
+        v0 only stores cron rows from the API; ``event_filter`` is accepted
+        here so the v0.5 event dispatcher can land without a schema change.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO automations (
+                    owner_id, project_id, name, description, trigger_type,
+                    cron_expr, timezone, catchup_window_seconds,
+                    event_filter, enabled,
+                    expert, prompt, config_override, autonomy, priority,
+                    max_chain_depth, max_fires_per_day,
+                    next_run_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6, $7, $8,
+                    $9::jsonb, $10,
+                    $11, $12, $13::jsonb, $14, $15,
+                    $16, $17,
+                    $18
+                )
+                RETURNING *
+                """,
+                UUID(owner_id),
+                UUID(project_id) if project_id else None,
+                name,
+                description,
+                trigger_type,
+                cron_expr,
+                timezone,
+                catchup_window_seconds,
+                json.dumps(event_filter) if event_filter else None,
+                enabled,
+                expert,
+                prompt,
+                json.dumps(config_override or {}),
+                autonomy,
+                priority,
+                max_chain_depth,
+                max_fires_per_day,
+                next_run_at,
+            )
+        return self._automation_row_to_dict(row)
+
+    async def get_automation(self, automation_id: str) -> Dict[str, Any] | None:
+        """Fetch one automation by id. Returns None if not found."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM automations WHERE id = $1",
+                UUID(automation_id),
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def list_automations(
+        self,
+        *,
+        owner_id: str | None = None,
+        project_id: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """List automations, newest first.
+
+        ``owner_id`` and ``project_id`` are both optional and additive:
+        passing both narrows to a single user's automations within one
+        project. Admin callers can pass neither to see everything.
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if owner_id is not None:
+            params.append(UUID(owner_id))
+            clauses.append(f"owner_id = ${len(params)}")
+        if project_id is not None:
+            params.append(UUID(project_id))
+            clauses.append(f"project_id = ${len(params)}")
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT * FROM automations {where} ORDER BY created_at DESC",
+                *params,
+            )
+        return [self._automation_row_to_dict(r) for r in rows]
+
+    # Fields the editor is allowed to mutate. Ownership, trigger_type,
+    # event_filter, and all *_at / run_count / fires_today_* state are
+    # locked. Renaming an automation must not require resending its prompt.
+    _AUTOMATION_UPDATABLE_FIELDS = frozenset(
+        {
+            "name",
+            "description",
+            "cron_expr",
+            "timezone",
+            "catchup_window_seconds",
+            "enabled",
+            "expert",
+            "prompt",
+            "config_override",
+            "autonomy",
+            "priority",
+            "max_chain_depth",
+            "max_fires_per_day",
+            "next_run_at",
+        }
+    )
+
+    async def update_automation(
+        self,
+        automation_id: str,
+        **fields: Any,
+    ) -> Dict[str, Any] | None:
+        """Partial update of an automation row.
+
+        Caller is responsible for recomputing ``next_run_at`` when changing
+        ``cron_expr`` / ``timezone`` / ``enabled`` and passing the new value
+        in the same call so a paused-then-resumed schedule lands atomically.
+
+        Unknown fields raise ValueError to catch typos at the boundary
+        rather than silently no-op.
+        """
+        unknown = set(fields) - self._AUTOMATION_UPDATABLE_FIELDS
+        if unknown:
+            raise ValueError(f"Cannot update automation fields: {sorted(unknown)}")
+        if not fields:
+            return await self.get_automation(automation_id)
+
+        sets: list[str] = []
+        params: list[Any] = []
+        for key, value in fields.items():
+            if key == "config_override":
+                params.append(json.dumps(value or {}))
+                sets.append(f"{key} = ${len(params)}::jsonb")
+            else:
+                params.append(value)
+                sets.append(f"{key} = ${len(params)}")
+
+        sets.append("updated_at = now()")
+        params.append(UUID(automation_id))
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"UPDATE automations SET {', '.join(sets)} WHERE id = ${len(params)} RETURNING *",
+                *params,
+            )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def delete_automation(self, automation_id: str) -> bool:
+        """Hard-delete. Spawned jobs survive (FK is ON DELETE SET NULL on
+        ``last_job_id``); the link from job → automation lives in
+        ``jobs.context->>'automation_id'`` and stays valid as an audit hint.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM automations WHERE id = $1",
+                UUID(automation_id),
+            )
+        return result.endswith(" 1")
+
+    async def list_automation_runs(
+        self,
+        automation_id: str,
+        *,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return jobs spawned by this automation, newest first. Joins on the
+        ``context->>'automation_id'`` tag the dispatcher writes at fire time.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, status, description, priority, created_at, updated_at,
+                       config_name, project_id, parent_job_id
+                FROM jobs
+                WHERE context->>'automation_id' = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                automation_id,
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def fetch_next_due_cron_automation(self, conn) -> Dict[str, Any] | None:
+        """Pessimistically claim the next due cron automation under SKIP LOCKED.
+
+        Must be called inside an open transaction on ``conn``. The returned
+        row is locked until the transaction commits or rolls back — the
+        caller advances ``next_run_at`` via ``advance_automation_after_fire``
+        (or ``skip_automation_fire`` for a catchup-window skip) before
+        committing so concurrent dispatcher replicas don't re-pick the row.
+
+        Returns None when nothing is due. The dispatcher loops on this until
+        None to drain the backlog within one tick.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT *
+            FROM automations
+            WHERE enabled = true
+              AND trigger_type = 'cron'
+              AND next_run_at IS NOT NULL
+              AND next_run_at <= now()
+            ORDER BY next_run_at ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+        return self._automation_row_to_dict(row) if row else None
+
+    async def advance_automation_after_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+        scheduled_for: datetime,
+        job_id: str,
+    ) -> None:
+        """Mark an automation as fired and advance its cron state.
+
+        Increments ``run_count`` and the daily ``fires_today_count`` counter
+        (rolled when ``fires_today_date`` < CURRENT_DATE). Called inside the
+        same transaction as ``fetch_next_due_cron_automation`` so the row
+        stays locked through the update.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_scheduled_at = $2,
+                last_dispatched_at = now(),
+                last_fired_at = now(),
+                last_job_id = $3,
+                run_count = run_count + 1,
+                fires_today_count = CASE
+                    WHEN fires_today_date = CURRENT_DATE
+                        THEN fires_today_count + 1
+                    ELSE 1
+                END,
+                fires_today_date = CURRENT_DATE,
+                updated_at = now()
+            WHERE id = $4
+            """,
+            next_run_at,
+            scheduled_for,
+            UUID(job_id),
+            UUID(automation_id),
+        )
+
+    async def skip_automation_fire(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        next_run_at: datetime,
+    ) -> None:
+        """Advance ``next_run_at`` without firing a job — used when the
+        scheduled time is older than ``catchup_window_seconds`` (orchestrator
+        was down past the grace window). Does NOT touch ``last_fired_at`` /
+        ``run_count`` so the cockpit shows the gap honestly.
+        """
+        await conn.execute(
+            """
+            UPDATE automations
+            SET next_run_at = $1,
+                last_dispatched_at = now(),
+                updated_at = now()
+            WHERE id = $2
+            """,
+            next_run_at,
+            UUID(automation_id),
+        )
+
+    async def auto_disable_automation(
+        self,
+        conn,
+        automation_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Disable an automation in response to a safety guard (today the only
+        guard is ``max_fires_per_day``). Sets ``enabled=false`` and clears
+        ``next_run_at`` so the dispatcher stops considering it; the row stays
+        editable so the owner can fix the cron and re-enable.
+
+        ``reason`` is logged but not persisted — surface it through a
+        notification rather than a DB column to keep the schema tidy.
+        """
+        logger.warning("Auto-disabling automation %s: %s", automation_id, reason)
+        await conn.execute(
+            """
+            UPDATE automations
+            SET enabled = false,
+                next_run_at = NULL,
+                updated_at = now()
+            WHERE id = $1
+            """,
+            UUID(automation_id),
+        )
+
+    @staticmethod
+    def _automation_row_to_dict(row) -> Dict[str, Any] | None:
+        """Normalize an asyncpg ``Record`` into a JSON-serializable dict.
+
+        Decodes JSONB columns to dicts; everything else passes through.
+        Returns None on a None row so callers can chain ``or None``.
+        """
+        if row is None:
+            return None
+        out = dict(row)
+        for jsonb_field in ("config_override", "event_filter"):
+            value = out.get(jsonb_field)
+            if isinstance(value, str):
+                try:
+                    out[jsonb_field] = json.loads(value)
+                except (TypeError, ValueError):
+                    pass
+        return out
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

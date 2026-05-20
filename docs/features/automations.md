@@ -22,7 +22,9 @@ related:
 
 Design document for a native trigger system that creates jobs in response to time-based schedules **or** job-completion events, unified under a single "Automations" tab in the cockpit. The orchestrator API is documented as the escape hatch for the long tail (webhooks, inbound email, Slack, complex branching).
 
-**Status:** Updated 2026-05-08 with a research refresh (see next section). Design phase. Supersedes the earlier `routines.md` (cron-only) framing — that scope is now the cron half of this feature.
+**Status:** The cron half (v0) **shipped 2026-05-18** per the focused implementation cut in [`automations_v0.md`](./automations_v0.md) — backend, cockpit, tests, and external-integration docs all landed and live-verified on the experimental cluster. Event triggers + per-chain cost cap + outbound webhooks remain on the v0.5 / v1 roadmap as originally scoped below.
+
+Previously updated 2026-05-08 with a research refresh (see next section). Supersedes the earlier `routines.md` (cron-only) framing — that scope is now the cron half of this feature.
 
 ## Research Refresh (2026-05-08)
 

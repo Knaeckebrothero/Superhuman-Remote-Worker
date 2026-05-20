@@ -232,7 +232,8 @@ NetworkPolicy enforcement on virt-launcher pods depends on the CNI:
 | Cilium             | yes                             | Same. Issue #37669 tracks a service-IP edge case.  |
 | OVN-Kubernetes     | yes                             | Used by OpenShift Virtualization.                  |
 | Antrea             | yes                             | Reported working.                                  |
-| **Flannel**        | **no**                          | Flannel does not enforce NetworkPolicy at all.     |
+| **Flannel** (alone) | **no**                         | Flannel itself doesn't enforce NetworkPolicy — needs a paired policy controller (kube-router, etc.). |
+| **K3s** (default)  | yes                             | Ships Flannel + the embedded kube-router controller, which enforces by default. |
 | Kube-OVN           | partial                         | Has KubeVirt-specific bugs (issue #5337).          |
 | Weave              | unconfirmed                     | Could not find clear data.                         |
 

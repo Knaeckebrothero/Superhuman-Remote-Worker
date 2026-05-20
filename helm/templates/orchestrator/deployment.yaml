@@ -242,6 +242,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SRW_COOKIE_SECURE
+            - name: SRW_COOKIE_SAMESITE
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SRW_COOKIE_SAMESITE
             - name: SRW_SESSION_IDLE_TIMEOUT_S
               valueFrom:
                 configMapKeyRef:
@@ -654,6 +659,12 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_NAMESPACE
+                  optional: true
+            - name: OPERATOR_HOME_ALLOWED_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: OPERATOR_HOME_ALLOWED_EMAIL
                   optional: true
             - name: WORKSPACE_SSH_SECRET
               value: {{ include "srw.vmSshKeySecretName" . | quote }}

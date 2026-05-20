@@ -1,8 +1,9 @@
 """Shared datasource setup logic for both job agents and persistent sessions.
 
 Processes datasource configs received from the orchestrator: connects managed
-connectors, injects env vars for CLI access, clones repositories, and builds
-a datasource index for workspace.md.
+connectors, injects env vars for CLI access, clones repositories, materializes
+credential files (kubeconfig, ssh_key, generic_file), and builds a datasource
+index for workspace.md.
 """
 
 import logging
@@ -14,10 +15,26 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+# Kept in sync with orchestrator/security/credential_files.py. The orchestrator
+# stores ``target_path`` already resolved against ``/home/srw``; at materialization
+# time we may need to remap to a different home (tests use a tmp dir).
+AGENT_HOME = "/home/srw"
+CREDENTIAL_FILE_TYPES = frozenset({"kubeconfig", "ssh_key", "generic_file"})
+
 
 def _slugify(name: str) -> str:
     """Convert a datasource name to a lowercase slug for env vars / filenames."""
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _ds_slug_hyphen(name: str) -> str:
+    """Hyphenated slug for filenames and kubeconfig context prefixes.
+
+    Matches ``slugify_datasource_name`` in
+    ``orchestrator/security/credential_files.py``.
+    """
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s or "unnamed"
 
 
 def process_datasources(
@@ -137,6 +154,298 @@ def close_datasource_connections(
                 logger.debug("Closed %s datasource client", ds_type)
         except Exception as e:
             logger.warning("Error closing %s datasource client: %s", ds_type, e)
+
+
+# ---------------------------------------------------------------------------
+# Credential file materialization (kubeconfig / ssh_key / generic_file)
+# ---------------------------------------------------------------------------
+
+
+def _retarget(path: str, home_dir: str) -> str:
+    """Swap ``/home/srw`` for ``home_dir`` so tests can use a tmp directory.
+
+    The orchestrator's validator already resolved ``~`` against
+    ``/home/srw``; in production no swap is needed. In tests we pass a
+    tmp ``home_dir`` and rewrite the prefix at write time.
+    """
+    if not path or home_dir == AGENT_HOME:
+        return path
+    if path == AGENT_HOME:
+        return home_dir
+    if path.startswith(AGENT_HOME + "/"):
+        return home_dir + path[len(AGENT_HOME) :]
+    return path
+
+
+def _mkdir_tracking(path: str, created_dirs: List[str]) -> None:
+    """``mkdir -p`` while recording each directory we (not the OS image) created.
+
+    Cleanup uses this list to ``rmdir`` only the directories we made, leaving
+    pre-existing ones like ``~/.ssh`` (which may have ``known_hosts``) intact.
+    """
+    if not path or path == "/" or os.path.isdir(path):
+        return
+    parent = os.path.dirname(path)
+    if parent and parent != path:
+        _mkdir_tracking(parent, created_dirs)
+    try:
+        os.mkdir(path)
+        created_dirs.append(path)
+    except FileExistsError:
+        pass
+
+
+def _prefix_kubeconfig_yaml(yaml_str: str, prefix: str) -> str:
+    """Prefix every cluster/user/context name in a kubeconfig with ``<prefix>-``.
+
+    Multi-cluster jobs merge several kubeconfigs into ``~/.kube/config``;
+    without prefixing, two uploads with a context named ``default`` would
+    collide. We pre-prefix per-datasource so the agent sees deterministic,
+    collision-free context names like ``prod-eu-default``.
+
+    Returns the re-emitted YAML. On a parse failure the original string is
+    returned and a warning is logged — the upload may still be usable,
+    just with un-prefixed contexts.
+    """
+    try:
+        import yaml
+    except ImportError:
+        logger.warning("PyYAML not available; skipping kubeconfig prefixing")
+        return yaml_str
+
+    try:
+        doc = yaml.safe_load(yaml_str)
+    except yaml.YAMLError as e:
+        logger.warning("Kubeconfig YAML parse failed (%s); writing un-prefixed", e)
+        return yaml_str
+    if not isinstance(doc, dict):
+        return yaml_str
+
+    def _pfx(name: Any) -> Any:
+        return f"{prefix}-{name}" if isinstance(name, str) and name else name
+
+    for cluster in doc.get("clusters") or []:
+        if isinstance(cluster, dict) and "name" in cluster:
+            cluster["name"] = _pfx(cluster["name"])
+    for user in doc.get("users") or []:
+        if isinstance(user, dict) and "name" in user:
+            user["name"] = _pfx(user["name"])
+    for ctx in doc.get("contexts") or []:
+        if isinstance(ctx, dict):
+            if "name" in ctx:
+                ctx["name"] = _pfx(ctx["name"])
+            inner = ctx.get("context")
+            if isinstance(inner, dict):
+                if "cluster" in inner:
+                    inner["cluster"] = _pfx(inner["cluster"])
+                if "user" in inner:
+                    inner["user"] = _pfx(inner["user"])
+    if doc.get("current-context"):
+        doc["current-context"] = _pfx(doc["current-context"])
+
+    return yaml.safe_dump(doc, sort_keys=False)
+
+
+def _merge_kubeconfigs(
+    kubeconfig_paths: List[str],
+    home_dir: str,
+    manifest: Dict[str, Any],
+) -> Optional[str]:
+    """Merge per-datasource kubeconfigs into ``~/.kube/config`` using ``kubectl``.
+
+    Returns the merged absolute path on success. On failure (no kubectl,
+    bad input) returns ``None`` and the per-datasource files remain
+    available individually — the caller falls back to a colon-separated
+    ``KUBECONFIG`` so kubectl can still find them.
+    """
+    if not kubeconfig_paths:
+        return None
+    merged_path = os.path.join(home_dir, ".kube", "config")
+    if os.path.exists(merged_path):
+        logger.warning(
+            "Refusing to overwrite existing %s; agent will use per-ds KUBECONFIG list",
+            merged_path,
+        )
+        return None
+    _mkdir_tracking(os.path.dirname(merged_path), manifest["dirs"])
+    env = {**os.environ, "KUBECONFIG": ":".join(kubeconfig_paths)}
+    try:
+        result = subprocess.run(
+            ["kubectl", "config", "view", "--flatten", "--merge"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+    except FileNotFoundError:
+        logger.warning("kubectl not installed; falling back to KUBECONFIG=<colon-list>")
+        return None
+    except subprocess.CalledProcessError as e:
+        logger.warning("kubectl config view failed: %s", e.stderr.strip())
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("kubectl config view timed out")
+        return None
+
+    try:
+        with open(merged_path, "w") as f:
+            f.write(result.stdout)
+        os.chmod(merged_path, 0o600)
+    except OSError as e:
+        logger.warning("Failed to write merged kubeconfig %s: %s", merged_path, e)
+        return None
+    manifest["files"].append(merged_path)
+    return merged_path
+
+
+def process_credential_files(
+    ds_configs: List[Dict[str, Any]],
+    home_dir: str = AGENT_HOME,
+) -> Dict[str, Any]:
+    """Materialize ``credentials.files[]`` for credential-file datasource types.
+
+    For each ``kubeconfig``/``ssh_key``/``generic_file`` datasource:
+      - ``mkdir -p`` the parent (recording new dirs in the manifest).
+      - For ``kubeconfig`` entries, prefix cluster/user/context names with
+        the datasource slug so multi-cluster merging is collision-free.
+      - Write contents at the resolved absolute path with the requested mode.
+      - If ``env_var`` is set, inject ``os.environ[env_var] = abs_path``.
+      - Skip (warn) any path that already exists on disk — we don't clobber
+        anything we didn't write.
+
+    After all per-datasource files are written, if any kubeconfigs were
+    attached, merge them via ``kubectl config view --flatten --merge`` into
+    ``~/.kube/config`` and set ``KUBECONFIG`` to that path.
+
+    Args:
+        ds_configs: Datasource configs from the orchestrator (already
+            validated by ``normalize_credential_files``).
+        home_dir: Override the ``/home/srw`` prefix in stored target_paths.
+            Production leaves the default; tests pass a tmp directory.
+
+    Returns:
+        Manifest dict consumed by :func:`cleanup_credential_files` at job
+        teardown::
+
+            {
+                "files":    [abs paths written],
+                "dirs":     [abs dirs we created],
+                "env_vars": [env var names we set],
+            }
+    """
+    manifest: Dict[str, Any] = {
+        "files": [],
+        "dirs": [],
+        "env_vars": [],
+    }
+    kubeconfig_paths: List[str] = []
+
+    for ds in ds_configs:
+        ds_type = ds.get("type")
+        if ds_type not in CREDENTIAL_FILE_TYPES:
+            continue
+        creds = ds.get("credentials") or {}
+        files = creds.get("files") or []
+        ds_name = ds.get("name", "unnamed")
+        ds_slug = _ds_slug_hyphen(ds_name)
+
+        for entry in files:
+            target_path = entry.get("target_path") or ""
+            absolute = _retarget(target_path, home_dir)
+            if not absolute:
+                logger.warning(
+                    "Skipping file entry with empty target_path on '%s'", ds_name
+                )
+                continue
+            if os.path.exists(absolute):
+                logger.warning(
+                    "Refusing to overwrite existing file at %s (datasource '%s')",
+                    absolute,
+                    ds_name,
+                )
+                continue
+            contents = entry.get("contents", "")
+            if ds_type == "kubeconfig":
+                contents = _prefix_kubeconfig_yaml(contents, ds_slug)
+            mode_str = entry.get("mode") or "0600"
+            try:
+                mode_int = int(mode_str, 8)
+            except ValueError:
+                logger.warning("Bad mode %r on '%s'; using 0600", mode_str, ds_name)
+                mode_int = 0o600
+
+            parent = os.path.dirname(absolute)
+            if parent:
+                _mkdir_tracking(parent, manifest["dirs"])
+            try:
+                with open(absolute, "w") as f:
+                    f.write(contents)
+                os.chmod(absolute, mode_int)
+            except OSError as e:
+                logger.warning(
+                    "Failed to write credential file %s for '%s': %s",
+                    absolute,
+                    ds_name,
+                    e,
+                )
+                continue
+            manifest["files"].append(absolute)
+            logger.info(
+                "Materialized credential file for '%s' at %s (mode %s)",
+                ds_name,
+                absolute,
+                mode_str,
+            )
+
+            env_var = entry.get("env_var")
+            if env_var:
+                os.environ[env_var] = absolute
+                manifest["env_vars"].append(env_var)
+
+            if ds_type == "kubeconfig":
+                kubeconfig_paths.append(absolute)
+
+    if kubeconfig_paths:
+        merged = _merge_kubeconfigs(kubeconfig_paths, home_dir, manifest)
+        if merged:
+            os.environ["KUBECONFIG"] = merged
+        else:
+            os.environ["KUBECONFIG"] = ":".join(kubeconfig_paths)
+        manifest["env_vars"].append("KUBECONFIG")
+
+    return manifest
+
+
+def cleanup_credential_files(manifest: Optional[Dict[str, Any]]) -> None:
+    """Undo a :func:`process_credential_files` manifest. Best-effort, never raises.
+
+    Removes materialized files, unsets env vars, and ``rmdir``s only the
+    directories the materialization step created (pre-existing dirs like
+    ``~/.ssh`` are left alone).
+    """
+    if not manifest:
+        return
+
+    for env_var in manifest.get("env_vars", []) or []:
+        os.environ.pop(env_var, None)
+
+    for path in manifest.get("files", []) or []:
+        try:
+            os.unlink(path)
+            logger.debug("Removed credential file %s", path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to remove credential file %s: %s", path, e)
+
+    # Deepest first so children come out before their parents.
+    for d in sorted(manifest.get("dirs", []) or [], key=lambda p: -len(p)):
+        try:
+            os.rmdir(d)
+        except OSError:
+            # Non-empty or already gone; either way, nothing to do.
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -406,10 +715,20 @@ def inject_datasource_index(
     databases = [
         ds for ds in ds_configs if ds.get("type") in ("postgresql", "neo4j", "mongodb")
     ]
+    creds = [ds for ds in ds_configs if ds.get("type") in CREDENTIAL_FILE_TYPES]
     others = [
         ds
         for ds in ds_configs
-        if ds.get("type") not in ("repository", "postgresql", "neo4j", "mongodb")
+        if ds.get("type")
+        not in (
+            "repository",
+            "postgresql",
+            "neo4j",
+            "mongodb",
+            "kubeconfig",
+            "ssh_key",
+            "generic_file",
+        )
     ]
 
     if repos:
@@ -432,6 +751,31 @@ def inject_datasource_index(
                 lines.append(f"- **{name}** ({ds_type}, read-only) — query tools")
             else:
                 lines.append(_format_rw_cli_entry(name, ds_type))
+        lines.append("")
+
+    if creds:
+        lines.append("### Credential Files")
+        for ds in creds:
+            ds_type = ds.get("type", "unknown")
+            name = ds.get("name", "Unnamed")
+            slug = _ds_slug_hyphen(name)
+            ds_creds = ds.get("credentials") or {}
+            files = ds_creds.get("files") or []
+            if ds_type == "kubeconfig":
+                lines.append(
+                    f"- **{name}** (kubeconfig) — merged into `~/.kube/config`; "
+                    f"contexts prefixed `{slug}-*`. Try `kubectl config get-contexts`."
+                )
+            elif ds_type == "ssh_key":
+                lines.append(
+                    f"- **{name}** (ssh_key) — private key at `~/.ssh/{slug}`. "
+                    f"Add a host block in `~/.ssh/config` to use it."
+                )
+            else:  # generic_file
+                paths = (
+                    ", ".join(f"`{f.get('target_path')}`" for f in files) or "<none>"
+                )
+                lines.append(f"- **{name}** (file) — {paths}")
         lines.append("")
 
     if others:

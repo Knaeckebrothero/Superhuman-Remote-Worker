@@ -118,9 +118,29 @@ def _get_orchestrator_url() -> str:
     return url.rstrip("/")
 
 
-def _get_client() -> httpx.AsyncClient:
-    """Create an httpx client for orchestrator calls."""
-    return httpx.AsyncClient(timeout=30.0)
+def _get_client(*, user_id: Optional[str] = None) -> httpx.AsyncClient:
+    """Create an httpx client for orchestrator calls.
+
+    Attaches ``X-Internal-Key`` when ``MCP_INTERNAL_KEY`` is set so the
+    orchestrator's Track B (P4b) gates accept agent-tool calls. When
+    ``user_id`` is supplied the client also sends ``X-MCP-User-Id`` so
+    the orchestrator's ``_get_user_from_mcp_headers`` path can resolve
+    the originating user — required by ``GET /api/jobs``,
+    ``GET /api/jobs/{id}`` and any other endpoint guarded by
+    ``require_approved_user`` / ``require_job_access``. Without the
+    user header those endpoints 401 even with a valid internal key.
+
+    Worker-mode callers (no session, no user identity) pass
+    ``user_id=None`` and continue to authenticate as anonymous internal
+    against the dual-callable / require_internal endpoints.
+    """
+    headers: dict[str, str] = {}
+    internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+    if internal_key:
+        headers["X-Internal-Key"] = internal_key
+    if user_id:
+        headers["X-MCP-User-Id"] = user_id
+    return httpx.AsyncClient(timeout=30.0, headers=headers)
 
 
 def _format_job_summary(job: Dict[str, Any]) -> str:
@@ -182,7 +202,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         if not project_id and context.project_id:
             payload["project_id"] = context.project_id
 
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.post(f"{base_url}/api/jobs", json=payload)
                 resp.raise_for_status()
@@ -220,7 +240,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         if status:
             params["status"] = status
 
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.get(f"{base_url}/api/jobs", params=params)
                 resp.raise_for_status()
@@ -258,7 +278,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         Returns:
             Job details including status, progress, and any errors
         """
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.get(f"{base_url}/api/jobs/{job_id}")
                 resp.raise_for_status()
@@ -282,7 +302,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         Returns:
             File contents or error message
         """
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.get(
                     f"{base_url}/api/jobs/{job_id}/workspace/file",
@@ -311,7 +331,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         Returns:
             Approval result
         """
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.post(f"{base_url}/api/jobs/{job_id}/approve")
                 resp.raise_for_status()
@@ -339,7 +359,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         if feedback:
             payload["feedback"] = feedback
 
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.post(
                     f"{base_url}/api/jobs/{job_id}/resume",
@@ -365,7 +385,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         Returns:
             Cancellation result
         """
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.post(f"{base_url}/api/jobs/{job_id}/cancel")
                 resp.raise_for_status()
@@ -385,7 +405,7 @@ def create_orchestrator_tools(context: ToolContext) -> List[Any]:
         Returns:
             Pause result
         """
-        async with _get_client() as client:
+        async with _get_client(user_id=context.user_id) as client:
             try:
                 resp = await client.post(f"{base_url}/api/jobs/{job_id}/pause")
                 resp.raise_for_status()

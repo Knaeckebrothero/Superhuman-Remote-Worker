@@ -11,8 +11,9 @@ import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppChipComponent} from '../../ui/chip';
 import {AppInputComponent} from '../../ui/input';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {ViewModePillComponent} from '../../shell/view-mode-pill/view-mode-pill.component';
 
-type StatusFilter = 'all' | 'mine' | JobStatus;
+type StatusFilter = 'all' | JobStatus;
 
 /** A row in the hierarchical job list. */
 interface JobRow {
@@ -35,12 +36,14 @@ interface JobRow {
     AppChipComponent,
     AppInputComponent,
     AppSpinnerComponent,
+    ViewModePillComponent,
   ],
   template: `
     <div class="job-list-container">
       <!-- Header with filters -->
       <div class="header-bar">
         <span class="title">{{ 'jobs.title' | transloco }}</span>
+        <app-view-mode-pill />
         <div class="filter-chips">
           @for (filter of statusFilters; track filter.value) {
             <app-chip
@@ -49,7 +52,7 @@ interface JobRow {
               (clicked)="setFilter(filter.value)"
             >
               {{ filter.labelKey | transloco }}
-              @if (filter.value !== 'all' && filter.value !== 'mine') {
+              @if (filter.value !== 'all') {
                 <span class="count">({{ getStatusCount(filter.value) }})</span>
               }
             </app-chip>
@@ -772,7 +775,6 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   readonly statusFilters: { labelKey: string; value: StatusFilter }[] = [
     { labelKey: 'jobs.filter.all', value: 'all' },
-    { labelKey: 'jobs.filter.mine', value: 'mine' },
     { labelKey: 'jobs.filter.pending_review', value: 'pending_review' },
     { labelKey: 'jobs.filter.reviewing', value: 'reviewing' },
     { labelKey: 'jobs.filter.waiting', value: 'waiting' },
@@ -790,11 +792,6 @@ export class JobListComponent implements OnInit, OnDestroy {
 
     if (filter === 'all') {
       return allJobs;
-    }
-    if (filter === 'mine') {
-      const userId = this.userService.currentUserId();
-      if (!userId) return allJobs;
-      return allJobs.filter((job) => job.user_id === userId);
     }
     return allJobs.filter((job) => job.status === filter);
   });

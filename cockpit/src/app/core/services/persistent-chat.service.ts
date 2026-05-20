@@ -17,6 +17,7 @@ import {
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
 import {reduce, ReducerAction} from './turn-reducer';
+import {AppToastService} from '../../ui/toast';
 
 /**
  * Transport architecture (post WS→SSE migration, 2026-05-13):
@@ -119,6 +120,7 @@ export class PersistentChatService {
     private readonly api = inject(ApiService);
     private readonly cache = inject(IndexedDbService);
     private readonly zone = inject(NgZone);
+    private readonly toast = inject(AppToastService);
 
     // --- Connection state ---
     readonly connectionState = signal<ConnectionState>('disconnected');
@@ -279,6 +281,14 @@ export class PersistentChatService {
      */
     async createAndConnect(body: Record<string, any>): Promise<string> {
         this.disconnect();
+        // Clear the conversation + threadId synchronously so the "Creating
+        // thread …" startup card isn't rendered on top of turns from the
+        // session the user just navigated away from. disconnect() intentionally
+        // keeps turns visible (the "Disconnect" button is a read-only state),
+        // so the create path has to do it explicitly. connect() will reset
+        // again with the real thread id once the POST resolves.
+        this.dispatch({type: 'reset', threadId: null});
+        this.threadId.set(null);
         this.isCreating.set(true);
         this.connectionState.set('connecting');
         this.startupPhase.set('creating');
@@ -374,11 +384,20 @@ export class PersistentChatService {
 
         this.sse.onopen = () => {
             this.zone.run(() => {
+                const wasReconnecting = this.connectionState() !== 'connected';
                 this.connectionState.set('connected');
                 this.error.set(null);
                 this.reconnectAttempt.set(0);
                 this.reconnectGaveUp.set(false);
                 this._startSseWatchdog(threadId);
+                // On a reconnect (not the initial open), refetch thread meta
+                // so any title.updated / status frame that crossed the wire
+                // while we were disconnected is reconciled. Without this the
+                // header can stay stuck on "Untitled Session" after a backend
+                // loop_crash even though the title was generated and persisted.
+                if (wasReconnecting && this.threadId() === threadId) {
+                    void this.loadThreadMeta(threadId);
+                }
             });
         };
 
@@ -541,14 +560,21 @@ export class PersistentChatService {
         this.controlWs.onerror = () => {
             // The close handler will fire; nothing to do here.
         };
-        // SSE is the canonical receive path for agent-emitted events. We
-        // listen here only for `status` frames, which the orchestrator's
-        // persistent_ws_proxy emits BEFORE attaching to the agent pod
-        // ({phase: provisioning|booting|connecting}) — they never reach
-        // the thread_events log and so never come via SSE. Every other
-        // method (token, turn.*, thinking, error, ready, session.ended,
-        // title.updated, message) is also relayed over this WS for
-        // back-compat and would double-dispatch with SSE, so we discard.
+        // SSE is the canonical receive path for agent-emitted events. The
+        // orchestrator's _broadcast() stamps every persisted event with
+        // params._seq = [epoch, seq] before writing it to thread_events,
+        // so any frame carrying _seq will be redelivered by SSE — we drop
+        // those here to avoid double-dispatch.
+        //
+        // Frames WITHOUT _seq come from _ws_send() (per-client direct
+        // sends, never persisted): orchestrator status frames during WS
+        // startup (provisioning/booting/connecting), the agent's
+        // session.state welcome frame, and control-plane acks
+        // (mode.changed, narration.changed, interrupt.ack, vm_upgrade.*).
+        // These never reach SSE, so the WS is the only path that delivers
+        // them — and session.state is what flips sessionReady on a
+        // reconnect to an already-idle loop where the cached SSE cursor
+        // sits past the most recent `ready` event.
         this.controlWs.onmessage = (event: MessageEvent) => {
             let frame: { method?: string; params?: Record<string, unknown> };
             try {
@@ -556,7 +582,10 @@ export class PersistentChatService {
             } catch {
                 return;
             }
-            if (frame?.method !== 'status') return;
+            if (!frame?.method) return;
+            if (frame.params && (frame.params as Record<string, unknown>)['_seq'] != null) {
+                return;
+            }
             this.zone.run(() =>
                 this._handleEvent(frame as { method: string; params?: Record<string, unknown> }),
             );
@@ -1156,6 +1185,16 @@ export class PersistentChatService {
                 );
                 break;
 
+            case 'workspace_sync.error': {
+                const op = (params['op'] as string) || 'sync';
+                const turn = params['turn_id'] as number | undefined;
+                const turnLabel = turn != null ? ` on turn ${turn}` : '';
+                this.toast.warning(
+                    `Workspace sync (${op}) failed${turnLabel}. Your changes are in the workspace but not yet in OpenCloud. Will retry on next turn.`,
+                );
+                break;
+            }
+
             case 'error':
                 this.error.set(this.sanitizeError(params['message'] as string));
                 break;
@@ -1221,6 +1260,15 @@ export class PersistentChatService {
     private markSessionReady(): void {
         if (this.sessionReady()) return;
         this.sessionReady.set(true);
+
+        // Clear any transient error left over from the WS reconnect storm
+        // during session attach: when the orchestrator polls /ready faster
+        // than the agent finishes attaching its session, the agent rejects
+        // each WS with an "Agent not ready" frame (persistent_app.py:1489)
+        // until attach completes. Those errors are stale the moment we get
+        // session.state — keep them on screen and the user sees a red
+        // banner contradicting a healthy session.
+        this.error.set(null);
 
         const pending = this.pendingMessage();
         if (pending) {

@@ -179,11 +179,21 @@ auth:
     # cockpit SPA's public client (keycloak.cockpitClientId). They share
     # the realm + the user identity; only the auth model differs.
     clientId: "cockpit-bff"
-    # -- Cookie Domain attribute. Empty string ("") = host-only (right for
-    # localhost dev). Default at render time = ".{{ global.domain }}".
-    cookieDomain: ""
+    # -- Cookie Domain attribute. Sentinel-based:
+    #     "auto"        → ".{{ global.domain }}" (the prod default — rides on
+    #                     api.* and cockpit subdomains under one base domain)
+    #     "" (empty)    → host-only (right for localhost dev; browsers reject
+    #                     Domain=.localhost as a public-suffix edge case)
+    #     "foo.example" → literal
+    cookieDomain: "auto"
     # -- "1"=Secure flag set (production), "0"=cleartext for HTTP-only dev.
     cookieSecure: "1"
+    # -- SameSite attribute. "lax" is right when cockpit + api share a base
+    # domain (production: both under superhuman-remote-worker.com → same-site).
+    # Set to "none" for split-host local dev (cockpit on `localhost`, api on
+    # `api.localhost` — Chrome treats those as cross-site, so Lax blocks the
+    # session cookie on the cockpit's XHR to the API). "none" requires Secure.
+    cookieSamesite: "lax"
     # -- Idle session expiry (seconds). Validator rejects a session whose
     # last_seen_at is older than now() - this.
     sessionIdleTimeoutSeconds: 1800
@@ -227,6 +237,25 @@ ingress:
   # -- CORS middleware (Traefik CRD) for cockpit -> API cross-origin
   cors:
     enabled: true
+  # -- Layer 1 (P4b): block /api/agents/* and /api/internal/* at the public
+  # API ingress so agent-internal paths can't be probed externally. Renders
+  # a Traefik IPWhiteList middleware + a high-priority Ingress that 403s
+  # those prefixes; the in-cluster Service stays reachable for the agent.
+  #
+  # Layer 2 (app-layer X-Internal-Key gate via require_internal) is always
+  # on regardless of this toggle — every agent-internal endpoint also
+  # refuses anonymous external callers at the application level.
+  #
+  # When to enable: you front the orchestrator with Traefik (or another
+  # ingress controller that honors the same Middleware CRD) and want a
+  # network-layer block before the request reaches the app.
+  # When to leave off: you use a tunnel/edge that bypasses Traefik
+  # (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.) — Traefik never
+  # sees the request, so the middleware would be dead code. Add the
+  # equivalent path rule at your tunnel/edge instead. See
+  # docs/multi_tenancy.md for the cloudflared example.
+  internalPathBlock:
+    enabled: false
 
 # =============================================================================
 # Secrets — three modes (pick one)
@@ -625,12 +654,36 @@ opencloud:
   image: docker.io/opencloudeu/opencloud:latest
   storageClass: ""
   # OpenCloud's decomposeds3 driver buffers TUS uploads on the local PVC
-  # before promoting them to S3 on finalize. Sized for multi-GB uploads
-  # at moderate concurrency — bumping below this risks a disk-full
-  # cascade where postprocessing can't drain via NATS jetstream and the
-  # entire UI returns "Resource not found" until staging is cleared.
-  dataStorageSize: "64Gi"
+  # before promoting them to S3 on finalize. 16Gi is a light-use baseline
+  # (single-user homelab, modest file sizes). Override per-cluster to 64Gi+
+  # if you expect multi-GB uploads at concurrency — undersizing risks a
+  # disk-full cascade where postprocessing can't drain via NATS jetstream
+  # and the entire UI returns "Resource not found" until staging is cleared.
+  # NB: PVC expansion is online (Longhorn supports it), but shrinking is
+  # not — once bumped, you can't go back without copy-swap.
+  dataStorageSize: "16Gi"
   configStorageSize: "1Gi"
+  # TTL for incomplete/abandoned TUS upload sessions. The decomposeds3
+  # driver doesn't auto-purge expired sessions (opencloud-eu/opencloud#2208) —
+  # this only marks them eligible for the cleanup CronJob below. Short
+  # values (4h) cap the worst-case staging working set when a sync client
+  # misbehaves; legitimate slow uploads renew the lease per chunk.
+  uploadExpiration: "4h"
+  # Periodic cleanup of expired TUS sessions. Runs `opencloud storage-users
+  # uploads sessions --expired=true --clean` inside the running pod via
+  # pods/exec RBAC. Without this, expired entries accumulate forever and
+  # eventually fill the data PVC.
+  cleanup:
+    enabled: true
+    schedule: "0 * * * *"   # hourly
+    image: "docker.io/bitnami/kubectl:latest"
+    resources:
+      requests:
+        cpu: "10m"
+        memory: "32Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
   resources:
     requests:
       memory: "256Mi"
@@ -666,11 +719,54 @@ workspace:
   # -- NetworkPolicy restricting workspace traffic. Covers BOTH container
   # workspaces and same-cluster KubeVirt VM workspaces (selector
   # srw.io/component=agent-workspace matches both). Disabling removes the
-  # policy for both implementations. Requires a CNI that enforces
-  # NetworkPolicy (Calico, Cilium, OVN-Kubernetes, Antrea — Flannel does
-  # not enforce it). See docs/features/workspace_network_policy_unification.md.
+  # policy for both implementations. Requires a CNI or paired controller
+  # that enforces NetworkPolicy: Calico, Cilium, OVN-Kubernetes, and Antrea
+  # enforce natively; K3s ships Flannel paired with the embedded kube-router
+  # network-policy controller, which enforces by default (Flannel alone
+  # does not). See docs/features/workspace_network_policy_unification.md.
+  #
+  # PR 3 (per-project tiering): one NetworkPolicy is rendered per entry
+  # in `tiers` below. Each policy selects pods carrying the matching
+  # `srw.io/network-tier: <name>` label (emitted by the orchestrator's
+  # ContainerProvisioner, derived from `projects.network_tier`). The
+  # default tier `internet-only` MUST exist — pre-PR-3 pods and pods
+  # whose project has no resolvable tier inherit it. See
+  # docs/features/workspace_network_isolation.md §3.
   networkPolicy:
     enabled: true
+    # If set, the orchestrator init seeder bumps this user's default
+    # project to `network_tier='home-allowed'` on first boot (idempotent,
+    # one-way: never moves a project off home-allowed). Intended for
+    # operator/homelab installs where the cluster admin needs their own
+    # workspaces to reach the home LAN. Leave empty in SaaS deployments.
+    operatorHomeAllowedEmail: ""
+    # The closed set of named tiers. Order is irrelevant; the orchestrator
+    # references each tier by name. The set must stay in sync with the
+    # CHECK constraint in 0016_project_network_tier.sql — widening here
+    # without a migration leaves stranded label values.
+    tiers:
+      - name: internet-only
+        # Default tier. Public internet TCP 80/443/22 (ipBlock-bounded),
+        # cluster CIDRs + home LAN + link-local denied. The orchestrator
+        # treats this as the implicit fallback for pods lacking the
+        # network-tier label (legacy/pre-migration).
+        except:
+          - 10.0.50.0/24       # K3s nodes
+          - 10.0.51.0/24       # MetalLB IPs (use podSelector for in-cluster services)
+          - 10.42.0.0/16       # pod CIDR
+          - 10.43.0.0/16       # service CIDR
+          - 192.168.178.0/24   # home LAN
+          - 169.254.0.0/16     # link-local / cloud-metadata
+      - name: home-allowed
+        # Operator/homelab tier: home LAN added back to the allowlist.
+        # Cluster CIDRs + link-local stay denied (in-cluster services
+        # remain reachable only via the explicit podSelector rules below).
+        except:
+          - 10.0.50.0/24       # K3s nodes
+          - 10.0.51.0/24       # MetalLB IPs
+          - 10.42.0.0/16       # pod CIDR
+          - 10.43.0.0/16       # service CIDR
+          - 169.254.0.0/16     # link-local / cloud-metadata
   # -- Pre-pull the workspace image on every node via a DaemonSet, so a
   # freshly-built tag doesn't pay a ~2-minute cold pull penalty on the first
   # session-attach (which would exceed the orchestrator/agent readiness

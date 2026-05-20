@@ -74,5 +74,9 @@ paramiko>=3.4.0
 cryptography>=42.0
 # Optional: NATS for cross-cluster VM lifecycle management
 nats-py>=2.9.0
+# Cron expression parsing for the automations dispatcher
+# (services/cron_dispatcher.py). Pairs with zoneinfo (stdlib) for
+# DST-aware next-fire-time computation against IANA-named timezones.
+croniter>=2.0.0
 # Citation engine (separate repo):
 citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git

@@ -4,16 +4,22 @@ Tests count_request_tokens, ContextOverflowError raising, reasoning_content
 extraction, _extract_responses_api_reasoning, and the _is_quota_error heuristic.
 """
 
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from src.llm.exceptions import ContextOverflowError
 from src.llm.reasoning_chat import (
     count_request_tokens,
+    _extract_reasoning_from_delta,
     _extract_reasoning_from_response,
     _extract_responses_api_reasoning,
+    _install_streaming_reasoning_tap,
     _is_debug_stream,
     _get_debug_tail_chars,
     _dump_codex_raw_response,
+    _SSEReasoningTap,
     ReasoningCapturingClient,
 )
 
@@ -443,3 +449,186 @@ class TestDumpCodexRawResponse:
         resp = self._make_response(b"{}")
         # Must not raise
         _dump_codex_raw_response(req, resp)
+
+
+# =============================================================================
+# _extract_reasoning_from_delta
+# =============================================================================
+
+
+class TestExtractReasoningFromDelta:
+    """Per-chunk delta reasoning extraction (Chat Completions SSE)."""
+
+    def test_none_input(self):
+        assert _extract_reasoning_from_delta(None) is None  # type: ignore[arg-type]
+
+    def test_empty_dict(self):
+        assert _extract_reasoning_from_delta({}) is None
+
+    def test_reasoning_content_field(self):
+        assert _extract_reasoning_from_delta({"reasoning_content": "hi"}) == "hi"
+
+    def test_openrouter_reasoning_field(self):
+        assert _extract_reasoning_from_delta({"reasoning": "ok"}) == "ok"
+
+    def test_reasoning_content_wins_over_reasoning(self):
+        d = {"reasoning_content": "primary", "reasoning": "secondary"}
+        assert _extract_reasoning_from_delta(d) == "primary"
+
+    def test_empty_string_returns_none(self):
+        assert _extract_reasoning_from_delta({"reasoning_content": ""}) is None
+
+    def test_non_string_value_returns_none(self):
+        assert _extract_reasoning_from_delta({"reasoning_content": 42}) is None
+
+
+# =============================================================================
+# _SSEReasoningTap + _install_streaming_reasoning_tap
+# =============================================================================
+
+
+def _sse_lines(events: list[dict]) -> bytes:
+    """Encode chat-completion-style chunks as SSE bytes."""
+    out: list[bytes] = []
+    for ev in events:
+        out.append(b"data: " + json.dumps(ev).encode("utf-8") + b"\n\n")
+    out.append(b"data: [DONE]\n\n")
+    return b"".join(out)
+
+
+class _FakeResponse:
+    """Minimal httpx.Response stand-in with iter_bytes/aiter_bytes."""
+
+    def __init__(self, body: bytes, chunk_size: int = 32):
+        self._body = body
+        self._chunk_size = chunk_size
+
+    def iter_bytes(self, _size=None):
+        for i in range(0, len(self._body), self._chunk_size):
+            yield self._body[i : i + self._chunk_size]
+
+    async def aiter_bytes(self, _size=None):
+        for i in range(0, len(self._body), self._chunk_size):
+            yield self._body[i : i + self._chunk_size]
+
+
+class TestSSEReasoningTap:
+    """Tap parses reasoning_content from SSE while forwarding bytes unchanged."""
+
+    def test_sync_extracts_reasoning_content(self):
+        body = _sse_lines(
+            [
+                {"choices": [{"delta": {"reasoning_content": "**Think**"}}]},
+                {"choices": [{"delta": {"reasoning_content": "ing..."}}]},
+                {"choices": [{"delta": {"content": "Done."}}]},
+            ]
+        )
+        resp = _FakeResponse(body, chunk_size=16)
+        tap = _SSEReasoningTap(resp)
+
+        forwarded = b"".join(tap.iter_bytes())
+
+        assert forwarded == body, "bytes must pass through unchanged"
+        assert tap.reasoning_content == "**Think**ing..."
+
+    def test_sync_returns_none_when_no_reasoning(self):
+        body = _sse_lines(
+            [
+                {"choices": [{"delta": {"content": "Hello"}}]},
+                {"choices": [{"delta": {"content": " world"}}]},
+            ]
+        )
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content is None
+
+    def test_sync_handles_split_lines_across_chunks(self):
+        """SSE chunks may split a line mid-payload — tap must buffer."""
+        body = _sse_lines(
+            [{"choices": [{"delta": {"reasoning_content": "abcdefghij"}}]}]
+        )
+        # Force a tiny chunk_size so a single SSE line spans many chunks
+        tap = _SSEReasoningTap(_FakeResponse(body, chunk_size=4))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content == "abcdefghij"
+
+    def test_openrouter_reasoning_field(self):
+        body = _sse_lines(
+            [
+                {"choices": [{"delta": {"reasoning": "open"}}]},
+                {"choices": [{"delta": {"reasoning": "router"}}]},
+            ]
+        )
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content == "openrouter"
+
+    def test_malformed_json_is_skipped(self):
+        body = (
+            b"data: {not json}\n\n"
+            b"data: "
+            + json.dumps(
+                {"choices": [{"delta": {"reasoning_content": "saved"}}]}
+            ).encode("utf-8")
+            + b"\n\n"
+            b"data: [DONE]\n\n"
+        )
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content == "saved"
+
+    def test_done_marker_ignored(self):
+        body = b"data: [DONE]\n\n"
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content is None
+
+    def test_trailing_line_without_newline_is_flushed(self):
+        """Some servers omit the trailing \\n before closing the stream."""
+        body = b"data: " + json.dumps(
+            {"choices": [{"delta": {"reasoning_content": "tail"}}]}
+        ).encode("utf-8")
+        tap = _SSEReasoningTap(_FakeResponse(body))
+        for _ in tap.iter_bytes():
+            pass
+        assert tap.reasoning_content == "tail"
+
+    @pytest.mark.asyncio
+    async def test_async_extracts_reasoning_content(self):
+        body = _sse_lines(
+            [
+                {"choices": [{"delta": {"reasoning_content": "First "}}]},
+                {"choices": [{"delta": {"reasoning_content": "second"}}]},
+            ]
+        )
+        resp = _FakeResponse(body)
+        tap = _SSEReasoningTap(resp)
+
+        forwarded = b""
+        async for chunk in tap.aiter_bytes():
+            forwarded += chunk
+
+        assert forwarded == body
+        assert tap.reasoning_content == "First second"
+
+
+class TestInstallStreamingReasoningTap:
+    """Tap installation replaces aiter_bytes / iter_bytes on the response."""
+
+    def test_replaces_iter_methods(self):
+        body = _sse_lines([{"choices": [{"delta": {"reasoning_content": "hello"}}]}])
+        resp = _FakeResponse(body)
+        original_iter = resp.iter_bytes
+        tap = _install_streaming_reasoning_tap(resp)
+
+        assert resp.iter_bytes is not original_iter
+        # The replaced method comes from the tap; consuming it captures
+        # reasoning while forwarding bytes unchanged.
+        for _ in resp.iter_bytes():
+            pass
+        assert tap.reasoning_content == "hello"

@@ -21,8 +21,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -57,8 +61,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- if .Values.ingress.cors.enabled }}
     traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-cors@kubernetescrd
     {{- end }}
@@ -84,6 +92,91 @@ spec:
                 name: {{ $fullName }}-orchestrator
                 port:
                   number: 8085
+{{- if .Values.ingress.internalPathBlock.enabled }}
+---
+# Track B (P4b) — Layer 1 (opt-in). Block /api/agents/* and /api/internal/*
+# at the public API ingress so agent-internal paths can't be probed from
+# outside. This is OPT-IN because it only works when the orchestrator is
+# fronted by Traefik (or another ingress controller that honors this CRD).
+#
+# If you use a tunnel/edge that bypasses your ingress controller
+# (Cloudflare Tunnel, Tailscale Funnel, Ngrok, etc.), Traefik never sees
+# the request and this middleware never fires — leave the toggle off and
+# put the equivalent path rule at your tunnel/edge instead. See
+# `docs/multi_tenancy.md` for the cloudflared example.
+#
+# Layer 2 (app-layer ``require_internal`` checking the ``X-Internal-Key``
+# header) is the primary defense and is always on regardless of this toggle.
+# Cluster-internal callers (the agent reaching the orchestrator via the
+# in-cluster Service DNS http://srw-orchestrator:8085) always bypass the
+# ingress, so the agent's traffic is unaffected whether or not Layer 1 is on.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullName }}-block-external
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+spec:
+  # An IP allow-list with a single non-routable address effectively denies all
+  # real clients while keeping the resource valid. Traefik returns 403.
+  #
+  # Field name: ``ipWhiteList`` works on both Traefik v2 (only known name) and
+  # Traefik v3 (deprecated alias, still accepted). The newer ``ipAllowList``
+  # spelling is v3-only and silently no-ops on v2.
+  ipWhiteList:
+    sourceRange:
+      - 127.0.0.99/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}-api-ingress-blocked-internal
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
+    {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
+    # Higher priority than the main API ingress so these path matches win.
+    # Without this, Traefik may evaluate the shorter `/` prefix first.
+    traefik.ingress.kubernetes.io/router.priority: "100"
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ $fullName }}-block-external@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $apiHost }}
+      secretName: {{ $fullName }}-api-tls
+  {{- end }}
+  rules:
+    - host: {{ $apiHost }}
+      http:
+        paths:
+          # Pure-agent paths (P4b ingress strip — agent ↔ orchestrator only).
+          # These are still served on the in-cluster Service DNS; only the
+          # public host blocks them.
+          - path: /api/agents
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+          - path: /api/internal
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullName }}-orchestrator
+                port:
+                  number: 8085
+{{- end }}
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
 ---
 # Keycloak SSO (browser must reach this for login flow). Skipped when using external OIDC.
@@ -97,8 +190,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -135,8 +232,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -173,8 +274,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -211,8 +316,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -249,8 +358,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -287,8 +400,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -325,8 +442,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -363,8 +484,12 @@ metadata:
     {{- if and .Values.ingress.tls.enabled .Values.ingress.tls.issuerName }}
     cert-manager.io/cluster-issuer: {{ .Values.ingress.tls.issuerName }}
     {{- end }}
+    {{- if .Values.ingress.tls.enabled }}
     traefik.ingress.kubernetes.io/router.entrypoints: websecure
     traefik.ingress.kubernetes.io/router.tls: "true"
+    {{- else }}
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

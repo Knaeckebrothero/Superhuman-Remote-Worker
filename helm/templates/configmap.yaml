@@ -62,8 +62,14 @@ data:
   # See docs/features/auth_bff_and_api_tokens.md.
   SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (include "srw.apiUrl" .) | quote }}
   SRW_SPA_BASE_URL: {{ include "srw.cockpitUrl" . | quote }}
-  SRW_COOKIE_DOMAIN: {{ .Values.auth.bff.cookieDomain | default (printf ".%s" .Values.global.domain) | quote }}
+  # auth.bff.cookieDomain semantics:
+  #   "auto" (default) → ".<global.domain>" (rides on cockpit + api subdomains)
+  #   ""               → host-only (right for localhost dev where browsers
+  #                                  may reject Domain=.localhost as a public-suffix)
+  #   anything else    → emitted literally
+  SRW_COOKIE_DOMAIN: {{ if eq .Values.auth.bff.cookieDomain "auto" }}{{ printf ".%s" .Values.global.domain | quote }}{{ else }}{{ .Values.auth.bff.cookieDomain | quote }}{{ end }}
   SRW_COOKIE_SECURE: {{ .Values.auth.bff.cookieSecure | default "1" | quote }}
+  SRW_COOKIE_SAMESITE: {{ .Values.auth.bff.cookieSamesite | default "lax" | quote }}
   SRW_SESSION_IDLE_TIMEOUT_S: {{ .Values.auth.bff.sessionIdleTimeoutSeconds | default 1800 | int | quote }}
   SRW_SESSION_ABSOLUTE_TIMEOUT_S: {{ .Values.auth.bff.sessionAbsoluteTimeoutSeconds | default 2592000 | int | quote }}
   SRW_ACCESS_TOKEN_REFRESH_SKEW_S: {{ .Values.auth.bff.accessTokenRefreshSkewSeconds | default 60 | int | quote }}
@@ -204,6 +210,11 @@ data:
   # Workspace containers (per-job sandboxed execution environments)
   WORKSPACE_IMAGE: {{ printf "%s:%s" .Values.image.workspace.repository .Values.image.workspace.tag | quote }}
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
+
+  # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
+  # When set, orchestrator init flips this user's default project from
+  # the database default 'internet-only' to 'home-allowed' on first boot.
+  OPERATOR_HOME_ALLOWED_EMAIL: {{ .Values.workspace.networkPolicy.operatorHomeAllowedEmail | default "" | quote }}
 
   # Agent pods (on-demand via AgentProvisioner)
   AGENT_IMAGE: {{ printf "%s:%s" .Values.image.agent.repository .Values.image.agent.tag | quote }}

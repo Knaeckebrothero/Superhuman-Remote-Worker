@@ -52,6 +52,16 @@ def _cookie_secure() -> bool:
     return os.getenv("SRW_COOKIE_SECURE", "1") == "1"
 
 
+def _cookie_samesite() -> str:
+    """Cookie SameSite attribute. "lax" is right for same-site prod deployments
+    (cockpit and api on the same base domain). For local dev where cockpit is
+    on `localhost` and api is on `api.localhost`, browsers treat those as
+    cross-site and SameSite=Lax blocks the cookie on cross-site XHR — set to
+    "none" in that case. SameSite=None requires Secure=true (browser-enforced).
+    """
+    return os.getenv("SRW_COOKIE_SAMESITE", "lax").lower()
+
+
 def _absolute_lifetime() -> timedelta:
     return timedelta(
         seconds=int(os.getenv("SRW_SESSION_ABSOLUTE_TIMEOUT_S", "2592000"))
@@ -107,7 +117,7 @@ def _set_session_cookie(resp: Response, session_id: str) -> None:
         domain=_cookie_domain(),
         secure=_cookie_secure(),
         httponly=True,
-        samesite="lax",
+        samesite=_cookie_samesite(),
     )
 
 
@@ -129,7 +139,7 @@ def _set_pre_auth_cookie(resp: Response, pre_auth_id: str) -> None:
         domain=_cookie_domain(),
         secure=_cookie_secure(),
         httponly=True,
-        samesite="lax",
+        samesite=_cookie_samesite(),
     )
 
 
@@ -373,10 +383,14 @@ async def logout(request: Request) -> JSONResponse:
             # from logging out locally; KC's session expires naturally
             # within the refresh-token TTL even if this misses.
             await kc_bff_client.logout_kc_side(sess["refresh_token"])
+            # Trailing slash matters: KC's post.logout.redirect.uris pattern is
+            # `{cockpit_url}/*`, and bare `https://localhost` doesn't reliably
+            # match `https://localhost/*` across KC versions. Send `.../` so
+            # the wildcard `*` matches the empty path explicitly.
             qs = urlencode(
                 {
                     "id_token_hint": sess["id_token"],
-                    "post_logout_redirect_uri": _spa_base(),
+                    "post_logout_redirect_uri": _spa_base() + "/",
                 }
             )
             kc_logout_url = f"{kc_bff_client.end_session_endpoint}?{qs}"

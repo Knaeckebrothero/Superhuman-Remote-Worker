@@ -103,8 +103,36 @@ from security.auth import (  # noqa: E402
     cleanup_expired_tokens,
     cleanup_expired_sessions,
 )
+from security.access import (  # noqa: E402
+    is_internal_call,
+    mcp_scope_project_id,
+    redact_datasource,
+    redact_datasources,
+    require_builder_session_owner,
+    require_datasource_access,
+    require_datasource_owner,
+    require_internal,
+    require_internal_or_job_access,
+    require_job_access,
+    require_project_member,
+    require_project_owner,
+    require_sudo_request_authority,
+    require_thread_owner,
+    user_can_access_any_job,
+    user_can_access_datasource,
+    user_can_access_ide_entity,
+    user_can_access_job,
+    user_visible_project_ids,
+)
+from security.credential_files import (  # noqa: E402
+    CREDENTIAL_FILE_TYPES,
+    CredentialFileValidationError,
+    normalize_credential_files,
+)
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
+from routers import automations_router  # noqa: E402
+from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -814,10 +842,10 @@ async def _inject_dispatch_credentials(
     # further down catches the same hole for unpinned phases, so the two
     # blocks together cover both shapes: explicit job overrides (here) and
     # user-default fallback (below).
-    for _section_name, _parent in (
-        ("auxiliary", config_override),
-        ("strategic", llm_over),
-        ("tactical", llm_over),
+    for _section_name, _parent, _capability in (
+        ("auxiliary", config_override, "auxiliary"),
+        ("strategic", llm_over, "chat"),
+        ("tactical", llm_over, "chat"),
     ):
         _section = _parent.get(_section_name)
         if not isinstance(_section, dict):
@@ -830,6 +858,7 @@ async def _inject_dispatch_credentials(
             model_id=_section_model,
             user_id=user_id_str,
             resolved_keys=resolved_keys,
+            capability=_capability,
         )
         if "api_key" not in _section and "base_url" not in _section:
             logger.warning(
@@ -858,6 +887,7 @@ async def _inject_dispatch_credentials(
                     model_id=aux_model,
                     user_id=user_id_str,
                     resolved_keys=resolved_keys,
+                    capability="auxiliary",
                 )
                 logger.info(f"Dispatch: injected auxiliary model override: {aux_model}")
 
@@ -916,11 +946,11 @@ async def _inject_dispatch_credentials(
                     f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
                 )
 
-        for _kind, _prefix, _user_key in (
-            ("vision", "VISION", "default_vision_model"),
-            ("whisper", "WHISPER", "default_whisper_model"),
-            ("tts", "TTS", "default_tts_model"),
-            ("citation", "CITATION_LLM", "default_citation_model"),
+        for _kind, _prefix, _user_key, _capability in (
+            ("vision", "VISION", "default_vision_model", "vision"),
+            ("whisper", "WHISPER", "default_whisper_model", "whisper"),
+            ("tts", "TTS", "default_tts_model", "tts"),
+            ("citation", "CITATION_LLM", "default_citation_model", "chat"),
         ):
             _model = user_settings.get(_user_key)
             if not _model:
@@ -936,6 +966,7 @@ async def _inject_dispatch_credentials(
                 model_id=_model,
                 user_id=user_id_str,
                 resolved_keys=resolved_keys,
+                capability=_capability,
             )
             # The citation_engine package reads CITATION_LLM_URL (not _BASE_URL)
             # and falls back to OPENAI_API_KEY for auth. Alias the URL key here
@@ -957,7 +988,14 @@ async def _inject_dispatch_credentials(
             if embedding_provider and "EMBEDDING_PROVIDER" not in env_keys_block:
                 env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
             if embedding_model and "EMBEDDING_MODEL" not in env_keys_block:
-                env_keys_block["EMBEDDING_MODEL"] = embedding_model
+                await _inject_env_key_credentials(
+                    env_keys=env_keys_block,
+                    prefix="EMBEDDING",
+                    model_id=embedding_model,
+                    user_id=user_id_str,
+                    resolved_keys=resolved_keys,
+                    capability="embedding",
+                )
             if (
                 embedding_provider == "openrouter"
                 and resolved_keys
@@ -1805,6 +1843,7 @@ async def _inject_model_credentials(
     model_id: str,
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
+    capability: str = "chat",
 ) -> None:
     """Populate a config-override section with the right base_url + api_key
     for a given model ID.
@@ -1826,7 +1865,7 @@ async def _inject_model_credentials(
 
     meta = None
     try:
-        meta = await _resolve_model(model_id, user_id=user_id)
+        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
 
@@ -1860,6 +1899,7 @@ async def _inject_env_key_credentials(
     model_id: str,
     user_id: str | None,
     resolved_keys: dict[str, str] | None,
+    capability: str = "chat",
 ) -> None:
     """Populate ``env_keys`` with ``{PREFIX}_MODEL/_BASE_URL/_API_KEY``.
 
@@ -1875,7 +1915,7 @@ async def _inject_env_key_credentials(
 
     meta = None
     try:
-        meta = await _resolve_model(model_id, user_id=user_id)
+        meta = await _resolve_model(model_id, user_id=user_id, capability=capability)
     except UnknownModelError:
         meta = None
 
@@ -2327,7 +2367,7 @@ class DatasourceCreate(BaseModel):
     name: str = Field(..., description="User-provided label")
     type: str = Field(
         ...,
-        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav",
+        description="Datasource type: generic, repository, postgresql, neo4j, mongodb, webdav, kubeconfig, ssh_key, generic_file",
     )
     connection_url: str | None = Field(
         None, description="Connection string (nullable for generic)"
@@ -2901,6 +2941,8 @@ class ProjectUpdate(BaseModel):
     default_config_name: str | None = None
     default_config_override: dict[str, Any] | None = None
     cloud_storage_read_only: bool | None = None
+    # Workspace egress tier. Admin-only — see PATCH /api/projects/{id}.
+    network_tier: str | None = None
 
 
 class ProjectMemberAdd(BaseModel):
@@ -3061,6 +3103,30 @@ async def lifespan(app: FastAPI):
     await postgres_db.apply_migrations()
     await vector_db.apply_migrations()
     logger.info("Database migrations applied")
+
+    # Encrypt any legacy plaintext datasource credentials. Idempotent — once
+    # all rows are v1 ciphertexts this is a fast no-op. Lives in lifespan
+    # (not init.py) for the same reason mongodb.ensure_indexes does: init.py
+    # is not reliably invoked at deploy time, and this is data-integrity
+    # critical for the encryption-at-rest guarantee.
+    try:
+        _bf = await postgres_db.backfill_encrypt_datasource_credentials()
+        if _bf["encrypted"] > 0:
+            logger.info(
+                "Encrypted %d legacy plaintext datasource credentials "
+                "(%d skipped, %d errors)",
+                _bf["encrypted"],
+                _bf["skipped"],
+                _bf["errors"],
+            )
+        elif _bf["errors"] > 0:
+            logger.warning(
+                "Datasource credentials backfill: %d errors (%d skipped)",
+                _bf["errors"],
+                _bf["skipped"],
+            )
+    except Exception as _e:
+        logger.error("Datasource credentials backfill failed: %s", _e)
 
     # Wire the model registry's catalog lookup to the DB. The registry lives
     # in src/core/ and must not import orchestrator/, so the hook is injected
@@ -3228,6 +3294,11 @@ async def lifespan(app: FastAPI):
         delegation_timeout_sweeper(_shutdown_event)
     )
     pool_reconciler_task = asyncio.create_task(agent_pool_reconciler(_shutdown_event))
+    automation_cron_task = asyncio.create_task(
+        cron_dispatcher_loop(
+            postgres_db, _shutdown_event, on_job_created=_trigger_dispatch
+        )
+    )
 
     # Unified instance lifecycle reconciler (drift-based draining and,
     # in future phases, crash recovery + cross-kind primitives). Runs
@@ -3299,6 +3370,7 @@ async def lifespan(app: FastAPI):
     await pool_reconciler_task
     await lifecycle_reconciler_task
     await main_cloud_listen_task
+    await automation_cron_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -3438,21 +3510,27 @@ async def request_logging_middleware(request: Request, call_next):
 app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
+app.include_router(automations_router)
 
 
 @app.get("/api/tables")
-async def list_tables() -> list[dict[str, Any]]:
-    """List available tables with row counts."""
+async def list_tables(request: Request) -> list[dict[str, Any]]:
+    """List available tables with row counts. **Admin only** (P4d) —
+    raw postgres table dump."""
+    await _require_admin(request)
     return await postgres_db.get_tables()
 
 
 @app.get("/api/tables/{table_name}")
 async def get_table_data(
+    request: Request,
     table_name: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=500, alias="pageSize"),
 ) -> dict[str, Any]:
-    """Get paginated table data. Use page=-1 to request the last page."""
+    """Get paginated table data. Use page=-1 to request the last page.
+    **Admin only** (P4d) — raw postgres rows."""
+    await _require_admin(request)
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
@@ -3463,8 +3541,9 @@ async def get_table_data(
 
 
 @app.get("/api/tables/{table_name}/schema")
-async def get_table_schema(table_name: str) -> list[dict[str, Any]]:
-    """Get column definitions for a table."""
+async def get_table_schema(request: Request, table_name: str) -> list[dict[str, Any]]:
+    """Get column definitions for a table. **Admin only** (P4d)."""
+    await _require_admin(request)
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
@@ -3474,6 +3553,7 @@ async def get_table_schema(table_name: str) -> list[dict[str, Any]]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+# nosec: public k8s-liveness-probe
 @app.get("/api/health")
 async def health_check() -> dict[str, str]:
     """Health check endpoint."""
@@ -3481,12 +3561,17 @@ async def health_check() -> dict[str, str]:
 
 
 @app.get("/api/workspace/status")
-async def workspace_status() -> dict[str, Any]:
+async def workspace_status(request: Request) -> dict[str, Any]:
     """Get workspace configuration status for debugging.
+
+    **Admin only** (P4a): leaks job UUIDs, filesystem paths, and env-var
+    values, so it shouldn't be anonymous. No callers currently rely on it.
 
     Returns:
         Dict with workspace path, availability, and sample job directories
     """
+    await _require_admin(request)
+
     import os
 
     base_path = workspace_service.base_path
@@ -3509,23 +3594,6 @@ async def workspace_status() -> dict[str, Any]:
     }
 
 
-def _get_mcp_scope(request: Request) -> tuple[str | None, str | None]:
-    """Extract MCP scope from request headers (set by the MCP server).
-
-    Returns (user_id, scope) if the request comes from an authenticated
-    MCP client, otherwise (None, None). Headers are only trusted when
-    the X-Internal-Key matches MCP_INTERNAL_KEY.
-    """
-    mcp_user = request.headers.get("X-MCP-User-Id")
-    mcp_scope = request.headers.get("X-MCP-Scope")
-    if mcp_user and mcp_scope:
-        key = request.headers.get("X-Internal-Key", "")
-        expected = os.environ.get("MCP_INTERNAL_KEY", "")
-        if expected and key == expected:
-            return mcp_user, mcp_scope
-    return None, None
-
-
 @app.get("/api/jobs")
 async def list_jobs(
     request: Request,
@@ -3533,37 +3601,60 @@ async def list_jobs(
     user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List jobs with optional status and user filter.
+    """List jobs visible to the caller.
+
+    Visibility model (G1):
+        * Admins see the full fleet, optionally narrowed by ``?user_id=`` or
+          by an MCP ``project:<uuid>`` token scope.
+        * Non-admins see jobs they own OR jobs in projects they're a member
+          of, additionally narrowed by any MCP project scope.
+        * A non-admin passing ``?user_id=`` for anyone other than themselves
+          is rejected (403). Self-query (``?user_id=<self>``) is allowed but
+          redundant — the visibility OR-clause already covers it.
 
     Returns jobs enriched with audit_count from MongoDB if available.
-    MCP scope filtering is applied when the request comes from an
-    authenticated MCP client.
     """
-    # Apply MCP scope filtering
-    mcp_user, mcp_scope = _get_mcp_scope(request)
-    if mcp_scope == "user":
-        user_id = mcp_user  # Override to show only the token owner's jobs
-    elif mcp_scope and mcp_scope.startswith("project:"):
-        pass  # project filtering applied below after fetching
+    user = await require_approved_user(request, postgres_db)
+    is_admin = bool(user.get("is_admin"))
+    scope_pid = mcp_scope_project_id(user)
+
+    if user_id is not None and not is_admin and str(user_id) != str(user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to query other users' jobs",
+        )
 
     try:
-        jobs = await postgres_db.get_jobs(status=status, user_id=user_id, limit=limit)
+        if is_admin:
+            jobs = await postgres_db.get_jobs(
+                status=status,
+                user_id=user_id,
+                limit=limit,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+            )
+        else:
+            visible = await user_visible_project_ids(user, postgres_db)
+            # Non-admin always lands on a concrete set (never "all").
+            project_ids = [str(p) for p in visible] if visible != "all" else []
+            jobs = await postgres_db.get_visible_jobs(
+                owner_user_id=str(user["id"]),
+                visible_project_ids=project_ids,
+                status=status,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+                limit=limit,
+            )
 
-        # Filter by project if MCP scope is project-scoped
-        if mcp_scope and mcp_scope.startswith("project:"):
-            project_id = mcp_scope.split(":", 1)[1]
-            jobs = [j for j in jobs if str(j.get("project_id", "")) == project_id]
-
-        # Enrich with audit counts if MongoDB is available
         if mongodb.is_available:
             for job in jobs:
-                job_id = str(job["id"])
-                job["audit_count"] = await mongodb.get_audit_count(job_id)
+                jid = str(job["id"])
+                job["audit_count"] = await mongodb.get_audit_count(jid)
         else:
             for job in jobs:
                 job["audit_count"] = None
 
         return jobs
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -3571,28 +3662,12 @@ async def list_jobs(
 @app.get("/api/jobs/{job_id}")
 async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     """Get a single job by ID."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        # MCP scope check
-        mcp_user, mcp_scope = _get_mcp_scope(request)
-        if mcp_scope == "user" and str(job.get("user_id", "")) != mcp_user:
-            raise HTTPException(status_code=403, detail="Access denied by token scope")
-        elif mcp_scope and mcp_scope.startswith("project:"):
-            project_id = mcp_scope.split(":", 1)[1]
-            if str(job.get("project_id", "")) != project_id:
-                raise HTTPException(
-                    status_code=403, detail="Access denied by token scope"
-                )
-
-        # Enrich with audit count if MongoDB is available
         if mongodb.is_available:
             job["audit_count"] = await mongodb.get_audit_count(job_id)
         else:
             job["audit_count"] = None
-
         return job
     except HTTPException:
         raise
@@ -3601,8 +3676,17 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/jobs")
-async def create_job(job: JobCreate) -> dict[str, Any]:
-    """Create a new job.
+async def create_job(request: Request, job: JobCreate) -> dict[str, Any]:
+    """Create a new job. **Dual-callable** (P4b):
+
+    * Cockpit / user path → ``require_approved_user``; if ``body.project_id``
+      is set, the caller must be at least an editor of that project; the
+      submitted ``user_id`` is forced to ``caller.id`` so a malicious body
+      can't create jobs attributed to someone else.
+    * Agent path (delegation child jobs from ``src/api/orchestrator_client.py``)
+      → bypass via ``X-Internal-Key``. The agent supplies the correct
+      ``user_id`` from the parent job's context; we trust the in-cluster
+      internal key here.
 
     Creates a job with status 'created'. The job must be assigned to an agent
     to start processing.
@@ -3613,6 +3697,16 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
     branched from the project's shared jobs repo instead of getting its own
     per-job repo.
     """
+    if not is_internal_call(request):
+        caller = await require_approved_user(request, postgres_db)
+        # Force user_id to caller; never honor body.user_id from a cockpit
+        # caller (F2 pattern). Project membership is checked below once we
+        # know the resolved project_id.
+        job.user_id = str(caller["id"])
+        if job.project_id:
+            await require_project_member(
+                request, postgres_db, str(job.project_id), min_role="editor"
+            )
     await _enforce_readiness_gate()
     try:
         # Merge upload IDs into context
@@ -3929,14 +4023,27 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
 
 
 @app.delete("/api/jobs/{job_id}")
-async def delete_job(job_id: str) -> dict[str, str]:
-    """Delete a job and its requirements."""
-    try:
-        # Look up the job before deletion for branch cleanup
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+async def delete_job(request: Request, job_id: str) -> dict[str, str]:
+    """Delete a job and its requirements.
 
+    P4c: destructive. Caller must own the job OR be project-owner OR admin.
+    Plain project membership is not enough — mirrors G3 sudo-authority gate.
+    """
+    caller, job = await require_job_access(request, postgres_db, job_id)
+    if not caller.get("is_admin"):
+        is_job_owner = str(job.get("user_id") or "") == str(caller["id"])
+        is_project_owner = False
+        if not is_job_owner and job.get("project_id"):
+            role = await postgres_db.get_user_role_in_project(
+                str(job["project_id"]), str(caller["id"])
+            )
+            is_project_owner = role == "owner"
+        if not (is_job_owner or is_project_owner):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the job owner, the project owner, or an admin may delete this job",
+            )
+    try:
         # Clean up Gitea repo/branch
         if gitea_client.is_initialized:
             if (
@@ -3994,12 +4101,15 @@ async def delete_job(job_id: str) -> dict[str, str]:
 
 
 @app.post("/api/jobs/{job_id}/subjob-merge")
-async def subjob_merge(job_id: str) -> dict[str, Any]:
+async def subjob_merge(request: Request, job_id: str) -> dict[str, Any]:
     """Squash-merge a completed subjob's branch into its parent's branch.
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips this
+    path.
 
     Called by the agent after a subjob completes (autonomy=full auto-completion).
     Performs pre-merge cleanup of job-scoped files, then squash merges.
     """
+    await require_internal(request)
     try:
         job = await postgres_db.get_job(job_id)
         if not job:
@@ -4137,19 +4247,16 @@ async def _cascade_pause_to_children(job_id: str) -> None:
 
 
 @app.put("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str) -> dict[str, str]:
-    """Cancel a running job.
+async def cancel_job(request: Request, job_id: str) -> dict[str, str]:
+    """Cancel a running job. **Dual-callable** (P4b): cockpit user with job
+    access (``require_job_access``) OR agent with valid ``X-Internal-Key``
+    (agent's `cancel_worker_job` tool path).
 
     If the job is assigned to an agent, this will also send a cancel request
     to the agent pod.
     """
-
+    _, job = await require_internal_or_job_access(request, postgres_db, job_id)
     try:
-        # First get the job to check if it's assigned to an agent
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         # If job is assigned to an agent, send cancel request to agent pod
         assigned_agent_id = job.get("assigned_agent_id")
         if assigned_agent_id:
@@ -4232,8 +4339,9 @@ async def cancel_job(job_id: str) -> dict[str, str]:
 
 
 @app.put("/api/jobs/{job_id}/pause")
-async def pause_job(job_id: str) -> dict[str, str]:
-    """Pause a running job.
+async def pause_job(request: Request, job_id: str) -> dict[str, str]:
+    """Pause a running job. **Dual-callable** (P4b): cockpit user with
+    job access OR agent with ``X-Internal-Key`` (`pause_worker_job` tool).
 
     If the job is assigned to an agent, sends a graceful pause request
     to the agent pod. The agent finishes its current graph node, saves
@@ -4242,12 +4350,8 @@ async def pause_job(job_id: str) -> dict[str, str]:
     The paused job re-enters the dispatch queue and will be auto-resumed
     when an agent becomes available.
     """
-
+    _, job = await require_internal_or_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         if job["status"] != "processing":
             raise HTTPException(
                 status_code=400,
@@ -4307,8 +4411,9 @@ async def pause_job(job_id: str) -> dict[str, str]:
 
 
 @app.put("/api/jobs/{job_id}/agent-release")
-async def agent_release_job(job_id: str) -> dict[str, str]:
-    """Agent-initiated job release (no agent callback).
+async def agent_release_job(request: Request, job_id: str) -> dict[str, str]:
+    """Agent-initiated job release (no agent callback). **Internal** (P4b)
+    — requires ``X-Internal-Key``. Ingress strips this path.
 
     Called by an agent that is shutting down or otherwise releasing a job
     it was working on.  Unlike the regular pause endpoint, this does NOT
@@ -4316,6 +4421,7 @@ async def agent_release_job(job_id: str) -> dict[str, str]:
     It simply sets the job to 'paused' and clears the agent assignment
     so the dispatcher can reassign it.
     """
+    await require_internal(request)
     try:
         success = await postgres_db.pause_job(job_id)
         if not success:
@@ -4372,13 +4478,21 @@ def _mask_email(email: str) -> str:
 
 @app.post("/api/jobs/{job_id}/messages/send")
 async def send_agent_message(
-    job_id: str, request: MessageSendRequest
+    req: Request,
+    job_id: str,
+    request: MessageSendRequest,
 ) -> dict[str, Any]:
-    """Send a message from an agent to a human.
+    """Send a message from an agent to a human. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
-    Agent-facing endpoint (no auth required). Resolves recipient from job
-    ownership, checks rate limits, sends email, and logs to message_log.
+    The Pydantic body keeps its historical name ``request`` to avoid
+    churning the body of this long handler; the FastAPI Request handle
+    is named ``req`` for the gate call only.
+
+    Resolves recipient from job ownership, checks rate limits, sends
+    email, and logs to message_log.
     """
+    await require_internal(req)
     try:
         # Validate job exists and has an owner
         job = await postgres_db.get_job(job_id)
@@ -4863,9 +4977,10 @@ async def _route_inbound_reply(
 
 @app.post("/api/jobs/{job_id}/messages/{thread_id}/reply")
 async def reply_to_agent_message(
+    request: Request,
     job_id: str,
     thread_id: str,
-    request: MessageReplyRequest,
+    body: MessageReplyRequest,
 ) -> dict[str, Any]:
     """Reply to an agent's message (cockpit UI or IMAP).
 
@@ -4873,12 +4988,13 @@ async def reply_to_agent_message(
     resumes the job with the reply as feedback. Otherwise, queues the reply
     for the next strategic phase.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         delivery_strategy, sequence = await _route_inbound_reply(
             job_id=job_id,
             thread_id=thread_id,
-            message=request.message,
-            urgent=request.urgent,
+            message=body.message,
+            urgent=body.urgent,
         )
 
         file_path = f"messages/{thread_id}/{sequence:03d}_received.md"
@@ -4902,13 +5018,10 @@ async def reply_to_agent_message(
 
 
 @app.get("/api/jobs/{job_id}/messages")
-async def list_message_threads(job_id: str) -> dict[str, Any]:
+async def list_message_threads(request: Request, job_id: str) -> dict[str, Any]:
     """List message threads for a job."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         threads = await postgres_db.get_message_threads(job_id)
 
         # Enrich with job freeze status
@@ -4945,13 +5058,12 @@ async def list_message_threads(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/messages/{thread_id}")
-async def get_thread_detail(job_id: str, thread_id: str) -> dict[str, Any]:
+async def get_thread_detail(
+    request: Request, job_id: str, thread_id: str
+) -> dict[str, Any]:
     """Get full ordered messages within a thread."""
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         thread = await postgres_db.get_thread_messages(job_id, thread_id)
         if not thread:
             raise HTTPException(
@@ -4987,25 +5099,45 @@ async def get_thread_detail(job_id: str, thread_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-_pending_actions_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+# Cache key is the caller's user id (or "__admin__" for the unfiltered admin
+# path). 5s TTL keeps the cockpit's polling cheap without leaking other
+# users' counts across cache slots.
+_pending_actions_cache: dict[str, dict[str, Any]] = {}
 
 
 @app.get("/api/actions/pending")
-async def get_pending_actions() -> dict[str, Any]:
-    """Get counts of all pending actions across types. Cached for 5 seconds."""
+async def get_pending_actions(request: Request) -> dict[str, Any]:
+    """Get counts of pending actions visible to the caller. Cached 5s per user.
+
+    **P4e** — pre-fix this was anonymous and returned global counts AND the
+    most-urgent sudo's command string. Now caller must be approved, and
+    non-admins see only their own / project-member jobs.
+    """
     import time
 
+    caller = await require_approved_user(request, postgres_db)
+    is_admin = bool(caller.get("is_admin"))
+    cache_key = "__admin__" if is_admin else str(caller["id"])
+
     now = time.monotonic()
-    if (
-        _pending_actions_cache["data"] is not None
-        and now < _pending_actions_cache["expires_at"]
-    ):
-        return _pending_actions_cache["data"]
+    cached = _pending_actions_cache.get(cache_key)
+    if cached and now < cached["expires_at"]:
+        return cached["data"]
 
     try:
-        data = await postgres_db.get_pending_action_counts()
-        _pending_actions_cache["data"] = data
-        _pending_actions_cache["expires_at"] = now + 5.0
+        if is_admin:
+            data = await postgres_db.get_pending_action_counts()
+        else:
+            projects = await postgres_db.get_projects_for_user(str(caller["id"]))
+            project_ids = [str(p["id"]) for p in projects]
+            data = await postgres_db.get_pending_action_counts(
+                owner_user_id=str(caller["id"]),
+                visible_project_ids=project_ids,
+            )
+        _pending_actions_cache[cache_key] = {
+            "data": data,
+            "expires_at": now + 5.0,
+        }
         return data
     except Exception as e:
         logger.exception(f"Failed to get pending action counts: {e}")
@@ -5027,18 +5159,20 @@ class ExternalContactCreate(BaseModel):
 @app.post("/api/projects/{project_id}/contacts")
 async def add_external_contact(
     project_id: str,
-    request: ExternalContactCreate,
+    body: ExternalContactCreate,
+    request: Request,
 ) -> dict[str, Any]:
-    """Add an external contact to a project."""
+    """Add an external contact to a project. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     try:
         # Basic email format validation
-        if "@" not in request.email or "." not in request.email.split("@")[-1]:
+        if "@" not in body.email or "." not in body.email.split("@")[-1]:
             raise HTTPException(status_code=400, detail="Invalid email format")
 
         contact = await postgres_db.add_external_contact(
             project_id=project_id,
-            display_name=request.display_name,
-            email=request.email,
+            display_name=body.display_name,
+            email=body.email,
         )
         return {
             "status": "created",
@@ -5059,8 +5193,9 @@ async def add_external_contact(
 
 
 @app.get("/api/projects/{project_id}/contacts")
-async def list_external_contacts(project_id: str) -> dict[str, Any]:
+async def list_external_contacts(request: Request, project_id: str) -> dict[str, Any]:
     """List external contacts for a project."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         contacts = await postgres_db.get_external_contacts(project_id)
         return {
@@ -5082,8 +5217,11 @@ async def list_external_contacts(project_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/projects/{project_id}/contacts/{contact_id}")
-async def delete_external_contact(project_id: str, contact_id: str) -> dict[str, str]:
-    """Delete an external contact."""
+async def delete_external_contact(
+    request: Request, project_id: str, contact_id: str
+) -> dict[str, str]:
+    """Delete an external contact. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     try:
         deleted = await postgres_db.delete_external_contact(contact_id)
         if not deleted:
@@ -5214,46 +5352,50 @@ async def notification_sse_events(request: Request) -> StreamingResponse:
 
 
 @app.post("/api/vms")
-async def create_vm(request: VMCreateRequest) -> dict[str, Any]:
+async def create_vm(request: Request, body: VMCreateRequest) -> dict[str, Any]:
     """Create a VM for a job.
+
+    **P4f** — gated by `require_job_access` on ``body.job_id``. VM
+    provisioning is job-scoped, so callers must already be able to see
+    the job. Admins (and project members) inherit access via the gate.
 
     Uses NATS (cross-cluster) or direct Kubernetes API (same-cluster).
     Returns 503 if no VM provisioning backend is available.
     """
+    await require_job_access(request, postgres_db, body.job_id)
     if not vm_provisioner.is_available:
         raise HTTPException(
             status_code=503, detail="VM provisioning not available (no NATS or K8s)"
         )
 
-    job = await postgres_db.get_job(request.job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{request.job_id}' not found")
-
     success = await vm_provisioner.create_vm(
-        job_id=request.job_id,
-        agent_config=request.agent_config,
-        vm_image=request.vm_image,
-        cpu_cores=request.cpu_cores,
-        memory=request.memory,
-        description=request.description,
+        job_id=body.job_id,
+        agent_config=body.agent_config,
+        vm_image=body.vm_image,
+        cpu_cores=body.cpu_cores,
+        memory=body.memory,
+        description=body.description,
     )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to create VM")
 
     return {
         "status": "provisioning",
-        "job_id": request.job_id,
+        "job_id": body.job_id,
         "mode": vm_provisioner.mode,
     }
 
 
 @app.get("/api/vms")
-async def list_vms() -> list[dict[str, Any]]:
-    """List jobs with active VMs.
+async def list_vms(request: Request) -> list[dict[str, Any]]:
+    """List jobs with active VMs. **Admin only** (P4d) — lists VMs across
+    all users; the per-job VM detail/lifecycle endpoints stay job-scoped
+    under P4f.
 
     Works from the database (no NATS required) — reads the 'vm' key from
     each job's context JSONB column.
     """
+    await _require_admin(request)
     try:
         async with postgres_db.acquire() as conn:
             rows = await conn.fetch(
@@ -5276,17 +5418,19 @@ async def list_vms() -> list[dict[str, Any]]:
 
 @app.get("/api/vms/{job_id}")
 async def get_vm_status(
+    request: Request,
     job_id: str,
     live: bool = Query(False, description="Query live status via NATS request/reply"),
 ) -> dict[str, Any]:
     """Get VM status for a job.
 
+    **P4f** — gated by `require_job_access`. VM status leaks pod/IP/host
+    details, so caller must already be able to see the job.
+
     By default reads from the database. With ?live=true, also queries the VM
     controller via NATS request/reply for real-time status.
     """
-    job = await postgres_db.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    _, job = await require_job_access(request, postgres_db, job_id)
 
     context = job.get("context") or {}
     vm_ctx = context.get("vm") if isinstance(context, dict) else None
@@ -5309,20 +5453,35 @@ async def get_vm_status(
 
 
 @app.delete("/api/vms/{job_id}")
-async def delete_vm(job_id: str) -> dict[str, str]:
+async def delete_vm(request: Request, job_id: str) -> dict[str, str]:
     """Delete a VM for a job.
+
+    **P4f** — destructive. Caller must own the job OR be project-owner OR
+    admin (mirrors `DELETE /api/jobs/{job_id}` from P4c). Plain project
+    membership isn't enough.
 
     Uses NATS (cross-cluster) or direct Kubernetes API (same-cluster).
     Returns 503 if no VM provisioning backend is available.
     """
+    caller, job = await require_job_access(request, postgres_db, job_id)
+    if not caller.get("is_admin"):
+        is_job_owner = str(job.get("user_id") or "") == str(caller["id"])
+        is_project_owner = False
+        if not is_job_owner and job.get("project_id"):
+            role = await postgres_db.get_user_role_in_project(
+                str(job["project_id"]), str(caller["id"])
+            )
+            is_project_owner = role == "owner"
+        if not (is_job_owner or is_project_owner):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the job owner, the project owner, or an admin may delete this VM",
+            )
+
     if not vm_provisioner.is_available:
         raise HTTPException(
             status_code=503, detail="VM provisioning not available (no NATS or K8s)"
         )
-
-    job = await postgres_db.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
     success = await vm_provisioner.delete_vm(job_id)
     if not success:
@@ -5366,7 +5525,14 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
     Pushes events:
       - new_request: a new sudo request is pending
       - request_decided: a request was approved/denied/expired
+
+    F6: per-user filtering. Admins see every event; non-admins see only
+    events for jobs they can access (owner OR project member). Orphan
+    events with no ``job_id`` are admin-only. Filtering is applied per
+    event inside the stream rather than at connect time so a member who
+    later gains access doesn't have to reconnect.
     """
+    user = await require_approved_user(request, postgres_db)
     queue = sudo_gate.subscribe_sse()
 
     async def event_stream():
@@ -5377,6 +5543,11 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
                     break
                 try:
                     event_type, data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    job_id = data.get("job_id") if isinstance(data, dict) else None
+                    if not await user_can_access_job(user, postgres_db, job_id):
+                        # Silently drop — the caller isn't authorized to
+                        # see this event. We don't reveal existence.
+                        continue
                     yield f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
                 except asyncio.TimeoutError:
                     # Send keepalive comment
@@ -5397,6 +5568,7 @@ async def sudo_sse_events(request: Request) -> StreamingResponse:
 
 @app.get("/api/sudo/requests")
 async def list_sudo_requests(
+    request: Request,
     job_id: str | None = Query(None, description="Filter by job ID"),
     status: str | None = Query(None, description="Filter by status"),
     request_type: str | None = Query(
@@ -5404,31 +5576,63 @@ async def list_sudo_requests(
     ),
     limit: int = Query(50, ge=1, le=200),
 ) -> list[dict]:
-    """List sudo approval requests."""
-    return await sudo_gate.list_requests(
-        job_id=job_id,
+    """List sudo approval requests visible to the caller (G3).
+
+    With ``?job_id=``: gate on ``require_job_access``. Without: admins
+    see the full feed; non-admins receive only requests whose underlying
+    job they can access (post-fetch filter).
+    """
+    if job_id:
+        await require_job_access(request, postgres_db, job_id)
+        return await sudo_gate.list_requests(
+            job_id=job_id,
+            status=status,
+            request_type=request_type,
+            limit=limit,
+        )
+
+    caller = await require_approved_user(request, postgres_db)
+    rows = await sudo_gate.list_requests(
+        job_id=None,
         status=status,
         request_type=request_type,
         limit=limit,
     )
+    if caller.get("is_admin") and mcp_scope_project_id(caller) is None:
+        return rows
+    visible: list[dict] = []
+    for row in rows:
+        if await user_can_access_job(caller, postgres_db, row.get("job_id")):
+            visible.append(row)
+    return visible
 
 
 @app.get("/api/sudo/requests/{request_id}")
-async def get_sudo_request(request_id: str) -> dict:
-    """Get a single sudo approval request."""
+async def get_sudo_request(request: Request, request_id: str) -> dict:
+    """Get a single sudo approval request (G3: caller must access the underlying job)."""
+    caller = await require_approved_user(request, postgres_db)
     result = await sudo_gate.get_request(request_id)
     if not result:
         raise HTTPException(
             status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
+    if not await user_can_access_job(caller, postgres_db, result.get("job_id")):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to access this sudo request"
         )
     return result
 
 
 @app.post("/api/sudo/requests/{request_id}/approve")
 async def approve_sudo_request(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a pending sudo request."""
+    """Approve a pending sudo request. Caller must be project owner of the related job, or admin."""
+    # H4: pre-fix, any authenticated user could approve any job's
+    # privileged shell command — a trust escalation, not just info leak.
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else ""
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5441,8 +5645,11 @@ async def approve_sudo_request(
 
 
 @app.post("/api/sudo/requests/{request_id}/deny")
-async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
-    """Deny a pending sudo request."""
+async def deny_sudo_request(
+    request_id: str, body: SudoDenyRequest, request: Request
+) -> dict:
+    """Deny a pending sudo request. Caller must be project owner of the related job, or admin."""
+    await require_sudo_request_authority(request, postgres_db, request_id)
     result = await sudo_gate.deny_request(request_id, reason=body.reason)
     if not result:
         raise HTTPException(
@@ -5455,9 +5662,12 @@ async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
 
 @app.post("/api/sudo/requests/{request_id}/approve-upgrade")
 async def approve_sudo_vm_upgrade(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a vm_upgrade sudo request — provisions a VM and resumes the job."""
+    """Approve a vm_upgrade sudo request — provisions a VM and resumes the job. Caller must be project owner of the related job, or admin."""
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else "VM upgrade approved"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5474,9 +5684,12 @@ async def approve_sudo_vm_upgrade(
 
 @app.post("/api/sudo/requests/{request_id}/resume-without-vm")
 async def resume_sudo_without_vm(
-    request_id: str, body: SudoApproveRequest | None = None
+    request_id: str,
+    request: Request,
+    body: SudoApproveRequest | None = None,
 ) -> dict:
-    """Approve a vm_upgrade request but resume without provisioning a VM."""
+    """Approve a vm_upgrade request but resume without provisioning a VM. Caller must be project owner of the related job, or admin."""
+    await require_sudo_request_authority(request, postgres_db, request_id)
     reason = body.reason if body else "Resume without VM"
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
@@ -5492,14 +5705,16 @@ async def resume_sudo_without_vm(
 
 
 @app.get("/api/sudo/rules")
-async def list_sudo_rules() -> list[dict]:
-    """List auto-approval rules."""
+async def list_sudo_rules(request: Request) -> list[dict]:
+    """List auto-approval rules. **Admin only** (P4d) — global pattern rules."""
+    await _require_admin(request)
     return await sudo_gate.list_rules()
 
 
 @app.post("/api/sudo/rules")
-async def create_sudo_rule(body: SudoRuleCreateRequest) -> dict:
-    """Create an auto-approval rule."""
+async def create_sudo_rule(request: Request, body: SudoRuleCreateRequest) -> dict:
+    """Create an auto-approval rule. **Admin only** (P4d) — global pattern rules."""
+    await _require_admin(request)
     if body.action not in ("approve", "deny", "review"):
         raise HTTPException(
             status_code=400, detail="action must be 'approve', 'deny', or 'review'"
@@ -5516,8 +5731,9 @@ async def create_sudo_rule(body: SudoRuleCreateRequest) -> dict:
 
 
 @app.delete("/api/sudo/rules/{rule_id}")
-async def delete_sudo_rule(rule_id: str) -> dict:
-    """Delete an auto-approval rule."""
+async def delete_sudo_rule(request: Request, rule_id: str) -> dict:
+    """Delete an auto-approval rule. **Admin only** (P4d)."""
+    await _require_admin(request)
     if not await sudo_gate.delete_rule(rule_id):
         raise HTTPException(status_code=404, detail=f"Rule '{rule_id}' not found")
     return {"status": "deleted", "id": rule_id}
@@ -5536,9 +5752,14 @@ class JobResumeRequest(BaseModel):
 
 @app.post("/api/jobs/{job_id}/resume")
 async def resume_job(
-    job_id: str, request: JobResumeRequest | None = None
+    req: Request,
+    job_id: str,
+    request: JobResumeRequest | None = None,
 ) -> dict[str, str]:
-    """Resume a failed or paused job from its checkpoint.
+    """Resume a failed or paused job from its checkpoint. **Dual-callable**
+    (P4b): cockpit user with job access OR agent with ``X-Internal-Key``
+    (autoresume + ``resume_worker_job`` tool). The Pydantic body keeps the
+    historical ``request`` name; the FastAPI Request handle is ``req``.
 
     This endpoint:
     1. Validates the job exists and is not 'completed'
@@ -5550,16 +5771,11 @@ async def resume_job(
     Returns:
         Status message indicating resume result
     """
-
+    _, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobResumeRequest()
 
     try:
-        # Get job details
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         # Allow resuming jobs in any status except completed
         # This handles cancelled jobs (user wants to retry) and cases where
         # agents disappear without marking jobs as failed
@@ -5762,9 +5978,14 @@ class JobApproveRequest(BaseModel):
 
 @app.post("/api/jobs/{job_id}/approve")
 async def approve_job(
-    job_id: str, request: JobApproveRequest | None = None
+    req: Request,
+    job_id: str,
+    request: JobApproveRequest | None = None,
 ) -> dict[str, Any]:
-    """Approve a frozen job, marking it as completed.
+    """Approve a frozen job, marking it as completed. **Dual-callable** (P4b):
+    cockpit user with job access OR agent with ``X-Internal-Key`` (autonomous
+    approve flow + ``approve_worker_job`` tool). Body keeps the historical
+    ``request`` name; FastAPI Request handle is ``req``.
 
     This endpoint mirrors the logic from agent.py:approve_frozen_job but runs
     entirely on the orchestrator side — no agent pod needs to be running.
@@ -5776,15 +5997,12 @@ async def approve_job(
     4. Removes job_frozen.json from the Gitea repo
     5. Updates DB status to 'completed' with completed_at timestamp
     """
+    _, job = await require_internal_or_job_access(req, postgres_db, job_id)
     if request is None:
         request = JobApproveRequest()
 
     try:
-        # 1. Validate job exists and is in pending_review
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
+        # 1. Validate status (gate already loaded the job and raised 404 if missing)
         if job["status"] not in ("pending_review", "reviewing"):
             raise HTTPException(
                 status_code=400,
@@ -5932,7 +6150,7 @@ async def approve_job(
 
 
 @app.post("/api/jobs/{job_id}/upgrade-to-vm")
-async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
+async def upgrade_job_to_vm(request: Request, job_id: str) -> dict[str, Any]:
     """Upgrade a frozen job from container workspace to a VM.
 
     This endpoint is used when a job freezes with ``freeze_type: vm_upgrade_required``
@@ -5952,6 +6170,7 @@ async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
     The original workspace container is NOT deleted immediately — it is cleaned up
     when the job eventually completes or is cancelled (existing cleanup logic).
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         # 1. Validate job
         job = await postgres_db.get_job(job_id)
@@ -7014,8 +7233,13 @@ async def _trigger_curation_final_pass(
 
 
 @app.post("/api/jobs/{job_id}/complete")
-async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, Any]:
-    """Handle job completion reported by the agent.
+async def complete_job(
+    request: Request,
+    job_id: str,
+    body: JobCompleteRequest,
+) -> dict[str, Any]:
+    """Handle job completion reported by the agent. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     The agent calls this after the graph finishes. The orchestrator handles
     all post-completion logic: status determination, critic verdict handling,
@@ -7024,6 +7248,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
     This replaces the agent-side ``_update_job_status_from_result``,
     ``_handle_critic_verdict``, and ``_maybe_trigger_verification`` functions.
     """
+    await require_internal(request)
     from services.completion import (
         determine_job_status,
         is_curation_enabled,
@@ -7046,7 +7271,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 detail=f"Job cannot be completed (status: {job['status']})",
             )
 
-        result = request.model_dump()
+        result = body.model_dump()
         actions: list[str] = []
 
         # Write freeze_data from the completion report.
@@ -7279,7 +7504,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
 
 @app.get("/api/jobs/{job_id}/frozen")
-async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
+async def get_frozen_job_data(request: Request, job_id: str) -> dict[str, Any]:
     """Get the frozen job data (job_frozen.json) for a pending_review job.
 
     Tries Gitea first, falls back to local workspace.
@@ -7287,12 +7512,12 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
     Returns:
         Contents of job_frozen.json (summary, deliverables, confidence, notes, etc.)
     """
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
         frozen_data = None
 
         # Primary: read freeze_data from DB
-        job = await postgres_db.get_job(job_id)
-        if job and job.get("freeze_data"):
+        if job.get("freeze_data"):
             frozen_data = job["freeze_data"]
             if isinstance(frozen_data, str):
                 frozen_data = json.loads(frozen_data)
@@ -7325,12 +7550,13 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/snapshot")
-async def get_job_snapshot(job_id: str) -> dict[str, Any]:
+async def get_job_snapshot(request: Request, job_id: str) -> dict[str, Any]:
     """Get snapshot metadata for a job.
 
     Returns status, source type, size, and environment summary.
     Used by the cockpit to show snapshot availability indicators.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         result = await snapshot_service.get_snapshot_status(job_id)
         return result
@@ -7339,8 +7565,9 @@ async def get_job_snapshot(job_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/jobs/{job_id}/snapshot")
-async def delete_job_snapshot(job_id: str) -> dict[str, Any]:
+async def delete_job_snapshot(request: Request, job_id: str) -> dict[str, Any]:
     """Delete all snapshots for a job from S3."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         success = await snapshot_service.delete_snapshot(job_id)
         if not success:
@@ -7353,11 +7580,12 @@ async def delete_job_snapshot(job_id: str) -> dict[str, Any]:
 
 
 @app.put("/api/jobs/{job_id}/snapshot/pin")
-async def toggle_snapshot_pin(job_id: str) -> dict[str, Any]:
+async def toggle_snapshot_pin(request: Request, job_id: str) -> dict[str, Any]:
     """Toggle pin state on a snapshot (GC exemption).
 
     Pinned snapshots are exempt from automatic garbage collection.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         new_value = await snapshot_service.toggle_pin(job_id)
         return {"job_id": job_id, "pinned": new_value}
@@ -7366,11 +7594,13 @@ async def toggle_snapshot_pin(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/snapshots/stats")
-async def get_snapshot_stats() -> dict[str, Any]:
-    """Get aggregate snapshot storage statistics.
+async def get_snapshot_stats(request: Request) -> dict[str, Any]:
+    """Get aggregate snapshot storage statistics. **Admin only** (G5) —
+    storage-level metric with no per-user shape.
 
     Returns total snapshot count, total size, GC pending info.
     """
+    await _require_admin(request)
     try:
         return await snapshot_service.get_storage_stats()
     except Exception as e:
@@ -7389,22 +7619,25 @@ class IdeSessionRequest(BaseModel):
 
 @app.post("/api/jobs/{job_id}/ide")
 async def start_ide_session(
-    job_id: str, request: IdeSessionRequest | None = None
+    request: Request,
+    job_id: str,
+    body: IdeSessionRequest | None = None,
 ) -> dict[str, Any]:
     """Start or get an IDE session for a job.
 
     Idempotent: if a session is already active, returns it.
     If restoring, returns current progress status.
     """
-    if request is None:
-        request = IdeSessionRequest()
+    await require_job_access(request, postgres_db, job_id)
+    if body is None:
+        body = IdeSessionRequest()
 
     try:
         result = await ide_session_service.start_session(
             job_id=job_id,
-            cpu_cores=request.cpu_cores,
-            memory=request.memory,
-            idle_timeout_minutes=request.idle_timeout_minutes,
+            cpu_cores=body.cpu_cores,
+            memory=body.memory,
+            idle_timeout_minutes=body.idle_timeout_minutes,
         )
         return result
     except Exception as e:
@@ -7412,12 +7645,13 @@ async def start_ide_session(
 
 
 @app.get("/api/jobs/{job_id}/ide")
-async def get_ide_session(job_id: str) -> dict[str, Any]:
+async def get_ide_session(request: Request, job_id: str) -> dict[str, Any]:
     """Get IDE session status and URL.
 
     Used by the cockpit to poll session state and determine
     IDE button visibility/behavior.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         return await ide_session_service.get_session_status(job_id)
     except Exception as e:
@@ -7425,12 +7659,13 @@ async def get_ide_session(job_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/jobs/{job_id}/ide")
-async def stop_ide_session(job_id: str) -> dict[str, Any]:
+async def stop_ide_session(request: Request, job_id: str) -> dict[str, Any]:
     """Tear down an active IDE session.
 
     Deletes the restored VM and marks the session as expired.
     The underlying S3 snapshot is preserved for future restores.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         result = await ide_session_service.stop_session(job_id)
         return result
@@ -7483,6 +7718,8 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
     # Neuter code-server's service worker — it caches aggressively behind the
     # reverse proxy and breaks subsequent visits (infinite loading screen).
     # Return a no-op worker so the browser doesn't intercept fetches.
+    # Pre-auth: the script body is non-sensitive and browsers may fetch it
+    # in the background even after a cookie expires.
     if path.endswith("serviceWorker.js") or path.endswith("service-worker.js"):
         return Response(
             content="self.addEventListener('install',()=>self.skipWaiting());"
@@ -7491,12 +7728,23 @@ async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
             headers={"cache-control": "no-store"},
         )
 
+    # H1: close the zero-auth hole — pre-fix, any caller knowing (or guessing)
+    # the job/thread UUID got full code-server access (file r/w, terminal).
+    user = await require_approved_user(request, postgres_db)
+    if not await user_can_access_ide_entity(user, postgres_db, job_id):
+        logger.warning(
+            "IDE HTTP: user %s denied access to entity %s",
+            user["id"],
+            job_id,
+        )
+        raise HTTPException(status_code=403, detail="IDE access denied")
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         raise HTTPException(status_code=503, detail="IDE session not active")
 
     # Build upstream URL (pod_ip may include port for Docker Compose, e.g. "localhost:8081")
-    host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
     upstream_url = f"http://{host}/{path}"
     if request.url.query:
         # Strip 'token' param (reserved for future auth) but forward the rest
@@ -7550,6 +7798,25 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
 
     import websockets
 
+    # H1: close the zero-auth hole. Browsers send the BFF session cookie on
+    # WS handshake automatically; pre-fix, this endpoint accepted any caller
+    # who knew (or guessed) the entity UUID. Same pattern as persistent_ws_proxy.
+    user = await resolve_ws_user(ws, postgres_db)
+    if not user:
+        await ws.close(code=4401, reason="Authentication required")
+        return
+    if not user.get("is_approved"):
+        await ws.close(code=4403, reason="Account pending approval")
+        return
+    if not await user_can_access_ide_entity(user, postgres_db, job_id):
+        logger.warning(
+            "IDE WS: user %s denied access to entity %s",
+            user["id"],
+            job_id,
+        )
+        await ws.close(code=4403, reason="IDE access denied")
+        return
+
     pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
     if not pod_ip:
         await ws.close(code=4503, reason="IDE session not active")
@@ -7558,7 +7825,7 @@ async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
     await ws.accept()
 
     # Build upstream WS URL (pod_ip may include port for Docker Compose)
-    ws_host = f"{pod_ip}:8080" if ":" not in pod_ip else pod_ip
+    ws_host = f"{pod_ip}:38080" if ":" not in pod_ip else pod_ip
     upstream_url = f"ws://{ws_host}/{path}"
     if ws.url.query:
         upstream_url += f"?{ws.url.query}"
@@ -7660,8 +7927,9 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
 
 
 @app.get("/api/jobs/{job_id}/progress")
-async def get_job_progress(job_id: str) -> dict[str, Any]:
+async def get_job_progress(request: Request, job_id: str) -> dict[str, Any]:
     """Get detailed progress information for a job including ETA."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         progress = await postgres_db.get_job_progress(job_id)
         if not progress:
@@ -7675,6 +7943,7 @@ async def get_job_progress(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/audit")
 async def get_job_audit(
+    request: Request,
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
@@ -7698,6 +7967,7 @@ async def get_job_audit(
         order: asc (oldest first, default) or desc (newest first)
         filter: all, messages, tools, or errors
     """
+    await require_job_access(request, postgres_db, job_id)
     effective_size = limit if limit is not None else page_size
     if not mongodb.is_available:
         return {
@@ -7726,14 +7996,12 @@ async def get_job_audit(
 
 
 @app.get("/api/requests/{doc_id}")
-async def get_request(doc_id: str) -> dict[str, Any]:
+async def get_request(request: Request, doc_id: str) -> dict[str, Any]:
     """Get a single LLM request by MongoDB document ID.
 
-    Args:
-        doc_id: MongoDB ObjectId as string (24 hex characters)
-
-    Returns:
-        Full LLM request document with messages and response
+    Gated by the caller's access to the request's underlying job — admins
+    pass; otherwise the embedded `job_id` is run through `require_job_access`.
+    Requests without a `job_id` (legacy) are admin-only.
     """
     if not mongodb.is_available:
         raise HTTPException(
@@ -7742,13 +8010,20 @@ async def get_request(doc_id: str) -> dict[str, Any]:
         )
 
     try:
-        request = await mongodb.get_request(doc_id)
-        if request is None:
+        llm_doc = await mongodb.get_request(doc_id)
+        if llm_doc is None:
+            # Auth before disclosing existence: any approved user may probe.
+            await require_approved_user(request, postgres_db)
             raise HTTPException(
                 status_code=404,
                 detail=f"Request '{doc_id}' not found",
             )
-        return request
+        job_id = llm_doc.get("job_id")
+        if job_id:
+            await require_job_access(request, postgres_db, str(job_id))
+        else:
+            await _require_admin(request)
+        return llm_doc
     except HTTPException:
         raise
     except Exception as e:
@@ -7756,12 +8031,13 @@ async def get_request(doc_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/audit/timerange")
-async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
+async def get_audit_time_range(request: Request, job_id: str) -> dict[str, str] | None:
     """Get first and last timestamps for job audit entries.
 
     Returns:
         Dict with 'start' and 'end' ISO timestamps, or null if no entries/MongoDB unavailable
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return None
 
@@ -7773,6 +8049,7 @@ async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
 
 @app.get("/api/jobs/{job_id}/chat")
 async def get_job_chat_history(
+    request: Request,
     job_id: str,
     page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
@@ -7787,6 +8064,7 @@ async def get_job_chat_history(
         page: Page number (1-indexed). Use -1 to request the last page.
         pageSize: Number of entries per page (max 200)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -7814,6 +8092,7 @@ async def get_job_chat_history(
 
 @app.get("/api/jobs/{job_id}/repo/contents")
 async def list_repo_contents(
+    request: Request,
     job_id: str,
     path: str = Query(default="", description="Directory path within the repo"),
     ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
@@ -7825,6 +8104,7 @@ async def list_repo_contents(
     Returns:
         List of entries, each with: name, path, type ("file"|"dir"), size
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(
             status_code=503,
@@ -7845,6 +8125,7 @@ async def list_repo_contents(
 
 @app.get("/api/jobs/{job_id}/repo/file")
 async def get_repo_file(
+    request: Request,
     job_id: str,
     path: str = Query(..., description="File path within the repo"),
     ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
@@ -7854,6 +8135,7 @@ async def get_repo_file(
     Returns:
         Dict with path, content (text), and size
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(
             status_code=503,
@@ -7880,6 +8162,7 @@ async def get_repo_file(
 
 @app.get("/api/jobs/{job_id}/repo/commits")
 async def list_repo_commits(
+    request: Request,
     job_id: str,
     sha: str = Query(
         default="main", description="Branch, tag, or commit SHA to list from"
@@ -7898,6 +8181,7 @@ async def list_repo_commits(
     Returns:
         Dict with commits list and total count
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -7927,6 +8211,7 @@ async def list_repo_commits(
 
 @app.get("/api/jobs/{job_id}/repo/diff")
 async def get_repo_diff(
+    request: Request,
     job_id: str,
     base: str = Query(..., description="Base ref (commit SHA, tag, or branch)"),
     head: str = Query(default="HEAD", description="Head ref"),
@@ -7936,6 +8221,7 @@ async def get_repo_diff(
     Returns:
         Dict with base, head, and diff text
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -7952,7 +8238,9 @@ async def get_repo_diff(
 
 
 @app.get("/api/jobs/{job_id}/repo/tags")
-async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, Any]]:
+async def list_repo_tags(
+    request: Request, job_id: str, all_jobs: bool = False
+) -> list[dict[str, Any]]:
     """List tags in a job's repository.
 
     By default, only returns tags for the specified job (namespaced by
@@ -7961,6 +8249,7 @@ async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, 
     Returns:
         List of tags with name, sha, and message
     """
+    await require_job_access(request, postgres_db, job_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -7987,18 +8276,21 @@ async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, 
 
 
 @app.get("/api/jobs/{job_id}/workspace")
-async def get_job_workspace(job_id: str) -> dict[str, Any]:
+async def get_job_workspace(request: Request, job_id: str) -> dict[str, Any]:
     """Get workspace overview for a job.
 
     Returns:
         Dict with workspace files, workspace.md/plan.md content (truncated),
         current todos, and archive count.
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.get_workspace_overview(job_id)
 
 
 @app.get("/api/jobs/{job_id}/workspace/{path:path}")
-async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
+async def get_workspace_file(
+    request: Request, job_id: str, path: str
+) -> dict[str, str]:
     """Get content of a workspace file by relative path.
 
     Supports any file within the job workspace, including subdirectories
@@ -8011,6 +8303,7 @@ async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
     Returns:
         Dict with path and file content
     """
+    await require_job_access(request, postgres_db, job_id)
     content = workspace_service.get_workspace_file(job_id, path)
     if content is None:
         raise HTTPException(
@@ -8022,7 +8315,10 @@ async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
 
 @app.put("/api/jobs/{job_id}/workspace/{path:path}")
 async def write_workspace_file(
-    job_id: str, path: str, body: dict[str, Any] = Body(...)
+    request: Request,
+    job_id: str,
+    path: str,
+    body: dict[str, Any] = Body(...),
 ) -> dict[str, Any]:
     """Write content to a workspace file.
 
@@ -8034,6 +8330,7 @@ async def write_workspace_file(
         path: Relative path within the workspace
         body: {"content": "...", "commit_message": "..."}
     """
+    await require_job_access(request, postgres_db, job_id)
     content = body.get("content")
     if content is None:
         raise HTTPException(status_code=400, detail="Missing 'content' in request body")
@@ -8054,7 +8351,7 @@ async def write_workspace_file(
 
 
 @app.get("/api/jobs/{job_id}/todos")
-async def get_job_todos(job_id: str) -> dict[str, Any]:
+async def get_job_todos(request: Request, job_id: str) -> dict[str, Any]:
     """Get all todos for a job (current + archives).
 
     Returns:
@@ -8064,16 +8361,18 @@ async def get_job_todos(job_id: str) -> dict[str, Any]:
         - archives: List of archived todo files
         - has_workspace: Whether workspace directory exists
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.get_all_todos(job_id)
 
 
 @app.get("/api/jobs/{job_id}/todos/current")
-async def get_current_todos(job_id: str) -> dict[str, Any]:
+async def get_current_todos(request: Request, job_id: str) -> dict[str, Any]:
     """Get current active todos from todos.yaml.
 
     Returns:
         Dict with todos list and metadata, or 404 if not found
     """
+    await require_job_access(request, postgres_db, job_id)
     result = workspace_service.get_current_todos(job_id)
     if result is None:
         raise HTTPException(
@@ -8083,17 +8382,20 @@ async def get_current_todos(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/todos/archives")
-async def list_todo_archives(job_id: str) -> list[dict[str, Any]]:
+async def list_todo_archives(request: Request, job_id: str) -> list[dict[str, Any]]:
     """List all archived todo files for a job.
 
     Returns:
         List of archive metadata (filename, phase_name, timestamp)
     """
+    await require_job_access(request, postgres_db, job_id)
     return workspace_service.list_archived_todos(job_id)
 
 
 @app.get("/api/jobs/{job_id}/todos/archives/{filename}")
-async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
+async def get_archived_todos(
+    request: Request, job_id: str, filename: str
+) -> dict[str, Any]:
     """Get parsed content of an archived todo file.
 
     Args:
@@ -8103,6 +8405,7 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
     Returns:
         Dict with parsed todos, summary, and metadata
     """
+    await require_job_access(request, postgres_db, job_id)
     result = workspace_service.get_archived_todos(job_id, filename)
     if result is None:
         raise HTTPException(
@@ -8118,6 +8421,7 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/audit/bulk")
 async def get_job_audit_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8131,6 +8435,7 @@ async def get_job_audit_bulk(
         offset: Number of entries to skip (default 0)
         limit: Maximum entries to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -8153,6 +8458,7 @@ async def get_job_audit_bulk(
 
 @app.get("/api/jobs/{job_id}/chat/bulk")
 async def get_job_chat_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8166,6 +8472,7 @@ async def get_job_chat_bulk(
         offset: Number of entries to skip (default 0)
         limit: Maximum entries to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "entries": [],
@@ -8188,6 +8495,7 @@ async def get_job_chat_bulk(
 
 @app.get("/api/jobs/{job_id}/graph/bulk")
 async def get_job_graph_bulk(
+    request: Request,
     job_id: str,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=5000, ge=1, le=5000),
@@ -8201,6 +8509,7 @@ async def get_job_graph_bulk(
         offset: Number of deltas to skip (default 0)
         limit: Maximum deltas to return (max 5000)
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return {
             "deltas": [],
@@ -8222,7 +8531,7 @@ async def get_job_graph_bulk(
 
 
 @app.get("/api/jobs/{job_id}/version")
-async def get_job_version(job_id: str) -> dict[str, Any] | None:
+async def get_job_version(request: Request, job_id: str) -> dict[str, Any] | None:
     """Get job data version info for cache invalidation.
 
     Returns counts and timestamps that can be compared to cached values
@@ -8232,6 +8541,7 @@ async def get_job_version(job_id: str) -> dict[str, Any] | None:
         Dict with version, auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate
         Returns null if job has no audit data or MongoDB unavailable
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         return None
 
@@ -8405,12 +8715,18 @@ def _build_datasources_payload(
 
 
 @app.post("/api/jobs/{job_id}/assign/{agent_id}")
-async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
+async def assign_job_to_agent(
+    request: Request, job_id: str, agent_id: str
+) -> dict[str, str]:
     """Manually assign a job to an agent.
+
+    **Admin only** (P4c): manual dispatch override bypasses the
+    auto-assign dispatcher's queue, so only admins can call it.
 
     Validates job and agent status, then delegates to the shared dispatch helper.
     Accepts jobs in 'created', 'failed', or 'paused' status.
     """
+    await _require_admin(request)
     try:
         job = await postgres_db.get_job(job_id)
         if not job:
@@ -8491,9 +8807,13 @@ def _normalize_datasource_credentials(
     response_model=SSHKeyGenerateResponse,
 )
 async def generate_datasource_ssh_key(
+    request: Request,
     body: SSHKeyGenerateRequest | None = None,
 ) -> SSHKeyGenerateResponse:
     """Generate a fresh ed25519 SSH keypair for the user to paste into the form.
+
+    **P4e** — gated to approved users. The keypair is ephemeral (no DB
+    write); the gate just blocks anonymous CPU-burn from key generation.
 
     The private half is returned in OpenSSH PEM format (already normalized
     with a trailing newline so it round-trips through validation) and the
@@ -8503,6 +8823,7 @@ async def generate_datasource_ssh_key(
     datasource form, which re-validates the private key via the same
     ssh_key path as a hand-pasted key.
     """
+    await require_approved_user(request, postgres_db)
     comment = (body.comment if body else None) or ""
     keypair = _generate_ed25519_keypair(comment=comment)
     return SSHKeyGenerateResponse(
@@ -8513,6 +8834,7 @@ async def generate_datasource_ssh_key(
 
 @app.get("/api/datasources")
 async def list_datasources(
+    request: Request,
     job_id: str | None = Query(
         default=None, description="Filter by job ID (use 'global' for global-only)"
     ),
@@ -8521,48 +8843,63 @@ async def list_datasources(
     ),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List datasources with optional filters."""
+    """List datasources visible to the caller.
+
+    F3: each row is scoped (admin / creator / project member) and the
+    `credentials` field is stripped from every row.
+    """
+    user = await require_approved_user(request, postgres_db)
     try:
-        return await postgres_db.list_datasources(
+        rows = await postgres_db.list_datasources(
             job_id=job_id, ds_type=type, limit=limit
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    visible: list[dict[str, Any]] = []
+    for ds in rows:
+        if await user_can_access_datasource(user, postgres_db, ds):
+            visible.append(ds)
+    return redact_datasources(visible)
 
 
 @app.get("/api/datasources/{datasource_id}")
-async def get_datasource(datasource_id: str) -> dict[str, Any]:
-    """Get a single datasource by ID."""
-    try:
-        ds = await postgres_db.get_datasource(datasource_id)
-        if not ds:
-            raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
-            )
-        return ds
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+async def get_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
+    """Get a single datasource by ID. F3: gated + credentials redacted."""
+    _, ds = await require_datasource_access(request, postgres_db, datasource_id)
+    return redact_datasource(ds)
 
 
 @app.post("/api/datasources")
 async def create_datasource(body: DatasourceCreate, request: Request) -> dict[str, Any]:
     """Create a new datasource owned by the current user."""
-    valid_types = {"generic", "repository", "postgresql", "neo4j", "mongodb", "webdav"}
+    valid_types = {
+        "generic",
+        "repository",
+        "postgresql",
+        "neo4j",
+        "mongodb",
+        "webdav",
+        "kubeconfig",
+        "ssh_key",
+        "generic_file",
+    }
     if body.type not in valid_types:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
         )
 
-    user = await get_current_user(request, postgres_db)
-    user_id = str(user["id"]) if user else None
+    user = await require_approved_user(request, postgres_db)
+    user_id = str(user["id"])
 
     credentials = _normalize_datasource_credentials(body.credentials)
+    try:
+        credentials = normalize_credential_files(body.type, body.name, credentials)
+    except CredentialFileValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        return await postgres_db.create_datasource(
+        created = await postgres_db.create_datasource(
             name=body.name,
             ds_type=body.type,
             connection_url=body.connection_url,
@@ -8584,14 +8921,29 @@ async def create_datasource(body: DatasourceCreate, request: Request) -> dict[st
                 detail=f"A datasource named '{body.name}' of type '{body.type}' already exists",
             ) from e
         raise HTTPException(status_code=500, detail=error_msg) from e
+    return redact_datasource(created)
 
 
 @app.put("/api/datasources/{datasource_id}")
 async def update_datasource(
-    datasource_id: str, body: DatasourceUpdate
+    request: Request, datasource_id: str, body: DatasourceUpdate
 ) -> dict[str, str]:
-    """Update a datasource."""
-    credentials = _normalize_datasource_credentials(body.credentials)
+    """Update a datasource. F3: creator/admin only; null/empty credentials preserved."""
+    _, existing_ds = await require_datasource_owner(request, postgres_db, datasource_id)
+    # F3: if body.credentials is None or {}, do NOT touch the stored value.
+    # The cockpit's edit form sends an empty creds dict when the user
+    # didn't re-enter; passing that through would clobber the secret.
+    raw_creds = _normalize_datasource_credentials(body.credentials)
+    credentials = raw_creds if raw_creds else None
+    if credentials is not None and existing_ds.get("type") in CREDENTIAL_FILE_TYPES:
+        try:
+            credentials = normalize_credential_files(
+                existing_ds["type"],
+                body.name or existing_ds.get("name", ""),
+                credentials,
+            )
+        except CredentialFileValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         success = await postgres_db.update_datasource(
             datasource_id=datasource_id,
@@ -8623,8 +8975,9 @@ async def update_datasource(
 
 
 @app.delete("/api/datasources/{datasource_id}")
-async def delete_datasource(datasource_id: str) -> dict[str, str]:
-    """Delete a datasource."""
+async def delete_datasource(request: Request, datasource_id: str) -> dict[str, str]:
+    """Delete a datasource. F3: creator/admin only."""
+    await require_datasource_owner(request, postgres_db, datasource_id)
     try:
         # Clean up knowledge entries for all linked projects before deletion
         linked_projects = await postgres_db.list_datasource_projects(datasource_id)
@@ -8644,32 +8997,31 @@ async def delete_datasource(datasource_id: str) -> dict[str, str]:
 
 
 @app.get("/api/jobs/{job_id}/datasources")
-async def get_job_datasources(job_id: str) -> list[dict[str, Any]]:
+async def get_job_datasources(request: Request, job_id: str) -> list[dict[str, Any]]:
     """Get resolved datasources for a job.
 
-    Returns one datasource per type, with job-specific taking precedence
-    over global datasources.
+    F3: gated by `require_job_access`; credentials redacted in the
+    response (the agent process gets them via internal dispatch, not via
+    this endpoint).
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
-        return await postgres_db.resolve_datasources_for_job(job_id)
+        rows = await postgres_db.resolve_datasources_for_job(job_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    return redact_datasources(rows)
 
 
 @app.post("/api/datasources/{datasource_id}/test")
-async def test_datasource(datasource_id: str) -> dict[str, Any]:
+async def test_datasource(request: Request, datasource_id: str) -> dict[str, Any]:
     """Test connectivity to a datasource.
 
     Attempts to connect using the stored connection details and returns
-    the result. Does not modify any data.
+    the result. Does not modify any data. F3: creator/admin only (test
+    uses live credentials and probes the target).
     """
     try:
-        ds = await postgres_db.get_datasource(datasource_id)
-        if not ds:
-            raise HTTPException(
-                status_code=404, detail=f"Datasource '{datasource_id}' not found"
-            )
-
+        _, ds = await require_datasource_owner(request, postgres_db, datasource_id)
         ds_type = ds["type"]
         url = ds["connection_url"]
         creds = ds.get("credentials") or {}
@@ -8745,29 +9097,62 @@ async def test_datasource(datasource_id: str) -> dict[str, Any]:
 # =============================================================================
 
 
+async def _visibility_kwargs_for_stats(user: dict[str, Any]) -> dict[str, Any]:
+    """Build the visibility kwargs G5 passes through to postgres stats methods.
+
+    Admin without an MCP project: scope → empty dict (full fleet view).
+    Admin with project scope → just ``scope_project_id`` (AND-narrowed).
+    Non-admin → owner_user_id + visible_project_ids (+ scope_project_id).
+    """
+    scope_pid = mcp_scope_project_id(user)
+    if user.get("is_admin"):
+        if scope_pid is None:
+            return {}
+        return {"scope_project_id": str(scope_pid)}
+    visible = await user_visible_project_ids(user, postgres_db)
+    project_ids = [str(p) for p in visible] if visible != "all" else []
+    return {
+        "owner_user_id": str(user["id"]),
+        "visible_project_ids": project_ids,
+        "scope_project_id": str(scope_pid) if scope_pid else None,
+    }
+
+
 @app.get("/api/stats/jobs")
-async def get_job_statistics() -> dict[str, int]:
-    """Get overall job statistics."""
+async def get_job_statistics(request: Request) -> dict[str, int]:
+    """Get overall job statistics scoped to the caller's visibility (G5).
+
+    Admins see the full fleet (optionally narrowed by an MCP
+    ``project:<uuid>`` scope). Non-admins see only jobs they own or
+    are project members of.
+    """
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.get_job_statistics()
+        return await postgres_db.get_job_statistics(**vis)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/stats/daily")
 async def get_daily_statistics(
+    request: Request,
     days: int = Query(default=7, ge=1, le=90),
 ) -> list[dict[str, Any]]:
-    """Get daily job statistics for the past N days."""
+    """Get daily job statistics for the past N days, scoped to the caller's visibility (G5)."""
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.get_daily_statistics(days=days)
+        return await postgres_db.get_daily_statistics(days=days, **vis)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/stats/agents")
-async def get_agent_statistics() -> dict[str, Any]:
-    """Get agent workforce summary."""
+async def get_agent_statistics(request: Request) -> dict[str, Any]:
+    """Get agent workforce summary. **Admin only** (G5) — counts the
+    fleet by status, which is infra-level data tied to ``/api/agents``."""
+    await _require_admin(request)
     try:
         agents = await postgres_db.list_agents(limit=500)
 
@@ -8794,15 +9179,21 @@ async def get_agent_statistics() -> dict[str, Any]:
 
 @app.get("/api/stats/stuck")
 async def get_stuck_jobs(
+    request: Request,
     threshold_minutes: int = Query(default=60, ge=1, le=1440),
 ) -> list[dict[str, Any]]:
-    """Get jobs that appear to be stuck.
+    """Get jobs that appear to be stuck, scoped to the caller's visibility (G5).
 
     A job is considered stuck if it's in 'processing' status but hasn't
-    been updated within the threshold period.
+    been updated within the threshold period. Admins see the full
+    fleet; non-admins see only jobs they own or are project members of.
     """
+    user = await require_approved_user(request, postgres_db)
+    vis = await _visibility_kwargs_for_stats(user)
     try:
-        return await postgres_db.detect_stuck_jobs(threshold_minutes=threshold_minutes)
+        return await postgres_db.detect_stuck_jobs(
+            threshold_minutes=threshold_minutes, **vis
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -8814,6 +9205,7 @@ async def get_stuck_jobs(
 
 @app.get("/api/sources")
 async def list_sources(
+    request: Request,
     job_id: str | None = Query(default=None, description="Filter by job ID"),
     type: str | None = Query(default=None, description="Filter by source type"),
     limit: int = Query(default=50, ge=1, le=500),
@@ -8821,9 +9213,25 @@ async def list_sources(
 ) -> dict[str, Any]:
     """List sources, optionally filtered by job and/or type.
 
-    When job_id is provided, returns sources linked to that job via job_sources.
-    When omitted, returns all sources across jobs.
+    Visibility model (G3):
+        * With ``?job_id=``: gate on ``require_job_access``. The job's
+          sources are returned (visible if the caller can access the job).
+        * Without ``?job_id=``: admin-only. Non-admins must filter by a
+          specific job they can access. (Cross-job source enumeration
+          would require a vector_db ⇆ postgres_db JOIN we deliberately
+          don't do; the per-job path covers the legitimate cockpit use
+          case without that complexity.)
     """
+    if job_id:
+        await require_job_access(request, postgres_db, job_id)
+    else:
+        caller = await require_approved_user(request, postgres_db)
+        if not caller.get("is_admin"):
+            raise HTTPException(
+                status_code=403,
+                detail="Cross-job source listing requires admin role; "
+                "non-admins must pass ?job_id=",
+            )
     try:
         async with vector_db.acquire() as conn:
             conditions = []
@@ -8881,10 +9289,17 @@ async def list_sources(
 
 @app.get("/api/sources/{source_id}")
 async def get_source_detail(
+    request: Request,
     source_id: int,
     content_limit: int = Query(default=2000, ge=0, le=100000),
 ) -> dict[str, Any]:
-    """Get full detail for a single source."""
+    """Get full detail for a single source.
+
+    Visibility (G3): the source is visible if the caller can access at
+    least one job linked to it via ``job_sources``. Admins (without an
+    MCP project: scope) bypass without enumerating links.
+    """
+    caller = await require_approved_user(request, postgres_db)
     try:
         async with vector_db.acquire() as conn:
             if content_limit > 0:
@@ -8922,6 +9337,15 @@ async def get_source_detail(
             )
             result["job_ids"] = [str(r["job_id"]) for r in job_rows]
 
+            # G3 visibility: caller must be able to access at least one
+            # linked job. Admins with no MCP project: scope skip the loop.
+            if not await user_can_access_any_job(
+                caller, postgres_db, result["job_ids"]
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Not authorized to access this source"
+                )
+
             return result
     except HTTPException:
         raise
@@ -8931,6 +9355,7 @@ async def get_source_detail(
 
 @app.get("/api/jobs/{job_id}/citations")
 async def list_job_citations(
+    request: Request,
     job_id: str,
     source_id: int | None = Query(default=None),
     status: str | None = Query(
@@ -8940,6 +9365,7 @@ async def list_job_citations(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List citations for a job with optional filters."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             conditions = ["c.job_id = $1::uuid"]
@@ -8985,8 +9411,15 @@ async def list_job_citations(
 
 
 @app.get("/api/citations/{citation_id}")
-async def get_citation_detail(citation_id: int) -> dict[str, Any]:
-    """Get full citation record with source info and verification details."""
+async def get_citation_detail(request: Request, citation_id: int) -> dict[str, Any]:
+    """Get full citation record with source info and verification details.
+
+    **P4e** — visible if the caller can access the citation's linked job
+    (mirrors G3's ``get_source_detail`` pattern). Admins without an MCP
+    ``project:<uuid>`` scope bypass. Missing/unauthorized → 404 to avoid
+    leaking citation existence via probe.
+    """
+    caller = await require_approved_user(request, postgres_db)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -9010,7 +9443,17 @@ async def get_citation_detail(citation_id: int) -> dict[str, Any]:
                     status_code=404, detail=f"Citation {citation_id} not found"
                 )
 
-            return dict(row)
+            result = dict(row)
+            job_id = result.get("job_id")
+            if not await user_can_access_any_job(
+                caller, postgres_db, [str(job_id)] if job_id else []
+            ):
+                # 404 instead of 403 — don't leak that the citation exists.
+                raise HTTPException(
+                    status_code=404, detail=f"Citation {citation_id} not found"
+                )
+
+            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -9019,11 +9462,13 @@ async def get_citation_detail(citation_id: int) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/sources/{source_id}/annotations")
 async def get_source_annotations(
+    request: Request,
     job_id: str,
     source_id: int,
     type: str | None = Query(default=None, description="Filter by annotation_type"),
 ) -> list[dict[str, Any]]:
     """Get annotations for a source within a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             if type:
@@ -9052,8 +9497,9 @@ async def get_source_annotations(
 
 
 @app.get("/api/jobs/{job_id}/sources/{source_id}/tags")
-async def get_source_tags(job_id: str, source_id: int) -> list[str]:
+async def get_source_tags(request: Request, job_id: str, source_id: int) -> list[str]:
     """Get tags for a source within a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             rows = await conn.fetch(
@@ -9067,8 +9513,9 @@ async def get_source_tags(job_id: str, source_id: int) -> list[str]:
 
 
 @app.get("/api/jobs/{job_id}/citations/stats")
-async def get_citation_stats(job_id: str) -> dict[str, Any]:
+async def get_citation_stats(request: Request, job_id: str) -> dict[str, Any]:
     """Get citation statistics for a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             # Sources by type
@@ -9126,8 +9573,9 @@ async def get_citation_stats(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/jobs/{job_id}/memory/stats")
-async def get_memory_stats(job_id: str) -> dict[str, Any]:
+async def get_memory_stats(request: Request, job_id: str) -> dict[str, Any]:
     """Get memory statistics for a job."""
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -9165,8 +9613,9 @@ async def get_memory_stats(job_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/projects/{project_id}/memory/stats")
-async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
+async def get_project_memory_stats(request: Request, project_id: str) -> dict[str, Any]:
     """Get memory statistics for a project (all memories scoped to this project)."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -9204,6 +9653,7 @@ async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
 
 @app.get("/api/jobs/{job_id}/memories")
 async def list_job_memories(
+    request: Request,
     job_id: str,
     memory_type: str | None = Query(default=None),
     source: str | None = Query(default=None),
@@ -9214,6 +9664,7 @@ async def list_job_memories(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List individual memories for a job with optional filters and pagination."""
+    await require_job_access(request, postgres_db, job_id)
     # Validate sort parameters
     valid_sort_fields = {
         "created_at",
@@ -9289,6 +9740,7 @@ async def list_job_memories(
 
 @app.get("/api/jobs/{job_id}/sources/search")
 async def search_job_sources(
+    request: Request,
     job_id: str,
     query: str = Query(..., description="Search query"),
     mode: str = Query(
@@ -9305,6 +9757,7 @@ async def search_job_sources(
     Falls back to SQL keyword search. Semantic/hybrid modes require
     the CitationEngine with pgvector.
     """
+    await require_job_access(request, postgres_db, job_id)
     try:
         async with vector_db.acquire() as conn:
             # Build conditions for source filtering
@@ -9391,8 +9844,11 @@ async def search_job_sources(
 
 
 @app.post("/api/agents/register", response_model=AgentRegistrationResponse)
-async def register_agent(registration: AgentRegistration) -> AgentRegistrationResponse:
-    """Register a new agent or update existing one.
+async def register_agent(
+    request: Request, registration: AgentRegistration
+) -> AgentRegistrationResponse:
+    """Register a new agent or update existing one. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Public ingress also strips this path.
 
     When an agent starts up, it calls this endpoint to register itself.
     If an agent with the same hostname exists, its pod_ip is updated.
@@ -9400,6 +9856,7 @@ async def register_agent(registration: AgentRegistration) -> AgentRegistrationRe
     Returns:
         AgentRegistrationResponse with agent_id and heartbeat_interval_seconds
     """
+    await require_internal(request)
     try:
         result = await postgres_db.register_agent(
             config_name=registration.config_name,
@@ -9450,18 +9907,22 @@ class AgentThreadMessageRequest(BaseModel):
 
 
 @app.post("/api/agents/threads")
-async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, Any]:
-    """Agent creates its own thread on startup (no auth).
+async def agent_create_thread(
+    request: Request, body: AgentThreadCreateRequest
+) -> dict[str, Any]:
+    """Agent creates its own thread on startup. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     Used by persistent agents starting with ORCHESTRATOR_URL set.
     Creates a thread with user_id=NULL (visible to all cockpit users).
     """
+    await require_internal(request)
     try:
         thread_id = await postgres_db.create_thread(
             user_id=None,
-            config_name=request.config_name,
-            permission_mode=request.permission_mode,
-            title=request.title,
+            config_name=body.config_name,
+            permission_mode=body.permission_mode,
+            title=body.title,
         )
 
         # Inject system-default model pins so the standalone agent boots
@@ -9488,6 +9949,7 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
                 model_id=aux_model,
                 user_id=None,
                 resolved_keys=None,
+                capability="auxiliary",
             )
             config_override["auxiliary"] = aux_section
         embedding_model = await postgres_db.resolve_default_for_capability("embedding")
@@ -9499,6 +9961,7 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
                 model_id=embedding_model,
                 user_id=None,
                 resolved_keys=None,
+                capability="embedding",
             )
             config_override["env_keys"] = env_keys_block
         if config_override:
@@ -9539,27 +10002,283 @@ async def agent_create_thread(request: AgentThreadCreateRequest) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _slugify_mount_name(name: str) -> str:
+    """Workspace-safe slug for a mount's target_path."""
+    out = "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_")
+    return out or "project"
+
+
+def _should_skip_session_folder(mounts: list[dict[str, Any]]) -> bool:
+    """Phase 4 (cloud_collaboration_model.md §9): is the legacy per-session
+    cloud folder redundant for this thread?
+
+    If at least one ``thread_mounts`` row has a working ``webdav_url`` —
+    any kind (``project``, ``project_default``, ``repo``) — the thread
+    already has a user-visible cloud surface. Provisioning a per-session
+    folder on top would create a parallel sync target the user has no
+    reason to use.
+
+    Returns False when no mount can be observed (no rows, or every row
+    failed to resolve a transport). That falls through to legacy
+    session-folder provisioning so the thread never ends up with zero
+    cloud surfaces — important for unattached sessions and for transient
+    backend failures during mount resolution.
+    """
+    for m in mounts:
+        if m.get("webdav_url"):
+            return True
+    return False
+
+
+def _project_ids_from_mounts(mounts: list[dict[str, Any]]) -> list[str]:
+    """Pick out project ``source_ref``s from a list of mount rows.
+
+    Both ``project`` (non-default, mounted under ``projects/<slug>/``) and
+    ``project_default`` (default project, mounted at workspace root via the
+    user's cloud home) rows contribute — the default project is still a
+    project attachment for datasource resolution and visibility.
+    """
+    out: list[str] = []
+    for m in mounts:
+        if m.get("mount_kind") not in {"project", "project_default"}:
+            continue
+        ref = m.get("source_ref")
+        if ref:
+            out.append(str(ref))
+    return out
+
+
+async def _thread_project_ids(thread_id: str) -> list[str]:
+    """Derive the project-attachment list for a thread from ``thread_mounts``.
+
+    Replaces the legacy ``threads.metadata.project_ids`` JSONB read. Phase 1
+    of cloud_collaboration_model.md §9. Only ``mount_kind='project'`` rows
+    contribute — ``project_default`` and ``repo`` rows are different shapes
+    on the agent side.
+
+    **Lazy backfill (transitional):** threads that predate the migration
+    have ``metadata.project_ids`` set but no ``thread_mounts`` rows. When
+    we see that combination we materialize the missing rows on the spot,
+    so the rest of the codebase observes ``thread_mounts`` as the single
+    source of truth from the first access onwards. Remove this fallback
+    one release after Phase 1 ships — by then every active thread has
+    been touched at least once and the JSONB key is dead.
+    """
+    mounts = await postgres_db.list_thread_mounts(thread_id)
+    ids = _project_ids_from_mounts(mounts)
+    if ids:
+        return ids
+
+    # ---- lazy backfill from metadata.project_ids ----
+    thread = await postgres_db.get_thread(thread_id)
+    if not thread:
+        return []
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            metadata = {}
+    legacy_ids = metadata.get("project_ids") or []
+    if not legacy_ids:
+        return []
+    try:
+        rows = await _build_thread_mount_rows([str(p) for p in legacy_ids])
+        if rows:
+            await postgres_db.replace_thread_mounts(thread_id, rows)
+            logger.info(
+                "Thread %s: backfilled %d thread_mounts row(s) from "
+                "legacy metadata.project_ids",
+                thread_id,
+                len(rows),
+            )
+            return _project_ids_from_mounts(
+                await postgres_db.list_thread_mounts(thread_id)
+            )
+    except Exception as e:
+        # Don't let a backfill failure prevent the caller from getting the
+        # project_ids — fall back to the legacy list so behavior matches
+        # the pre-migration era. The next access retries the backfill.
+        logger.warning(
+            "Thread %s: thread_mounts backfill failed (%s); "
+            "returning legacy project_ids",
+            thread_id,
+            e,
+        )
+    return [str(p) for p in legacy_ids]
+
+
+async def _build_default_project_mount_row(
+    project_id: str, project: dict[str, Any]
+) -> Optional[dict[str, Any]]:
+    """Shape a ``project_default`` mount row for a default project.
+
+    Resolves the project's owner on the cloud backend and queries their
+    personal home Space. The mount targets the workspace root (``target_path
+    = ""``) — the agent's workspace and the user's cloud home become two
+    views of the same surface. Phase 2 of cloud_collaboration_model.md §9.
+
+    Also stashes the owner's Keycloak ``sub`` on the row (``target_user_sub``)
+    so the agent can mint a user-scoped token via RFC 8693 token-exchange
+    at WebDAV-call time. Without that, the agent's service-account
+    bearer token gets a 404 on PROPFIND against the user's Personal Space
+    (owned by exactly one user, not shared with the service account).
+
+    Returns ``None`` when the user-home can't be resolved (no owner, owner
+    missing from the cloud backend, no webdav URL, no keycloak_sub on the
+    owner, backend down). The caller treats ``None`` as "fall back to the
+    legacy session folder" so a transient resolution failure never leaves
+    the thread with zero mounts.
+    """
+    backend = main_cloud_router.for_project(project)
+    if not backend.is_initialized:
+        return None
+    members = await postgres_db.get_project_members(project_id)
+    owner = next((m for m in members if m.get("role") == "owner"), None)
+    if not owner:
+        return None
+    owner_email = owner.get("email")
+    if not owner_email:
+        return None
+    owner_user = await postgres_db.get_user(str(owner["user_id"]))
+    target_user_sub = (owner_user or {}).get("keycloak_sub")
+    if not target_user_sub:
+        # Owner has never completed an SSO login, so we don't have their
+        # Keycloak sub yet. Token-exchange impersonation needs a real sub —
+        # bail out and let the caller fall back to the legacy session folder.
+        return None
+    owner_display = (owner.get("display_name") or "").lower()
+    resolved = await backend.resolve_user_identity(owner_email, owner_display)
+    if not resolved:
+        return None
+    home = await backend.get_user_home(resolved)
+    if not home or not home.webdav_url:
+        return None
+    return {
+        "mount_kind": "project_default",
+        "target_path": "",
+        "source_kind": "user_home",
+        "source_ref": project_id,
+        "backend_id": backend.backend_id,
+        "cloud_handle": home.handle.to_db(),
+        "webdav_url": home.webdav_url,
+        "target_user_sub": target_user_sub,
+    }
+
+
+async def _build_thread_mount_rows(
+    project_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Resolve mount-row payloads for the given project_ids.
+
+    Each row carries everything ``replace_thread_mounts`` needs. Default
+    projects (Phase 2) produce a ``project_default`` row that mounts the
+    owner's cloud home at the workspace root; non-default projects produce
+    a ``project`` row that mounts at ``projects/<slug>/``. Projects whose
+    cloud transport can't be resolved are skipped — the mount-row entry is
+    not partially filled, the caller observes a missing row.
+
+    Multi-project collisions (two attached projects whose slugified names
+    are identical, including case-insensitive matches since the slugifier
+    lowercases) are resolved by suffixing ``-2``, ``-3``, ... on the
+    target_path so the ``UNIQUE (thread_id, target_path)`` constraint at
+    persistence time always holds.
+    """
+    rows: list[dict[str, Any]] = []
+    used_paths: set[str] = set()
+    seen_project_ids: set[str] = set()
+    for project_id in project_ids:
+        if project_id in seen_project_ids:
+            continue
+        seen_project_ids.add(project_id)
+        project = await postgres_db.get_project(project_id)
+        if not project:
+            continue
+        if project.get("is_default"):
+            try:
+                default_row = await _build_default_project_mount_row(
+                    project_id, project
+                )
+            except Exception as e:
+                logger.warning(
+                    "Project %s (default): failed to resolve user-home mount row: %s",
+                    project_id,
+                    e,
+                )
+                continue
+            if default_row:
+                rows.append(default_row)
+                used_paths.add(default_row.get("target_path", ""))
+            continue
+        backend_id = project.get("main_cloud_backend")
+        handle_str = project.get("main_cloud_folder_handle")
+        webdav_url: str | None = None
+        if backend_id and handle_str:
+            try:
+                backend = main_cloud_router.for_backend(backend_id)
+                if backend.is_initialized:
+                    handle = ProjectFolderHandle.from_db(
+                        handle_str, backend=backend.backend_id
+                    )
+                    webdav_url = backend.get_project_folder_webdav_url(handle)
+            except Exception as e:
+                logger.warning(
+                    "Project %s: failed to resolve webdav URL for thread mount: %s",
+                    project_id,
+                    e,
+                )
+        base_path = f"projects/{_slugify_mount_name(project.get('name', ''))}"
+        target_path = base_path
+        suffix = 2
+        while target_path in used_paths:
+            target_path = f"{base_path}-{suffix}"
+            suffix += 1
+        used_paths.add(target_path)
+        rows.append(
+            {
+                "mount_kind": "project",
+                "target_path": target_path,
+                "source_kind": "project_folder",
+                "source_ref": project_id,
+                "backend_id": backend_id,
+                "cloud_handle": handle_str,
+                "webdav_url": webdav_url,
+            }
+        )
+    return rows
+
+
 async def _resolve_thread_datasources(
     metadata: dict[str, Any],
+    *,
+    project_ids: list[str] | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Resolve and build datasource payload from thread metadata."""
+    """Resolve and build datasource payload for a thread.
+
+    ``project_ids`` is the canonical input — derived from ``thread_mounts``
+    by the caller. ``metadata`` still carries the explicit ``datasource_ids``
+    list.
+    """
     ds_ids = metadata.get("datasource_ids")
-    p_ids = metadata.get("project_ids")
-    if not ds_ids and not p_ids:
+    if not ds_ids and not project_ids:
         return None
     resolved = await postgres_db.resolve_datasources_for_thread(
-        datasource_ids=ds_ids, project_ids=p_ids
+        datasource_ids=ds_ids, project_ids=project_ids
     )
     return _build_datasources_payload(resolved)
 
 
 @app.get("/api/agents/threads/{thread_id}/workspace")
-async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
-    """Agent polls workspace container status for a thread (no auth).
+async def agent_get_thread_workspace(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """Agent polls workspace container status for a thread. **Internal**
+    (P4b) — requires ``X-Internal-Key``. Ingress strips this path.
 
     Returns workspace_container metadata from the thread,
     allowing the agent to wait for the workspace to be ready.
     """
+    await require_internal(request)
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -9571,6 +10290,9 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
             metadata = {}
     ws = metadata.get("workspace_container") or {}
     vm = metadata.get("vm") or {}
+    # Phase 1: project attachment + cloud mounts now live on thread_mounts.
+    project_ids = await _thread_project_ids(thread_id)
+    mount_rows = await postgres_db.list_thread_mounts(thread_id)
     return {
         "status": ws.get("status", "none"),
         # K8s provisioner uses pod_ip; Docker provisioner uses host — normalize
@@ -9589,25 +10311,30 @@ async def agent_get_thread_workspace(thread_id: str) -> dict[str, Any]:
         # Config overrides (model, temperature, etc.)
         "config_override": metadata.get("config_override"),
         # Project scoping
-        "project_ids": metadata.get("project_ids"),
+        "project_ids": project_ids,
         # Resolved datasources for the thread
-        "datasources": await _resolve_thread_datasources(metadata),
+        "datasources": await _resolve_thread_datasources(
+            metadata, project_ids=project_ids
+        ),
         # Nextcloud session folder (legacy; preserved one release for back-compat)
         "nc_session_folder": thread.get("nc_session_folder"),
         # Structured cloud-sync config (backend + webdav URL + auth).
         # Agent consumes this via ``src.services.cloud_sync.build_workspace_sync``.
-        "cloud_sync": _build_agent_cloud_sync(thread),
+        "cloud_sync": _build_agent_cloud_sync(thread, mount_rows=mount_rows),
     }
 
 
 @app.get("/api/agents/threads/{thread_id}/lifecycle")
-async def agent_get_thread_lifecycle(thread_id: str) -> dict[str, Any]:
+async def agent_get_thread_lifecycle(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
     """Return lifecycle fields the agent needs for self-cleanup polling.
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips.
 
     Minimal projection so the agent's thread-status watchdog (PR 2) can
     decide whether to exit without dragging in the full thread payload.
-    Agent-facing — no user auth.
     """
+    await require_internal(request)
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -9626,9 +10353,12 @@ class AgentThreadStatusRequest(BaseModel):
 
 @app.put("/api/agents/threads/{thread_id}/status")
 async def agent_update_thread_status(
-    thread_id: str, request: AgentThreadStatusRequest
+    request: Request,
+    thread_id: str,
+    body: AgentThreadStatusRequest,
 ) -> dict[str, str]:
-    """Update thread status (no auth, agent-facing).
+    """Update thread status. **Internal** (P4b) — requires ``X-Internal-Key``.
+    Ingress strips this path.
 
     Lifecycle transitions:
       created → active, active → ended (existing).
@@ -9643,14 +10373,15 @@ async def agent_update_thread_status(
     writable from agent path — would create a race where an agent flips
     the thread back to active while the orchestrator is mid-suspend.
     """
+    await require_internal(request)
     valid_statuses = {"active", "ended", "awaiting_user"}
-    if request.status not in valid_statuses:
+    if body.status not in valid_statuses:
         raise HTTPException(
             status_code=400,
             detail=f"Status must be one of: {valid_statuses}",
         )
     try:
-        if request.status == "ended":
+        if body.status == "ended":
             # Route through end_thread so ended_at gets stamped.
             await postgres_db.end_thread(thread_id)
             # Agent-initiated `ended` (idle timeout, drain, watchdog, WS
@@ -9660,7 +10391,7 @@ async def agent_update_thread_status(
             # _release_thread_resources for true destruction.
             # See docs/issues/persistent_session_permission_check_race.md.
             asyncio.create_task(_suspend_thread_resources(thread_id))
-        elif request.status == "awaiting_user":
+        elif body.status == "awaiting_user":
             # Idempotent: preserve awaiting_user_since on repeated writes
             # (the agent's loop calls this on every untethered turn-complete
             # in eager mode; resetting the timestamp would let the
@@ -9697,22 +10428,26 @@ async def agent_update_thread_status(
                     "    last_activity = CURRENT_TIMESTAMP "
                     "WHERE id = $1",
                     thread_id,
-                    request.status,
+                    body.status,
                 )
-        return {"status": request.status}
+        return {"status": body.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/api/agents/threads/{thread_id}/release-agent")
-async def agent_release_thread_agent(thread_id: str) -> dict[str, str]:
-    """Clear threads.agent_id (no auth, agent-facing).
+async def agent_release_thread_agent(
+    request: Request, thread_id: str
+) -> dict[str, str]:
+    """Clear threads.agent_id. **Internal** (P4b) — requires
+    ``X-Internal-Key``. Ingress strips this path.
 
     Called by an agent whose /session/attach background task failed (e.g.
     workspace SSH polling timed out before the workspace pod's image pull
     completed). Without this, the thread stays bound to a session-less agent
     and the next WS reconnect re-targets the same broken agent.
     """
+    await require_internal(request)
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -9726,9 +10461,12 @@ class AgentThreadConfigUpdateRequest(BaseModel):
 
 @app.patch("/api/agents/threads/{thread_id}/config")
 async def agent_update_thread_config(
-    thread_id: str, request: AgentThreadConfigUpdateRequest
+    request: Request,
+    thread_id: str,
+    body: AgentThreadConfigUpdateRequest,
 ) -> dict[str, Any]:
-    """Persist runtime config changes for a thread (no auth, agent-facing).
+    """Persist runtime config changes for a thread. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     Deep-merges the provided config_override into the existing
     ``threads.metadata.config_override``.  If the override includes
@@ -9739,12 +10477,13 @@ async def agent_update_thread_config(
     LLM with the resolved ``base_url``/``api_key`` instead of sending the
     next request to api.openai.com with ``not-needed``.
     """
+    await require_internal(request)
     try:
         # Enrich endpoint-backed model swaps with base_url + api_key so the
         # persisted override is complete. Without this, a hot-swap to a
         # custom-endpoint model leaves the next session attach pointing at
         # the default OpenAI base.
-        config_override = dict(request.config_override or {})
+        config_override = dict(body.config_override or {})
         llm_section = config_override.get("llm")
         if llm_section and llm_section.get("model"):
             thread_row = await postgres_db.get_thread(thread_id)
@@ -9791,12 +10530,16 @@ async def agent_update_thread_config(
 
 
 @app.post("/api/agents/threads/{thread_id}/upgrade-to-vm")
-async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
-    """Request VM provisioning for a persistent thread (no auth, agent-facing).
+async def agent_upgrade_thread_to_vm(
+    request: Request, thread_id: str
+) -> dict[str, Any]:
+    """Request VM provisioning for a persistent thread. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     Called by the persistent agent when a sudo command is detected and the
     user approves a VM upgrade via WebSocket.
     """
+    await require_internal(request)
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
@@ -9838,22 +10581,26 @@ async def agent_upgrade_thread_to_vm(thread_id: str) -> dict[str, Any]:
 
 @app.post("/api/agents/threads/{thread_id}/messages")
 async def agent_save_message(
-    thread_id: str, request: AgentThreadMessageRequest
+    request: Request,
+    thread_id: str,
+    body: AgentThreadMessageRequest,
 ) -> dict[str, Any]:
-    """Agent saves a message to thread history (no auth).
+    """Agent saves a message to thread history. **Internal** (P4b) —
+    requires ``X-Internal-Key``. Ingress strips this path.
 
     Fire-and-forget safe — agents call this after each turn.
     """
+    await require_internal(request)
     try:
         message_id = await postgres_db.save_thread_message(
             thread_id=thread_id,
-            role=request.role,
-            content=request.content,
-            tool_calls=request.tool_calls,
-            turn_number=request.turn_number,
-            metrics=request.metrics,
-            tool_call_id=request.tool_call_id,
-            thinking=request.thinking,
+            role=body.role,
+            content=body.content,
+            tool_calls=body.tool_calls,
+            turn_number=body.turn_number,
+            metrics=body.metrics,
+            tool_call_id=body.tool_call_id,
+            thinking=body.thinking,
         )
         return {"message_id": message_id, "status": "saved"}
     except Exception as e:
@@ -9861,12 +10608,16 @@ async def agent_save_message(
 
 
 @app.post("/api/agents/{agent_id}/heartbeat")
-async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str, Any]:
-    """Update agent heartbeat and status.
+async def agent_heartbeat(
+    request: Request, agent_id: str, heartbeat: AgentHeartbeat
+) -> dict[str, Any]:
+    """Update agent heartbeat and status. **Internal** (P4b) — requires
+    ``X-Internal-Key``. Ingress strips this path.
 
     Agents call this every 60 seconds to report their status.
     The orchestrator uses this to track agent health and current job state.
     """
+    await require_internal(request)
     try:
         result = await postgres_db.heartbeat(
             agent_id=agent_id,
@@ -9914,15 +10665,20 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
 
 @app.get("/api/agents")
 async def list_agents(
+    request: Request,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List all registered agents.
+    """List all registered agents. **Admin only** (G4) — exposes pod IPs,
+    hostnames, and full fleet metadata. Non-admins must use
+    `/api/me/active-jobs` for a stripped, per-user projection of their
+    in-flight work.
 
     Args:
         status: Optional status filter (booting, ready, working, completed, failed, offline)
         limit: Maximum agents to return
     """
+    await _require_admin(request)
     try:
         return await postgres_db.list_agents(status=status, limit=limit)
     except Exception as e:
@@ -9930,8 +10686,9 @@ async def list_agents(
 
 
 @app.get("/api/agents/{agent_id}")
-async def get_agent(agent_id: str) -> dict[str, Any]:
-    """Get agent details by ID."""
+async def get_agent(request: Request, agent_id: str) -> dict[str, Any]:
+    """Get agent details by ID. **Admin only** (G4)."""
+    await _require_admin(request)
     try:
         agent = await postgres_db.get_agent(agent_id)
         if not agent:
@@ -9944,13 +10701,15 @@ async def get_agent(agent_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/agents/{agent_id}/system-info")
-async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
+async def get_agent_system_info(request: Request, agent_id: str) -> dict[str, Any]:
     """Proxy system info request to an agent's /system/info endpoint.
+    **Admin only** (G4) — proxies host-level CPU/memory/process/port
+    inventory from the agent container.
 
     Returns CPU, memory, disk, processes, listening ports, and network
     connections from the agent's container.
     """
-
+    await _require_admin(request)
     try:
         agent = await postgres_db.get_agent(agent_id)
         if not agent:
@@ -10132,6 +10891,7 @@ async def create_thread(
                 model_id=aux_section["model"],
                 user_id=str(user["id"]),
                 resolved_keys=resolved_keys,
+                capability="auxiliary",
             )
             config_override["auxiliary"] = aux_section
 
@@ -10157,6 +10917,7 @@ async def create_thread(
                 model_id=embedding_model,
                 user_id=str(user["id"]),
                 resolved_keys=resolved_keys,
+                capability="embedding",
             )
             logger.info(
                 "Thread create: injected embedding: provider=%s, model=%s",
@@ -10182,12 +10943,13 @@ async def create_thread(
             title=request_body.title,
         )
 
-        # Store config_override and project_ids in thread metadata
+        # Store config_override + datasource_ids in thread metadata. Project
+        # attachment is the canonical concern of ``thread_mounts`` (Phase 1
+        # of cloud_collaboration_model.md §9) — the legacy
+        # ``metadata.project_ids`` JSONB key is no longer written.
         metadata_patch = {}
         if config_override:
             metadata_patch["config_override"] = config_override
-        if effective_project_ids:
-            metadata_patch["project_ids"] = effective_project_ids
         if request_body.datasource_ids:
             metadata_patch["datasource_ids"] = request_body.datasource_ids
         if metadata_patch:
@@ -10200,6 +10962,17 @@ async def create_thread(
                     """,
                     thread_id,
                     json.dumps(metadata_patch),
+                )
+
+        # Seed thread_mounts for the attached projects.
+        if effective_project_ids:
+            try:
+                mount_rows = await _build_thread_mount_rows(effective_project_ids)
+                if mount_rows:
+                    await postgres_db.replace_thread_mounts(thread_id, mount_rows)
+            except Exception as e:
+                logger.warning(
+                    "Thread %s: failed to seed thread_mounts: %s", thread_id, e
                 )
 
         # Provision workspace container + agent pod FIRST (non-blocking).
@@ -10301,6 +11074,33 @@ async def create_thread(
                 await backend.ensure_initialized()
             if not backend.is_initialized:
                 return
+
+            # Phase 4 (cloud_collaboration_model.md §9): if the thread
+            # already has any mount with a working webdav_url — project,
+            # project_default, or repo — the legacy session folder would
+            # be a redundant second sync target. Skip provisioning it.
+            # The gate is observable-state: failed mount resolution
+            # leaves no usable row, the legacy folder is still
+            # provisioned as fallback, the thread never ends up with
+            # zero cloud surfaces.
+            try:
+                existing_mounts = await postgres_db.list_thread_mounts(thread_id)
+            except Exception as e:
+                existing_mounts = []
+                logger.warning(
+                    "Thread %s: failed to read thread_mounts before session "
+                    "folder provisioning (%s); proceeding with legacy folder.",
+                    thread_id,
+                    e,
+                )
+            if _should_skip_session_folder(existing_mounts):
+                logger.info(
+                    "Thread %s: skipping legacy session folder — at least "
+                    "one mount with a working webdav_url is observable.",
+                    thread_id,
+                )
+                return
+
             try:
                 session_handle = await backend.ensure_session_folder(
                     session_id=thread_id[:8]
@@ -10467,7 +11267,12 @@ async def list_threads(
             status=status,
         )
         for t in threads:
-            t["cloud_session_url"] = _resolve_cloud_session_url(t)
+            # Phase 2: default-project threads have no legacy session folder,
+            # so the cloud-button URL has to come from the project_default
+            # mount row instead. Per-thread mounts lookup is N+1 but the
+            # list endpoint is bounded by the user's own thread count.
+            mount_rows = await postgres_db.list_thread_mounts(str(t["id"]))
+            t["cloud_session_url"] = _resolve_cloud_session_url(t, mount_rows)
         return {"threads": threads}
     except HTTPException:
         raise
@@ -10475,48 +11280,77 @@ async def list_threads(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-def _resolve_cloud_session_url(thread: dict[str, Any]) -> Optional[str]:
-    """Compute a backend-agnostic browser URL for a thread's cloud folder."""
-    handle_str = thread.get("main_cloud_session_handle") or thread.get(
-        "nc_session_folder"
-    )
-    if not handle_str:
-        return None
-    backend_id = thread.get("main_cloud_backend") or None
-    backend = main_cloud_router.for_backend(backend_id)
-    if not backend.is_initialized:
-        return None
-    try:
-        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        return backend.get_session_folder_browser_url(handle)
-    except Exception:
-        return None
+def _resolve_cloud_session_url(
+    thread: dict[str, Any],
+    mount_rows: list[dict[str, Any]] | None = None,
+) -> Optional[str]:
+    """Compute a backend-agnostic browser URL for a thread's cloud folder.
 
-
-def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Build the ``cloud_sync`` payload the agent uses to push/pull session files.
-
-    Shape mirrors ``src/services/cloud_sync/__init__.py::build_workspace_sync``.
-    Returns ``None`` when there's no session folder or the backend is offline.
-    Never logs the auth payload.
+    Looks at the legacy session-folder handle first (Phase 1 and earlier).
+    When that's empty — as happens for Phase 2 default-project threads
+    where the session folder is intentionally skipped in favor of the
+    user-home mount — fall back to the first ``project_default`` mount
+    row's cloud handle. The Cockpit's "Cloud" button (sessions-page line
+    179: ``thread.cloud_session_url || thread.nc_session_folder``) depends
+    on this; without the fallback, default-project threads show no
+    button even though sync is working fine.
     """
     handle_str = thread.get("main_cloud_session_handle") or thread.get(
         "nc_session_folder"
     )
-    if not handle_str:
-        return None
-    backend_id = thread.get("main_cloud_backend") or None
-    backend = main_cloud_router.for_backend(backend_id)
-    if not backend.is_initialized:
-        return None
-    try:
-        handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
-        webdav_url = backend.get_session_folder_webdav_url(handle)
-    except Exception:
-        return None
-    if not webdav_url:
-        return None
+    if handle_str:
+        backend_id = thread.get("main_cloud_backend") or None
+        backend = main_cloud_router.for_backend(backend_id)
+        if not backend.is_initialized:
+            return None
+        try:
+            handle = SessionFolderHandle.from_db(handle_str, backend=backend.backend_id)
+            return backend.get_session_folder_browser_url(handle)
+        except Exception:
+            return None
 
+    # No legacy folder — try the project_default mount.
+    for m in mount_rows or []:
+        if m.get("mount_kind") != "project_default":
+            continue
+        row_backend_id = m.get("backend_id")
+        row_handle_str = m.get("cloud_handle")
+        if not row_backend_id or not row_handle_str:
+            continue
+        backend = main_cloud_router.for_backend(row_backend_id)
+        if not backend.is_initialized:
+            continue
+        try:
+            handle = ProjectFolderHandle.from_db(
+                row_handle_str, backend=backend.backend_id
+            )
+            return backend.get_project_folder_browser_url(handle)
+        except Exception:
+            continue
+    return None
+
+
+def _backend_cloud_cfg(
+    backend,
+    webdav_url: str,
+    *,
+    target_user_sub: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Build a single ``{backend, webdav_url, auth}`` cfg for the agent.
+
+    Shape matches ``src/services/cloud_sync/__init__.py::build_workspace_sync``'s
+    expected payload. Returns ``None`` when credentials aren't resolvable.
+    Never logs the auth payload.
+
+    When ``target_user_sub`` is set (Phase 2 user-home mount, only on
+    OpenCloud), the auth shape becomes ``keycloak_user_impersonation``: the
+    agent first fetches its service-account token via client_credentials,
+    then exchanges it for a user-scoped token impersonating the target
+    user (their Keycloak ``sub``) via RFC 8693 token-exchange. The exchanged
+    token is what authenticates WebDAV calls — required because OpenCloud
+    Personal Spaces are owned by exactly one user and the service account
+    has no WebDAV access of its own to them.
+    """
     if backend.backend_id == "nextcloud":
         creds = backend.webdav_credentials or {}
         if not creds.get("username") or not creds.get("password"):
@@ -10538,30 +11372,137 @@ def _build_agent_cloud_sync(thread: dict[str, Any]) -> Optional[dict[str, Any]]:
             client_secret = settings.keycloak_client_secret.get_secret_value()
         except Exception:
             return None
+        auth: dict[str, Any] = {
+            "issuer": str(settings.keycloak_issuer).rstrip("/"),
+            "client_id": settings.keycloak_client_id,
+            "client_secret": client_secret,
+        }
+        if target_user_sub:
+            auth["type"] = "keycloak_user_impersonation"
+            auth["target_user_sub"] = target_user_sub
+        else:
+            auth["type"] = "keycloak_client_credentials"
         return {
             "backend": "opencloud",
             "webdav_url": webdav_url,
-            "auth": {
-                "type": "keycloak_client_credentials",
-                "issuer": str(settings.keycloak_issuer).rstrip("/"),
-                "client_id": settings.keycloak_client_id,
-                "client_secret": client_secret,
-            },
+            "auth": auth,
         }
     return None
 
 
+def _build_agent_cloud_sync(
+    thread: dict[str, Any],
+    *,
+    mount_rows: list[dict[str, Any]] | None = None,
+) -> Optional[dict[str, Any]]:
+    """Build the ``cloud_sync`` payload the agent uses to push/pull workspace files.
+
+    Phase 1 of ``docs/features/cloud_collaboration_model.md`` §9 introduces the
+    multi-mount model. Payload shape is now ``version: 2``::
+
+        {
+          "version": 2,
+          "session_folder": {backend, webdav_url, auth} | None,
+          "mounts": [
+              {mount_id, mount_kind, target_path, backend, webdav_url, auth},
+              ...
+          ],
+        }
+
+    ``session_folder`` is the legacy per-thread session folder cfg (kept in
+    parallel for back-compat until Phase 4). ``mounts`` are the project /
+    user-home / repo mounts derived from ``thread_mounts``. Returns ``None``
+    when neither a session folder nor any mount could be resolved — in that
+    case there's nothing for the agent to sync. Never logs auth payloads.
+    """
+    # ---- legacy session folder (still provisioned in v1)
+    session_folder_cfg: Optional[dict[str, Any]] = None
+    handle_str = thread.get("main_cloud_session_handle") or thread.get(
+        "nc_session_folder"
+    )
+    if handle_str:
+        backend_id = thread.get("main_cloud_backend") or None
+        backend = main_cloud_router.for_backend(backend_id)
+        if backend.is_initialized:
+            try:
+                handle = SessionFolderHandle.from_db(
+                    handle_str, backend=backend.backend_id
+                )
+                webdav_url = backend.get_session_folder_webdav_url(handle)
+                if webdav_url:
+                    session_folder_cfg = _backend_cloud_cfg(backend, webdav_url)
+            except Exception:
+                session_folder_cfg = None
+
+    # ---- new-style mounts from thread_mounts
+    mounts_out: list[dict[str, Any]] = []
+    for row in mount_rows or []:
+        row_backend_id = row.get("backend_id")
+        webdav_url = row.get("webdav_url")
+        if not row_backend_id or not webdav_url:
+            # The orchestrator couldn't resolve this mount's transport
+            # details — skip rather than ship a half-built entry. Agent
+            # will surface "no mount available" via the raise-and-block
+            # policy at the next turn boundary if anything depended on it.
+            continue
+        backend = main_cloud_router.for_backend(row_backend_id)
+        if not backend.is_initialized:
+            continue
+        cfg = _backend_cloud_cfg(
+            backend,
+            webdav_url,
+            target_user_sub=row.get("target_user_sub"),
+        )
+        if not cfg:
+            continue
+        mounts_out.append(
+            {
+                "mount_id": str(row.get("id", "")),
+                "mount_kind": row.get("mount_kind"),
+                "target_path": row.get("target_path", ""),
+                **cfg,
+            }
+        )
+
+    if not session_folder_cfg and not mounts_out:
+        return None
+
+    return {
+        "version": 2,
+        "session_folder": session_folder_cfg,
+        "mounts": mounts_out,
+    }
+
+
 @app.get("/api/persistent/threads/{thread_id}")
 async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
-    """Get thread status and metadata (auth: owner only)."""
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    """Get thread status and metadata (auth: owner only).
+
+    Phase 1 of cloud_collaboration_model.md §9 surfaces the thread's
+    attached mounts here so the Cockpit "Project files" panel can render
+    them without a second round-trip. ``project_ids`` is the derived
+    list-of-strings view kept stable for callers that only need scoping.
+    """
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     result = dict(thread)
-    result["cloud_session_url"] = _resolve_cloud_session_url(thread)
+    mounts = await postgres_db.list_thread_mounts(thread_id)
+    result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
+    result["mounts"] = [
+        {
+            "id": str(m["id"]),
+            "mount_kind": m["mount_kind"],
+            "target_path": m["target_path"],
+            "source_kind": m["source_kind"],
+            "source_ref": str(m["source_ref"]) if m.get("source_ref") else None,
+            "backend_id": m.get("backend_id"),
+        }
+        for m in mounts
+    ]
+    result["project_ids"] = [
+        str(m["source_ref"])
+        for m in mounts
+        if m.get("mount_kind") == "project" and m.get("source_ref")
+    ]
     return result
 
 
@@ -10577,12 +11518,7 @@ async def end_thread(
         permanent: If true, delete the thread row and all associated messages
                    from the database. If false (default), just mark as ended.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
         try:
@@ -10639,12 +11575,7 @@ async def resume_thread(
     a new agent can pick it up. The frontend navigates to the chat page after
     calling this, where the orchestrator will provision or wait for an agent.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
     if thread.get("status") != "ended":
         raise HTTPException(
             status_code=409, detail=f"Thread is already {thread.get('status')}"
@@ -10662,8 +11593,26 @@ async def resume_thread(
     needs_share_only = bool(existing_session_handle) and not thread.get(
         "main_cloud_share_handle"
     )
-    needs_full_provision = not existing_session_handle and not thread.get(
-        "nc_session_folder"
+    # Phase 4: if the thread already has a working mount, skip the
+    # late-provision branch — the mount is the user-visible cloud surface
+    # and a session folder on top would be redundant. The share-retry
+    # branch is untouched: it only fires on existing folders, so it
+    # remains the recovery path for old session folders that lost their
+    # share record.
+    try:
+        existing_mounts = await postgres_db.list_thread_mounts(thread_id)
+    except Exception as e:
+        existing_mounts = []
+        logger.warning(
+            "Thread %s: failed to read thread_mounts during resume late-provision "
+            "check (%s); proceeding with default policy.",
+            thread_id,
+            e,
+        )
+    needs_full_provision = (
+        not existing_session_handle
+        and not thread.get("nc_session_folder")
+        and not _should_skip_session_folder(existing_mounts)
     )
 
     if needs_full_provision or needs_share_only:
@@ -10797,12 +11746,7 @@ async def get_thread_messages_history(
     Returns messages ordered by created_at ASC. Paginated.
     Load this via REST before opening the WebSocket connection.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     messages = await postgres_db.get_thread_messages_history(
         thread_id=thread_id,
@@ -10868,7 +11812,8 @@ async def _resolve_thread_for_forwarding(
     thread = await postgres_db.get_thread(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
+    # Fail-closed for orphans (user_id IS NULL); admins bypass.
+    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="Not your thread")
 
     # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
@@ -10944,12 +11889,7 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     Otherwise: replay everything since the cursor, then switch to live
     mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     server_epoch = int(thread.get("events_epoch") or 0)
 
@@ -11208,12 +12148,7 @@ async def thread_approve(
         404 — approval_id not found, or wrong thread, or no pending request
         409 — request already decided (idempotent re-clicks land here)
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if body.decision == "approve":
         new_status = "approved"
@@ -12080,12 +13015,7 @@ async def get_thread_ide_status(thread_id: str, request: Request) -> dict[str, A
     when the workspace is ready. The proxy path uses the thread_id in
     place of job_id: ``/api/ide/{thread_id}/proxy/``.
     """
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     metadata = thread.get("metadata") or {}
     if isinstance(metadata, str):
@@ -12162,12 +13092,7 @@ async def upload_files_to_thread(
         upload_files_to_thread_workspace,
     )
 
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     if not files:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -12222,12 +13147,7 @@ async def synthesize_thread_message_tts(
     """
     from services.tts import generate_message_tts
 
-    user = await require_approved_user(request, postgres_db)
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if thread.get("user_id") and str(thread["user_id"]) != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
+    user, thread = await require_thread_owner(request, postgres_db, thread_id)
 
     content = (body.get("content") or "").strip()
     if not content:
@@ -12647,6 +13567,7 @@ async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
 
 @app.get("/api/jobs/{job_id}/logs")
 async def get_job_logs(
+    request: Request,
     job_id: str,
     lines: int = Query(default=100, ge=1, le=1000),
     grep: str | None = Query(default=None),
@@ -12667,6 +13588,8 @@ async def get_job_logs(
         UUID(job_id)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
+
+    await require_job_access(request, postgres_db, job_id)
 
     log_path = workspace_service.base_path / "logs" / f"job_{job_id}.log"
     if not log_path.exists():
@@ -12717,6 +13640,7 @@ async def get_job_logs(
 
 @app.get("/api/jobs/{job_id}/llm-requests")
 async def get_job_llm_requests(
+    request: Request,
     job_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
@@ -12727,6 +13651,7 @@ async def get_job_llm_requests(
     for each request. Use the _id with GET /api/requests/{doc_id} to get
     the full request/response.
     """
+    await require_job_access(request, postgres_db, job_id)
     if not mongodb.is_available:
         raise HTTPException(status_code=503, detail="MongoDB not available")
 
@@ -12743,7 +13668,7 @@ async def get_job_llm_requests(
 
 
 @app.get("/api/jobs/{job_id}/shell-state")
-async def get_job_shell_state(job_id: str) -> dict[str, Any]:
+async def get_job_shell_state(request: Request, job_id: str) -> dict[str, Any]:
     """Proxy shell state request to the agent processing a job.
 
     Resolves job -> assigned agent -> pod IP, then proxies to
@@ -12751,11 +13676,8 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
     """
     import httpx as _httpx
 
+    _, job = await require_job_access(request, postgres_db, job_id)
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
         if job.get("status") != "processing":
             raise HTTPException(
                 status_code=400,
@@ -12802,16 +13724,74 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
 
 
 @app.delete("/api/agents/{agent_id}")
-async def delete_agent(agent_id: str) -> dict[str, str]:
-    """Deregister an agent.
+async def delete_agent(request: Request, agent_id: str) -> dict[str, str]:
+    """Deregister an agent. **Admin only** (G4).
 
-    Called when an agent shuts down gracefully.
+    Used by the cockpit's agent-list admin tool. Agents may also call
+    this on graceful shutdown, but Track B (agent ↔ orchestrator auth)
+    will give them a proper bearer-credentialled path — for now the
+    heartbeat timeout (3min) handles agent crashes without needing
+    this endpoint to be open.
     """
+    await _require_admin(request)
     try:
         success = await postgres_db.delete_agent(agent_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
         return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Per-User Projections — safe replacement for non-admin agent visibility (G4)
+# =============================================================================
+
+
+_ME_ACTIVE_JOB_STATUSES = {"created", "processing", "paused", "pending_review"}
+
+
+@app.get("/api/me/active-jobs")
+async def list_my_active_jobs(
+    request: Request,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """Caller's in-flight jobs — the non-admin replacement for `/api/agents`.
+
+    Returns jobs visible to the caller (G1 visibility OR — own jobs OR
+    project-member jobs) in any of the active statuses (created,
+    processing, paused, pending_review). The underlying ``get_jobs`` /
+    ``get_visible_jobs`` SELECT already excludes pod IPs and hostnames,
+    so this is safe to expose to non-admins. Admins still get the full
+    fleet via `/api/agents`; they can use this endpoint too if they want
+    a personal in-flight summary.
+
+    Respects MCP ``project:<uuid>`` scope narrowing.
+    """
+    user = await require_approved_user(request, postgres_db)
+    is_admin = bool(user.get("is_admin"))
+    scope_pid = mcp_scope_project_id(user)
+    try:
+        if is_admin:
+            jobs = await postgres_db.get_jobs(
+                status=None,
+                user_id=str(user["id"]),
+                limit=limit,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+            )
+        else:
+            visible = await user_visible_project_ids(user, postgres_db)
+            project_ids = [str(p) for p in visible] if visible != "all" else []
+            jobs = await postgres_db.get_visible_jobs(
+                owner_user_id=str(user["id"]),
+                visible_project_ids=project_ids,
+                status=None,
+                scope_project_id=str(scope_pid) if scope_pid else None,
+                limit=limit,
+            )
+        return [j for j in jobs if j.get("status") in _ME_ACTIVE_JOB_STATUSES]
     except HTTPException:
         raise
     except Exception as e:
@@ -12903,12 +13883,14 @@ _experts_cache: list[ExpertInfo] | None = None
 
 
 @app.get("/api/experts")
-async def list_experts() -> list[dict[str, Any]]:
-    """List available expert configurations.
+async def list_experts(request: Request) -> list[dict[str, Any]]:
+    """List available expert configurations. **P4e** — gated to approved
+    users; the expert catalog is shared metadata, not per-user.
 
     Scans config/experts/ for expert configs and returns metadata
     for expert selection in the cockpit UI.
     """
+    await require_approved_user(request, postgres_db)
     global _experts_cache
     if _experts_cache is None:
         _experts_cache = _scan_experts()
@@ -12916,8 +13898,10 @@ async def list_experts() -> list[dict[str, Any]]:
 
 
 @app.post("/api/experts/reload")
-async def reload_experts() -> dict[str, Any]:
-    """Force reload of expert configurations cache."""
+async def reload_experts(request: Request) -> dict[str, Any]:
+    """Force reload of expert configurations cache. **Admin only** (P4d) —
+    reloads expert YAML from disk."""
+    await _require_admin(request)
     global _experts_cache
     _experts_cache = _scan_experts()
     return {"status": "reloaded", "count": len(_experts_cache)}
@@ -13114,13 +14098,16 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/experts/{expert_id}")
-async def get_expert(expert_id: str) -> dict[str, Any]:
+async def get_expert(request: Request, expert_id: str) -> dict[str, Any]:
     """Get full expert detail including merged config and instructions content.
+
+    **P4e** — gated to approved users (shared catalog metadata, not per-user).
 
     Returns the expert's configuration (merged with defaults) and the raw
     instructions.md content, enabling the cockpit to pre-populate the job
     creation form.
     """
+    await require_approved_user(request, postgres_db)
     # Verify expert exists
     global _experts_cache
     if _experts_cache is None:
@@ -13163,12 +14150,15 @@ async def _get_project_jobs_repo(project_id: str) -> str | None:
 
 
 @app.get("/api/projects/{project_id}/experts")
-async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
+async def list_project_experts(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
     """List expert configurations from a project's jobs repo.
 
     Scans the experts/ directory in the project's Gitea jobs repo and returns
     metadata for each expert configuration found.
     """
+    await require_project_member(request, postgres_db, project_id)
     if not gitea_client.is_initialized:
         return []
 
@@ -13226,8 +14216,11 @@ async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/api/projects/{project_id}/experts/{expert_name}")
-async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any]:
+async def get_project_expert(
+    request: Request, project_id: str, expert_name: str
+) -> dict[str, Any]:
     """Get full detail for a project expert including merged config and instructions."""
+    await require_project_member(request, postgres_db, project_id)
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
@@ -13341,6 +14334,7 @@ async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
         logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
 
 
+# nosec: public auth-bootstrap (Bearer-required, intentionally serves pending-approval users)
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
     """Get current user from Bearer token (OIDC).
@@ -13356,7 +14350,9 @@ async def auth_me(request: Request) -> dict[str, Any]:
 # MCP Token Endpoints
 # =============================================================================
 
-_MCP_INTERNAL_KEY = os.environ.get("MCP_INTERNAL_KEY", "")
+# Note: ``MCP_INTERNAL_KEY`` is read in ``security/access.py`` (helpers
+# ``require_internal`` / ``is_internal_call``) and used by every Track B
+# (P4b) endpoint. This module-level constant is no longer needed here.
 
 
 @app.post("/api/mcp-tokens")
@@ -13437,13 +14433,10 @@ async def internal_mcp_token_verify(
     request: Request, body: McpTokenVerifyRequest
 ) -> dict[str, Any]:
     """Internal endpoint for MCP server to verify a token hash.
-
-    Protected by X-Internal-Key header (shared secret).
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips
+    this path.
     """
-    internal_key = request.headers.get("X-Internal-Key", "")
-    if not _MCP_INTERNAL_KEY or internal_key != _MCP_INTERNAL_KEY:
-        raise HTTPException(status_code=401, detail="Invalid internal key")
-
+    await require_internal(request)
     token_data = await postgres_db.get_mcp_token_by_hash(body.token_hash)
     if not token_data:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -13463,15 +14456,13 @@ async def internal_mcp_token_create(
     request: Request, body: McpTokenCreateInternal
 ) -> dict[str, Any]:
     """Internal endpoint for OAuth bridge to create an srw_* token.
+    **Internal** (P4b) — requires ``X-Internal-Key``. Ingress strips
+    this path.
 
     Looks up the user by Keycloak subject (JIT-creates if needed),
     then creates a token with the given hash, scope, and origin.
-    Protected by X-Internal-Key header.
     """
-    internal_key = request.headers.get("X-Internal-Key", "")
-    if not _MCP_INTERNAL_KEY or internal_key != _MCP_INTERNAL_KEY:
-        raise HTTPException(status_code=401, detail="Invalid internal key")
-
+    await require_internal(request)
     # Look up or JIT-create user by Keycloak sub
     user = await postgres_db.get_user_by_keycloak_sub(body.user_sub)
     if not user:
@@ -14568,6 +15559,7 @@ async def admin_detect_family(request: Request, model_id: str) -> dict[str, str]
     }
 
 
+# nosec: public auth-bootstrap (Bearer-required, intentionally pre-approval — onboarding first paint)
 @app.get("/api/system/readiness")
 async def system_readiness(request: Request) -> dict[str, Any]:
     """Return the cockpit-facing readiness signal.
@@ -14940,9 +15932,16 @@ async def reload_model_catalog(request: Request) -> dict[str, str]:
 
 
 async def _require_admin(request: Request) -> dict[str, Any]:
-    """Require authenticated admin user."""
+    """Require authenticated admin user.
+
+    Checks ``real_is_admin`` (the un-shadowed privilege flag set by
+    ``require_approved_user``) so admin-only endpoints stay reachable when
+    the caller is in "view as user" mode. ``is_admin`` on the returned
+    dict still reflects the shadow, so any downstream visibility check
+    on the returned user dict honours the toggle.
+    """
     user = await require_approved_user(request, postgres_db)
-    if not user.get("is_admin", False):
+    if not user.get("real_is_admin", False):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
@@ -15601,8 +16600,13 @@ async def get_user(user_id: str, request: Request) -> dict[str, Any]:
 
 @app.post("/api/users")
 async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
-    """Create a new user with a default project (requires authentication)."""
-    await require_approved_user(request, postgres_db)
+    """Create a new user with a default project. Admin-only.
+
+    Real users are JIT-provisioned via Keycloak OIDC login (see
+    upsert_user_from_oidc). This endpoint is for admin user management
+    and tests.
+    """
+    await _require_admin(request)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
@@ -15665,8 +16669,13 @@ async def update_user(
 
 @app.delete("/api/users/{user_id}")
 async def delete_user(user_id: str, request: Request) -> dict[str, str]:
-    """Delete a user (requires authentication)."""
-    await require_approved_user(request, postgres_db)
+    """Delete a user. Admin-only.
+
+    Self-service deletion isn't exposed yet — it needs Keycloak sync and
+    explicit handling of orphaned jobs/threads/project_members. Add a
+    separate endpoint if/when the cockpit needs it.
+    """
+    await _require_admin(request)
     success = await postgres_db.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -15875,8 +16884,14 @@ async def _ensure_project_cloud_resources(
 
 
 @app.post("/api/projects")
-async def create_project(body: ProjectCreate) -> dict[str, Any]:
+async def create_project(body: ProjectCreate, request: Request) -> dict[str, Any]:
     """Create a new project with the requesting user as owner."""
+    # H5: pre-fix, this endpoint had no auth at all and trusted body.user_id,
+    # so any unauthenticated caller could create projects owned by anyone.
+    # Admins keep the ability to create on behalf of others (legitimate
+    # setup flow); regular users get bound to themselves.
+    user = await require_approved_user(request, postgres_db)
+    owner_id = body.user_id if user.get("is_admin") else str(user["id"])
     try:
         project = await postgres_db.create_project(
             name=body.name,
@@ -15889,7 +16904,7 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
         # Add creator as owner
         await postgres_db.add_project_member(
             project_id=str(project["id"]),
-            user_id=body.user_id,
+            user_id=owner_id,
             role="owner",
         )
 
@@ -15906,9 +16921,9 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                     is_managed=True,
                 )
                 # Grant creator read access
-                if body.user_id:
+                if owner_id:
                     try:
-                        creator = await postgres_db.get_user(body.user_id)
+                        creator = await postgres_db.get_user(owner_id)
                         if creator and creator.get("email"):
                             await gitea_client.grant_user_repo_access(
                                 creator["email"], repo_name
@@ -15934,28 +16949,56 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
 
 @app.get("/api/projects")
 async def list_projects(
+    request: Request,
     user_id: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
-    """List projects. If user_id provided, returns projects the user is a member of."""
+    """List projects visible to the caller.
+
+    Visibility model (G2):
+        * Admins see the full list, optionally narrowed by ``?user_id=`` or
+          by an MCP ``project:<uuid>`` token scope.
+        * Non-admins see only the projects they're a member of
+          (``get_projects_for_user(caller)``), narrowed by any MCP scope.
+        * A non-admin passing ``?user_id=`` for anyone other than themselves
+          is rejected (403). Self-query is allowed but redundant.
+    """
+    caller = await require_approved_user(request, postgres_db)
+    is_admin = bool(caller.get("is_admin"))
+    scope_pid = mcp_scope_project_id(caller)
+
+    if user_id is not None and not is_admin and str(user_id) != str(caller["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Not authorized to query other users' projects",
+        )
+
     try:
-        if user_id:
-            return await postgres_db.get_projects_for_user(user_id)
-        # Without user_id, return all projects (admin view)
-        async with postgres_db.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM projects WHERE status != 'deleted' ORDER BY updated_at DESC LIMIT 100"
-            )
-            return [dict(r) for r in rows]
+        if is_admin and user_id is None:
+            async with postgres_db.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM projects WHERE status != 'deleted' "
+                    "ORDER BY updated_at DESC LIMIT 100"
+                )
+                projects = [dict(r) for r in rows]
+        elif user_id is not None:
+            projects = await postgres_db.get_projects_for_user(user_id)
+        else:
+            projects = await postgres_db.get_projects_for_user(str(caller["id"]))
+
+        if scope_pid:
+            projects = [p for p in projects if str(p.get("id", "")) == str(scope_pid)]
+
+        return projects
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/api/projects/{project_id}")
-async def get_project(project_id: str) -> dict[str, Any]:
+async def get_project(request: Request, project_id: str) -> dict[str, Any]:
     """Get a single project by ID."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    _, project = await require_project_member(request, postgres_db, project_id)
 
     # Lazy-heal: projects created before the cloud-resource fix have no
     # folder handle. The helper is a no-op if the Space already exists.
@@ -16019,11 +17062,23 @@ async def get_project(project_id: str) -> dict[str, Any]:
 
 
 @app.patch("/api/projects/{project_id}")
-async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]:
-    """Update a project."""
+async def update_project(
+    project_id: str, body: ProjectUpdate, request: Request
+) -> dict[str, str]:
+    """Update a project. Caller must be a project owner or admin."""
+    # H5: pre-fix, anyone could rename any project, change its goal, or
+    # toggle cloud-storage settings.
+    await require_project_owner(request, postgres_db, project_id)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
+    # network_tier is admin-gated: a tier change widens what the project's
+    # workspaces can reach at the pod-network layer (e.g. home-allowed
+    # exposes the homelab LAN). Letting any project owner choose their own
+    # tier defeats the operator-side control plane. See
+    # docs/features/workspace_network_isolation.md §3.
+    if body.network_tier is not None:
+        await _require_admin(request)
     success = await postgres_db.update_project(project_id, **kwargs)
     if not success:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
@@ -16050,11 +17105,11 @@ async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]
 
 
 @app.delete("/api/projects/{project_id}")
-async def delete_project(project_id: str) -> dict[str, str]:
-    """Delete a project. Cannot delete default projects."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def delete_project(project_id: str, request: Request) -> dict[str, str]:
+    """Delete a project. Caller must be a project owner or admin. Cannot delete default projects."""
+    # H5: pre-fix, anyone could cascade-delete any project (repos,
+    # Keycloak groups, cloud folders, knowledge index, ...).
+    _, project = await require_project_owner(request, postgres_db, project_id)
     if project.get("is_default"):
         raise HTTPException(status_code=400, detail="Cannot delete a default project")
 
@@ -16116,20 +17171,23 @@ async def delete_project(project_id: str) -> dict[str, str]:
 
 
 @app.get("/api/projects/{project_id}/members")
-async def list_project_members(project_id: str) -> list[dict[str, Any]]:
+async def list_project_members(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
     """List members of a project with user info."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    await require_project_member(request, postgres_db, project_id)
     return await postgres_db.get_project_members(project_id)
 
 
 @app.post("/api/projects/{project_id}/members")
-async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[str, Any]:
-    """Add a member to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def add_project_member(
+    project_id: str, body: ProjectMemberAdd, request: Request
+) -> dict[str, Any]:
+    """Add a member to a project. Caller must be a project owner or admin."""
+    # H3: pre-fix, anyone could invite themselves as owner of any project
+    # and then access everything in it. This is the foundational
+    # privilege-escalation path that opens every other gate.
+    _, project = await require_project_owner(request, postgres_db, project_id)
     try:
         result = await postgres_db.add_project_member(
             project_id=project_id,
@@ -16170,9 +17228,11 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
 
 @app.patch("/api/projects/{project_id}/members/{user_id}")
 async def update_project_member(
-    project_id: str, user_id: str, body: ProjectMemberUpdate
+    project_id: str, user_id: str, body: ProjectMemberUpdate, request: Request
 ) -> dict[str, str]:
-    """Update a member's role in a project."""
+    """Update a member's role in a project. Caller must be a project owner or admin."""
+    # H3: role changes are sensitive — restrict to owners/admins.
+    await require_project_owner(request, postgres_db, project_id)
     success = await postgres_db.update_project_member_role(
         project_id=project_id, user_id=user_id, role=body.role
     )
@@ -16182,8 +17242,20 @@ async def update_project_member(
 
 
 @app.delete("/api/projects/{project_id}/members/{user_id}")
-async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]:
-    """Remove a member from a project. Cannot remove the last owner."""
+async def remove_project_member(
+    project_id: str, user_id: str, request: Request
+) -> dict[str, str]:
+    """Remove a member from a project. Owner/admin can remove anyone; any member can remove themselves. Cannot remove the last owner."""
+    # H3: pre-fix, anyone could remove anyone (only the last-owner check
+    # was enforced). Allow self-removal so members can leave projects.
+    caller = await require_approved_user(request, postgres_db)
+    if str(caller["id"]) != str(user_id) and not caller.get("is_admin"):
+        caller_role = await postgres_db.get_user_role_in_project(
+            project_id, str(caller["id"])
+        )
+        if caller_role != "owner":
+            raise HTTPException(status_code=403, detail="Project owner role required")
+
     # Check if this is the last owner
     role = await postgres_db.get_user_role_in_project(project_id, user_id)
     if role == "owner":
@@ -16230,24 +17302,21 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
 
 @app.get("/api/projects/{project_id}/repositories")
 async def list_project_repositories(
+    request: Request,
     project_id: str,
     role: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
     """List repositories attached to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    await require_project_member(request, postgres_db, project_id)
     return await postgres_db.get_project_repositories(project_id, role=role)
 
 
 @app.post("/api/projects/{project_id}/repositories")
 async def add_project_repository(
-    project_id: str, body: ProjectRepositoryCreate
+    request: Request, project_id: str, body: ProjectRepositoryCreate
 ) -> dict[str, Any]:
-    """Attach a repository to a project. Optionally creates a managed Gitea repo."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """Attach a repository to a project. Owner or admin only (creates managed Gitea repo)."""
+    await require_project_owner(request, postgres_db, project_id)
 
     repo_url = body.repo_url
     is_managed = False
@@ -16282,9 +17351,10 @@ async def add_project_repository(
 
 @app.patch("/api/projects/{project_id}/repositories/{repo_id}")
 async def update_project_repository(
-    project_id: str, repo_id: str, body: ProjectRepositoryUpdate
+    request: Request, project_id: str, repo_id: str, body: ProjectRepositoryUpdate
 ) -> dict[str, str]:
-    """Update a project repository."""
+    """Update a project repository. Owner or admin only."""
+    await require_project_owner(request, postgres_db, project_id)
     kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
     if not kwargs:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -16295,8 +17365,11 @@ async def update_project_repository(
 
 
 @app.delete("/api/projects/{project_id}/repositories/{repo_id}")
-async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, str]:
-    """Remove a repository from a project. Cannot remove the jobs repo."""
+async def remove_project_repository(
+    request: Request, project_id: str, repo_id: str
+) -> dict[str, str]:
+    """Remove a repository from a project. Owner or admin only. Cannot remove the jobs repo."""
+    await require_project_owner(request, postgres_db, project_id)
     repo = await postgres_db.get_project_repository(repo_id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
@@ -16318,35 +17391,44 @@ async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, 
 
 
 @app.get("/api/projects/{project_id}/datasources")
-async def list_project_datasources(project_id: str) -> list[dict[str, Any]]:
-    """List datasources linked to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def list_project_datasources(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
+    """List datasources linked to a project. F3: project membership required."""
+    await require_project_member(request, postgres_db, project_id)
     try:
-        return await postgres_db.list_project_datasources(project_id)
+        rows = await postgres_db.list_project_datasources(project_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    return redact_datasources(rows)
 
 
 @app.post("/api/projects/{project_id}/datasources/{datasource_id}")
 async def link_datasource_to_project(
+    request: Request,
     project_id: str,
     datasource_id: str,
     body: ProjectDatasourceSettings | None = None,
 ) -> dict[str, str]:
     """Link an existing datasource to a project.
 
+    F3: caller must be project owner of the target project AND must be
+    able to see the datasource (admin / creator / member of one of its
+    projects). Prevents a project owner from probing for stranger
+    datasources by guessing UUIDs.
+
     Optionally pass project-level overrides (read_only, description).
     Also creates a knowledge entry so agents discover the datasource.
     """
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    user, _ = await require_project_owner(request, postgres_db, project_id)
     ds = await postgres_db.get_datasource(datasource_id)
     if not ds:
         raise HTTPException(
             status_code=404, detail=f"Datasource '{datasource_id}' not found"
+        )
+    if not await user_can_access_datasource(user, postgres_db, ds):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to link this datasource"
         )
 
     try:
@@ -16371,14 +17453,16 @@ async def link_datasource_to_project(
 
 @app.patch("/api/projects/{project_id}/datasources/{datasource_id}")
 async def update_project_datasource(
+    request: Request,
     project_id: str,
     datasource_id: str,
     body: ProjectDatasourceSettings,
 ) -> dict[str, str]:
-    """Update project-level settings for a linked datasource.
+    """Update project-level settings for a linked datasource. F3: project owner only.
 
     Pass null to clear an override and fall back to datasource defaults.
     """
+    await require_project_owner(request, postgres_db, project_id)
     success = await postgres_db.update_project_datasource(
         project_id,
         datasource_id,
@@ -16406,12 +17490,13 @@ async def update_project_datasource(
 
 @app.delete("/api/projects/{project_id}/datasources/{datasource_id}")
 async def unlink_datasource_from_project(
-    project_id: str, datasource_id: str
+    request: Request, project_id: str, datasource_id: str
 ) -> dict[str, str]:
-    """Unlink a datasource from a project.
+    """Unlink a datasource from a project. F3: project owner only.
 
     Also removes the knowledge entry.
     """
+    await require_project_owner(request, postgres_db, project_id)
     removed = await postgres_db.unlink_datasource_from_project(
         project_id, datasource_id
     )
@@ -16426,23 +17511,24 @@ async def unlink_datasource_from_project(
 
 
 @app.post("/api/projects/{project_id}/jobs")
-async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
-    """Create a job within a project — delegates to create_job."""
+async def create_project_job(
+    request: Request, project_id: str, job: JobCreate
+) -> dict[str, Any]:
+    """Create a job within a project — delegates to create_job. Requires editor or higher."""
+    await require_project_member(request, postgres_db, project_id, min_role="editor")
     job.project_id = project_id
     return await create_job(job)
 
 
 @app.get("/api/projects/{project_id}/jobs")
 async def list_project_jobs(
+    request: Request,
     project_id: str,
     status: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """List jobs belonging to a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with postgres_db.acquire() as conn:
             query = "SELECT * FROM job_summary WHERE project_id = $1"
@@ -16472,12 +17558,21 @@ async def list_project_jobs(
 
 
 @app.post("/api/jobs/{job_id}/promote")
-async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
+async def promote_job(
+    request: Request,
+    job_id: str,
+    body: PromoteRequest,
+) -> dict[str, Any]:
     """Promote a default-project job into a dedicated project.
 
     Creates a new project, seeds its jobs repo from the job's branch content
     (preserving git history), and moves the job to the new project.
+
+    P4c: ``body.user_id`` is forced to the caller (mirrors F2 — no cross-user
+    promotion).
     """
+    caller, _ = await require_job_access(request, postgres_db, job_id)
+    body.user_id = caller["id"]
     import shutil
     import subprocess
     import tempfile
@@ -16517,16 +17612,16 @@ async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
 
         # Create new project
         new_project = await postgres_db.create_project(
-            name=request.name,
-            description=request.description,
-            goal=request.goal,
+            name=body.name,
+            description=body.description,
+            goal=body.goal,
         )
         new_project_id = str(new_project["id"])
 
         # Add user as owner
         await postgres_db.add_project_member(
             project_id=new_project_id,
-            user_id=request.user_id,
+            user_id=body.user_id,
             role="owner",
         )
 
@@ -17001,11 +18096,9 @@ async def _delete_datasource_knowledge(project_id: str, datasource_id: str) -> N
 
 
 @app.get("/api/projects/{project_id}/knowledge/summary")
-async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
-    """Get knowledge base summary statistics for a project."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def get_knowledge_summary(request: Request, project_id: str) -> dict[str, Any]:
+    """Get knowledge base summary statistics for a project. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17049,6 +18142,7 @@ async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
 
 @app.get("/api/projects/{project_id}/knowledge")
 async def list_knowledge_notes(
+    request: Request,
     project_id: str,
     note_type: str | None = Query(default=None, alias="type"),
     status: str | None = Query(default=None),
@@ -17057,10 +18151,8 @@ async def list_knowledge_notes(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
-    """List knowledge notes for a project with optional filters."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """List knowledge notes for a project with optional filters. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17114,8 +18206,11 @@ async def list_knowledge_notes(
 
 
 @app.get("/api/projects/{project_id}/knowledge/{note_id}")
-async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
-    """Get a single knowledge note with full content."""
+async def get_knowledge_note(
+    request: Request, project_id: str, note_id: str
+) -> dict[str, Any]:
+    """Get a single knowledge note with full content. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
@@ -17154,13 +18249,12 @@ async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/knowledge/search")
 async def search_knowledge(
+    request: Request,
     project_id: str,
     body: KnowledgeSearchRequest,
 ) -> dict[str, Any]:
-    """Hybrid search over project knowledge base."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    """Hybrid search over project knowledge base. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
 
     try:
         async with vector_db.acquire() as conn:
@@ -17213,11 +18307,13 @@ async def search_knowledge(
 
 @app.patch("/api/projects/{project_id}/knowledge/{note_id}")
 async def update_knowledge_note(
+    request: Request,
     project_id: str,
     note_id: str,
     body: KnowledgeNoteUpdate,
 ) -> dict[str, str]:
-    """Update a knowledge note's status or tags."""
+    """Update a knowledge note's status or tags. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     valid_statuses = {"active", "resolved", "superseded", "archived"}
     if body.status and body.status not in valid_statuses:
         raise HTTPException(
@@ -17293,8 +18389,11 @@ async def update_knowledge_note(
 
 
 @app.delete("/api/projects/{project_id}/knowledge/{note_id}")
-async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]:
-    """Hard delete a knowledge note from both stores."""
+async def delete_knowledge_note(
+    request: Request, project_id: str, note_id: str
+) -> dict[str, str]:
+    """Hard delete a knowledge note from both stores. F5: member-only."""
+    await require_project_member(request, postgres_db, project_id)
     try:
         # Delete from vector DB
         async with vector_db.acquire() as conn:
@@ -17328,11 +18427,14 @@ async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]
 
 
 @app.post("/api/projects/{project_id}/knowledge/export")
-async def export_knowledge(project_id: str) -> dict[str, Any]:
-    """Export project knowledge base as Obsidian-compatible markdown files."""
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+async def export_knowledge(request: Request, project_id: str) -> dict[str, Any]:
+    """Export project knowledge base as Obsidian-compatible markdown files.
+
+    F5: member-only. Same access requirement as the per-note read endpoint
+    — the bulk export is equivalent to scraping the list and getting each
+    note individually, so a tighter gate wouldn't close a real gap.
+    """
+    _, project = await require_project_member(request, postgres_db, project_id)
 
     kg = _get_knowledge_graph()
     if not kg:
@@ -17409,16 +18511,23 @@ async def export_knowledge(project_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/builder/sessions")
-async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
+async def create_builder_session(
+    request: Request, body: BuilderSessionCreate
+) -> dict[str, Any]:
     """Create a new builder chat session.
 
     Called when the user sends their first message in the builder chat.
     The session is not linked to a job yet (that happens on job submission).
     """
+    caller = await require_approved_user(request, postgres_db)
+    # Force ownership to the caller — body.user_id is ignored to prevent
+    # session impersonation (F2 / docs/multi_tenancy.md). Admins create
+    # their own sessions like any other user; an on-behalf-of admin flow
+    # would be a separate endpoint.
     try:
         session = await postgres_db.create_builder_session(
             expert_id=body.expert_id,
-            user_id=body.user_id,
+            user_id=str(caller["id"]),
         )
         return session
     except Exception as e:
@@ -17426,19 +18535,29 @@ async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
 
 
 @app.get("/api/builder/sessions")
-async def list_builder_sessions(user_id: str | None = None) -> list[dict[str, Any]]:
-    """List builder sessions for a user."""
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id query parameter required")
-    return await postgres_db.list_builder_sessions(user_id)
+async def list_builder_sessions(
+    request: Request, user_id: str | None = None
+) -> list[dict[str, Any]]:
+    """List builder sessions for the caller.
+
+    The ``user_id`` query parameter is supported for back-compat with the
+    cockpit but must match the caller (or the caller must be admin).
+    Cross-user listing is rejected with 403 — see F2 in
+    ``docs/multi_tenancy.md``.
+    """
+    caller = await require_approved_user(request, postgres_db)
+    target = user_id or str(caller["id"])
+    if target != str(caller["id"]) and not caller.get("is_admin"):
+        raise HTTPException(
+            status_code=403, detail="Not authorized to list another user's sessions"
+        )
+    return await postgres_db.list_builder_sessions(target)
 
 
 @app.get("/api/builder/sessions/{session_id}")
-async def get_builder_session(session_id: str) -> dict[str, Any]:
-    """Get builder session details."""
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_builder_session(request: Request, session_id: str) -> dict[str, Any]:
+    """Get builder session details. Owner or admin only (F2)."""
+    _, session = await require_builder_session_owner(request, postgres_db, session_id)
     return session
 
 
@@ -17507,16 +18626,17 @@ def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str,
 
 
 @app.get("/api/builder/sessions/{session_id}/messages")
-async def get_builder_messages(session_id: str) -> list[dict[str, Any]]:
-    """Get all messages for a builder session."""
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def get_builder_messages(
+    request: Request, session_id: str
+) -> list[dict[str, Any]]:
+    """Get all messages for a builder session. Owner or admin only (F2)."""
+    await require_builder_session_owner(request, postgres_db, session_id)
     return await postgres_db.get_builder_messages(session_id)
 
 
 @app.post("/api/builder/sessions/{session_id}/message")
 async def send_builder_message(
+    request: Request,
     session_id: str,
     body: BuilderMessageRequest,
 ) -> StreamingResponse:
@@ -17531,10 +18651,15 @@ async def send_builder_message(
     - done: stream complete with usage info
     - error: error information
     """
-    # Verify session exists
-    session = await postgres_db.get_builder_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # F2: session ownership gate + active_*_id validation. active_job_id /
+    # active_project_id end up in the LLM system prompt and steer
+    # inspection tools; an attacker who could pass arbitrary IDs would
+    # leak job/project data via the model's responses. Fail closed.
+    _, session = await require_builder_session_owner(request, postgres_db, session_id)
+    if body.active_job_id:
+        await require_job_access(request, postgres_db, body.active_job_id)
+    if body.active_project_id:
+        await require_project_member(request, postgres_db, body.active_project_id)
 
     # Store user message
     await postgres_db.create_builder_message(

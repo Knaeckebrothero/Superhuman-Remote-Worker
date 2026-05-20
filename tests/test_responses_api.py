@@ -7,7 +7,10 @@ content block format used by models like GPT-5.2-pro.
 
 from unittest.mock import MagicMock
 
-from src.llm.reasoning_chat import _extract_responses_api_reasoning
+from src.llm.reasoning_chat import (
+    _extract_responses_api_reasoning,
+    extract_reasoning_text_from_block,
+)
 from src.core.archiver import _normalize_content
 
 
@@ -152,6 +155,71 @@ class TestExtractResponsesApiReasoning:
         _extract_responses_api_reasoning(msg)
         assert msg.additional_kwargs["existing_key"] == "existing_value"
         assert msg.additional_kwargs["reasoning_content"] == "Thinking"
+
+
+# =============================================================================
+# extract_reasoning_text_from_block tests
+# =============================================================================
+
+
+class TestExtractReasoningTextFromBlock:
+    """Tests for the streaming-tolerant reasoning text extractor."""
+
+    def test_empty_block(self):
+        assert extract_reasoning_text_from_block({}) == ""
+
+    def test_direct_text_field(self):
+        """Some streaming chunks ship text directly on the block."""
+        assert extract_reasoning_text_from_block({"text": "hi"}) == "hi"
+
+    def test_summary_items(self):
+        block = {
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "First."},
+                {"type": "summary_text", "text": "Second."},
+            ],
+        }
+        # Streaming concatenation: no separator between deltas.
+        assert extract_reasoning_text_from_block(block) == "First.Second."
+
+    def test_content_items(self):
+        block = {
+            "type": "reasoning",
+            "content": [
+                {"type": "reasoning_text", "text": "A"},
+                {"type": "reasoning_text", "text": "B"},
+            ],
+        }
+        assert extract_reasoning_text_from_block(block) == "AB"
+
+    def test_direct_and_summary_combined(self):
+        """Direct text + summary items concatenated in order."""
+        block = {
+            "text": "direct ",
+            "summary": [{"text": "summary"}],
+        }
+        assert extract_reasoning_text_from_block(block) == "direct summary"
+
+    def test_skips_non_string_text(self):
+        """Items with non-string text fields are skipped."""
+        block = {
+            "summary": [
+                {"text": "ok"},
+                {"text": None},
+                {"text": 42},
+                {"other": "ignored"},
+            ],
+        }
+        assert extract_reasoning_text_from_block(block) == "ok"
+
+    def test_skips_non_dict_items(self):
+        block = {"summary": ["raw string", {"text": "kept"}, None]}
+        assert extract_reasoning_text_from_block(block) == "kept"
+
+    def test_none_summary_handled(self):
+        """A None summary (explicit absence) shouldn't crash."""
+        assert extract_reasoning_text_from_block({"summary": None}) == ""
 
 
 # =============================================================================

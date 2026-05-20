@@ -109,7 +109,14 @@ The key is written to a temp file at clone time and configured via `GIT_SSH_COMM
 
 Both fit naturally into the existing `credentials` JSONB field on the datasources table.
 
-#### Future: General Credentials Store
+#### Future: General Credentials Store — **superseded**
+
+> Superseded by [[credential_file_datasources]] (shipped 2026-05-17). The follow-on direction landed as **three new datasource types** rather than a sibling credentials store: `kubeconfig`, `ssh_key`, and `generic_file`. Each carries a `credentials.files[]` payload that is materialized as files on the agent's filesystem at job start (`~/.kube/config`, `~/.ssh/<slug>`, user-chosen paths). The whole `datasources.credentials` JSONB column is now AES-256-GCM-encrypted at rest, so the "secrets in plain text" caveat from the original design no longer applies.
+>
+> If a true cross-datasource credentials registry (one secret referenced by N datasources) becomes desirable later, it can build on the same encryption + materialization machinery; the design notes below are kept for historical context.
+
+<details>
+<summary>Original proposal (historical)</summary>
 
 Beyond datasources, an agent may need credentials for other purposes (API keys, service accounts, etc.). A general-purpose credentials section in the agent config is worth considering:
 
@@ -128,6 +135,8 @@ credentials:
 ```
 
 This is out of scope for the initial implementation but should be kept in mind. Datasource credentials stay in the datasources table for now. A unified credentials store can be added later and datasources can reference it by name instead of embedding secrets directly.
+
+</details>
 
 ### 4. Unique Constraint (One Per Type Per Job)
 
@@ -254,11 +263,9 @@ Connection test: attempt clone to a temp directory, verify access, clean up.
 - Support multiple git datasources per job with distinct names/paths
 - Tool disambiguation (which repo to operate on)
 
-### Phase 3: General Credentials Store (Deferred)
+### Phase 3: General Credentials Store — **superseded**
 
-- Unified credentials management in agent config
-- Datasources reference credentials by name
-- Secrets encryption at rest
+The follow-on work landed as [[credential_file_datasources]] (shipped 2026-05-17): three new datasource types (`kubeconfig`, `ssh_key`, `generic_file`) whose `credentials.files[]` payload is materialized as files on the agent's filesystem. Encryption-at-rest for the `datasources.credentials` column shipped alongside.
 
 ## Open Questions
 

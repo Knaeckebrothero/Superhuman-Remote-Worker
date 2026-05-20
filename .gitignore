@@ -7,9 +7,6 @@ orchestrator/workspace/*
 project_documentation/*
 docker/certs/*
 
-Advanced-LLM-Chat/*
-claude_design_system/*
-
 # SSH keys (generated for workspace/VM access — never commit)
 .dev/
 .local-ssh/

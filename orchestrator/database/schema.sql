@@ -903,7 +903,7 @@ CREATE TABLE IF NOT EXISTS datasources (
     description TEXT,                      -- What this datasource contains (included in agent context)
 
     -- Connection details
-    type TEXT NOT NULL,                    -- 'generic', 'repository', 'postgresql', 'neo4j', 'mongodb', 'webdav'
+    type TEXT NOT NULL,                    -- 'generic', 'repository', 'postgresql', 'neo4j', 'mongodb', 'webdav', 'kubeconfig', 'ssh_key', 'generic_file'
     connection_url TEXT,                   -- Connection string (nullable for generic datasources using env vars only)
     credentials JSONB DEFAULT '{}',       -- Auth details: env_vars dict (generic), auth_method+token/ssh_key (repository), type-specific (managed)
     cli_hint TEXT,                         -- Suggested CLI command (e.g. "psql $DATABASE_URL")

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 SYNC_IGNORE_PATTERNS = [
     ".git/",
     "repos/",
+    "projects/",
     "tools/",
     "todos.yaml",
     "archive/",
@@ -61,10 +62,15 @@ class WorkspaceSyncBase(abc.ABC):
         *,
         poll_interval: int = 15,
         workspace_backend: Optional["WorkspaceBackend"] = None,
+        mount_subdir: str = "",
     ) -> None:
         self._workspace_path = Path(workspace_path)
         self._poll_interval = poll_interval
         self._backend = workspace_backend
+        # Workspace-relative path of this mount inside the backend's filesystem.
+        # Empty string means "the whole workspace" (legacy single-folder mount).
+        # For project mounts, e.g. "projects/alpha". No leading/trailing slash.
+        self._mount_subdir = mount_subdir.strip("/")
 
         self._local_state: dict[str, float] = {}
         self._remote_state: dict[str, str] = {}
@@ -120,10 +126,26 @@ class WorkspaceSyncBase(abc.ABC):
             pass
         self._remote_dirs.add(rel_dir)
 
+    def _backend_path(self, mount_rel_path: str) -> str:
+        """Translate a mount-relative path to a workspace-backend path."""
+        if not self._mount_subdir:
+            return mount_rel_path
+        return (
+            f"{self._mount_subdir}/{mount_rel_path}"
+            if mount_rel_path
+            else self._mount_subdir
+        )
+
     def _walk_backend_files(self) -> list[str]:
-        """Recursively list files from the remote workspace backend."""
+        """Recursively list files from the remote workspace backend.
+
+        Returns *mount-relative* paths — i.e. with ``mount_subdir`` stripped
+        so the rest of the algorithm operates in the mount's coordinate
+        system, matching what the cloud-side ``webdav_url`` expects.
+        """
         results: list[str] = []
-        stack = [""]
+        stack = [self._mount_subdir]
+        prefix = f"{self._mount_subdir}/" if self._mount_subdir else ""
         while stack:
             dir_path = stack.pop()
             try:
@@ -134,25 +156,36 @@ class WorkspaceSyncBase(abc.ABC):
                 if entry.endswith("/"):
                     stack.append(entry.rstrip("/"))
                 else:
-                    results.append(entry)
+                    if prefix and entry.startswith(prefix):
+                        results.append(entry[len(prefix) :])
+                    elif not prefix:
+                        results.append(entry)
         return results
 
-    async def push(self) -> list[str]:
-        """Push locally modified/new files to the cloud."""
+    async def push(self, *, strict: bool = False) -> list[str]:
+        """Push locally modified/new files to the cloud.
+
+        When ``strict`` is True, transport-level and per-file errors raise
+        instead of being logged and swallowed. This is what the
+        ``WorkspaceSyncCoordinator`` uses to enforce the raise-and-block
+        policy at turn boundaries.
+        """
         pushed: list[str] = []
         try:
             await self._ensure_ready()
             if self._backend:
-                pushed = await self._push_via_backend()
+                pushed = await self._push_via_backend(strict=strict)
             else:
-                pushed = await self._push_local()
+                pushed = await self._push_local(strict=strict)
             if pushed:
                 logger.info("Synced %d file(s) to cloud", len(pushed))
         except Exception as e:
+            if strict:
+                raise
             logger.warning("Push sync failed: %s", e)
         return pushed
 
-    async def _push_via_backend(self) -> list[str]:
+    async def _push_via_backend(self, *, strict: bool = False) -> list[str]:
         """Push files from a remote workspace backend. Uses size-based dedup."""
         pushed: list[str] = []
         files = await asyncio.to_thread(self._walk_backend_files)
@@ -163,7 +196,7 @@ class WorkspaceSyncBase(abc.ABC):
             try:
                 content = await asyncio.to_thread(
                     self._backend.read_file,  # type: ignore[union-attr]
-                    rel_path,
+                    self._backend_path(rel_path),
                     True,
                 )
                 if isinstance(content, str):
@@ -189,10 +222,12 @@ class WorkspaceSyncBase(abc.ABC):
                     except OSError:
                         pass
             except Exception as e:
+                if strict:
+                    raise
                 logger.debug("Push failed for %s: %s", rel_path, e)
         return pushed
 
-    async def _push_local(self) -> list[str]:
+    async def _push_local(self, *, strict: bool = False) -> list[str]:
         """Push files from the local filesystem. Uses mtime-based dedup."""
         pushed: list[str] = []
         for root, _dirs, files in os.walk(self._workspace_path):
@@ -215,17 +250,26 @@ class WorkspaceSyncBase(abc.ABC):
                     self._local_state[rel_path] = mtime
                     pushed.append(rel_path)
                 except Exception as e:
+                    if strict:
+                        raise
                     logger.debug("Push failed for %s: %s", rel_path, e)
         return pushed
 
-    async def pull(self) -> list[str]:
-        """Pull remotely modified/new files from the cloud into the workspace."""
+    async def pull(self, *, strict: bool = False) -> list[str]:
+        """Pull remotely modified/new files from the cloud into the workspace.
+
+        When ``strict`` is True, transport-level and per-file errors raise
+        instead of being logged and swallowed. Used by the coordinator at
+        turn boundaries.
+        """
         pulled: list[str] = []
         try:
             await self._ensure_ready()
             try:
                 remote_files = await self._list_remote_files()
             except Exception:
+                if strict:
+                    raise
                 # Folder doesn't exist yet — nothing to pull
                 return pulled
 
@@ -248,11 +292,15 @@ class WorkspaceSyncBase(abc.ABC):
                         await self._pull_file_local(path, etag)
                     pulled.append(path)
                 except Exception as e:
+                    if strict:
+                        raise
                     logger.debug("Pull failed for %s: %s", path, e)
 
             if pulled:
                 logger.info("Pulled %d file(s) from cloud", len(pulled))
         except Exception as e:
+            if strict:
+                raise
             logger.warning("Pull sync failed: %s", e)
         return pulled
 
@@ -265,7 +313,7 @@ class WorkspaceSyncBase(abc.ABC):
                 content = f.read()
             await asyncio.to_thread(
                 self._backend.write_file,  # type: ignore[union-attr]
-                path,
+                self._backend_path(path),
                 content,
             )
             self._remote_state[path] = etag
@@ -283,10 +331,10 @@ class WorkspaceSyncBase(abc.ABC):
         self._remote_state[path] = etag
         self._local_state[path] = local_path.stat().st_mtime
 
-    async def full_sync(self) -> tuple[list[str], list[str]]:
+    async def full_sync(self, *, strict: bool = False) -> tuple[list[str], list[str]]:
         """Push first, then pull."""
-        pushed = await self.push()
-        pulled = await self.pull()
+        pushed = await self.push(strict=strict)
+        pulled = await self.pull(strict=strict)
         return pushed, pulled
 
     # ------------------------------------------------------------ Poll lifecycle

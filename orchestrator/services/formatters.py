@@ -2416,7 +2416,11 @@ def format_persistent_thread_detail(thread: dict[str, Any]) -> str:
         except (ValueError, TypeError):
             metadata = {}
 
-    project_ids = metadata.get("project_ids")
+    # Phase 1 of cloud_collaboration_model.md §9: project attachment is
+    # exposed on the thread response as a top-level ``project_ids`` field
+    # (derived from ``thread_mounts``). The legacy ``metadata.project_ids``
+    # JSONB key is no longer written.
+    project_ids = thread.get("project_ids")
     if project_ids:
         lines.append(f"Project IDs: {', '.join(str(p) for p in project_ids)}")
 

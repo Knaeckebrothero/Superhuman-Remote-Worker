@@ -5,6 +5,7 @@ import {of, throwError} from 'rxjs';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
 import {IndexedDbService} from './indexed-db.service';
+import {AppToastService} from '../../ui/toast';
 import {
     AssistantTurn,
     isAssistantTurn,
@@ -130,6 +131,16 @@ function createService(opts: {
         run: <T>(fn: () => T) => fn(),
     };
 
+    const mockToast: any = {
+        show: vi.fn(),
+        info: vi.fn(),
+        success: vi.fn(),
+        warning: vi.fn(),
+        danger: vi.fn(),
+        dismiss: vi.fn(),
+        dismissAll: vi.fn(),
+    };
+
     const sseInstances: MockEventSource[] = [];
 
     function MockEventSourceCtor(this: any, url: string, _init?: EventSourceInit) {
@@ -165,6 +176,7 @@ function createService(opts: {
             {provide: ApiService, useValue: mockApi},
             {provide: IndexedDbService, useValue: mockCache},
             {provide: NgZone, useValue: mockZone},
+            {provide: AppToastService, useValue: mockToast},
         ],
     });
 
@@ -342,6 +354,83 @@ describe('PersistentChatService — connect()', () => {
         expect(service.connectionState()).toBe('connected');
         expect(service.isConnected()).toBe(true);
         expect(service.error()).toBeNull();
+    });
+});
+
+describe('PersistentChatService — createAndConnect()', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('clears prior session turns + threadId synchronously, before the POST resolves', async () => {
+        const {service, mockHttp} = createService();
+
+        // Seed a prior session so the bug reproduces: connect to thread-A,
+        // then create a new thread. Without the synchronous reset in
+        // createAndConnect(), thread-A's turns would still be visible
+        // throughout the (potentially multi-second) POST + boot phase.
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) {
+                return of({
+                    messages: [
+                        {
+                            id: 'u-prev',
+                            role: 'human',
+                            content: 'Hello from thread A',
+                            tool_calls: null,
+                            turn_number: 1,
+                            created_at: '2026-05-15T08:00:00Z',
+                        },
+                    ],
+                    total: 1,
+                });
+            }
+            return of({status: 'active', title: 'Old session', total_turns: 1});
+        });
+        await service.connect('thread-A');
+        expect(service.turns().length).toBeGreaterThan(0);
+        expect(service.threadId()).toBe('thread-A');
+
+        // Make the POST hang so we can observe the state during the await.
+        let resolvePost: (v: any) => void = () => {};
+        mockHttp.post.mockReturnValue({
+            subscribe(observer: any) {
+                resolvePost = (v) => {
+                    observer.next(v);
+                    observer.complete();
+                };
+                return {unsubscribe: () => {}};
+            },
+        });
+
+        const promise = service.createAndConnect({config_name: 'scholar'});
+
+        // Synchronous part of createAndConnect must have already cleared
+        // the prior session's content. Without the fix, turns would still
+        // contain thread-A's user message.
+        expect(service.turns()).toEqual([]);
+        expect(service.threadId()).toBeNull();
+        expect(service.isCreating()).toBe(true);
+        expect(service.startupPhase()).toBe('creating');
+
+        // Let the POST resolve so the test cleans up.
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.endsWith('/messages')) return of({messages: [], total: 0});
+            return of({status: 'active', total_turns: 0});
+        });
+        resolvePost({thread_id: 'thread-new'});
+        await promise;
+        expect(service.threadId()).toBe('thread-new');
     });
 });
 
@@ -958,23 +1047,75 @@ describe('PersistentChatService — control WS frame filtering', () => {
         expect(service.startupPhase()).toBe('connecting');
     });
 
-    it('drops non-status frames on the control WS to avoid double-dispatch with SSE', async () => {
+    it('drops _seq-stamped frames on the control WS to avoid double-dispatch with SSE', async () => {
         const {service, wsInstances} = await readySession();
         const turnsBefore = service.turns().length;
 
-        // turn.started would create a streaming turn if dispatched.
-        fireWsFrame(wsInstances[0], {method: 'turn.started', params: {turn_id: 99}});
+        // Broadcast events carry params._seq = [epoch, seq] from the agent's
+        // _broadcast() — SSE will redeliver them, so the WS copy is discarded.
+        fireWsFrame(wsInstances[0], {
+            method: 'turn.started',
+            params: {turn_id: 99, _seq: [0, 12]},
+        });
         expect(service.currentStreamingTurn()).toBeNull();
 
-        // token would attach text to the streaming turn if dispatched.
-        fireWsFrame(wsInstances[0], {method: 'token', params: {content: 'should-be-dropped'}});
+        fireWsFrame(wsInstances[0], {
+            method: 'token',
+            params: {content: 'should-be-dropped', _seq: [0, 13]},
+        });
         expect(service.currentStreamingTurn()).toBeNull();
 
-        // ready would flip sessionReady if dispatched — leave that to SSE.
-        fireWsFrame(wsInstances[0], {method: 'ready', params: {}});
+        fireWsFrame(wsInstances[0], {method: 'ready', params: {_seq: [0, 14]}});
         expect(service.sessionReady()).toBe(false);
 
         expect(service.turns().length).toBe(turnsBefore);
+    });
+
+    it('processes session.state from the control WS (WS-direct, no _seq)', async () => {
+        // Regression: reconnect to an idle session whose cached SSE cursor sits
+        // past the most recent `ready` event. The agent's session.state welcome
+        // frame is the only thing that arrives over the WS, and it must flip
+        // sessionReady so the UI clears the "Establishing connection" card.
+        const {service, wsInstances} = await readySession();
+        expect(service.sessionReady()).toBe(false);
+
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {
+                thread_id: 'thread-status',
+                permission_mode: 'manual',
+                narration_mode: 'verbose',
+                turn_count: 1,
+                model: 'claude-opus-4-7',
+                temperature: 0.5,
+            },
+        });
+
+        expect(service.sessionReady()).toBe(true);
+        expect(service.permissionMode()).toBe('manual');
+        expect(service.modelName()).toBe('claude-opus-4-7');
+    });
+
+    it('clears a stale "Agent not ready" error once session.state arrives', async () => {
+        // Regression: during the WS reconnect storm at session attach the agent
+        // rejects each /ws/chat with an `error: Agent not ready` frame until
+        // attach completes. The eventual session.state must wipe the stale
+        // banner so the UI doesn't show a red error contradicting a healthy
+        // session.
+        const {service, wsInstances} = await readySession();
+
+        fireWsFrame(wsInstances[0], {
+            method: 'error',
+            params: {message: 'Agent not ready'},
+        });
+        expect(service.error()).toBe('Agent not ready');
+
+        fireWsFrame(wsInstances[0], {
+            method: 'session.state',
+            params: {thread_id: 'thread-status'},
+        });
+        expect(service.error()).toBeNull();
+        expect(service.sessionReady()).toBe(true);
     });
 
     it('silently ignores malformed WS frames', async () => {

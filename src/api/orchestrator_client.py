@@ -83,6 +83,7 @@ class OrchestratorClient:
         hostname: str,
         config_name: str,
         pid: Optional[int] = None,
+        user_id: Optional[str] = None,
     ):
         """Initialize the orchestrator client.
 
@@ -93,6 +94,13 @@ class OrchestratorClient:
             hostname: Hostname for identification
             config_name: Agent configuration name (e.g., "creator", "validator")
             pid: Optional process ID
+            user_id: Originating user UUID. When set, the client attaches
+                ``X-MCP-User-Id`` so the orchestrator's
+                ``_get_user_from_mcp_headers`` path can resolve the user
+                on routes guarded by ``require_approved_user`` /
+                ``require_job_access``. Worker-mode and lifecycle calls
+                (register, heartbeat) leave this unset and continue to
+                authenticate as anonymous-internal via X-Internal-Key.
         """
         self.orchestrator_url = orchestrator_url.rstrip("/")
         self.pod_ip = pod_ip
@@ -100,6 +108,7 @@ class OrchestratorClient:
         self.hostname = hostname
         self.config_name = config_name
         self.pid = pid or os.getpid()
+        self.user_id = user_id
 
         self.agent_id: Optional[str] = None
         self.heartbeat_interval: int = 60  # Default, may be updated by orchestrator
@@ -109,9 +118,28 @@ class OrchestratorClient:
         self._stop_heartbeat = asyncio.Event()
 
     async def connect(self) -> None:
-        """Initialize the HTTP client."""
+        """Initialize the HTTP client.
+
+        Attaches ``X-Internal-Key`` to every request when ``MCP_INTERNAL_KEY``
+        is set in the agent's env. The orchestrator's Track B (P4b) gates
+        check this header on agent-internal endpoints (register, heartbeat,
+        job-complete, etc.) and on the dual-callable job mutation paths
+        (cancel/pause/resume/approve/subjob-merge/messages-send). Without
+        the key the agent's calls would be rejected as anonymous external
+        traffic.
+
+        When the client was constructed with a ``user_id``, ``X-MCP-User-Id``
+        is also attached so the orchestrator can resolve the originating
+        user on require_approved_user / require_job_access endpoints.
+        """
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            headers: dict[str, str] = {}
+            internal_key = os.getenv("MCP_INTERNAL_KEY", "")
+            if internal_key:
+                headers["X-Internal-Key"] = internal_key
+            if self.user_id:
+                headers["X-MCP-User-Id"] = self.user_id
+            self._client = httpx.AsyncClient(timeout=30.0, headers=headers)
 
     async def close(self) -> None:
         """Close the HTTP client."""

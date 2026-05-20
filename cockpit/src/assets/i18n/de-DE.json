@@ -19,6 +19,7 @@
     "jobs": "Aufträge",
     "projects": "Projekte",
     "datasources": "Datenquellen",
+    "automations": "Automationen",
     "create": "Erstellen",
     "debug": "Debug",
     "settings": "Einstellungen",
@@ -56,6 +57,69 @@
       "active": "aktiv",
       "archived": "archiviert",
       "deleted": "gelöscht"
+    },
+    "error": {
+      "noAccess": "Sie haben keinen Zugriff auf dieses Projekt."
+    }
+  },
+  "automations": {
+    "title": "Automationen",
+    "subtitle": "Lasse Aufträge nach Zeitplan laufen. Alles andere geht über die API.",
+    "new": "Neue Automation",
+    "list": {
+      "empty": "Noch keine Automationen",
+      "emptyDetail": "Mit Zeitplänen laufen deine Agenten von selbst — zum Beispiel jeden Montagmorgen Instagram-Posts entwerfen.",
+      "enabled": "Aktiv",
+      "disabled": "Pausiert",
+      "expert": "Experte",
+      "nextRun": "Nächster Lauf",
+      "lastFired": "Zuletzt ausgelöst",
+      "lastStatus": "Letzter Status",
+      "openProject": "Projekt öffnen",
+      "runNow": "Jetzt ausführen",
+      "toggleAria": "Automation aktivieren oder pausieren",
+      "confirmDelete": "Die Automation \"{{name}}\" löschen? Das kann nicht rückgängig gemacht werden.",
+      "softCap": "Du hast {{count}} Automationen. Empfohlen sind höchstens 20 — überlege, vorhandene zusammenzuführen, bevor du weitere anlegst."
+    },
+    "editor": {
+      "titleCreate": "Neue Automation",
+      "titleEdit": "Automation bearbeiten",
+      "name": "Name",
+      "namePlaceholder": "z. B. Montag Instagram-Entwürfe",
+      "description": "Beschreibung (optional)",
+      "descriptionPlaceholder": "Was macht diese Automation?",
+      "preset": "Zeitplan",
+      "time": "Uhrzeit",
+      "minute": "Minute der Stunde",
+      "customCron": "Cron-Ausdruck",
+      "timezone": "Zeitzone",
+      "preview": "Vorschau",
+      "expert": "Experte",
+      "prompt": "Anweisung",
+      "promptPlaceholder": "Was soll der Agent tun, wenn die Automation auslöst?",
+      "enabled": "Aktiv",
+      "advanced": "Erweiterte Einstellungen",
+      "autonomy": "Autonomie",
+      "priority": "Priorität (0-10)",
+      "maxFiresPerDay": "Maximale Auslösungen pro Tag",
+      "catchupHours": "Nachholfenster (Stunden)",
+      "create": "Automation anlegen",
+      "save": "Änderungen speichern",
+      "requiredMissing": "Name, Experte, Anweisung und ein gültiger Cron-Ausdruck sind Pflicht."
+    },
+    "preview": {
+      "timezoneNote": "Zeiten in {{tz}}. Der Orchestrator speichert intern in UTC und beachtet Sommerzeit automatisch.",
+      "invalid": "Dieser Cron-Ausdruck ist ungültig."
+    },
+    "escapeHatch": {
+      "title": "Mehr als nur Zeitpläne?",
+      "body": "Nutze die Orchestrator-API direkt — aus n8n, Zapier, eigenen Skripten oder jedem HTTP-Client. Webhooks, verzweigte Workflows und E-Mail-Auslöser liegen dort.",
+      "apiDocs": "API-Dokumentation",
+      "guide": "Externer API-Leitfaden",
+      "createKey": "API-Schlüssel anlegen"
+    },
+    "errors": {
+      "generic": "Etwas ist schiefgegangen. Bitte erneut versuchen."
     }
   },
   "sessions": {
@@ -122,7 +186,6 @@
     "colActions": "Aktionen",
     "filter": {
       "all": "Alle",
-      "mine": "Meine",
       "pending_review": "Prüfung",
       "reviewing": "In Prüfung",
       "waiting": "Wartend",
@@ -288,6 +351,20 @@
           "whisper": "Whisper (Spracherkennung)",
           "tts": "Sprachsynthese"
         }
+      }
+    },
+    "viewMode": {
+      "role": "Admin",
+      "scopeAll": "Alle Daten",
+      "scopeMe": "Eigene Daten",
+      "tooltip": {
+        "switchToMe": "Wechseln, um nur eigene Daten zu sehen",
+        "switchToAll": "Wechseln zur flottenweiten Ansicht"
+      },
+      "pill": {
+        "label": "Nur eigene Daten",
+        "showAll": "Alle anzeigen",
+        "tooltip": "Zurück zur flottenweiten Ansicht"
       }
     }
   },
@@ -594,6 +671,7 @@
       "created": "Erstellt",
       "edit": "Bearbeiten",
       "openFolder": "Projektordner öffnen",
+      "manageAutomations": "Automationen verwalten",
       "save": "Speichern",
       "cancel": "Abbrechen"
     },
@@ -708,6 +786,11 @@
       "readOnlyAgent": "Nur-Lese-Zugriff für Agenten",
       "readOnlyAgentDesc": "Wenn aktiviert, können Agenten Dateien durchsuchen und herunterladen, aber nicht hochladen, ändern oder löschen.",
       "cloudUnavailable": "Cloud-Speicher nicht verfügbar — nicht konfiguriert.",
+      "workspaceNetwork": "Workspace-Netzwerk",
+      "networkTier": "Egress-Stufe",
+      "networkTierInternetOnly": "Nur Internet (Standard)",
+      "networkTierHomeAllowed": "Home-LAN erlaubt",
+      "networkTierDesc": "Steuert, welche Netzwerke die Workspaces dieses Projekts erreichen können. \"Nur Internet\" sperrt clusterinterne Hosts und das Home-LAN. \"Home-LAN erlaubt\" öffnet das Home-LAN wieder — nur für vertrauenswürdige Operator-Projekte im Homelab aktivieren.",
       "dangerZone": "Gefahrenzone",
       "defaultProjectWarning": "Dies ist Ihr persönliches Standardprojekt und kann nicht archiviert oder gelöscht werden.",
       "archiveTitle": "Projekt archivieren",
@@ -970,7 +1053,10 @@
       "postgresql": "PostgreSQL",
       "neo4j": "Neo4j",
       "mongodb": "MongoDB",
-      "webdav": "WebDAV"
+      "webdav": "WebDAV",
+      "kubeconfig": "Kubeconfig",
+      "ssh_key": "SSH-Schlüssel",
+      "generic_file": "Datei"
     },
     "form": {
       "editTitle": "Datenquelle bearbeiten",
@@ -980,12 +1066,16 @@
       "typeLabel": "Typ",
       "typeGroupCli": "CLI-basiert",
       "typeGroupManaged": "Verwaltet",
+      "typeGroupCredentialFiles": "Anmeldedaten-Dateien",
       "optGeneric": "Generisch",
       "optRepository": "Repository",
       "optPostgresql": "PostgreSQL",
       "optNeo4j": "Neo4j",
       "optMongodb": "MongoDB",
       "optWebdav": "WebDAV",
+      "optKubeconfig": "Kubeconfig (kubectl)",
+      "optSshKey": "SSH-Schlüssel",
+      "optGenericFile": "Generische Datei",
       "connectionUrlLabel": "Verbindungs-URL",
       "repoUrlLabel": "Repository-URL",
       "optional": "(optional)",
@@ -1023,7 +1113,30 @@
       "cancel": "Abbrechen",
       "saving": "Wird gespeichert...",
       "update": "Aktualisieren",
-      "create": "Erstellen"
+      "create": "Erstellen",
+      "kubeconfigLabel": "Kubeconfig-YAML",
+      "kubeconfigPlaceholder": "apiVersion: v1\nkind: Config\nclusters:\n  - name: prod\n    cluster:\n      server: https://...",
+      "kubeconfigHint": "Cluster-, Benutzer- und Kontext-Namen werden zur Laufzeit mit dem Slug der Datenquelle präfixiert, damit mehrere Kubeconfigs ohne Kollisionen zusammengeführt werden können. Mit `kubectl config get-contexts` im Agenten lässt sich die zusammengeführte Sicht prüfen.",
+      "sshKeyContentLabel": "Privater SSH-Schlüssel",
+      "sshKeyContentPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----",
+      "sshKeyHint": "Der Schlüssel wird unter ~/.ssh/<slug> mit Modus 0600 materialisiert. Konfigurieren Sie im Agenten einen Host-Block in ~/.ssh/config, um ihn für bestimmte Hosts zu verwenden.",
+      "uploadFile": "Datei hochladen",
+      "trustNoticeTitle": "Vom Agenten lesbares Geheimnis",
+      "trustNotice": "Diese Datei wird im Dateisystem des Agenten materialisiert und ist vom Agenten-Prozess lesbar. Verwenden Sie ein eng zugeschnittenes Geheimnis — ein nur-lesendes Kubeconfig, einen projektgebundenen Deploy-Key — wenn der Job keinen weitergehenden Zugriff benötigt.",
+      "credFilesLabel": "Dateien",
+      "credFilesAdd": "Datei hinzufügen",
+      "credFileNameLabel": "Name",
+      "credFileNamePlaceholder": "config.json",
+      "credFileTargetPathLabel": "Zielpfad",
+      "credFileTargetPathPlaceholder": "~/.config/myapp/config.json",
+      "credFileContentsLabel": "Inhalt",
+      "credFileContentsPlaceholder": "Dateiinhalt (nur Text, max. 64 KB)",
+      "credFileModeLabel": "Modus",
+      "credFileModePlaceholder": "0600",
+      "credFileEnvVarLabel": "Env-Variable",
+      "credFileEnvVarPlaceholder": "MY_TOKEN_FILE",
+      "credFileRemoveTooltip": "Datei entfernen",
+      "credFileGenericHint": "Jede Datei wird unter dem Zielpfad mit dem angegebenen Modus geschrieben. Ist eine \"Env-Variable\" gesetzt, erhält der Agent-Prozess diese Variable mit dem absoluten Pfad. Pfade müssen unter /home/srw, /tmp, /run oder /workspace liegen."
     },
     "sshKeyDialog": {
       "title": "Fügen Sie diesen SSH-Schlüssel zu Ihrem Repository hinzu",
@@ -1062,7 +1175,8 @@
       "deleteFailed": "Löschen der Datenquelle fehlgeschlagen",
       "deleteError": "Fehler beim Löschen der Datenquelle",
       "testFailed": "Anfrage fehlgeschlagen",
-      "testRequestFailed": "Testanfrage fehlgeschlagen"
+      "testRequestFailed": "Testanfrage fehlgeschlagen",
+      "fileTooLarge": "Datei überschreitet 64 KB — Anmeldedaten-Dateien sind auf 64 KB begrenzt."
     }
   },
   "inbox": {

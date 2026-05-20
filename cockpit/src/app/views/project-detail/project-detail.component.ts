@@ -170,6 +170,9 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   <app-button variant="ghost" size="md" (clicked)="startEditOverview()">
                     {{ 'projectDetail.overview.edit' | transloco }}
                   </app-button>
+                  <app-button variant="ghost" size="md" (clicked)="openAutomationsForProject()">
+                    {{ 'projectDetail.overview.manageAutomations' | transloco }}
+                  </app-button>
                   @if (proj.cloud_storage_url) {
                     <a class="ghost-link" [href]="proj.cloud_storage_url" target="_blank" rel="noopener">
                       {{ 'projectDetail.overview.openFolder' | transloco }}
@@ -761,6 +764,25 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'datasources' | 'repos' | 'expert
                   {{ 'projectDetail.settings.shareMemoriesDesc' | transloco }}
                 </p>
               </div>
+
+              <!-- Workspace Network (admin-only) -->
+              @if (isAdmin()) {
+                <div class="settings-group">
+                  <h3 class="settings-heading">{{ 'projectDetail.settings.workspaceNetwork' | transloco }}</h3>
+                  <app-form-field [label]="'projectDetail.settings.networkTier' | transloco">
+                    <app-select
+                      [value]="settingsNetworkTier()"
+                      (changed)="onNetworkTierChange($event ?? '')"
+                    >
+                      <option value="internet-only">{{ 'projectDetail.settings.networkTierInternetOnly' | transloco }}</option>
+                      <option value="home-allowed">{{ 'projectDetail.settings.networkTierHomeAllowed' | transloco }}</option>
+                    </app-select>
+                  </app-form-field>
+                  <p class="text-muted setting-desc">
+                    {{ 'projectDetail.settings.networkTierDesc' | transloco }}
+                  </p>
+                </div>
+              }
 
               <!-- Cloud Storage -->
               <div class="settings-group">
@@ -1497,7 +1519,10 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
   readonly settingsCloudReadOnly = signal(false);
+  readonly settingsNetworkTier = signal<'internet-only' | 'home-allowed'>('internet-only');
   readonly isSavingSettings = signal(false);
+  /** Admin-only fields (e.g. workspace network tier) are hidden unless this is true. */
+  readonly isAdmin = computed(() => !!this.userService.currentUser()?.is_admin);
   /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
   private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectMemoryShared = computed(() => {
@@ -1570,6 +1595,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.settingsName.set(p.name);
         this.settingsConfigName.set(p.default_config_name ?? '');
         this.settingsCloudReadOnly.set(p.cloud_storage_read_only ?? false);
+        this.settingsNetworkTier.set(p.network_tier ?? 'internet-only');
       }
     });
     this.loadJobs();
@@ -1773,6 +1799,23 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     });
   }
 
+  onNetworkTierChange(value: string): void {
+    if (value !== 'internet-only' && value !== 'home-allowed') return;
+    const previous = this.settingsNetworkTier();
+    if (value === previous) return;
+    this.settingsNetworkTier.set(value);
+    this.api.updateProject(this.projectId, { network_tier: value }).subscribe({
+      next: (res) => {
+        if (res) {
+          this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
+        }
+      },
+      error: () => {
+        this.settingsNetworkTier.set(previous);
+      },
+    });
+  }
+
   archiveProject(): void {
     if (!confirm(this.transloco.translate('projectDetail.settings.archiveConfirm'))) return;
     this.api.updateProject(this.projectId, { status: 'archived' }).subscribe((res) => {
@@ -1789,6 +1832,15 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   createJobInProject(): void {
     this.router.navigate(['/'], { queryParams: { project: this.projectId } });
+  }
+
+  /** Cross-link to the Automations page with this project preselected.
+   *  The /automations page opens its editor when the ?project= query
+   *  param is present. */
+  openAutomationsForProject(): void {
+    this.router.navigate(['/automations'], {
+      queryParams: { project: this.projectId },
+    });
   }
 
   // Knowledge
