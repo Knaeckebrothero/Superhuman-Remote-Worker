@@ -6,6 +6,10 @@
 /out-tsc
 /bazel-out
 
+# Monaco prebuilt assets copied by scripts/copy-monaco.mjs at build time.
+# 16 MB of vendored bundles; reproduced from node_modules on each build.
+/public/monaco/
+
 # Node
 /node_modules
 npm-debug.log

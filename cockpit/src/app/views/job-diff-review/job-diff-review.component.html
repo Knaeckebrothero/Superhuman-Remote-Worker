@@ -1,0 +1,204 @@
+<div class="diff-review">
+  <header class="diff-review__header">
+    <span class="diff-review__title">{{ 'jobDiffReview.title' | transloco }}</span>
+    @if (!loadingDiff() && hasFiles()) {
+      <span class="diff-review__subtitle">
+        @if (fileCount() === 1) {
+          {{ 'jobDiffReview.subtitleSingular' | transloco: {count: fileCount()} }}
+        } @else {
+          {{ 'jobDiffReview.subtitle' | transloco: {count: fileCount()} }}
+        }
+      </span>
+    }
+  </header>
+
+  @if (loadingDiff()) {
+    <div class="diff-review__loading">
+      <app-spinner size="lg" tone="accent" />
+      <span>{{ 'jobDiffReview.loading' | transloco }}</span>
+    </div>
+  } @else if (!summary() || !hasFiles()) {
+    <div class="diff-review__empty">
+      <span>{{ 'jobDiffReview.empty' | transloco }}</span>
+    </div>
+  } @else {
+    @if (conflict(); as c) {
+      <div class="diff-review__banner diff-review__banner--conflict" role="alert">
+        <div class="diff-review__banner-body">
+          <strong>{{ 'jobDiffReview.conflict.title' | transloco }}</strong>
+          <p>{{ 'jobDiffReview.conflict.body' | transloco }}</p>
+          <ul class="diff-review__diverged">
+            @for (entry of c.diverged; track entry.path) {
+              <li>
+                <code>{{ entry.path }}</code>
+                <app-badge tone="warning" size="sm">{{ conflictLabel(entry.kind) }}</app-badge>
+              </li>
+            }
+          </ul>
+        </div>
+        <app-button variant="ghost" size="sm" (clicked)="dismissConflict()">
+          {{ 'jobDiffReview.conflict.dismiss' | transloco }}
+        </app-button>
+      </div>
+    }
+
+    @if (partial(); as p) {
+      <div class="diff-review__banner diff-review__banner--partial" role="alert">
+        <div class="diff-review__banner-body">
+          <strong>{{ 'jobDiffReview.partial.title' | transloco }}</strong>
+          <p>
+            {{
+              'jobDiffReview.partial.body'
+                | transloco: {applied: p.applied, deleted: p.deleted, count: p.errors.length}
+            }}
+          </p>
+          <ul class="diff-review__diverged">
+            @for (err of p.errors; track err) {
+              <li><code>{{ err }}</code></li>
+            }
+          </ul>
+        </div>
+      </div>
+    }
+
+    <div class="diff-review__layout">
+      <aside class="diff-review__tree">
+        <div class="diff-review__tree-header">
+          {{ 'jobDiffReview.fileTree.header' | transloco }}
+        </div>
+        <ul class="diff-review__tree-list">
+          @for (entry of summary()!.files; track entry.path) {
+            <li>
+              <button
+                type="button"
+                class="diff-review__tree-item"
+                [class.is-active]="selectedPath() === entry.path"
+                (click)="selectFile(entry)"
+              >
+                <span
+                  class="diff-review__status-glyph"
+                  [attr.data-status]="entry.status"
+                  [attr.aria-label]="
+                    entry.status === 'added'
+                      ? ('jobDiffReview.fileTree.statusAdded' | transloco)
+                      : entry.status === 'modified'
+                        ? ('jobDiffReview.fileTree.statusModified' | transloco)
+                        : ('jobDiffReview.fileTree.statusDeleted' | transloco)
+                  "
+                >{{ statusGlyph(entry.status) }}</span>
+                <span class="diff-review__tree-path">{{ entry.path }}</span>
+              </button>
+            </li>
+          }
+        </ul>
+      </aside>
+
+      <section class="diff-review__viewer">
+        @if (!selectedPath()) {
+          <div class="diff-review__viewer-empty">
+            {{ 'jobDiffReview.viewer.selectPrompt' | transloco }}
+          </div>
+        } @else if (loadingFile()) {
+          <div class="diff-review__viewer-empty">
+            <app-spinner size="md" />
+            <span>{{ 'jobDiffReview.viewer.loadingFile' | transloco }}</span>
+          </div>
+        } @else if (fileLoadFailed()) {
+          <div class="diff-review__viewer-empty">
+            {{ 'jobDiffReview.viewer.loadFailed' | transloco }}
+          </div>
+        } @else if (selectedFile(); as f) {
+          @if (f.status === 'deleted') {
+            <div class="diff-review__viewer-note">
+              {{ 'jobDiffReview.viewer.deletedNote' | transloco }}
+            </div>
+          } @else if (f.status === 'added') {
+            <div class="diff-review__viewer-note">
+              {{ 'jobDiffReview.viewer.addedNote' | transloco }}
+            </div>
+          }
+          @if (monacoFailed()) {
+            <div class="diff-review__monaco-fallback">
+              <p class="diff-review__viewer-note">
+                {{ 'jobDiffReview.viewer.monacoUnavailable' | transloco }}
+              </p>
+              <div class="diff-review__fallback-grid">
+                <div>
+                  <h4>{{ 'jobDiffReview.viewer.labelOriginal' | transloco }}</h4>
+                  <pre>{{ f.old_content ?? '' }}</pre>
+                </div>
+                <div>
+                  <h4>{{ 'jobDiffReview.viewer.labelChanged' | transloco }}</h4>
+                  <pre>{{ f.new_content ?? '' }}</pre>
+                </div>
+              </div>
+            </div>
+          } @else {
+            <div #diffContainer class="diff-review__monaco"></div>
+          }
+        }
+      </section>
+    </div>
+
+    <footer class="diff-review__actions">
+      <app-button
+        variant="secondary"
+        [disabled]="rejecting() || accepting()"
+        [loading]="rejecting()"
+        (clicked)="onRejectClick()"
+      >
+        {{
+          (rejecting()
+            ? 'jobDiffReview.actions.rejecting'
+            : 'jobDiffReview.actions.reject') | transloco
+        }}
+      </app-button>
+      <app-button
+        variant="success"
+        [disabled]="!!conflict() || accepting() || rejecting()"
+        [loading]="accepting()"
+        (clicked)="onAcceptClick()"
+      >
+        {{
+          (accepting()
+            ? 'jobDiffReview.actions.accepting'
+            : 'jobDiffReview.actions.accept') | transloco
+        }}
+      </app-button>
+    </footer>
+  }
+
+  <app-dialog
+    [open]="showAcceptConfirm()"
+    (openChange)="showAcceptConfirm.set($event)"
+    [title]="'jobDiffReview.actions.confirmAcceptTitle' | transloco"
+    size="sm"
+  >
+    <p>{{ 'jobDiffReview.actions.confirmAcceptBody' | transloco: {count: fileCount()} }}</p>
+    <ng-container appDialogActions>
+      <app-button variant="ghost" (clicked)="showAcceptConfirm.set(false)">
+        {{ 'jobDiffReview.actions.cancel' | transloco }}
+      </app-button>
+      <app-button variant="success" (clicked)="confirmAccept()">
+        {{ 'jobDiffReview.actions.confirm' | transloco }}
+      </app-button>
+    </ng-container>
+  </app-dialog>
+
+  <app-dialog
+    [open]="showRejectConfirm()"
+    (openChange)="showRejectConfirm.set($event)"
+    [title]="'jobDiffReview.actions.confirmRejectTitle' | transloco"
+    size="sm"
+  >
+    <p>{{ 'jobDiffReview.actions.confirmRejectBody' | transloco }}</p>
+    <ng-container appDialogActions>
+      <app-button variant="ghost" (clicked)="showRejectConfirm.set(false)">
+        {{ 'jobDiffReview.actions.cancel' | transloco }}
+      </app-button>
+      <app-button variant="danger" (clicked)="confirmReject()">
+        {{ 'jobDiffReview.actions.confirm' | transloco }}
+      </app-button>
+    </ng-container>
+  </app-dialog>
+</div>

@@ -1468,6 +1468,53 @@
       "resumeFailed": "Job konnte nicht fortgesetzt werden. Details in der Konsole."
     }
   },
+  "jobDiffReview": {
+    "title": "Cloud-Diff prüfen",
+    "subtitle": "{{count}} Datei(en) wurden in diesem Job geändert. Prüfen und entscheiden.",
+    "subtitleSingular": "{{count}} Datei wurde in diesem Job geändert. Prüfen und entscheiden.",
+    "loading": "Diff wird geladen…",
+    "empty": "Keine Änderungen zu prüfen — der Agent hat den Projektordner nicht angefasst.",
+    "fileTree": {
+      "header": "Dateien",
+      "statusAdded": "Hinzugefügt",
+      "statusModified": "Geändert",
+      "statusDeleted": "Gelöscht"
+    },
+    "viewer": {
+      "selectPrompt": "Wähle eine Datei aus der Liste, um den Diff anzuzeigen.",
+      "loadingFile": "Datei wird geladen…",
+      "loadFailed": "Diff dieser Datei konnte nicht geladen werden. Details in der Konsole.",
+      "labelOriginal": "Cloud-Version",
+      "labelChanged": "Agent-Änderung",
+      "deletedNote": "Diese Datei wird beim Annehmen aus dem Cloud-Ordner gelöscht.",
+      "addedNote": "Diese Datei wird beim Annehmen im Cloud-Ordner angelegt.",
+      "monacoUnavailable": "Der Diff-Editor konnte nicht geladen werden. Inhalt wird als Text angezeigt."
+    },
+    "conflict": {
+      "title": "Cloud-Ordner wurde extern geändert",
+      "body": "Während dieses Jobs wurden Dateien im Cloud-Ordner verändert. Annehmen ist deaktiviert, bis der Konflikt manuell aufgelöst wird (extern geänderte Dateien herunterladen, zusammenführen, dann erneut versuchen).",
+      "etagMismatch": "Extern geändert",
+      "missingAtCloud": "Extern gelöscht",
+      "unexpectedAtCloud": "Extern angelegt",
+      "dismiss": "Schließen"
+    },
+    "partial": {
+      "title": "Schreiben teilweise fehlgeschlagen",
+      "body": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) angewandt, aber {{count}} Datei(en) sind fehlgeschlagen. Der Job bleibt zur Prüfung; Ursache beheben und erneut versuchen."
+    },
+    "actions": {
+      "accept": "Alle Änderungen annehmen",
+      "accepting": "Wird angewandt…",
+      "reject": "Alle verwerfen",
+      "rejecting": "Wird verworfen…",
+      "confirmAcceptTitle": "Diese Änderungen in deinen Cloud-Ordner schreiben?",
+      "confirmAcceptBody": "{{count}} Datei(en) werden in den Projektordner geschrieben. Diese Aktion ist aus dem Cockpit nicht reversibel.",
+      "confirmRejectTitle": "Alle Änderungen verwerfen?",
+      "confirmRejectBody": "Die Bearbeitungen des Agents werden verworfen. Die Gitea-Commits bleiben als Audit-Trail erhalten.",
+      "cancel": "Abbrechen",
+      "confirm": "Fortfahren"
+    }
+  },
   "chatHistory": {
     "title": "Chatverlauf",
     "refresh": "Aktualisieren",
@@ -1796,7 +1843,9 @@
       "approveFailed": "Job konnte nicht freigegeben werden.",
       "upgradeVmFailed": "Upgrade auf VM-Workspace fehlgeschlagen.",
       "replyFailed": "Antwort konnte nicht gesendet werden.",
-      "exportFailed": "Auftrag konnte nicht in deine Cloud exportiert werden."
+      "exportFailed": "Auftrag konnte nicht in deine Cloud exportiert werden.",
+      "acceptFailed": "Diff konnte nicht angenommen werden.",
+      "rejectFailed": "Diff konnte nicht verworfen werden."
     },
     "ide": {
       "startFailed": "IDE-Sitzung konnte nicht gestartet werden.",
@@ -1819,7 +1868,9 @@
       "approved": "Job freigegeben",
       "vmUpgradeStarted": "VM-Upgrade gestartet",
       "replySent": "Antwort gesendet",
-      "exportedToCloud": "{{count}} Datei(en) in deine Cloud exportiert"
+      "exportedToCloud": "{{count}} Datei(en) in deine Cloud exportiert",
+      "diffAccepted": "{{applied}} Änderung(en) und {{deleted}} Löschung(en) in den Cloud-Ordner geschrieben.",
+      "diffRejected": "Diff verworfen; keine Änderungen in der Cloud."
     },
     "ide": {
       "stopped": "IDE-Sitzung beendet"
