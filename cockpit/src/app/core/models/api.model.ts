@@ -1018,6 +1018,70 @@ export interface JobCreateRequest {
 }
 
 /**
+ * Mode A diff summary for a project-attached job in `pending_review`.
+ * See docs/features/job_cloud_export.md §3.4–§3.5.
+ */
+export interface JobDiffFileEntry {
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+}
+
+export interface JobDiffSummary {
+  job_id: string;
+  diff_status: 'pending' | 'accepted' | 'rejected' | null;
+  baseline_commit: string;
+  head_commit: string;
+  files: JobDiffFileEntry[];
+}
+
+export interface JobDiffFile {
+  job_id: string;
+  path: string;
+  status: 'added' | 'modified' | 'deleted';
+  old_content: string | null;
+  new_content: string | null;
+}
+
+export interface JobAcceptResult {
+  job_id: string;
+  diff_status: 'accepted';
+  status: 'completed';
+  applied: number;
+  deleted: number;
+}
+
+export interface JobRejectResult {
+  job_id: string;
+  diff_status: 'rejected';
+  status: 'completed';
+}
+
+/** Returned in the 409 body when the cloud folder diverged since seed. */
+export interface JobAcceptConflict {
+  code: 'external_modifications_detected';
+  message: string;
+  diverged: Array<{
+    path: string;
+    kind: 'etag_mismatch' | 'missing_at_cloud' | 'unexpected_at_cloud';
+  }>;
+}
+
+/** Returned in the 502 body when partial WebDAV writes failed during apply. */
+export interface JobAcceptPartialFailure {
+  code: 'partial_write_failure';
+  applied: number;
+  deleted: number;
+  errors: string[];
+}
+
+/** Outcome shape the cockpit uses to drive the diff-review UI state. */
+export type JobAcceptOutcome =
+  | { kind: 'ok'; data: JobAcceptResult }
+  | { kind: 'conflict'; data: JobAcceptConflict }
+  | { kind: 'partial'; data: JobAcceptPartialFailure }
+  | { kind: 'error'; status: number; detail: string };
+
+/**
  * Job progress with ETA calculation.
  */
 export interface JobProgress {
