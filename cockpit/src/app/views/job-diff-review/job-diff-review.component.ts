@@ -33,7 +33,7 @@ import { AppToastService } from '../../ui/toast';
  * actions (footer). Handles the external-mod 409 by surfacing an inline
  * banner with the diverged paths.
  *
- * See docs/features/job_cloud_export.md §3.4–§3.6.
+ * See docs/done/job_cloud_export.md §3.4–§3.6.
  */
 @Component({
   selector: 'app-job-diff-review',

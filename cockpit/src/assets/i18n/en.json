@@ -17,6 +17,7 @@
     "builder": "Builder",
     "sessions": "Sessions",
     "jobs": "Jobs",
+    "review": "Job Review",
     "projects": "Projects",
     "datasources": "Data Sources",
     "automations": "Automations",
@@ -1410,6 +1411,15 @@
       "idleDisabled": "0 = disabled",
       "autoPlaceholder": "auto"
     }
+  },
+  "jobReviewPage": {
+    "title": "Job Review",
+    "refresh": "Refresh",
+    "loading": "Loading...",
+    "empty": "No jobs awaiting review.",
+    "listAriaLabel": "Jobs awaiting review",
+    "pendingBadge": "Pending review",
+    "timeNow": "now"
   },
   "jobReview": {
     "title": "Job Review",

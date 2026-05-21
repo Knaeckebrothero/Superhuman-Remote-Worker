@@ -732,6 +732,30 @@ export class PersistentChatService {
         await this.connect(threadId);
     }
 
+    /**
+     * End the active session: DELETE the thread server-side (soft — status
+     * flips to 'ended', workspace is snapshotted, agent pod is released) and
+     * tear down the local transport. The thread row + Gitea repo + cloud
+     * session folder are kept so the user can /resume later.
+     *
+     * Local disconnect runs regardless of the DELETE result so the user
+     * never gets stuck on a stale connection if the API call fails.
+     */
+    async endSession(): Promise<void> {
+        const threadId = this.threadId();
+        if (!threadId) {
+            this.disconnect();
+            return;
+        }
+        try {
+            await firstValueFrom(
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${threadId}`),
+            );
+        } finally {
+            this.disconnect();
+        }
+    }
+
     /** Add files queued in the composer to be uploaded on next send. */
     addAttachments(previews: FilePreview[]): void {
         if (!previews.length) return;

@@ -143,30 +143,30 @@ footer{padding:36px 0 56px;border-bottom:0}
 </div></nav>
 
 <section class="hero" id="top"><div class="wrap">
- <p class="label">Imperium</p>
- <h1 class="disp">Self-hosted AI agents that remember, cite, and answer to you.</h1>
- <p class="lede">Superhuman Remote Worker is an agent orchestration platform you run on your own infrastructure — or ours. Persistent memory, isolated SSH workspaces, citations on every claim, and YAML-defined specialists. Not rented seats from a closed SaaS.</p>
+ <p class="label">Overview</p>
+ <h1 class="disp">Self-hosted AI agents with persistent memory and source citations.</h1>
+ <p class="lede">Superhuman Remote Worker is an orchestration platform for AI agents. It schedules long-running jobs across a fleet of isolated workspaces, persists agent memory in pgvector, and maintains a shared knowledge graph in Neo4j. Run it as a managed subscription, or deploy the Helm chart in your own Kubernetes cluster.</p>
  <div class="cta">
-  <a class="btn" href="https://app.superhuman-remote-worker.com/signup">Start free trial</a>
+  <a class="btn" href="https://cockpit.superhuman-remote-worker.com/signup">Start free trial</a>
   <a class="btn ghost" href="https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md">Self-host with Helm →</a>
  </div>
  <p class="cap">Source-available · commercial license required to run in production · <a class="tertiary" href="/cdn-cgi/l/email-protection#bac9dbd6dfc9fac9cfcadfc8d2cfd7dbd497c8dfd7d5cedf97cdd5c8d1dfc894d9d5d7">Get a license</a></p>
 </div></section>
 
 <section class="problem"><div class="wrap">
- <p class="label">The problem</p>
- <h2 class="disp">Renting agents from a closed SaaS is a dead end.</h2>
+ <p class="label">Why self-host</p>
+ <h2 class="disp">What you give up on closed-SaaS agent platforms.</h2>
  <ul>
-  <li><b>Your prompts, embeddings, and graph live in their tenant.</b> Export, if it exists, is a courtesy.</li>
-  <li><b>Memory resets when the vendor decides.</b> Context windows are not a substitute for state you control.</li>
-  <li><b>No audit trail you can subpoena.</b> Compliance teams have noticed.</li>
-  <li><b>One generic “assistant” role.</b> No scholar, no critic, no curator — no specialization at all.</li>
+  <li><b>Your prompts, embeddings, and graph live in the vendor's tenant.</b> Exports are limited or unavailable.</li>
+  <li><b>The vendor controls memory retention.</b> You don't decide what's kept or for how long.</li>
+  <li><b>No audit trail you can query or export.</b> Compliance and forensics depend on whatever the vendor surfaces.</li>
+  <li><b>One generic assistant role.</b> No way to define specialized agents for different kinds of work.</li>
  </ul>
 </div></section>
 
 <section class="how"><div class="wrap">
  <p class="label">How it works</p>
- <h2 class="disp">Three tiers. One legion.</h2>
+ <h2 class="disp">Three components, one workflow.</h2>
  <svg class="diagram" viewBox="0 0 920 220" role="img" aria-label="Architecture: Orchestrator coordinates Agents and Cockpit.">
   <defs>
    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -203,25 +203,25 @@ footer{padding:36px 0 56px;border-bottom:0}
   </g>
  </svg>
  <div class="tiers">
-  <div class="tier"><span class="tag">Tier 1</span><h3>Orchestrator</h3><p>FastAPI service. Schedules jobs, persists state to PostgreSQL, brokers between cockpit and the field.</p></div>
-  <div class="tier"><span class="tag">Tier 2</span><h3>Agents</h3><p>LangGraph workers running in isolated, SSH-accessible workspaces. Strategic and tactical phases alternate; memory persists.</p></div>
-  <div class="tier"><span class="tag">Tier 3</span><h3>Cockpit</h3><p>Angular dashboard for humans. Inspect runs, approve checkpoints, redirect agents mid-mission.</p></div>
+  <div class="tier"><span class="tag">Tier 1</span><h3>Orchestrator</h3><p>FastAPI service. Schedules jobs, persists state to PostgreSQL, mediates between the cockpit and the agent fleet.</p></div>
+  <div class="tier"><span class="tag">Tier 2</span><h3>Agents</h3><p>LangGraph workers running in isolated, SSH-accessible workspaces. Each run alternates planning and execution; memory persists between them.</p></div>
+  <div class="tier"><span class="tag">Tier 3</span><h3>Cockpit</h3><p>Angular dashboard. Inspect runs, approve checkpoints, redirect agents during a job.</p></div>
  </div>
 </div></section>
 
 <section class="what"><div class="wrap">
  <p class="label">What you get</p>
- <h2 class="disp">Nine things, no asterisks.</h2>
+ <h2 class="disp">Built-in capabilities.</h2>
  <div class="grid" style="margin-top:28px">
   <div class="cell"><h3>Multi-agent orchestration</h3><p>Parallel jobs across a fleet of agents, scheduled and supervised.</p></div>
-  <div class="cell"><h3>Persistent memory</h3><p>Vector + relational state per agent. Survives restarts, reboots, and your bedtime.</p></div>
-  <div class="cell"><h3>Isolated workspaces</h3><p>Each run gets its own filesystem and SSH endpoint. No shared blast radius.</p></div>
+  <div class="cell"><h3>Persistent memory</h3><p>Vector and relational state per agent. Survives restarts and redeploys.</p></div>
+  <div class="cell"><h3>Isolated workspaces</h3><p>Each run gets its own filesystem and SSH endpoint.</p></div>
   <div class="cell"><h3>Citation engine</h3><p>Every factual claim links to the source the agent actually read.</p></div>
   <div class="cell"><h3>Knowledge graph</h3><p>Neo4j-backed. Agents query and extend it as they work.</p></div>
   <div class="cell"><h3>MCP integration</h3><p>Tools exposed over Model Context Protocol — bring your own server.</p></div>
-  <div class="cell"><h3>OIDC via Keycloak</h3><p>SSO that survives your security review. Roles map to agent capabilities.</p></div>
-  <div class="cell"><h3>YAML specialists</h3><p>Define a scholar, developer, critic, or curator in 30 lines. Promote with a PR.</p></div>
-  <div class="cell"><h3>Audit log</h3><p>MongoDB-backed, append-only, queryable. Compliance won't hate you.</p></div>
+  <div class="cell"><h3>OIDC via Keycloak</h3><p>SSO with role-based access. Roles map to agent capabilities.</p></div>
+  <div class="cell"><h3>YAML specialists</h3><p>Specialized agents defined in YAML. Ships with scholar, developer, critic, and curator presets.</p></div>
+  <div class="cell"><h3>Audit log</h3><p>Append-only audit log in MongoDB. Queryable for compliance and forensics.</p></div>
  </div>
 </div></section>
 
@@ -232,19 +232,19 @@ footer{padding:36px 0 56px;border-bottom:0}
 
 <section class="run"><div class="wrap">
  <p class="label">Two ways to run it</p>
- <h2 class="disp">Pick a path. Both are first class.</h2>
+ <h2 class="disp">Same codebase, different operating model.</h2>
  <div class="run-grid" style="margin-top:28px">
   <div class="lane l">
    <h3 class="disp">Hosted</h3>
-   <p>Managed subscription. We run the orchestrator, the database cluster, the agent fleet, and the upgrades. You sign in and command. Best when you'd rather not think about Kubernetes today.</p>
+   <p>Managed subscription. We run the orchestrator, the database cluster, the agent fleet, and the upgrades. You sign in and use it. Best when you don't want to operate Kubernetes yourself.</p>
    <div class="row">
-    <a class="btn" href="https://app.superhuman-remote-worker.com/signup">Start free trial</a>
-    <a class="tertiary" href="https://app.superhuman-remote-worker.com/pricing">See pricing →</a>
+    <a class="btn" href="https://cockpit.superhuman-remote-worker.com/signup">Start free trial</a>
+    <a class="tertiary" href="https://cockpit.superhuman-remote-worker.com/pricing">See pricing →</a>
    </div>
   </div>
   <div class="lane r">
    <h3 class="disp">Self-hosted</h3>
-   <p>Your cluster, your data, your rules. Ships as a Helm chart with a terms-of-service gate where you attest you hold a valid commercial license — same model as Neo4j Enterprise. Reading the source is free; running it commercially is not.</p>
+   <p>Your cluster, your data. Ships as a Helm chart with a terms-of-service gate where you attest you hold a valid commercial license — same model as Neo4j Enterprise. Reading the source is free; running it commercially is not.</p>
    <div class="row">
     <a class="btn ghost" href="https://github.com/superhuman-remote-worker/srw/blob/main/helm/README.md">Read the Helm guide</a>
     <a class="tertiary" href="/cdn-cgi/l/email-protection#eb988a878e98ab989e9b8e99839e868a85c6998e86849f8ec69c8499808e99c5888486">Get a license →</a>
