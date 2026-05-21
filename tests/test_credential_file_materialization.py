@@ -11,7 +11,6 @@ covered (the latter via shutil.which monkeypatching to a fake kubectl).
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 import pytest
@@ -20,7 +19,6 @@ from src.core.datasource_setup import (
     AGENT_HOME,
     cleanup_credential_files,
     process_credential_files,
-    _merge_kubeconfigs,
     _mkdir_tracking,
     _prefix_kubeconfig_yaml,
     _retarget,
