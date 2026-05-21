@@ -86,7 +86,7 @@ interface FrozenJobData {
           <span class="job-desc">{{ job()!.description }}</span>
         </div>
       } @else if (job()!.diff_status === 'pending') {
-        <!-- Mode A diff review (see docs/features/job_cloud_export.md) -->
+        <!-- Mode A diff review (see docs/done/job_cloud_export.md) -->
         <app-job-diff-review
           [jobId]="job()!.id"
           (resolved)="onDiffResolved()"

@@ -1,6 +1,6 @@
 """Mode A baseline seeding + diff capture for the job cloud workflow.
 
-See ``docs/features/job_cloud_export.md`` §3 for the design. This module
+See ``docs/done/job_cloud_export.md`` §3 for the design. This module
 owns the cloud→Gitea seed at job-start and the Gitea-diff capture at
 job-completion. Both run from the orchestrator side; the agent stays
 unchanged (it picks the seeded ``projects/<slug>/`` up via its existing
@@ -72,7 +72,7 @@ _BASELINE_COMMIT_MESSAGE = (
     "Mode A baseline: seed project folder for job {job_short}\n\n"
     "Seeded by orchestrator from project '{project_name}' cloud folder. "
     "This is the diff baseline; agent edits on top become the diff at "
-    "job completion. See docs/features/job_cloud_export.md."
+    "job completion. See docs/done/job_cloud_export.md."
 )
 
 

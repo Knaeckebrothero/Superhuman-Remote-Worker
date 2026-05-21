@@ -63,6 +63,14 @@ import {ViewModeToggleComponent} from '../view-mode-toggle/view-mode-toggle.comp
           </a>
           <a
             class="nav-link"
+            routerLink="/review"
+            routerLinkActive="active"
+          >
+            <app-icon size="md" class="nav-icon">rate_review</app-icon>
+            {{ 'nav.review' | transloco }}
+          </a>
+          <a
+            class="nav-link"
             routerLink="/projects"
             routerLinkActive="active"
           >

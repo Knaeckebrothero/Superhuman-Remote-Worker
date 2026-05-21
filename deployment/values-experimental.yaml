@@ -23,6 +23,15 @@ global:
   # upstream Docker Hub for the admin UIs). Re-add a `ghcr-pull-secret`
   # entry here (and create the matching Secret in-namespace) only if a
   # package is ever flipped back to private.
+  hostnames:
+    # Cockpit lives on the cockpit.* subdomain so the apex
+    # (superhuman-remote-worker.com) is free for the sales landing page,
+    # which is deployed separately from the HomeLab repo
+    # (deployments_managed/srw-sales-page) — not from this chart. The
+    # override propagates through srw.cockpitUrl to the cockpit ingress,
+    # the env.js init, CORS allow-list, and the Keycloak bootstrap Job's
+    # redirect URIs.
+    cockpit: "cockpit.superhuman-remote-worker.com"
 # -----------------------------------------------------------------------------
 # Image tags — updated by CI on every push to develop
 # -----------------------------------------------------------------------------
