@@ -504,7 +504,7 @@ class NextcloudBackend:
         """Not yet implemented for Nextcloud.
 
         Mode A baseline-seed currently ships OpenCloud-only
-        (docs/features/job_cloud_export.md §0). Add Group Folders
+        (docs/done/job_cloud_export.md §0). Add Group Folders
         PROPFIND walk when first Nextcloud user requests Mode A.
         """
         raise CloudBackendError(

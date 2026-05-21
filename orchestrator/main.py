@@ -8421,7 +8421,7 @@ async def get_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     project job). Empty ``files`` list means no changes under
     ``projects/<slug>/`` — the agent didn't touch the mounted folder.
 
-    See docs/features/job_cloud_export.md §5.
+    See docs/done/job_cloud_export.md §5.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
     if not job.get("cloud_diff_baseline_commit"):
@@ -8532,7 +8532,7 @@ async def accept_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     backend, then transitions ``diff_status='accepted'`` and
     ``status='completed'``.
 
-    See docs/features/job_cloud_export.md §3.5.
+    See docs/done/job_cloud_export.md §3.5.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
 
@@ -8662,7 +8662,7 @@ async def reject_job_diff(request: Request, job_id: str) -> dict[str, Any]:
     Gitea commits stay around as the audit trail of what the agent
     tried to do (cheap; see §3.6).
 
-    See docs/features/job_cloud_export.md §3.6.
+    See docs/done/job_cloud_export.md §3.6.
     """
     _, job = await require_job_access(request, postgres_db, job_id)
 
@@ -8711,7 +8711,7 @@ async def export_job_to_shared_folder(request: Request, job_id: str) -> dict[str
     re-export is refused while the handle is set (user must delete the
     cloud folder to retry).
 
-    See docs/features/job_cloud_export.md §3.2.
+    See docs/done/job_cloud_export.md §3.2.
     """
     user, job = await require_job_access(request, postgres_db, job_id)
 

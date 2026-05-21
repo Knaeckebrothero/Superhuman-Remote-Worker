@@ -3,6 +3,7 @@ import {SettingsComponent} from './views/settings/settings.component';
 import {ApiKeysPageComponent} from './views/settings/api-keys/api-keys-page.component';
 import {ShellPageComponent} from './views/shell/shell.component';
 import {JobsPageComponent} from './views/jobs/jobs-page.component';
+import {JobReviewPageComponent} from './views/job-review/job-review-page.component';
 import {CreatePageComponent} from './views/create/create-page.component';
 import {DebugPageComponent} from './debug/pages/debug.component';
 import {ProjectListPageComponent} from './views/projects/project-list.component';
@@ -27,6 +28,7 @@ export const routes: Routes = [
     {path: 'sessions/:threadId', component: ChatPageComponent, canActivate: [authGuard]},
     {path: 'chat', redirectTo: 'sessions'},
   { path: 'jobs', component: JobsPageComponent, canActivate: [authGuard] },
+  { path: 'review', component: JobReviewPageComponent, canActivate: [authGuard] },
   { path: 'create', component: CreatePageComponent, canActivate: [authGuard] },
   { path: 'inbox', component: InboxPageComponent, canActivate: [authGuard] },
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },

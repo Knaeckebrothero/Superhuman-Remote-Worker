@@ -17,6 +17,7 @@
     "builder": "Builder",
     "sessions": "Sitzungen",
     "jobs": "Aufträge",
+    "review": "Auftragsprüfung",
     "projects": "Projekte",
     "datasources": "Datenquellen",
     "automations": "Automationen",
@@ -1410,6 +1411,15 @@
       "idleDisabled": "0 = deaktiviert",
       "autoPlaceholder": "auto"
     }
+  },
+  "jobReviewPage": {
+    "title": "Auftragsprüfung",
+    "refresh": "Aktualisieren",
+    "loading": "Wird geladen …",
+    "empty": "Keine Aufträge zur Prüfung.",
+    "listAriaLabel": "Aufträge zur Prüfung",
+    "pendingBadge": "Prüfung offen",
+    "timeNow": "jetzt"
   },
   "jobReview": {
     "title": "Job-Review",

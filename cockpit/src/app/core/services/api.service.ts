@@ -1456,7 +1456,7 @@ export class ApiService {
    * that are completed AND have no project_id. Returns the folder's
    * browser/WebDAV URLs and the number of files copied.
    *
-   * See docs/features/job_cloud_export.md §3.2.
+   * See docs/done/job_cloud_export.md §3.2.
    */
   exportJobToSharedFolder(
     jobId: string,

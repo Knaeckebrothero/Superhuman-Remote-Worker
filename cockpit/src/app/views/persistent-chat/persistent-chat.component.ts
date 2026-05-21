@@ -47,6 +47,8 @@ import {AppBadgeComponent} from '../../ui/badge';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconComponent} from '../../ui/icon';
 import {AppDialogComponent} from '../../ui/dialog';
+import {AppToastService} from '../../ui/toast';
+import {ErrorMessageService} from '../../core/services/error-message.service';
 
 interface SlashCommand {
     command: string;
@@ -1004,6 +1006,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     private readonly deviceCapabilities = inject(DeviceCapabilitiesService);
     private readonly voiceRecording = inject(VoiceRecordingService);
     private readonly router = inject(Router);
+    private readonly toast = inject(AppToastService);
+    private readonly errors = inject(ErrorMessageService);
 
     @ViewChild('messagesContainer') messagesContainer!: ElementRef<HTMLDivElement>;
     @ViewChild('inputEl') inputEl!: ElementRef<HTMLTextAreaElement>;
@@ -1898,9 +1902,14 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         }
     }
 
-    disconnectAndLeave(): void {
-        this.chat.disconnect();
-        this.router.navigate(['/sessions']);
+    async disconnectAndLeave(): Promise<void> {
+        try {
+            await this.chat.endSession();
+        } catch (e: any) {
+            this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
+        } finally {
+            this.router.navigate(['/sessions']);
+        }
     }
 
     private startIdePolling(threadId: string): void {

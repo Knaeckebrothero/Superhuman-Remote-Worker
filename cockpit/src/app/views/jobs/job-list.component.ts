@@ -1,4 +1,5 @@
 import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
@@ -760,6 +761,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  private readonly router = inject(Router);
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
@@ -1073,9 +1075,9 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   reviewJob(jobId: string): void {
-    // Select the job and open it in debug panels (review component will detect pending_review)
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
+    this.router.navigate(['/review']);
   }
 
   pauseJob(jobId: string): void {

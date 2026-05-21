@@ -1019,7 +1019,7 @@ export interface JobCreateRequest {
 
 /**
  * Mode A diff summary for a project-attached job in `pending_review`.
- * See docs/features/job_cloud_export.md §3.4–§3.5.
+ * See docs/done/job_cloud_export.md §3.4–§3.5.
  */
 export interface JobDiffFileEntry {
   path: string;
