@@ -36,7 +36,7 @@ related:
 **Last updated:** 2026-05-18
 **Depends on:** [[project_cloud_folders]] (current per-project + per-session folder lifecycle), [[main_cloud_abstraction]] (`MainCloudBackend` Protocol + OpenCloud default).
 
-> **Closure note (2026-05-18):** This doc covered the **session-side** cloud-mirror foundation. It shipped fully. Job-side cloud integration originally lived here as Phase 5 (staging clone) and Phase 6 (accept UI), but the framing changed: a much simpler "export job results to cloud" button is shipping instead, designed in `docs/features/job_cloud_export.md`. The bigger accept-UI / diff-view ambition is deferred to that doc as a follow-up. Phase 7 (per-turn snapshots + session timeline) and Phase 8 (orphan session-folder sweep) remain intentionally deferred — file separately if/when picked up.
+> **Closure note (2026-05-18):** This doc covered the **session-side** cloud-mirror foundation. It shipped fully. Job-side cloud integration originally lived here as Phase 5 (staging clone) and Phase 6 (accept UI), but the framing changed: a much simpler "export job results to cloud" button is shipping instead, designed in `docs/done/job_cloud_export.md`. The bigger accept-UI / diff-view ambition is deferred to that doc as a follow-up. Phase 7 (per-turn snapshots + session timeline) and Phase 8 (orphan session-folder sweep) remain intentionally deferred — file separately if/when picked up.
 
 ## 1. Motivation
 
@@ -510,11 +510,11 @@ The per-thread Gitea repo (`thread-<id>`) was previously paired with the session
 
 Original framing: clone attached cloud surfaces into a hidden per-user drafts area (`/Drafts/jobs/<id>/`) at job-start; job workspace mounts staging instead of live project folders.
 
-**Superseded by a simpler approach:** a "export job results to cloud" button on the job review component (no live mounting, no per-turn sync — explicit user action puts job outputs into `<project>/job-<id>/` or the user's home Space for default-project jobs). Design lives in `docs/features/job_cloud_export.md`. The full staging-clone vision is preserved there as a deferred follow-up.
+**Superseded by a simpler approach:** a "export job results to cloud" button on the job review component (no live mounting, no per-turn sync — explicit user action puts job outputs into `<project>/job-<id>/` or the user's home Space for default-project jobs). Design lives in `docs/done/job_cloud_export.md`. The full staging-clone vision is preserved there as a deferred follow-up.
 
 ### Phase 6 — Job accept UI + endpoint — deferred 2026-05-18
 
-Diff view + `POST /api/jobs/{id}/accept` + per-file conflict UI. Deferred along with Phase 5 — listed in `docs/features/job_cloud_export.md` as the "v2" extension after the export button lands.
+Diff view + `POST /api/jobs/{id}/accept` + per-file conflict UI. Deferred along with Phase 5 — listed in `docs/done/job_cloud_export.md` as the "v2" extension after the export button lands.
 
 ### Phase 7 — Per-turn snapshots + session timeline — deferred (still relevant)
 
@@ -551,7 +551,7 @@ Refocused on the foundation. The pre-rewrite questions about branch placement an
 
 ### Q2-Q5 — Migrated to job_cloud_export.md
 
-Job-flavored questions (staging clone location, accept-time conflicts, per-job retention) moved to `docs/features/job_cloud_export.md` as pre-considered context for that doc's design.
+Job-flavored questions (staging clone location, accept-time conflicts, per-job retention) moved to `docs/done/job_cloud_export.md` as pre-considered context for that doc's design.
 
 ### Q3. Mount path collisions — ✅ resolved by Phase 3a
 
