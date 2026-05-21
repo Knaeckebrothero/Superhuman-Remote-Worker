@@ -17,6 +17,7 @@
     "builder": "Builder",
     "sessions": "Sessions",
     "jobs": "Jobs",
+    "review": "Job Review",
     "projects": "Projects",
     "datasources": "Data Sources",
     "automations": "Automations",
@@ -79,7 +80,12 @@
       "runNow": "Run now",
       "toggleAria": "Enable or pause this automation",
       "confirmDelete": "Delete the automation \"{{name}}\"? This cannot be undone.",
-      "softCap": "You have {{count}} automations. The recommended limit is 20 — consider consolidating before adding more."
+      "softCap": "You have {{count}} automations. The recommended limit is 20 — consider consolidating before adding more.",
+      "projectFilter": {
+        "label": "Scoped to {{name}} · {{count}} automation(s)",
+        "fallbackName": "this project",
+        "clear": "Show all"
+      }
     },
     "editor": {
       "titleCreate": "New automation",
@@ -221,7 +227,9 @@
       "delete": "Delete",
       "confirmDelete": "Confirm?",
       "promote": "Promote",
-      "createProject": "Create Project"
+      "createProject": "Create Project",
+      "exportToCloud": "Export to cloud",
+      "exported": "Exported"
     },
     "tooltip": {
       "collapse": "Collapse sub-jobs",
@@ -240,6 +248,8 @@
       "confirmDelete": "Click again to confirm deletion",
       "deleteJob": "Delete job",
       "promoteJob": "Promote to project",
+      "exportToCloud": "Copy this job's output/ folder to a shared cloud folder",
+      "alreadyExported": "Already exported. Delete the cloud folder to re-export.",
       "snapshotStats": "S3 snapshot storage",
       "snapshotAvailable": "Environment snapshot available",
       "delegationWaiting": "Waiting for delegation children to complete",
@@ -1402,6 +1412,15 @@
       "autoPlaceholder": "auto"
     }
   },
+  "jobReviewPage": {
+    "title": "Job Review",
+    "refresh": "Refresh",
+    "loading": "Loading...",
+    "empty": "No jobs awaiting review.",
+    "listAriaLabel": "Jobs awaiting review",
+    "pendingBadge": "Pending review",
+    "timeNow": "now"
+  },
   "jobReview": {
     "title": "Job Review",
     "empty": {
@@ -1457,6 +1476,53 @@
       "continueFailed": "Failed to continue job. Check console for details.",
       "resumedWithFeedback": "Job resumed with feedback. Agent will continue working.",
       "resumeFailed": "Failed to resume job. Check console for details."
+    }
+  },
+  "jobDiffReview": {
+    "title": "Cloud diff review",
+    "subtitle": "{{count}} file(s) changed in this job. Review and decide.",
+    "subtitleSingular": "{{count}} file changed in this job. Review and decide.",
+    "loading": "Loading diff…",
+    "empty": "No changes to review — the agent didn't modify the project folder.",
+    "fileTree": {
+      "header": "Files",
+      "statusAdded": "Added",
+      "statusModified": "Modified",
+      "statusDeleted": "Deleted"
+    },
+    "viewer": {
+      "selectPrompt": "Select a file from the list to view the diff.",
+      "loadingFile": "Loading file…",
+      "loadFailed": "Couldn't load this file's diff. Check console for details.",
+      "labelOriginal": "Cloud version",
+      "labelChanged": "Agent edit",
+      "deletedNote": "This file will be deleted from the cloud folder on accept.",
+      "addedNote": "This file will be created in the cloud folder on accept.",
+      "monacoUnavailable": "The diff editor failed to load. Showing plain content instead."
+    },
+    "conflict": {
+      "title": "Cloud folder was modified externally",
+      "body": "Files in the cloud folder changed during this job run. Accept is disabled until you resolve the conflict manually (download the diverged files, reconcile, then retry).",
+      "etagMismatch": "Edited externally",
+      "missingAtCloud": "Deleted externally",
+      "unexpectedAtCloud": "Created externally",
+      "dismiss": "Dismiss"
+    },
+    "partial": {
+      "title": "Partial write failure",
+      "body": "Applied {{applied}} change(s) and {{deleted}} deletion(s), but {{count}} file(s) failed. The job stays in pending review; fix the cause and retry."
+    },
+    "actions": {
+      "accept": "Accept all changes",
+      "accepting": "Applying changes…",
+      "reject": "Reject all",
+      "rejecting": "Rejecting…",
+      "confirmAcceptTitle": "Apply these changes to your cloud folder?",
+      "confirmAcceptBody": "{{count}} file(s) will be written to the project's cloud folder. This action is not reversible from the cockpit.",
+      "confirmRejectTitle": "Discard all changes?",
+      "confirmRejectBody": "The agent's edits will be discarded. The Gitea commits stay as an audit trail.",
+      "cancel": "Cancel",
+      "confirm": "Continue"
     }
   },
   "chatHistory": {
@@ -1786,7 +1852,10 @@
       "resumeFailed": "Couldn't resume the job.",
       "approveFailed": "Couldn't approve the job.",
       "upgradeVmFailed": "Couldn't upgrade to a VM workspace.",
-      "replyFailed": "Couldn't send the reply."
+      "replyFailed": "Couldn't send the reply.",
+      "exportFailed": "Couldn't export the job to your cloud.",
+      "acceptFailed": "Couldn't accept the diff.",
+      "rejectFailed": "Couldn't reject the diff."
     },
     "ide": {
       "startFailed": "Couldn't start the IDE session.",
@@ -1808,7 +1877,10 @@
       "resumed": "Job resumed",
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
-      "replySent": "Reply sent"
+      "replySent": "Reply sent",
+      "exportedToCloud": "Exported {{count}} file(s) to your cloud",
+      "diffAccepted": "Applied {{applied}} change(s), {{deleted}} deletion(s) to the cloud folder.",
+      "diffRejected": "Diff rejected; no cloud changes were made."
     },
     "ide": {
       "stopped": "IDE session stopped"

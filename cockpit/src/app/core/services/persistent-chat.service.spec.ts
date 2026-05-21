@@ -1157,6 +1157,64 @@ describe('PersistentChatService — disconnect()', () => {
     });
 });
 
+describe('PersistentChatService — endSession()', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    it('DELETEs the thread, tears down SSE/WS, resets state', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-e');
+        fireSseOpen(ctx.sseInstances[0]);
+
+        await ctx.service.endSession();
+
+        const deleteCalls = ctx.mockHttp.delete.mock.calls;
+        expect(deleteCalls.length).toBe(1);
+        expect(deleteCalls[0][0]).toContain('/persistent/threads/thread-e');
+        expect(deleteCalls[0][0]).not.toContain('permanent=true');
+        expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+        expect(ctx.wsInstances[0].close).toHaveBeenCalledWith(1000);
+        expect(ctx.service.connectionState()).toBe('disconnected');
+        expect(ctx.service.sessionReady()).toBe(false);
+    });
+
+    it('tears down locally even if DELETE fails', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(() =>
+            of({status: 'active', total_turns: 0, messages: [], total: 0}),
+        );
+        await ctx.service.connect('thread-f');
+        fireSseOpen(ctx.sseInstances[0]);
+
+        ctx.mockHttp.delete.mockImplementation(() => throwError(() => new Error('boom')));
+
+        await expect(ctx.service.endSession()).rejects.toThrow('boom');
+        expect(ctx.service.connectionState()).toBe('disconnected');
+        expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    });
+
+    it('skips DELETE when no thread is connected', async () => {
+        const ctx = createService();
+        await ctx.service.endSession();
+        expect(ctx.mockHttp.delete).not.toHaveBeenCalled();
+        expect(ctx.service.connectionState()).toBe('disconnected');
+    });
+});
+
 describe('PersistentChatService — attachments', () => {
     let originalEs: any;
     let originalWs: any;

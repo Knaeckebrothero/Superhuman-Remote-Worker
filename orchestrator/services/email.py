@@ -160,6 +160,65 @@ class EmailService:
             logger.error(f"Failed to send email to {recipients}: {e}")
             return False
 
+    async def send_system_notification(
+        self,
+        to: str,
+        to_name: str,
+        subject: str,
+        body_md: str,
+        *,
+        cockpit_path: str = "",
+    ) -> bool:
+        """Send a non-job system notification email.
+
+        For events that aren't tied to a specific job — automation auto-disable,
+        account-level alerts — where ``send_agent_message``'s job-shaped
+        headers (job_id, config_name, reply-routing) don't apply.
+
+        Args:
+            to: Recipient email address
+            to_name: Recipient display name
+            subject: Subject line (prefixed with [SRW])
+            body_md: Body in markdown (rendered as plain text in HTML)
+            cockpit_path: Optional path appended to COCKPIT_EXTERNAL_URL
+                for the "Open Cockpit" link (e.g. "/automations").
+
+        Returns True on success, False on failure.
+        """
+        full_subject = f"[SRW] {subject}"
+        cockpit_link = (
+            f"{self.cockpit_url}{cockpit_path}" if cockpit_path else self.cockpit_url
+        )
+
+        body_text = (
+            f"Hello {to_name},\n\n"
+            f"{body_md}\n\n"
+            f"{'=' * 50}\n"
+            f"Open Cockpit: {cockpit_link}\n"
+        )
+
+        body_html_msg = (
+            body_md.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br>")
+        )
+        body_html = (
+            '<!DOCTYPE html><html><body style="font-family: sans-serif; color: #222;">'
+            f"<p>Hello {to_name},</p>"
+            f"<p>{body_html_msg}</p>"
+            "<hr>"
+            f'<p style="color: #666;"><a href="{cockpit_link}">Open Cockpit</a></p>'
+            "</body></html>"
+        )
+
+        return await self._send(
+            to=to,
+            subject=full_subject,
+            body_text=body_text,
+            body_html=body_html,
+        )
+
     async def send_agent_message(
         self,
         to: str,

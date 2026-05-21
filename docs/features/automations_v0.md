@@ -18,7 +18,7 @@ Focused, implementation-ready cut of the parent [Automations design](./automatio
 
 The parent doc remains the long-term reference; this doc is what gets built first.
 
-**Status:** v0 backend + cockpit shipped 2026-05-18, live-verified on the experimental cluster (`superhuman-remote-worker.com`) the same day. One small UX race surfaced + fixed in tree, pending the next deploy. See [Implementation log](#implementation-log) and [Live verification](#live-verification-2026-05-18-superhuman-remote-workercom) below.
+**Status:** v0 backend + cockpit shipped 2026-05-18, live-verified on the experimental cluster (`superhuman-remote-worker.com`). The editor race fix landed in `0a193cca` and shipped with the next deploy. A follow-up verification on 2026-05-20 confirmed the two remaining load-bearing paths that the initial probes had skipped — the background cron tick actually fires scheduled jobs, and PAT (`ak_*`) auth works end-to-end against `/api/automations`. The feature is functional in production. See [Implementation log](#implementation-log), [Live verification](#live-verification-2026-05-18-superhuman-remote-workercom), and [Follow-up verification](#follow-up-verification-2026-05-20-cron-tick--pat-auth) below.
 
 **Estimated effort:** v0 ≈ 5–6 dev days (came in at ~5 — the API Keys page line item was already done by the auth refactor PR 3). v0.5 ≈ 5–7 dev days on top.
 
@@ -107,6 +107,39 @@ this.api.getExperts().subscribe({
 ```
 
 Two changes from the original: (a) the queryParam-driven `openEditor` moves inside the `next` callback so it can't fire before experts are ready; (b) reads from `route.snapshot.queryParamMap` instead of subscribing — we don't need to react to later URL changes, only the initial one. The `!this.editor()` guard keeps the same idempotency the subscription gave.
+
+The fix landed squashed into `0a193cca` ("Introduce streaming reasoning content extraction for Chat Completions") and shipped with the subsequent `deploy: update image tags to sha-0a193cc` rollout.
+
+## Follow-up verification (2026-05-20): cron tick + PAT auth
+
+The 2026-05-18 acceptance run covered every UI- and HTTP-driven path but skipped two paths that aren't directly clickable: the *background* cron tick (everything previous to this had been observed only via the `/run-now` button, which is a different code path) and PAT (`ak_*`) auth on `/api/automations` (the integration guide promises it, but it had never actually been exercised). Both probes ran against the live dev cluster.
+
+### Cron tick fires scheduled automations
+
+Created an `* * * * *` automation in `Europe/Berlin` at `09:53:02 UTC`. Server seeded `next_run_at = 09:54:00 UTC`. Polled state without ever clicking *Run now*:
+
+| Tick | Scheduled (`next_run_at` before fire) | Actually fired (`last_fired_at` after fire) | Spawned job |
+|---|---|---|---|
+| 1 | `09:54:00 UTC` | **`09:54:55 UTC`** | (first row in `/runs`) |
+| 2 | `09:55:00 UTC` | **`09:55:55 UTC`** | `c13d8f9e-bd60-4b75-93af-7c11e31b0af5` (status `processing`) |
+
+Both fires landed `:55` seconds past the minute, which proves the dispatcher loop is on a stable 60s cadence offset from the minute boundary (pod start time determined the phase). Worst-case dispatch lag = `TICK_SECONDS`, exactly as designed. `run_count`, `fires_today_count`, `last_scheduled_at`, `last_dispatched_at`, `last_fired_at`, and `next_run_at` all advanced cleanly after each fire. The second-tick job dispatched to an agent and reached `processing` within ~5s — the `on_job_created=_trigger_dispatch` callback woke the auto-assign loop. Automation deleted (204) before a third tick to avoid leaving a recurring fire in the cluster.
+
+### PAT auth on `/api/automations`
+
+| Step | Request shape | Result |
+|---|---|---|
+| Mint PAT | `POST /api/api-keys` (cookie) with `scopes=[jobs:read, jobs:write]`, `expires_in_days=30` | 200, returned `ak_uT2…` |
+| List with PAT | `GET /api/automations`, `credentials: 'omit'` + `Authorization: Bearer ak_…` | 200, body identical to the cookie response |
+| Create with PAT | `POST /api/automations` with same Bearer header | 201; `owner_id` resolved to the same user the PAT belongs to |
+| Delete with PAT | `DELETE /api/automations/{id}` with same Bearer header | 204 |
+| Revoke PAT | `DELETE /api/api-keys/{id}` (cookie) | 200 |
+
+`credentials: 'omit'` on the PAT calls means the cookie session couldn't sneak in — the Bearer header is doing all the work. This validates the integration guide we shipped in `automations_api.md`: n8n / Zapier / curl can drive the API end-to-end with just an `ak_*` token, no browser session needed. The PAT dispatcher in `security/auth.py` (added by the auth refactor PR 3) correctly resolves the token to its owning user across both read and write endpoints.
+
+### Net result
+
+The "definitely needed" verification list is empty. Every path the feature relies on — cron tick, manual `run-now`, pause/resume, project cross-link (after the race fix), PAT auth, validation surfaces, runs list join, delete — has been observed working live. The remaining items in [Open follow-ups](#open-follow-ups-not-blockers) are quality-of-life, not functional gaps.
 
 ## Open follow-ups (not blockers)
 

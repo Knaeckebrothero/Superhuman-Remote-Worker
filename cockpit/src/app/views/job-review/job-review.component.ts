@@ -9,6 +9,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
 import {AppBadgeComponent, type BadgeTone} from '../../ui/badge';
 import {AppTextareaComponent} from '../../ui/textarea';
 import {AppSpinnerComponent} from '../../ui/spinner';
+import {JobDiffReviewComponent} from '../job-diff-review/job-diff-review.component';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -41,6 +42,7 @@ interface FrozenJobData {
     AppBadgeComponent,
     AppTextareaComponent,
     AppSpinnerComponent,
+    JobDiffReviewComponent,
   ],
   template: `
     <div class="review-container">
@@ -83,6 +85,12 @@ interface FrozenJobData {
           </span>
           <span class="job-desc">{{ job()!.description }}</span>
         </div>
+      } @else if (job()!.diff_status === 'pending') {
+        <!-- Mode A diff review (see docs/done/job_cloud_export.md) -->
+        <app-job-diff-review
+          [jobId]="job()!.id"
+          (resolved)="onDiffResolved()"
+        />
       } @else {
         <!-- Pending Review State -->
         <div class="review-content">
@@ -583,6 +591,16 @@ export class JobReviewComponent {
         this.resultMessage.set(null);
       }
     });
+  }
+
+  /**
+   * Called by the Mode A diff-review child after a successful
+   * accept/reject. Refresh the job from the server so the parent panel
+   * re-renders with the new status (completed) and the diff UI
+   * disappears.
+   */
+  onDiffResolved(): void {
+    this.loadJob();
   }
 
   loadJob(): void {

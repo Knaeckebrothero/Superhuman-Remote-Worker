@@ -1738,6 +1738,57 @@ class TestHandlePersistentWebsocketReadiness:
         ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
 
 
+class TestSessionReadyHelper:
+    """_session_ready() is the single source of truth shared by /ready,
+    /session/status, and handle_persistent_websocket. The WS-handler
+    regression tests above cover the integrated behavior; these probe the
+    helper directly so a future caller (e.g. a new health endpoint) can't
+    accidentally reintroduce a two-way variant of the check.
+    """
+
+    def test_false_when_session_missing(self):
+        from src.api import persistent_app as pa
+
+        with (
+            patch("src.api.persistent_app._session", None),
+            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+        ):
+            assert pa._session_ready() is False
+
+    def test_false_when_llm_with_tools_missing(self):
+        from src.api import persistent_app as pa
+
+        session = MagicMock()
+        session.llm_with_tools = None
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+        ):
+            assert pa._session_ready() is False
+
+    def test_false_when_loop_user_queue_missing(self):
+        from src.api import persistent_app as pa
+
+        session = MagicMock()
+        session.llm_with_tools = MagicMock()
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._loop_user_queue", None),
+        ):
+            assert pa._session_ready() is False
+
+    def test_true_when_all_three_set(self):
+        from src.api import persistent_app as pa
+
+        session = MagicMock()
+        session.llm_with_tools = MagicMock()
+        with (
+            patch("src.api.persistent_app._session", session),
+            patch("src.api.persistent_app._loop_user_queue", MagicMock()),
+        ):
+            assert pa._session_ready() is True
+
+
 # ---------------------------------------------------------------------------
 # 3.17.4 Headless: module-level loop callbacks behave as the old closures did
 # ---------------------------------------------------------------------------

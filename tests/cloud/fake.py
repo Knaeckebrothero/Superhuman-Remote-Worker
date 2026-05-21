@@ -22,6 +22,7 @@ from orchestrator.services.cloud import (
     CloudBackendErrorKind,
     GroupId,
     HealthStatus,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -48,7 +49,9 @@ class FakeMainCloudBackend:
         self._users: dict[str, dict[str, str]] = {}
         self._groups: dict[str, set[str]] = {}
         self._project_folders: dict[str, dict[str, object]] = {}
+        self._project_files: dict[tuple[str, str], bytes] = {}
         self._session_folders: dict[str, dict[str, object]] = {}
+        self._session_files: dict[tuple[str, str], bytes] = {}
         self._shares: dict[str, dict[str, object]] = {}
         self._next_id = 1
         # Tracks every mutating call for assertion in tests.
@@ -85,6 +88,14 @@ class FakeMainCloudBackend:
     ) -> None:
         """Test helper: pre-populate a user that ``resolve_user_identity`` can find."""
         self._users[user_id] = {"email": email, "display_name": display_name}
+
+    def seed_project_file(
+        self, folder_native_id: str, path: str, content: bytes
+    ) -> None:
+        """Test helper: pre-populate a file inside an already-ensured project folder
+        so ``list_project_folder`` / ``get_project_folder_file_bytes`` can return it.
+        """
+        self._project_files[(folder_native_id, path.strip("/"))] = content
 
     # --------------------------------------------------------------- Properties
 
@@ -255,6 +266,121 @@ class FakeMainCloudBackend:
             return None
         return f"fake-dav://folder/{mountpoint}/"
 
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        self._ensure_ready()
+        self._fail_if_configured()
+        if handle.native_id not in self._project_folders:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"project folder {handle.native_id} not found",
+                backend=self.backend_id,
+            )
+        prefix = subpath.strip("/")
+        entries: list[ProjectFolderEntry] = []
+        dirs: set[str] = set()
+        for (fid, path), content in self._project_files.items():
+            if fid != handle.native_id:
+                continue
+            if prefix and not (path == prefix or path.startswith(prefix + "/")):
+                continue
+            rel = path[len(prefix) + 1 :] if prefix else path
+            entries.append(
+                ProjectFolderEntry(path=rel, is_dir=False, size=len(content))
+            )
+            parts = rel.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                dirs.add("/".join(parts[:i]))
+        for d in dirs:
+            entries.append(ProjectFolderEntry(path=d, is_dir=True))
+        entries.sort(key=lambda e: e.path)
+        return entries
+
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        self._ensure_ready()
+        self._fail_if_configured()
+        rel = path.lstrip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        blob = self._project_files.get((handle.native_id, rel))
+        if blob is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"project folder file {handle.native_id}/{rel} not found",
+                backend=self.backend_id,
+            )
+        return blob
+
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        self._ensure_ready()
+        self._fail_if_configured()
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        if handle.native_id not in self._project_folders:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"project folder {handle.native_id} not found",
+                backend=self.backend_id,
+            )
+        self._project_files[(handle.native_id, rel)] = content
+        self._rec("put_project_folder_file_bytes", handle.native_id, rel, content_type)
+
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        self._ensure_ready()
+        self._fail_if_configured()
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        key = (handle.native_id, rel)
+        self._rec("delete_project_folder_file", handle.native_id, rel)
+        if key not in self._project_files:
+            if if_exists:
+                return
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"project folder file {handle.native_id}/{rel} not found",
+                backend=self.backend_id,
+            )
+        del self._project_files[key]
+
     # ------------------------------------------------------------- Session folders
 
     async def ensure_session_folder(self, *, session_id: str) -> SessionFolderHandle:
@@ -329,3 +455,24 @@ class FakeMainCloudBackend:
         self, handle: SessionFolderHandle
     ) -> Optional[str]:
         return f"fake-dav://session/{handle.native_id}/"
+
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        self._ensure_ready()
+        self._fail_if_configured()
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_session_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        self._rec("put_session_file", handle.native_id, rel, content_type)
+        self._session_files[(handle.native_id, rel)] = content

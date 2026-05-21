@@ -127,6 +127,21 @@ export class PersistentChatService {
     readonly isConnected = computed(() => this.connectionState() === 'connected');
     readonly threadId = signal<string | null>(null);
 
+    /**
+     * True iff a session start is *actively in flight* — POST creating a thread,
+     * SSE/WS handshaking, or connected-but-waiting-for-the-agent-ready frame.
+     * Gates the "Starting session" card so it never lingers after disconnect()
+     * (which nulls `threadStatus`, so a `threadStatus !== 'ended'` check alone
+     * would render a fake spinner indefinitely).
+     */
+    readonly isStartingSession = computed(() =>
+        !this.sessionReady() &&
+        this.threadStatus() !== 'ended' &&
+        (this.isCreating() ||
+            this.connectionState() === 'connecting' ||
+            this.connectionState() === 'connected'),
+    );
+
     // --- Reconnect surface (kept for back-compat with the resume banner UI).
     // EventSource handles reconnect natively, so these mostly stay quiet —
     // we only bump `reconnectAttempt` while the SSE is in CONNECTING after an
@@ -715,6 +730,30 @@ export class PersistentChatService {
             this.http.post(`${environment.apiUrl}/persistent/threads/${threadId}/resume`, {})
         );
         await this.connect(threadId);
+    }
+
+    /**
+     * End the active session: DELETE the thread server-side (soft — status
+     * flips to 'ended', workspace is snapshotted, agent pod is released) and
+     * tear down the local transport. The thread row + Gitea repo + cloud
+     * session folder are kept so the user can /resume later.
+     *
+     * Local disconnect runs regardless of the DELETE result so the user
+     * never gets stuck on a stale connection if the API call fails.
+     */
+    async endSession(): Promise<void> {
+        const threadId = this.threadId();
+        if (!threadId) {
+            this.disconnect();
+            return;
+        }
+        try {
+            await firstValueFrom(
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${threadId}`),
+            );
+        } finally {
+            this.disconnect();
+        }
     }
 
     /** Add files queued in the composer to be uploaded on next send. */

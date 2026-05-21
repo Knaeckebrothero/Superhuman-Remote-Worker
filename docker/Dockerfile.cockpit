@@ -27,6 +27,10 @@ RUN --mount=type=cache,target=/root/.npm \
 COPY cockpit/tsconfig.json cockpit/tsconfig.app.json cockpit/angular.json cockpit/ngsw-config.json ./
 COPY cockpit/src/ ./src/
 COPY cockpit/public/ ./public/
+# scripts/ holds prebuild helpers (e.g. copy-monaco.mjs) that npm runs via
+# the `prebuild` hook when `npm run build` fires. Without this COPY the
+# Docker build fails at `MODULE_NOT_FOUND scripts/copy-monaco.mjs`.
+COPY cockpit/scripts/ ./scripts/
 
 # Build the Angular application (static output)
 RUN npm run build

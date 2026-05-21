@@ -87,6 +87,7 @@ GET    /api/jobs                                                                
 POST   /api/jobs                                                                        gated:require_project_member
 DELETE /api/jobs/{job_id}                                                               gated:require_job_access
 GET    /api/jobs/{job_id}                                                               gated:require_job_access
+POST   /api/jobs/{job_id}/accept                                                        gated:require_job_access
 PUT    /api/jobs/{job_id}/agent-release                                                 internal:require_internal
 POST   /api/jobs/{job_id}/approve                                                       gated:require_internal_or_job_access
 POST   /api/jobs/{job_id}/assign/{agent_id}                                             admin:_require_admin
@@ -100,7 +101,10 @@ GET    /api/jobs/{job_id}/citations                                             
 GET    /api/jobs/{job_id}/citations/stats                                               gated:require_job_access
 POST   /api/jobs/{job_id}/complete                                                      internal:require_internal
 GET    /api/jobs/{job_id}/datasources                                                   gated:require_job_access
+GET    /api/jobs/{job_id}/diff                                                          gated:require_job_access
+GET    /api/jobs/{job_id}/diff/{file_path:path}                                         gated:require_job_access
 POST   /api/jobs/{job_id}/ensure-workspace-access                                       gated:require_approved_user
+POST   /api/jobs/{job_id}/export-to-shared-folder                                       gated:require_job_access
 GET    /api/jobs/{job_id}/frozen                                                        gated:require_job_access
 GET    /api/jobs/{job_id}/graph/bulk                                                    gated:require_job_access
 DELETE /api/jobs/{job_id}/ide                                                           gated:require_job_access
@@ -117,6 +121,7 @@ POST   /api/jobs/{job_id}/messages/{thread_id}/reply                            
 PUT    /api/jobs/{job_id}/pause                                                         gated:require_internal_or_job_access
 GET    /api/jobs/{job_id}/progress                                                      gated:require_job_access
 POST   /api/jobs/{job_id}/promote                                                       gated:require_job_access
+POST   /api/jobs/{job_id}/reject                                                        gated:require_job_access
 GET    /api/jobs/{job_id}/repo/commits                                                  gated:require_job_access
 GET    /api/jobs/{job_id}/repo/contents                                                 gated:require_job_access
 GET    /api/jobs/{job_id}/repo/diff                                                     gated:require_job_access

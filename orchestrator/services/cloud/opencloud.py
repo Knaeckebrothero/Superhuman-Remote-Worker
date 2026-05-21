@@ -25,7 +25,7 @@ import logging
 import re
 import time
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -34,6 +34,7 @@ from .config import OpenCloudSettings
 from .errors import CloudBackendError, CloudBackendErrorKind
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -78,6 +79,66 @@ _FOLDER_EDITOR_ROLE_WEIGHT = 60  # "Can edit" — subfolder invite
 _FOLDER_EDITOR_ROLE_NAME = "Can edit"
 _AGENT_HOME_SPACE_NAME = "srw-agent-home"
 _TOKEN_CLOCK_SKEW_SECONDS = 30.0
+
+
+# PROPFIND response patterns — module-level so they compile once. Used by
+# list_project_folder to walk a Space recursively. The XML matches the
+# existing regex-based approach in _resolve_item_id rather than pulling
+# in a full XML parser; OpenCloud's PROPFIND output is structurally
+# regular enough that this is safe.
+_PROPFIND_RESPONSE_RE = re.compile(
+    r"<d:response[^>]*>(.*?)</d:response>", re.DOTALL | re.IGNORECASE
+)
+_PROPFIND_HREF_RE = re.compile(r"<d:href[^>]*>([^<]+)</d:href>", re.IGNORECASE)
+_PROPFIND_COLLECTION_RE = re.compile(r"<d:collection\s*/>", re.IGNORECASE)
+_PROPFIND_CONTENTLENGTH_RE = re.compile(
+    r"<d:getcontentlength[^>]*>(\d+)</d:getcontentlength>", re.IGNORECASE
+)
+_PROPFIND_ETAG_RE = re.compile(r"<d:getetag[^>]*>([^<]+)</d:getetag>", re.IGNORECASE)
+_PROPFIND_CONTENTTYPE_RE = re.compile(
+    r"<d:getcontenttype[^>]*>([^<]+)</d:getcontenttype>", re.IGNORECASE
+)
+
+
+def _parse_propfind_entries(xml: str, *, href_prefix: str) -> list[ProjectFolderEntry]:
+    """Pull file + directory entries out of a PROPFIND multistatus body.
+
+    ``href_prefix`` is the URL path prefix to strip so returned paths are
+    relative to the folder root (no leading slash). Both ``href_prefix``
+    and the ``<d:href>`` values are URL-decoded before comparison —
+    OpenCloud's response uses literal ``$`` in href even when the request
+    URL had it as ``%24``, which would otherwise break a naive
+    ``startswith`` check. Entries pointing at the root itself (empty path
+    after stripping) are dropped.
+    """
+    decoded_prefix = unquote(href_prefix)
+    entries: list[ProjectFolderEntry] = []
+    for resp in _PROPFIND_RESPONSE_RE.finditer(xml):
+        block = resp.group(1)
+        href_match = _PROPFIND_HREF_RE.search(block)
+        if not href_match:
+            continue
+        href = unquote(href_match.group(1).strip())
+        if not href.startswith(decoded_prefix):
+            continue
+        rel_path = href[len(decoded_prefix) :].rstrip("/")
+        if not rel_path:
+            # The folder root itself shows up first; skip it.
+            continue
+        is_dir = bool(_PROPFIND_COLLECTION_RE.search(block))
+        size_match = _PROPFIND_CONTENTLENGTH_RE.search(block)
+        etag_match = _PROPFIND_ETAG_RE.search(block)
+        ctype_match = _PROPFIND_CONTENTTYPE_RE.search(block)
+        entries.append(
+            ProjectFolderEntry(
+                path=rel_path,
+                is_dir=is_dir,
+                size=int(size_match.group(1)) if size_match else 0,
+                etag=etag_match.group(1).strip().strip('"') if etag_match else "",
+                content_type=ctype_match.group(1).strip() if ctype_match else "",
+            )
+        )
+    return entries
 
 
 class OpenCloudBackend:
@@ -628,6 +689,264 @@ class OpenCloudBackend:
         safe_id = quote(drive_id, safe="")
         return f"{self._public_url}/files/spaces/{safe_id}"
 
+    @instrument_backend_op("list_project_folder")
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        """Recursive enumeration of a project folder Space, via repeated
+        ``PROPFIND`` with ``Depth: 1``.
+
+        OpenCloud (oCIS) rejects ``Depth: infinity`` with HTTP 400, so we
+        walk the tree breadth-first instead — one ``Depth: 1`` PROPFIND
+        per directory. Returns every descendant (files + directories);
+        order is breadth-first.
+        """
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "list_project_folder: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        base_path = f"/dav/spaces/{safe_drive}"
+        # Strip the leading prefix off of every href so callers get
+        # paths relative to the project root.
+        href_prefix = f"{base_path}/"
+
+        all_entries: list[ProjectFolderEntry] = []
+        # Breadth-first queue of subpaths to expand. Empty string = root.
+        queue: list[str] = [subpath.strip("/")]
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            safe_sub = quote(current, safe="/")
+            url_path = f"{base_path}/{safe_sub}" if safe_sub else base_path
+            entries = await self._propfind_depth_one(url_path, href_prefix)
+            for entry in entries:
+                # Skip entries that fall outside ``subpath`` — Depth=1
+                # only returns immediate children, but defensive guard.
+                if current and not entry.path.startswith(current.rstrip("/") + "/"):
+                    if entry.path != current:
+                        continue
+                all_entries.append(entry)
+                if entry.is_dir and entry.path not in seen:
+                    queue.append(entry.path)
+        return all_entries
+
+    async def _propfind_depth_one(
+        self, url_path: str, href_prefix: str
+    ) -> list[ProjectFolderEntry]:
+        """Single ``Depth: 1`` PROPFIND that returns one folder's children.
+
+        Sent with no body — the server returns all known props by
+        default, same shape that ``_resolve_item_id`` (Depth=0) gets
+        back. Including a body XML had OpenCloud returning 400 in
+        testing.
+        """
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.request(
+                "PROPFIND",
+                url_path,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Depth": "1",
+                },
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"path {url_path} not found",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 207:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"unexpected PROPFIND status {resp.status_code} for {url_path}",
+                backend=self.backend_id,
+                status_code=resp.status_code,
+                raw={"body": resp.text[:500]},
+            )
+        return _parse_propfind_entries(resp.text, href_prefix=href_prefix)
+
+    @instrument_backend_op("get_project_folder_file_bytes")
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        """GET one file out of a project folder Space."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        rel = path.lstrip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "get_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_path = quote(rel, safe="/")
+        url = f"/dav/spaces/{safe_drive}/{safe_path}"
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code == 404:
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in drive {drive_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        if resp.status_code != 200:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNKNOWN,
+                f"GET file {path!r}: unexpected status {resp.status_code}",
+                backend=self.backend_id,
+                status_code=resp.status_code,
+            )
+        return resp.content
+
+    @instrument_backend_op("put_project_folder_file_bytes")
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """PUT one file into a project folder Space, MKCOL-ing parents.
+
+        Same MKCOL-each-segment-then-PUT idiom as ``put_session_file``.
+        Used by the Mode A accept flow (job_cloud_export.md §3.5) to
+        write the agent's edits back to the cloud folder.
+        """
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_project_folder_file_bytes: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        base = f"/dav/spaces/{safe_drive}"
+        token = await self._get_service_token()
+        segments = rel.split("/")
+        parents = segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{base}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = f"{base}/{quote(rel, safe='/')}"
+            headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(put_url, headers=headers, content=content)
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+
+    @instrument_backend_op("delete_project_folder_file")
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        """DELETE one file from a project folder Space."""
+        self._ensure_ready()
+        drive_id = handle.native_id
+        if not drive_id:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: handle has no drive id",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "delete_project_folder_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        safe_drive = quote(drive_id, safe="")
+        url = f"/dav/spaces/{safe_drive}/{quote(rel, safe='/')}"
+        token = await self._get_service_token()
+        try:
+            resp = await self._client.delete(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
+        if resp.status_code in (200, 204):
+            return
+        if resp.status_code == 404:
+            if if_exists:
+                return
+            raise CloudBackendError(
+                CloudBackendErrorKind.NOT_FOUND,
+                f"file {path!r} not found in drive {drive_id}",
+                backend=self.backend_id,
+                status_code=404,
+            )
+        raise CloudBackendError(
+            CloudBackendErrorKind.UNKNOWN,
+            f"DELETE file {path!r}: unexpected status {resp.status_code}",
+            backend=self.backend_id,
+            status_code=resp.status_code,
+        )
+
     def get_project_folder_webdav_url(
         self, handle: ProjectFolderHandle
     ) -> Optional[str]:
@@ -870,6 +1189,68 @@ class OpenCloudBackend:
         safe_id = quote(str(drive_id), safe="")
         safe_path = quote(handle.native_id, safe="/")
         return f"{self._base_url}/dav/spaces/{safe_id}/{safe_path}/"
+
+    @instrument_backend_op("put_session_file")
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """PUT one file into a session folder, MKCOL-ing parents on the way.
+
+        ``path`` is slash-separated, relative to the session folder root,
+        no leading slash. WebDAV PUT does not auto-create missing
+        intermediate collections, so we MKCOL each parent segment one
+        at a time first (idempotent — 405 means "already there").
+        """
+        self._ensure_ready()
+        if self._agent_home_webdav_base is None:
+            raise CloudBackendError(
+                CloudBackendErrorKind.UNAVAILABLE,
+                "agent-home Space WebDAV base not set",
+                backend=self.backend_id,
+            )
+        rel = path.strip("/")
+        if not rel:
+            raise CloudBackendError(
+                CloudBackendErrorKind.INVALID_REQUEST,
+                "put_session_file: path must be non-empty",
+                backend=self.backend_id,
+                retryable=False,
+            )
+        token = await self._get_service_token()
+        folder_path = handle.native_id.strip("/")
+        full_segments = folder_path.split("/") + rel.split("/")
+        # MKCOL every parent collection of the target file.
+        parents = full_segments[:-1]
+        try:
+            for i in range(len(parents)):
+                partial = "/".join(parents[: i + 1])
+                url = f"{self._agent_home_webdav_base}/{quote(partial, safe='/')}"
+                resp = await self._client.request(
+                    "MKCOL",
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if resp.status_code in (201, 405):
+                    continue
+                resp.raise_for_status()
+
+            put_url = (
+                f"{self._agent_home_webdav_base}/"
+                f"{quote('/'.join(full_segments), safe='/')}"
+            )
+            headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
+            if content_type:
+                headers["Content-Type"] = content_type
+            put_resp = await self._client.put(put_url, headers=headers, content=content)
+            if put_resp.status_code not in (200, 201, 204):
+                put_resp.raise_for_status()
+        except httpx.HTTPError as e:
+            raise self._map_http_error(e) from e
 
     # ------------------------------------------------------------ Internal helpers
 

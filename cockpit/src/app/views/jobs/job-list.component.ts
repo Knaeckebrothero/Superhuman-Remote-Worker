@@ -1,4 +1,5 @@
 import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
@@ -274,6 +275,21 @@ interface JobRow {
                       >
                         {{ 'jobs.action.promote' | transloco }}
                       </app-button>
+                      @if (!row.job.exported_at) {
+                        <app-button
+                          variant="secondary"
+                          size="sm"
+                          [loading]="exportingJobIds().has(row.job.id)"
+                          [ariaLabel]="'jobs.tooltip.exportToCloud' | transloco"
+                          (clicked)="exportJobToSharedFolder(row.job.id); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.exportToCloud' | transloco }}
+                        </app-button>
+                      } @else {
+                        <app-badge tone="success" size="sm">
+                          {{ 'jobs.action.exported' | transloco }}
+                        </app-badge>
+                      }
                     }
                     @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
                       <app-button
@@ -745,6 +761,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   private readonly data = inject(DataService);
   private readonly userService = inject(UserService);
   private readonly transloco = inject(TranslocoService);
+  private readonly router = inject(Router);
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
@@ -757,6 +774,7 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   // In-flight action tracking
   readonly cancelingJobIds = signal<Set<string>>(new Set());
+  readonly exportingJobIds = signal<Set<string>>(new Set());
   readonly ideLoadingJobIds = signal<Set<string>>(new Set());
   private idePollingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -1057,9 +1075,9 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   reviewJob(jobId: string): void {
-    // Select the job and open it in debug panels (review component will detect pending_review)
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
+    this.router.navigate(['/review']);
   }
 
   pauseJob(jobId: string): void {
@@ -1160,6 +1178,32 @@ export class JobListComponent implements OnInit, OnDestroy {
         this.refresh();
       }
     });
+  }
+
+  exportJobToSharedFolder(jobId: string): void {
+    const next = new Set(this.exportingJobIds());
+    next.add(jobId);
+    this.exportingJobIds.set(next);
+
+    this.api.exportJobToSharedFolder(jobId).subscribe({
+      next: (result) => {
+        this.removeExporting(jobId);
+        if (result) {
+          const url = result.folder?.browser_url;
+          if (url) {
+            window.open(url, '_blank', 'noopener');
+          }
+          this.refresh();
+        }
+      },
+      error: () => this.removeExporting(jobId),
+    });
+  }
+
+  private removeExporting(jobId: string): void {
+    const next = new Set(this.exportingJobIds());
+    next.delete(jobId);
+    this.exportingJobIds.set(next);
   }
 
   getUserColor(userId?: string | null): string | null {

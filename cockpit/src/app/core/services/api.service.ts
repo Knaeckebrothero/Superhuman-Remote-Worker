@@ -17,8 +17,15 @@ import {
     Expert,
     ExpertDetail,
     Job,
+    JobAcceptConflict,
+    JobAcceptOutcome,
+    JobAcceptPartialFailure,
+    JobAcceptResult,
     JobCreateRequest,
+    JobDiffFile,
+    JobDiffSummary,
     JobProgress,
+    JobRejectResult,
     JobStatistics,
     KnowledgeListResponse,
     KnowledgeNoteDetail,
@@ -1441,6 +1448,123 @@ export class ApiService {
     return this.http.post<{ status: string; project_id?: string }>(
       `${this.baseUrl}/jobs/${jobId}/promote`, body,
     ).pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Mode B of the job cloud workflow — export a completed loose job's output/
+   * folder to a freshly-allocated shared cloud folder. Only valid for jobs
+   * that are completed AND have no project_id. Returns the folder's
+   * browser/WebDAV URLs and the number of files copied.
+   *
+   * See docs/done/job_cloud_export.md §3.2.
+   */
+  exportJobToSharedFolder(
+    jobId: string,
+  ): Observable<{
+    job_id: string;
+    files_copied: number;
+    folder: { name: string; browser_url: string | null; webdav_url: string | null };
+  } | null> {
+    return this.http
+      .post<{
+        job_id: string;
+        files_copied: number;
+        folder: { name: string; browser_url: string | null; webdav_url: string | null };
+      }>(`${this.baseUrl}/jobs/${jobId}/export-to-shared-folder`, {})
+      .pipe(
+        tap((result) =>
+          this.toast.success(
+            this.t('toasts.jobs.exportedToCloud', { count: result?.files_copied ?? 0 }),
+          ),
+        ),
+        catchError((error) => {
+          console.error(`Failed to export job ${jobId} to cloud:`, error);
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.exportFailed'));
+          return of(null);
+        }),
+      );
+  }
+
+  // ===== Mode A diff review (job_cloud_export.md §3.4–§3.6) =====
+
+  /**
+   * Fetch the file-level diff summary for a project-attached job in
+   * pending_review. Returns null when the orchestrator has no Mode A
+   * baseline for the job (loose job, or a pre-Mode-A project job).
+   */
+  getJobDiff(jobId: string): Observable<JobDiffSummary | null> {
+    return this.http
+      .get<JobDiffSummary>(`${this.baseUrl}/jobs/${jobId}/diff`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Fetch one file's old/new content for the Mode A diff view.
+   * Paths must be under ``projects/<slug>/`` — the orchestrator rejects
+   * anything else with 400. ``old_content`` is null for ``added``,
+   * ``new_content`` is null for ``deleted``.
+   */
+  getJobDiffFile(jobId: string, filePath: string): Observable<JobDiffFile | null> {
+    // Encode each path segment so spaces / unicode / German umlauts in
+    // the slug survive the round-trip. FastAPI's ``:path`` converter
+    // happily takes encoded slashes.
+    const encoded = filePath.split('/').map(encodeURIComponent).join('/');
+    return this.http
+      .get<JobDiffFile>(`${this.baseUrl}/jobs/${jobId}/diff/${encoded}`)
+      .pipe(catchError(() => of(null)));
+  }
+
+  /**
+   * Accept the Mode A diff — orchestrator writes each change back to
+   * the project's cloud folder, then transitions diff_status=accepted +
+   * status=completed.
+   *
+   * Returns a tagged outcome so the component can branch on:
+   * - `ok`: success, surface applied/deleted counts
+   * - `conflict`: 409 external_modifications_detected (show banner +
+   *   diverged paths)
+   * - `partial`: 502 partial_write_failure (show per-file errors)
+   * - `error`: any other failure (toast + log)
+   */
+  acceptJobDiff(jobId: string): Observable<JobAcceptOutcome> {
+    return this.http
+      .post<JobAcceptResult>(`${this.baseUrl}/jobs/${jobId}/accept`, {})
+      .pipe(
+        map((data): JobAcceptOutcome => ({ kind: 'ok', data })),
+        catchError((err: HttpErrorResponse): Observable<JobAcceptOutcome> => {
+          // FastAPI wraps custom 409 / 502 payloads under {detail: {...}}.
+          const detail = err.error?.detail;
+          if (err.status === 409 && detail && typeof detail === 'object' &&
+              detail.code === 'external_modifications_detected') {
+            return of({ kind: 'conflict', data: detail as JobAcceptConflict });
+          }
+          if (err.status === 502 && detail && typeof detail === 'object' &&
+              detail.code === 'partial_write_failure') {
+            return of({ kind: 'partial', data: detail as JobAcceptPartialFailure });
+          }
+          const message = typeof detail === 'string'
+            ? detail
+            : this.errors.translate(err, 'errors.jobs.acceptFailed');
+          return of({ kind: 'error', status: err.status, detail: message });
+        }),
+      );
+  }
+
+  /**
+   * Reject the Mode A diff — orchestrator stamps diff_status=rejected
+   * and status=completed. No cloud writes happen; the Gitea commits
+   * remain as audit trail.
+   */
+  rejectJobDiff(jobId: string): Observable<JobRejectResult | null> {
+    return this.http
+      .post<JobRejectResult>(`${this.baseUrl}/jobs/${jobId}/reject`, {})
+      .pipe(
+        catchError((err) => {
+          console.error(`Failed to reject job ${jobId} diff:`, err);
+          this.toast.danger(this.errors.translate(err, 'errors.jobs.rejectFailed'));
+          return of(null);
+        }),
+      );
   }
 
   // ===== Knowledge Base Endpoints =====

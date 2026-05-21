@@ -22,6 +22,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 from .handles import (
     GroupId,
+    ProjectFolderEntry,
     ProjectFolderHandle,
     SessionFolderHandle,
     ShareHandle,
@@ -153,6 +154,72 @@ class MainCloudBackend(Protocol):
         self, handle: ProjectFolderHandle
     ) -> Optional[str]: ...
 
+    async def list_project_folder(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        subpath: str = "",
+    ) -> list[ProjectFolderEntry]:
+        """Recursive inventory of a project folder via WebDAV ``PROPFIND``.
+
+        ``subpath`` is relative to the folder root (slash-separated, no
+        leading slash). Empty means "walk from root." Returned entries
+        list every descendant file and directory, sorted by ``path``.
+
+        Used by the job cloud-export Mode A baseline-seed
+        (docs/done/job_cloud_export.md §3.1) to enumerate what to
+        push into Gitea before the agent starts.
+        """
+        ...
+
+    async def get_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+    ) -> bytes:
+        """Read one file's raw bytes from a project folder.
+
+        ``path`` is relative to the folder root. Raises
+        ``CloudBackendError(NOT_FOUND)`` if the file is missing.
+        Returns the file body as-is so binary content survives.
+        """
+        ...
+
+    async def put_project_folder_file_bytes(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Write one file into a project folder, creating parents as needed.
+
+        ``path`` is slash-separated, relative to the project folder root,
+        no leading slash. Parent collections are created on the way
+        (WebDAV ``MKCOL`` is idempotent against existing collections).
+        Used by the Mode A accept flow (job_cloud_export.md §3.5) to
+        write the agent's accepted edits back to the cloud.
+        """
+        ...
+
+    async def delete_project_folder_file(
+        self,
+        handle: ProjectFolderHandle,
+        *,
+        path: str,
+        if_exists: bool = True,
+    ) -> None:
+        """Delete one file from a project folder.
+
+        ``path`` is relative to the folder root. With ``if_exists=True``
+        a missing file is treated as success (the goal state is "gone").
+        Used by the Mode A accept flow when the agent deleted a file
+        within the mounted project folder.
+        """
+        ...
+
     # ------------------------------------------------------------- Session folders
     async def ensure_session_folder(
         self, *, session_id: str
@@ -180,6 +247,27 @@ class MainCloudBackend(Protocol):
     def get_session_folder_webdav_url(
         self, handle: SessionFolderHandle
     ) -> Optional[str]: ...
+
+    async def put_session_file(
+        self,
+        handle: SessionFolderHandle,
+        *,
+        path: str,
+        content: bytes,
+        content_type: Optional[str] = None,
+    ) -> None:
+        """Upload one file into the session folder via WebDAV.
+
+        ``path`` is relative to the session folder root, slash-separated,
+        no leading slash. The implementation must MKCOL any missing
+        parent collections before issuing the PUT. ``content_type`` is
+        advisory; backends may pick a default if omitted.
+
+        Used by the job cloud-export endpoint (Mode B in
+        docs/done/job_cloud_export.md) to copy a completed job's
+        output files into a freshly-allocated shared folder.
+        """
+        ...
 
     # ------------------------------------------------------------- Credentials
     @property

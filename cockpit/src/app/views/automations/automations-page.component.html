@@ -7,7 +7,7 @@
       <app-button
         variant="primary"
         size="md"
-        (clicked)="openEditor(null)"
+        (clicked)="openNewEditor()"
         [disabled]="editor() !== null"
       >
         <app-icon size="inherit">add</app-icon>
@@ -16,6 +16,18 @@
     </div>
 
     <p class="page-desc">{{ 'automations.subtitle' | transloco }}</p>
+
+    @if (projectFilter()) {
+      <div class="filter-chip" role="status">
+        <app-icon size="inherit">folder_shared</app-icon>
+        <span class="filter-chip__label">
+          {{ 'automations.list.projectFilter.label' | transloco: {name: projectFilterDisplayName(), count: automations().length} }}
+        </span>
+        <button type="button" class="filter-chip__clear" (click)="clearProjectFilter()">
+          {{ 'automations.list.projectFilter.clear' | transloco }}
+        </button>
+      </div>
+    }
 
     @if (errorMessage()) {
       <div class="error-banner" role="alert">{{ errorMessage() }}</div>
