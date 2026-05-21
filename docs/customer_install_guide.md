@@ -41,15 +41,14 @@ see the chart README (`helm show readme oci://ghcr.io/knaeckebrothero/charts/sup
 
 ## 2. What the customer provides
 
-### 2.1 Kubernetes
+### 2.1 A host for the cluster
 
-- **k3s 1.28+** on a single node, or a larger cluster. k3s is recommended
-  for prototypes — it ships with Traefik ingress and a default
-  local-path StorageClass, both of which the chart uses out of the box.
-- **Minimum resources (prototype):** 8 vCPU / 16 GiB RAM / 100 GiB disk.
-  Comfortable for 1–3 concurrent agents. Scale up for more.
-- A default `StorageClass` (k3s `local-path` is fine).
-- Outbound internet from the cluster to GHCR (`ghcr.io`) for image pulls.
+- **Ubuntu 22.04+ LTS** (24.04 also fine) on a physical machine or VM.
+- **Minimum (prototype):** 8 vCPU / 16 GiB RAM / 100 GiB disk. Comfortable
+  for 1–3 concurrent agents. Scale up for heavier demos.
+- **Network:** static IP reachable from the customer's edge reverse proxy
+  on TCP/80, and outbound internet for image pulls (`ghcr.io`).
+- **SSH access** for the SRW deployment engineer.
 
 ### 2.2 DNS
 
@@ -68,28 +67,34 @@ Use a wildcard `*.srw.example.com` if the customer prefers — easier to
 maintain.
 
 If a subdomain is already in use in the parent zone, override it
-individually under `global.hostnames` in the values file (see §5).
+individually under `global.hostnames` in the values file (see §6).
 
 ### 2.3 Edge reverse proxy — TLS termination
 
 TLS is terminated **at the customer's edge proxy** (in this engagement:
 Zoraxy). The k3s ingress runs HTTP-only inside the cluster.
 
+```
+browser ─HTTPS─▶ Zoraxy ─HTTP─▶ k3s Traefik ─HTTP─▶ pods
+                 (TLS terminated here,
+                  ACME cert via lego)
+```
+
 Per route, the customer configures on their proxy:
 
 | Setting | Value |
 |---|---|
 | Public hostname | one of the five above |
-| Upstream / backend | `http://<k3s-ingress-ip>:80` (or the NodePort, e.g. `:32080`) |
+| Upstream / backend | `http://<k3s-node-ip>:80` |
 | TLS | enable with the customer's preferred ACME setup (Let's Encrypt, ZeroSSL, internal CA) |
 | Pass `Host` header | **yes** — required for the cluster Ingress to route by hostname |
 | WebSocket / SSE | enabled (Zoraxy enables both automatically) |
 | HTTP/2 | enabled |
 
 This is the **only customer-side integration** this install requires.
-Cluster-side `cert-manager` is not used.
+Cluster-side `cert-manager` is not used — see §3.3 for why.
 
-### 2.4 LLM provider keys
+### 2.4 LLM provider accounts
 
 At least one provider account. Customer-billed, customer-owned. **These are
 NOT placed in the Kubernetes Secret** — they're configured post-install via
@@ -102,46 +107,152 @@ model.
 
 ---
 
-## 3. Pre-flight checklist
+## 3. Cluster bootstrap (Ubuntu → k3s → helm)
 
-Run through these on the cluster **before** `helm install`.
+Run on the Ubuntu host the customer provided. All commands below are run
+via SSH on that node — `kubectl` and `helm` execute locally there.
+
+### 3.1 System prep
 
 ```bash
-# Kubernetes version
-kubectl version --short
+# Update + a couple of utilities the chart and install need
+sudo apt update && sudo apt -y upgrade
+sudo apt -y install curl ca-certificates iptables jq
+
+# Make sure the hostname resolves locally (k3s needs this)
+hostnamectl set-hostname srw-host       # whatever the customer calls it
+echo "127.0.1.1 $(hostname)" | sudo tee -a /etc/hosts
+
+# Confirm a swap-free setup is fine — k3s handles swap, but high I/O on
+# swap will hurt the databases. Recommended: leave swap off for prod-ish
+# workloads.
+free -h
+```
+
+### 3.2 Install k3s
+
+```bash
+# One-line install. k3s ships Traefik + local-path StorageClass +
+# metrics-server + CoreDNS + klipper-lb as a single binary, so this is
+# everything you need for a working single-node cluster.
+curl -sfL https://get.k3s.io | sh -
+
+# k3s starts automatically as a systemd service:
+sudo systemctl status k3s --no-pager
+
+# Confirm node is Ready
+sudo k3s kubectl get nodes
+#   → STATUS=Ready
+
+# Confirm built-ins are up
+sudo k3s kubectl -n kube-system get pods
+#   → traefik, local-path-provisioner, metrics-server, coredns all Running
+
+# Confirm the default StorageClass
+sudo k3s kubectl get storageclass
+#   → `local-path (default)`
+```
+
+### 3.3 Why no cert-manager
+
+Zoraxy at the edge already does ACME (via go-lego — supports Let's Encrypt,
+ZeroSSL, Buypass, Google CA, plus DNS-01 for ~100 providers). The cluster
+Ingress runs HTTP-only (`ingress.tls.enabled: false` in §6) and pods are
+unreachable from outside the proxy. Adding cert-manager would mean **two
+cert systems with no integration between them** — Zoraxy can't consume
+cluster-issued certs automatically, and the cluster doesn't need certs.
+Dead weight on a prototype.
+
+If a later phase needs per-service mTLS (e.g. encrypting the orchestrator's
+Postgres connection), we install cert-manager then for that specific use
+case.
+
+### 3.4 kubectl + helm setup for the install user
+
+```bash
+# Make `kubectl` work without sudo for the install user
+sudo install -m 0644 /etc/rancher/k3s/k3s.yaml ~/.kube/config 2>/dev/null \
+  || (mkdir -p ~/.kube && sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config && sudo chown $(id -u):$(id -g) ~/.kube/config)
+export KUBECONFIG=~/.kube/config
+echo "export KUBECONFIG=~/.kube/config" >> ~/.bashrc
+
+kubectl get nodes      # should work without sudo now
+
+# Install helm 3.12+
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version           # → v3.12.x or newer
+```
+
+### 3.5 Firewall
+
+k3s itself does not need any ports open to the outside world for the
+install — `kubectl` and `helm` run locally on the node. The only inbound
+traffic the cluster receives in this install is from the customer's edge
+proxy.
+
+If `ufw` is active on the host:
+
+```bash
+sudo ufw status
+# If inactive — nothing to do.
+# If active — allow inbound HTTP from the edge proxy host:
+sudo ufw allow from <zoraxy-host-ip> to any port 80 proto tcp
+sudo ufw reload
+```
+
+Ports the customer should **not** expose publicly:
+
+| Port | Purpose | Public exposure |
+|---|---|---|
+| `6443/tcp` | k3s API server | localhost only (install runs on-node) |
+| `80/tcp` | cluster Ingress (Traefik) | only from the edge proxy |
+| `443/tcp` | unused on the node — Zoraxy terminates TLS | not needed on the cluster host |
+| `8472/udp` | k3s flannel VXLAN | internal — single-node anyway |
+| `10250/tcp` | kubelet | internal — single-node anyway |
+
+---
+
+## 4. Pre-flight checklist
+
+Before `helm install`, confirm the bootstrap landed cleanly:
+
+```bash
+# K8s version
+kubectl version
 #   → server ≥ v1.28
 
-# Default storage class exists
+# Default storage class
 kubectl get storageclass
-#   → one entry has (default) annotation (k3s ships `local-path` (default))
+#   → `local-path (default)`
 
-# Traefik ingress controller (k3s default)
+# Traefik ingress controller (k3s built-in)
 kubectl -n kube-system get pods | grep traefik
 #   → Running
 
 # DNS records resolve to the edge proxy
-dig +short srw.example.com
-dig +short api.srw.example.com
-dig +short auth.srw.example.com
-dig +short git.srw.example.com
-dig +short cloud.srw.example.com
+for h in srw api.srw auth.srw git.srw cloud.srw; do
+  echo -n "$h.example.com → "; dig +short $h.example.com
+done
 #   → all return the edge proxy IP
 
-# Edge proxy can reach k3s
+# Edge proxy can reach the cluster
 # (from the proxy host)
 curl -sI http://<k3s-node-ip>/
 #   → 404 from Traefik is fine — it means HTTP works, just no Host match yet
+
+# helm is installed
+helm version    # → v3.12+
 ```
 
 ---
 
-## 4. Secret creation
+## 5. Secret creation
 
 The chart references a Kubernetes Secret named `srw-secrets` for cluster
 credentials. **LLM provider keys are NOT in this Secret** — those go into
-the database via the Admin UI after install (see §9).
+the database via the Admin UI after install (see §10).
 
-### 4.1 Generate the encryption key
+### 5.1 Generate the encryption key
 
 ```bash
 openssl rand -base64 32
@@ -149,11 +260,11 @@ openssl rand -base64 32
 #     If lost, every stored credential in the DB becomes unrecoverable.
 ```
 
-### 4.2 Author `srw.env`
+### 5.2 Author `srw.env`
 
 ```env
 # --- Always required ---
-APP_ENCRYPTION_KEY=<paste from 4.1>
+APP_ENCRYPTION_KEY=<paste from 5.1>
 
 # --- Bundled Postgres ---
 POSTGRES_USER=srw
@@ -182,7 +293,7 @@ CLOUD_SERVICE_PASSWORD=<random 32-char string>
 > source, the OpenCloud OIDC client, and the agent's account on OpenCloud —
 > all using the secrets above. No manual OIDC client setup required.
 
-### 4.3 Apply
+### 5.3 Apply
 
 ```bash
 kubectl create namespace srw
@@ -198,14 +309,14 @@ Delete `srw.env` from disk once the Secret is applied. The
 
 ---
 
-## 5. Values file
+## 6. Values file
 
 ```yaml
 # my-values.yaml
 license:
   acceptTerms: true
 
-# Pin resource names to `srw-*` (matches the verification commands in §7).
+# Pin resource names to `srw-*` (matches the verification commands in §8).
 fullnameOverride: srw
 
 global:
@@ -295,7 +406,7 @@ logLevel: INFO
 
 ---
 
-## 6. Install
+## 7. Install
 
 ```bash
 helm install srw \
@@ -314,7 +425,7 @@ kubectl -n srw get pods -w
 
 ---
 
-## 7. Post-install verification
+## 8. Post-install verification
 
 ```bash
 kubectl -n srw rollout status deploy/srw-orchestrator --timeout=300s
@@ -341,7 +452,7 @@ kubectl -n srw logs deploy/srw-orchestrator | grep -iE "encryption|app_encryptio
 
 ---
 
-## 8. Edge proxy route configuration
+## 9. Edge proxy route configuration
 
 (Customer-side. Configure these after the cluster install completes.)
 
@@ -388,12 +499,12 @@ Browse to `https://srw.example.com`. You should be redirected to
 
 ---
 
-## 9. First-user setup + LLM providers
+## 10. First-user setup + LLM providers
 
 ### Create the first user in Keycloak
 
 1. Open `https://auth.srw.example.com/admin/` in a browser.
-2. Sign in: `admin` / `KEYCLOAK_ADMIN_PASSWORD` from §4.2.
+2. Sign in: `admin` / `KEYCLOAK_ADMIN_PASSWORD` from §5.2.
 3. Top-left realm dropdown → switch from `master` to `srw`.
 4. **Users → Add user.** Fill in `Email`, `First/Last name`, set
    `Email verified` ON.
@@ -426,7 +537,7 @@ The system is now usable.
 
 ---
 
-## 10. Upgrade
+## 11. Upgrade
 
 ```bash
 helm upgrade srw \
@@ -449,7 +560,7 @@ kubectl -n srw rollout restart deploy/srw-cockpit deploy/srw-orchestrator
 
 ---
 
-## 11. Rollback
+## 12. Rollback
 
 ```bash
 helm history srw -n srw
@@ -462,7 +573,7 @@ upgrade you need a snapshot taken before the upgrade.
 
 ---
 
-## 12. Uninstall
+## 13. Uninstall
 
 ```bash
 helm uninstall srw -n srw
@@ -474,9 +585,15 @@ kubectl -n srw delete pvc -l app.kubernetes.io/instance=srw
 kubectl delete namespace srw
 ```
 
+To fully tear down the cluster too (only if abandoning the host):
+
+```bash
+sudo /usr/local/bin/k3s-uninstall.sh
+```
+
 ---
 
-## 13. Secret schema (this install)
+## 14. Secret schema (this install)
 
 | Key | Required | Notes |
 |---|---|---|
@@ -507,11 +624,11 @@ endpoints.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `orchestrator` `CrashLoopBackOff`, logs say `APP_ENCRYPTION_KEY` missing/invalid | Secret not created or key absent | Re-create per §4 |
-| Cockpit loads but login bounces / "Invalid redirect_uri" | Edge proxy not passing the `Host` header, or DNS for `auth.<domain>` not pointing at the edge proxy | Verify §2.2 and §8 |
+| `orchestrator` `CrashLoopBackOff`, logs say `APP_ENCRYPTION_KEY` missing/invalid | Secret not created or key absent | Re-create per §5 |
+| Cockpit loads but login bounces / "Invalid redirect_uri" | Edge proxy not passing the `Host` header, or DNS for `auth.<domain>` not pointing at the edge proxy | Verify §2.2 and §9 |
 | `502 Bad Gateway` from edge proxy on every host | k3s ingress IP changed or NodePort moved | Re-check `kubectl -n kube-system get svc traefik`, update upstream in proxy |
 | WebSocket fails (chat shows "disconnected") | Edge proxy not forwarding `Upgrade: websocket` | Confirm WebSocket toggle is on for the host (Zoraxy enables by default) |
-| Cockpit shows "no LLM providers configured" | Expected on first login | Configure in §9 Step 3 |
+| Cockpit shows "no LLM providers configured" | Expected on first login | Configure in §10 Step 3 |
 | Jobs stuck in `created` | Agent pool size = 0 or agents `Offline` | `kubectl -n srw get pods -l app.kubernetes.io/component=agent`; agents heartbeat every 5s, go offline after 3min |
 | OpenCloud login fails | `OPENCLOUD_KEYCLOAK_CLIENT_SECRET` mismatch, or the in-realm OIDC client wasn't created | `kubectl -n srw logs job/srw-keycloak-bootstrap` (the realm bootstrap Job's output) |
 | Migration fails on upgrade | Crashed orchestrator left the advisory lock held | See `docs/db_migration.md` § "Troubleshooting" |
@@ -534,7 +651,7 @@ has been evaluated:
   Nextcloud / OpenCloud / MS365. Chart supports `cloud.externalBackend`.
   MS365 support is on the SRW roadmap (1–2 months).
 - **mailcow SMTP** — wire the customer's existing SMTP into the
-  `SMTP_*` Secret keys (§13) and turn on the relevant email features.
+  `SMTP_*` Secret keys (§14) and turn on the relevant email features.
 - **n8n / osTicket / Teams** — out-of-cluster integrations via the SRW
   REST API; no chart changes needed.
 - **GPU node for local LLM** — if the customer wants on-prem inference for
