@@ -174,6 +174,11 @@ class OrchestratorClient:
             "agent_mode": agent_mode,
             "thread_id": thread_id,
             "build_sha": os.environ.get("BUILD_SHA", ""),
+            # Injected via Kubernetes downward API by agent_provisioner; empty
+            # outside of K8s (local dev). The orchestrator persists this on
+            # the agents row so the session router can construct K8s
+            # ownerReferences on per-session Service/Ingress resources.
+            "pod_uid": os.environ.get("POD_UID", ""),
         }
 
         try:
