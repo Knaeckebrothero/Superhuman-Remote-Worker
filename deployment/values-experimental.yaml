@@ -37,7 +37,7 @@ global:
 # -----------------------------------------------------------------------------
 image:
   orchestrator:
-    tag: sha-22d60f9
+    tag: sha-1f24ff0
   agent:
     tag: sha-e7a91a5
   cockpit:
