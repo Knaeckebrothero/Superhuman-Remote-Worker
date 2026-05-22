@@ -132,6 +132,7 @@ from security.credential_files import (  # noqa: E402
 from security.csrf import CSRFMiddleware  # noqa: E402
 from auth import bff_router  # noqa: E402
 from routers import automations_router  # noqa: E402
+from routers.sessions import router as sessions_router  # noqa: E402
 from services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
@@ -193,6 +194,8 @@ from services.container_provisioner import container_provisioner  # noqa: E402
 from services.docker_provisioner import docker_provisioner  # noqa: E402
 from services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from services.agent_provisioner import agent_provisioner  # noqa: E402
+from services.session_router import SessionRouterService  # noqa: E402
+from services.session_tokens import SessionTokenService  # noqa: E402
 from services.lifecycle import (  # noqa: E402
     AgentInstanceManager,
     InstanceLifecycleReconciler,
@@ -237,6 +240,43 @@ vector_db = PostgresDB(
     connection_string=_vector_url,
     migrations_dir=MIGRATIONS_VECTOR_DIR,
 )
+
+# Session router singletons — see docs/features/direct_session_websockets.md
+import json as _session_json
+
+_session_annotations_raw = os.environ.get("SESSION_INGRESS_ANNOTATIONS", "{}")
+try:
+    _session_annotations = _session_json.loads(_session_annotations_raw)
+    if not isinstance(_session_annotations, dict):
+        _session_annotations = {}
+except (ValueError, TypeError):
+    logger.warning(
+        "SESSION_INGRESS_ANNOTATIONS env not valid JSON: %r — falling back to {}",
+        _session_annotations_raw,
+    )
+    _session_annotations = {}
+
+session_router = SessionRouterService(
+    namespace=os.environ.get("SESSION_INGRESS_NAMESPACE", "default"),
+    ingress_host=os.environ.get("SESSION_INGRESS_HOST", "api.example.com"),
+    ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
+    annotations=_session_annotations,
+)
+
+_session_jwt_secret = os.environ.get("SESSION_JWT_SECRET", "")
+if _session_jwt_secret:
+    session_tokens = SessionTokenService(
+        secret=_session_jwt_secret,
+        ttl_seconds=int(os.environ.get("SESSION_JWT_TTL_S", "60")),
+    )
+else:
+    # Allow boot without session_tokens (e.g., during chart install before
+    # the Secret is set). Calls to GET /connection will fail at runtime
+    # with a clear error.
+    session_tokens = None  # type: ignore[assignment]
+    logger.warning(
+        "SESSION_JWT_SECRET not set — direct WS session endpoints will fail"
+    )
 
 
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
@@ -3520,6 +3560,7 @@ app.include_router(bff_router)
 app.include_router(graph_router)
 app.include_router(uploads_router)
 app.include_router(automations_router)
+app.include_router(sessions_router)
 
 
 @app.get("/api/tables")
@@ -13674,402 +13715,6 @@ async def synthesize_thread_message_tts(
         # disabled-feature signal rather than an error.
         return Response(status_code=204)
     return Response(content=audio, media_type="audio/mpeg")
-
-
-# --- Session notification helpers (used by WS proxy) ---
-
-_SESSION_NOTIFY_METHODS = {"permission.request", "vm_upgrade.needed", "ready"}
-_SESSION_RESOLVE_METHODS = {"approve", "deny"}
-
-
-def _inspect_session_event(
-    raw: str,
-    thread_id: str,
-    user_id: str,
-    thread_title: str,
-    config_name: str | None,
-) -> None:
-    """Inspect an agent→browser WS frame and broadcast SSE if notification-worthy."""
-    if not user_id:
-        return
-    try:
-        event = json.loads(raw)
-        method = event.get("method")
-        if method not in _SESSION_NOTIFY_METHODS:
-            return
-
-        from services.notification_feed import notification_feed
-        import uuid as _uuid
-
-        params = event.get("params") or {}
-        event_id = str(_uuid.uuid4())
-
-        type_map = {
-            "permission.request": "session.permission_request",
-            "vm_upgrade.needed": "session.vm_upgrade",
-            "ready": "session.waiting",
-        }
-
-        notification_feed.broadcast(
-            user_id=user_id,
-            event_type=type_map[method],
-            data={
-                "event_id": event_id,
-                "thread_id": thread_id,
-                "title": thread_title,
-                "config_name": config_name,
-                "tool": params.get("tool"),
-                "args": params.get("args"),
-                "reason": params.get("reason"),
-                "command": params.get("command"),
-            },
-        )
-    except (json.JSONDecodeError, Exception):
-        pass
-
-
-def _inspect_browser_event(
-    raw: str,
-    thread_id: str,
-    user_id: str,
-) -> None:
-    """Inspect a browser→agent WS frame and broadcast resolve if approve/deny."""
-    if not user_id:
-        return
-    try:
-        event = json.loads(raw)
-        method = event.get("method")
-        if method not in _SESSION_RESOLVE_METHODS:
-            return
-
-        from services.notification_feed import notification_feed
-
-        notification_feed.broadcast(
-            user_id=user_id,
-            event_type="session.resolved",
-            data={"thread_id": thread_id, "resolution": method},
-        )
-    except (json.JSONDecodeError, Exception):
-        pass
-
-
-@app.websocket("/ws/persistent/{thread_id}")
-async def persistent_ws_proxy(ws: WebSocket, thread_id: str):
-    """Proxy WebSocket connection to a persistent agent pod.
-
-    Looks up the agent serving this thread and forwards WebSocket frames
-    bidirectionally. Follows the same pattern as the IDE proxy.
-    """
-    # Must accept before we can send/close — FastAPI raises 500 otherwise
-    await ws.accept()
-
-    # Cookie auth: browsers send the BFF session cookie on WS handshake
-    # automatically when the URL is on the API host. Closes the prior
-    # zero-auth hole — pre-BFF, this endpoint accepted any caller who
-    # knew (or guessed) the thread UUID. See
-    # docs/features/auth_bff_and_api_tokens.md §1.1.
-    user = await resolve_ws_user(ws, postgres_db)
-    if not user:
-        await ws.close(code=4401, reason="Authentication required")
-        return
-    if not user.get("is_approved"):
-        await ws.close(code=4403, reason="Account pending approval")
-        return
-
-    # Resolve thread → agent → pod_ip
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        await ws.close(code=4404, reason="Thread not found")
-        return
-
-    # Thread ownership: a session can only attach to its own threads. The
-    # cockpit's persistent-chat UI already enforces this in its REST flow,
-    # but the WS handshake is a separate trust boundary.
-    if str(thread.get("user_id") or "") != str(user["id"]):
-        logger.warning(
-            "WS: user %s tried to attach to thread %s owned by %s",
-            user["id"],
-            thread_id,
-            thread.get("user_id"),
-        )
-        await ws.close(code=4403, reason="Thread access denied")
-        return
-
-    # Restore suspended workspace before connecting to agent
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
-    ws_status = ws_ctx.get("status")
-    if ws_status == "failed":
-        error = ws_ctx.get("error", "unknown error")
-        logger.error("Thread %s workspace container failed: %s", thread_id, error)
-        await ws.close(
-            code=4503,
-            reason=f"Workspace container failed: {error}",
-        )
-        return
-    if ws_status == "suspended" and workspace_suspension_service.is_enabled:
-        logger.info("Restoring suspended workspace for thread %s", thread_id)
-        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
-        if not ok:
-            await ws.close(code=4503, reason="Failed to restore workspace")
-            return
-
-    # If agent_id is set but the agent is offline, clear the stale binding
-    # so we can re-provision.  This handles the case where the desktop cockpit
-    # opens the WS directly (without calling the resume endpoint first).
-    # Also clear when the agent is alive but no longer holds this thread —
-    # this catches /session/attach failures where the agent reset its local
-    # _pod_state to IDLE (heartbeat → status=ready, thread_id=NULL) but the
-    # release-agent POST didn't reach us (e.g. orchestrator restart).
-    if thread.get("agent_id"):
-        bound_agent = await postgres_db.get_agent(str(thread["agent_id"]))
-        is_missing = not bound_agent
-        is_offline = bool(bound_agent) and bound_agent.get("status") == "offline"
-        is_session_lost = (
-            bool(bound_agent)
-            and bound_agent.get("status") == "ready"
-            and str(bound_agent.get("thread_id") or "") != thread_id
-        )
-        if is_missing or is_offline or is_session_lost:
-            reason = (
-                "missing"
-                if is_missing
-                else "offline"
-                if is_offline
-                else "ready-without-session"
-            )
-            logger.warning(
-                "Thread %s: bound agent %s is %s — clearing stale binding",
-                thread_id,
-                thread.get("agent_id"),
-                reason,
-            )
-            await postgres_db.resume_thread(thread_id)
-            thread = await postgres_db.get_thread(thread_id)
-
-    if not thread.get("agent_id"):
-        # On-demand: try idle pool agent first (instant), then new pod.
-        if agent_provisioner.is_available:
-            config_name = thread.get("config_name", "persistent_defaults")
-
-            async def _ws_provision(
-                tid: str,
-                cfg: str,
-                thr: dict,
-            ) -> None:
-                # Pool-first: attach an idle dual-mode agent (no boot).
-                idle_agent = await _find_idle_persistent_agent()
-                if idle_agent:
-                    co = thr.get("config_override") or {}
-                    if isinstance(co, str):
-                        try:
-                            co = json.loads(co)
-                        except (json.JSONDecodeError, TypeError):
-                            co = {}
-                    pids = thr.get("project_ids") or []
-                    resolved_ds = await postgres_db.resolve_datasources_for_thread(
-                        project_ids=pids
-                    )
-                    ds_payload = _build_datasources_payload(resolved_ds)
-                    if resolved_ds:
-                        co = _build_datasource_tool_override(resolved_ds, co)
-                    ok = await _send_session_attach(
-                        idle_agent,
-                        tid,
-                        co,
-                        pids,
-                        datasources=ds_payload,
-                    )
-                    if ok:
-                        logger.info(
-                            "Thread %s: WS attached to idle pool agent %s",
-                            tid,
-                            idle_agent["hostname"],
-                        )
-                        return
-
-                # Fallback: create a dedicated session pod.
-                await agent_provisioner.provision_agent(
-                    purpose="session", thread_id=tid, config_name=cfg
-                )
-
-            asyncio.create_task(_ws_provision(thread_id, config_name, thread))
-        elif persistent_provisioner.is_available:
-            pod_status = await persistent_provisioner.get_pod_status(thread_id)
-            if not pod_status:
-                config_name = thread.get("config_name", "persistent_defaults")
-                asyncio.create_task(
-                    persistent_provisioner.create_agent_pod(
-                        thread_id, config_name=config_name
-                    )
-                )
-
-        # Poll for agent registration (agent calls /api/agents/register on startup).
-        # Budget must accommodate a cold pull of the agent image — on a fresh
-        # tag, kubelet image pull alone can take 2–3 minutes per node.
-        await ws.send_json({"method": "status", "params": {"phase": "provisioning"}})
-        bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
-        bind_interval_s = 2
-        bind_iterations = max(1, bind_timeout_s // bind_interval_s)
-        agent_bound = False
-        for i in range(bind_iterations):
-            await asyncio.sleep(bind_interval_s)
-            thread = await postgres_db.get_thread(thread_id)
-            if thread and thread.get("agent_id"):
-                agent_bound = True
-                break
-            # Periodic progress ping so the cockpit doesn't sit silent for
-            # minutes on a cold agent image pull.
-            if i > 0 and i % 5 == 0:
-                try:
-                    await ws.send_json(
-                        {
-                            "method": "status",
-                            "params": {
-                                "phase": "provisioning",
-                                "elapsed_s": (i + 1) * bind_interval_s,
-                                "timeout_s": bind_timeout_s,
-                            },
-                        }
-                    )
-                except Exception:
-                    pass
-
-        if not agent_bound:
-            await ws.close(code=4503, reason="Agent failed to start within timeout")
-            return
-
-    agent = await postgres_db.get_agent(str(thread["agent_id"]))
-    if not agent:
-        await ws.close(code=4503, reason="Agent not available")
-        return
-
-    pod_ip = agent.get("pod_ip")
-    pod_port = agent.get("pod_port", 8001)
-    if not pod_ip:
-        await ws.close(code=4503, reason="Agent has no IP")
-        return
-
-    # Wait for agent readiness before proxying WS.
-    # Budget must outlast the agent's own _poll_workspace_ready (120s) plus
-    # margin for image pulls — a cold workspace image pull can take ~130s.
-    await ws.send_json({"method": "status", "params": {"phase": "booting"}})
-    ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
-    poll_interval_s = 2
-    iterations = max(1, ready_timeout_s // poll_interval_s)
-    agent_ready = False
-    for i in range(iterations):
-        try:
-            async with httpx.AsyncClient(timeout=2) as client:
-                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
-                if resp.status_code == 200:
-                    try:
-                        body = resp.json()
-                        if body.get("ready", False):
-                            agent_ready = True
-                            break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        # Periodic progress ping so the cockpit doesn't sit silent for minutes
-        # on a cold image pull. Every 5 iterations ≈ every 10s.
-        if i > 0 and i % 5 == 0:
-            try:
-                await ws.send_json(
-                    {
-                        "method": "status",
-                        "params": {
-                            "phase": "booting",
-                            "elapsed_s": i * poll_interval_s,
-                            "timeout_s": ready_timeout_s,
-                        },
-                    }
-                )
-            except Exception:
-                pass
-        await asyncio.sleep(poll_interval_s)
-
-    if not agent_ready:
-        await ws.close(code=4503, reason="Agent not ready within timeout")
-        return
-
-    await ws.send_json({"method": "status", "params": {"phase": "connecting"}})
-
-    upstream_url = f"ws://{pod_ip}:{pod_port}/ws/chat"
-    logger.info(f"Proxying WS for thread {thread_id} to {upstream_url}")
-
-    try:
-        import websockets
-
-        async with websockets.connect(
-            upstream_url,
-            max_size=16 * 1024 * 1024,
-            ping_interval=30,
-            close_timeout=5,
-        ) as upstream:
-
-            async def agent_to_browser():
-                try:
-                    async for message in upstream:
-                        if isinstance(message, str):
-                            # Inspect for notification-worthy events
-                            _inspect_session_event(
-                                message,
-                                thread_id,
-                                str(thread.get("user_id") or ""),
-                                thread.get("title") or "Session",
-                                thread.get("config_name"),
-                            )
-                            await ws.send_text(message)
-                        else:
-                            await ws.send_bytes(message)
-                except Exception:
-                    pass
-
-            async def browser_to_agent_with_inspect():
-                """Relay browser→agent, inspecting for approve/deny to clear notifications."""
-                try:
-                    while True:
-                        data = await ws.receive_text()
-                        _inspect_browser_event(
-                            data,
-                            thread_id,
-                            str(thread.get("user_id") or ""),
-                        )
-                        await upstream.send(data)
-                except WebSocketDisconnect:
-                    pass
-                except Exception:
-                    pass
-
-            # Run both directions concurrently
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(browser_to_agent_with_inspect()),
-                    asyncio.create_task(agent_to_browser()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-
-    except ImportError:
-        logger.error("websockets package not installed — WS proxy unavailable")
-        await ws.close(code=4500, reason="Server misconfigured")
-    except Exception as e:
-        logger.error(f"WS proxy error for thread {thread_id}: {e}")
-    finally:
-        try:
-            await ws.close()
-        except Exception:
-            pass
-        logger.info(f"WS proxy ended for thread {thread_id}")
 
 
 @app.get("/api/jobs/{job_id}/logs")
