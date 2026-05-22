@@ -10,6 +10,7 @@ This module provides the canonical async PostgreSQL interface using asyncpg with
 This is the canonical database layer for the orchestrator.
 """
 
+import hashlib
 import json
 import logging
 import math
@@ -2482,6 +2483,26 @@ class PostgresDB:
                 title,
             )
         return str(row["id"])
+
+    @asynccontextmanager
+    async def thread_advisory_lock(self, thread_id: str):
+        """Postgres advisory lock keyed by ``thread_id``.
+
+        Pattern matches the schema-migration lock at
+        ``orchestrator/database/migrate.py:157``. The lock key is a stable
+        hash of the thread_id (Postgres advisory locks take a bigint key).
+        Used by ``POST /api/sessions/{thread_id}/prepare`` to serialize
+        concurrent prepare calls — see
+        ``docs/issues/persistent_thread_double_provisioning_race.md``.
+        """
+        h = hashlib.blake2b(thread_id.encode(), digest_size=8).digest()
+        key = int.from_bytes(h, byteorder="big", signed=True)
+
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
+                yield
+                # Lock auto-released at transaction end.
 
     async def get_thread(self, thread_id: str) -> Dict[str, Any] | None:
         """Get thread by ID."""
