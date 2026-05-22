@@ -124,6 +124,13 @@ async def _do_prepare(
             {"thread_id": thread_id, "state": state, **extra},
         )
 
+    # Emit "provisioning" up-front so the cockpit's progress card surfaces
+    # the phase even when a sibling path (POST /resume) wins the race and
+    # has the agent_id set by the time we acquire the lock. The state names
+    # describe phases of the request, not of the underlying work — if the
+    # agent is already bound, we still went through a "preparing" phase
+    # before we got there.
+    _emit("provisioning")
     try:
         async with db.thread_advisory_lock(thread_id):
             thread = await db.get_thread(thread_id)
@@ -133,7 +140,6 @@ async def _do_prepare(
 
             # Provisioning (if needed).
             if not thread.get("agent_id"):
-                _emit("provisioning")
                 await _provision_agent_for_thread(
                     thread_id=thread_id,
                     config_name=config_name or "persistent_defaults",
