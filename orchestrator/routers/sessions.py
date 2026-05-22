@@ -22,7 +22,7 @@ import logging
 import os
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from security.auth import require_approved_user
@@ -70,9 +70,9 @@ class PrepareResponse(BaseModel):
     response_model=PrepareResponse,
 )
 async def prepare_session(
+    request: Request,
     thread_id: str,
     body: PrepareRequest,
-    user: dict = Depends(require_approved_user),
 ):
     """Kick off (or rejoin) provisioning for the given thread.
 
@@ -81,6 +81,7 @@ async def prepare_session(
     calls GET /api/sessions/{tid}/connection for the token.
     """
     db = _get_db()
+    user = await require_approved_user(request, db)
 
     thread = await db.get_thread(thread_id)
     if not thread:
@@ -254,8 +255,8 @@ class ConnectionResponse(BaseModel):
     response_model=ConnectionResponse,
 )
 async def get_connection(
+    request: Request,
     thread_id: str,
-    user: dict = Depends(require_approved_user),
 ):
     """Return the canonical {ws_url, token, expires_at} for a bound session.
 
@@ -264,6 +265,7 @@ async def get_connection(
     code path on the cockpit.
     """
     db = _get_db()
+    user = await require_approved_user(request, db)
 
     thread = await db.get_thread(thread_id)
     if not thread:
