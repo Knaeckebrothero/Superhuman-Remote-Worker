@@ -281,10 +281,22 @@ async def get_connection(
     agent = await db.get_agent(str(agent_id))
     if not agent or not agent.get("pod_ip"):
         raise HTTPException(status_code=409, detail="agent unavailable")
-    if agent.get("status") not in ("ready", "working"):
+    if agent.get("status") not in ("ready", "working", "session"):
         raise HTTPException(status_code=409, detail="agent not ready")
 
-    from main import session_tokens  # type: ignore
+    # Make /connection self-healing: any code path that binds an agent to a
+    # thread (POST /prepare, the legacy resume in main.py, orchestrator restart
+    # re-binding from DB) must end up routable. ensure_route is idempotent and
+    # tolerates concurrent-create races, so calling it here guarantees the
+    # Service + Ingress exist by the time the cockpit opens the WS — no matter
+    # which path bound the agent.
+    from main import session_router, session_tokens  # type: ignore
+
+    await session_router.ensure_route(
+        thread_id=thread_id,
+        pod_name=str(agent.get("hostname") or ""),
+        pod_uid=str(agent.get("pod_uid") or ""),
+    )
 
     token, expires_at = session_tokens.mint(
         user_id=str(user["id"]),
