@@ -120,6 +120,70 @@ _tool_inflight: bool = False
 _events_epoch: int = 0
 _next_seq: int = 0
 
+# ---------------------------------------------------------------------------
+# NATS notification publishing (Direct Session WebSockets, Task 9)
+# ---------------------------------------------------------------------------
+# The agent pod mirrors notification-worthy _broadcast events onto NATS subject
+# ``session.events.{tid}`` so the orchestrator's nats_bridge (Task 5) can
+# re-broadcast them onto the SSE notification feed. Replaces the orchestrator's
+# old per-WS-frame inspection. Non-fatal: if NATS is unconfigured or down,
+# WS subscribers still get the event — only the SSE notification mirror is lost.
+import json as _json
+import os as _os
+
+_nats_client = None  # Lazily initialized.
+
+# Methods that the orchestrator's nats_bridge subscribes to and forwards
+# to the SSE notification feed. Keep in sync with the event_type_map in
+# orchestrator/services/nats_bridge.py:_on_session_event.
+_NOTIFICATION_METHODS = frozenset({
+    "permission.request",
+    "vm_upgrade.needed",
+    "approve",
+    "deny",
+    "ready",
+})
+
+
+async def _ensure_nats_client():
+    """Lazy NATS connection. Returns None if NATS is unconfigured."""
+    global _nats_client
+    if _nats_client is not None:
+        return _nats_client
+    url = _os.environ.get("NATS_URL")
+    if not url:
+        return None
+    try:
+        import nats
+        _nats_client = await nats.connect(url)
+        return _nats_client
+    except Exception as e:
+        logger.warning("agent pod: NATS connect failed: %s", e)
+        return None
+
+
+async def emit_session_event(method: str, params: dict) -> None:
+    """Publish a notification event to ``session.events.{tid}`` on NATS.
+
+    Mirrors what _broadcast does to WS subscribers but for the
+    orchestrator's bridge. Methods not in _NOTIFICATION_METHODS are
+    skipped. Failures are non-fatal: if NATS is down, the WS subscribers
+    still get the event.
+    """
+    if method not in _NOTIFICATION_METHODS:
+        return
+    tid = _os.environ.get("SESSION_BOUND_THREAD_ID", "")
+    if not tid:
+        return
+    nc = await _ensure_nats_client()
+    if not nc:
+        return
+    payload = {"thread_id": tid, "method": method, "params": params}
+    try:
+        await nc.publish(f"session.events.{tid}", _json.dumps(payload).encode())
+    except Exception as e:
+        logger.warning("agent pod: NATS publish failed: %s", e)
+
 
 def _session_ready() -> bool:
     """True when the persistent session is fully attached and the loop
@@ -1853,6 +1917,12 @@ def _broadcast(method: str, params: Dict[str, Any]) -> None:
                     client_id,
                     method,
                 )
+
+    # Mirror notification-worthy events to NATS so the orchestrator's
+    # bridge can fan them out to the SSE notification feed. Non-blocking,
+    # non-fatal on failure.
+    if method in _NOTIFICATION_METHODS:
+        asyncio.create_task(emit_session_event(method, params))
 
     # Fire-and-forget DB write. Doesn't block the broadcast — if persistence
     # fails the live subscribers still received the frame; only the SSE
