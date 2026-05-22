@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
+from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from .persistent_session import PersistentSession
 from ..tools.registry import TOOL_REGISTRY
@@ -1359,6 +1360,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
+        # Validate the session JWT carried as ?t={token}.
+        if not await _validate_session_token(ws):
+            return
         await handle_persistent_websocket(ws)
 
     return app

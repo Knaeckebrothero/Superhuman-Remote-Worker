@@ -35,6 +35,7 @@ from .models import (
     JobStartResponse,
     ReadyResponse,
 )
+from ._session_auth import validate_session_token as _validate_session_token
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
@@ -1110,6 +1111,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
     @app.websocket("/ws/chat")
     async def ws_chat(ws: WebSocket):
         global _pending_exit_task
+
+        # Validate the session JWT carried as ?t={token}.
+        if not await _validate_session_token(ws):
+            return
 
         # Cancel any pending exit from a previous WS disconnect (e.g. page
         # refresh). Vestigial under the Phase-1 keystone — the WS-disconnect
