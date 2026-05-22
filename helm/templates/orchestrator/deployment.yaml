@@ -277,6 +277,8 @@ spec:
               value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
             - name: SESSION_INGRESS_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            - name: SESSION_INGRESS_ANNOTATIONS
+              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:
