@@ -279,6 +279,13 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_INGRESS_ANNOTATIONS
               value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+            # Name of the Secret holding the shared HS256 JWT key. The
+            # orchestrator passes this through to dynamically-provisioned
+            # agent pod manifests (services/agent_provisioner.py) so the
+            # pod's JWT validator (src/api/_session_auth.py) can look up the
+            # same secret and verify handshake tokens.
+            - name: SESSION_JWT_SECRET_NAME
+              value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:

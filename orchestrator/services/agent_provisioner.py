@@ -980,6 +980,31 @@ class AgentProvisioner:
                             "fieldRef": {"fieldPath": "metadata.uid"},
                         },
                     },
+                    # Session handshake authentication. The orchestrator mints
+                    # an HS256 JWT carrying `tid=<thread_id>`; the pod's
+                    # validator (src/api/_session_auth.py) verifies the
+                    # signature with SESSION_JWT_SECRET and checks the `tid`
+                    # claim against SESSION_BOUND_THREAD_ID. Both must be set
+                    # for the direct-WS flow; missing them closes every
+                    # handshake with code 4500. Worker pods get empty values
+                    # (the WS endpoints aren't reachable for them anyway).
+                    {
+                        "name": "SESSION_BOUND_THREAD_ID",
+                        "value": thread_id or "",
+                    },
+                    {
+                        "name": "SESSION_JWT_SECRET",
+                        "valueFrom": {
+                            "secretKeyRef": {
+                                "name": os.environ.get(
+                                    "SESSION_JWT_SECRET_NAME",
+                                    "srw-session-jwt",
+                                ),
+                                "key": "jwt-secret",
+                                "optional": True,
+                            },
+                        },
+                    },
                 ],
                 "securityContext": {
                     "runAsNonRoot": True,
