@@ -970,7 +970,9 @@ def test_pod_manifest_injects_session_bound_thread_id_env():
     )
 
     env = manifest["spec"]["containers"][0].get("env", [])
-    tid_entry = next((e for e in env if e.get("name") == "SESSION_BOUND_THREAD_ID"), None)
+    tid_entry = next(
+        (e for e in env if e.get("name") == "SESSION_BOUND_THREAD_ID"), None
+    )
     assert tid_entry is not None
     assert tid_entry["value"] == "11111111-2222-3333-4444-555555555555"
 

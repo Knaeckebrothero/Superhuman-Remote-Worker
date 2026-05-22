@@ -274,9 +274,7 @@ else:
     # the Secret is set). Calls to GET /connection will fail at runtime
     # with a clear error.
     session_tokens = None  # type: ignore[assignment]
-    logger.warning(
-        "SESSION_JWT_SECRET not set — direct WS session endpoints will fail"
-    )
+    logger.warning("SESSION_JWT_SECRET not set — direct WS session endpoints will fail")
 
 
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:

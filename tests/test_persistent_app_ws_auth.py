@@ -16,6 +16,7 @@ def configure_pod_env(monkeypatch):
 @pytest.fixture
 def app():
     from src.api.persistent_app import create_persistent_app
+
     # config_path is required; we never actually run the lifespan / session,
     # but the constructor needs a value. A dummy string is fine — the route
     # under test (the validator gate on /ws/chat) doesn't touch it.
@@ -48,9 +49,9 @@ def test_ws_chat_rejects_missing_token(app):
 
 def test_ws_chat_rejects_token_for_other_thread(app):
     """Token's `tid` doesn't match pod's bound thread → close with 4403."""
-    other_token, _ = SessionTokenService(
-        "test-pod-secret-do-not-use"
-    ).mint("u1", "OTHER-thread")
+    other_token, _ = SessionTokenService("test-pod-secret-do-not-use").mint(
+        "u1", "OTHER-thread"
+    )
     client = TestClient(app)
     code = _connect_and_capture_close(client, f"/ws/chat?t={other_token}")
     assert code == 4403
@@ -81,9 +82,7 @@ def test_ws_chat_accepts_valid_token(app):
     are 4401 (auth), 4403 (mismatch), and 4500 (misconfig). Anything else
     means the validator allowed the request through.
     """
-    token, _ = SessionTokenService(
-        "test-pod-secret-do-not-use"
-    ).mint("u1", "t1")
+    token, _ = SessionTokenService("test-pod-secret-do-not-use").mint("u1", "t1")
     client = TestClient(app)
     try:
         code = _connect_and_capture_close(client, f"/ws/chat?t={token}")

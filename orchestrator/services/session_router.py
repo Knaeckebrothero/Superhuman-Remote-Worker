@@ -19,6 +19,7 @@ try:
     from kubernetes import client as k8s_client
     from kubernetes import config as k8s_config
     from kubernetes.client.exceptions import ApiException
+
     KUBERNETES_AVAILABLE = True
 except ImportError:
     k8s_client = None  # type: ignore[assignment]
@@ -127,7 +128,9 @@ class SessionRouterService:
                 if e.status != 404:
                     logger.warning(
                         "teardown_route: %s on %s returned %s",
-                        delete_fn.__name__, name, e.status,
+                        delete_fn.__name__,
+                        name,
+                        e.status,
                     )
 
     # --------------------------------------------------------------------- #
