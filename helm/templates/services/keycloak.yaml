@@ -242,9 +242,9 @@ data:
               }
             }
           ]
-        },
+        }
         {{- if .Values.nextcloud.enabled }}
-        {
+        ,{
           "clientId": "nextcloud",
           "name": "Nextcloud",
           "description": "Cloud storage",
@@ -270,9 +270,10 @@ data:
             "email",
             "groups"
           ]
-        },
+        }
         {{- end }}
-        {
+        {{- if .Values.pgadmin.enabled }}
+        ,{
           "clientId": "pgadmin",
           "name": "pgAdmin",
           "description": "Database administration UI (optional)",
@@ -297,8 +298,10 @@ data:
             "profile",
             "email"
           ]
-        },
-        {
+        }
+        {{- end }}
+        {{- if .Values.mcp.enabled }}
+        ,{
           "clientId": "mcp-server",
           "name": "MCP OAuth Bridge",
           "description": "MCP server OAuth proxy — enables Claude.ai, ChatGPT, and other OAuth-based AI platforms to connect via OIDC",
@@ -325,6 +328,7 @@ data:
             "roles"
           ]
         }
+        {{- end }}
       ],
       "users": [
         {
@@ -687,11 +691,13 @@ spec:
                   name: {{ include "srw.secretName" . }}
                   key: NEXTCLOUD_OIDC_CLIENT_SECRET
             {{- end }}
+            {{- if .Values.pgadmin.enabled }}
             - name: PGADMIN_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: PGADMIN_OIDC_CLIENT_SECRET
+            {{- end }}
             - name: OPENCLOUD_KEYCLOAK_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
@@ -704,12 +710,14 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: OPENCLOUD_PUBLIC_URL
                   optional: true
+            {{- if .Values.mcp.enabled }}
             - name: MCP_OIDC_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_OIDC_CLIENT_SECRET
                   optional: true
+            {{- end }}
             # Cockpit BFF — flips the cockpit client from public-PKCE to
             # confidential when a value is present. Absence keeps the
             # client public (pre-BFF behavior). See
@@ -728,6 +736,7 @@ spec:
               value: {{ include "srw.apiUrl" . | quote }}
             - name: COCKPIT_URL
               value: {{ include "srw.cockpitUrl" . | quote }}
+            {{- if .Values.email.enabled }}
             - name: SMTP_HOST
               valueFrom:
                 configMapKeyRef:
@@ -743,6 +752,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SMTP_PASSWORD
+            {{- end }}
           lifecycle:
             postStart:
               exec:
@@ -776,8 +786,12 @@ spec:
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
                                 {{- end }}
                                 "opencloud-orchestrator:$OPENCLOUD_KEYCLOAK_CLIENT_SECRET" \
+                                {{- if .Values.pgadmin.enabled }}
                                 "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
+                                {{- end }}
+                                {{- if .Values.mcp.enabled }}
                                 "mcp-server:$MCP_OIDC_CLIENT_SECRET" \
+                                {{- end }}
                                 "${BFF_CLIENT_ID:-cockpit-bff}:$KC_CLIENT_SECRET"; do
                       CID="${pair%%:*}"; SEC="${pair#*:}"
                       [ -z "$SEC" ] && continue
