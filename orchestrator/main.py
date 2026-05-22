@@ -2445,6 +2445,14 @@ class AgentRegistration(BaseModel):
     build_sha: str | None = Field(
         None, description="Build commit SHA baked into the agent image"
     )
+    pod_uid: str | None = Field(
+        None,
+        description=(
+            "K8s-assigned metadata.uid of the agent pod, self-reported via "
+            "the Kubernetes downward API. Used by the session router to "
+            "stamp ownerReferences on per-session Service/Ingress resources."
+        ),
+    )
 
 
 class AgentRegistrationResponse(BaseModel):
@@ -10365,6 +10373,7 @@ async def register_agent(
             agent_mode=registration.agent_mode,
             thread_id=registration.thread_id,
             build_sha=registration.build_sha,
+            pod_uid=registration.pod_uid,
         )
         # Bind persistent agent to its thread
         if registration.agent_mode == "persistent" and registration.thread_id:
