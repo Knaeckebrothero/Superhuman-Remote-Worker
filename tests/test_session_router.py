@@ -108,3 +108,22 @@ async def test_teardown_route_swallows_404(
     k8s_networking_api.delete_namespaced_ingress.side_effect = ApiException(status=404)
 
     await svc.teardown_route(thread_id="t1")  # Must not raise
+
+
+@pytest.mark.asyncio
+async def test_ensure_route_tolerates_409_on_race(
+    svc, k8s_core_api, k8s_networking_api
+):
+    """If a concurrent writer beats us to creating the resource, the create
+    call returns 409. ensure_route must treat that as success, not raise."""
+    from kubernetes.client.exceptions import ApiException
+    # Reads still 404 (we think it doesn't exist).
+    # Creates return 409 (a racing writer created it just now).
+    k8s_core_api.create_namespaced_service.side_effect = ApiException(status=409)
+    k8s_networking_api.create_namespaced_ingress.side_effect = ApiException(status=409)
+
+    # Must not raise.
+    prefix = await svc.ensure_route(
+        thread_id="t1", pod_name="srw-agent-abc", pod_uid="pod-uid-1"
+    )
+    assert prefix == "/p/t1"

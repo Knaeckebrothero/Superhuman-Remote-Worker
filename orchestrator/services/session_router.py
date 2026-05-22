@@ -15,9 +15,16 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from kubernetes import client as k8s_client
-from kubernetes import config as k8s_config
-from kubernetes.client.exceptions import ApiException
+try:
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+    from kubernetes.client.exceptions import ApiException
+    KUBERNETES_AVAILABLE = True
+except ImportError:
+    k8s_client = None  # type: ignore[assignment]
+    k8s_config = None  # type: ignore[assignment]
+    ApiException = Exception  # type: ignore[misc, assignment]  # fallback so isinstance/raise still work
+    KUBERNETES_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,11 @@ class SessionRouterService:
     def _lazy_init_apis(self) -> None:
         if self._core_api is not None and self._networking_api is not None:
             return
+        if not KUBERNETES_AVAILABLE:
+            raise RuntimeError(
+                "session_router requires the 'kubernetes' package; "
+                "set it in orchestrator/requirements.txt or inject test APIs."
+            )
         try:
             k8s_config.load_incluster_config()
         except k8s_config.ConfigException:
@@ -74,19 +86,29 @@ class SessionRouterService:
 
         # Service
         if not await self._exists(self._core_api.read_namespaced_service, name):
-            await self._call(
-                self._core_api.create_namespaced_service,
-                namespace=self._namespace,
-                body=self._service_body(thread_id, name, pod_name, pod_uid),
-            )
+            try:
+                await self._call(
+                    self._core_api.create_namespaced_service,
+                    namespace=self._namespace,
+                    body=self._service_body(thread_id, name, pod_name, pod_uid),
+                )
+            except ApiException as e:
+                if e.status != 409:
+                    raise
+                # 409 = a racing writer beat us. The resource exists, we're done.
 
         # Ingress
         if not await self._exists(self._networking_api.read_namespaced_ingress, name):
-            await self._call(
-                self._networking_api.create_namespaced_ingress,
-                namespace=self._namespace,
-                body=self._ingress_body(thread_id, name, pod_name, pod_uid),
-            )
+            try:
+                await self._call(
+                    self._networking_api.create_namespaced_ingress,
+                    namespace=self._namespace,
+                    body=self._ingress_body(thread_id, name, pod_name, pod_uid),
+                )
+            except ApiException as e:
+                if e.status != 409:
+                    raise
+                # 409 = a racing writer beat us. The resource exists, we're done.
 
         return f"/p/{thread_id}"
 
