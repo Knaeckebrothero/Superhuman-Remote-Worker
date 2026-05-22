@@ -51,6 +51,11 @@ async def test_ensure_route_creates_service_and_ingress(
     )
 
     assert prefix == "/p/t1"
+    # Pod label patched so the Service selector matches.
+    k8s_core_api.patch_namespaced_pod.assert_called_once()
+    patch_kwargs = k8s_core_api.patch_namespaced_pod.call_args.kwargs
+    assert patch_kwargs["name"] == "srw-agent-abc"
+    assert patch_kwargs["body"]["metadata"]["labels"]["srw.io/thread-id"] == "t1"
     k8s_core_api.create_namespaced_service.assert_called_once()
     k8s_networking_api.create_namespaced_ingress.assert_called_once()
 

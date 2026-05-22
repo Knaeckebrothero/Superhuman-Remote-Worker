@@ -181,4 +181,12 @@ sessionRouter:
   jwtSecret: ""
   jwtSecretName: srw
   jwtSecretKey: SESSION_JWT_SECRET
+  # The cluster's `srw-api-ingress` (host api.*, path /, → orchestrator) is
+  # older than any per-session Ingress, and Traefik's default precedence is
+  # older-wins on host conflicts. Without an explicit priority bump, the
+  # per-session route `/p/{tid}/ws` loses to the catch-all `/` and the WS
+  # handshake ends up at the orchestrator (which 403s since the legacy proxy
+  # is gone). A high priority value makes the more-specific path win.
+  annotations:
+    traefik.ingress.kubernetes.io/router.priority: "1000"
 logLevel: "INFO"
