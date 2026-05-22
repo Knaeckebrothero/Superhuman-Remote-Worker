@@ -7,6 +7,21 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 
+def _install_fake_auth(monkeypatch, user_id: str = "u1") -> None:
+    """Replace require_approved_user on the sessions module with a fake.
+
+    The handlers call `require_approved_user(request, db)` inline rather than
+    via Depends, so app.dependency_overrides won't intercept it — we patch the
+    name on the importing module instead.
+    """
+    from orchestrator.routers import sessions as sessions_mod
+
+    async def _fake(request, db):
+        return {"id": user_id, "is_approved": True}
+
+    monkeypatch.setattr(sessions_mod, "require_approved_user", _fake, raising=True)
+
+
 @pytest.fixture
 def app(monkeypatch):
     """Minimal FastAPI app with the sessions router mounted."""
@@ -14,13 +29,7 @@ def app(monkeypatch):
 
     app = FastAPI()
 
-    # Override require_approved_user dependency to return a fixed user.
-    from security.auth import require_approved_user
-
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
 
     fake_db = AsyncMock()
     fake_db.get_thread = AsyncMock(
@@ -208,14 +217,10 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from orchestrator.routers.sessions import router as sessions_router
-    from security.auth import require_approved_user
     from orchestrator.services.session_tokens import SessionTokenService
 
     app = FastAPI()
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
 
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
@@ -259,13 +264,9 @@ def test_connection_returns_425_when_thread_unbound(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from orchestrator.routers.sessions import router as sessions_router
-    from security.auth import require_approved_user
 
     app = FastAPI()
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
 
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {"id": "t1", "user_id": "u1", "agent_id": None}
@@ -283,13 +284,9 @@ def test_connection_returns_404_for_missing_thread(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from orchestrator.routers.sessions import router as sessions_router
-    from security.auth import require_approved_user
 
     app = FastAPI()
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = None
     from orchestrator.routers import sessions as sessions_mod
@@ -306,13 +303,9 @@ def test_connection_returns_403_when_other_user(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from orchestrator.routers.sessions import router as sessions_router
-    from security.auth import require_approved_user
 
     app = FastAPI()
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
@@ -334,13 +327,9 @@ def test_connection_returns_409_when_agent_not_ready(monkeypatch):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     from orchestrator.routers.sessions import router as sessions_router
-    from security.auth import require_approved_user
 
     app = FastAPI()
-    app.dependency_overrides[require_approved_user] = lambda: {
-        "id": "u1",
-        "is_approved": True,
-    }
+    _install_fake_auth(monkeypatch)
     fake_db = AsyncMock()
     fake_db.get_thread.return_value = {
         "id": "t1",
