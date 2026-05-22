@@ -232,3 +232,65 @@ async def _wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
             pass
         await asyncio.sleep(interval)
     return False
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/sessions/{thread_id}/connection
+# --------------------------------------------------------------------------- #
+
+
+class ConnectionResponse(BaseModel):
+    state: str = Field(..., examples=["ready"])
+    ws_url: str
+    token: str
+    expires_at: int
+
+
+@router.get(
+    "/{thread_id}/connection",
+    response_model=ConnectionResponse,
+)
+async def get_connection(
+    thread_id: str,
+    user: dict = Depends(require_approved_user),
+):
+    """Return the canonical {ws_url, token, expires_at} for a bound session.
+
+    Same payload shape used by cold-start (after SSE "ready") and warm
+    reconnect — one token-mint code path on the orchestrator, one consumer
+    code path on the cockpit.
+    """
+    db = _get_db()
+
+    thread = await db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="thread not found")
+    if str(thread.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=403, detail="thread access denied")
+
+    agent_id = thread.get("agent_id")
+    if not agent_id:
+        # Not bound yet — caller should POST /prepare.
+        raise HTTPException(status_code=425, detail="session not ready")
+
+    agent = await db.get_agent(str(agent_id))
+    if not agent or not agent.get("pod_ip"):
+        raise HTTPException(status_code=409, detail="agent unavailable")
+    if agent.get("status") not in ("ready", "working"):
+        raise HTTPException(status_code=409, detail="agent not ready")
+
+    from main import session_tokens  # type: ignore
+    token, expires_at = session_tokens.mint(
+        user_id=str(user["id"]),
+        thread_id=thread_id,
+    )
+
+    host = os.environ.get("SESSION_INGRESS_HOST", "api.example.com")
+    ws_url = f"wss://{host}/p/{thread_id}/ws?t={token}"
+
+    return ConnectionResponse(
+        state="ready",
+        ws_url=ws_url,
+        token=token,
+        expires_at=expires_at,
+    )
