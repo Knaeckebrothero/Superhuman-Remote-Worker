@@ -234,17 +234,20 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
         "pod_port": 8001,
         "status": "ready",
         "hostname": "srw-agent-x",
+        "pod_uid": "k8s-uid-xyz",
     }
     from orchestrator.routers import sessions as sessions_mod
 
     monkeypatch.setattr(sessions_mod, "_get_db", lambda: fake_db, raising=False)
 
-    # Inject a real SessionTokenService that the endpoint can use.
+    # Inject a real SessionTokenService and a fake session_router.
     test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
     import sys
 
     fake_main = MagicMock()
     fake_main.session_tokens = test_tokens
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     monkeypatch.setitem(sys.modules, "main", fake_main)
     monkeypatch.setenv("SESSION_INGRESS_HOST", "api.test.example")
 
@@ -257,6 +260,12 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     assert body["ws_url"].startswith("wss://api.test.example/p/t1/ws?t=")
     assert isinstance(body["token"], str) and body["token"]
     assert isinstance(body["expires_at"], int)
+    # ensure_route is called idempotently on every /connection.
+    fake_main.session_router.ensure_route.assert_called_once_with(
+        thread_id="t1",
+        pod_name="srw-agent-x",
+        pod_uid="k8s-uid-xyz",
+    )
 
 
 def test_connection_returns_425_when_thread_unbound(monkeypatch):
