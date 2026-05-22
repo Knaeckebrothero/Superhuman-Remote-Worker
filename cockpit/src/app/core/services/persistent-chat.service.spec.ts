@@ -1125,6 +1125,189 @@ describe('PersistentChatService — control WS frame filtering', () => {
     });
 });
 
+describe('PersistentChatService — direct session WS (prepare + connection)', () => {
+    let originalEs: any;
+    let originalWs: any;
+
+    beforeEach(() => {
+        originalEs = (globalThis as any).EventSource;
+        originalWs = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+        (globalThis as any).EventSource = originalEs;
+        (globalThis as any).WebSocket = originalWs;
+        vi.clearAllMocks();
+    });
+
+    /** Build a URL-aware GET mock that handles all the endpoints connect() hits. */
+    function connectGetMock(opts: {
+        connectionResponses?: any[];  // array of values/errors to return on successive /connection calls
+        threadMeta?: Record<string, unknown>;
+        messages?: any[];
+    } = {}) {
+        const connectionResponses = opts.connectionResponses ?? [
+            of({state: 'ready', ws_url: 'wss://api.example.com/p/t/ws?t=jwt', token: 'jwt', expires_at: 0}),
+        ];
+        let connectionCallIdx = 0;
+        return (url: string) => {
+            if (url.includes('/api/sessions/') && url.endsWith('/connection')) {
+                const r = connectionResponses[Math.min(connectionCallIdx, connectionResponses.length - 1)];
+                connectionCallIdx += 1;
+                return r;
+            }
+            if (url.endsWith('/messages')) {
+                return of({messages: opts.messages ?? [], total: 0});
+            }
+            return of(opts.threadMeta ?? {status: 'active', total_turns: 0});
+        };
+    }
+
+    it('warm reconnect (already bound): GETs /connection, opens WS at returned ws_url, skips /prepare', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t1/ws?t=tok-warm',
+                        token: 'tok-warm',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        await ctx.service.connect('t1');
+
+        // GET /api/sessions/t1/connection was called.
+        const getUrls = ctx.mockHttp.get.mock.calls.map((c: any) => c[0]);
+        expect(getUrls.some((u: string) => u.endsWith('/api/sessions/t1/connection'))).toBe(true);
+
+        // POST /api/sessions/t1/prepare was NOT called.
+        const prepareCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t1/prepare'),
+        );
+        expect(prepareCalls).toHaveLength(0);
+
+        // WebSocket was opened at the URL returned by /connection.
+        expect(ctx.wsInstances).toHaveLength(1);
+        expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t1/ws?t=tok-warm');
+    });
+
+    it('cold start (425 → prepare → SSE ready → /connection): full sequence opens WS at final ws_url', async () => {
+        const ctx = createService();
+
+        // First /connection call → 425 (not bound). Second call → ready.
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    throwError(() => ({status: 425})),
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t2/ws?t=tok-cold',
+                        token: 'tok-cold',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        // POST /prepare returns 202 {state: provisioning}.
+        ctx.mockHttp.post.mockImplementation((url: string) => {
+            if (url.endsWith('/api/sessions/t2/prepare')) {
+                return of({state: 'provisioning'});
+            }
+            return of({});
+        });
+
+        const connectPromise = ctx.service.connect('t2');
+
+        // Allow microtasks to flush so /prepare is called and the lifecycle
+        // EventSource is opened on /notifications/events.
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        // Find the lifecycle EventSource (on /notifications/events).
+        const lifecycleEs = ctx.sseInstances.find((es) => es.url.includes('/notifications/events'));
+        expect(lifecycleEs).toBeDefined();
+
+        // Fire the ready lifecycle event.
+        fireSseMessage(lifecycleEs!, {
+            type: 'session.lifecycle',
+            thread_id: 't2',
+            state: 'ready',
+        });
+
+        await connectPromise;
+
+        // POST /prepare was called.
+        const prepareCalls = ctx.mockHttp.post.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t2/prepare'),
+        );
+        expect(prepareCalls).toHaveLength(1);
+
+        // GET /connection was called twice (initial 425, then post-ready).
+        const connCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t2/connection'),
+        );
+        expect(connCalls.length).toBe(2);
+
+        // WebSocket opened at the URL returned by the second /connection call.
+        const sessionWs = ctx.wsInstances.find((ws) =>
+            String(ws.url || '').includes('wss://api.example.com/p/t2/ws'),
+        );
+        expect(sessionWs).toBeDefined();
+        expect(sessionWs.url).toBe('wss://api.example.com/p/t2/ws?t=tok-cold');
+    });
+
+    it('WS close code 4401 re-fetches /connection and reopens WS with the fresh token', async () => {
+        const ctx = createService();
+        ctx.mockHttp.get.mockImplementation(
+            connectGetMock({
+                connectionResponses: [
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t3/ws?t=tok-A',
+                        token: 'tok-A',
+                        expires_at: 0,
+                    }),
+                    of({
+                        state: 'ready',
+                        ws_url: 'wss://api.example.com/p/t3/ws?t=tok-B',
+                        token: 'tok-B',
+                        expires_at: 0,
+                    }),
+                ],
+            }),
+        );
+
+        await ctx.service.connect('t3');
+
+        // The first WS should be at the first ws_url.
+        expect(ctx.wsInstances).toHaveLength(1);
+        expect(ctx.wsInstances[0].url).toBe('wss://api.example.com/p/t3/ws?t=tok-A');
+
+        // Fire a 4401 close on the first WS.
+        ctx.wsInstances[0].onclose?.({code: 4401, reason: 'token expired'} as CloseEvent);
+
+        // Let microtasks flush so the re-fetch + WS reopen happens.
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        // /connection was called again (twice total: initial + post-4401 refresh).
+        const connCalls = ctx.mockHttp.get.mock.calls.filter((c: any) =>
+            String(c[0]).endsWith('/api/sessions/t3/connection'),
+        );
+        expect(connCalls.length).toBeGreaterThanOrEqual(2);
+
+        // A new WS was opened at the refreshed ws_url.
+        expect(ctx.wsInstances.length).toBeGreaterThanOrEqual(2);
+        const secondWs = ctx.wsInstances[ctx.wsInstances.length - 1];
+        expect(secondWs.url).toBe('wss://api.example.com/p/t3/ws?t=tok-B');
+    });
+});
+
 describe('PersistentChatService — disconnect()', () => {
     let originalEs: any;
     let originalWs: any;
