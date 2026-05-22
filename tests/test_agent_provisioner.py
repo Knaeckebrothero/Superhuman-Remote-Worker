@@ -934,3 +934,81 @@ def test_pod_manifest_injects_pod_uid_via_downward_api():
     pod_uid_entry = next((e for e in container_env if e.get("name") == "POD_UID"), None)
     assert pod_uid_entry is not None, "POD_UID env not present"
     assert pod_uid_entry["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.uid"
+
+
+def test_pod_manifest_injects_session_bound_thread_id_env():
+    """Session pods carry SESSION_BOUND_THREAD_ID env so the pod's JWT
+    validator can check the `tid` claim matches its own thread."""
+    from orchestrator.services.agent_provisioner import AgentProvisioner
+
+    p = AgentProvisioner.__new__(AgentProvisioner)
+    p._namespace = "srw"
+    p._configmap_name = "srw-config"
+    p._secret_name = "srw-secret"
+    p._agent_image = "srw-agent:latest"
+    p._chart_label_name = ""
+    p._chart_label_instance = ""
+    # Additional attributes _build_pod_manifest reads beyond the JWT-env
+    # assertions this test cares about. Kept minimal: SSH secret name for the
+    # vm-ssh-key volume, and the tailscale sidecar gate disabled so we don't
+    # need a headscale URL.
+    p._ssh_secret_name = "srw-vm-ssh-key"
+    p._orchestrator_host = "srw-orchestrator"
+    p._orchestrator_port = 8085
+    p._tailscale_enabled = False
+    p._headscale_url = ""
+
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-s-deadbeef",
+        purpose="session",
+        thread_id="11111111-2222-3333-4444-555555555555",
+        config_name="persistent_defaults",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    env = manifest["spec"]["containers"][0].get("env", [])
+    tid_entry = next((e for e in env if e.get("name") == "SESSION_BOUND_THREAD_ID"), None)
+    assert tid_entry is not None
+    assert tid_entry["value"] == "11111111-2222-3333-4444-555555555555"
+
+
+def test_pod_manifest_injects_session_jwt_secret_env_from_secretref(monkeypatch):
+    """Session pods reference the JWT Secret by name (via SESSION_JWT_SECRET_NAME
+    env on the orchestrator) so handshake validation has the shared key."""
+    monkeypatch.setenv("SESSION_JWT_SECRET_NAME", "my-release-session-jwt")
+    from orchestrator.services.agent_provisioner import AgentProvisioner
+
+    p = AgentProvisioner.__new__(AgentProvisioner)
+    p._namespace = "srw"
+    p._configmap_name = "srw-config"
+    p._secret_name = "srw-secret"
+    p._agent_image = "srw-agent:latest"
+    p._chart_label_name = ""
+    p._chart_label_instance = ""
+    # See test above for why these extra attributes are set.
+    p._ssh_secret_name = "srw-vm-ssh-key"
+    p._orchestrator_host = "srw-orchestrator"
+    p._orchestrator_port = 8085
+    p._tailscale_enabled = False
+    p._headscale_url = ""
+
+    manifest = p._build_pod_manifest(
+        pod_name="srw-agent-s-abc",
+        purpose="session",
+        thread_id="t1",
+        config_name="persistent_defaults",
+        cpu_request="100m",
+        memory_request="256Mi",
+        cpu_limit="1",
+        memory_limit="2Gi",
+    )
+
+    env = manifest["spec"]["containers"][0].get("env", [])
+    jwt_entry = next((e for e in env if e.get("name") == "SESSION_JWT_SECRET"), None)
+    assert jwt_entry is not None
+    assert jwt_entry["valueFrom"]["secretKeyRef"]["name"] == "my-release-session-jwt"
+    assert jwt_entry["valueFrom"]["secretKeyRef"]["key"] == "jwt-secret"
+    assert jwt_entry["valueFrom"]["secretKeyRef"]["optional"] is True
