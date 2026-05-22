@@ -1,0 +1,232 @@
+"""``/api/sessions`` — prepare endpoint (Task 6) + connection endpoint (Task 7).
+
+These two endpoints replace the WS handshake's pre-flight work that used to
+live inline in ``orchestrator/main.py``'s ``persistent_ws_proxy``.
+
+  - ``POST /api/sessions/{thread_id}/prepare`` — slow path. Auth, ownership,
+    provisioning, readiness. Returns 202 immediately; progress goes via the
+    existing SSE notification feed on event type ``session.lifecycle``.
+    Idempotent: a concurrent retry blocks on a Postgres advisory lock keyed
+    by thread_id and returns the in-flight call's result.
+
+Spec: docs/features/direct_session_websockets.md §Component details.
+Pattern: late imports of postgres_db (and other singletons) inside handler
+bodies to avoid circular imports at module load time — same pattern as
+orchestrator/routers/automations.py.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from security.auth import require_approved_user
+from services.notification_feed import notification_feed
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/sessions", tags=["Sessions"])
+
+
+def _get_db() -> Any:
+    """Late-resolve the postgres_db singleton from main.
+
+    Wrapped in a function so tests can monkeypatch this single symbol
+    instead of having to patch the late `from main import postgres_db`
+    inside the handler body.
+    """
+    from main import postgres_db  # type: ignore
+    return postgres_db
+
+
+# --------------------------------------------------------------------------- #
+# Models
+# --------------------------------------------------------------------------- #
+
+
+class PrepareRequest(BaseModel):
+    config_name: str | None = Field(None, max_length=120)
+    config_override: dict[str, Any] | None = None
+
+
+class PrepareResponse(BaseModel):
+    state: str = Field(..., examples=["provisioning"])
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/sessions/{thread_id}/prepare
+# --------------------------------------------------------------------------- #
+
+
+@router.post(
+    "/{thread_id}/prepare",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=PrepareResponse,
+)
+async def prepare_session(
+    thread_id: str,
+    body: PrepareRequest,
+    user: dict = Depends(require_approved_user),
+):
+    """Kick off (or rejoin) provisioning for the given thread.
+
+    Returns 202 immediately. The caller subscribes to the SSE notification
+    feed and waits for ``session.lifecycle`` events with state=ready, then
+    calls GET /api/sessions/{tid}/connection for the token.
+    """
+    db = _get_db()
+
+    thread = await db.get_thread(thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="thread not found")
+    if str(thread.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=403, detail="thread access denied")
+
+    # Fire-and-forget the actual work in a background task. Progress reaches
+    # the cockpit via SSE. Idempotency is enforced by the advisory lock
+    # inside _do_prepare.
+    asyncio.create_task(
+        _do_prepare(
+            thread_id=thread_id,
+            user_id=str(user["id"]),
+            config_name=body.config_name or thread.get("config_name"),
+            config_override=body.config_override,
+        )
+    )
+
+    return PrepareResponse(state="provisioning")
+
+
+async def _do_prepare(
+    thread_id: str,
+    user_id: str,
+    config_name: str | None,
+    config_override: dict[str, Any] | None,
+) -> None:
+    """Run the actual provisioning + readiness work asynchronously.
+
+    Serializes concurrent prepares on the same thread via advisory lock.
+    Broadcasts ``session.lifecycle`` SSE events at each phase change.
+    """
+    db = _get_db()
+
+    def _emit(state: str, **extra: Any) -> None:
+        notification_feed.broadcast(
+            user_id,
+            "session.lifecycle",
+            {"thread_id": thread_id, "state": state, **extra},
+        )
+
+    try:
+        async with db.thread_advisory_lock(thread_id):
+            thread = await db.get_thread(thread_id)
+            if not thread:
+                _emit("failed", reason="thread vanished")
+                return
+
+            # Provisioning (if needed).
+            if not thread.get("agent_id"):
+                _emit("provisioning")
+                await _provision_agent_for_thread(
+                    thread_id=thread_id,
+                    config_name=config_name or "persistent_defaults",
+                    config_override=config_override,
+                )
+                # Wait for agent registration.
+                bind_timeout_s = int(os.environ.get("AGENT_BIND_TIMEOUT_S", "300"))
+                if not await _wait_for_binding(thread_id, bind_timeout_s):
+                    _emit("failed", reason="agent failed to register")
+                    return
+
+            # Readiness probe.
+            _emit("booting")
+            thread = await db.get_thread(thread_id)
+            agent_id = thread["agent_id"]
+            agent = await db.get_agent(str(agent_id))
+            if not agent or not agent.get("pod_ip"):
+                _emit("failed", reason="agent has no pod_ip")
+                return
+
+            ready_timeout_s = int(os.environ.get("WS_READY_TIMEOUT_S", "180"))
+            if not await _wait_for_ready(
+                pod_ip=agent["pod_ip"],
+                pod_port=int(agent.get("pod_port", 8001)),
+                timeout_s=ready_timeout_s,
+            ):
+                _emit("failed", reason="agent /ready timeout")
+                return
+
+            # Create the route resource.
+            from main import session_router  # type: ignore
+            await session_router.ensure_route(
+                thread_id=thread_id,
+                pod_name=agent["hostname"],
+                pod_uid=agent.get("pod_uid", ""),
+            )
+
+            _emit("ready")
+    except Exception as e:
+        logger.exception("prepare failed for thread %s: %s", thread_id, e)
+        _emit("failed", reason=str(e))
+
+
+async def _provision_agent_for_thread(
+    thread_id: str,
+    config_name: str,
+    config_override: dict[str, Any] | None,
+) -> None:
+    """Trigger pool-first then create-pod provisioning.
+
+    Migrated from main.py:_ws_provision (the inline helper that used to live
+    inside persistent_ws_proxy at main.py:13851-13884).
+    """
+    from main import (
+        _find_idle_persistent_agent,
+        _send_session_attach,
+        agent_provisioner,
+    )
+
+    idle_agent = await _find_idle_persistent_agent()
+    if idle_agent:
+        ok = await _send_session_attach(
+            idle_agent, thread_id, config_override or {}, [], datasources=None
+        )
+        if ok:
+            return
+
+    await agent_provisioner.provision_agent(
+        purpose="session", thread_id=thread_id, config_name=config_name
+    )
+
+
+async def _wait_for_binding(thread_id: str, timeout_s: int) -> bool:
+    """Poll the DB until thread.agent_id is set, or timeout."""
+    db = _get_db()
+    interval = 2
+    for _ in range(max(1, timeout_s // interval)):
+        thread = await db.get_thread(thread_id)
+        if thread and thread.get("agent_id"):
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+async def _wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
+    """Poll the agent pod's /ready until it returns ready=true, or timeout."""
+    import httpx
+    interval = 2
+    for _ in range(max(1, timeout_s // interval)):
+        try:
+            async with httpx.AsyncClient(timeout=2) as client:
+                resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
+                if resp.status_code == 200 and resp.json().get("ready"):
+                    return True
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    return False
