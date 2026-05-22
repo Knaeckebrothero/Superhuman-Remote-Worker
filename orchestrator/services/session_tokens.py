@@ -60,6 +60,14 @@ class SessionTokenService:
                 self._secret,
                 algorithms=[self._ALGORITHM],
                 audience=self._AUDIENCE,
+                leeway=2,  # 2s tolerance for clock skew between orchestrator and pod
+                options={
+                    "require": ["exp", "iat", "aud", "sub", "tid"],
+                    "verify_signature": True,
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_aud": True,
+                },
             )
         except jwt.PyJWTError as e:
             raise InvalidSessionTokenError(str(e)) from e
