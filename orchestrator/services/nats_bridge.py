@@ -37,6 +37,8 @@ except ImportError:
     NatsClient = None
     NATS_AVAILABLE = False
 
+from .notification_feed import notification_feed
+
 logger = logging.getLogger(__name__)
 
 
@@ -132,6 +134,14 @@ class NatsBridge:
 
             sudo_gate.connect(db=db, nc=self._nc)
             await self._nc.subscribe("sudo.request.>", cb=sudo_gate.on_sudo_request)
+
+            # Session event re-broadcast: agent pods publish notification
+            # events to session.events.{thread_id}; we forward to the SSE
+            # feed after filtering. The defense-in-depth payload-level
+            # thread_id check guards against a misbehaving pod publishing
+            # for another thread. See docs/issues/nats_subject_acl_hardening.md
+            # for the deferred transport-layer enforcement.
+            await self._nc.subscribe("session.events.>", cb=self._on_session_event)
 
             self._available = True
             logger.info("NATS bridge connected: %s", self._url)
@@ -427,6 +437,69 @@ class NatsBridge:
 
         except Exception:
             logger.exception("Error handling daemon heartbeat")
+
+    async def _on_session_event(self, msg: Any) -> None:
+        """Forward a session.events.{tid} event to the SSE notification feed.
+
+        Defense-in-depth: the payload's claimed thread_id must match the
+        subject's thread_id AND must resolve to an existing thread in DB.
+        Tracked for transport-layer hardening in
+        docs/issues/nats_subject_acl_hardening.md.
+        """
+        try:
+            payload = json.loads(msg.data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.warning("session.events: invalid JSON: %s", e)
+            return
+
+        # Extract thread_id from subject ("session.events.{tid}").
+        subject_parts = msg.subject.split(".")
+        if len(subject_parts) != 3 or subject_parts[0:2] != ["session", "events"]:
+            logger.warning("session.events: malformed subject: %s", msg.subject)
+            return
+        subject_tid = subject_parts[2]
+        payload_tid = payload.get("thread_id")
+
+        if payload_tid != subject_tid:
+            logger.warning(
+                "session.events: payload tid %r != subject tid %r — dropped",
+                payload_tid, subject_tid,
+            )
+            return
+
+        if self._db is None:
+            return
+        thread = await self._db.get_thread(subject_tid)
+        if not thread:
+            logger.debug("session.events: unknown thread %s — dropped", subject_tid)
+            return
+
+        user_id = str(thread.get("user_id") or "")
+        if not user_id:
+            return
+
+        # Map the pod's event method to a notification feed event type.
+        method = payload.get("method", "")
+        event_type_map = {
+            "permission.request": "session.permission_request",
+            "vm_upgrade.needed": "session.vm_upgrade",
+            "approve": "session.resolved",
+            "deny": "session.resolved",
+            "ready": "session.waiting",
+        }
+        event_type = event_type_map.get(method)
+        if not event_type:
+            return
+
+        notification_feed.broadcast(
+            user_id,
+            event_type,
+            {
+                "thread_id": subject_tid,
+                "method": method,
+                "params": payload.get("params", {}),
+            },
+        )
 
     async def _on_daemon_status(self, msg) -> None:
         """Handle agent.vm.*.status — agent process exited.

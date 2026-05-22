@@ -198,8 +198,8 @@ class TestConnect:
         assert bridge._nc is mock_nc
         assert bridge._db is mock_db
 
-        # Verify subscriptions were created (4 VM lifecycle + 1 sudo)
-        assert mock_nc.subscribe.call_count == 5
+        # Verify subscriptions were created (4 VM lifecycle + 1 sudo + 1 session.events)
+        assert mock_nc.subscribe.call_count == 6
 
         # Check subscription subjects
         subjects = [call.args[0] for call in mock_nc.subscribe.call_args_list]
@@ -208,6 +208,7 @@ class TestConnect:
         assert "agent.vm.*.heartbeat" in subjects
         assert "agent.vm.*.status" in subjects
         assert "sudo.request.>" in subjects
+        assert "session.events.>" in subjects
 
     @pytest.mark.asyncio
     async def test_connect_stores_on_vm_ready_callback(self, mock_nats_module, mock_db):
