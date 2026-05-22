@@ -84,11 +84,12 @@ secrets:
     GITEA_ADMIN_USER: "srw-admin"
     GITEA_ADMIN_PASSWORD: "dev_gitea_admin"
 
-    # OIDC client secrets — realm-export references ALL of these even for
-    # disabled services, so stubs are required.
+    # OIDC client secrets — only the ones whose service is enabled.
+    # gitea + mcp are on by default; opencloud's env ref is optional so the
+    # stub is just for fresh runs that flip opencloud on. Add
+    # NEXTCLOUD_OIDC_CLIENT_SECRET / PGADMIN_OIDC_CLIENT_SECRET only when
+    # you set `nextcloud.enabled=true` / `pgadmin.enabled=true`.
     GITEA_OIDC_CLIENT_SECRET: "dev_gitea_oidc_secret"
-    NEXTCLOUD_OIDC_CLIENT_SECRET: "dev_nextcloud_oidc_secret"
-    PGADMIN_OIDC_CLIENT_SECRET: "dev_pgadmin_oidc_secret"
     MCP_OIDC_CLIENT_SECRET: "dev_mcp_oidc_secret"
     OPENCLOUD_KEYCLOAK_CLIENT_SECRET: "dev_opencloud_oidc"
 
@@ -102,15 +103,9 @@ secrets:
     NEXTCLOUD_S3_ACCESS_KEY: "stub"
     NEXTCLOUD_S3_SECRET_KEY: "stub"
 
-    # S3 (snapshot service stubs)
-    S3_ACCESS_KEY: "minioadmin"
-    S3_SECRET_KEY: "minioadmin_secret"
-
-    # Email/notifications/integrations — all disabled, stubs to satisfy chart refs
-    SMTP_USER: "stub"
-    SMTP_PASSWORD: "stub"
-    IMAP_USER: "stub"
-    IMAP_PASSWORD: "stub"
+    # Email/notifications/integrations + S3 — chart refs are gated/optional,
+    # so entries here are only required when you flip `email.enabled=true`,
+    # configure an `s3.endpoint`, or wire up a webhook/integration.
     DISCORD_WEBHOOK_URL: ""
     SLACK_WEBHOOK_URL: ""
     NTFY_TOKEN: ""

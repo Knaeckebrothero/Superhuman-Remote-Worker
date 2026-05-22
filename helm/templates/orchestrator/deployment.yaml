@@ -288,12 +288,14 @@ spec:
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
             - name: SESSION_JWT_SECRET_KEY
               value: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" | quote }}
-            # MCP auth
+            # MCP auth (only when mcp pod is deployed)
+            {{- if .Values.mcp.enabled }}
             - name: MCP_INTERNAL_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: MCP_INTERNAL_KEY
+            {{- end }}
             # CORS
             - name: CORS_ORIGINS
               valueFrom:
@@ -481,16 +483,21 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: S3_ENDPOINT
+            # S3 credentials are optional — when absent the orchestrator
+            # detects "no S3" via empty S3_ENDPOINT and disables snapshots
+            # / external IDE session storage.
             - name: S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: S3_ACCESS_KEY
+                  optional: true
             - name: S3_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: S3_SECRET_KEY
+                  optional: true
             - name: S3_BUCKET
               valueFrom:
                 configMapKeyRef:
@@ -548,6 +555,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: SMTP_PORT
+            {{- if .Values.email.enabled }}
             - name: SMTP_USER
               valueFrom:
                 secretKeyRef:
@@ -558,6 +566,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: SMTP_PASSWORD
+            {{- end }}
             - name: SMTP_USE_TLS
               valueFrom:
                 configMapKeyRef:
@@ -584,6 +593,7 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: IMAP_PORT
+            {{- if .Values.email.enabled }}
             - name: IMAP_USER
               valueFrom:
                 secretKeyRef:
@@ -594,6 +604,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: IMAP_PASSWORD
+            {{- end }}
             - name: IMAP_USE_SSL
               valueFrom:
                 configMapKeyRef:
