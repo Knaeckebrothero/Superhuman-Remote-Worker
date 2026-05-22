@@ -14865,7 +14865,7 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
             status_code=400,
             detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'",
         )
-    if scope == "all" and not user.get("is_admin", False):
+    if scope == "all" and not user.get("real_is_admin", False):
         raise HTTPException(
             status_code=403, detail="Only admins can create full-access tokens"
         )
@@ -15026,7 +15026,7 @@ async def create_api_key(request: Request, body: ApiKeyCreate) -> dict[str, Any]
             status_code=400,
             detail=f"Unknown scopes: {sorted(bad)}",
         )
-    if "admin" in requested and not user.get("is_admin", False):
+    if "admin" in requested and not user.get("real_is_admin", False):
         raise HTTPException(
             status_code=403, detail="Only admins can issue admin-scoped tokens"
         )
