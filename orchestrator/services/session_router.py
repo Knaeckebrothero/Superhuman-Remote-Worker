@@ -93,9 +93,33 @@ class SessionRouterService:
         pod_name: str,
         pod_uid: str,
     ) -> str:
-        """Create Service + Ingress if missing. Returns the path prefix."""
+        """Create Service + Ingress if missing. Patch the pod's thread-id
+        label so the Service selector matches. Returns the path prefix."""
         self._lazy_init_apis()
         name = f"session-{thread_id}"
+
+        # Stamp the pod's srw.io/thread-id label. The Service selector matches
+        # this label; idle-pool agents that get attached via main._send_session_attach
+        # are bound in DB but never get their K8s pod metadata updated, so the
+        # Service ends up with zero endpoints. Patching here is idempotent —
+        # same value is a no-op, and a no-longer-bound thread can claim the
+        # pod next by overwriting the label.
+        try:
+            await self._call(
+                self._core_api.patch_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+                body={"metadata": {"labels": {"srw.io/thread-id": thread_id}}},
+            )
+        except Exception as e:
+            if _is_k8s_status(e, 404):
+                logger.warning(
+                    "ensure_route: pod %s not found for thread %s — skipping label patch",
+                    pod_name,
+                    thread_id,
+                )
+            else:
+                raise
 
         # Service
         if not await self._exists(self._core_api.read_namespaced_service, name):
