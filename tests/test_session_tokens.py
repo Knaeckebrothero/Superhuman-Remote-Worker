@@ -1,6 +1,5 @@
 """Tests for the session JWT module — mint and validate."""
 
-import os
 import time
 
 import pytest
@@ -50,10 +49,10 @@ def test_validate_rejects_wrong_signature(svc):
 
 
 def test_validate_rejects_expired_token():
-    """A token past its expiry is rejected."""
+    """A token past its expiry (plus 2s leeway) is rejected."""
     svc = SessionTokenService(secret="test-secret", ttl_seconds=1)
     token, _ = svc.mint(user_id="u1", thread_id="t1")
-    time.sleep(2)
+    time.sleep(4)  # exceed ttl (1s) + leeway (2s) with margin
 
     with pytest.raises(InvalidSessionTokenError):
         svc.validate(token)
@@ -76,3 +75,28 @@ def test_validate_rejects_malformed_token(svc):
     """Garbage strings are rejected, not crashed on."""
     with pytest.raises(InvalidSessionTokenError):
         svc.validate("not-a-jwt-at-all")
+
+
+def test_validate_rejects_token_missing_required_claims(svc):
+    """A token missing `sub`, `tid`, `aud`, `iat`, or `exp` is rejected.
+
+    Defensive boundary: validate() must reject incomplete tokens so callers
+    don't need to recheck claim presence.
+    """
+    import time as _t
+    import jwt as _jwt
+
+    # Token missing `tid` — should be rejected even though signature is valid.
+    incomplete = _jwt.encode(
+        {
+            "sub": "u1",
+            "aud": "agent",
+            "iat": int(_t.time()),
+            "exp": int(_t.time()) + 60,
+            # NO `tid` claim
+        },
+        "test-secret-do-not-use",
+        algorithm="HS256",
+    )
+    with pytest.raises(InvalidSessionTokenError):
+        svc.validate(incomplete)
