@@ -155,6 +155,24 @@ ingress:
     issuerName: letsencrypt-prod
 
 # -----------------------------------------------------------------------------
+# Session router — Direct Session WebSockets
+# (docs/features/direct_session_websockets.md)
+#
+# Generate a strong key with:  openssl rand -hex 32
+# Then pass at install time so it never lives in the repo:
+#   helm install srw ./helm \
+#     --set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"
+# -----------------------------------------------------------------------------
+sessionRouter:
+  ingressClass: nginx          # match your cluster's controller (Tier-1: traefik)
+  ingressHost: ""              # default: api.<global.domain>
+  jwtSecret: ""                # REQUIRED — replace-with-32-bytes-of-random
+  jwtTtlSeconds: 60
+  # annotations:
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+# -----------------------------------------------------------------------------
 # Sizing — defaults are dev-friendly. Adjust for production load.
 # -----------------------------------------------------------------------------
 agent:

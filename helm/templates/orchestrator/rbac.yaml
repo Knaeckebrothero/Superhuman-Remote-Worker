@@ -35,6 +35,15 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "delete", "get", "list"]
+  # Session router: per-session Service + Ingress lifecycle managed by
+  # SessionRouterService when a thread binds to an agent. See
+  # docs/features/direct_session_websockets.md §RBAC changes.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "delete", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "create", "delete", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
