@@ -75,3 +75,111 @@ def test_prepare_returns_403_when_thread_owned_by_other_user(app):
 
     resp = client.post("/api/sessions/t1/prepare", json={})
     assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch):
+    """When the thread already has an agent_id and the pod is ready,
+    _do_prepare skips provisioning, runs the readiness probe, calls
+    session_router.ensure_route, and emits booting then ready."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    # Already bound and ready.
+    db.get_thread.return_value = {
+        "id": "t1",
+        "user_id": "u1",
+        "agent_id": "agent-xyz",
+        "config_name": "persistent_defaults",
+    }
+    db.get_agent.return_value = {
+        "id": "agent-xyz",
+        "pod_ip": "10.0.0.5",
+        "pod_port": 8001,
+        "hostname": "srw-agent-s-deadbeef",
+        "pod_uid": "k8s-uid-1",
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    # Mock the readiness probe to immediately return ready=true.
+    async def _ready_ok(pod_ip, pod_port, timeout_s):
+        return True
+    monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_ok, raising=True)
+
+    # Mock session_router on main.
+    import sys
+    fake_main = MagicMock()
+    fake_main.session_router = AsyncMock()
+    fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    # Capture broadcasts.
+    feed = MagicMock()
+    monkeypatch.setattr(sessions_mod, "notification_feed", feed, raising=True)
+
+    await sessions_mod._do_prepare(
+        thread_id="t1",
+        user_id="u1",
+        config_name="persistent_defaults",
+        config_override=None,
+    )
+
+    # Expected phase sequence: booting → ready (no provisioning, agent was already bound).
+    states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
+    assert states == ["booting", "ready"]
+
+    # ensure_route called with correct pod info.
+    fake_main.session_router.ensure_route.assert_called_once_with(
+        thread_id="t1",
+        pod_name="srw-agent-s-deadbeef",
+        pod_uid="k8s-uid-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_do_prepare_emits_failed_when_pod_not_ready(monkeypatch):
+    """If readiness probe times out, _do_prepare emits failed and does not
+    call session_router.ensure_route."""
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    db.get_thread.return_value = {
+        "id": "t1", "user_id": "u1", "agent_id": "agent-xyz",
+        "config_name": "persistent_defaults",
+    }
+    db.get_agent.return_value = {
+        "id": "agent-xyz", "pod_ip": "10.0.0.5", "pod_port": 8001,
+        "hostname": "srw-agent-x", "pod_uid": "uid",
+    }
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    monkeypatch.setattr(sessions_mod, "_get_db", lambda: db, raising=False)
+
+    # Readiness times out.
+    async def _ready_timeout(pod_ip, pod_port, timeout_s):
+        return False
+    monkeypatch.setattr(sessions_mod, "_wait_for_ready", _ready_timeout, raising=True)
+
+    import sys
+    fake_main = MagicMock()
+    fake_main.session_router = AsyncMock()
+    fake_main.session_router.ensure_route = AsyncMock()
+    monkeypatch.setitem(sys.modules, "main", fake_main)
+
+    feed = MagicMock()
+    monkeypatch.setattr(sessions_mod, "notification_feed", feed, raising=True)
+
+    await sessions_mod._do_prepare(
+        thread_id="t1", user_id="u1",
+        config_name="persistent_defaults", config_override=None,
+    )
+
+    states = [call.args[2]["state"] for call in feed.broadcast.call_args_list]
+    assert "failed" in states
+    fake_main.session_router.ensure_route.assert_not_called()

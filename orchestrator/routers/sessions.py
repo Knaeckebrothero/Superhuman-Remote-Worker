@@ -205,10 +205,11 @@ async def _provision_agent_for_thread(
 
 
 async def _wait_for_binding(thread_id: str, timeout_s: int) -> bool:
-    """Poll the DB until thread.agent_id is set, or timeout."""
+    """Poll the DB until thread.agent_id is set, or wall-clock timeout."""
     db = _get_db()
+    deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
-    for _ in range(max(1, timeout_s // interval)):
+    while asyncio.get_event_loop().time() < deadline:
         thread = await db.get_thread(thread_id)
         if thread and thread.get("agent_id"):
             return True
@@ -217,10 +218,11 @@ async def _wait_for_binding(thread_id: str, timeout_s: int) -> bool:
 
 
 async def _wait_for_ready(pod_ip: str, pod_port: int, timeout_s: int) -> bool:
-    """Poll the agent pod's /ready until it returns ready=true, or timeout."""
+    """Poll the agent pod's /ready until it returns ready=true, or wall-clock timeout."""
     import httpx
+    deadline = asyncio.get_event_loop().time() + timeout_s
     interval = 2
-    for _ in range(max(1, timeout_s // interval)):
+    while asyncio.get_event_loop().time() < deadline:
         try:
             async with httpx.AsyncClient(timeout=2) as client:
                 resp = await client.get(f"http://{pod_ip}:{pod_port}/ready")
