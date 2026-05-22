@@ -939,6 +939,12 @@ class AgentProvisioner:
             labels["app.kubernetes.io/component"] = "agent"
         if thread_id:
             labels["srw/thread-id"] = thread_id[:12]
+            # Full-value label consumed by the per-session Service selector
+            # built by the session router (docs/features/direct_session_websockets.md).
+            # The legacy `srw/thread-id` label above is kept for backwards-compat
+            # with the lifecycle reconciler, which still selects on the truncated
+            # form. K8s label values cap at 63 chars; a UUID fits.
+            labels["srw.io/thread-id"] = thread_id
         # Build SHA label — lets the lifecycle reconciler enumerate stale
         # pods by selector without joining to the agents table. Set when
         # the image tag follows the `:sha-XXXXXXX` convention; absent for
@@ -963,6 +969,17 @@ class AgentProvisioner:
                 "env": [
                     {"name": "AGENT_CONFIG", "value": config_name},
                     {"name": "AGENT_PORT", "value": "8001"},
+                    # Downward-API injection: the K8s-assigned pod UID. The
+                    # agent reports this back at /api/agents/register so the
+                    # session router can stamp ownerReferences on per-session
+                    # Service/Ingress resources for K8s GC.
+                    # (docs/features/direct_session_websockets.md)
+                    {
+                        "name": "POD_UID",
+                        "valueFrom": {
+                            "fieldRef": {"fieldPath": "metadata.uid"},
+                        },
+                    },
                 ],
                 "securityContext": {
                     "runAsNonRoot": True,

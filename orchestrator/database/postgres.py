@@ -1974,6 +1974,7 @@ class PostgresDB:
         agent_mode: str = "worker",
         thread_id: str | None = None,
         build_sha: str | None = None,
+        pod_uid: str | None = None,
     ) -> Dict[str, Any]:
         """Register a new agent or update existing one.
 
@@ -2029,7 +2030,8 @@ class PostgresDB:
                             registered_at = CURRENT_TIMESTAMP,
                             agent_mode    = $6,
                             thread_id     = $7,
-                            metadata = COALESCE(metadata, '{}') || $8::jsonb
+                            metadata = COALESCE(metadata, '{}') || $8::jsonb,
+                            pod_uid       = COALESCE(NULLIF($9, ''), pod_uid)
                         WHERE id = $5
                         """,
                         pod_ip,
@@ -2040,6 +2042,7 @@ class PostgresDB:
                         agent_mode,
                         thread_id,
                         json.dumps({"build_sha": build_sha or ""}),
+                        pod_uid,
                     )
                     return {
                         "agent_id": str(agent_id),
@@ -2049,8 +2052,8 @@ class PostgresDB:
             # Create new agent
             row = await conn.fetchrow(
                 """
-                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+                INSERT INTO agents (config_name, hostname, pod_ip, pod_port, pid, agent_mode, thread_id, metadata, pod_uid)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, NULLIF($9, ''))
                 RETURNING id
                 """,
                 config_name,
@@ -2061,6 +2064,7 @@ class PostgresDB:
                 agent_mode,
                 thread_id,
                 json.dumps({"build_sha": build_sha or ""}),
+                pod_uid,
             )
 
             return {
@@ -2192,7 +2196,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata
+                           last_completed_at, metadata, pod_uid
                     FROM agents
                     WHERE status = $1
                     ORDER BY last_heartbeat DESC
@@ -2206,7 +2210,7 @@ class PostgresDB:
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                            status, current_job_id, registered_at, last_heartbeat,
-                           last_completed_at, metadata
+                           last_completed_at, metadata, pod_uid
                     FROM agents
                     ORDER BY last_heartbeat DESC
                     LIMIT $1
@@ -2235,7 +2239,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, thread_id,
-                       registered_at, last_heartbeat, metadata
+                       registered_at, last_heartbeat, metadata, pod_uid
                 FROM agents
                 WHERE id = $1
                 """,
@@ -2443,7 +2447,7 @@ class PostgresDB:
                 """
                 SELECT id, config_name, hostname, pod_ip, pod_port, pid,
                        status, current_job_id, registered_at, last_heartbeat,
-                       last_completed_at, metadata
+                       last_completed_at, metadata, pod_uid
                 FROM agents
                 WHERE status = 'ready'
                   AND COALESCE(agent_mode, 'worker') IN ('worker', 'dual')
