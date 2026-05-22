@@ -166,7 +166,20 @@ ingress:
 sessionRouter:
   ingressClass: nginx          # match your cluster's controller (Tier-1: traefik)
   ingressHost: ""              # default: api.<global.domain>
-  jwtSecret: ""                # REQUIRED — replace-with-32-bytes-of-random
+
+  # Layout A — chart renders a standalone Secret. Pass the random value at
+  # install time:  --set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"
+  jwtSecret: ""                # REQUIRED for Layout A
+  # jwtSecretName: ""          # defaults to <release>-session-jwt
+  # jwtSecretKey: "jwt-secret"
+
+  # Layout B — key already lives on an existing Secret (e.g. ESO-synced from
+  # Vault, sealed-secrets, etc.). Leave jwtSecret empty so the standalone
+  # Secret isn't rendered; point the chart at the existing bundle:
+  #   jwtSecret: ""
+  #   jwtSecretName: srw                  # the bundle Secret your release already has
+  #   jwtSecretKey: SESSION_JWT_SECRET    # the key inside that bundle
+
   jwtTtlSeconds: 60
   # annotations:
   #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
