@@ -169,4 +169,16 @@ llm:
   browserBaseUrl: ""
   embeddingBaseUrl: ""
   codexBaseUrl: ""
+# -----------------------------------------------------------------------------
+# Session router — Direct Session WebSockets
+# (docs/features/direct_session_websockets.md)
+#
+# The HS256 signing key lives in the shared `srw` bundle Secret, populated by
+# ESO from Vault under the key `SESSION_JWT_SECRET`. Leaving `jwtSecret` empty
+# skips the chart's standalone Secret render (Layout B in helm/values.yaml).
+# -----------------------------------------------------------------------------
+sessionRouter:
+  jwtSecret: ""
+  jwtSecretName: srw
+  jwtSecretKey: SESSION_JWT_SECRET
 logLevel: "INFO"
