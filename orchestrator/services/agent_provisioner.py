@@ -1000,7 +1000,10 @@ class AgentProvisioner:
                                     "SESSION_JWT_SECRET_NAME",
                                     "srw-session-jwt",
                                 ),
-                                "key": "jwt-secret",
+                                "key": os.environ.get(
+                                    "SESSION_JWT_SECRET_KEY",
+                                    "jwt-secret",
+                                ),
                                 "optional": True,
                             },
                         },

@@ -267,7 +267,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) }}
-                  key: jwt-secret
+                  key: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" }}
                   optional: true
             - name: SESSION_JWT_TTL_S
               value: {{ .Values.sessionRouter.jwtTtlSeconds | default 60 | quote }}
@@ -279,13 +279,15 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_INGRESS_ANNOTATIONS
               value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
-            # Name of the Secret holding the shared HS256 JWT key. The
-            # orchestrator passes this through to dynamically-provisioned
+            # Name + key of the Secret holding the shared HS256 JWT key.
+            # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the
-            # pod's JWT validator (src/api/_session_auth.py) can look up the
-            # same secret and verify handshake tokens.
+            # pod's JWT validator (src/api/_session_auth.py) can resolve the
+            # same secret/key pair and verify handshake tokens.
             - name: SESSION_JWT_SECRET_NAME
               value: {{ .Values.sessionRouter.jwtSecretName | default (printf "%s-session-jwt" (include "srw.fullname" .)) | quote }}
+            - name: SESSION_JWT_SECRET_KEY
+              value: {{ .Values.sessionRouter.jwtSecretKey | default "jwt-secret" | quote }}
             # MCP auth
             - name: MCP_INTERNAL_KEY
               valueFrom:

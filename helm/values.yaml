@@ -1036,10 +1036,25 @@ sessionRouter:
   ingressHost: ""
 
   # JWT signing key shared by orchestrator + agent pods. REQUIRED to enable
-  # the new flow. Leave empty during development; set in values-prod.yaml
-  # (or --set-string sessionRouter.jwtSecret=...) at install time.
+  # the new flow.
+  #
+  # Two layouts:
+  #
+  #   Layout A (standalone Secret, simplest for dev / non-Vault):
+  #     Set ``jwtSecret`` to a 32+ byte random string. The chart renders a
+  #     dedicated K8s Secret named ``<release>-session-jwt`` (override via
+  #     ``jwtSecretName``) with the value at key ``jwt-secret``.
+  #     `--set-string sessionRouter.jwtSecret="$(openssl rand -hex 32)"`
+  #
+  #   Layout B (key on an existing bundled Secret, e.g. ESO-synced from Vault):
+  #     Leave ``jwtSecret`` empty (so the standalone Secret render is skipped).
+  #     Point ``jwtSecretName`` at the existing Secret (e.g. ``srw``) and set
+  #     ``jwtSecretKey`` to the key within that bundle (e.g.
+  #     ``SESSION_JWT_SECRET``). The bundle's owner (ESO, sealed-secrets, etc.)
+  #     populates it.
   jwtSecret: ""
-  jwtSecretName: ""  # defaults to <release>-session-jwt
+  jwtSecretName: ""  # defaults to <release>-session-jwt (Layout A)
+  jwtSecretKey: "jwt-secret"  # key within the Secret; "jwt-secret" matches Layout A's standalone render
   jwtTtlSeconds: 60
 
   # Extra annotations merged into every per-session Ingress resource.
